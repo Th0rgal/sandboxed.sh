@@ -13,6 +13,9 @@ Cargo.lock
 .env
 .env.local
 
+# Calibration / local artifacts
+.open_agent_calibration/
+
 # OS files
 .DS_Store
 Thumbs.db

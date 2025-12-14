@@ -27,6 +27,9 @@ use crate::task::Task;
 /// 4. Return model with minimum expected cost within budget
 pub struct ModelSelector {
     id: AgentId,
+    retry_multiplier: f64,
+    inefficiency_scale: f64,
+    max_failure_probability: f64,
 }
 
 /// Model recommendation from the selector.
@@ -51,7 +54,22 @@ pub struct ModelRecommendation {
 impl ModelSelector {
     /// Create a new model selector.
     pub fn new() -> Self {
-        Self { id: AgentId::new() }
+        Self {
+            id: AgentId::new(),
+            retry_multiplier: 1.5,
+            inefficiency_scale: 0.5,
+            max_failure_probability: 0.9,
+        }
+    }
+
+    /// Create a selector with calibrated parameters.
+    pub fn with_params(retry_multiplier: f64, inefficiency_scale: f64, max_failure_probability: f64) -> Self {
+        Self {
+            id: AgentId::new(),
+            retry_multiplier: retry_multiplier.max(1.0),
+            inefficiency_scale: inefficiency_scale.max(0.0),
+            max_failure_probability: max_failure_probability.clamp(0.0, 0.99),
+        }
     }
 
     /// Calculate expected cost for a model given task complexity.
@@ -84,14 +102,14 @@ impl ModelSelector {
         
         // Failure probability: higher complexity + lower capability = more failures
         // Formula: P(fail) = complexity * (1 - capability)
-        let failure_prob = (complexity * (1.0 - capability)).clamp(0.0, 0.9);
+        let failure_prob = (complexity * (1.0 - capability)).clamp(0.0, self.max_failure_probability);
         
         // Token inefficiency: weaker models need more tokens
         // Formula: inefficiency = 1 + (1 - capability) * 0.5
-        let inefficiency = 1.0 + (1.0 - capability) * 0.5;
+        let inefficiency = 1.0 + (1.0 - capability) * self.inefficiency_scale;
         
         // Retry cost: if it fails, we pay again (possibly with a better model)
-        let retry_multiplier = 1.5; // Retries cost 50% more (wasted context)
+        let retry_multiplier = self.retry_multiplier;
         
         // Base cost for estimated tokens
         let input_tokens = estimated_tokens / 2;
@@ -211,10 +229,12 @@ impl ModelSelector {
 #[derive(Debug)]
 struct ExpectedCost {
     model_id: String,
+    #[allow(dead_code)]
     base_cost_cents: u64,
     expected_cost_cents: u64,
     failure_probability: f64,
     capability: f64,
+    #[allow(dead_code)]
     inefficiency: f64,
 }
 
@@ -246,10 +266,13 @@ impl Agent for ModelSelector {
     /// # Returns
     /// AgentResult with ModelRecommendation in the `data` field.
     async fn execute(&self, task: &mut Task, ctx: &AgentContext) -> AgentResult {
-        // Get complexity (default to moderate if not estimated)
-        // In practice, this would be passed from ComplexityEstimator
-        let complexity = 0.5; // TODO: Get from task metadata
-        let estimated_tokens = 2000_u64;
+        // Get complexity + estimated tokens from task analysis (populated by ComplexityEstimator).
+        let complexity = task
+            .analysis()
+            .complexity_score
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+        let estimated_tokens = task.analysis().estimated_total_tokens.unwrap_or(2000_u64);
         
         // Get available budget
         let budget_cents = task.budget().remaining_cents();
@@ -274,6 +297,13 @@ impl Agent for ModelSelector {
 
         match self.select_optimal(&models, complexity, estimated_tokens, budget_cents) {
             Some(rec) => {
+                // Record selection in analysis
+                {
+                    let a = task.analysis_mut();
+                    a.selected_model = Some(rec.model_id.clone());
+                    a.estimated_cost_cents = Some(rec.expected_cost_cents);
+                }
+
                 AgentResult::success(
                     &rec.reasoning,
                     1, // Minimal cost for selection itself
@@ -284,6 +314,11 @@ impl Agent for ModelSelector {
                     "confidence": rec.confidence,
                     "reasoning": rec.reasoning,
                     "fallbacks": rec.fallbacks,
+                    "inputs": {
+                        "complexity": complexity,
+                        "estimated_tokens": estimated_tokens,
+                        "budget_cents": budget_cents
+                    }
                 }))
             }
             None => {

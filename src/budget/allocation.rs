@@ -142,6 +142,7 @@ fn allocate_priority(subtasks: &[Subtask], total_budget: u64) -> Vec<u64> {
 /// - 0.8-1.0: ~500 cents (very complex task)
 /// 
 /// # Pure Function
+#[allow(dead_code)]
 pub fn estimate_budget_for_complexity(complexity_score: f64) -> u64 {
     let clamped = complexity_score.clamp(0.0, 1.0);
     

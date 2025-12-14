@@ -19,12 +19,14 @@
 mod types;
 mod context;
 mod tree;
+pub mod tuning;
 pub mod orchestrator;
 pub mod leaf;
 
 pub use types::{AgentId, AgentType, AgentResult, AgentError, Complexity};
 pub use context::AgentContext;
 pub use tree::{AgentTree, AgentRef};
+pub use tuning::TuningParams;
 
 use async_trait::async_trait;
 use crate::task::Task;

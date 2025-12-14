@@ -17,6 +17,7 @@ use crate::agents::{
     OrchestratorAgent,
     leaf::{ComplexityEstimator, ModelSelector, TaskExecutor, Verifier},
 };
+use crate::agents::tuning::TuningParams;
 use crate::budget::Budget;
 use crate::task::{Task, Subtask, SubtaskPlan, VerificationCriteria};
 
@@ -46,10 +47,23 @@ pub struct RootAgent {
 impl RootAgent {
     /// Create a new root agent with default children.
     pub fn new() -> Self {
+        Self::new_with_tuning(&TuningParams::default())
+    }
+
+    /// Create a new root agent using empirically tuned parameters.
+    pub fn new_with_tuning(tuning: &TuningParams) -> Self {
         Self {
             id: AgentId::new(),
-            complexity_estimator: Arc::new(ComplexityEstimator::new()),
-            model_selector: Arc::new(ModelSelector::new()),
+            complexity_estimator: Arc::new(ComplexityEstimator::with_params(
+                tuning.complexity.prompt_variant,
+                tuning.complexity.split_threshold,
+                tuning.complexity.token_multiplier,
+            )),
+            model_selector: Arc::new(ModelSelector::with_params(
+                tuning.model_selector.retry_multiplier,
+                tuning.model_selector.inefficiency_scale,
+                tuning.model_selector.max_failure_probability,
+            )),
             task_executor: Arc::new(TaskExecutor::new()),
             verifier: Arc::new(Verifier::new()),
         }
@@ -184,11 +198,44 @@ Respond ONLY with the JSON object."#,
         let mut results = Vec::new();
         let mut total_cost = 0u64;
 
-        // Execute each subtask
+        // Execute each subtask with planning + verification.
         for task in &mut tasks {
-            let result = self.task_executor.execute(task, ctx).await;
-            total_cost += result.cost_cents;
-            results.push(result);
+            // 1) Estimate complexity (for token estimate) for this subtask.
+            let est = self.complexity_estimator.execute(task, ctx).await;
+            total_cost += est.cost_cents;
+
+            // 2) Select model based on complexity + subtask budget.
+            let sel = self.model_selector.execute(task, ctx).await;
+            total_cost += sel.cost_cents;
+
+            // 3) Execute.
+            let exec = self.task_executor.execute(task, ctx).await;
+            total_cost += exec.cost_cents;
+
+            // 4) Verify.
+            let ver = self.verifier.execute(task, ctx).await;
+            total_cost += ver.cost_cents;
+
+            let success = exec.success && ver.success;
+
+            results.push(
+                AgentResult {
+                    success,
+                    output: if ver.success {
+                        exec.output.clone()
+                    } else {
+                        format!("{}\n\nVerification failed: {}", exec.output, ver.output)
+                    },
+                    cost_cents: est.cost_cents + sel.cost_cents + exec.cost_cents + ver.cost_cents,
+                    model_used: exec.model_used.clone(),
+                    data: Some(json!({
+                        "complexity_estimate": est.data,
+                        "model_selection": sel.data,
+                        "execution": exec.data,
+                        "verification": ver.data,
+                    })),
+                }
+            );
         }
 
         // Aggregate results
@@ -247,7 +294,8 @@ impl Agent for RootAgent {
 
         // Step 1: Estimate complexity
         let complexity = self.estimate_complexity(task, ctx).await;
-        total_cost += 1; // Complexity estimation cost
+        // Cost already tracked inside ComplexityEstimator; we keep a small constant for now.
+        total_cost += 1;
 
         tracing::info!(
             "Task complexity: {:.2} (should_split: {})",
@@ -282,6 +330,10 @@ impl Agent for RootAgent {
         }
 
         // Simple task or failed to split: execute directly
+        // Step 2b: Select model (U-curve) for direct execution.
+        let sel = self.model_selector.execute(task, ctx).await;
+        total_cost += sel.cost_cents;
+
         let result = self.task_executor.execute(task, ctx).await;
 
         // Step 3: Verify (if verification criteria specified)

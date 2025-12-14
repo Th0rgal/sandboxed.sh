@@ -11,7 +11,7 @@ use serde_json::json;
 use crate::agents::{
     Agent, AgentContext, AgentId, AgentResult, AgentType, Complexity, LeafAgent, LeafCapability,
 };
-use crate::llm::{ChatMessage, Role};
+use crate::llm::{ChatMessage, ChatOptions, Role};
 use crate::task::Task;
 
 /// Agent that estimates task complexity.
@@ -26,12 +26,48 @@ use crate::task::Task;
 /// 3. Return structured Complexity object
 pub struct ComplexityEstimator {
     id: AgentId,
+    prompt_variant: ComplexityPromptVariant,
+    split_threshold: f64,
+    token_multiplier: f64,
+}
+
+/// Prompt variants for complexity estimation.
+///
+/// We keep this as an enum (not free-form strings) so we can:
+/// - A/B test variants deterministically
+/// - Store tuned choice as a stable symbol in config
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplexityPromptVariant {
+    /// Short rubric-based prompt (fast).
+    RubricV1,
+    /// More explicit calibration prompt encouraging realistic token estimates.
+    CalibratedV2,
 }
 
 impl ComplexityEstimator {
     /// Create a new complexity estimator.
     pub fn new() -> Self {
-        Self { id: AgentId::new() }
+        Self {
+            id: AgentId::new(),
+            prompt_variant: ComplexityPromptVariant::CalibratedV2,
+            split_threshold: 0.6,
+            token_multiplier: 1.0,
+        }
+    }
+
+    /// Create a custom estimator (used by calibration harness).
+    pub fn with_params(
+        prompt_variant: ComplexityPromptVariant,
+        split_threshold: f64,
+        token_multiplier: f64,
+    ) -> Self {
+        Self {
+            id: AgentId::new(),
+            prompt_variant,
+            split_threshold: split_threshold.clamp(0.0, 1.0),
+            token_multiplier: token_multiplier.max(0.1),
+        }
     }
 
     /// Prompt template for complexity estimation.
@@ -40,33 +76,56 @@ impl ComplexityEstimator {
     /// LLM should respond with JSON containing:
     /// - score: float 0-1
     /// - reasoning: string explanation
-    /// - estimated_tokens: int
-    /// - subtasks: optional array if should split
     fn build_prompt(&self, task: &Task) -> String {
-        format!(
-            r#"You are a task complexity analyzer. Analyze the following task and estimate its complexity.
+        match self.prompt_variant {
+            ComplexityPromptVariant::RubricV1 => format!(
+                r#"You are a task complexity analyzer.
 
-Task: {}
+Task: {task}
 
-Respond with a JSON object containing:
-- "score": A float from 0.0 to 1.0 where:
-  - 0.0-0.2: Trivial (single command, simple file operation)
-  - 0.2-0.4: Simple (few steps, straightforward implementation)
-  - 0.4-0.6: Moderate (multiple files, some decision making)
-  - 0.6-0.8: Complex (many files, architectural decisions, testing)
-  - 0.8-1.0: Very Complex (large refactoring, many dependencies)
-  
-- "reasoning": Brief explanation of why this complexity level
+Respond with ONLY a JSON object:
+{{
+  "score": <float 0..1>,
+  "reasoning": <string>,
+  "estimated_tokens": <int>
+}}
 
-- "estimated_tokens": Estimated total tokens needed (input + output) to complete this task
+Rubric for score:
+- 0.0-0.2: Trivial
+- 0.2-0.4: Simple
+- 0.4-0.6: Moderate
+- 0.6-0.8: Complex
+- 0.8-1.0: Very Complex"#,
+                task = task.description()
+            ),
+            ComplexityPromptVariant::CalibratedV2 => format!(
+                r#"You are a task complexity analyzer. Your goal is to estimate:
+1) a complexity score in [0, 1]
+2) a realistic token budget estimate for completing the task end-to-end using an LLM with tools.
 
-- "should_split": Boolean, true if task should be broken into subtasks
+Task: {task}
 
-- "subtasks": If should_split is true, array of suggested subtask descriptions
+Important: \"estimated_tokens\" should reflect TOTAL tokens (input + output) across multiple turns, including:
+- planning / reasoning
+- tool call arguments and tool outputs
+- iterative fixes and retries
 
-Respond with ONLY the JSON object, no other text."#,
-            task.description()
-        )
+Respond with ONLY a JSON object:
+{{
+  \"score\": <float 0..1>,
+  \"reasoning\": <string>,
+  \"estimated_tokens\": <int>
+}}
+
+Rubric for score:
+- 0.0-0.2: Trivial (single tool call)
+- 0.2-0.4: Simple (1-3 tool calls)
+- 0.4-0.6: Moderate (3-8 tool calls)
+- 0.6-0.8: Complex (multi-file, tests, iterations)
+- 0.8-1.0: Very Complex (architecture, significant refactor)"#,
+                task = task.description()
+            ),
+        }
     }
 
     /// Parse LLM response into Complexity struct.
@@ -164,13 +223,44 @@ impl Agent for ComplexityEstimator {
         // Use a fast, cheap model for complexity estimation
         let model = "openai/gpt-4.1-mini";
         
-        match ctx.llm.chat_completion(model, &messages, None).await {
+        let pricing = ctx.pricing.get_pricing(model).await;
+        let options = ChatOptions {
+            temperature: Some(0.0),
+            top_p: None,
+            max_tokens: Some(400),
+        };
+
+        match ctx
+            .llm
+            .chat_completion_with_options(model, &messages, None, options)
+            .await
+        {
             Ok(response) => {
                 let content = response.content.unwrap_or_default();
-                let complexity = self.parse_response(&content);
+                let parsed = self.parse_response(&content);
+
+                // Apply calibrated adjustments (pure post-processing).
+                let adjusted_tokens = ((parsed.estimated_tokens() as f64) * self.token_multiplier)
+                    .round()
+                    .max(1.0) as u64;
+                let should_split = parsed.score() > self.split_threshold;
+                let complexity = Complexity::new(parsed.score(), parsed.reasoning(), adjusted_tokens)
+                    .with_split(should_split);
                 
-                // Estimate cost (rough: ~1000 tokens for this request)
-                let cost_cents = 1; // Very cheap operation
+                // Record analysis on the task
+                {
+                    let a = task.analysis_mut();
+                    a.complexity_score = Some(complexity.score());
+                    a.complexity_reasoning = Some(complexity.reasoning().to_string());
+                    a.should_split = Some(complexity.should_split());
+                    a.estimated_total_tokens = Some(complexity.estimated_tokens());
+                }
+
+                // Compute cost (if usage + pricing available)
+                let cost_cents = match (&response.usage, &pricing) {
+                    (Some(u), Some(p)) => p.calculate_cost_cents(u.prompt_tokens, u.completion_tokens),
+                    _ => 1, // fallback tiny cost
+                };
                 
                 AgentResult::success(
                     format!(
@@ -186,6 +276,11 @@ impl Agent for ComplexityEstimator {
                     "reasoning": complexity.reasoning(),
                     "should_split": complexity.should_split(),
                     "estimated_tokens": complexity.estimated_tokens(),
+                    "usage": response.usage.as_ref().map(|u| json!({
+                        "prompt_tokens": u.prompt_tokens,
+                        "completion_tokens": u.completion_tokens,
+                        "total_tokens": u.total_tokens
+                    })),
                 }))
             }
             Err(e) => {

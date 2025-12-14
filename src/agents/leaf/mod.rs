@@ -11,7 +11,7 @@ mod model_select;
 mod executor;
 mod verifier;
 
-pub use complexity::ComplexityEstimator;
+pub use complexity::{ComplexityEstimator, ComplexityPromptVariant};
 pub use model_select::ModelSelector;
 pub use executor::TaskExecutor;
 pub use verifier::Verifier;

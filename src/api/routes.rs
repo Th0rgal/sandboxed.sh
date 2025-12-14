@@ -19,7 +19,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::agents::{Agent, AgentContext, AgentRef};
+use crate::agents::{AgentContext, AgentRef, TuningParams};
 use crate::agents::orchestrator::RootAgent;
 use crate::budget::ModelPricing;
 use crate::config::Config;
@@ -34,34 +34,20 @@ pub struct AppState {
     pub tasks: RwLock<HashMap<Uuid, TaskState>>,
     /// The hierarchical root agent
     pub root_agent: AgentRef,
-    /// Shared context for agent execution
-    pub agent_context: AgentContext,
 }
 
 /// Start the HTTP server.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
+    // Load empirically tuned parameters (if present in workspace)
+    let tuning = TuningParams::load_from_workspace(&config.workspace_path).await;
+
     // Create the root agent (hierarchical)
-    let root_agent: AgentRef = Arc::new(RootAgent::new());
-    
-    // Create shared agent context
-    let llm = Arc::new(OpenRouterClient::new(config.api_key.clone()));
-    let tools = ToolRegistry::new();
-    let pricing = Arc::new(ModelPricing::new());
-    let workspace = config.workspace_path.clone();
-    
-    let agent_context = AgentContext::new(
-        config.clone(),
-        llm,
-        tools,
-        pricing,
-        workspace,
-    );
+    let root_agent: AgentRef = Arc::new(RootAgent::new_with_tuning(&tuning));
     
     let state = Arc::new(AppState {
         config: config.clone(),
         tasks: RwLock::new(HashMap::new()),
         root_agent,
-        agent_context,
     });
 
     let app = Router::new()
