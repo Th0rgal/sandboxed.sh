@@ -154,6 +154,123 @@ pub struct ContextPack {
     pub query: String,
 }
 
+/// Task outcome record for learning from execution history.
+/// 
+/// Captures predictions vs actuals to enable data-driven optimization
+/// of complexity estimation, model selection, and budget allocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbTaskOutcome {
+    pub id: Option<Uuid>,
+    pub run_id: Uuid,
+    pub task_id: Uuid,
+    
+    // Predictions (what we estimated before execution)
+    pub predicted_complexity: Option<f64>,
+    pub predicted_tokens: Option<i64>,
+    pub predicted_cost_cents: Option<i64>,
+    pub selected_model: Option<String>,
+    
+    // Actuals (what happened during execution)
+    pub actual_tokens: Option<i64>,
+    pub actual_cost_cents: Option<i64>,
+    pub success: bool,
+    pub iterations: Option<i32>,
+    pub tool_calls_count: Option<i32>,
+    
+    // Metadata for similarity search
+    pub task_description: String,
+    /// Category of task (inferred or explicit)
+    pub task_type: Option<String>,
+    
+    // Computed ratios for quick stats
+    pub cost_error_ratio: Option<f64>,
+    pub token_error_ratio: Option<f64>,
+    
+    pub created_at: Option<String>,
+}
+
+impl DbTaskOutcome {
+    /// Create a new outcome from predictions and actuals.
+    pub fn new(
+        run_id: Uuid,
+        task_id: Uuid,
+        task_description: String,
+        predicted_complexity: Option<f64>,
+        predicted_tokens: Option<i64>,
+        predicted_cost_cents: Option<i64>,
+        selected_model: Option<String>,
+        actual_tokens: Option<i64>,
+        actual_cost_cents: Option<i64>,
+        success: bool,
+        iterations: Option<i32>,
+        tool_calls_count: Option<i32>,
+    ) -> Self {
+        // Compute error ratios
+        let cost_error_ratio = match (actual_cost_cents, predicted_cost_cents) {
+            (Some(actual), Some(predicted)) if predicted > 0 => {
+                Some(actual as f64 / predicted as f64)
+            }
+            _ => None,
+        };
+        
+        let token_error_ratio = match (actual_tokens, predicted_tokens) {
+            (Some(actual), Some(predicted)) if predicted > 0 => {
+                Some(actual as f64 / predicted as f64)
+            }
+            _ => None,
+        };
+        
+        Self {
+            id: None,
+            run_id,
+            task_id,
+            predicted_complexity,
+            predicted_tokens,
+            predicted_cost_cents,
+            selected_model,
+            actual_tokens,
+            actual_cost_cents,
+            success,
+            iterations,
+            tool_calls_count,
+            task_description,
+            task_type: None,
+            cost_error_ratio,
+            token_error_ratio,
+            created_at: None,
+        }
+    }
+}
+
+/// Model performance statistics from historical data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelStats {
+    pub model_id: String,
+    /// Success rate (0-1)
+    pub success_rate: f64,
+    /// Average cost vs predicted (1.0 = accurate, >1 = underestimated)
+    pub avg_cost_ratio: f64,
+    /// Average tokens vs predicted
+    pub avg_token_ratio: f64,
+    /// Average iterations needed
+    pub avg_iterations: f64,
+    /// Number of samples
+    pub sample_count: i64,
+}
+
+/// Historical context for a task (similar past tasks).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoricalContext {
+    /// Similar past task outcomes
+    pub similar_outcomes: Vec<DbTaskOutcome>,
+    /// Average cost adjustment multiplier
+    pub avg_cost_multiplier: f64,
+    /// Average token adjustment multiplier
+    pub avg_token_multiplier: f64,
+    /// Success rate for similar tasks
+    pub similar_success_rate: f64,
+}
+
 impl ContextPack {
     /// Format as a string for prompt injection.
     pub fn format_for_prompt(&self) -> String {

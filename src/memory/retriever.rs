@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use super::supabase::SupabaseClient;
 use super::embed::EmbeddingClient;
-use super::types::{SearchResult, ContextPack};
+use super::types::{SearchResult, ContextPack, DbTaskOutcome, ModelStats, HistoricalContext};
 
 /// Default similarity threshold for vector search.
 const DEFAULT_THRESHOLD: f64 = 0.5;
@@ -229,6 +229,82 @@ Only return the JSON array, nothing else."#,
     /// List runs.
     pub async fn list_runs(&self, limit: usize, offset: usize) -> anyhow::Result<Vec<super::types::DbRun>> {
         self.supabase.list_runs(limit, offset).await
+    }
+    
+    // ==================== Learning Methods ====================
+    
+    /// Get model performance statistics for a given complexity range.
+    /// 
+    /// Returns historical success rates, cost ratios, etc. for each model
+    /// that has been used at the given complexity level.
+    pub async fn get_model_stats(
+        &self,
+        complexity: f64,
+        range: f64,
+    ) -> anyhow::Result<Vec<ModelStats>> {
+        let min = (complexity - range).max(0.0);
+        let max = (complexity + range).min(1.0);
+        self.supabase.get_model_stats(min, max).await
+    }
+    
+    /// Find similar past tasks and their outcomes.
+    /// 
+    /// Uses embedding similarity to find tasks that are semantically similar
+    /// to the given task description, then returns their execution outcomes.
+    pub async fn find_similar_tasks(
+        &self,
+        task_description: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DbTaskOutcome>> {
+        // Generate embedding for the task description
+        let embedding = self.embedder.embed(task_description).await?;
+        
+        // Search for similar outcomes
+        self.supabase.search_similar_outcomes(&embedding, 0.6, limit).await
+    }
+    
+    /// Get historical context for a task.
+    /// 
+    /// Returns aggregated learning data from similar past tasks including:
+    /// - Average cost adjustment multiplier
+    /// - Average token adjustment multiplier
+    /// - Success rate for similar tasks
+    pub async fn get_historical_context(
+        &self,
+        task_description: &str,
+        limit: usize,
+    ) -> anyhow::Result<Option<HistoricalContext>> {
+        let similar = self.find_similar_tasks(task_description, limit).await?;
+        
+        if similar.is_empty() {
+            return Ok(None);
+        }
+        
+        // Calculate aggregated stats
+        let total = similar.len() as f64;
+        
+        let avg_cost_multiplier = similar.iter()
+            .filter_map(|o| o.cost_error_ratio)
+            .sum::<f64>() / similar.iter().filter(|o| o.cost_error_ratio.is_some()).count().max(1) as f64;
+        
+        let avg_token_multiplier = similar.iter()
+            .filter_map(|o| o.token_error_ratio)
+            .sum::<f64>() / similar.iter().filter(|o| o.token_error_ratio.is_some()).count().max(1) as f64;
+        
+        let success_count = similar.iter().filter(|o| o.success).count() as f64;
+        let similar_success_rate = success_count / total;
+        
+        Ok(Some(HistoricalContext {
+            similar_outcomes: similar,
+            avg_cost_multiplier: if avg_cost_multiplier.is_nan() { 1.0 } else { avg_cost_multiplier },
+            avg_token_multiplier: if avg_token_multiplier.is_nan() { 1.0 } else { avg_token_multiplier },
+            similar_success_rate,
+        }))
+    }
+    
+    /// Get global learning statistics.
+    pub async fn get_learning_stats(&self) -> anyhow::Result<serde_json::Value> {
+        self.supabase.get_global_stats().await
     }
 }
 

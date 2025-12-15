@@ -3,7 +3,7 @@
 use reqwest::Client;
 use uuid::Uuid;
 
-use super::types::{DbRun, DbTask, DbEvent, DbChunk, SearchResult};
+use super::types::{DbRun, DbTask, DbEvent, DbChunk, DbTaskOutcome, SearchResult, ModelStats};
 
 /// Supabase client for database and storage operations.
 pub struct SupabaseClient {
@@ -356,6 +356,157 @@ impl SupabaseClient {
         });
         
         self.update_run(run_id, body).await
+    }
+    
+    // ==================== Task Outcomes (Learning) ====================
+    
+    /// Insert a task outcome for learning.
+    pub async fn insert_task_outcome(
+        &self,
+        outcome: &DbTaskOutcome,
+        embedding: Option<&[f32]>,
+    ) -> anyhow::Result<Uuid> {
+        let embedding_str = embedding.map(|e| format!(
+            "[{}]",
+            e.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
+        ));
+        
+        let body = serde_json::json!({
+            "run_id": outcome.run_id,
+            "task_id": outcome.task_id,
+            "predicted_complexity": outcome.predicted_complexity,
+            "predicted_tokens": outcome.predicted_tokens,
+            "predicted_cost_cents": outcome.predicted_cost_cents,
+            "selected_model": outcome.selected_model,
+            "actual_tokens": outcome.actual_tokens,
+            "actual_cost_cents": outcome.actual_cost_cents,
+            "success": outcome.success,
+            "iterations": outcome.iterations,
+            "tool_calls_count": outcome.tool_calls_count,
+            "task_description": outcome.task_description,
+            "task_type": outcome.task_type,
+            "cost_error_ratio": outcome.cost_error_ratio,
+            "token_error_ratio": outcome.token_error_ratio,
+            "task_embedding": embedding_str
+        });
+        
+        let resp = self.client
+            .post(format!("{}/task_outcomes", self.rest_url()))
+            .header("apikey", &self.service_role_key)
+            .header("Authorization", format!("Bearer {}", self.service_role_key))
+            .header("Content-Type", "application/json")
+            .header("Prefer", "return=representation")
+            .json(&body)
+            .send()
+            .await?;
+        
+        let status = resp.status();
+        let text = resp.text().await?;
+        
+        if !status.is_success() {
+            anyhow::bail!("Failed to insert task outcome: {} - {}", status, text);
+        }
+        
+        let outcomes: Vec<DbTaskOutcome> = serde_json::from_str(&text)?;
+        outcomes.into_iter().next()
+            .and_then(|o| o.id)
+            .ok_or_else(|| anyhow::anyhow!("No outcome ID returned"))
+    }
+    
+    /// Get model statistics for a complexity range.
+    /// 
+    /// Returns aggregated stats for each model that has been used
+    /// for tasks in the given complexity range.
+    pub async fn get_model_stats(
+        &self,
+        complexity_min: f64,
+        complexity_max: f64,
+    ) -> anyhow::Result<Vec<ModelStats>> {
+        let body = serde_json::json!({
+            "complexity_min": complexity_min,
+            "complexity_max": complexity_max
+        });
+        
+        let resp = self.client
+            .post(format!("{}/rpc/get_model_stats", self.rest_url()))
+            .header("apikey", &self.service_role_key)
+            .header("Authorization", format!("Bearer {}", self.service_role_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        
+        let status = resp.status();
+        let text = resp.text().await?;
+        
+        if !status.is_success() {
+            // If RPC doesn't exist yet, return empty
+            tracing::debug!("get_model_stats RPC not available: {}", text);
+            return Ok(vec![]);
+        }
+        
+        Ok(serde_json::from_str(&text).unwrap_or_default())
+    }
+    
+    /// Search for similar task outcomes by embedding similarity.
+    pub async fn search_similar_outcomes(
+        &self,
+        embedding: &[f32],
+        threshold: f64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DbTaskOutcome>> {
+        let embedding_str = format!(
+            "[{}]",
+            embedding.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
+        );
+        
+        let body = serde_json::json!({
+            "query_embedding": embedding_str,
+            "match_threshold": threshold,
+            "match_count": limit
+        });
+        
+        let resp = self.client
+            .post(format!("{}/rpc/search_similar_outcomes", self.rest_url()))
+            .header("apikey", &self.service_role_key)
+            .header("Authorization", format!("Bearer {}", self.service_role_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        
+        let status = resp.status();
+        let text = resp.text().await?;
+        
+        if !status.is_success() {
+            // If RPC doesn't exist yet, return empty
+            tracing::debug!("search_similar_outcomes RPC not available: {}", text);
+            return Ok(vec![]);
+        }
+        
+        Ok(serde_json::from_str(&text).unwrap_or_default())
+    }
+    
+    /// Get global learning statistics (for tuning).
+    pub async fn get_global_stats(&self) -> anyhow::Result<serde_json::Value> {
+        let resp = self.client
+            .post(format!("{}/rpc/get_global_learning_stats", self.rest_url()))
+            .header("apikey", &self.service_role_key)
+            .header("Authorization", format!("Bearer {}", self.service_role_key))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        
+        let status = resp.status();
+        let text = resp.text().await?;
+        
+        if !status.is_success() {
+            tracing::debug!("get_global_learning_stats RPC not available: {}", text);
+            return Ok(serde_json::json!({}));
+        }
+        
+        Ok(serde_json::from_str(&text).unwrap_or_default())
     }
 }
 

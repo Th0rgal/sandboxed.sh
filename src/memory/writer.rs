@@ -7,7 +7,7 @@ use serde_json::json;
 
 use super::supabase::SupabaseClient;
 use super::embed::EmbeddingClient;
-use super::types::{DbTask, DbEvent, DbChunk, EventKind, MemoryStatus};
+use super::types::{DbTask, DbEvent, DbChunk, DbTaskOutcome, EventKind, MemoryStatus};
 
 /// Maximum chunk size in characters.
 const MAX_CHUNK_SIZE: usize = 2000;
@@ -239,6 +239,47 @@ impl MemoryWriter {
     pub async fn store_run_summary(&self, run_id: Uuid, summary: &str) -> anyhow::Result<()> {
         let embedding = self.embedder.embed(summary).await?;
         self.supabase.update_run_summary(run_id, summary, &embedding).await
+    }
+    
+    /// Record a task outcome for learning.
+    /// 
+    /// This captures predictions vs actuals to enable data-driven optimization
+    /// of complexity estimation, model selection, and budget allocation.
+    pub async fn record_task_outcome(
+        &self,
+        run_id: Uuid,
+        task_id: Uuid,
+        task_description: &str,
+        predicted_complexity: Option<f64>,
+        predicted_tokens: Option<i64>,
+        predicted_cost_cents: Option<i64>,
+        selected_model: Option<String>,
+        actual_tokens: Option<i64>,
+        actual_cost_cents: Option<i64>,
+        success: bool,
+        iterations: Option<i32>,
+        tool_calls_count: Option<i32>,
+    ) -> anyhow::Result<Uuid> {
+        // Create the outcome record
+        let outcome = DbTaskOutcome::new(
+            run_id,
+            task_id,
+            task_description.to_string(),
+            predicted_complexity,
+            predicted_tokens,
+            predicted_cost_cents,
+            selected_model,
+            actual_tokens,
+            actual_cost_cents,
+            success,
+            iterations,
+            tool_calls_count,
+        );
+        
+        // Generate embedding for similarity search
+        let embedding = self.embedder.embed(task_description).await.ok();
+        
+        self.supabase.insert_task_outcome(&outcome, embedding.as_deref()).await
     }
     
     /// Split text into chunks.
