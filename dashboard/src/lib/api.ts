@@ -1,6 +1,12 @@
 import { authHeader, clearJwt, signalAuthRequired } from './auth';
+import { getRuntimeApiBase, getRuntimeTaskDefaults } from './settings';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:3000';
+function apiUrl(pathOrUrl: string): string {
+  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
+  const base = getRuntimeApiBase();
+  const path = pathOrUrl.startsWith('/') ? pathOrUrl : `/${pathOrUrl}`;
+  return `${base}${path}`;
+}
 
 export interface TaskState {
   id: string;
@@ -45,7 +51,7 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
     ...authHeader(),
   };
 
-  const res = await fetch(path, { ...init, headers });
+  const res = await fetch(apiUrl(path), { ...init, headers });
   if (res.status === 401) {
     clearJwt();
     signalAuthRequired();
@@ -72,13 +78,13 @@ export interface Run {
 
 // Health check
 export async function getHealth(): Promise<HealthResponse> {
-  const res = await fetch(`${API_BASE}/api/health`);
+  const res = await fetch(apiUrl('/api/health'));
   if (!res.ok) throw new Error('Failed to fetch health');
   return res.json();
 }
 
 export async function login(password: string): Promise<LoginResponse> {
-  const res = await fetch(`${API_BASE}/api/auth/login`, {
+  const res = await fetch(apiUrl('/api/auth/login'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ password }),
@@ -89,31 +95,36 @@ export async function login(password: string): Promise<LoginResponse> {
 
 // Get statistics
 export async function getStats(): Promise<StatsResponse> {
-  const res = await apiFetch(`${API_BASE}/api/stats`);
+  const res = await apiFetch('/api/stats');
   if (!res.ok) throw new Error('Failed to fetch stats');
   return res.json();
 }
 
 // List all tasks
 export async function listTasks(): Promise<TaskState[]> {
-  const res = await apiFetch(`${API_BASE}/api/tasks`);
+  const res = await apiFetch('/api/tasks');
   if (!res.ok) throw new Error('Failed to fetch tasks');
   return res.json();
 }
 
 // Get a specific task
 export async function getTask(id: string): Promise<TaskState> {
-  const res = await apiFetch(`${API_BASE}/api/task/${id}`);
+  const res = await apiFetch(`/api/task/${id}`);
   if (!res.ok) throw new Error('Failed to fetch task');
   return res.json();
 }
 
 // Create a new task
 export async function createTask(request: CreateTaskRequest): Promise<{ id: string; status: string }> {
-  const res = await apiFetch(`${API_BASE}/api/task`, {
+  const defaults = getRuntimeTaskDefaults();
+  const merged: CreateTaskRequest = {
+    ...defaults,
+    ...request,
+  };
+  const res = await apiFetch('/api/task', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
+    body: JSON.stringify(merged),
   });
   if (!res.ok) throw new Error('Failed to create task');
   return res.json();
@@ -121,7 +132,7 @@ export async function createTask(request: CreateTaskRequest): Promise<{ id: stri
 
 // Stop a task
 export async function stopTask(id: string): Promise<void> {
-  const res = await apiFetch(`${API_BASE}/api/task/${id}/stop`, {
+  const res = await apiFetch(`/api/task/${id}/stop`, {
     method: 'POST',
   });
   if (!res.ok) throw new Error('Failed to stop task');
@@ -136,7 +147,7 @@ export function streamTask(id: string, onEvent: (event: { type: string; data: un
 
   void (async () => {
     try {
-      const res = await apiFetch(`${API_BASE}/api/task/${id}/stream`, {
+      const res = await apiFetch(`/api/task/${id}/stream`, {
         method: 'GET',
         headers: { Accept: 'text/event-stream' },
         signal: controller.signal,
@@ -204,21 +215,21 @@ export function streamTask(id: string, onEvent: (event: { type: string; data: un
 
 // List runs
 export async function listRuns(limit = 20, offset = 0): Promise<{ runs: Run[]; limit: number; offset: number }> {
-  const res = await apiFetch(`${API_BASE}/api/runs?limit=${limit}&offset=${offset}`);
+  const res = await apiFetch(`/api/runs?limit=${limit}&offset=${offset}`);
   if (!res.ok) throw new Error('Failed to fetch runs');
   return res.json();
 }
 
 // Get run details
 export async function getRun(id: string): Promise<Run> {
-  const res = await apiFetch(`${API_BASE}/api/runs/${id}`);
+  const res = await apiFetch(`/api/runs/${id}`);
   if (!res.ok) throw new Error('Failed to fetch run');
   return res.json();
 }
 
 // Get run events
 export async function getRunEvents(id: string, limit?: number): Promise<{ run_id: string; events: unknown[] }> {
-  const url = limit ? `${API_BASE}/api/runs/${id}/events?limit=${limit}` : `${API_BASE}/api/runs/${id}/events`;
+  const url = limit ? `/api/runs/${id}/events?limit=${limit}` : `/api/runs/${id}/events`;
   const res = await apiFetch(url);
   if (!res.ok) throw new Error('Failed to fetch run events');
   return res.json();
@@ -226,7 +237,7 @@ export async function getRunEvents(id: string, limit?: number): Promise<{ run_id
 
 // Get run tasks
 export async function getRunTasks(id: string): Promise<{ run_id: string; tasks: unknown[] }> {
-  const res = await apiFetch(`${API_BASE}/api/runs/${id}/tasks`);
+  const res = await apiFetch(`/api/runs/${id}/tasks`);
   if (!res.ok) throw new Error('Failed to fetch run tasks');
   return res.json();
 }

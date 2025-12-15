@@ -79,7 +79,59 @@ export default function ControlClient() {
         logs: task.log,
       };
       setMessages([userMessage, assistantMessage]);
-      setCurrentTaskId(task.status === 'running' ? taskId : null);
+      const shouldStream = task.status === 'running' || task.status === 'pending';
+      setCurrentTaskId(shouldStream ? taskId : null);
+
+      // If the task is still running, attach streaming so the UI keeps updating (and Stop button is visible).
+      if (shouldStream) {
+        setIsLoading(true);
+        streamCleanupRef.current?.();
+
+        const cleanup = streamTask(taskId, (event) => {
+          if (event.type === 'log') {
+            const logEntry = event.data as TaskLogEntry;
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === `assistant-${taskId}` ? { ...m, logs: [...(m.logs || []), logEntry] } : m
+              )
+            );
+          } else if (event.type === 'done') {
+            const doneData = event.data as { status: string; result: string | null };
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === `assistant-${taskId}`
+                  ? {
+                      ...m,
+                      content: doneData.result || 'Task completed',
+                      status: doneData.status as Message['status'],
+                    }
+                  : m
+              )
+            );
+            setCurrentTaskId(null);
+            setIsLoading(false);
+            streamCleanupRef.current = null;
+          } else if (event.type === 'error') {
+            const err = event.data as { message?: string; status?: number };
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === `assistant-${taskId}`
+                  ? { ...m, content: err?.message || 'Streaming failed', status: 'failed' }
+                  : m
+              )
+            );
+            setCurrentTaskId(null);
+            setIsLoading(false);
+            streamCleanupRef.current = null;
+          }
+        });
+
+        streamCleanupRef.current = cleanup;
+      } else {
+        setIsLoading(false);
+        streamCleanupRef.current?.();
+        streamCleanupRef.current = null;
+      }
     } catch (error) {
       console.error('Failed to load task:', error);
     }
@@ -192,15 +244,17 @@ export default function ControlClient() {
 
   const handleStop = async () => {
     if (!currentTaskId) return;
+    const taskId = currentTaskId;
     try {
-      // Stop streaming locally immediately.
+      // Do NOT disconnect the stream until we know the stop request succeeded.
+      await stopTask(taskId);
+
+      // Now stop streaming locally.
       streamCleanupRef.current?.();
       streamCleanupRef.current = null;
-
-      await stopTask(currentTaskId);
       setMessages((prev) =>
         prev.map((m) =>
-          m.id === `assistant-${currentTaskId}`
+          m.id === `assistant-${taskId}`
             ? { ...m, status: 'cancelled' as const, content: 'Task was cancelled' }
             : m
         )
@@ -209,6 +263,15 @@ export default function ControlClient() {
       setIsLoading(false);
     } catch (error) {
       console.error('Failed to stop task:', error);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `stop-error-${Date.now()}`,
+          role: 'system',
+          content: 'Failed to stop task. The stream is still connected; try again.',
+          timestamp: new Date(),
+        },
+      ]);
     }
   };
 

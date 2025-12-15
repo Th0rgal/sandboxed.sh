@@ -6,8 +6,7 @@ import { FitAddon } from 'xterm-addon-fit';
 import 'xterm/css/xterm.css';
 
 import { authHeader, getValidJwt } from '@/lib/auth';
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:3000';
+import { getRuntimeApiBase } from '@/lib/settings';
 
 type FsEntry = {
   name: string;
@@ -31,6 +30,7 @@ function formatBytes(n: number) {
 }
 
 async function listDir(path: string): Promise<FsEntry[]> {
+  const API_BASE = getRuntimeApiBase();
   const res = await fetch(`${API_BASE}/api/fs/list?path=${encodeURIComponent(path)}`, {
     headers: { ...authHeader() },
   });
@@ -39,6 +39,7 @@ async function listDir(path: string): Promise<FsEntry[]> {
 }
 
 async function mkdir(path: string): Promise<void> {
+  const API_BASE = getRuntimeApiBase();
   const res = await fetch(`${API_BASE}/api/fs/mkdir`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeader() },
@@ -48,6 +49,7 @@ async function mkdir(path: string): Promise<void> {
 }
 
 async function rm(path: string, recursive = false): Promise<void> {
+  const API_BASE = getRuntimeApiBase();
   const res = await fetch(`${API_BASE}/api/fs/rm`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeader() },
@@ -57,6 +59,7 @@ async function rm(path: string, recursive = false): Promise<void> {
 }
 
 async function downloadFile(path: string) {
+  const API_BASE = getRuntimeApiBase();
   const res = await fetch(`${API_BASE}/api/fs/download?path=${encodeURIComponent(path)}`, {
     headers: { ...authHeader() },
   });
@@ -77,6 +80,7 @@ async function uploadFiles(dir: string, files: File[], onProgress?: (done: numbe
   let done = 0;
   for (const f of files) {
     await new Promise<void>((resolve, reject) => {
+      const API_BASE = getRuntimeApiBase();
       const form = new FormData();
       form.append('file', f, f.name);
       const xhr = new XMLHttpRequest();
@@ -200,6 +204,7 @@ export default function ConsoleClient() {
 
     const jwt = getValidJwt()?.token ?? null;
     const proto = jwt ? (['openagent', `jwt.${jwt}`] as string[]) : (['openagent'] as string[]);
+    const API_BASE = getRuntimeApiBase();
     const u = new URL(`${API_BASE}/api/console/ws`);
     u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = u.toString();

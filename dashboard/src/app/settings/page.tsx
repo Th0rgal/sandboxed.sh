@@ -3,26 +3,7 @@
 import { useState, useEffect } from 'react';
 import { getHealth, HealthResponse } from '@/lib/api';
 import { Server, Bot, Cpu, Wallet, Save } from 'lucide-react';
-
-function readSavedSettings(): Partial<{
-  apiUrl: string;
-  defaultModel: string;
-  defaultBudget: string;
-}> {
-  if (typeof window === 'undefined') return {};
-  try {
-    const raw = localStorage.getItem('settings');
-    if (!raw) return {};
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const out: Record<string, string> = {};
-    if (typeof parsed.apiUrl === 'string') out.apiUrl = parsed.apiUrl;
-    if (typeof parsed.defaultModel === 'string') out.defaultModel = parsed.defaultModel;
-    if (typeof parsed.defaultBudget === 'string') out.defaultBudget = parsed.defaultBudget;
-    return out;
-  } catch {
-    return {};
-  }
-}
+import { readSavedSettings, writeSavedSettings } from '@/lib/settings';
 
 export default function SettingsPage() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -45,11 +26,7 @@ export default function SettingsPage() {
   }, []);
 
   const handleSave = () => {
-    localStorage.setItem('settings', JSON.stringify({
-      apiUrl,
-      defaultModel,
-      defaultBudget,
-    }));
+    writeSavedSettings({ apiUrl, defaultModel, defaultBudget });
     alert('Settings saved!');
   };
 
