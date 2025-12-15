@@ -304,7 +304,7 @@ Set these on the backend:
 - `CONSOLE_SSH_HOST` (e.g. `95.216.112.253`)
 - `CONSOLE_SSH_PORT` (default `22`)
 - `CONSOLE_SSH_USER` (default `root`)
-- `CONSOLE_SSH_PRIVATE_KEY_B64` (preferred) or `CONSOLE_SSH_PRIVATE_KEY`
+- `CONSOLE_SSH_PRIVATE_KEY_PATH` (recommended), or `CONSOLE_SSH_PRIVATE_KEY_B64`, or `CONSOLE_SSH_PRIVATE_KEY`
 
 ## Dashboard package manager (Bun)
 

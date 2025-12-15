@@ -10,6 +10,7 @@
 //! - `CONSOLE_SSH_HOST` - Optional. Host for dashboard console/file explorer SSH (default: 127.0.0.1).
 //! - `CONSOLE_SSH_PORT` - Optional. SSH port (default: 22).
 //! - `CONSOLE_SSH_USER` - Optional. SSH user (default: root).
+//! - `CONSOLE_SSH_PRIVATE_KEY_PATH` - Optional. Path to an OpenSSH private key file (recommended).
 //! - `CONSOLE_SSH_PRIVATE_KEY_B64` - Optional. Base64-encoded OpenSSH private key.
 //! - `CONSOLE_SSH_PRIVATE_KEY` - Optional. Raw (multiline) OpenSSH private key (fallback).
 //! - `SUPABASE_URL` - Optional. Supabase project URL for memory storage.
@@ -284,6 +285,19 @@ fn parse_bool(value: &str) -> Result<bool, String> {
 }
 
 fn read_private_key_from_env() -> Result<Option<String>, ConfigError> {
+    // Recommended: load from file path to avoid large/multiline env values.
+    if let Ok(path) = std::env::var("CONSOLE_SSH_PRIVATE_KEY_PATH") {
+        if path.trim().is_empty() {
+            return Ok(None);
+        }
+        let s = std::fs::read_to_string(path.trim())
+            .map_err(|e| ConfigError::InvalidValue("CONSOLE_SSH_PRIVATE_KEY_PATH".to_string(), format!("{}", e)))?;
+        if s.trim().is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(s));
+    }
+
     // Prefer base64 to avoid multiline env complications.
     if let Ok(b64) = std::env::var("CONSOLE_SSH_PRIVATE_KEY_B64") {
         if b64.trim().is_empty() {
