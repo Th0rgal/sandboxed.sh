@@ -67,6 +67,7 @@ impl Tool for RunCommand {
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(60);
 
         tracing::info!("Executing command in {:?}: {}", cwd, command);
+        tracing::debug!("CWD exists: {}, is_dir: {}", cwd.exists(), cwd.is_dir());
 
         // Determine shell based on OS
         let (shell, shell_arg) = if cfg!(target_os = "windows") {
@@ -92,6 +93,16 @@ impl Tool for RunCommand {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let exit_code = output.status.code().unwrap_or(-1);
+        
+        tracing::debug!("Command exit code: {}, stdout len: {}, stderr len: {}", 
+            exit_code, stdout.len(), stderr.len());
+        if !stdout.is_empty() {
+            tracing::debug!("Command stdout (first 500 chars): {}", 
+                &stdout[..stdout.len().min(500)]);
+        }
+        if !stderr.is_empty() {
+            tracing::warn!("Command stderr: {}", &stderr[..stderr.len().min(500)]);
+        }
 
         let mut result = String::new();
 
