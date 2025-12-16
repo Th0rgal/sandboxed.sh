@@ -472,12 +472,26 @@ export default function ControlClient() {
                 <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
                   <Bot className="h-8 w-8 text-indigo-400" />
                 </div>
-                <h2 className="text-lg font-medium text-white">
-                  Start a conversation
-                </h2>
-                <p className="mt-2 text-sm text-white/40 max-w-sm">
-                  Ask the agent to do something — messages queue while it&apos;s busy
-                </p>
+                {currentMission && currentMission.status !== 'active' ? (
+                  <>
+                    <h2 className="text-lg font-medium text-white">
+                      No conversation history
+                    </h2>
+                    <p className="mt-2 text-sm text-white/40 max-w-sm">
+                      This mission was {currentMission.status} without any messages.
+                      {currentMission.status === 'completed' && ' You can reactivate it to continue.'}
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <h2 className="text-lg font-medium text-white">
+                      Start a conversation
+                    </h2>
+                    <p className="mt-2 text-sm text-white/40 max-w-sm">
+                      Ask the agent to do something — messages queue while it&apos;s busy
+                    </p>
+                  </>
+                )}
               </div>
             </div>
           ) : (

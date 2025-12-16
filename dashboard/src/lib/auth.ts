@@ -3,8 +3,9 @@ const EXP_KEY = 'openagent.jwt_exp';
 
 export function getStoredJwt(): { token: string; exp: number } | null {
   if (typeof window === 'undefined') return null;
-  const token = sessionStorage.getItem(TOKEN_KEY);
-  const expRaw = sessionStorage.getItem(EXP_KEY);
+  // Use localStorage for persistence across browser sessions
+  const token = localStorage.getItem(TOKEN_KEY);
+  const expRaw = localStorage.getItem(EXP_KEY);
   if (!token || !expRaw) return null;
   const exp = Number(expRaw);
   if (!Number.isFinite(exp)) return null;
@@ -28,14 +29,15 @@ export function getValidJwt(): { token: string; exp: number } | null {
 
 export function setJwt(token: string, exp: number): void {
   if (typeof window === 'undefined') return;
-  sessionStorage.setItem(TOKEN_KEY, token);
-  sessionStorage.setItem(EXP_KEY, String(exp));
+  // Use localStorage for persistence across browser sessions
+  localStorage.setItem(TOKEN_KEY, token);
+  localStorage.setItem(EXP_KEY, String(exp));
 }
 
 export function clearJwt(): void {
   if (typeof window === 'undefined') return;
-  sessionStorage.removeItem(TOKEN_KEY);
-  sessionStorage.removeItem(EXP_KEY);
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(EXP_KEY);
 }
 
 export function authHeader(): Record<string, string> {
