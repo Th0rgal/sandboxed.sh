@@ -31,7 +31,6 @@ import {
   ChevronDown,
   ChevronRight,
   Target,
-  Brain,
 } from 'lucide-react';
 import {
   OptionList,
