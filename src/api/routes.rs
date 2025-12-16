@@ -363,8 +363,11 @@ async fn run_agent_task(
         if let Some(data) = &result.data {
             let recorder = crate::memory::EventRecorder::new(run_id);
             
+            // RootAgent wraps executor data under "execution" field
+            let exec_data = data.get("execution").unwrap_or(data);
+            
             // Record each tool call as an event
-            if let Some(tools_used) = data.get("tools_used") {
+            if let Some(tools_used) = exec_data.get("tools_used") {
                 if let Some(arr) = tools_used.as_array() {
                     for tool_entry in arr {
                         let tool_str = tool_entry.as_str().unwrap_or("");
@@ -376,12 +379,12 @@ async fn run_agent_task(
             }
 
             // Record final response as an event
-            let prompt_tokens = data.get("usage")
+            let prompt_tokens = exec_data.get("usage")
                 .and_then(|u| u.get("prompt_tokens"))
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32)
                 .unwrap_or(0);
-            let completion_tokens = data.get("usage")
+            let completion_tokens = exec_data.get("usage")
                 .and_then(|u| u.get("completion_tokens"))
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32)
@@ -428,17 +431,21 @@ async fn run_agent_task(
     {
         let mut tasks = state.tasks.write().await;
         if let Some(task_state) = tasks.get_mut(&task_id) {
-            // Extract iterations from execution signals
+            // Extract iterations and tools from result data
+            // Note: RootAgent wraps executor data under "execution" field
             if let Some(data) = &result.data {
+                // Try to get execution data (may be nested under "execution" from RootAgent)
+                let exec_data = data.get("execution").unwrap_or(data);
+                
                 // Update iterations count from execution signals
-                if let Some(signals) = data.get("execution_signals") {
+                if let Some(signals) = exec_data.get("execution_signals") {
                     if let Some(iterations) = signals.get("iterations").and_then(|v| v.as_u64()) {
                         task_state.iterations = iterations as usize;
                     }
                 }
 
                 // Add log entries for tools used
-                if let Some(tools_used) = data.get("tools_used") {
+                if let Some(tools_used) = exec_data.get("tools_used") {
                     if let Some(arr) = tools_used.as_array() {
                         for tool in arr {
                             task_state.log.push(TaskLogEntry {
