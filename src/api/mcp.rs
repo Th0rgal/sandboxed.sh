@@ -164,6 +164,9 @@ pub async fn list_tools(
         });
     }
     
+    // Sort by name for stable ordering
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    
     Json(tools)
 }
 

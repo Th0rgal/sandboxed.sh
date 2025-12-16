@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use axum::middleware;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::{
         sse::{Event, Sse},
@@ -91,6 +91,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // WebSocket console uses subprotocol-based auth (browser can't set Authorization header)
         .route("/api/console/ws", get(console::console_ws));
 
+    // File upload route with increased body limit (10GB)
+    let upload_route = Router::new()
+        .route("/api/fs/upload", post(fs::upload))
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024 * 1024));
+
     let protected_routes = Router::new()
         .route("/api/stats", get(get_stats))
         .route("/api/task", post(create_task))
@@ -112,7 +117,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // Remote file explorer endpoints (use Authorization header)
         .route("/api/fs/list", get(fs::list))
         .route("/api/fs/download", get(fs::download))
-        .route("/api/fs/upload", post(fs::upload))
+        .merge(upload_route)
         .route("/api/fs/mkdir", post(fs::mkdir))
         .route("/api/fs/rm", post(fs::rm))
         // MCP management endpoints
