@@ -1,12 +1,25 @@
 //! Directory operation tools: list directory, search files by name.
+//!
+//! These tools have full system access - they can browse any directory on the machine.
+//! Paths can be absolute (e.g., `/var/log`) or relative to the working directory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use walkdir::WalkDir;
 
 use super::Tool;
+
+/// Resolve a path - if absolute, use as-is; if relative, join with working_dir.
+fn resolve_path(path_str: &str, working_dir: &Path) -> PathBuf {
+    let path = Path::new(path_str);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    }
+}
 
 /// List contents of a directory.
 pub struct ListDirectory;
@@ -18,7 +31,7 @@ impl Tool for ListDirectory {
     }
 
     fn description(&self) -> &str {
-        "List files and directories in a given path. Returns a tree-like view of the directory structure."
+        "List files and directories anywhere on the system. Returns a tree-like view of the directory structure."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -27,7 +40,7 @@ impl Tool for ListDirectory {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the directory to list, relative to workspace. Use '.' for workspace root."
+                    "description": "Path to the directory. Can be absolute (e.g., /var/log) or relative to working directory. Use '.' for working directory."
                 },
                 "max_depth": {
                     "type": "integer",
@@ -38,13 +51,13 @@ impl Tool for ListDirectory {
         })
     }
 
-    async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String> {
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
         let path = args["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
         let max_depth = args["max_depth"].as_u64().unwrap_or(3) as usize;
 
-        let full_path = workspace.join(path);
+        let full_path = resolve_path(path, working_dir);
 
         if !full_path.exists() {
             return Err(anyhow::anyhow!("Directory not found: {}", path));
@@ -96,7 +109,7 @@ impl Tool for SearchFiles {
     }
 
     fn description(&self) -> &str {
-        "Search for files by name pattern (glob-style). Returns matching file paths."
+        "Search for files by name pattern (glob-style) anywhere on the system. Returns matching file paths."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -109,20 +122,20 @@ impl Tool for SearchFiles {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in, relative to workspace. Defaults to workspace root."
+                    "description": "Directory to search in. Can be absolute (e.g., /home) or relative to working directory. Defaults to working directory."
                 }
             },
             "required": ["pattern"]
         })
     }
 
-    async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String> {
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
         let pattern = args["pattern"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' argument"))?;
         let path = args["path"].as_str().unwrap_or(".");
 
-        let full_path = workspace.join(path);
+        let full_path = resolve_path(path, working_dir);
 
         if !full_path.exists() {
             return Err(anyhow::anyhow!("Directory not found: {}", path));
@@ -153,11 +166,8 @@ impl Tool for SearchFiles {
             };
 
             if matched {
-                let relative = entry
-                    .path()
-                    .strip_prefix(workspace)
-                    .unwrap_or(entry.path());
-                matches.push(relative.to_string_lossy().to_string());
+                // Show absolute path for system-wide clarity
+                matches.push(entry.path().to_string_lossy().to_string());
             }
 
             // Limit results

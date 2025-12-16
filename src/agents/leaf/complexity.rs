@@ -203,10 +203,6 @@ impl Agent for ComplexityEstimator {
     /// # Returns
     /// AgentResult with Complexity data in the `data` field.
     async fn execute(&self, task: &mut Task, ctx: &AgentContext) -> AgentResult {
-        if ctx.is_cancelled() {
-            return AgentResult::failure("Cancelled", 0);
-        }
-
         let prompt = self.build_prompt(task);
         
         let messages = vec![
@@ -225,7 +221,7 @@ impl Agent for ComplexityEstimator {
         ];
 
         // Use a fast, cheap model for complexity estimation
-        let model = "anthropic/claude-sonnet-4.5";
+        let model = "openai/gpt-4.1-mini";
         
         let pricing = ctx.pricing.get_pricing(model).await;
         let options = ChatOptions {

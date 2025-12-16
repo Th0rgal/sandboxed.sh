@@ -266,10 +266,6 @@ impl Agent for ModelSelector {
     /// # Returns
     /// AgentResult with ModelRecommendation in the `data` field.
     async fn execute(&self, task: &mut Task, ctx: &AgentContext) -> AgentResult {
-        if ctx.is_cancelled() {
-            return AgentResult::failure("Cancelled", 0);
-        }
-
         // Get complexity + estimated tokens from task analysis (populated by ComplexityEstimator).
         let complexity = task
             .analysis()
@@ -281,8 +277,8 @@ impl Agent for ModelSelector {
         // Get available budget
         let budget_cents = task.budget().remaining_cents();
         
-        // Fetch pricing for models that support tool calling
-        let models = ctx.pricing.models_by_cost_filtered(true).await;
+        // Fetch pricing for all models
+        let models = ctx.pricing.models_by_cost().await;
         
         if models.is_empty() {
             // Use hardcoded defaults if no pricing available
@@ -291,11 +287,11 @@ impl Agent for ModelSelector {
                 0,
             )
             .with_data(json!({
-                "model_id": "anthropic/claude-sonnet-4.5",
+                "model_id": "openai/gpt-4.1-mini",
                 "expected_cost_cents": 10,
                 "confidence": 0.5,
                 "reasoning": "Fallback to default model",
-                "fallbacks": ["anthropic/claude-sonnet-4", "anthropic/claude-3.5-haiku"],
+                "fallbacks": ["openai/gpt-4o-mini", "anthropic/claude-3-haiku"],
             }));
         }
 

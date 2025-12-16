@@ -93,10 +93,6 @@ impl Agent for NodeAgent {
     async fn execute(&self, task: &mut Task, ctx: &AgentContext) -> AgentResult {
         tracing::debug!("NodeAgent '{}' executing task", self.name);
 
-        if ctx.is_cancelled() {
-            return AgentResult::failure("Cancelled", 0);
-        }
-
         // Execute the task
         let result = self.task_executor.execute(task, ctx).await;
 

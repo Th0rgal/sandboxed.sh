@@ -22,15 +22,15 @@ import { Check } from "lucide-react";
 function parseSelectionToIdSet(
   value: OptionListSelection | undefined,
   mode: "multi" | "single",
-  maxSelections?: number,
+  maxSelections?: number
 ): Set<string> {
   if (mode === "single") {
     const single =
       typeof value === "string"
         ? value
         : Array.isArray(value)
-          ? value[0]
-          : null;
+        ? value[0]
+        : null;
     return single ? new Set([single]) : new Set();
   }
 
@@ -42,7 +42,7 @@ function parseSelectionToIdSet(
 
 function convertIdSetToSelection(
   selected: Set<string>,
-  mode: "multi" | "single",
+  mode: "multi" | "single"
 ): OptionListSelection {
   if (mode === "single") {
     const [first] = selected;
@@ -79,7 +79,7 @@ function SelectionIndicator({
         shape,
         isSelected && "border-primary bg-primary text-primary-foreground",
         !isSelected && "border-muted-foreground/50",
-        disabled && "opacity-50",
+        disabled && "opacity-50"
       )}
     >
       {mode === "multi" && isSelected && <Check className="size-3" />}
@@ -133,12 +133,12 @@ function OptionItem({
         "peer group relative h-auto min-h-[50px] w-full justify-start text-left text-sm font-medium",
         "rounded-none border-0 bg-transparent px-0 py-2 text-base shadow-none transition-none hover:bg-transparent! @md/option-list:text-sm",
         isFirst && "pb-2.5",
-        hasAdjacentOptions && "py-2.5",
+        hasAdjacentOptions && "py-2.5"
       )}
     >
       <span
         className={cn(
-          "bg-primary/5 absolute inset-0 -mx-3 -my-0.5 rounded-xl opacity-0 group-hover:opacity-100",
+          "bg-primary/5 absolute inset-0 -mx-3 -my-0.5 rounded-xl opacity-0 group-hover:opacity-100"
         )}
       />
       <div className="relative flex items-start gap-3">
@@ -185,7 +185,7 @@ function OptionListConfirmation({
       className={cn(
         "@container/option-list flex w-full max-w-md min-w-80 flex-col",
         "text-foreground",
-        className,
+        className
       )}
       data-slot="option-list"
       data-tool-ui-id={id}
@@ -195,7 +195,7 @@ function OptionListConfirmation({
     >
       <div
         className={cn(
-          "bg-card/60 flex w-full flex-col overflow-hidden rounded-2xl border px-5 py-2.5 shadow-xs",
+          "bg-card/60 flex w-full flex-col overflow-hidden rounded-2xl border px-5 py-2.5 shadow-xs"
         )}
       >
         {confirmedOptions.map((option, index) => (
@@ -246,12 +246,12 @@ export function OptionList({
   if (process.env["NODE_ENV"] !== "production") {
     if (value !== undefined && defaultValue !== undefined) {
       console.warn(
-        "[OptionList] Both `value` (controlled) and `defaultValue` (uncontrolled) were provided. `defaultValue` is ignored when `value` is set.",
+        "[OptionList] Both `value` (controlled) and `defaultValue` (uncontrolled) were provided. `defaultValue` is ignored when `value` is set."
       );
     }
     if (value !== undefined && !onChange) {
       console.warn(
-        "[OptionList] `value` was provided without `onChange`. This makes OptionList controlled; selection will not update unless the parent updates `value`.",
+        "[OptionList] `value` was provided without `onChange`. This makes OptionList controlled; selection will not update unless the parent updates `value`."
       );
     }
   }
@@ -260,20 +260,15 @@ export function OptionList({
 
   const [uncontrolledSelected, setUncontrolledSelected] = useState<Set<string>>(
     () =>
-      parseSelectionToIdSet(
-        defaultValue,
-        selectionMode,
-        effectiveMaxSelections,
-      ),
+      parseSelectionToIdSet(defaultValue, selectionMode, effectiveMaxSelections)
   );
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setUncontrolledSelected((prev) => {
       const normalized = parseSelectionToIdSet(
         Array.from(prev),
         selectionMode,
-        effectiveMaxSelections,
+        effectiveMaxSelections
       );
       return areSetsEqual(prev, normalized) ? prev : normalized;
     });
@@ -284,7 +279,7 @@ export function OptionList({
       value !== undefined
         ? parseSelectionToIdSet(value, selectionMode, effectiveMaxSelections)
         : uncontrolledSelected,
-    [value, uncontrolledSelected, selectionMode, effectiveMaxSelections],
+    [value, uncontrolledSelected, selectionMode, effectiveMaxSelections]
   );
 
   const selectedCount = selectedIds.size;
@@ -312,7 +307,7 @@ export function OptionList({
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [activeIndex, setActiveIndex] = useState(() => {
     const firstSelected = optionStates.findIndex(
-      (s) => s.isSelected && !s.isDisabled,
+      (s) => s.isSelected && !s.isDisabled
     );
     if (firstSelected >= 0) return firstSelected;
     const firstEnabled = optionStates.findIndex((s) => !s.isDisabled);
@@ -321,7 +316,6 @@ export function OptionList({
 
   useEffect(() => {
     if (optionStates.length === 0) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setActiveIndex((prev) => {
       if (
         prev < 0 ||
@@ -340,7 +334,7 @@ export function OptionList({
       const normalizedNext = parseSelectionToIdSet(
         Array.from(next),
         selectionMode,
-        effectiveMaxSelections,
+        effectiveMaxSelections
       );
 
       if (value === undefined) {
@@ -357,7 +351,7 @@ export function OptionList({
       uncontrolledSelected,
       value,
       onChange,
-    ],
+    ]
   );
 
   const toggleSelection = useCallback(
@@ -385,7 +379,7 @@ export function OptionList({
 
       updateSelection(next);
     },
-    [effectiveMaxSelections, selectedIds, selectionMode, updateSelection],
+    [effectiveMaxSelections, selectedIds, selectionMode, updateSelection]
   );
 
   const handleConfirm = useCallback(async () => {
@@ -414,7 +408,7 @@ export function OptionList({
         handleCancel();
       }
     },
-    [handleConfirm, handleCancel, hasCustomResponseActions, onResponseAction],
+    [handleConfirm, handleCancel, hasCustomResponseActions, onResponseAction]
   );
 
   const normalizedFooterActions = useMemo(() => {
@@ -461,7 +455,7 @@ export function OptionList({
       }
       return start;
     },
-    [optionStates],
+    [optionStates]
   );
 
   const handleListboxKeyDown = useCallback(
@@ -525,7 +519,7 @@ export function OptionList({
       hasNothingToClear,
       optionStates,
       toggleSelection,
-    ],
+    ]
   );
 
   const actionsWithDisabledState = useMemo((): Action[] => {
@@ -569,7 +563,7 @@ export function OptionList({
       className={cn(
         "@container/option-list flex w-full max-w-md min-w-80 flex-col gap-3",
         "text-foreground",
-        className,
+        className
       )}
       data-slot="option-list"
       data-tool-ui-id={id}
@@ -578,7 +572,7 @@ export function OptionList({
     >
       <div
         className={cn(
-          "group/list bg-card flex w-full flex-col overflow-hidden rounded-2xl border px-4 py-1.5 shadow-xs",
+          "group/list bg-card flex w-full flex-col overflow-hidden rounded-2xl border px-4 py-1.5 shadow-xs"
         )}
         role="listbox"
         aria-multiselectable={selectionMode === "multi"}

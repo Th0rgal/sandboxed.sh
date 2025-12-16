@@ -6,7 +6,7 @@ A minimal autonomous coding agent with full machine access, implemented in Rust.
 
 - **HTTP API** for task submission and monitoring
 - **Tool-based agent loop** following the "tools in a loop" pattern
-- **Full toolset**: file operations, terminal, grep search, web access, git
+- **Full toolset**: file operations, terminal, machine-wide search, web access, git
 - **OpenRouter integration** for LLM access (supports any model)
 - **SSE streaming** for real-time task progress
 - **AI-maintainable** Rust codebase with strong typing
@@ -32,8 +32,12 @@ cargo build --release
 # Set your API key
 export OPENROUTER_API_KEY="sk-or-v1-..."
 
-# Optional: configure model (default: openai/gpt-4.1-mini)
-export DEFAULT_MODEL="openai/gpt-4.1-mini"
+# Optional: configure model (default: anthropic/claude-sonnet-4.5)
+export DEFAULT_MODEL="anthropic/claude-sonnet-4.5"
+
+# Optional: default working directory for relative paths (absolute paths work everywhere)
+# In production this is typically /root
+export WORKING_DIR="."
 
 # Start the server
 cargo run --release
@@ -98,27 +102,27 @@ curl http://localhost:3000/api/health
 
 | Tool | Description |
 |------|-------------|
-| `read_file` | Read file contents with optional line range |
-| `write_file` | Write/create files |
-| `delete_file` | Delete files |
-| `list_directory` | List directory contents |
-| `search_files` | Search files by name pattern |
-| `run_command` | Execute shell commands |
-| `grep_search` | Search file contents with regex |
+| `read_file` | Read file contents (any path on the machine) with optional line range |
+| `write_file` | Write/create files anywhere on the machine |
+| `delete_file` | Delete files anywhere on the machine |
+| `list_directory` | List directory contents anywhere on the machine |
+| `search_files` | Search for files by name pattern (machine-wide; scope with `path`) |
+| `run_command` | Execute shell commands (optionally in a specified `cwd`) |
+| `grep_search` | Search file contents with regex (machine-wide; scope with `path`) |
 | `web_search` | Search the web (DuckDuckGo) |
 | `fetch_url` | Fetch URL contents |
-| `git_status` | Get git status |
-| `git_diff` | Show git diff |
-| `git_commit` | Create git commits |
-| `git_log` | Show git log |
+| `git_status` | Get git status for any repo path |
+| `git_diff` | Show git diff for any repo path |
+| `git_commit` | Create git commits for any repo path |
+| `git_log` | Show git log for any repo path |
 
 ## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENROUTER_API_KEY` | (required) | Your OpenRouter API key |
-| `DEFAULT_MODEL` | `openai/gpt-4.1-mini` | Default LLM model |
-| `WORKSPACE_PATH` | `.` | Working directory for file operations |
+| `DEFAULT_MODEL` | `anthropic/claude-sonnet-4.5` | Default LLM model |
+| `WORKING_DIR` | `.` (dev) / `/root` (prod) | Default working directory for relative paths (agent still has full machine access) |
 | `HOST` | `127.0.0.1` | Server bind address |
 | `PORT` | `3000` | Server port |
 | `MAX_ITERATIONS` | `50` | Max agent loop iterations |

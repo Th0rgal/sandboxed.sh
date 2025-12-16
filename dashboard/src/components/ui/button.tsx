@@ -3,57 +3,52 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
 
-export type ButtonVariant =
-  | "default"
-  | "secondary"
-  | "ghost"
-  | "outline"
-  | "destructive";
-
-export type ButtonSize = "sm" | "md" | "lg";
-
 export interface ButtonProps
   extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: ButtonVariant;
-  size?: ButtonSize;
+  variant?: "default" | "destructive" | "outline" | "secondary" | "ghost" | "link";
+  size?: "default" | "sm" | "lg" | "icon";
 }
 
-const variantClasses: Record<ButtonVariant, string> = {
-  default:
-    "bg-primary text-primary-foreground hover:bg-primary/90 focus-visible:ring-primary/30",
-  secondary:
-    "bg-muted text-foreground hover:bg-muted/80 focus-visible:ring-primary/30",
-  ghost:
-    "bg-transparent text-foreground hover:bg-muted/50 focus-visible:ring-primary/30",
-  outline:
-    "border border-border bg-transparent text-foreground hover:bg-muted/40 focus-visible:ring-primary/30",
-  destructive:
-    "bg-destructive text-destructive-foreground hover:bg-destructive/90 focus-visible:ring-destructive/30",
-};
-
-const sizeClasses: Record<ButtonSize, string> = {
-  sm: "h-9 px-3 text-sm",
-  md: "h-10 px-4 text-sm",
-  lg: "h-11 px-5 text-base",
-};
-
-export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ className, variant = "default", size = "md", type, ...props }, ref) => {
+const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
+  ({ className, variant = "default", size = "default", ...props }, ref) => {
     return (
       <button
-        ref={ref}
-        type={type ?? "button"}
         className={cn(
-          "inline-flex items-center justify-center gap-2 rounded-lg font-medium transition-colors",
-          "disabled:pointer-events-none disabled:opacity-50",
-          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
-          variantClasses[variant],
-          sizeClasses[size],
-          className,
+          "inline-flex items-center justify-center whitespace-nowrap rounded-lg text-sm font-medium transition-colors focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50",
+          {
+            // Primary (accent)
+            "bg-indigo-500 hover:bg-indigo-600 text-white":
+              variant === "default",
+            // Destructive
+            "bg-red-500 hover:bg-red-600 text-white":
+              variant === "destructive",
+            // Outline/Ghost subtle
+            "bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] hover:border-white/[0.12] text-white/80":
+              variant === "outline",
+            // Secondary
+            "bg-white/[0.06] hover:bg-white/[0.10] text-white/80":
+              variant === "secondary",
+            // Ghost
+            "hover:bg-white/[0.04] text-white/60 hover:text-white/80":
+              variant === "ghost",
+            // Link
+            "text-indigo-400 underline-offset-4 hover:underline":
+              variant === "link",
+          },
+          {
+            "h-9 px-4 py-2": size === "default",
+            "h-8 rounded-md px-3 text-xs": size === "sm",
+            "h-10 rounded-lg px-6": size === "lg",
+            "h-9 w-9": size === "icon",
+          },
+          className
         )}
+        ref={ref}
         {...props}
       />
     );
-  },
+  }
 );
 Button.displayName = "Button";
+
+export { Button };

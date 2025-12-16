@@ -1,6 +1,6 @@
 "use client";
 
-import { cn } from "@/lib/ui/cn";
+import { cn } from "@/lib/utils";
 
 export interface DataTableColumn {
   id: string;
@@ -30,25 +30,25 @@ export function DataTable({
   return (
     <div
       className={cn(
-        "w-full max-w-2xl overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--background-secondary)]",
+        "w-full max-w-2xl overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.02]",
         className
       )}
       data-slot="data-table"
       data-tool-ui-id={id}
     >
       {title && (
-        <div className="border-b border-[var(--border)] px-4 py-2">
-          <h3 className="text-sm font-medium text-[var(--foreground)]">{title}</h3>
+        <div className="border-b border-white/[0.06] px-4 py-3">
+          <h3 className="text-sm font-medium text-white">{title}</h3>
         </div>
       )}
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
-            <tr className="border-b border-[var(--border)] bg-[var(--background-tertiary)]">
+            <tr className="border-b border-white/[0.06] bg-white/[0.02]">
               {columns.map((col) => (
                 <th
                   key={col.id}
-                  className="px-4 py-2 text-left font-medium text-[var(--foreground-muted)]"
+                  className="px-4 py-2.5 text-left text-[10px] font-medium uppercase tracking-wider text-white/40"
                   style={col.width ? { width: col.width } : undefined}
                 >
                   {col.label ?? col.id}
@@ -56,21 +56,21 @@ export function DataTable({
               ))}
             </tr>
           </thead>
-          <tbody className="divide-y divide-[var(--border)]">
+          <tbody className="divide-y divide-white/[0.04]">
             {rows.length === 0 ? (
               <tr>
                 <td
                   colSpan={columns.length}
-                  className="px-4 py-8 text-center text-[var(--foreground-muted)]"
+                  className="px-4 py-8 text-center text-white/40"
                 >
                   No data
                 </td>
               </tr>
             ) : (
               rows.map((row, rowIndex) => (
-                <tr key={rowIndex} className="hover:bg-[var(--background-tertiary)]">
+                <tr key={rowIndex} className="hover:bg-white/[0.02] transition-colors">
                   {columns.map((col) => (
-                    <td key={col.id} className="px-4 py-2 text-[var(--foreground)]">
+                    <td key={col.id} className="px-4 py-3 text-white/80">
                       {formatCellValue(row[col.id])}
                     </td>
                   ))}
@@ -112,23 +112,19 @@ export function parseSerializableDataTable(input: unknown): SerializableDataTabl
   
   const obj = input as Record<string, unknown>;
   
-  // Handle missing id by generating one
   const id = typeof obj.id === "string" ? obj.id : `table-${Date.now()}`;
   
   if (!Array.isArray(obj.columns) || !Array.isArray(obj.rows)) {
     return null;
   }
   
-  // Parse columns - be more flexible with the format
   const columns: Array<{ id: string; label?: string; width?: string }> = [];
   
   for (const col of obj.columns) {
     if (typeof col === "string") {
-      // Simple string column
       columns.push({ id: col, label: col });
     } else if (typeof col === "object" && col !== null) {
       const colObj = col as Record<string, unknown>;
-      // Try different field names for ID
       const colId = String(colObj.id ?? colObj.key ?? colObj.field ?? colObj.name ?? colObj.header ?? "col");
       const label = String(colObj.label ?? colObj.header ?? colObj.title ?? colObj.name ?? colId);
       columns.push({ 

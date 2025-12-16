@@ -54,7 +54,7 @@ impl TaskExecutor {
     }
 
     /// Build the system prompt for task execution.
-    fn build_system_prompt(&self, workspace: &str, tools: &ToolRegistry) -> String {
+    fn build_system_prompt(&self, working_dir: &str, tools: &ToolRegistry) -> String {
         let tool_descriptions = tools
             .list_tools()
             .iter()
@@ -63,8 +63,10 @@ impl TaskExecutor {
             .join("\n");
 
         format!(
-            r#"You are an autonomous task executor with access to tools. 
-You operate in the workspace: {workspace}
+            r#"You are an autonomous task executor with **full system access**.
+You can read/write any file, execute any command, and search anywhere on the machine.
+Your default working directory is: {working_dir}
+You can use absolute paths (e.g., /etc/hosts, /var/log) to access any location.
 
 ## Available Tools
 {tool_descriptions}
@@ -72,18 +74,20 @@ You operate in the workspace: {workspace}
 ## Rules
 1. Use tools to accomplish the task - don't just describe what to do
 2. Read files before editing them
-3. Verify your work when possible
-4. If stuck, explain what's blocking you
-5. When done, summarize what you accomplished
-6. For structured output (tables, lists of choices), prefer calling UI tools (ui_*) so the dashboard can render rich components.
-7. If you call an interactive UI tool (e.g. ui_optionList), wait for the tool result and continue based on the user's selection.
+3. Prefer working in {working_dir} for relative paths; create reusable helper scripts in {working_dir}/tools/ (production convention: /root/tools/)
+4. For large filesystem searches, scope `grep_search` / `search_files` with an appropriate `path`. If you'll search the same large tree repeatedly, build an index with `index_files` then query it with `search_file_index`.
+5. Verify your work when possible
+6. If stuck, explain what's blocking you
+7. When done, summarize what you accomplished
+8. For structured output (tables, lists of choices), prefer calling UI tools (ui_*) so the dashboard can render rich components.
+9. If you call an interactive UI tool (e.g. ui_optionList), wait for the tool result and continue based on the user's selection.
 
 ## Response
 When task is complete, provide a clear summary of:
 - What you did
-- Files created/modified
+- Files created/modified (with full paths)
 - How to verify the result"#,
-            workspace = workspace,
+            working_dir = working_dir,
             tool_descriptions = tool_descriptions
         )
     }
@@ -98,7 +102,7 @@ When task is complete, provide a clear summary of:
             .unwrap_or(serde_json::Value::Null);
 
         ctx.tools
-            .execute(&tool_call.function.name, args, &ctx.workspace)
+            .execute(&tool_call.function.name, args, &ctx.working_dir)
             .await
     }
 
@@ -126,7 +130,7 @@ When task is complete, provide a clear summary of:
         let pricing = ctx.pricing.get_pricing(model).await;
 
         // Build initial messages
-        let system_prompt = self.build_system_prompt(&ctx.workspace_str(), &ctx.tools);
+        let system_prompt = self.build_system_prompt(&ctx.working_dir_str(), &ctx.tools);
         let mut messages = vec![
             ChatMessage {
                 role: Role::System,

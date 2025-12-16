@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { login, getHealth } from '@/lib/api';
 import { clearJwt, getValidJwt, setJwt } from '@/lib/auth';
+import { Lock } from 'lucide-react';
 
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
@@ -28,8 +29,6 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
           setIsAuthed(Boolean(getValidJwt()));
         }
       } catch {
-        // If we can't reach the API, don't hard-block the UI here.
-        // The dashboard will show its normal connection errors.
         if (mounted) {
           setAuthRequired(false);
           setIsAuthed(true);
@@ -78,31 +77,44 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
       {children}
 
       {needsLogin && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
+        <div className="fixed inset-0 z-50 flex items-center justify-center animate-fade-in">
           <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
 
-          <div className="panel relative z-10 w-full max-w-md rounded-lg p-6">
-            <h2 className="text-lg font-semibold text-[var(--foreground)]">Authenticate</h2>
-            <p className="mt-1 text-sm text-[var(--foreground-muted)]">
-              Enter the dashboard password to continue.
-            </p>
+          <div className="relative z-10 w-full max-w-md rounded-2xl glass-panel border border-white/[0.08] p-6 animate-slide-up">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10">
+                <Lock className="h-5 w-5 text-indigo-400" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold text-white">Authenticate</h2>
+                <p className="text-xs text-white/50">
+                  Enter the dashboard password to continue
+                </p>
+              </div>
+            </div>
 
-            <form onSubmit={onSubmit} className="mt-4 space-y-3">
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Password"
-                autoFocus
-                className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)]/60 px-4 py-2 text-sm text-[var(--foreground)] placeholder-[var(--foreground-muted)] focus:border-[var(--accent)] focus:outline-none focus-visible:!border-[var(--border)]"
-              />
+            <form onSubmit={onSubmit} className="space-y-4">
+              <div>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Password"
+                  autoFocus
+                  className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
+                />
+              </div>
 
-              {error && <p className="text-sm text-[var(--error)]">{error}</p>}
+              {error && (
+                <div className="rounded-lg bg-red-500/10 border border-red-500/20 px-3 py-2">
+                  <p className="text-sm text-red-400">{error}</p>
+                </div>
+              )}
 
               <button
                 type="submit"
                 disabled={!password || isSubmitting}
-                className="w-full rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[var(--accent)]/90 disabled:opacity-50"
+                className="w-full rounded-lg bg-indigo-500 hover:bg-indigo-600 px-4 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isSubmitting ? 'Signing in…' : 'Sign in'}
               </button>
@@ -113,6 +125,3 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
     </>
   );
 }
-
-
-

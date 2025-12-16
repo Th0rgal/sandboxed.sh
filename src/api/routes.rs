@@ -26,6 +26,7 @@ use crate::agents::{AgentContext, AgentRef, TuningParams};
 use crate::budget::ModelPricing;
 use crate::config::Config;
 use crate::llm::OpenRouterClient;
+use crate::mcp::McpRegistry;
 use crate::memory::{self, MemorySystem};
 use crate::tools::ToolRegistry;
 
@@ -33,6 +34,7 @@ use super::auth;
 use super::console;
 use super::control;
 use super::fs;
+use super::mcp as mcp_api;
 use super::types::*;
 
 /// Shared application state.
@@ -45,18 +47,30 @@ pub struct AppState {
     pub memory: Option<MemorySystem>,
     /// Global interactive control session
     pub control: control::ControlState,
+    /// MCP server registry
+    pub mcp: Arc<McpRegistry>,
 }
 
 /// Start the HTTP server.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    // Load empirically tuned parameters (if present in workspace)
-    let tuning = TuningParams::load_from_workspace(&config.workspace_path).await;
+    // Load empirically tuned parameters (if present in working directory)
+    let tuning = TuningParams::load_from_working_dir(&config.working_dir).await;
 
     // Create the root agent (hierarchical)
     let root_agent: AgentRef = Arc::new(RootAgent::new_with_tuning(&tuning));
 
     // Initialize memory system (optional - needs Supabase config)
     let memory = memory::init_memory(&config.memory, &config.api_key).await;
+
+    // Initialize MCP registry
+    let mcp = Arc::new(McpRegistry::new(&config.working_dir).await);
+    // Refresh all MCPs in background
+    {
+        let mcp_clone = Arc::clone(&mcp);
+        tokio::spawn(async move {
+            mcp_clone.refresh_all().await;
+        });
+    }
 
     // Spawn the single global control session actor.
     let control_state =
@@ -68,6 +82,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         root_agent,
         memory,
         control: control_state,
+        mcp,
     });
 
     let public_routes = Router::new()
@@ -100,6 +115,18 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/fs/upload", post(fs::upload))
         .route("/api/fs/mkdir", post(fs::mkdir))
         .route("/api/fs/rm", post(fs::rm))
+        // MCP management endpoints
+        .route("/api/mcp", get(mcp_api::list_mcps))
+        .route("/api/mcp", post(mcp_api::add_mcp))
+        .route("/api/mcp/refresh", post(mcp_api::refresh_all_mcps))
+        .route("/api/mcp/:id", get(mcp_api::get_mcp))
+        .route("/api/mcp/:id", axum::routing::delete(mcp_api::remove_mcp))
+        .route("/api/mcp/:id/enable", post(mcp_api::enable_mcp))
+        .route("/api/mcp/:id/disable", post(mcp_api::disable_mcp))
+        .route("/api/mcp/:id/refresh", post(mcp_api::refresh_mcp))
+        // Tools management endpoints
+        .route("/api/tools", get(mcp_api::list_tools))
+        .route("/api/tools/:name/toggle", post(mcp_api::toggle_tool))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_auth,
@@ -233,13 +260,13 @@ async fn create_task(
     // Spawn background task to run the agent
     let state_clone = Arc::clone(&state);
     let task_description = req.task.clone();
-    let workspace_path = req
-        .workspace_path
+    let working_dir = req
+        .working_dir
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| state.config.workspace_path.clone());
+        .unwrap_or_else(|| state.config.working_dir.clone());
 
     tokio::spawn(async move {
-        run_agent_task(state_clone, id, task_description, model, workspace_path).await;
+        run_agent_task(state_clone, id, task_description, model, working_dir).await;
     });
 
     Ok(Json(CreateTaskResponse {
@@ -254,7 +281,7 @@ async fn run_agent_task(
     task_id: Uuid,
     task_description: String,
     _model: String,
-    workspace_path: std::path::PathBuf,
+    working_dir: std::path::PathBuf,
 ) {
     // Update status to running
     {
@@ -282,7 +309,7 @@ async fn run_agent_task(
         }
     };
 
-    // Create context with the specified workspace and memory
+    // Create context with the specified working directory and memory
     let llm = Arc::new(OpenRouterClient::new(state.config.api_key.clone()));
     let tools = ToolRegistry::new();
     let pricing = Arc::new(ModelPricing::new());
@@ -292,7 +319,7 @@ async fn run_agent_task(
         llm,
         tools,
         pricing,
-        workspace_path,
+        working_dir,
         state.memory.clone(),
     );
 

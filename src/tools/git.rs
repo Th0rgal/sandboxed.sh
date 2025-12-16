@@ -1,6 +1,9 @@
 //! Git operation tools.
+//!
+//! These tools can operate on any git repository on the system.
+//! The repo path can be specified explicitly or defaults to the working directory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -8,6 +11,16 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use super::Tool;
+
+/// Resolve a path - if absolute, use as-is; if relative, join with working_dir.
+fn resolve_path(path_str: &str, working_dir: &Path) -> PathBuf {
+    let path = Path::new(path_str);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    }
+}
 
 /// Get git status.
 pub struct GitStatus;
@@ -25,12 +38,21 @@ impl Tool for GitStatus {
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": {}
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Optional: path to the git repository. Can be absolute or relative. Defaults to working directory."
+                }
+            }
         })
     }
 
-    async fn execute(&self, _args: Value, workspace: &Path) -> anyhow::Result<String> {
-        run_git_command(&["status", "--porcelain=v2", "--branch"], workspace).await
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
+        let repo_path = args["repo_path"]
+            .as_str()
+            .map(|p| resolve_path(p, working_dir))
+            .unwrap_or_else(|| working_dir.to_path_buf());
+        run_git_command(&["status", "--porcelain=v2", "--branch"], &repo_path).await
     }
 }
 
@@ -51,6 +73,10 @@ impl Tool for GitDiff {
         json!({
             "type": "object",
             "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Optional: path to the git repository. Can be absolute or relative. Defaults to working directory."
+                },
                 "staged": {
                     "type": "boolean",
                     "description": "Show staged changes instead of unstaged (default: false)"
@@ -63,7 +89,11 @@ impl Tool for GitDiff {
         })
     }
 
-    async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String> {
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
+        let repo_path = args["repo_path"]
+            .as_str()
+            .map(|p| resolve_path(p, working_dir))
+            .unwrap_or_else(|| working_dir.to_path_buf());
         let staged = args["staged"].as_bool().unwrap_or(false);
         let file = args["file"].as_str();
 
@@ -78,7 +108,7 @@ impl Tool for GitDiff {
             git_args.push(f);
         }
 
-        let result = run_git_command(&git_args, workspace).await?;
+        let result = run_git_command(&git_args, &repo_path).await?;
 
         if result.is_empty() {
             Ok("No changes".to_string())
@@ -110,6 +140,10 @@ impl Tool for GitCommit {
         json!({
             "type": "object",
             "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Optional: path to the git repository. Can be absolute or relative. Defaults to working directory."
+                },
                 "message": {
                     "type": "string",
                     "description": "The commit message"
@@ -124,7 +158,11 @@ impl Tool for GitCommit {
         })
     }
 
-    async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String> {
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
+        let repo_path = args["repo_path"]
+            .as_str()
+            .map(|p| resolve_path(p, working_dir))
+            .unwrap_or_else(|| working_dir.to_path_buf());
         let message = args["message"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'message' argument"))?;
@@ -136,15 +174,15 @@ impl Tool for GitCommit {
 
         // Stage files
         if files.is_empty() {
-            run_git_command(&["add", "-A"], workspace).await?;
+            run_git_command(&["add", "-A"], &repo_path).await?;
         } else {
             let mut git_args = vec!["add", "--"];
             git_args.extend(files);
-            run_git_command(&git_args, workspace).await?;
+            run_git_command(&git_args, &repo_path).await?;
         }
 
         // Commit
-        run_git_command(&["commit", "-m", message], workspace).await
+        run_git_command(&["commit", "-m", message], &repo_path).await
     }
 }
 
@@ -165,6 +203,10 @@ impl Tool for GitLog {
         json!({
             "type": "object",
             "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Optional: path to the git repository. Can be absolute or relative. Defaults to working directory."
+                },
                 "num_commits": {
                     "type": "integer",
                     "description": "Number of commits to show (default: 10)"
@@ -177,7 +219,11 @@ impl Tool for GitLog {
         })
     }
 
-    async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String> {
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
+        let repo_path = args["repo_path"]
+            .as_str()
+            .map(|p| resolve_path(p, working_dir))
+            .unwrap_or_else(|| working_dir.to_path_buf());
         let num_commits = args["num_commits"].as_u64().unwrap_or(10);
         let oneline = args["oneline"].as_bool().unwrap_or(true);
 
@@ -189,15 +235,15 @@ impl Tool for GitLog {
             git_args.push("--oneline");
         }
 
-        run_git_command(&git_args, workspace).await
+        run_git_command(&git_args, &repo_path).await
     }
 }
 
 /// Run a git command and return its output.
-async fn run_git_command(args: &[&str], workspace: &Path) -> anyhow::Result<String> {
+async fn run_git_command(args: &[&str], repo_path: &Path) -> anyhow::Result<String> {
     let output = Command::new("git")
         .args(args)
-        .current_dir(workspace)
+        .current_dir(repo_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

@@ -1,6 +1,9 @@
 //! Terminal/shell command execution tool.
+//!
+//! This tool has full system access - it can execute any command on the machine.
+//! The working directory can be specified explicitly or defaults to the agent's working directory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -8,6 +11,16 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use super::Tool;
+
+/// Resolve a path - if absolute, use as-is; if relative, join with working_dir.
+fn resolve_path(path_str: &str, working_dir: &Path) -> PathBuf {
+    let path = Path::new(path_str);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    }
+}
 
 /// Run a shell command.
 pub struct RunCommand;
@@ -19,7 +32,7 @@ impl Tool for RunCommand {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the workspace directory. Returns stdout and stderr. Use for running tests, installing dependencies, compiling code, etc."
+        "Execute any shell command on the system. Returns stdout and stderr. Use for running tests, installing packages, compiling code, system administration, etc."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -30,6 +43,10 @@ impl Tool for RunCommand {
                     "type": "string",
                     "description": "The shell command to execute"
                 },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional: working directory for the command. Can be absolute (e.g., /var/log) or relative. Defaults to agent's working directory."
+                },
                 "timeout_secs": {
                     "type": "integer",
                     "description": "Timeout in seconds (default: 60)"
@@ -39,13 +56,17 @@ impl Tool for RunCommand {
         })
     }
 
-    async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String> {
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
         let command = args["command"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
+        let cwd = args["cwd"]
+            .as_str()
+            .map(|p| resolve_path(p, working_dir))
+            .unwrap_or_else(|| working_dir.to_path_buf());
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(60);
 
-        tracing::info!("Executing command: {}", command);
+        tracing::info!("Executing command in {:?}: {}", cwd, command);
 
         // Determine shell based on OS
         let (shell, shell_arg) = if cfg!(target_os = "windows") {
@@ -59,7 +80,7 @@ impl Tool for RunCommand {
             Command::new(shell)
                 .arg(shell_arg)
                 .arg(command)
-                .current_dir(workspace)
+                .current_dir(&cwd)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output(),

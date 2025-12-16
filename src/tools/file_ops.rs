@@ -1,11 +1,24 @@
 //! File operation tools: read, write, delete files.
+//!
+//! These tools have full system access - they can read/write any file on the machine.
+//! Paths can be absolute (e.g., `/etc/hosts`) or relative to the working directory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::Tool;
+
+/// Resolve a path - if absolute, use as-is; if relative, join with working_dir.
+fn resolve_path(path_str: &str, working_dir: &Path) -> PathBuf {
+    let path = Path::new(path_str);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    }
+}
 
 /// Read the contents of a file.
 pub struct ReadFile;
@@ -17,7 +30,7 @@ impl Tool for ReadFile {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file. Returns the file content as text. Use this to inspect files before editing them."
+        "Read the contents of a file from anywhere on the system. Returns the file content as text. Use this to inspect files before editing them."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -26,7 +39,7 @@ impl Tool for ReadFile {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to read, relative to workspace"
+                    "description": "Path to the file. Can be absolute (e.g., /etc/hosts) or relative to working directory."
                 },
                 "start_line": {
                     "type": "integer",
@@ -41,12 +54,12 @@ impl Tool for ReadFile {
         })
     }
 
-    async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String> {
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
         let path = args["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
 
-        let full_path = workspace.join(path);
+        let full_path = resolve_path(path, working_dir);
 
         if !full_path.exists() {
             return Err(anyhow::anyhow!("File not found: {}", path));
@@ -93,7 +106,7 @@ impl Tool for WriteFile {
     }
 
     fn description(&self) -> &str {
-        "Write content to a file. Creates the file if it doesn't exist, or overwrites if it does. Creates parent directories as needed."
+        "Write content to a file anywhere on the system. Creates the file if it doesn't exist, or overwrites if it does. Creates parent directories as needed."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -102,7 +115,7 @@ impl Tool for WriteFile {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to write, relative to workspace"
+                    "description": "Path to the file. Can be absolute (e.g., /root/tools/script.py) or relative to working directory."
                 },
                 "content": {
                     "type": "string",
@@ -113,7 +126,7 @@ impl Tool for WriteFile {
         })
     }
 
-    async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String> {
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
         let path = args["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
@@ -121,7 +134,7 @@ impl Tool for WriteFile {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'content' argument"))?;
 
-        let full_path = workspace.join(path);
+        let full_path = resolve_path(path, working_dir);
 
         // Create parent directories if needed
         if let Some(parent) = full_path.parent() {
@@ -144,7 +157,7 @@ impl Tool for DeleteFile {
     }
 
     fn description(&self) -> &str {
-        "Delete a file. Use with caution."
+        "Delete a file anywhere on the system. Use with caution."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -153,19 +166,19 @@ impl Tool for DeleteFile {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to delete, relative to workspace"
+                    "description": "Path to the file to delete. Can be absolute or relative to working directory."
                 }
             },
             "required": ["path"]
         })
     }
 
-    async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String> {
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
         let path = args["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
 
-        let full_path = workspace.join(path);
+        let full_path = resolve_path(path, working_dir);
 
         if !full_path.exists() {
             return Err(anyhow::anyhow!("File not found: {}", path));

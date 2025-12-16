@@ -1,21 +1,23 @@
-'use client';
+"use client";
 
-import { useEffect, useState } from 'react';
-import { cn } from '@/lib/utils';
-import { getHealth } from '@/lib/api';
+import { useEffect, useState } from "react";
+import { cn } from "@/lib/utils";
+import { getHealth } from "@/lib/api";
 
 interface ConnectionItem {
   name: string;
-  status: 'connected' | 'disconnected' | 'checking';
+  status: "connected" | "disconnected" | "checking";
   latency?: number;
 }
 
 export function ConnectionStatus() {
   const [connections, setConnections] = useState<ConnectionItem[]>([
-    { name: 'Dashboard → API', status: 'checking' },
-    { name: 'API → LLM', status: 'checking' },
+    { name: "Dashboard → API", status: "checking" },
+    { name: "API → LLM", status: "checking" },
   ]);
-  const [overallStatus, setOverallStatus] = useState<'all' | 'partial' | 'none'>('partial');
+  const [overallStatus, setOverallStatus] = useState<
+    "all" | "partial" | "none"
+  >("partial");
 
   useEffect(() => {
     const checkConnections = async () => {
@@ -24,16 +26,16 @@ export function ConnectionStatus() {
         await getHealth();
         const latency = Date.now() - start;
         setConnections([
-          { name: 'Dashboard → API', status: 'connected', latency },
-          { name: 'API → LLM', status: 'connected' },
+          { name: "Dashboard → API", status: "connected", latency },
+          { name: "API → LLM", status: "connected" },
         ]);
-        setOverallStatus('all');
+        setOverallStatus("all");
       } catch {
         setConnections([
-          { name: 'Dashboard → API', status: 'disconnected' },
-          { name: 'API → LLM', status: 'disconnected' },
+          { name: "Dashboard → API", status: "disconnected" },
+          { name: "API → LLM", status: "disconnected" },
         ]);
-        setOverallStatus('none');
+        setOverallStatus("none");
       }
     };
 
@@ -42,56 +44,49 @@ export function ConnectionStatus() {
     return () => clearInterval(interval);
   }, []);
 
-  const statusColors = {
-    connected: 'bg-[var(--success)]',
-    disconnected: 'bg-[var(--error)]',
-    checking: 'bg-[var(--warning)]',
-  };
-
   return (
-    <div className="panel rounded-lg p-4">
-      <h3 className="mb-4 text-sm font-semibold text-[var(--foreground)]">
-        Connection Status
-      </h3>
+    <div>
+      <h3 className="mb-4 text-sm font-medium text-white">Connection Status</h3>
 
-      <div className="space-y-4">
+      <div className="space-y-3">
         {connections.map((conn, i) => (
           <div key={i} className="flex items-center justify-between">
             <div>
-              <p className="text-sm text-[var(--foreground-muted)]">{conn.name}</p>
+              <p className="text-xs text-white/50">{conn.name}</p>
               {conn.latency !== undefined && (
-                <p className="text-2xl font-bold text-[var(--foreground)]">
+                <p className="text-lg font-light text-white tabular-nums">
                   {conn.latency}
-                  <span className="text-sm font-normal text-[var(--foreground-muted)]">ms</span>
+                  <span className="text-xs text-white/40 ml-0.5">ms</span>
                 </p>
               )}
             </div>
-            <div
+            <span
               className={cn(
-                'h-2.5 w-2.5 rounded-full',
-                statusColors[conn.status]
+                "h-2 w-2 rounded-full",
+                conn.status === "connected" && "bg-emerald-400",
+                conn.status === "disconnected" && "bg-red-400",
+                conn.status === "checking" && "bg-amber-400 animate-pulse"
               )}
             />
           </div>
         ))}
       </div>
 
-      <div className="mt-4 flex items-center justify-between border-t border-[var(--border)] pt-4">
-        <span className="text-sm text-[var(--foreground-muted)]">All Systems</span>
+      <div className="mt-4 flex items-center justify-between border-t border-white/[0.06] pt-4">
+        <span className="text-xs text-white/40">All Systems</span>
         <span
           className={cn(
-            'text-sm font-medium',
-            overallStatus === 'all' && 'text-[var(--success)]',
-            overallStatus === 'partial' && 'text-[var(--warning)]',
-            overallStatus === 'none' && 'text-[var(--error)]'
+            "text-xs font-medium",
+            overallStatus === "all" && "text-emerald-400",
+            overallStatus === "partial" && "text-amber-400",
+            overallStatus === "none" && "text-red-400"
           )}
         >
-          {overallStatus === 'all' && 'Operational'}
-          {overallStatus === 'partial' && 'Partial'}
-          {overallStatus === 'none' && 'Offline'}
+          {overallStatus === "all" && "Operational"}
+          {overallStatus === "partial" && "Partial"}
+          {overallStatus === "none" && "Offline"}
         </span>
       </div>
     </div>
   );
 }
-

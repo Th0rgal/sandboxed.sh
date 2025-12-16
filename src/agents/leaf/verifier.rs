@@ -39,19 +39,22 @@ impl Verifier {
     /// 
     /// # Returns
     /// `Ok(true)` if check passes, `Ok(false)` if fails, `Err` on error.
+    /// 
+    /// # Note
+    /// Paths in checks can be absolute or relative to working_dir.
     async fn run_programmatic_check(
         &self,
         check: &ProgrammaticCheck,
-        workspace: &Path,
+        working_dir: &Path,
     ) -> Result<bool, String> {
         match check {
             ProgrammaticCheck::FileExists { path } => {
-                let full_path = workspace.join(path);
+                let full_path = Self::resolve_path(path, working_dir);
                 Ok(full_path.exists())
             }
 
             ProgrammaticCheck::FileContains { path, content } => {
-                let full_path = workspace.join(path);
+                let full_path = Self::resolve_path(path, working_dir);
                 match tokio::fs::read_to_string(&full_path).await {
                     Ok(file_content) => Ok(file_content.contains(content)),
                     Err(_) => Ok(false),
@@ -62,7 +65,7 @@ impl Verifier {
                 let output = Command::new("sh")
                     .arg("-c")
                     .arg(command)
-                    .current_dir(workspace)
+                    .current_dir(working_dir)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
@@ -76,7 +79,7 @@ impl Verifier {
                 let output = Command::new("sh")
                     .arg("-c")
                     .arg(command)
-                    .current_dir(workspace)
+                    .current_dir(working_dir)
                     .output()
                     .await
                     .map_err(|e| e.to_string())?;
@@ -87,12 +90,12 @@ impl Verifier {
             }
 
             ProgrammaticCheck::DirectoryExists { path } => {
-                let full_path = workspace.join(path);
+                let full_path = Self::resolve_path(path, working_dir);
                 Ok(full_path.is_dir())
             }
 
             ProgrammaticCheck::FileMatchesRegex { path, pattern } => {
-                let full_path = workspace.join(path);
+                let full_path = Self::resolve_path(path, working_dir);
                 match tokio::fs::read_to_string(&full_path).await {
                     Ok(content) => {
                         let regex = regex::Regex::new(pattern).map_err(|e| e.to_string())?;
@@ -104,7 +107,7 @@ impl Verifier {
 
             ProgrammaticCheck::All(checks) => {
                 for c in checks {
-                    if !Box::pin(self.run_programmatic_check(c, workspace)).await? {
+                    if !Box::pin(self.run_programmatic_check(c, working_dir)).await? {
                         return Ok(false);
                     }
                 }
@@ -113,12 +116,22 @@ impl Verifier {
 
             ProgrammaticCheck::Any(checks) => {
                 for c in checks {
-                    if Box::pin(self.run_programmatic_check(c, workspace)).await? {
+                    if Box::pin(self.run_programmatic_check(c, working_dir)).await? {
                         return Ok(true);
                     }
                 }
                 Ok(false)
             }
+        }
+    }
+
+    /// Resolve a path - if absolute, use as-is; if relative, join with working_dir.
+    fn resolve_path(path_str: &str, working_dir: &Path) -> std::path::PathBuf {
+        let path = Path::new(path_str);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            working_dir.join(path)
         }
     }
 
@@ -170,7 +183,7 @@ Respond ONLY with the JSON object."#,
             },
         ];
 
-        let model = "anthropic/claude-sonnet-4.5";
+        let model = "openai/gpt-4.1-mini";
         
         match ctx.llm.chat_completion(model, &messages, None).await {
             Ok(response) => {
@@ -247,7 +260,7 @@ Respond ONLY with the JSON object."#,
             }
 
             VerificationCriteria::Programmatic(check) => {
-                match self.run_programmatic_check(check, &ctx.workspace).await {
+                match self.run_programmatic_check(check, &ctx.working_dir).await {
                     Ok(true) => VerificationResult::pass(
                         "Programmatic check passed",
                         VerificationMethod::Programmatic,
@@ -272,7 +285,7 @@ Respond ONLY with the JSON object."#,
 
             VerificationCriteria::Hybrid { programmatic, llm_fallback } => {
                 // Try programmatic first
-                match self.run_programmatic_check(programmatic, &ctx.workspace).await {
+                match self.run_programmatic_check(programmatic, &ctx.working_dir).await {
                     Ok(true) => VerificationResult::pass(
                         "Programmatic check passed",
                         VerificationMethod::Programmatic,
@@ -313,10 +326,6 @@ impl Agent for Verifier {
     }
 
     async fn execute(&self, task: &mut Task, ctx: &AgentContext) -> AgentResult {
-        if ctx.is_cancelled() {
-            return AgentResult::failure("Cancelled", 0);
-        }
-
         let result = self.verify(task, ctx).await;
         
         if result.passed() {

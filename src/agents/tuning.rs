@@ -28,24 +28,24 @@ impl Default for TuningParams {
 }
 
 impl TuningParams {
-    /// Load tuning parameters from the workspace, if present.
+    /// Load tuning parameters from the working directory, if present.
     ///
     /// # Path
-    /// `{workspace}/.open_agent/tuning.json`
-    pub async fn load_from_workspace(workspace: &Path) -> Self {
-        let path = workspace.join(".open_agent").join("tuning.json");
+    /// `{working_dir}/.open_agent/tuning.json`
+    pub async fn load_from_working_dir(working_dir: &Path) -> Self {
+        let path = working_dir.join(".open_agent").join("tuning.json");
         match tokio::fs::read_to_string(&path).await {
             Ok(s) => serde_json::from_str::<TuningParams>(&s).unwrap_or_default(),
             Err(_) => TuningParams::default(),
         }
     }
 
-    /// Save tuning parameters to the workspace.
+    /// Save tuning parameters to the working directory.
     ///
     /// # Postcondition
-    /// If successful, subsequent `load_from_workspace` returns an equivalent value.
-    pub async fn save_to_workspace(&self, workspace: &Path) -> anyhow::Result<PathBuf> {
-        let dir = workspace.join(".open_agent");
+    /// If successful, subsequent `load_from_working_dir` returns an equivalent value.
+    pub async fn save_to_working_dir(&self, working_dir: &Path) -> anyhow::Result<PathBuf> {
+        let dir = working_dir.join(".open_agent");
         tokio::fs::create_dir_all(&dir).await?;
         let path = dir.join("tuning.json");
         let content = serde_json::to_string_pretty(self)?;

@@ -1,6 +1,9 @@
 //! Code search tools: grep/regex search.
+//!
+//! These tools have full system access - they can search any directory on the machine.
+//! Paths can be absolute (e.g., `/var/log`) or relative to the working directory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -8,6 +11,16 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use super::Tool;
+
+/// Resolve a path - if absolute, use as-is; if relative, join with working_dir.
+fn resolve_path(path_str: &str, working_dir: &Path) -> PathBuf {
+    let path = Path::new(path_str);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    }
+}
 
 /// Search file contents with regex/grep.
 pub struct GrepSearch;
@@ -19,7 +32,7 @@ impl Tool for GrepSearch {
     }
 
     fn description(&self) -> &str {
-        "Search for a pattern in file contents using regex. Returns matching lines with file paths and line numbers. Great for finding function definitions, usages, or specific code patterns."
+        "Search for a pattern in file contents anywhere on the system using regex. Returns matching lines with file paths and line numbers. Great for finding function definitions, usages, config values, or specific patterns."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -32,11 +45,11 @@ impl Tool for GrepSearch {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in, relative to workspace. Defaults to workspace root."
+                    "description": "Directory to search in. Can be absolute (e.g., /var/log, /etc) or relative to working directory. Defaults to working directory."
                 },
                 "file_pattern": {
                     "type": "string",
-                    "description": "Optional: only search files matching this glob (e.g., '*.rs', '*.py')"
+                    "description": "Optional: only search files matching this glob (e.g., '*.rs', '*.py', '*.log')"
                 },
                 "case_sensitive": {
                     "type": "boolean",
@@ -47,7 +60,7 @@ impl Tool for GrepSearch {
         })
     }
 
-    async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String> {
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
         let pattern = args["pattern"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' argument"))?;
@@ -55,7 +68,7 @@ impl Tool for GrepSearch {
         let file_pattern = args["file_pattern"].as_str();
         let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(false);
 
-        let search_path = workspace.join(path);
+        let search_path = resolve_path(path, working_dir);
 
         // Try to use ripgrep (rg) if available, fall back to grep
         let mut cmd = if which_exists("rg") {
@@ -111,12 +124,10 @@ impl Tool for GrepSearch {
             return Ok(format!("No matches found for pattern: {}", pattern));
         }
 
-        // Process output to make paths relative
-        let workspace_str = workspace.to_string_lossy();
+        // Show results with full paths for system-wide clarity
         let result: String = stdout
             .lines()
             .take(100) // Limit results
-            .map(|line| line.replace(&*workspace_str, ".").replace("./", ""))
             .collect::<Vec<_>>()
             .join("\n");
 

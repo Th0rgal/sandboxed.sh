@@ -15,6 +15,10 @@ use tokio::sync::broadcast;
 /// # Thread Safety
 /// Context is wrapped in Arc for sharing across async tasks.
 /// Individual components use interior mutability where needed.
+/// 
+/// # System Access
+/// The agent has **full system access** - it can read/write any file, execute any command,
+/// and search anywhere on the machine. The `working_dir` is just the default for relative paths.
 pub struct AgentContext {
     /// Application configuration
     pub config: Config,
@@ -28,8 +32,9 @@ pub struct AgentContext {
     /// Model pricing information
     pub pricing: Arc<ModelPricing>,
     
-    /// Workspace path for file operations
-    pub workspace: PathBuf,
+    /// Default working directory for relative paths.
+    /// The agent can still access any path on the system using absolute paths.
+    pub working_dir: PathBuf,
     
     /// Maximum depth for recursive task splitting
     pub max_split_depth: usize,
@@ -60,7 +65,7 @@ impl AgentContext {
         llm: Arc<dyn LlmClient>,
         tools: ToolRegistry,
         pricing: Arc<ModelPricing>,
-        workspace: PathBuf,
+        working_dir: PathBuf,
     ) -> Self {
         Self {
             max_iterations: config.max_iterations,
@@ -68,7 +73,7 @@ impl AgentContext {
             llm,
             tools,
             pricing,
-            workspace,
+            working_dir,
             max_split_depth: 3, // Default max recursion for splitting
             memory: None,
             control_events: None,
@@ -84,7 +89,7 @@ impl AgentContext {
         llm: Arc<dyn LlmClient>,
         tools: ToolRegistry,
         pricing: Arc<ModelPricing>,
-        workspace: PathBuf,
+        working_dir: PathBuf,
         memory: Option<MemorySystem>,
     ) -> Self {
         Self {
@@ -93,7 +98,7 @@ impl AgentContext {
             llm,
             tools,
             pricing,
-            workspace,
+            working_dir,
             max_split_depth: 3,
             memory,
             control_events: None,
@@ -113,7 +118,7 @@ impl AgentContext {
             llm: Arc::clone(&self.llm),
             tools: ToolRegistry::new(), // Fresh tools for isolation
             pricing: Arc::clone(&self.pricing),
-            workspace: self.workspace.clone(),
+            working_dir: self.working_dir.clone(),
             max_split_depth: self.max_split_depth.saturating_sub(1),
             max_iterations: self.max_iterations,
             memory: self.memory.clone(),
@@ -129,9 +134,9 @@ impl AgentContext {
         self.max_split_depth > 0
     }
 
-    /// Get the workspace path as a string.
-    pub fn workspace_str(&self) -> String {
-        self.workspace.to_string_lossy().to_string()
+    /// Get the working directory path as a string.
+    pub fn working_dir_str(&self) -> String {
+        self.working_dir.to_string_lossy().to_string()
     }
     
     /// Check if memory is available.

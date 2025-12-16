@@ -1,11 +1,16 @@
 //! Tool system for the agent.
 //!
 //! Tools are the "hands and eyes" of the agent - they allow it to interact with
-//! the file system, run commands, search code, and access the web.
+//! the entire file system, run commands anywhere, search the machine, and access the web.
+//!
+//! The agent has **full system access** - it can read/write any file, execute any command,
+//! and search anywhere on the machine. The `working_dir` parameter is the default directory
+//! for relative paths (typically `/root` in production).
 
 mod directory;
 mod file_ops;
 mod git;
+mod index;
 mod search;
 mod terminal;
 mod ui;
@@ -40,7 +45,10 @@ pub trait Tool: Send + Sync {
     fn parameters_schema(&self) -> Value;
 
     /// Execute the tool with the given arguments.
-    async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String>;
+    /// 
+    /// The `working_dir` is the default directory for relative paths.
+    /// Tools can accept absolute paths to operate anywhere on the system.
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String>;
 }
 
 /// Registry of available tools.
@@ -61,6 +69,13 @@ impl ToolRegistry {
         // Directory operations
         tools.insert("list_directory".to_string(), Arc::new(directory::ListDirectory));
         tools.insert("search_files".to_string(), Arc::new(directory::SearchFiles));
+
+        // Indexing (optional performance optimization for large trees)
+        tools.insert("index_files".to_string(), Arc::new(index::IndexFiles));
+        tools.insert(
+            "search_file_index".to_string(),
+            Arc::new(index::SearchFileIndex),
+        );
 
         // Terminal
         tools.insert("run_command".to_string(), Arc::new(terminal::RunCommand));
@@ -112,18 +127,21 @@ impl ToolRegistry {
     }
 
     /// Execute a tool by name.
+    /// 
+    /// The `working_dir` is the default directory for relative paths.
+    /// Tools accept absolute paths to operate anywhere on the system.
     pub async fn execute(
         &self,
         name: &str,
         args: Value,
-        workspace: &Path,
+        working_dir: &Path,
     ) -> anyhow::Result<String> {
         let tool = self
             .tools
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?;
 
-        tool.execute(args, workspace).await
+        tool.execute(args, working_dir).await
     }
 }
 

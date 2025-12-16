@@ -71,11 +71,11 @@ function statusLabel(state: ControlRunState): {
 } {
   switch (state) {
     case 'idle':
-      return { label: 'Idle', Icon: Clock, className: 'text-[var(--foreground-muted)]' };
+      return { label: 'Idle', Icon: Clock, className: 'text-white/40' };
     case 'running':
-      return { label: 'Running', Icon: Loader, className: 'text-[var(--accent)]' };
+      return { label: 'Running', Icon: Loader, className: 'text-indigo-400' };
     case 'waiting_for_tool':
-      return { label: 'Waiting', Icon: Loader, className: 'text-[var(--warning)]' };
+      return { label: 'Waiting', Icon: Loader, className: 'text-amber-400' };
   }
 }
 
@@ -233,14 +233,15 @@ export default function ControlClient() {
   };
 
   return (
-    <div className="flex min-h-screen flex-col p-8">
-      <div className="mb-6 flex items-start justify-between gap-6">
+    <div className="flex h-screen flex-col p-6">
+      {/* Header */}
+      <div className="mb-6 flex items-start justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-[var(--foreground)]">
+          <h1 className="text-xl font-semibold text-white">
             Agent Control
           </h1>
-          <p className="mt-1 text-sm text-[var(--foreground-muted)]">
-            Talk to the global RootAgent session (messages queue while busy)
+          <p className="mt-1 text-sm text-white/50">
+            Talk to the global RootAgent session
           </p>
         </div>
 
@@ -248,23 +249,27 @@ export default function ControlClient() {
           <div className={cn('flex items-center gap-2 text-sm', status.className)}>
             <StatusIcon className={cn('h-4 w-4', runState !== 'idle' && 'animate-spin')} />
             <span>{status.label}</span>
-            <span className="text-[var(--foreground-muted)]">•</span>
-            <span className="text-[var(--foreground-muted)]">Queue: {queueLen}</span>
+            <span className="text-white/20">•</span>
+            <span className="text-white/40">Queue: {queueLen}</span>
           </div>
         </div>
       </div>
 
-      <div className="panel flex-1 min-h-0 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--background-secondary)]/70 backdrop-blur-xl">
+      {/* Chat container */}
+      <div className="flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden">
+        {/* Messages */}
         <div className="flex-1 overflow-y-auto p-6">
           {items.length === 0 ? (
             <div className="flex h-full items-center justify-center">
               <div className="text-center">
-                <Bot className="mx-auto h-12 w-12 text-[var(--foreground-muted)]" />
-                <h2 className="mt-4 text-lg font-medium text-[var(--foreground)]">
+                <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
+                  <Bot className="h-8 w-8 text-indigo-400" />
+                </div>
+                <h2 className="text-lg font-medium text-white">
                   Start a conversation
                 </h2>
-                <p className="mt-2 text-sm text-[var(--foreground-muted)]">
-                  Ask the agent to do something (it will queue if already busy)
+                <p className="mt-2 text-sm text-white/40 max-w-sm">
+                  Ask the agent to do something — messages queue while it&apos;s busy
                 </p>
               </div>
             </div>
@@ -273,12 +278,12 @@ export default function ControlClient() {
               {items.map((item) => {
                 if (item.kind === 'user') {
                   return (
-                    <div key={item.id} className="flex justify-end gap-4">
-                      <div className="max-w-[80%] rounded-lg bg-[var(--accent)] px-4 py-3 text-white">
+                    <div key={item.id} className="flex justify-end gap-3">
+                      <div className="max-w-[80%] rounded-2xl rounded-br-md bg-indigo-500 px-4 py-3 text-white">
                         <p className="whitespace-pre-wrap text-sm">{item.content}</p>
                       </div>
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--background-tertiary)]">
-                        <User className="h-4 w-4 text-[var(--foreground-muted)]" />
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.08]">
+                        <User className="h-4 w-4 text-white/60" />
                       </div>
                     </div>
                   );
@@ -287,38 +292,37 @@ export default function ControlClient() {
                 if (item.kind === 'assistant') {
                   const statusIcon = item.success ? CheckCircle : XCircle;
                   const StatusIcon = statusIcon;
-                  // Truncate long model names (e.g., "tngtech/tng-r1t-chimera:free" -> "tng-r1t-chimera:free")
                   const displayModel = item.model 
                     ? (item.model.includes('/') ? item.model.split('/').pop() : item.model)
                     : null;
                   return (
-                    <div key={item.id} className="flex justify-start gap-4">
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-[var(--accent)] to-[var(--accent-secondary)]">
-                        <Bot className="h-4 w-4 text-white" />
+                    <div key={item.id} className="flex justify-start gap-3">
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+                        <Bot className="h-4 w-4 text-indigo-400" />
                       </div>
-                      <div className="max-w-[80%] rounded-lg bg-[var(--background-secondary)] px-4 py-3 text-[var(--foreground)]">
-                        <div className="mb-2 flex items-center gap-2 text-xs text-[var(--foreground-muted)]">
+                      <div className="max-w-[80%] rounded-2xl rounded-bl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+                        <div className="mb-2 flex items-center gap-2 text-xs text-white/40">
                           <StatusIcon
                             className={cn(
                               'h-3 w-3',
-                              item.success ? 'text-[var(--success)]' : 'text-[var(--error)]',
+                              item.success ? 'text-emerald-400' : 'text-red-400',
                             )}
                           />
                           <span>{item.success ? 'Completed' : 'Failed'}</span>
                           {displayModel && (
                             <>
                               <span>•</span>
-                              <span className="font-mono truncate max-w-[150px]" title={item.model ?? undefined}>{displayModel}</span>
+                              <span className="font-mono truncate max-w-[120px]" title={item.model ?? undefined}>{displayModel}</span>
                             </>
                           )}
                           {item.costCents > 0 && (
                             <>
                               <span>•</span>
-                              <span className="text-[var(--success)]">${(item.costCents / 100).toFixed(4)}</span>
+                              <span className="text-emerald-400">${(item.costCents / 100).toFixed(4)}</span>
                             </>
                           )}
                         </div>
-                        <div className="prose prose-sm prose-invert max-w-none text-sm [&_p]:my-2 [&_a]:text-[var(--accent)] [&_a]:underline [&_strong]:text-[var(--foreground)] [&_code]:bg-[var(--background-tertiary)] [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded">
+                        <div className="prose-glass text-sm [&_p]:my-2 [&_code]:text-xs">
                           <Markdown>{item.content}</Markdown>
                         </div>
                       </div>
@@ -348,17 +352,17 @@ export default function ControlClient() {
                     const confirmed = item.result as OptionListSelection | undefined;
 
                     return (
-                      <div key={item.id} className="flex justify-start gap-4">
-                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-[var(--accent)] to-[var(--accent-secondary)]">
-                          <Bot className="h-4 w-4 text-white" />
+                      <div key={item.id} className="flex justify-start gap-3">
+                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+                          <Bot className="h-4 w-4 text-indigo-400" />
                         </div>
-                        <div className="max-w-[80%] rounded-lg bg-[var(--background-secondary)] px-4 py-3 text-[var(--foreground)]">
-                          <div className="mb-2 text-xs text-[var(--foreground-muted)]">
-                            Tool UI: <span className="font-mono">{item.name}</span>
+                        <div className="max-w-[80%] rounded-2xl rounded-bl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+                          <div className="mb-2 text-xs text-white/40">
+                            Tool: <span className="font-mono text-indigo-400">{item.name}</span>
                           </div>
 
                           {parseErr || !optionList ? (
-                            <div className="rounded-lg border border-[var(--border)] bg-[var(--background-tertiary)] p-3 text-sm text-[var(--error)]">
+                            <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
                               {parseErr ?? 'Failed to render OptionList'}
                             </div>
                           ) : (
@@ -368,7 +372,6 @@ export default function ControlClient() {
                                 value={undefined}
                                 confirmed={confirmed}
                                 onConfirm={async (selection) => {
-                                  // Optimistic receipt state.
                                   setItems((prev) =>
                                     prev.map((it) =>
                                       it.kind === 'tool' && it.toolCallId === toolCallId
@@ -409,13 +412,13 @@ export default function ControlClient() {
                     const dataTable = parseSerializableDataTable(rawArgs);
 
                     return (
-                      <div key={item.id} className="flex justify-start gap-4">
-                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-[var(--accent)] to-[var(--accent-secondary)]">
-                          <Bot className="h-4 w-4 text-white" />
+                      <div key={item.id} className="flex justify-start gap-3">
+                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+                          <Bot className="h-4 w-4 text-indigo-400" />
                         </div>
-                        <div className="max-w-[90%] rounded-lg bg-[var(--background-secondary)] px-4 py-3 text-[var(--foreground)]">
-                          <div className="mb-2 text-xs text-[var(--foreground-muted)]">
-                            Tool UI: <span className="font-mono">{item.name}</span>
+                        <div className="max-w-[90%] rounded-2xl rounded-bl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+                          <div className="mb-2 text-xs text-white/40">
+                            Tool: <span className="font-mono text-indigo-400">{item.name}</span>
                           </div>
                           {dataTable ? (
                             <DataTable
@@ -425,7 +428,7 @@ export default function ControlClient() {
                               rows={dataTable.rows}
                             />
                           ) : (
-                            <div className="rounded-lg border border-[var(--border)] bg-[var(--background-tertiary)] p-3 text-sm text-[var(--error)]">
+                            <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
                               Failed to render DataTable
                             </div>
                           )}
@@ -436,13 +439,13 @@ export default function ControlClient() {
 
                   // Unknown UI tool.
                   return (
-                    <div key={item.id} className="flex justify-start gap-4">
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-[var(--accent)] to-[var(--accent-secondary)]">
-                        <Bot className="h-4 w-4 text-white" />
+                    <div key={item.id} className="flex justify-start gap-3">
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+                        <Bot className="h-4 w-4 text-indigo-400" />
                       </div>
-                      <div className="max-w-[80%] rounded-lg bg-[var(--background-secondary)] px-4 py-3 text-[var(--foreground)]">
-                        <p className="text-sm">
-                          Unsupported Tool UI: <span className="font-mono">{item.name}</span>
+                      <div className="max-w-[80%] rounded-2xl rounded-bl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+                        <p className="text-sm text-white/60">
+                          Unsupported Tool: <span className="font-mono text-indigo-400">{item.name}</span>
                         </p>
                       </div>
                     </div>
@@ -451,12 +454,12 @@ export default function ControlClient() {
 
                 // system
                 return (
-                  <div key={item.id} className="flex justify-start gap-4">
-                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--background-tertiary)]">
-                      <Ban className="h-4 w-4 text-[var(--foreground-muted)]" />
+                  <div key={item.id} className="flex justify-start gap-3">
+                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.04]">
+                      <Ban className="h-4 w-4 text-white/40" />
                     </div>
-                    <div className="max-w-[80%] rounded-lg bg-[var(--background-tertiary)] px-4 py-3 text-[var(--foreground)]">
-                      <p className="whitespace-pre-wrap text-sm">{item.content}</p>
+                    <div className="max-w-[80%] rounded-2xl rounded-bl-md bg-white/[0.02] border border-white/[0.04] px-4 py-3">
+                      <p className="whitespace-pre-wrap text-sm text-white/60">{item.content}</p>
                     </div>
                   </div>
                 );
@@ -466,21 +469,22 @@ export default function ControlClient() {
           )}
         </div>
 
-        <div className="border-t border-[var(--border)] bg-[var(--background-secondary)]/40 backdrop-blur p-4">
+        {/* Input */}
+        <div className="border-t border-white/[0.06] bg-white/[0.01] p-4">
           <form onSubmit={handleSubmit} className="mx-auto flex max-w-3xl gap-3">
             <input
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               placeholder="Message the root agent…"
-              className="flex-1 rounded-lg border border-[var(--border)] bg-[var(--background)]/60 px-4 py-3 text-sm text-[var(--foreground)] placeholder-[var(--foreground-muted)] focus:border-[var(--accent)] focus:outline-none"
+              className="flex-1 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
             />
 
             {isBusy ? (
               <button
                 type="button"
                 onClick={handleStop}
-                className="flex items-center gap-2 rounded-lg bg-[var(--error)] px-4 py-3 text-sm font-medium text-white transition-colors hover:bg-[var(--error)]/90"
+                className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors"
               >
                 <Square className="h-4 w-4" />
                 Stop
@@ -489,7 +493,7 @@ export default function ControlClient() {
               <button
                 type="submit"
                 disabled={!input.trim()}
-                className="flex items-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-3 text-sm font-medium text-white transition-colors hover:bg-[var(--accent)]/90 disabled:opacity-50"
+                className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Send className="h-4 w-4" />
                 Send

@@ -5,8 +5,18 @@
 Open Agent is a minimal autonomous coding agent implemented in Rust. It is designed to be:
 - **AI-maintainable**: Rust's strong type system and compiler provide immediate feedback
 - **Self-contained**: No external dependencies beyond OpenRouter for LLM access
-- **Full-access**: Has complete access to the local machine (filesystem, terminal, network)
+- **Full system access**: Has complete access to the entire machine (filesystem, terminal, network) - not containerized to a single project
 - **Provable**: Code structured for future formal verification in Lean
+
+### System-Wide Access Model
+
+The agent has **full system access** by design:
+- Can read/write any file anywhere on the machine using absolute paths
+- Can execute any shell command in any directory
+- Can search for files/content across the entire filesystem
+- Default working directory is `/root` in production (configurable via `WORKING_DIR`)
+- Paths can be absolute (e.g., `/var/log/syslog`) or relative to the working directory
+- Agent can create helper tools/scripts in `/root/tools/` for reuse
 
 ## Architecture (v2: Hierarchical Agent Tree)
 
@@ -376,7 +386,9 @@ GET  /api/memory/search     - Semantic search across memory
 ```
 OPENROUTER_API_KEY       - Required. Your OpenRouter API key
 DEFAULT_MODEL            - Optional. Default: anthropic/claude-sonnet-4.5
-WORKSPACE_PATH           - Optional. Default: current directory
+WORKING_DIR              - Optional. Default working directory for relative paths.
+                           Defaults to /root in production, current directory in dev.
+                           Agent has full system access regardless of this setting.
 HOST                     - Optional. Default: 127.0.0.1
 PORT                     - Optional. Default: 3000
 MAX_ITERATIONS           - Optional. Default: 50
@@ -423,17 +435,18 @@ The cursor agent has SSH access to the production server and can:
 
 ## Security Considerations
 
-This agent has **full machine access**. It can:
-- Read/write any file the process can access
-- Execute any shell command
+This agent has **full machine access** by design. It can:
+- Read/write any file on the system
+- Execute any shell command in any directory
 - Make network requests
+- Search the entire filesystem
 
-When deploying:
-- Run as a limited user
-- Use workspace isolation
-- Consider a sandbox for terminal commands
+This is intentional - the agent is designed to be a powerful system-wide assistant, not a sandboxed tool. When deploying:
+- Run on a dedicated server/VM (production runs on `95.216.112.253`)
 - Never expose the API publicly without authentication
+- Use the built-in JWT auth system (`DASHBOARD_PASSWORD`, `JWT_SECRET`)
 - Keep `.env` out of version control
+- The agent's default working directory is `/root` with tools stored in `/root/tools/`
 
 ## Future Work
 

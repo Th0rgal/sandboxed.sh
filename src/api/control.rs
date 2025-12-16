@@ -515,7 +515,7 @@ async fn run_single_control_turn(
         llm,
         tools,
         pricing,
-        config.workspace_path.clone(),
+        config.working_dir.clone(),
         memory,
     );
     ctx.control_events = Some(events_tx);

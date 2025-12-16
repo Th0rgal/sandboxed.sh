@@ -1,6 +1,6 @@
 //! Calibration harness for Open Agent estimators.
 //!
-//! This binary runs trial tasks in a temporary workspace and measures:
+//! This binary runs trial tasks in a temporary directory and measures:
 //! - ComplexityEstimator: predicted tokens vs actual tokens used by TaskExecutor
 //! - Split decision quality (against a small labeled set)
 //!
@@ -11,11 +11,11 @@
 //!
 //! ```bash
 //! export OPENROUTER_API_KEY="..."
-//! cargo run --release --bin calibrate -- --workspace /tmp/open_agent_calibration --model openai/gpt-4.1-mini
+//! cargo run --release --bin calibrate -- --working-dir /tmp/open_agent_calibration --model openai/gpt-4.1-mini
 //! ```
 //!
 //! Notes:
-//! - This will create and delete files under the given workspace.
+//! - This will create and delete files under the given directory.
 //! - Costs real money. Keep the task set small.
 
 use std::path::{Path, PathBuf};
@@ -38,23 +38,23 @@ struct CalibTask {
 }
 
 fn parse_args() -> (PathBuf, String, bool) {
-    let mut workspace = None::<PathBuf>;
+    let mut working_dir = None::<PathBuf>;
     let mut model = None::<String>;
     let mut write_tuning = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--workspace" => workspace = args.next().map(PathBuf::from),
+            "--working-dir" | "--workspace" => working_dir = args.next().map(PathBuf::from),
             "--model" => model = args.next(),
             "--write-tuning" => write_tuning = true,
             _ => {}
         }
     }
 
-    let workspace = workspace.unwrap_or_else(|| PathBuf::from("./.open_agent_calibration"));
+    let working_dir = working_dir.unwrap_or_else(|| PathBuf::from("./.open_agent_calibration"));
     let model = model.unwrap_or_else(|| "openai/gpt-4.1-mini".to_string());
-    (workspace, model, write_tuning)
+    (working_dir, model, write_tuning)
 }
 
 fn task_set() -> Vec<CalibTask> {
@@ -100,7 +100,7 @@ async fn ensure_clean_dir(dir: &Path) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (workspace_root, exec_model, write_tuning) = parse_args();
+    let (working_dir_root, exec_model, write_tuning) = parse_args();
 
     let api_key = std::env::var("OPENROUTER_API_KEY")
         .map_err(|_| anyhow::anyhow!("OPENROUTER_API_KEY must be set for calibration"))?;
@@ -127,23 +127,23 @@ async fn main() -> anyhow::Result<()> {
                 let mut correct_split = 0usize;
 
                 for t in &tasks {
-                    let ws = workspace_root.join(format!(
+                    let wd = working_dir_root.join(format!(
                         "{}_st{}_tm{}",
                         t.name,
                         (split_threshold * 100.0) as u64,
                         (token_mult * 100.0) as u64
                     ));
-                    ensure_clean_dir(&ws).await?;
+                    ensure_clean_dir(&wd).await?;
 
                     // Minimal config for context.
-                    let cfg = Config::new("<redacted>".to_string(), exec_model.clone(), ws.clone());
+                    let cfg = Config::new("<redacted>".to_string(), exec_model.clone(), wd.clone());
 
                     let ctx = AgentContext::new(
                         cfg,
                         Arc::clone(&llm),
                         ToolRegistry::new(),
                         Arc::clone(&pricing),
-                        ws.clone(),
+                        wd.clone(),
                     );
 
                     // Build task with generous budget.
@@ -231,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
                 split_threshold,
                 token_multiplier: token_mult,
             };
-            let path = tuning.save_to_workspace(&workspace_root).await?;
+            let path = tuning.save_to_working_dir(&working_dir_root).await?;
             println!("Wrote tuning file to {}", path.to_string_lossy());
         }
     } else {

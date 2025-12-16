@@ -13,15 +13,25 @@ interface StatsCardProps {
     isPositive: boolean;
   };
   className?: string;
-  color?: 'default' | 'success' | 'warning' | 'error' | 'info';
+  color?: 'default' | 'success' | 'warning' | 'error' | 'info' | 'accent';
 }
 
-const colorClasses = {
-  default: 'text-[var(--foreground)]',
-  success: 'text-[var(--success)]',
-  warning: 'text-[var(--warning)]',
-  error: 'text-[var(--error)]',
-  info: 'text-[var(--info)]',
+const labelColors = {
+  default: 'text-white/40',
+  success: 'text-emerald-400',
+  warning: 'text-amber-400',
+  error: 'text-red-400',
+  info: 'text-blue-400',
+  accent: 'text-indigo-400',
+};
+
+const valueColors = {
+  default: 'text-white',
+  success: 'text-emerald-400',
+  warning: 'text-amber-400',
+  error: 'text-red-400',
+  info: 'text-blue-400',
+  accent: 'text-indigo-400',
 };
 
 export function StatsCard({
@@ -36,26 +46,26 @@ export function StatsCard({
   return (
     <div
       className={cn(
-        'panel rounded-lg p-5',
+        'stat-panel',
         className
       )}
     >
       <div className="flex items-start justify-between">
-        <div>
-          <p className="text-xs font-medium uppercase tracking-wider text-[var(--foreground-muted)]">
+        <div className="flex-1">
+          <p className={cn('stat-label', labelColors[color])}>
             {title}
           </p>
-          <div className="mt-2 flex items-baseline gap-2">
-            <p className={cn('text-3xl font-bold', colorClasses[color])}>{value}</p>
+          <div className="mt-1 flex items-baseline gap-1">
+            <p className={cn('stat-value', valueColors[color])}>{value}</p>
             {subtitle && (
-              <span className="text-sm text-[var(--foreground-muted)]">{subtitle}</span>
+              <span className="stat-suffix">{subtitle}</span>
             )}
           </div>
           {trend && (
             <p
               className={cn(
                 'mt-1 text-xs',
-                trend.isPositive ? 'text-[var(--success)]' : 'text-[var(--error)]'
+                trend.isPositive ? 'text-emerald-400' : 'text-red-400'
               )}
             >
               {trend.isPositive ? '↑' : '↓'} {Math.abs(trend.value)}%
@@ -63,12 +73,11 @@ export function StatsCard({
           )}
         </div>
         {Icon && (
-          <div className="rounded-md bg-[var(--background-tertiary)]/70 p-2">
-            <Icon className="h-5 w-5 text-[var(--foreground-muted)]" />
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/[0.04]">
+            <Icon className="h-5 w-5 text-white/40" />
           </div>
         )}
       </div>
     </div>
   );
 }
-

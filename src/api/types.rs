@@ -12,8 +12,8 @@ pub struct CreateTaskRequest {
     /// Optional model override (uses default if not specified)
     pub model: Option<String>,
 
-    /// Optional workspace path override
-    pub workspace_path: Option<String>,
+    /// Optional working directory for relative paths (agent has full system access regardless)
+    pub working_dir: Option<String>,
 
     /// Optional budget in cents (default: 1000 = $10)
     pub budget_cents: Option<u64>,

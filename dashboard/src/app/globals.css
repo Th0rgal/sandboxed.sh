@@ -21,36 +21,50 @@
   font-display: swap;
 }
 
+/* =========================================================================
+   Design System: "Quiet Luxury + Liquid Glass"
+   ========================================================================= */
+
 :root {
-  --background: #0d0d12;
-  --background-secondary: #15151d;
-  --background-tertiary: #1a1a24;
-  --foreground: #e4e4e7;
-  --foreground-muted: #71717a;
-  --border: #27272a;
-  --border-light: #3f3f46;
-  /* Blue (Vercel/shadcn-ish) accents */
-  --accent: #3b82f6;
-  --accent-secondary: #2563eb;
-  --success: #22c55e;
-  --warning: #f59e0b;
-  --error: #ef4444;
-  --info: #3b82f6;
+  /* Backgrounds (dark mode) - No pure black */
+  --background: 18 18 20;          /* #121214 - primary surface */
+  --background-elevated: 28 28 30; /* #1C1C1E - cards, panels */
+  --background-tertiary: 44 44 46; /* #2C2C2E - nested elements */
+
+  /* Text Hierarchy */
+  --foreground: 255 255 255;           /* Primary text - white */
+  --foreground-secondary: 160 160 165; /* #A0A0A5 - secondary text */
+  --foreground-tertiary: 110 110 115;  /* #6E6E73 - tertiary/disabled */
+  --foreground-muted: 72 72 77;        /* #48484D - very subtle */
+
+  /* Accent (single accent color - Indigo) */
+  --accent: 99 102 241;  /* Indigo-500 (#6366F1) */
+
+  /* Semantic Colors */
+  --success: 34 197 94;   /* #22C55E - emerald/green */
+  --warning: 234 179 8;   /* #EAB308 - amber */
+  --error: 239 68 68;     /* #EF4444 - red */
+  --info: 59 130 246;     /* #3B82F6 - blue */
+
+  /* Borders - subtle */
+  --border: 255 255 255;  /* Used with /0.06 */
+  --border-elevated: 255 255 255; /* Used with /0.08 */
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-card: var(--background-secondary);
-  --color-card-foreground: var(--foreground);
-  --color-muted: var(--background-tertiary);
-  --color-muted-foreground: var(--foreground-muted);
-  --color-border: var(--border);
+  --color-background: rgb(var(--background));
+  --color-foreground: rgb(var(--foreground));
+  --color-card: rgb(var(--background-elevated));
+  --color-card-foreground: rgb(var(--foreground));
+  --color-muted: rgb(var(--background-tertiary));
+  --color-muted-foreground: rgb(var(--foreground-muted));
+  --color-border: rgb(var(--border) / 0.06);
+  --color-border-elevated: rgb(var(--border-elevated) / 0.08);
 
-  --color-primary: var(--accent);
+  --color-primary: rgb(var(--accent));
   --color-primary-foreground: #ffffff;
 
-  --color-destructive: var(--error);
+  --color-destructive: rgb(var(--error));
   --color-destructive-foreground: #ffffff;
 
   --font-sans: var(--font-geist-sans);
@@ -62,128 +76,284 @@
 }
 
 body {
-  background-color: var(--background);
-  /* Subtle grid + spotlight, keeping a “liquid glass” vibe but with straight lines */
-  background-image:
-    radial-gradient(900px 450px at 20% -10%, rgba(59, 130, 246, 0.18), transparent 60%),
-    radial-gradient(700px 360px at 85% 0%, rgba(37, 99, 235, 0.12), transparent 55%),
-    linear-gradient(to bottom, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
-    linear-gradient(to right, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
-  background-size: auto, auto, 64px 64px, 64px 64px;
-  background-position: 0 0, 0 0, 0 0, 0 0;
-  background-attachment: fixed;
-  color: var(--foreground);
-  font-family: var(--font-sans), ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background-color: rgb(var(--background));
+  color: rgb(var(--foreground));
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, 
+               "Helvetica Neue", Arial, sans-serif;
   min-height: 100vh;
 }
 
-/* Accessible, consistent focus treatment (shadcn-ish) */
-:focus-visible {
-  outline: 2px solid rgba(59, 130, 246, 0.55);
-  outline-offset: 2px;
+/* =========================================================================
+   Focus States - subtle background changes, no outlines
+   ========================================================================= */
+*:focus-visible {
+  outline: none;
+}
+
+button:focus-visible,
+a:focus-visible {
+  background-color: rgba(255, 255, 255, 0.06) !important;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  border-color: rgb(var(--accent) / 0.5) !important;
 }
 
 ::selection {
-  background: rgba(59, 130, 246, 0.25);
+  background: rgb(var(--accent) / 0.25);
 }
 
-/* Custom scrollbar */
+/* =========================================================================
+   Scrollbars - minimal, subtle
+   ========================================================================= */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--background-secondary);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--border-light);
+  background: rgb(var(--foreground-muted));
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--foreground-muted);
+  background: rgb(var(--foreground-tertiary));
 }
 
-@keyframes pulse-glow {
-  0%, 100% {
-    opacity: 0.5;
-    filter: blur(20px);
-  }
-  50% {
-    opacity: 0.8;
-    filter: blur(30px);
-  }
+/* =========================================================================
+   Animations
+   ========================================================================= */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
-@keyframes fade-in-up {
-  from {
-    opacity: 0;
-    transform: translateY(20px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
-.animate-fade-in-up {
-  animation: fade-in-up 0.5s ease-out forwards;
+@keyframes slide-in-right {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: translateX(0); }
 }
 
-.animate-pulse-glow {
-  animation: pulse-glow 4s ease-in-out infinite;
+@keyframes pulse-subtle {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 
-/* Status badge colors */
-.status-running {
-  background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+.animate-fade-in {
+  animation: fade-in 150ms ease-out forwards;
 }
 
-.status-completed {
-  background: var(--success);
+.animate-slide-up {
+  animation: slide-up 200ms ease-out forwards;
 }
 
-.status-failed {
-  background: var(--error);
+.animate-slide-in-right {
+  animation: slide-in-right 200ms ease-out forwards;
 }
 
-.status-pending {
-  background: var(--warning);
+.animate-pulse-subtle {
+  animation: pulse-subtle 2s ease-in-out infinite;
 }
 
-.status-cancelled {
-  background: var(--foreground-muted);
-}
-
-/* Glass effect */
-.panel,
-.glass {
-  background: rgba(21, 21, 29, 0.72);
-  backdrop-filter: blur(14px);
+/* =========================================================================
+   Glass Panels
+   ========================================================================= */
+.glass-panel {
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(20px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.06);
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.04) inset,
-    0 20px 60px rgba(0, 0, 0, 0.35);
 }
 
-.panel-strong {
-  background: rgba(21, 21, 29, 0.9);
+.glass {
+  background: rgb(var(--background-elevated) / 0.7);
+  backdrop-filter: blur(20px) saturate(180%);
+}
+
+/* Legacy panel class - maps to glass-panel */
+.panel {
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* =========================================================================
+   Cards - elevation via color, not shadows
+   ========================================================================= */
+.card {
+  padding: 1rem;
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  transition: background-color 150ms ease-out, border-color 150ms ease-out;
+}
+
+.card:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.card-interactive {
+  cursor: pointer;
+}
+
+/* =========================================================================
+   Stat Panels
+   ========================================================================= */
+.stat-panel {
+  padding: 1rem;
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.03);
   border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(20px);
 }
 
-/* Gradient text */
-.gradient-text {
-  background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+.stat-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: rgb(var(--accent));
+  margin-bottom: 0.25rem;
 }
 
-/* XTerm: eliminate leftover pixel gap at bottom */
+.stat-value {
+  font-size: 1.5rem;
+  font-weight: 300;
+  color: white;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-suffix {
+  font-size: 0.875rem;
+  color: rgba(255, 255, 255, 0.5);
+  margin-left: 0.125rem;
+}
+
+/* =========================================================================
+   Toggle Switches
+   ========================================================================= */
+.toggle {
+  position: relative;
+  height: 1.25rem;
+  width: 2.25rem;
+  border-radius: 9999px;
+  transition: background-color 150ms ease-out;
+  cursor: pointer;
+}
+
+.toggle-off {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.toggle-on {
+  background: rgb(var(--success));
+}
+
+.toggle-thumb {
+  position: absolute;
+  top: 0.125rem;
+  height: 1rem;
+  width: 1rem;
+  border-radius: 9999px;
+  background: white;
+  transition: transform 150ms ease-out;
+}
+
+.toggle-off .toggle-thumb {
+  left: 0.125rem;
+}
+
+.toggle-on .toggle-thumb {
+  transform: translateX(1rem);
+  left: 0.125rem;
+}
+
+/* =========================================================================
+   Status Indicators
+   ========================================================================= */
+.status-dot {
+  width: 0.375rem;
+  height: 0.375rem;
+  border-radius: 9999px;
+}
+
+.status-connected { background: rgb(var(--success)); }
+.status-disconnected { background: rgb(var(--error)); }
+.status-warning { background: rgb(var(--warning)); }
+.status-info { background: rgb(var(--info)); }
+
+/* =========================================================================
+   Badges/Tags
+   ========================================================================= */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.625rem;
+  border-radius: 0.375rem;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+}
+
+.tag {
+  padding: 0.125rem 0.375rem;
+  border-radius: 0.25rem;
+  font-size: 9px;
+  color: rgba(255, 255, 255, 0.4);
+  background: rgba(255, 255, 255, 0.04);
+  font-family: var(--font-mono);
+}
+
+/* =========================================================================
+   XTerm Terminal Fixes
+   ========================================================================= */
 .xterm,
 .xterm .xterm-screen,
 .xterm .xterm-viewport {
   height: 100%;
+}
+
+/* =========================================================================
+   Prose styles for markdown
+   ========================================================================= */
+.prose-glass {
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.prose-glass strong {
+  color: white;
+}
+
+.prose-glass a {
+  color: rgb(var(--accent));
+  text-decoration: underline;
+}
+
+.prose-glass code {
+  background: rgb(var(--background-tertiary));
+  padding: 0.125rem 0.25rem;
+  border-radius: 0.25rem;
+  font-size: 0.875em;
+}
+
+.prose-glass pre {
+  background: rgb(var(--background-tertiary));
+  border-radius: 0.5rem;
+  padding: 1rem;
+  overflow-x: auto;
+}
+
+.prose-glass pre code {
+  background: transparent;
+  padding: 0;
 }

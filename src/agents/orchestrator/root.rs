@@ -6,28 +6,28 @@
 //! 3. Decide: execute directly or split into subtasks
 //! 4. Delegate to appropriate children
 //! 5. Aggregate results
-//! 6. Handle failures with smart retry strategy
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::agents::tuning::TuningParams;
 use crate::agents::{
+    Agent, AgentContext, AgentId, AgentRef, AgentResult, AgentType, Complexity,
+    OrchestratorAgent,
     leaf::{ComplexityEstimator, ModelSelector, TaskExecutor, Verifier},
-    Agent, AgentContext, AgentId, AgentRef, AgentResult, AgentType, Complexity, OrchestratorAgent,
 };
-use crate::budget::{Budget, RetryConfig, RetryRecommendation};
-use crate::task::{Subtask, SubtaskPlan, Task, VerificationCriteria};
+use crate::agents::tuning::TuningParams;
+use crate::budget::Budget;
+use crate::task::{Task, Subtask, SubtaskPlan, VerificationCriteria};
 
 /// Root agent - the top of the agent tree.
-///
+/// 
 /// # Task Processing Flow
 /// ```text
 /// 1. Estimate complexity (ComplexityEstimator)
 /// 2. If simple: execute directly (TaskExecutor)
-/// 3. If complex:
+/// 3. If complex: 
 ///    a. Split into subtasks (LLM-based)
 ///    b. Select model for each subtask (ModelSelector)
 ///    c. Execute subtasks (TaskExecutor)
@@ -36,7 +36,7 @@ use crate::task::{Subtask, SubtaskPlan, Task, VerificationCriteria};
 /// ```
 pub struct RootAgent {
     id: AgentId,
-
+    
     // Child agents
     complexity_estimator: Arc<ComplexityEstimator>,
     model_selector: Arc<ModelSelector>,
@@ -69,18 +69,27 @@ impl RootAgent {
         }
     }
 
+    /// Estimate complexity of a task.
+    async fn estimate_complexity(&self, task: &mut Task, ctx: &AgentContext) -> Complexity {
+        let result = self.complexity_estimator.execute(task, ctx).await;
+        
+        if let Some(data) = result.data {
+            let score = data["score"].as_f64().unwrap_or(0.5);
+            let reasoning = data["reasoning"].as_str().unwrap_or("").to_string();
+            let estimated_tokens = data["estimated_tokens"].as_u64().unwrap_or(2000);
+            let should_split = data["should_split"].as_bool().unwrap_or(false);
+            
+            Complexity::new(score, reasoning, estimated_tokens)
+                .with_split(should_split)
+        } else {
+            Complexity::moderate("Could not estimate complexity")
+        }
+    }
+
     /// Split a complex task into subtasks.
-    ///
+    /// 
     /// Uses LLM to analyze the task and propose subtasks.
-    ///
-    /// # Returns
-    /// A tuple of (SubtaskPlan, actual_cost_cents) on success.
-    async fn split_task(
-        &self,
-        task: &Task,
-        ctx: &AgentContext,
-    ) -> Result<(SubtaskPlan, u64), AgentResult> {
-        let model = "anthropic/claude-sonnet-4.5";
+    async fn split_task(&self, task: &Task, ctx: &AgentContext) -> Result<SubtaskPlan, AgentResult> {
         let prompt = format!(
             r#"You are a task planner. Break down this task into smaller, manageable subtasks.
 
@@ -111,9 +120,7 @@ Respond ONLY with the JSON object."#,
         let messages = vec![
             crate::llm::ChatMessage {
                 role: crate::llm::Role::System,
-                content: Some(
-                    "You are a precise task planner. Respond only with JSON.".to_string(),
-                ),
+                content: Some("You are a precise task planner. Respond only with JSON.".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -125,29 +132,13 @@ Respond ONLY with the JSON object."#,
             },
         ];
 
-        let response = ctx
-            .llm
-            .chat_completion(model, &messages, None)
+        let response = ctx.llm
+            .chat_completion("openai/gpt-4.1-mini", &messages, None)
             .await
             .map_err(|e| AgentResult::failure(format!("LLM error: {}", e), 1))?;
 
-        // Calculate actual cost from token usage
-        let actual_cost_cents = if let Some(usage) = &response.usage {
-            if let Some(pricing) = ctx.pricing.get_pricing(model).await {
-                pricing.calculate_cost_cents(usage.prompt_tokens, usage.completion_tokens)
-            } else {
-                // Fallback: estimate based on typical rates if pricing unavailable
-                let estimated = (usage.total_tokens as f64 * 0.00001 * 100.0).ceil() as u64;
-                estimated.max(1)
-            }
-        } else {
-            // No usage data available, use conservative estimate
-            2
-        };
-
         let content = response.content.unwrap_or_default();
-        let plan = self.parse_subtask_plan(&content, task.id())?;
-        Ok((plan, actual_cost_cents))
+        self.parse_subtask_plan(&content, task.id())
     }
 
     /// Parse LLM response into SubtaskPlan.
@@ -172,8 +163,12 @@ Respond ONLY with the JSON object."#,
                         let desc = s["description"].as_str().unwrap_or("").to_string();
                         let verification = s["verification"].as_str().unwrap_or("");
                         let weight = s["weight"].as_f64().unwrap_or(1.0);
-
-                        Subtask::new(desc, VerificationCriteria::llm_based(verification), weight)
+                        
+                        Subtask::new(
+                            desc,
+                            VerificationCriteria::llm_based(verification),
+                            weight,
+                        )
                     })
                     .collect()
             })
@@ -187,7 +182,7 @@ Respond ONLY with the JSON object."#,
             .map_err(|e| AgentResult::failure(format!("Invalid subtask plan: {}", e), 0))
     }
 
-    /// Execute subtasks and aggregate results with smart retry on failure.
+    /// Execute subtasks and aggregate results.
     async fn execute_subtasks(
         &self,
         subtask_plan: SubtaskPlan,
@@ -202,19 +197,45 @@ Respond ONLY with the JSON object."#,
 
         let mut results = Vec::new();
         let mut total_cost = 0u64;
-        let retry_config = RetryConfig::default();
 
-        // Execute each subtask with planning + verification + smart retry.
+        // Execute each subtask with planning + verification.
         for task in &mut tasks {
-            if ctx.is_cancelled() {
-                return AgentResult::failure("Cancelled", total_cost);
-            }
+            // 1) Estimate complexity (for token estimate) for this subtask.
+            let est = self.complexity_estimator.execute(task, ctx).await;
+            total_cost += est.cost_cents;
 
-            let subtask_result = self
-                .execute_single_subtask_with_retry(task, ctx, &retry_config)
-                .await;
-            total_cost += subtask_result.cost_cents;
-            results.push(subtask_result);
+            // 2) Select model based on complexity + subtask budget.
+            let sel = self.model_selector.execute(task, ctx).await;
+            total_cost += sel.cost_cents;
+
+            // 3) Execute.
+            let exec = self.task_executor.execute(task, ctx).await;
+            total_cost += exec.cost_cents;
+
+            // 4) Verify.
+            let ver = self.verifier.execute(task, ctx).await;
+            total_cost += ver.cost_cents;
+
+            let success = exec.success && ver.success;
+
+            results.push(
+                AgentResult {
+                    success,
+                    output: if ver.success {
+                        exec.output.clone()
+                    } else {
+                        format!("{}\n\nVerification failed: {}", exec.output, ver.output)
+                    },
+                    cost_cents: est.cost_cents + sel.cost_cents + exec.cost_cents + ver.cost_cents,
+                    model_used: exec.model_used.clone(),
+                    data: Some(json!({
+                        "complexity_estimate": est.data,
+                        "model_selection": sel.data,
+                        "execution": exec.data,
+                        "verification": ver.data,
+                    })),
+                }
+            );
         }
 
         // Aggregate results
@@ -246,243 +267,6 @@ Respond ONLY with the JSON object."#,
             }))
         }
     }
-
-    /// Execute a single subtask with smart retry on failure.
-    ///
-    /// Analyzes failure mode and retries with appropriate strategy:
-    /// - If model lacks capability: upgrade to smarter model
-    /// - If task needs more tokens: continue with same/cheaper model
-    async fn execute_single_subtask_with_retry(
-        &self,
-        task: &mut Task,
-        ctx: &AgentContext,
-        retry_config: &RetryConfig,
-    ) -> AgentResult {
-        let mut total_cost = 0u64;
-        let mut retry_count = 0u32;
-        let mut _last_result: Option<AgentResult> = None;
-        let mut retry_history = Vec::new();
-
-        loop {
-            if ctx.is_cancelled() {
-                return AgentResult::failure("Cancelled", total_cost);
-            }
-
-            // 1) Estimate complexity for this subtask.
-            let est = self.complexity_estimator.execute(task, ctx).await;
-            total_cost += est.cost_cents;
-
-            // 2) Select model based on complexity + subtask budget.
-            let sel = self.model_selector.execute(task, ctx).await;
-            total_cost += sel.cost_cents;
-
-            // 3) Execute with signal tracking.
-            let (exec, signals) = self.task_executor.execute_with_signals(task, ctx).await;
-            total_cost += exec.cost_cents;
-
-            // 4) Verify.
-            let ver = self.verifier.execute(task, ctx).await;
-            total_cost += ver.cost_cents;
-
-            let success = exec.success && ver.success;
-
-            let result = AgentResult {
-                success,
-                output: if ver.success {
-                    exec.output.clone()
-                } else {
-                    format!("{}\n\nVerification failed: {}", exec.output, ver.output)
-                },
-                cost_cents: est.cost_cents + sel.cost_cents + exec.cost_cents + ver.cost_cents,
-                model_used: exec.model_used.clone(),
-                data: Some(json!({
-                    "complexity_estimate": est.data,
-                    "model_selection": sel.data,
-                    "execution": exec.data,
-                    "verification": ver.data,
-                    "retry_count": retry_count,
-                    "retry_history": retry_history.clone(),
-                })),
-            };
-
-            // If successful, return immediately
-            if success {
-                return AgentResult {
-                    cost_cents: total_cost,
-                    ..result
-                };
-            }
-
-            // Analyze failure and decide retry strategy
-            let analysis = signals.analyze();
-
-            tracing::info!(
-                "Subtask failed - mode: {:?}, confidence: {:.2}, recommendation: {:?}",
-                analysis.mode,
-                analysis.confidence,
-                analysis.recommendation
-            );
-
-            // Check if we should retry
-            if retry_count >= retry_config.max_retries {
-                tracing::warn!(
-                    "Max retries ({}) reached for subtask",
-                    retry_config.max_retries
-                );
-                return AgentResult {
-                    cost_cents: total_cost,
-                    data: Some(json!({
-                        "original_result": result.data,
-                        "failure_analysis": {
-                            "mode": format!("{:?}", analysis.mode),
-                            "confidence": analysis.confidence,
-                            "evidence": analysis.evidence,
-                        },
-                        "retries_exhausted": true,
-                    })),
-                    ..result
-                };
-            }
-
-            // Apply retry strategy based on analysis
-            match &analysis.recommendation {
-                RetryRecommendation::UpgradeModel {
-                    suggested_model,
-                    additional_budget_cents,
-                    reason,
-                } => {
-                    if !retry_config.allow_model_upgrade {
-                        tracing::info!("Model upgrade disabled, not retrying");
-                        return AgentResult {
-                            cost_cents: total_cost,
-                            ..result
-                        };
-                    }
-
-                    if let Some(new_model) = suggested_model {
-                        tracing::info!(
-                            "Upgrading model from {} to {} - {}",
-                            signals.model_used,
-                            new_model,
-                            reason
-                        );
-                        task.analysis_mut().selected_model = Some(new_model.clone());
-
-                        // Allocate additional budget if possible
-                        let additional = (*additional_budget_cents).min(
-                            (task.budget().total_cents() as f64
-                                * retry_config.max_budget_multiplier)
-                                as u64,
-                        );
-                        if additional > 0 {
-                            // Note: In a real system, this would request budget from parent
-                            tracing::debug!(
-                                "Would request {} additional cents for retry",
-                                additional
-                            );
-                        }
-
-                        retry_history.push(json!({
-                            "retry": retry_count,
-                            "action": "upgrade_model",
-                            "from": signals.model_used,
-                            "to": new_model,
-                            "reason": reason,
-                        }));
-                    } else {
-                        // Already at top tier, can't upgrade
-                        tracing::warn!("Cannot upgrade model further, already at top tier");
-                        return AgentResult {
-                            cost_cents: total_cost,
-                            ..result
-                        };
-                    }
-                }
-
-                RetryRecommendation::TryCheaperModel {
-                    suggested_model,
-                    additional_budget_cents,
-                    reason,
-                } => {
-                    if !retry_config.allow_model_downgrade {
-                        tracing::info!("Model downgrade disabled, using same model");
-                    } else if let Some(new_model) = suggested_model {
-                        tracing::info!(
-                            "Trying cheaper model: {} -> {} - {}",
-                            signals.model_used,
-                            new_model,
-                            reason
-                        );
-                        task.analysis_mut().selected_model = Some(new_model.clone());
-
-                        retry_history.push(json!({
-                            "retry": retry_count,
-                            "action": "downgrade_model",
-                            "from": signals.model_used,
-                            "to": new_model,
-                            "reason": reason,
-                            "additional_budget": additional_budget_cents,
-                        }));
-                    }
-                }
-
-                RetryRecommendation::ContinueSameModel {
-                    additional_budget_cents,
-                    reason,
-                } => {
-                    tracing::info!(
-                        "Continuing with same model ({}) - {}",
-                        signals.model_used,
-                        reason
-                    );
-
-                    retry_history.push(json!({
-                        "retry": retry_count,
-                        "action": "continue_same",
-                        "model": signals.model_used,
-                        "reason": reason,
-                        "additional_budget": additional_budget_cents,
-                    }));
-                }
-
-                RetryRecommendation::RequestExtension {
-                    estimated_additional_cents,
-                    reason,
-                } => {
-                    tracing::warn!(
-                        "Task requires budget extension: {} cents - {}",
-                        estimated_additional_cents,
-                        reason
-                    );
-                    // For now, we don't support budget extensions, so fail
-                    return AgentResult {
-                        cost_cents: total_cost,
-                        data: Some(json!({
-                            "original_result": result.data,
-                            "failure_analysis": {
-                                "mode": format!("{:?}", analysis.mode),
-                                "recommendation": "request_extension",
-                                "estimated_additional_cents": estimated_additional_cents,
-                                "reason": reason,
-                            },
-                        })),
-                        ..result
-                    };
-                }
-
-                RetryRecommendation::DoNotRetry { reason } => {
-                    tracing::info!("Not retrying: {}", reason);
-                    return AgentResult {
-                        cost_cents: total_cost,
-                        ..result
-                    };
-                }
-            }
-
-            _last_result = Some(result);
-            retry_count += 1;
-        }
-    }
 }
 
 impl Default for RootAgent {
@@ -508,44 +292,28 @@ impl Agent for RootAgent {
     async fn execute(&self, task: &mut Task, ctx: &AgentContext) -> AgentResult {
         let mut total_cost = 0u64;
 
-        if ctx.is_cancelled() {
-            return AgentResult::failure("Cancelled", total_cost);
-        }
-
-        // Step 1: Estimate complexity (cost is tracked in the result)
-        let complexity_result = self.complexity_estimator.execute(task, ctx).await;
-        total_cost += complexity_result.cost_cents;
-
-        let complexity = if let Some(data) = &complexity_result.data {
-            let score = data["score"].as_f64().unwrap_or(0.5);
-            let reasoning = data["reasoning"].as_str().unwrap_or("").to_string();
-            let estimated_tokens = data["estimated_tokens"].as_u64().unwrap_or(2000);
-            let should_split = data["should_split"].as_bool().unwrap_or(false);
-
-            Complexity::new(score, reasoning, estimated_tokens).with_split(should_split)
-        } else {
-            Complexity::moderate("Could not estimate complexity")
-        };
+        // Step 1: Estimate complexity
+        let complexity = self.estimate_complexity(task, ctx).await;
+        // Cost already tracked inside ComplexityEstimator; we keep a small constant for now.
+        total_cost += 1;
 
         tracing::info!(
-            "Task complexity: {:.2} (should_split: {}, estimation_cost: {} cents)",
+            "Task complexity: {:.2} (should_split: {})",
             complexity.score(),
-            complexity.should_split(),
-            complexity_result.cost_cents
+            complexity.should_split()
         );
 
         // Step 2: Decide execution strategy
         if complexity.should_split() && ctx.can_split() {
             // Complex task: split and delegate
             match self.split_task(task, ctx).await {
-                Ok((plan, split_cost)) => {
-                    total_cost += split_cost;
-                    tracing::debug!("Task split cost: {} cents", split_cost);
-
+                Ok(plan) => {
+                    total_cost += 2; // Splitting cost
+                    
                     // Execute subtasks
                     let child_ctx = ctx.child_context();
                     let result = self.execute_subtasks(plan, task.budget(), &child_ctx).await;
-
+                    
                     return AgentResult {
                         success: result.success,
                         output: result.output,
@@ -561,206 +329,32 @@ impl Agent for RootAgent {
             }
         }
 
-        // Simple task or failed to split: execute directly with smart retry
-        let retry_config = RetryConfig::default();
-        let exec_result = self
-            .execute_direct_with_retry(task, ctx, &retry_config, &complexity)
-            .await;
+        // Simple task or failed to split: execute directly
+        // Step 2b: Select model (U-curve) for direct execution.
+        let sel = self.model_selector.execute(task, ctx).await;
+        total_cost += sel.cost_cents;
+
+        let result = self.task_executor.execute(task, ctx).await;
+
+        // Step 3: Verify (if verification criteria specified)
+        let verification = self.verifier.execute(task, ctx).await;
+        total_cost += verification.cost_cents;
 
         AgentResult {
-            cost_cents: total_cost + exec_result.cost_cents,
-            ..exec_result
-        }
-    }
-}
-
-impl RootAgent {
-    /// Execute a task directly (without subtask splitting) with smart retry on failure.
-    async fn execute_direct_with_retry(
-        &self,
-        task: &mut Task,
-        ctx: &AgentContext,
-        retry_config: &RetryConfig,
-        complexity: &Complexity,
-    ) -> AgentResult {
-        let mut total_cost = 0u64;
-        let mut retry_count = 0u32;
-        let mut retry_history = Vec::new();
-
-        loop {
-            if ctx.is_cancelled() {
-                return AgentResult::failure("Cancelled", total_cost);
-            }
-
-            // Select model (U-curve) for execution
-            let sel = self.model_selector.execute(task, ctx).await;
-            total_cost += sel.cost_cents;
-
-            // Execute with signal tracking
-            let (exec, signals) = self.task_executor.execute_with_signals(task, ctx).await;
-            total_cost += exec.cost_cents;
-
-            // Verify
-            let verification = self.verifier.execute(task, ctx).await;
-            total_cost += verification.cost_cents;
-
-            let success = exec.success && verification.success;
-
-            let result = AgentResult {
-                success,
-                output: if verification.success {
-                    exec.output.clone()
-                } else {
-                    format!(
-                        "{}\n\nVerification failed: {}",
-                        exec.output, verification.output
-                    )
-                },
-                cost_cents: total_cost,
-                model_used: exec.model_used.clone(),
-                data: json!({
-                    "complexity": complexity.score(),
-                    "was_split": false,
-                    "verification": verification.data,
-                    "execution": exec.data,
-                    "retry_count": retry_count,
-                    "retry_history": retry_history.clone(),
-                })
-                .into(),
-            };
-
-            // If successful, return immediately
-            if success {
-                return result;
-            }
-
-            // Analyze failure and decide retry strategy
-            let analysis = signals.analyze();
-
-            tracing::info!(
-                "Direct execution failed - mode: {:?}, confidence: {:.2}",
-                analysis.mode,
-                analysis.confidence
-            );
-
-            // Check if we should retry
-            if retry_count >= retry_config.max_retries {
-                tracing::warn!("Max retries ({}) reached", retry_config.max_retries);
-                return AgentResult {
-                    data: Some(json!({
-                        "original_result": result.data,
-                        "failure_analysis": {
-                            "mode": format!("{:?}", analysis.mode),
-                            "confidence": analysis.confidence,
-                            "evidence": analysis.evidence,
-                        },
-                        "retries_exhausted": true,
-                    })),
-                    ..result
-                };
-            }
-
-            // Apply retry strategy based on analysis
-            match &analysis.recommendation {
-                RetryRecommendation::UpgradeModel {
-                    suggested_model,
-                    reason,
-                    ..
-                } => {
-                    if !retry_config.allow_model_upgrade {
-                        tracing::info!("Model upgrade disabled, not retrying");
-                        return result;
-                    }
-
-                    if let Some(new_model) = suggested_model {
-                        tracing::info!(
-                            "Upgrading model: {} -> {} - {}",
-                            signals.model_used,
-                            new_model,
-                            reason
-                        );
-                        task.analysis_mut().selected_model = Some(new_model.clone());
-
-                        retry_history.push(json!({
-                            "retry": retry_count,
-                            "action": "upgrade_model",
-                            "from": signals.model_used,
-                            "to": new_model,
-                            "reason": reason,
-                        }));
-                    } else {
-                        tracing::warn!("Cannot upgrade model further");
-                        return result;
-                    }
-                }
-
-                RetryRecommendation::TryCheaperModel {
-                    suggested_model,
-                    reason,
-                    ..
-                } => {
-                    if !retry_config.allow_model_downgrade {
-                        // Continue with same model
-                        tracing::info!("Model downgrade disabled, continuing with same model");
-                    } else if let Some(new_model) = suggested_model {
-                        tracing::info!(
-                            "Trying cheaper model: {} -> {} - {}",
-                            signals.model_used,
-                            new_model,
-                            reason
-                        );
-                        task.analysis_mut().selected_model = Some(new_model.clone());
-
-                        retry_history.push(json!({
-                            "retry": retry_count,
-                            "action": "downgrade_model",
-                            "from": signals.model_used,
-                            "to": new_model,
-                            "reason": reason,
-                        }));
-                    }
-                }
-
-                RetryRecommendation::ContinueSameModel { reason, .. } => {
-                    tracing::info!("Continuing with same model - {}", reason);
-
-                    retry_history.push(json!({
-                        "retry": retry_count,
-                        "action": "continue_same",
-                        "model": signals.model_used,
-                        "reason": reason,
-                    }));
-                }
-
-                RetryRecommendation::RequestExtension {
-                    estimated_additional_cents,
-                    reason,
-                } => {
-                    tracing::warn!(
-                        "Budget extension needed: {} cents - {}",
-                        estimated_additional_cents,
-                        reason
-                    );
-                    return AgentResult {
-                        data: Some(json!({
-                            "original_result": result.data,
-                            "failure_analysis": {
-                                "mode": format!("{:?}", analysis.mode),
-                                "recommendation": "request_extension",
-                                "estimated_additional_cents": estimated_additional_cents,
-                            },
-                        })),
-                        ..result
-                    };
-                }
-
-                RetryRecommendation::DoNotRetry { reason } => {
-                    tracing::info!("Not retrying: {}", reason);
-                    return result;
-                }
-            }
-
-            retry_count += 1;
+            success: result.success && verification.success,
+            output: if verification.success {
+                result.output
+            } else {
+                format!("{}\n\nVerification failed: {}", result.output, verification.output)
+            },
+            cost_cents: total_cost + result.cost_cents,
+            model_used: result.model_used,
+            data: json!({
+                "complexity": complexity.score(),
+                "was_split": false,
+                "verification": verification.data,
+                "execution": result.data,
+            }).into(),
         }
     }
 }
@@ -778,9 +372,7 @@ impl OrchestratorAgent for RootAgent {
 
     fn find_child(&self, agent_type: AgentType) -> Option<AgentRef> {
         match agent_type {
-            AgentType::ComplexityEstimator => {
-                Some(Arc::clone(&self.complexity_estimator) as AgentRef)
-            }
+            AgentType::ComplexityEstimator => Some(Arc::clone(&self.complexity_estimator) as AgentRef),
             AgentType::ModelSelector => Some(Arc::clone(&self.model_selector) as AgentRef),
             AgentType::TaskExecutor => Some(Arc::clone(&self.task_executor) as AgentRef),
             AgentType::Verifier => Some(Arc::clone(&self.verifier) as AgentRef),
@@ -794,12 +386,13 @@ impl OrchestratorAgent for RootAgent {
 
     async fn delegate_all(&self, tasks: &mut [Task], ctx: &AgentContext) -> Vec<AgentResult> {
         let mut results = Vec::with_capacity(tasks.len());
-
+        
         for task in tasks {
             let result = self.task_executor.execute(task, ctx).await;
             results.push(result);
         }
-
+        
         results
     }
 }
+

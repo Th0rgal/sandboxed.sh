@@ -2,8 +2,8 @@
 //!
 //! Configuration can be set via environment variables:
 //! - `OPENROUTER_API_KEY` - Required. Your OpenRouter API key.
-//! - `DEFAULT_MODEL` - Optional. The default LLM model to use. Defaults to `openai/gpt-5-mini`.
-//! - `WORKSPACE_PATH` - Optional. The workspace directory. Defaults to current directory.
+//! - `DEFAULT_MODEL` - Optional. The default LLM model to use. Defaults to `anthropic/claude-sonnet-4.5`.
+//! - `WORKING_DIR` - Optional. Default working directory for relative paths. Defaults to `/root` in production, current directory in dev.
 //! - `HOST` - Optional. Server host. Defaults to `127.0.0.1`.
 //! - `PORT` - Optional. Server port. Defaults to `3000`.
 //! - `MAX_ITERATIONS` - Optional. Maximum agent loop iterations. Defaults to `50`.
@@ -17,6 +17,9 @@
 //! - `SUPABASE_SERVICE_ROLE_KEY` - Optional. Service role key for Supabase.
 //! - `MEMORY_EMBED_MODEL` - Optional. Embedding model. Defaults to `openai/text-embedding-3-small`.
 //! - `MEMORY_RERANK_MODEL` - Optional. Reranker model.
+//!
+//! Note: The agent has **full system access**. It can read/write any file, execute any command,
+//! and search anywhere on the machine. The `WORKING_DIR` is just the default for relative paths.
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -78,8 +81,9 @@ pub struct Config {
     /// Default LLM model identifier (OpenRouter format)
     pub default_model: String,
     
-    /// Workspace directory for file operations
-    pub workspace_path: PathBuf,
+    /// Default working directory for relative paths (agent has full system access regardless).
+    /// In production, this is typically `/root`. The agent can still access any path on the system.
+    pub working_dir: PathBuf,
     
     /// Server host
     pub host: String,
@@ -176,9 +180,17 @@ impl Config {
         let default_model = std::env::var("DEFAULT_MODEL")
             .unwrap_or_else(|_| "anthropic/claude-sonnet-4.5".to_string());
         
-        let workspace_path = std::env::var("WORKSPACE_PATH")
+        // WORKING_DIR: default working directory for relative paths.
+        // In production (release build), default to /root. In dev, default to current directory.
+        let working_dir = std::env::var("WORKING_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            .unwrap_or_else(|_| {
+                if cfg!(debug_assertions) {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                } else {
+                    PathBuf::from("/root")
+                }
+            });
         
         let host = std::env::var("HOST")
             .unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -252,7 +264,7 @@ impl Config {
         Ok(Self {
             api_key,
             default_model,
-            workspace_path,
+            working_dir,
             host,
             port,
             max_iterations,
@@ -267,12 +279,12 @@ impl Config {
     pub fn new(
         api_key: String,
         default_model: String,
-        workspace_path: PathBuf,
+        working_dir: PathBuf,
     ) -> Self {
         Self {
             api_key,
             default_model,
-            workspace_path,
+            working_dir,
             host: "127.0.0.1".to_string(),
             port: 3000,
             max_iterations: 50,
