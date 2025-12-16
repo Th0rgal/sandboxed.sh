@@ -3,10 +3,12 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { Terminal as XTerm } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
+import { toast } from "sonner";
 import "xterm/css/xterm.css";
 
 import { authHeader, getValidJwt } from "@/lib/auth";
 import { getRuntimeApiBase } from "@/lib/settings";
+import { CopyButton } from "@/components/ui/copy-button";
 
 type FsEntry = {
   name: string;
@@ -479,9 +481,12 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
       await uploadFiles(cwd, files, (done, total) =>
         setUploading({ done, total })
       );
+      toast.success(`Uploaded ${files.length} file${files.length > 1 ? 's' : ''}`);
       await refreshDir(cwd, true);
     } catch (err) {
-      setFsError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setFsError(message);
+      toast.error(`Upload failed: ${message}`);
     } finally {
       setUploading(null);
     }
@@ -620,8 +625,13 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
             const name = prompt("New folder name");
             if (!name) return;
             const target = cwd.endsWith("/") ? `${cwd}${name}` : `${cwd}/${name}`;
-            await mkdir(target);
-            await refreshDir(cwd, true);
+            try {
+              await mkdir(target);
+              toast.success(`Created folder ${name}`);
+              await refreshDir(cwd, true);
+            } catch (err) {
+              toast.error(`Failed to create folder: ${err instanceof Error ? err.message : String(err)}`);
+            }
           }}
           title="New folder"
         >
@@ -655,7 +665,8 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
       </div>
 
       {/* Breadcrumb navigation / Editable path */}
-      <div className="mb-2 flex items-center text-xs">
+      <div className="mb-2 flex items-center text-xs group">
+        <CopyButton text={cwd} label="Copied path" className="mr-1.5 opacity-60 group-hover:opacity-100" showOnHover={false} />
         {isEditingPath ? (
           <input
             ref={pathInputRef}
@@ -844,8 +855,13 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
                   className="flex h-6 items-center gap-1 rounded border border-red-500/30 bg-red-500/10 px-2 text-red-300 hover:bg-red-500/20"
                   onClick={async () => {
                     if (!confirm(`Delete ${selected.name}?`)) return;
-                    await rm(selected.path, selected.kind === "dir");
-                    await refreshDir(cwd, true);
+                    try {
+                      await rm(selected.path, selected.kind === "dir");
+                      toast.success(`Deleted ${selected.name}`);
+                      await refreshDir(cwd, true);
+                    } catch (err) {
+                      toast.error(`Failed to delete: ${err instanceof Error ? err.message : String(err)}`);
+                    }
                   }}
                   title="Delete"
                 >
@@ -862,13 +878,55 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
   );
 }
 
+const CONSOLE_TABS_KEY = 'console-tabs';
+
+function loadSavedTabs(): { tabs: Tab[]; activeTabId: string } | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const saved = localStorage.getItem(CONSOLE_TABS_KEY);
+    if (saved) {
+      const data = JSON.parse(saved);
+      if (data.tabs && data.tabs.length > 0 && data.activeTabId) {
+        return data;
+      }
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return null;
+}
+
+function saveTabs(tabs: Tab[], activeTabId: string) {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(CONSOLE_TABS_KEY, JSON.stringify({ tabs, activeTabId }));
+  } catch {
+    // ignore storage errors
+  }
+}
+
 export default function ConsoleClient() {
-  const [tabs, setTabs] = useState<Tab[]>([
-    { id: generateTabId(), type: "terminal", title: "Terminal 1" },
-    { id: generateTabId(), type: "files", title: "Files 1" },
-  ]);
-  const [activeTabId, setActiveTabId] = useState<string>(tabs[0].id);
+  // Initialize with saved tabs or default tabs
+  const [tabs, setTabs] = useState<Tab[]>(() => {
+    const saved = loadSavedTabs();
+    if (saved) {
+      return saved.tabs;
+    }
+    return [
+      { id: generateTabId(), type: "terminal", title: "Terminal 1" },
+      { id: generateTabId(), type: "files", title: "Files 1" },
+    ];
+  });
+  const [activeTabId, setActiveTabId] = useState<string>(() => {
+    const saved = loadSavedTabs();
+    return saved?.activeTabId ?? tabs[0]?.id ?? '';
+  });
   const [showNewTabMenu, setShowNewTabMenu] = useState(false);
+
+  // Save tabs to localStorage whenever they change
+  useEffect(() => {
+    saveTabs(tabs, activeTabId);
+  }, [tabs, activeTabId]);
 
   const addTab = (type: TabType) => {
     const newTabId = generateTabId();

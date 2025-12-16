@@ -1,9 +1,13 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useMemo } from "react";
 import Link from "next/link";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { listTasks, listRuns, listMissions, TaskState, Run, Mission } from "@/lib/api";
+import { ShimmerTableRow } from "@/components/ui/shimmer";
+import { CopyButton } from "@/components/ui/copy-button";
+import { RelativeTime } from "@/components/ui/relative-time";
 import {
   CheckCircle,
   XCircle,
@@ -14,6 +18,9 @@ import {
   Search,
   MessageSquare,
   Target,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
 } from "lucide-react";
 
 const statusIcons = {
@@ -34,6 +41,39 @@ const statusConfig = {
   active: { color: "text-indigo-400", bg: "bg-indigo-500/10" },
 };
 
+type SortField = 'date' | 'status' | 'messages';
+type SortDirection = 'asc' | 'desc';
+
+function SortButton({ 
+  field, 
+  currentField, 
+  direction, 
+  onClick 
+}: { 
+  field: SortField;
+  currentField: SortField;
+  direction: SortDirection;
+  onClick: () => void;
+}) {
+  const isActive = field === currentField;
+  
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "ml-1 p-0.5 rounded transition-colors",
+        isActive ? "text-white/60" : "text-white/20 hover:text-white/40"
+      )}
+    >
+      {isActive ? (
+        direction === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+      ) : (
+        <ArrowUpDown className="h-3 w-3" />
+      )}
+    </button>
+  );
+}
+
 export default function HistoryPage() {
   const [tasks, setTasks] = useState<TaskState[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
@@ -41,6 +81,8 @@ export default function HistoryPage() {
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<string>("all");
   const [search, setSearch] = useState("");
+  const [sortField, setSortField] = useState<SortField>('date');
+  const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const fetchedRef = useRef(false);
 
   useEffect(() => {
@@ -59,6 +101,7 @@ export default function HistoryPage() {
         setMissions(missionsData);
       } catch (error) {
         console.error("Failed to fetch data:", error);
+        toast.error("Failed to load history");
       } finally {
         setLoading(false);
       }
@@ -66,6 +109,15 @@ export default function HistoryPage() {
 
     fetchData();
   }, []);
+
+  const handleSort = (field: SortField) => {
+    if (sortField === field) {
+      setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortField(field);
+      setSortDirection('desc');
+    }
+  };
 
   const filteredTasks = tasks.filter((task) => {
     if (filter !== "all" && task.status !== filter) return false;
@@ -81,13 +133,32 @@ export default function HistoryPage() {
     return true;
   });
 
-  const filteredMissions = missions.filter((mission) => {
-    if (filter !== "all" && mission.status !== filter) return false;
-    const title = mission.title || "";
-    if (search && !title.toLowerCase().includes(search.toLowerCase()))
-      return false;
-    return true;
-  });
+  const filteredMissions = useMemo(() => {
+    let filtered = missions.filter((mission) => {
+      if (filter !== "all" && mission.status !== filter) return false;
+      const title = mission.title || "";
+      if (search && !title.toLowerCase().includes(search.toLowerCase()))
+        return false;
+      return true;
+    });
+
+    // Sort missions
+    return filtered.sort((a, b) => {
+      let comparison = 0;
+      switch (sortField) {
+        case 'date':
+          comparison = new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+          break;
+        case 'status':
+          comparison = a.status.localeCompare(b.status);
+          break;
+        case 'messages':
+          comparison = b.history.length - a.history.length;
+          break;
+      }
+      return sortDirection === 'asc' ? -comparison : comparison;
+    });
+  }, [missions, filter, search, sortField, sortDirection]);
 
   const hasData = filteredTasks.length > 0 || filteredRuns.length > 0 || filteredMissions.length > 0;
 
@@ -134,8 +205,29 @@ export default function HistoryPage() {
 
       {/* Content */}
       {loading ? (
-        <div className="py-12 text-center">
-          <Loader className="h-8 w-8 animate-spin text-indigo-400 mx-auto" />
+        <div className="space-y-6">
+          {/* Shimmer for missions table */}
+          <div>
+            <div className="h-4 w-24 bg-white/[0.04] rounded mb-3 animate-pulse" />
+            <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] overflow-hidden">
+              <table className="w-full">
+                <thead>
+                  <tr className="border-b border-white/[0.04]">
+                    <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">Status</th>
+                    <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">Mission</th>
+                    <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">Messages</th>
+                    <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">Updated</th>
+                    <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/[0.04]">
+                  <ShimmerTableRow columns={5} />
+                  <ShimmerTableRow columns={5} />
+                  <ShimmerTableRow columns={5} />
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       ) : !hasData ? (
         <div className="flex flex-col items-center py-16 text-center">
@@ -167,16 +259,25 @@ export default function HistoryPage() {
                   <thead>
                     <tr className="border-b border-white/[0.04]">
                       <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
-                        Status
+                        <span className="flex items-center">
+                          Status
+                          <SortButton field="status" currentField={sortField} direction={sortDirection} onClick={() => handleSort('status')} />
+                        </span>
                       </th>
                       <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
                         Mission
                       </th>
                       <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
-                        Messages
+                        <span className="flex items-center">
+                          Messages
+                          <SortButton field="messages" currentField={sortField} direction={sortDirection} onClick={() => handleSort('messages')} />
+                        </span>
                       </th>
                       <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
-                        Updated
+                        <span className="flex items-center">
+                          Updated
+                          <SortButton field="date" currentField={sortField} direction={sortDirection} onClick={() => handleSort('date')} />
+                        </span>
                       </th>
                       <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
                         Actions
@@ -192,7 +293,7 @@ export default function HistoryPage() {
                       return (
                         <tr
                           key={mission.id}
-                          className="hover:bg-white/[0.02] transition-colors"
+                          className="group hover:bg-white/[0.02] transition-colors"
                         >
                           <td className="px-4 py-3">
                             <span
@@ -212,6 +313,7 @@ export default function HistoryPage() {
                               <p className="max-w-md truncate text-sm text-white/80">
                                 {displayTitle}
                               </p>
+                              <CopyButton text={title} showOnHover label="Copied title" />
                             </div>
                           </td>
                           <td className="px-4 py-3">
@@ -220,18 +322,27 @@ export default function HistoryPage() {
                             </span>
                           </td>
                           <td className="px-4 py-3">
-                            <span className="text-xs text-white/40">
-                              {new Date(mission.updated_at).toLocaleString()}
-                            </span>
+                            <RelativeTime 
+                              date={mission.updated_at} 
+                              className="text-xs text-white/40"
+                            />
                           </td>
                           <td className="px-4 py-3">
-                            <Link
-                              href={`/control?mission=${mission.id}`}
-                              className="inline-flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
-                            >
-                              {mission.status === "active" ? "Continue" : "View"}{" "}
-                              <ArrowRight className="h-3 w-3" />
-                            </Link>
+                            <div className="flex items-center gap-2">
+                              <Link
+                                href={`/control?mission=${mission.id}`}
+                                className="inline-flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+                              >
+                                {mission.status === "active" ? "Continue" : "View"}{" "}
+                                <ArrowRight className="h-3 w-3" />
+                              </Link>
+                              <CopyButton 
+                                text={mission.id} 
+                                showOnHover 
+                                label="Copied mission ID"
+                                className="opacity-0 group-hover:opacity-100"
+                              />
+                            </div>
                           </td>
                         </tr>
                       );
@@ -276,7 +387,7 @@ export default function HistoryPage() {
                       return (
                         <tr
                           key={task.id}
-                          className="hover:bg-white/[0.02] transition-colors"
+                          className="group hover:bg-white/[0.02] transition-colors"
                         >
                           <td className="px-4 py-3">
                             <span
@@ -296,9 +407,12 @@ export default function HistoryPage() {
                             </span>
                           </td>
                           <td className="px-4 py-3">
-                            <p className="max-w-md truncate text-sm text-white/80">
-                              {task.task}
-                            </p>
+                            <div className="flex items-center gap-2">
+                              <p className="max-w-md truncate text-sm text-white/80">
+                                {task.task}
+                              </p>
+                              <CopyButton text={task.task} showOnHover label="Copied task" />
+                            </div>
                           </td>
                           <td className="px-4 py-3">
                             <span className="text-xs text-white/40 font-mono">
@@ -311,12 +425,20 @@ export default function HistoryPage() {
                             </span>
                           </td>
                           <td className="px-4 py-3">
-                            <Link
-                              href={`/control?task=${task.id}`}
-                              className="inline-flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
-                            >
-                              View <ArrowRight className="h-3 w-3" />
-                            </Link>
+                            <div className="flex items-center gap-2">
+                              <Link
+                                href={`/control?task=${task.id}`}
+                                className="inline-flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+                              >
+                                View <ArrowRight className="h-3 w-3" />
+                              </Link>
+                              <CopyButton 
+                                text={task.id} 
+                                showOnHover 
+                                label="Copied task ID"
+                                className="opacity-0 group-hover:opacity-100"
+                              />
+                            </div>
                           </td>
                         </tr>
                       );
@@ -360,7 +482,7 @@ export default function HistoryPage() {
                       return (
                         <tr
                           key={run.id}
-                          className="hover:bg-white/[0.02] transition-colors"
+                          className="group hover:bg-white/[0.02] transition-colors"
                         >
                           <td className="px-4 py-3">
                             <span
@@ -375,14 +497,18 @@ export default function HistoryPage() {
                             </span>
                           </td>
                           <td className="px-4 py-3">
-                            <p className="max-w-md truncate text-sm text-white/80">
-                              {run.input_text}
-                            </p>
+                            <div className="flex items-center gap-2">
+                              <p className="max-w-md truncate text-sm text-white/80">
+                                {run.input_text}
+                              </p>
+                              <CopyButton text={run.input_text} showOnHover label="Copied input" />
+                            </div>
                           </td>
                           <td className="px-4 py-3">
-                            <span className="text-xs text-white/40">
-                              {new Date(run.created_at).toLocaleString()}
-                            </span>
+                            <RelativeTime 
+                              date={run.created_at} 
+                              className="text-xs text-white/40"
+                            />
                           </td>
                           <td className="px-4 py-3">
                             <span className="text-sm text-emerald-400 tabular-nums">

@@ -108,13 +108,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/control/tool_result", post(control::post_tool_result))
         .route("/api/control/stream", get(control::stream))
         .route("/api/control/cancel", post(control::post_cancel))
-        // Mission management endpoints
-        .route("/api/control/missions", get(control::list_missions))
-        .route("/api/control/missions", post(control::create_mission))
-        .route("/api/control/missions/current", get(control::get_current_mission))
-        .route("/api/control/missions/:id", get(control::get_mission))
-        .route("/api/control/missions/:id/load", post(control::load_mission))
-        .route("/api/control/missions/:id/status", post(control::set_mission_status))
         // Memory endpoints
         .route("/api/runs", get(list_runs))
         .route("/api/runs/:id", get(get_run))

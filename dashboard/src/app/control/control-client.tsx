@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Markdown from 'react-markdown';
+import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import {
   cancelControl,
@@ -13,6 +14,7 @@ import {
   createMission,
   setMissionStatus,
   getCurrentMission,
+  uploadFile,
   type ControlRunState,
   type Mission,
   type MissionStatus,
@@ -31,6 +33,11 @@ import {
   ChevronDown,
   ChevronRight,
   Target,
+  Brain,
+  Copy,
+  Check,
+  Paperclip,
+  ArrowDown,
 } from 'lucide-react';
 import {
   OptionList,
@@ -42,6 +49,9 @@ import {
   DataTable,
   parseSerializableDataTable,
 } from '@/components/tool-ui/data-table';
+import { useScrollToBottom } from '@/hooks/use-scroll-to-bottom';
+import { useLocalStorage } from '@/hooks/use-local-storage';
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard';
 
 type ChatItem =
   | {
@@ -111,10 +121,58 @@ function missionStatusLabel(status: MissionStatus): {
   }
 }
 
-// Thinking item component with collapsible UI (Cursor-style)
+// Copy button component
+function CopyButton({ text, className }: { text: string; className?: string }) {
+  const [, copy] = useCopyToClipboard();
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    const success = await copy(text);
+    if (success) {
+      setCopied(true);
+      toast.success('Copied to clipboard');
+      setTimeout(() => setCopied(false), 2000);
+    } else {
+      toast.error('Failed to copy');
+    }
+  };
+
+  return (
+    <button
+      onClick={handleCopy}
+      className={cn(
+        'p-1.5 rounded-lg transition-all',
+        'opacity-0 group-hover:opacity-100',
+        'hover:bg-white/[0.08] text-white/40 hover:text-white/70',
+        className
+      )}
+      title="Copy message"
+    >
+      {copied ? (
+        <Check className="h-3.5 w-3.5 text-emerald-400" />
+      ) : (
+        <Copy className="h-3.5 w-3.5" />
+      )}
+    </button>
+  );
+}
+
+// Shimmer loading effect
+function Shimmer({ className }: { className?: string }) {
+  return (
+    <div className={cn('animate-pulse', className)}>
+      <div className="h-4 bg-white/[0.06] rounded w-3/4 mb-2" />
+      <div className="h-4 bg-white/[0.06] rounded w-1/2 mb-2" />
+      <div className="h-4 bg-white/[0.06] rounded w-5/6" />
+    </div>
+  );
+}
+
+// Thinking item component with collapsible UI and auto-collapse
 function ThinkingItem({ item }: { item: Extract<ChatItem, { kind: 'thinking' }> }) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(!item.done); // Auto-expand while thinking
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const hasAutoCollapsedRef = useRef(false);
 
   // Update elapsed time while thinking is active
   useEffect(() => {
@@ -124,6 +182,17 @@ function ThinkingItem({ item }: { item: Extract<ChatItem, { kind: 'thinking' }> 
     }, 1000);
     return () => clearInterval(interval);
   }, [item.done, item.startTime]);
+
+  // Auto-collapse when thinking is done (with delay)
+  useEffect(() => {
+    if (item.done && expanded && !hasAutoCollapsedRef.current) {
+      const timer = setTimeout(() => {
+        setExpanded(false);
+        hasAutoCollapsedRef.current = true;
+      }, 500);
+      return () => clearTimeout(timer);
+    }
+  }, [item.done, expanded]);
 
   const formatDuration = (seconds: number) => {
     if (seconds < 60) return `${seconds}s`;
@@ -141,25 +210,65 @@ function ThinkingItem({ item }: { item: Extract<ChatItem, { kind: 'thinking' }> 
       {/* Compact header */}
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-1.5 text-white/40 hover:text-white/60 transition-colors"
-      >
-        <span className="text-xs">
-          {item.done ? 'Thought' : 'Thinking'} for {duration}
-        </span>
-        {expanded ? (
-          <ChevronDown className="h-3 w-3" />
-        ) : (
-          <ChevronRight className="h-3 w-3" />
+        className={cn(
+          'flex items-center gap-1.5 px-2.5 py-1 rounded-full',
+          'bg-white/[0.04] border border-white/[0.06]',
+          'text-white/40 hover:text-white/60 hover:bg-white/[0.06]',
+          'transition-all duration-200'
         )}
+      >
+        <Brain className={cn('h-3 w-3', !item.done && 'animate-pulse text-indigo-400')} />
+        <span className="text-xs">
+          {item.done ? `Thought for ${duration}` : `Thinking for ${duration}`}
+        </span>
+        <ChevronDown 
+          className={cn(
+            'h-3 w-3 transition-transform duration-200',
+            expanded ? 'rotate-0' : '-rotate-90'
+          )} 
+        />
       </button>
       
-      {/* Expandable content */}
-      {expanded && (
-        <div className="mt-2 pl-0.5 border-l-2 border-white/10">
-          <div className="pl-3 text-xs text-white/50 whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed">
+      {/* Expandable content with animation */}
+      <div
+        className={cn(
+          'overflow-hidden transition-all duration-200 ease-out',
+          expanded ? 'max-h-80 opacity-100 mt-2' : 'max-h-0 opacity-0'
+        )}
+      >
+        <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+          <div className="text-xs text-white/50 whitespace-pre-wrap overflow-y-auto max-h-64 leading-relaxed">
             {item.content}
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// Attachment preview component
+function AttachmentPreview({ 
+  file, 
+  isUploading,
+  onRemove 
+}: { 
+  file: { name: string; type: string }; 
+  isUploading?: boolean;
+  onRemove?: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.06]">
+      <Paperclip className="h-4 w-4 text-white/40" />
+      <span className="text-sm text-white/70 truncate max-w-[200px]">{file.name}</span>
+      {isUploading ? (
+        <Loader className="h-3 w-3 animate-spin text-indigo-400" />
+      ) : onRemove && (
+        <button
+          onClick={onRemove}
+          className="text-white/40 hover:text-white/70 transition-colors"
+        >
+          <XCircle className="h-4 w-4" />
+        </button>
       )}
     </div>
   );
@@ -170,7 +279,8 @@ export default function ControlClient() {
   const router = useRouter();
   
   const [items, setItems] = useState<ChatItem[]>([]);
-  const [input, setInput] = useState('');
+  const [draftInput, setDraftInput] = useLocalStorage('control-draft', '');
+  const [input, setInput] = useState(draftInput);
 
   const [runState, setRunState] = useState<ControlRunState>('idle');
   const [queueLen, setQueueLen] = useState(0);
@@ -180,19 +290,49 @@ export default function ControlClient() {
   const [showStatusMenu, setShowStatusMenu] = useState(false);
   const [missionLoading, setMissionLoading] = useState(false);
 
+  // Attachment state
+  const [attachments, setAttachments] = useState<{ file: File; uploading: boolean }[]>([]);
+  const [uploadQueue, setUploadQueue] = useState<string[]>([]);
+
   const isBusy = runState !== 'idle';
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const streamCleanupRef = useRef<null | (() => void)>(null);
   const statusMenuRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+  // Smart auto-scroll
+  const { containerRef, endRef, isAtBottom, scrollToBottom } = useScrollToBottom();
+
+  // Sync input to localStorage draft
+  useEffect(() => {
+    setDraftInput(input);
+  }, [input, setDraftInput]);
+
+  // Initialize input from draft on mount
+  useEffect(() => {
+    if (draftInput && !input) {
+      setInput(draftInput);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Auto-resize textarea
+  const adjustTextareaHeight = useCallback(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    
+    textarea.style.height = 'auto';
+    const lineHeight = 20;
+    const maxLines = 10;
+    const maxHeight = lineHeight * maxLines;
+    const newHeight = Math.min(textarea.scrollHeight, maxHeight);
+    textarea.style.height = `${newHeight}px`;
+  }, []);
 
   useEffect(() => {
-    scrollToBottom();
-  }, [items]);
+    adjustTextareaHeight();
+  }, [input, adjustTextareaHeight]);
   
   // Close status menu when clicking outside
   useEffect(() => {
@@ -204,6 +344,71 @@ export default function ControlClient() {
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
+
+  // Handle paste to upload files
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    const handlePaste = async (event: ClipboardEvent) => {
+      const items = event.clipboardData?.items;
+      if (!items) return;
+
+      const files: File[] = [];
+      for (const item of items) {
+        if (item.kind === 'file') {
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      }
+
+      if (files.length === 0) return;
+
+      // Prevent default paste for files
+      event.preventDefault();
+
+      // Upload files
+      for (const file of files) {
+        await handleFileUpload(file);
+      }
+    };
+
+    textarea.addEventListener('paste', handlePaste);
+    return () => textarea.removeEventListener('paste', handlePaste);
+  }, []);
+
+  // Handle file upload
+  const handleFileUpload = async (file: File) => {
+    setUploadQueue((prev) => [...prev, file.name]);
+    
+    try {
+      const result = await uploadFile(file, '/root/context/');
+      toast.success(`Uploaded ${result.name} to /root/context/`);
+      
+      // Add a message about the upload
+      setInput((prev) => {
+        const uploadNote = `[Uploaded: ${result.name}]`;
+        return prev ? `${prev}\n${uploadNote}` : uploadNote;
+      });
+    } catch (error) {
+      console.error('Upload failed:', error);
+      toast.error(`Failed to upload ${file.name}`);
+    } finally {
+      setUploadQueue((prev) => prev.filter((name) => name !== file.name));
+    }
+  };
+
+  // Handle file input change
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    for (const file of files) {
+      await handleFileUpload(file);
+    }
+    // Reset input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
 
   // Convert mission history to chat items
   const missionHistoryToItems = useCallback((mission: Mission): ChatItem[] => {
@@ -239,20 +444,15 @@ export default function ControlClient() {
         })
         .catch((err) => {
           console.error('Failed to load mission:', err);
-          setItems((prev) => [
-            ...prev,
-            { kind: 'system', id: `err-${Date.now()}`, content: `Failed to load mission: ${err.message}` },
-          ]);
+          toast.error('Failed to load mission');
         })
         .finally(() => setMissionLoading(false));
     } else {
-      // Try to get current mission
       getCurrentMission()
         .then((mission) => {
           if (mission) {
             setCurrentMission(mission);
             setItems(missionHistoryToItems(mission));
-            // Update URL without navigation
             router.replace(`/control?mission=${mission.id}`, { scroll: false });
           }
         })
@@ -270,12 +470,10 @@ export default function ControlClient() {
       setCurrentMission(mission);
       setItems([]);
       router.replace(`/control?mission=${mission.id}`, { scroll: false });
+      toast.success('New mission created');
     } catch (err) {
       console.error('Failed to create mission:', err);
-      setItems((prev) => [
-        ...prev,
-        { kind: 'system', id: `err-${Date.now()}`, content: 'Failed to create new mission.' },
-      ]);
+      toast.error('Failed to create new mission');
     } finally {
       setMissionLoading(false);
     }
@@ -288,12 +486,10 @@ export default function ControlClient() {
       await setMissionStatus(currentMission.id, status);
       setCurrentMission({ ...currentMission, status });
       setShowStatusMenu(false);
+      toast.success(`Mission marked as ${status}`);
     } catch (err) {
       console.error('Failed to set mission status:', err);
-      setItems((prev) => [
-        ...prev,
-        { kind: 'system', id: `err-${Date.now()}`, content: 'Failed to update mission status.' },
-      ]);
+      toast.error('Failed to update mission status');
     }
   };
 
@@ -303,14 +499,13 @@ export default function ControlClient() {
     let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
     let reconnectAttempts = 0;
     let mounted = true;
-    const maxReconnectDelay = 30000; // 30 seconds max
-    const baseDelay = 1000; // Start with 1 second
+    const maxReconnectDelay = 30000;
+    const baseDelay = 1000;
 
     const handleEvent = (event: { type: string; data: unknown }) => {
       const data: unknown = event.data;
 
       if (event.type === 'status' && isRecord(data)) {
-        // Successfully receiving events - reset reconnect counter
         reconnectAttempts = 0;
         const st = data['state'];
         setRunState(typeof st === 'string' ? (st as ControlRunState) : 'idle');
@@ -332,7 +527,6 @@ export default function ControlClient() {
       }
 
       if (event.type === 'assistant_message' && isRecord(data)) {
-        // Remove any pending thinking items when we get the final message
         setItems((prev) => [
           ...prev.filter(it => it.kind !== 'thinking' || it.done),
           {
@@ -352,10 +546,8 @@ export default function ControlClient() {
         const done = Boolean(data['done']);
         
         setItems((prev) => {
-          // Find existing thinking item that's not done
           const existingIdx = prev.findIndex(it => it.kind === 'thinking' && !it.done);
           if (existingIdx >= 0) {
-            // Update existing thinking item
             const updated = [...prev];
             const existing = updated[existingIdx] as Extract<ChatItem, { kind: 'thinking' }>;
             updated[existingIdx] = {
@@ -365,7 +557,6 @@ export default function ControlClient() {
             };
             return updated;
           } else {
-            // Create new thinking item
             return [
               ...prev,
               {
@@ -418,7 +609,6 @@ export default function ControlClient() {
           (isRecord(data) && data['message'] ? String(data['message']) : null) ??
           'An error occurred.';
         
-        // Auto-reconnect on stream errors
         if (msg.includes('Stream connection failed') || msg.includes('Stream ended')) {
           scheduleReconnect();
         } else {
@@ -426,23 +616,17 @@ export default function ControlClient() {
             ...prev,
             { kind: 'system', id: `err-${Date.now()}`, content: msg },
           ]);
+          toast.error(msg);
         }
       }
     };
 
     const scheduleReconnect = () => {
       if (!mounted) return;
-      
-      // Calculate delay with exponential backoff
       const delay = Math.min(baseDelay * Math.pow(2, reconnectAttempts), maxReconnectDelay);
       reconnectAttempts++;
-      
-      console.log(`Stream disconnected, reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
-      
       reconnectTimeout = setTimeout(() => {
-        if (mounted) {
-          connect();
-        }
+        if (mounted) connect();
       }, delay);
     };
 
@@ -451,7 +635,6 @@ export default function ControlClient() {
       cleanup = streamControl(handleEvent);
     };
 
-    // Initial connection
     connect();
     streamCleanupRef.current = cleanup;
 
@@ -472,35 +655,23 @@ export default function ControlClient() {
     if (!content) return;
 
     setInput('');
+    setDraftInput('');
 
     try {
       await postControlMessage(content);
     } catch (err) {
       console.error(err);
-      setItems((prev) => [
-        ...prev,
-        {
-          kind: 'system',
-          id: `err-${Date.now()}`,
-          content: 'Failed to send message to control session.',
-        },
-      ]);
+      toast.error('Failed to send message');
     }
   };
 
   const handleStop = async () => {
     try {
       await cancelControl();
+      toast.success('Cancelled');
     } catch (err) {
       console.error(err);
-      setItems((prev) => [
-        ...prev,
-        {
-          kind: 'system',
-          id: `err-${Date.now()}`,
-          content: 'Failed to cancel control session.',
-        },
-      ]);
+      toast.error('Failed to cancel');
     }
   };
 
@@ -511,41 +682,48 @@ export default function ControlClient() {
 
   return (
     <div className="flex h-screen flex-col p-6">
+      {/* Hidden file input */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        onChange={handleFileChange}
+        className="hidden"
+      />
+
       {/* Header */}
-      <div className="mb-6 flex items-start justify-between">
-        <div className="flex items-center gap-4">
-          {/* Mission indicator */}
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/20">
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-center gap-4 min-w-0 flex-1">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-indigo-500/20">
               <Target className="h-5 w-5 text-indigo-400" />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-lg font-semibold text-white">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h1 className="text-lg font-semibold text-white truncate">
                   {missionLoading ? 'Loading...' : missionTitle}
                 </h1>
                 {missionStatus && (
-                  <span className={cn('px-2 py-0.5 rounded-full text-xs font-medium', missionStatus.className)}>
+                  <span className={cn('px-2 py-0.5 rounded-full text-xs font-medium shrink-0', missionStatus.className)}>
                     {missionStatus.label}
                   </span>
                 )}
               </div>
-              <p className="text-xs text-white/40">
+              <p className="text-xs text-white/40 truncate">
                 {currentMission ? `Mission ${currentMission.id.slice(0, 8)}...` : 'No active mission'}
               </p>
             </div>
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
-          {/* Status dropdown */}
+        <div className="flex items-center gap-3 shrink-0 flex-wrap">
           {currentMission && (
             <div className="relative" ref={statusMenuRef}>
               <button
                 onClick={() => setShowStatusMenu(!showStatusMenu)}
                 className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] transition-colors"
               >
-                Set Status
+                <span className="hidden sm:inline">Set</span> Status
                 <ChevronDown className="h-4 w-4" />
               </button>
               {showStatusMenu && (
@@ -578,18 +756,16 @@ export default function ControlClient() {
             </div>
           )}
           
-          {/* New Mission button */}
           <button
             onClick={handleNewMission}
             disabled={missionLoading}
             className="flex items-center gap-2 rounded-lg bg-indigo-500/20 px-3 py-2 text-sm font-medium text-indigo-400 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"
           >
             <Plus className="h-4 w-4" />
-            New Mission
+            <span className="hidden sm:inline">New</span> Mission
           </button>
 
-          {/* Run status */}
-          <div className={cn('flex items-center gap-2 text-sm', status.className)}>
+          <div className={cn('flex items-center gap-2 text-sm whitespace-nowrap', status.className)}>
             <StatusIcon className={cn('h-4 w-4', runState !== 'idle' && 'animate-spin')} />
             <span>{status.label}</span>
             <span className="text-white/20">•</span>
@@ -599,16 +775,18 @@ export default function ControlClient() {
       </div>
 
       {/* Chat container */}
-      <div className="flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden">
+      <div className="flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative">
         {/* Messages */}
-        <div className="flex-1 overflow-y-auto p-6">
+        <div ref={containerRef} className="flex-1 overflow-y-auto p-6">
           {items.length === 0 ? (
             <div className="flex h-full items-center justify-center">
               <div className="text-center">
                 <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
                   <Bot className="h-8 w-8 text-indigo-400" />
                 </div>
-                {currentMission && currentMission.status !== 'active' ? (
+                {missionLoading ? (
+                  <Shimmer className="max-w-xs mx-auto" />
+                ) : currentMission && currentMission.status !== 'active' ? (
                   <>
                     <h2 className="text-lg font-medium text-white">
                       No conversation history
@@ -626,6 +804,9 @@ export default function ControlClient() {
                     <p className="mt-2 text-sm text-white/40 max-w-sm">
                       Ask the agent to do something — messages queue while it&apos;s busy
                     </p>
+                    <p className="mt-1 text-xs text-white/30">
+                      Tip: Paste files directly to upload to /root/context/
+                    </p>
                   </>
                 )}
               </div>
@@ -635,7 +816,8 @@ export default function ControlClient() {
               {items.map((item) => {
                 if (item.kind === 'user') {
                   return (
-                    <div key={item.id} className="flex justify-end gap-3">
+                    <div key={item.id} className="flex justify-end gap-3 group">
+                      <CopyButton text={item.content} className="self-start mt-2" />
                       <div className="max-w-[80%] rounded-2xl rounded-br-md bg-indigo-500 px-4 py-3 text-white">
                         <p className="whitespace-pre-wrap text-sm">{item.content}</p>
                       </div>
@@ -648,18 +830,18 @@ export default function ControlClient() {
 
                 if (item.kind === 'assistant') {
                   const statusIcon = item.success ? CheckCircle : XCircle;
-                  const StatusIcon = statusIcon;
+                  const MessageStatusIcon = statusIcon;
                   const displayModel = item.model 
                     ? (item.model.includes('/') ? item.model.split('/').pop() : item.model)
                     : null;
                   return (
-                    <div key={item.id} className="flex justify-start gap-3">
+                    <div key={item.id} className="flex justify-start gap-3 group">
                       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
                         <Bot className="h-4 w-4 text-indigo-400" />
                       </div>
                       <div className="max-w-[80%] rounded-2xl rounded-bl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
                         <div className="mb-2 flex items-center gap-2 text-xs text-white/40">
-                          <StatusIcon
+                          <MessageStatusIcon
                             className={cn(
                               'h-3 w-3',
                               item.success ? 'text-emerald-400' : 'text-red-400',
@@ -683,6 +865,7 @@ export default function ControlClient() {
                           <Markdown>{item.content}</Markdown>
                         </div>
                       </div>
+                      <CopyButton text={item.content} className="self-start mt-8" />
                     </div>
                   );
                 }
@@ -798,7 +981,6 @@ export default function ControlClient() {
                     );
                   }
 
-                  // Unknown UI tool.
                   return (
                     <div key={item.id} className="flex justify-start gap-3">
                       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
@@ -825,27 +1007,66 @@ export default function ControlClient() {
                   </div>
                 );
               })}
-              <div ref={messagesEndRef} />
+              <div ref={endRef} />
             </div>
           )}
         </div>
 
+        {/* Scroll to bottom button */}
+        {!isAtBottom && items.length > 0 && (
+          <button
+            onClick={() => scrollToBottom()}
+            className="absolute bottom-20 right-6 p-2 rounded-full bg-white/[0.1] border border-white/[0.1] text-white/60 hover:bg-white/[0.15] hover:text-white/80 transition-all shadow-lg"
+            title="Scroll to bottom"
+          >
+            <ArrowDown className="h-4 w-4" />
+          </button>
+        )}
+
         {/* Input */}
         <div className="border-t border-white/[0.06] bg-white/[0.01] p-4">
-          <form onSubmit={handleSubmit} className="mx-auto flex max-w-3xl gap-3">
-            <input
-              type="text"
+          {/* Upload queue */}
+          {uploadQueue.length > 0 && (
+            <div className="mx-auto max-w-3xl mb-3 flex flex-wrap gap-2">
+              {uploadQueue.map((name) => (
+                <AttachmentPreview key={name} file={{ name, type: '' }} isUploading />
+              ))}
+            </div>
+          )}
+          
+          <form onSubmit={handleSubmit} className="mx-auto flex max-w-3xl gap-3 items-end">
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
+              title="Attach files"
+            >
+              <Paperclip className="h-5 w-5" />
+            </button>
+            
+            <textarea
+              ref={textareaRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Message the root agent…"
-              className="flex-1 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  if (input.trim()) {
+                    handleSubmit(e);
+                  }
+                }
+              }}
+              placeholder="Message the root agent… (paste files to upload)"
+              rows={1}
+              className="flex-1 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-[border-color,height] duration-150 ease-out resize-none overflow-y-auto leading-5"
+              style={{ minHeight: '46px' }}
             />
 
             {isBusy ? (
               <button
                 type="button"
                 onClick={handleStop}
-                className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors"
+                className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
               >
                 <Square className="h-4 w-4" />
                 Stop
@@ -854,7 +1075,7 @@ export default function ControlClient() {
               <button
                 type="submit"
                 disabled={!input.trim()}
-                className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
               >
                 <Send className="h-4 w-4" />
                 Send

@@ -1,31 +1,53 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import Link from 'next/link';
+import { toast } from 'sonner';
 import { StatsCard } from '@/components/stats-card';
 import { ConnectionStatus } from '@/components/connection-status';
 import { RecentTasks } from '@/components/recent-tasks';
+import { ShimmerStat } from '@/components/ui/shimmer';
 import { getStats, StatsResponse } from '@/lib/api';
-import { Activity, CheckCircle, DollarSign, Zap } from 'lucide-react';
+import { Activity, CheckCircle, DollarSign, Zap, Plus } from 'lucide-react';
 import { formatCents } from '@/lib/utils';
 
 export default function OverviewPage() {
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [isActive, setIsActive] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let mounted = true;
+    let hasShownError = false;
+
     const fetchStats = async () => {
       try {
         const data = await getStats();
+        if (!mounted) return;
         setStats(data);
         setIsActive(data.active_tasks > 0);
-      } catch (error) {
-        console.error('Failed to fetch stats:', error);
+        setError(null);
+        setLoading(false);
+        hasShownError = false;
+      } catch (err) {
+        if (!mounted) return;
+        const message = err instanceof Error ? err.message : 'Failed to fetch stats';
+        setError(message);
+        setLoading(false);
+        if (!hasShownError) {
+          toast.error('Failed to connect to agent server');
+          hasShownError = true;
+        }
       }
     };
 
     fetchStats();
     const interval = setInterval(fetchStats, 3000);
-    return () => clearInterval(interval);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
   }, []);
 
   return (
@@ -50,6 +72,15 @@ export default function OverviewPage() {
               Real-time agent activity
             </p>
           </div>
+          
+          {/* Quick Actions */}
+          <Link
+            href="/control"
+            className="flex items-center gap-2 rounded-lg bg-indigo-500/20 px-3 py-2 text-sm font-medium text-indigo-400 hover:bg-indigo-500/30 transition-colors"
+          >
+            <Plus className="h-4 w-4" />
+            New Mission
+          </Link>
         </div>
 
         {/* Visualization Area (placeholder for radar/globe) - takes remaining space */}
@@ -95,29 +126,40 @@ export default function OverviewPage() {
 
         {/* Stats grid - at bottom */}
         <div className="grid grid-cols-4 gap-4">
-          <StatsCard
-            title="Total Tasks"
-            value={stats?.total_tasks ?? 0}
-            icon={Activity}
-          />
-          <StatsCard
-            title="Active"
-            value={stats?.active_tasks ?? 0}
-            subtitle="running"
-            icon={Zap}
-            color={stats?.active_tasks ? 'accent' : 'default'}
-          />
-          <StatsCard
-            title="Success Rate"
-            value={`${((stats?.success_rate ?? 1) * 100).toFixed(0)}%`}
-            icon={CheckCircle}
-            color="success"
-          />
-          <StatsCard
-            title="Total Cost"
-            value={formatCents(stats?.total_cost_cents ?? 0)}
-            icon={DollarSign}
-          />
+          {loading ? (
+            <>
+              <ShimmerStat />
+              <ShimmerStat />
+              <ShimmerStat />
+              <ShimmerStat />
+            </>
+          ) : (
+            <>
+              <StatsCard
+                title="Total Tasks"
+                value={stats?.total_tasks ?? 0}
+                icon={Activity}
+              />
+              <StatsCard
+                title="Active"
+                value={stats?.active_tasks ?? 0}
+                subtitle="running"
+                icon={Zap}
+                color={stats?.active_tasks ? 'accent' : 'default'}
+              />
+              <StatsCard
+                title="Success Rate"
+                value={`${((stats?.success_rate ?? 1) * 100).toFixed(0)}%`}
+                icon={CheckCircle}
+                color="success"
+              />
+              <StatsCard
+                title="Total Cost"
+                value={formatCents(stats?.total_cost_cents ?? 0)}
+                icon={DollarSign}
+              />
+            </>
+          )}
         </div>
       </div>
 

@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useMemo } from "react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import {
   listMcps,
@@ -16,6 +17,9 @@ import {
   type McpStatus,
   type ToolInfo,
 } from "@/lib/api";
+import { ShimmerCard } from "@/components/ui/shimmer";
+import { CopyButton } from "@/components/ui/copy-button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Plus,
   RefreshCw,
@@ -29,6 +33,7 @@ import {
   Plug,
   Wrench,
   Settings,
+  Search,
 } from "lucide-react";
 
 type TabType = "installed" | "tools";
@@ -143,7 +148,10 @@ function McpCard({
               {status.label}
             </span>
           </div>
-          <p className="text-xs text-white/40 truncate">{mcp.endpoint}</p>
+          <div className="flex items-center gap-1 group">
+            <p className="text-xs text-white/40 truncate">{mcp.endpoint}</p>
+            <CopyButton text={mcp.endpoint} showOnHover label="Copied endpoint" />
+          </div>
         </div>
       </div>
 
@@ -735,7 +743,35 @@ export default function ModulesPage() {
   const [selectedMcp, setSelectedMcp] = useState<McpServerState | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
   const [showConfigureModal, setShowConfigureModal] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [mcpToDelete, setMcpToDelete] = useState<McpServerState | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [toolSearch, setToolSearch] = useState("");
+
+  // Filter MCPs by search
+  const filteredMcps = useMemo(() => {
+    if (!searchQuery.trim()) return mcps;
+    const query = searchQuery.toLowerCase();
+    return mcps.filter(
+      (m) =>
+        m.name.toLowerCase().includes(query) ||
+        m.endpoint.toLowerCase().includes(query) ||
+        m.tools.some((t) => t.toLowerCase().includes(query))
+    );
+  }, [mcps, searchQuery]);
+
+  // Filter tools by search
+  const filteredTools = useMemo(() => {
+    if (!toolSearch.trim()) return tools;
+    const query = toolSearch.toLowerCase();
+    return tools.filter(
+      (t) =>
+        t.name.toLowerCase().includes(query) ||
+        t.description.toLowerCase().includes(query)
+    );
+  }, [tools, toolSearch]);
 
   const fetchData = useCallback(async () => {
     try {
@@ -753,6 +789,7 @@ export default function ModulesPage() {
       }
     } catch (error) {
       console.error("Failed to fetch data:", error);
+      toast.error("Failed to fetch modules");
     } finally {
       setLoading(false);
     }
@@ -770,6 +807,7 @@ export default function ModulesPage() {
     description?: string;
   }) => {
     await addMcp(data);
+    toast.success(`Added ${data.name}`);
     await fetchData();
   };
 
@@ -784,6 +822,7 @@ export default function ModulesPage() {
     await removeMcp(selectedMcp.id);
     const newMcp = await addMcp(data);
     setSelectedMcp(newMcp);
+    toast.success(`Updated ${data.name}`);
     await fetchData();
   };
 
@@ -791,50 +830,72 @@ export default function ModulesPage() {
     try {
       if (mcp.enabled) {
         await disableMcp(mcp.id);
+        toast.success(`Disabled ${mcp.name}`);
       } else {
         await enableMcp(mcp.id);
+        toast.success(`Enabled ${mcp.name}`);
       }
       await fetchData();
     } catch (error) {
       console.error("Failed to toggle MCP:", error);
+      toast.error(`Failed to toggle ${mcp.name}`);
     }
   };
 
   const handleRefreshMcp = async (mcp: McpServerState) => {
     try {
       await refreshMcp(mcp.id);
+      toast.success(`Refreshed ${mcp.name}`);
       await fetchData();
     } catch (error) {
       console.error("Failed to refresh MCP:", error);
+      toast.error(`Failed to refresh ${mcp.name}`);
     }
   };
 
   const handleDeleteMcp = async (mcp: McpServerState) => {
-    if (!confirm(`Remove ${mcp.name}?`)) return;
+    setMcpToDelete(mcp);
+    setShowDeleteConfirm(true);
+  };
+
+  const confirmDeleteMcp = async () => {
+    if (!mcpToDelete) return;
     try {
-      await removeMcp(mcp.id);
+      await removeMcp(mcpToDelete.id);
+      toast.success(`Removed ${mcpToDelete.name}`);
       setSelectedMcp(null);
       await fetchData();
     } catch (error) {
       console.error("Failed to delete MCP:", error);
+      toast.error(`Failed to remove ${mcpToDelete.name}`);
+    } finally {
+      setShowDeleteConfirm(false);
+      setMcpToDelete(null);
     }
   };
 
   const handleToggleTool = async (name: string, enabled: boolean) => {
     try {
       await toggleTool(name, enabled);
+      toast.success(`${enabled ? "Enabled" : "Disabled"} ${name}`);
       await fetchData();
     } catch (error) {
       console.error("Failed to toggle tool:", error);
+      toast.error(`Failed to toggle ${name}`);
     }
   };
 
   const handleRefreshAll = async () => {
+    setRefreshing(true);
     try {
       await refreshAllMcps();
+      toast.success("Refreshed all MCP servers");
       await fetchData();
     } catch (error) {
       console.error("Failed to refresh MCPs:", error);
+      toast.error("Failed to refresh MCP servers");
+    } finally {
+      setRefreshing(false);
     }
   };
 
@@ -851,9 +912,10 @@ export default function ModulesPage() {
         <div className="flex items-center gap-2">
           <button
             onClick={handleRefreshAll}
-            className="flex items-center gap-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] px-3 py-2 text-sm text-white/80 transition-colors"
+            disabled={refreshing}
+            className="flex items-center gap-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] px-3 py-2 text-sm text-white/80 transition-colors disabled:opacity-50"
           >
-            <RefreshCw className="h-4 w-4" />
+            <RefreshCw className={cn("h-4 w-4", refreshing && "animate-spin")} />
             Refresh
           </button>
           <button
@@ -867,50 +929,72 @@ export default function ModulesPage() {
       </div>
 
       {/* Tabs */}
-      <div className="mb-6 inline-flex rounded-lg bg-white/[0.02] border border-white/[0.04] p-1">
-        <button
-          onClick={() => setActiveTab("installed")}
-          className={cn(
-            "px-4 py-2 rounded-md text-sm font-medium transition-colors",
-            activeTab === "installed"
-              ? "bg-white/[0.08] text-white"
-              : "text-white/40 hover:text-white/60"
-          )}
-        >
-          Installed
-        </button>
-        <button
-          onClick={() => setActiveTab("tools")}
-          className={cn(
-            "px-4 py-2 rounded-md text-sm font-medium transition-colors",
-            activeTab === "tools"
-              ? "bg-white/[0.08] text-white"
-              : "text-white/40 hover:text-white/60"
-          )}
-        >
-          Tools
-        </button>
+      <div className="mb-6 flex items-center justify-between flex-wrap gap-4">
+        <div className="inline-flex rounded-lg bg-white/[0.02] border border-white/[0.04] p-1">
+          <button
+            onClick={() => setActiveTab("installed")}
+            className={cn(
+              "px-4 py-2 rounded-md text-sm font-medium transition-colors",
+              activeTab === "installed"
+                ? "bg-white/[0.08] text-white"
+                : "text-white/40 hover:text-white/60"
+            )}
+          >
+            Installed ({mcps.length})
+          </button>
+          <button
+            onClick={() => setActiveTab("tools")}
+            className={cn(
+              "px-4 py-2 rounded-md text-sm font-medium transition-colors",
+              activeTab === "tools"
+                ? "bg-white/[0.08] text-white"
+                : "text-white/40 hover:text-white/60"
+            )}
+          >
+            Tools ({tools.length})
+          </button>
+        </div>
+        
+        {/* Search */}
+        <div className="relative w-64">
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/30" />
+          <input
+            type="text"
+            placeholder={activeTab === "installed" ? "Search MCPs..." : "Search tools..."}
+            value={activeTab === "installed" ? searchQuery : toolSearch}
+            onChange={(e) => 
+              activeTab === "installed" 
+                ? setSearchQuery(e.target.value) 
+                : setToolSearch(e.target.value)
+            }
+            className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] py-2 pl-9 pr-3 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
+          />
+        </div>
       </div>
 
       {/* Content */}
       {loading ? (
-        <div className="py-12 text-center">
-          <RefreshCw className="h-8 w-8 animate-spin text-indigo-400 mx-auto" />
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <ShimmerCard />
+          <ShimmerCard />
+          <ShimmerCard />
         </div>
       ) : activeTab === "installed" ? (
-        mcps.length === 0 ? (
+        filteredMcps.length === 0 ? (
           <div className="flex flex-col items-center py-16 text-center">
             <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-white/[0.02] mb-4">
               <Plug className="h-8 w-8 text-white/30" />
             </div>
-            <p className="text-white/80">No MCP servers configured</p>
+            <p className="text-white/80">
+              {searchQuery ? "No MCPs match your search" : "No MCP servers configured"}
+            </p>
             <p className="mt-1 text-sm text-white/40">
-              Click &quot;Add MCP&quot; to connect to an MCP server
+              {searchQuery ? "Try a different search term" : 'Click "Add MCP" to connect to an MCP server'}
             </p>
           </div>
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {mcps.map((mcp) => (
+            {filteredMcps.map((mcp) => (
               <McpCard
                 key={mcp.id}
                 mcp={mcp}
@@ -921,7 +1005,7 @@ export default function ModulesPage() {
           </div>
         )
       ) : (
-        <ToolsTab tools={tools} onToggle={handleToggleTool} />
+        <ToolsTab tools={filteredTools} onToggle={handleToggleTool} />
       )}
 
       {/* Detail panel (overlay) */}
@@ -952,6 +1036,20 @@ export default function ModulesPage() {
           onSave={handleConfigureMcp}
         />
       )}
+
+      {/* Delete confirmation dialog */}
+      <ConfirmDialog
+        open={showDeleteConfirm}
+        title={`Remove ${mcpToDelete?.name}?`}
+        description="This will disconnect the MCP server and remove it from your configuration. This action cannot be undone."
+        confirmLabel="Remove"
+        variant="danger"
+        onConfirm={confirmDeleteMcp}
+        onCancel={() => {
+          setShowDeleteConfirm(false);
+          setMcpToDelete(null);
+        }}
+      />
     </div>
   );
 }

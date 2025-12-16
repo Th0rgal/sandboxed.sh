@@ -585,3 +585,34 @@ export async function toggleTool(
   });
   if (!res.ok) throw new Error("Failed to toggle tool");
 }
+
+// ==================== File System ====================
+
+export interface UploadResult {
+  ok: boolean;
+  path: string;
+  name: string;
+}
+
+// Upload a file to the remote filesystem
+export async function uploadFile(
+  file: File,
+  remotePath: string = "/root/context/"
+): Promise<UploadResult> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const url = apiUrl(`/api/fs/upload?path=${encodeURIComponent(remotePath)}`);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: authHeader(),
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to upload file: ${text}`);
+  }
+
+  return res.json();
+}

@@ -2,9 +2,13 @@
 
 import { useEffect, useMemo, useState, useRef } from 'react';
 import Link from 'next/link';
+import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { listTasks, listRuns, listMissions, getCurrentMission, streamControl, TaskState, Run, Mission, ControlRunState } from '@/lib/api';
 import { formatCents } from '@/lib/utils';
+import { ShimmerSidebarItem, ShimmerCard } from '@/components/ui/shimmer';
+import { CopyButton } from '@/components/ui/copy-button';
+import { useScrollToBottom } from '@/hooks/use-scroll-to-bottom';
 import {
   Bot,
   Brain,
@@ -20,6 +24,7 @@ import {
   GitBranch,
   Target,
   MessageSquare,
+  Search,
 } from 'lucide-react';
 
 interface AgentNode {
@@ -53,16 +58,6 @@ const statusConfig = {
   paused: { border: 'border-white/20', bg: 'bg-white/[0.04]', text: 'text-white/40' },
   cancelled: { border: 'border-white/20', bg: 'bg-white/[0.04]', text: 'text-white/40' },
 };
-
-function mapTaskStatusToAgentStatus(status: TaskState['status']): AgentNode['status'] {
-  switch (status) {
-    case 'running': return 'running';
-    case 'completed': return 'completed';
-    case 'failed': return 'failed';
-    case 'pending': return 'pending';
-    case 'cancelled': return 'cancelled';
-  }
-}
 
 function AgentTreeNode({
   agent,
@@ -168,12 +163,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export default function AgentsPage() {
-  const [tasks, setTasks] = useState<TaskState[]>([]);
-  const [runs, setRuns] = useState<Run[]>([]);
   const [missions, setMissions] = useState<Mission[]>([]);
   const [currentMission, setCurrentMission] = useState<Mission | null>(null);
   const [controlState, setControlState] = useState<ControlRunState>('idle');
   const [selectedMissionId, setSelectedMissionId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
   const selectedMission = useMemo(
     () => missions.find((m) => m.id === selectedMissionId) ?? currentMission,
     [missions, selectedMissionId, currentMission]
@@ -182,6 +176,9 @@ export default function AgentsPage() {
   const [loading, setLoading] = useState(true);
   const fetchedRef = useRef(false);
   const streamCleanupRef = useRef<null | (() => void)>(null);
+  
+  // Smart scroll for logs
+  const { containerRef: logsContainerRef, endRef: logsEndRef } = useScrollToBottom();
 
   // Stream control events for real-time status
   useEffect(() => {
@@ -204,24 +201,17 @@ export default function AgentsPage() {
 
   useEffect(() => {
     let cancelled = false;
-    let seq = 0;
+    let hasShownError = false;
 
     const fetchData = async () => {
-      const mySeq = ++seq;
       try {
-        const [tasksData, runsData, missionsData, currentMissionData] = await Promise.all([
-          listTasks().catch(() => []),
-          !fetchedRef.current ? listRuns().catch(() => ({ runs: [] })) : Promise.resolve({ runs }),
+        const [missionsData, currentMissionData] = await Promise.all([
           listMissions().catch(() => []),
           getCurrentMission().catch(() => null),
         ]);
-        if (cancelled || mySeq !== seq) return;
+        if (cancelled) return;
         
         fetchedRef.current = true;
-        setTasks(tasksData);
-        if ('runs' in runsData) {
-          setRuns(runsData.runs || []);
-        }
         setMissions(missionsData);
         setCurrentMission(currentMissionData);
         
@@ -229,10 +219,15 @@ export default function AgentsPage() {
         if (!selectedMissionId && currentMissionData) {
           setSelectedMissionId(currentMissionData.id);
         }
+        hasShownError = false;
       } catch (error) {
+        if (!hasShownError) {
+          toast.error('Failed to fetch missions');
+          hasShownError = true;
+        }
         console.error('Failed to fetch data:', error);
       } finally {
-        if (!cancelled && mySeq === seq) {
+        if (!cancelled) {
           setLoading(false);
         }
       }
@@ -242,10 +237,19 @@ export default function AgentsPage() {
     const interval = setInterval(fetchData, 3000);
     return () => {
       cancelled = true;
-      seq += 1;
       clearInterval(interval);
     };
-  }, [runs, selectedMissionId]);
+  }, [selectedMissionId]);
+
+  // Filter missions by search query
+  const filteredMissions = useMemo(() => {
+    if (!searchQuery.trim()) return missions;
+    const query = searchQuery.toLowerCase();
+    return missions.filter((m) => 
+      m.title?.toLowerCase().includes(query) || 
+      m.id.toLowerCase().includes(query)
+    );
+  }, [missions, searchQuery]);
 
   // Map control state to agent status
   const controlStateToStatus = (state: ControlRunState, missionStatus?: string): AgentNode['status'] => {
@@ -315,14 +319,24 @@ export default function AgentsPage() {
 
   // Determine if there's active work
   const isActive = controlState !== 'idle';
-  const activeMissions = missions.filter(m => m.status === 'active');
-  const hasActiveMission = currentMission !== null || activeMissions.length > 0;
 
   return (
     <div className="flex h-screen">
       {/* Mission selector sidebar */}
-      <div className="w-64 border-r border-white/[0.06] glass-panel p-4">
-        <h2 className="mb-4 text-sm font-medium text-white">Missions</h2>
+      <div className="w-64 border-r border-white/[0.06] glass-panel p-4 flex flex-col">
+        <h2 className="mb-3 text-sm font-medium text-white">Missions</h2>
+        
+        {/* Search */}
+        <div className="relative mb-4">
+          <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-white/30" />
+          <input
+            type="text"
+            placeholder="Search missions..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] py-2 pl-8 pr-3 text-xs text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
+          />
+        </div>
         
         {/* Current/Active indicator */}
         {isActive && currentMission && (
@@ -337,13 +351,21 @@ export default function AgentsPage() {
           </div>
         )}
         
-        <div className="space-y-2">
-          {missions.length === 0 && !currentMission ? (
-            <p className="text-xs text-white/40 py-2">No missions yet</p>
+        <div className="flex-1 overflow-y-auto space-y-2">
+          {loading ? (
+            <>
+              <ShimmerSidebarItem />
+              <ShimmerSidebarItem />
+              <ShimmerSidebarItem />
+            </>
+          ) : filteredMissions.length === 0 && !currentMission ? (
+            <p className="text-xs text-white/40 py-2">
+              {searchQuery ? 'No missions found' : 'No missions yet'}
+            </p>
           ) : (
             <>
-              {/* Show current mission first if it exists */}
-              {currentMission && (
+              {/* Show current mission first if it exists and matches search */}
+              {currentMission && (!searchQuery || currentMission.title?.toLowerCase().includes(searchQuery.toLowerCase())) && (
                 <button
                   key={currentMission.id}
                   onClick={() => setSelectedMissionId(currentMission.id)}
@@ -372,7 +394,7 @@ export default function AgentsPage() {
               )}
               
               {/* Other missions */}
-              {missions.filter(m => m.id !== currentMission?.id).map((mission) => (
+              {filteredMissions.filter(m => m.id !== currentMission?.id).map((mission) => (
                 <button
                   key={mission.id}
                   onClick={() => setSelectedMissionId(mission.id)}
@@ -412,8 +434,12 @@ export default function AgentsPage() {
         </div>
 
         {loading ? (
-          <div className="flex items-center justify-center py-16">
-            <Loader className="h-8 w-8 animate-spin text-indigo-400" />
+          <div className="space-y-4">
+            <ShimmerCard />
+            <div className="ml-6 space-y-4">
+              <ShimmerCard />
+              <ShimmerCard />
+            </div>
           </div>
         ) : mockAgentTree ? (
           <div className="space-y-2">
@@ -423,7 +449,7 @@ export default function AgentsPage() {
               selectedId={selectedAgent?.id || null}
             />
           </div>
-        ) : !hasActiveMission && missions.length === 0 ? (
+        ) : missions.length === 0 && !currentMission ? (
           <div className="flex flex-col items-center justify-center py-16">
             <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-white/[0.02] mb-4">
               <MessageSquare className="h-8 w-8 text-white/30" />
@@ -436,14 +462,6 @@ export default function AgentsPage() {
               </Link>{' '}
               page
             </p>
-            {runs.length > 0 && (
-              <p className="mt-3 text-xs text-white/30">
-                You have {runs.length} archived runs in{' '}
-                <Link href="/history" className="text-indigo-400 hover:text-indigo-300">
-                  History
-                </Link>
-              </p>
-            )}
           </div>
         ) : (
           <div className="flex items-center justify-center py-16">
@@ -472,9 +490,12 @@ export default function AgentsPage() {
               </p>
             </div>
 
-            <div>
+            <div className="group">
               <label className="text-[10px] uppercase tracking-wider text-white/40">Description</label>
-              <p className="text-sm text-white/80">{selectedAgent.description}</p>
+              <div className="flex items-start gap-2">
+                <p className="text-sm text-white/80 flex-1">{selectedAgent.description}</p>
+                <CopyButton text={selectedAgent.description} showOnHover />
+              </div>
             </div>
 
             <div>
@@ -490,7 +511,7 @@ export default function AgentsPage() {
                 </div>
                 <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
                   <div
-                    className="h-full rounded-full bg-indigo-500"
+                    className="h-full rounded-full bg-indigo-500 transition-all duration-500"
                     style={{
                       width: `${Math.min(100, (selectedAgent.budgetSpent / selectedAgent.budgetAllocated) * 100)}%`,
                     }}
@@ -509,9 +530,12 @@ export default function AgentsPage() {
             )}
 
             {selectedAgent.selectedModel && (
-              <div>
+              <div className="group">
                 <label className="text-[10px] uppercase tracking-wider text-white/40">Selected Model</label>
-                <p className="text-sm text-white font-mono">{selectedAgent.selectedModel.split('/').pop()}</p>
+                <div className="flex items-center gap-2">
+                  <p className="text-sm text-white font-mono">{selectedAgent.selectedModel.split('/').pop()}</p>
+                  <CopyButton text={selectedAgent.selectedModel} showOnHover />
+                </div>
               </div>
             )}
 
@@ -520,15 +544,22 @@ export default function AgentsPage() {
                 <label className="text-[10px] uppercase tracking-wider text-white/40">
                   Logs ({selectedAgent.logs.length})
                 </label>
-                <div className="mt-2 max-h-48 space-y-2 overflow-auto">
+                <div 
+                  ref={logsContainerRef}
+                  className="mt-2 max-h-48 space-y-2 overflow-auto"
+                >
                   {selectedAgent.logs.map((log, i) => (
                     <div
                       key={i}
-                      className="rounded-lg bg-white/[0.02] border border-white/[0.04] p-2 text-xs font-mono text-white/60"
+                      className="group rounded-lg bg-white/[0.02] border border-white/[0.04] p-2 text-xs font-mono text-white/60"
                     >
-                      {log.slice(0, 80)}...
+                      <div className="flex items-start gap-2">
+                        <p className="flex-1">{log.slice(0, 80)}...</p>
+                        <CopyButton text={log} showOnHover />
+                      </div>
                     </div>
                   ))}
+                  <div ref={logsEndRef} />
                 </div>
               </div>
             )}
