@@ -65,7 +65,17 @@ struct FileEntry: Codable, Identifiable {
                           : String(format: "%.1f %@", value, units[unitIndex])
     }
     
-    var modifiedDate: Date {
-        Date(timeIntervalSince1970: TimeInterval(mtime))
+    var modifiedDate: Date? {
+        guard mtime > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(mtime))
+    }
+}
+
+// Extend Date for relative formatting (shared across views)
+extension Date {
+    var relativeFormatted: String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: self, relativeTo: Date())
     }
 }

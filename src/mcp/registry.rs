@@ -124,22 +124,17 @@ impl McpRegistry {
         let mut proc = process.lock().await;
 
         // Write request to stdin
-        proc.stdin
-            .write_all(request_json.as_bytes())
-            .await?;
+        proc.stdin.write_all(request_json.as_bytes()).await?;
         proc.stdin.write_all(b"\n").await?;
         proc.stdin.flush().await?;
 
         // Read response from stdout
         let mut stdout = proc.stdout_lines.lock().await;
         let mut line = String::new();
-        
+
         // Read with timeout
-        let read_result = tokio::time::timeout(
-            Duration::from_secs(30),
-            stdout.read_line(&mut line),
-        )
-        .await;
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(30), stdout.read_line(&mut line)).await;
 
         match read_result {
             Ok(Ok(0)) => anyhow::bail!("MCP process closed stdout"),
@@ -255,7 +250,7 @@ impl McpRegistry {
             "method": "notifications/initialized"
         });
         let notification_json = serde_json::to_string(&notification)?;
-        
+
         let mut proc = process.lock().await;
         let _ = proc.stdin.write_all(notification_json.as_bytes()).await;
         let _ = proc.stdin.write_all(b"\n").await;
@@ -278,12 +273,17 @@ impl McpRegistry {
     /// Note: This does NOT automatically attempt to connect. Use refresh() after adding.
     pub async fn add(&self, req: AddMcpRequest) -> anyhow::Result<McpServerState> {
         let transport = req.effective_transport();
-        
+
         let mut config = match &transport {
-            McpTransport::Http { endpoint } => McpServerConfig::new(req.name.clone(), endpoint.clone()),
-            McpTransport::Stdio { command, args, env } => {
-                McpServerConfig::new_stdio(req.name.clone(), command.clone(), args.clone(), env.clone())
+            McpTransport::Http { endpoint } => {
+                McpServerConfig::new(req.name.clone(), endpoint.clone())
             }
+            McpTransport::Stdio { command, args, env } => McpServerConfig::new_stdio(
+                req.name.clone(),
+                command.clone(),
+                args.clone(),
+                env.clone(),
+            ),
         };
         config.description = req.description;
 
@@ -402,7 +402,7 @@ impl McpRegistry {
         server_version: Option<String>,
     ) {
         let tool_names: Vec<String> = tool_descriptors.iter().map(|t| t.name.clone()).collect();
-        
+
         // Try up to 5 times with small delays to handle temporary lock contention
         for attempt in 0..5 {
             if let Ok(mut states) = self.states.try_write() {
@@ -437,11 +437,10 @@ impl McpRegistry {
         }
 
         match &state.config.transport {
-            McpTransport::Http { endpoint } => {
-                self.refresh_http(id, endpoint.clone()).await
-            }
+            McpTransport::Http { endpoint } => self.refresh_http(id, endpoint.clone()).await,
             McpTransport::Stdio { command, args, env } => {
-                self.refresh_stdio(id, command.clone(), args.clone(), env.clone()).await
+                self.refresh_stdio(id, command.clone(), args.clone(), env.clone())
+                    .await
             }
         }
     }
@@ -475,7 +474,8 @@ impl McpRegistry {
                 match serde_json::from_value::<McpToolsResponse>(result) {
                     Ok(tools_response) => {
                         let tool_descriptors = tools_response.tools;
-                        let tool_names: Vec<String> = tool_descriptors.iter().map(|t| t.name.clone()).collect();
+                        let tool_names: Vec<String> =
+                            tool_descriptors.iter().map(|t| t.name.clone()).collect();
 
                         // Update config with discovered tools
                         let _ = self
@@ -576,7 +576,8 @@ impl McpRegistry {
                 match serde_json::from_value::<McpToolsResponse>(result) {
                     Ok(tools_response) => {
                         let tool_descriptors = tools_response.tools;
-                        let tool_names: Vec<String> = tool_descriptors.iter().map(|t| t.name.clone()).collect();
+                        let tool_names: Vec<String> =
+                            tool_descriptors.iter().map(|t| t.name.clone()).collect();
 
                         // Update config with discovered tools
                         let _ = self
@@ -652,14 +653,16 @@ impl McpRegistry {
         let result = match &state.config.transport {
             McpTransport::Http { endpoint } => {
                 let endpoint = endpoint.trim_end_matches('/');
-                self.send_jsonrpc_http(endpoint, "tools/call", Some(params)).await
+                self.send_jsonrpc_http(endpoint, "tools/call", Some(params))
+                    .await
             }
             McpTransport::Stdio { .. } => {
                 let processes = self.stdio_processes.read().await;
                 let process = processes
                     .get(&mcp_id)
                     .ok_or_else(|| anyhow::anyhow!("No stdio process for MCP {}", mcp_id))?;
-                self.send_jsonrpc_stdio(process, "tools/call", Some(params)).await
+                self.send_jsonrpc_stdio(process, "tools/call", Some(params))
+                    .await
             }
         };
 

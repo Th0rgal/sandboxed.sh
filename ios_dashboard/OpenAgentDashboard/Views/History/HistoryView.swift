@@ -437,16 +437,6 @@ struct MissionDetailView: View {
     }
 }
 
-// MARK: - Date Extension
-
-extension Date {
-    var relativeFormatted: String {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: self, relativeTo: Date())
-    }
-}
-
 #Preview {
     NavigationStack {
         HistoryView()

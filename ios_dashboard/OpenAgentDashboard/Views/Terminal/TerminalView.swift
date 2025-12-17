@@ -120,22 +120,23 @@ struct TerminalView: View {
     private var terminalOutputView: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
+                LazyVStack(alignment: .leading, spacing: 1) {
                     ForEach(terminalOutput) { line in
                         Text(line.text)
-                            .font(.system(.caption, design: .monospaced))
+                            .font(.system(size: 13, weight: .regular, design: .monospaced))
                             .foregroundStyle(line.color)
                             .textSelection(.enabled)
                             .id(line.id)
                     }
                 }
-                .padding()
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .background(Color.black.opacity(0.3))
+            .background(Color(red: 0.05, green: 0.05, blue: 0.07))
             .onChange(of: terminalOutput.count) { _, _ in
                 if let lastLine = terminalOutput.last {
-                    withAnimation {
+                    withAnimation(.easeOut(duration: 0.1)) {
                         proxy.scrollTo(lastLine.id, anchor: .bottom)
                     }
                 }
@@ -271,7 +272,11 @@ struct TerminalView: View {
         let lines = text.components(separatedBy: .newlines)
         for line in lines {
             if !line.isEmpty {
-                terminalOutput.append(TerminalLine(text: line, type: .output))
+                // Strip ANSI escape codes for clean display
+                let cleanLine = stripANSICodes(line)
+                if !cleanLine.isEmpty {
+                    terminalOutput.append(TerminalLine(text: cleanLine, type: .output))
+                }
             }
         }
         
@@ -279,6 +284,17 @@ struct TerminalView: View {
         if terminalOutput.count > 1000 {
             terminalOutput.removeFirst(terminalOutput.count - 1000)
         }
+    }
+    
+    /// Strip ANSI escape codes from terminal output
+    private func stripANSICodes(_ text: String) -> String {
+        // Match ANSI escape sequences: ESC[...m, ESC[...H, ESC[...J, etc.
+        let pattern = "\\x1B\\[[0-9;]*[A-Za-z]|\\x1B\\][^\\x07]*\\x07|\\x1B[\\(\\)][AB012]"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+            return text
+        }
+        let range = NSRange(text.startIndex..., in: text)
+        return regex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: "")
     }
     
     private func sendCommand() {

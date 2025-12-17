@@ -38,14 +38,11 @@ struct FilesView: View {
     }
     
     var body: some View {
-        ZStack {
+        ZStack(alignment: .bottomTrailing) {
             Theme.backgroundPrimary.ignoresSafeArea()
             
             VStack(spacing: 0) {
-                // Toolbar
-                toolbarView
-                
-                // Breadcrumb navigation
+                // Breadcrumb navigation (compact)
                 breadcrumbView
                 
                 // File list
@@ -60,19 +57,69 @@ struct FilesView: View {
                         actionLabel: "Retry"
                     )
                 } else if sortedEntries.isEmpty {
-                    EmptyStateView(
-                        icon: "folder",
-                        title: "Empty Folder",
-                        message: "This folder is empty.\nDrag files here or tap Import."
-                    )
+                    emptyFolderView
                 } else {
                     fileListView
                 }
             }
+            
+            // Floating Action Button for Import
+            Button {
+                isImporting = true
+            } label: {
+                Image(systemName: "plus")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 56, height: 56)
+                    .background(Theme.accent)
+                    .clipShape(Circle())
+                    .shadow(color: Theme.accent.opacity(0.4), radius: 8, x: 0, y: 4)
+            }
+            .padding(.trailing, 20)
+            .padding(.bottom, 20)
         }
         .navigationTitle("Files")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                // Quick nav menu
+                Menu {
+                    Button {
+                        navigateTo("/root/context")
+                    } label: {
+                        Label("Context", systemImage: "tray.and.arrow.down")
+                    }
+                    
+                    Button {
+                        navigateTo("/root/work")
+                    } label: {
+                        Label("Work", systemImage: "hammer")
+                    }
+                    
+                    Button {
+                        navigateTo("/root/tools")
+                    } label: {
+                        Label("Tools", systemImage: "wrench.and.screwdriver")
+                    }
+                    
+                    Divider()
+                    
+                    Button {
+                        navigateTo("/root")
+                    } label: {
+                        Label("Home", systemImage: "house")
+                    }
+                    
+                    Button {
+                        navigateTo("/")
+                    } label: {
+                        Label("Root", systemImage: "externaldrive")
+                    }
+                } label: {
+                    Image(systemName: "folder.badge.gearshape")
+                }
+            }
+            
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button {
@@ -128,132 +175,132 @@ struct FilesView: View {
     
     // MARK: - Subviews
     
-    private var toolbarView: some View {
-        HStack(spacing: 12) {
-            // Back button
-            Button {
-                goUp()
-            } label: {
-                Image(systemName: "chevron.up")
-                    .font(.body.weight(.medium))
-                    .foregroundStyle(currentPath == "/" ? Theme.textMuted : Theme.textPrimary)
-                    .frame(width: 36, height: 36)
-                    .background(.ultraThinMaterial)
-                    .clipShape(Circle())
+    private var breadcrumbView: some View {
+        HStack(spacing: 0) {
+            // Up button
+            if currentPath != "/" {
+                Button {
+                    goUp()
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(Theme.accent)
+                        .frame(width: 44, height: 44)
+                }
             }
-            .disabled(currentPath == "/")
             
-            // Quick nav buttons
-            quickNavButton(icon: "📥", label: "context", path: "/root/context")
-            quickNavButton(icon: "🔨", label: "work", path: "/root/work")
-            quickNavButton(icon: "🛠️", label: "tools", path: "/root/tools")
-            
+            // Breadcrumb path
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 2) {
+                    ForEach(Array(breadcrumbs.enumerated()), id: \.offset) { index, crumb in
+                        if index > 0 {
+                            Image(systemName: "chevron.right")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(Theme.textMuted)
+                        }
+                        
+                        Button {
+                            navigateTo(crumb.path)
+                        } label: {
+                            Text(crumb.name)
+                                .font(.subheadline.weight(index == breadcrumbs.count - 1 ? .semibold : .medium))
+                                .foregroundStyle(index == breadcrumbs.count - 1 ? Theme.textPrimary : Theme.textTertiary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .background(index == breadcrumbs.count - 1 ? Theme.backgroundSecondary : .clear)
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+                    }
+                }
+                .padding(.trailing, 16)
+            }
+        }
+        .padding(.leading, currentPath == "/" ? 16 : 0)
+        .frame(height: 44)
+        .background(.thinMaterial)
+    }
+    
+    private var emptyFolderView: some View {
+        VStack(spacing: 24) {
             Spacer()
             
-            // Import button
-            Button {
-                isImporting = true
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "square.and.arrow.down")
-                    Text("Import")
-                }
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(Theme.accent)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(Theme.accent.opacity(0.15))
-                .clipShape(Capsule())
+            Image(systemName: "folder")
+                .font(.system(size: 64, weight: .light))
+                .foregroundStyle(Theme.textMuted)
+            
+            VStack(spacing: 8) {
+                Text("Empty Folder")
+                    .font(.title3.bold())
+                    .foregroundStyle(Theme.textPrimary)
+                
+                Text("Tap + to import files")
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.textSecondary)
             }
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 10)
-    }
-    
-    private func quickNavButton(icon: String, label: String, path: String) -> some View {
-        Button {
-            navigateTo(path)
-        } label: {
-            HStack(spacing: 4) {
-                Text(icon)
-                    .font(.caption)
-                Text(label)
-                    .font(.caption.weight(.medium))
-            }
-            .foregroundStyle(currentPath.hasPrefix(path) ? Theme.accent : Theme.textSecondary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(currentPath.hasPrefix(path) ? Theme.accent.opacity(0.15) : Color.white.opacity(0.05))
-            .clipShape(Capsule())
-            .overlay(
-                Capsule()
-                    .stroke(currentPath.hasPrefix(path) ? Theme.accent.opacity(0.3) : Theme.border, lineWidth: 1)
-            )
-        }
-    }
-    
-    private var breadcrumbView: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 4) {
-                ForEach(Array(breadcrumbs.enumerated()), id: \.offset) { index, crumb in
-                    if index > 0 {
-                        Image(systemName: "chevron.right")
-                            .font(.caption2)
-                            .foregroundStyle(Theme.textMuted)
-                    }
-                    
-                    Button {
-                        navigateTo(crumb.path)
-                    } label: {
-                        Text(crumb.name)
-                            .font(.caption.weight(index == breadcrumbs.count - 1 ? .semibold : .regular))
-                            .foregroundStyle(index == breadcrumbs.count - 1 ? Theme.textPrimary : Theme.textSecondary)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 4)
-                    }
+            
+            // Quick actions
+            HStack(spacing: 12) {
+                Button {
+                    showingNewFolderAlert = true
+                } label: {
+                    Label("New Folder", systemImage: "folder.badge.plus")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(Theme.textPrimary)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(.ultraThinMaterial)
+                        .clipShape(Capsule())
                 }
             }
-            .padding(.horizontal)
+            
+            Spacer()
+            Spacer()
         }
-        .padding(.vertical, 8)
-        .background(Color.white.opacity(0.02))
+        .frame(maxWidth: .infinity)
     }
     
     private var fileListView: some View {
-        List {
-            ForEach(sortedEntries) { entry in
-                FileRow(entry: entry)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        if entry.isDirectory {
-                            navigateTo(entry.path)
-                        } else {
-                            selectedEntry = entry
-                        }
-                    }
-                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        Button(role: .destructive) {
-                            selectedEntry = entry
-                            showingDeleteAlert = true
-                        } label: {
-                            Label("Delete", systemImage: "trash")
-                        }
-                        
-                        if entry.isFile {
-                            Button {
-                                downloadFile(entry)
-                            } label: {
-                                Label("Download", systemImage: "arrow.down.circle")
+        ScrollView {
+            LazyVStack(spacing: 8) {
+                ForEach(sortedEntries) { entry in
+                    FileRow(entry: entry)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            HapticService.selectionChanged()
+                            if entry.isDirectory {
+                                navigateTo(entry.path)
+                            } else {
+                                selectedEntry = entry
                             }
-                            .tint(Theme.accent)
                         }
-                    }
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
+                        .contextMenu {
+                            if entry.isFile {
+                                Button {
+                                    downloadFile(entry)
+                                } label: {
+                                    Label("Download", systemImage: "arrow.down.circle")
+                                }
+                            }
+                            
+                            Button(role: .destructive) {
+                                selectedEntry = entry
+                                showingDeleteAlert = true
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
+                }
+                
+                // Bottom padding for FAB
+                Spacer()
+                    .frame(height: 80)
             }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
+        .refreshable {
+            await loadDirectory()
+        }
     }
     
     // MARK: - Actions
@@ -358,31 +405,66 @@ struct FilesView: View {
 private struct FileRow: View {
     let entry: FileEntry
     
+    private var iconColor: Color {
+        if entry.isDirectory {
+            return Theme.accent
+        }
+        // Color by file type
+        let ext = entry.name.components(separatedBy: ".").last?.lowercased() ?? ""
+        switch ext {
+        case "json", "yaml", "yml", "toml": return .orange
+        case "swift", "rs", "py", "js", "ts": return .cyan
+        case "md", "txt", "log": return Theme.textSecondary
+        case "jpg", "jpeg", "png", "gif", "svg": return .pink
+        case "zip", "tar", "gz", "jar": return .purple
+        default: return Theme.textSecondary
+        }
+    }
+    
     var body: some View {
-        HStack(spacing: 14) {
-            // Icon
-            Image(systemName: entry.icon)
-                .font(.title3)
-                .foregroundStyle(entry.isDirectory ? Theme.accent : Theme.textSecondary)
-                .frame(width: 40, height: 40)
-                .background(entry.isDirectory ? Theme.accent.opacity(0.15) : Color.white.opacity(0.05))
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        HStack(spacing: 16) {
+            // Icon with color accent
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(iconColor.opacity(0.15))
+                    .frame(width: 48, height: 48)
+                
+                Image(systemName: entry.icon)
+                    .font(.title3)
+                    .foregroundStyle(iconColor)
+            }
             
             // Name and details
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(entry.name)
-                    .font(.subheadline.weight(.medium))
+                    .font(.body.weight(.medium))
                     .foregroundStyle(Theme.textPrimary)
                     .lineLimit(1)
                 
-                HStack(spacing: 8) {
-                    Text(entry.formattedSize)
-                        .font(.caption)
-                        .foregroundStyle(Theme.textTertiary)
+                HStack(spacing: 6) {
+                    if entry.isFile {
+                        Text(entry.formattedSize)
+                            .font(.caption)
+                            .foregroundStyle(Theme.textTertiary)
+                        
+                        Text("•")
+                            .font(.caption)
+                            .foregroundStyle(Theme.textMuted)
+                    }
                     
                     Text(entry.kind)
                         .font(.caption)
                         .foregroundStyle(Theme.textMuted)
+                    
+                    if let date = entry.modifiedDate {
+                        Text("•")
+                            .font(.caption)
+                            .foregroundStyle(Theme.textMuted)
+                        
+                        Text(date.relativeFormatted)
+                            .font(.caption)
+                            .foregroundStyle(Theme.textMuted)
+                    }
                 }
             }
             
@@ -391,12 +473,14 @@ private struct FileRow: View {
             // Chevron for directories
             if entry.isDirectory {
                 Image(systemName: "chevron.right")
-                    .font(.caption)
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(Theme.textMuted)
             }
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 4)
+        .padding(.vertical, 12)
+        .padding(.horizontal, 16)
+        .background(Theme.backgroundSecondary)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
 
