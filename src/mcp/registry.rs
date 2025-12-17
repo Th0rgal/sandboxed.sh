@@ -200,29 +200,47 @@ impl McpRegistry {
         self.get(id).await.ok_or_else(|| anyhow::anyhow!("MCP not found"))
     }
 
-    /// Helper to update state with error - uses try_write to avoid blocking
-    fn try_update_state_error(&self, id: Uuid, error_msg: String) {
-        if let Ok(mut states) = self.states.try_write() {
-            if let Some(state) = states.get_mut(&id) {
-                state.status = McpStatus::Error;
-                state.error = Some(error_msg);
+    /// Helper to update state with error - retries a few times to handle lock contention
+    async fn update_state_error(&self, id: Uuid, error_msg: String) {
+        // Try up to 5 times with small delays to handle temporary lock contention
+        for attempt in 0..5 {
+            if let Ok(mut states) = self.states.try_write() {
+                if let Some(state) = states.get_mut(&id) {
+                    state.status = McpStatus::Error;
+                    state.error = Some(error_msg);
+                }
+                return;
+            }
+            // Small delay before retry (10ms, 20ms, 40ms, 80ms, 160ms)
+            if attempt < 4 {
+                tokio::time::sleep(Duration::from_millis(10 << attempt)).await;
             }
         }
-        // If we can't get the lock, just log and skip - state update is best-effort
+        // If still can't get lock after retries, log warning
+        tracing::warn!("Failed to update MCP {} error state after retries", id);
     }
     
-    /// Helper to update state with success - uses try_write to avoid blocking
-    fn try_update_state_success(&self, id: Uuid, tool_names: Vec<String>, server_version: Option<String>) {
-        if let Ok(mut states) = self.states.try_write() {
-            if let Some(state) = states.get_mut(&id) {
-                state.config.tools = tool_names;
-                state.config.version = server_version;
-                state.config.last_connected_at = Some(chrono::Utc::now());
-                state.status = McpStatus::Connected;
-                state.error = None;
+    /// Helper to update state with success - retries a few times to handle lock contention
+    async fn update_state_success(&self, id: Uuid, tool_names: Vec<String>, server_version: Option<String>) {
+        // Try up to 5 times with small delays to handle temporary lock contention
+        for attempt in 0..5 {
+            if let Ok(mut states) = self.states.try_write() {
+                if let Some(state) = states.get_mut(&id) {
+                    state.config.tools = tool_names;
+                    state.config.version = server_version;
+                    state.config.last_connected_at = Some(chrono::Utc::now());
+                    state.status = McpStatus::Connected;
+                    state.error = None;
+                }
+                return;
+            }
+            // Small delay before retry
+            if attempt < 4 {
+                tokio::time::sleep(Duration::from_millis(10 << attempt)).await;
             }
         }
-        // If we can't get the lock, just log and skip - state update is best-effort
+        // If still can't get lock after retries, log warning
+        tracing::warn!("Failed to update MCP {} success state after retries", id);
     }
     
     /// Refresh an MCP server - reconnect and discover tools.
@@ -239,7 +257,7 @@ impl McpRegistry {
         let init_result = match self.initialize_mcp(&endpoint).await {
             Ok(result) => result,
             Err(e) => {
-                self.try_update_state_error(id, format!("Initialize failed: {}", e));
+                self.update_state_error(id, format!("Initialize failed: {}", e)).await;
                 return self.get(id).await.ok_or_else(|| anyhow::anyhow!("MCP not found"));
             }
         };
@@ -265,16 +283,16 @@ impl McpRegistry {
                             c.last_connected_at = Some(chrono::Utc::now());
                         }).await;
                         
-                        // Update state (best-effort, non-blocking)
-                        self.try_update_state_success(id, tool_names, server_version);
+                        // Update runtime state
+                        self.update_state_success(id, tool_names, server_version).await;
                     }
                     Err(e) => {
-                        self.try_update_state_error(id, format!("Failed to parse tools: {}", e));
+                        self.update_state_error(id, format!("Failed to parse tools: {}", e)).await;
                     }
                 }
             }
             Err(e) => {
-                self.try_update_state_error(id, format!("tools/list failed: {}", e));
+                self.update_state_error(id, format!("tools/list failed: {}", e)).await;
             }
         }
         
