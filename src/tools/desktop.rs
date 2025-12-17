@@ -301,7 +301,11 @@ impl Tool for Screenshot {
     }
 
     fn description(&self) -> &str {
-        "Take a screenshot of the virtual desktop. Automatically uploads and returns a 'markdown' field. IMPORTANT: You MUST copy the markdown field value (e.g., '![screenshot](https://...)') directly into your response text for the user to see the image."
+        "Take a screenshot of the virtual desktop. Automatically uploads and returns markdown to embed the image.
+
+IMPORTANT: After launching applications with i3 exec commands, use wait_seconds (3-5s recommended) to let them render before capturing. Otherwise the screenshot may be black.
+
+You MUST copy the returned markdown (e.g., '![screenshot](https://...)') directly into your response text for the user to see the image."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -311,6 +315,10 @@ impl Tool for Screenshot {
                 "display": {
                     "type": "string",
                     "description": "The display identifier (e.g., ':99') from desktop_start_session"
+                },
+                "wait_seconds": {
+                    "type": "number",
+                    "description": "Seconds to wait before taking screenshot. Use 3-5 seconds after launching apps (chromium, xterm, etc.) to let them render. Default: 0"
                 },
                 "upload": {
                     "type": "boolean",
@@ -343,6 +351,13 @@ impl Tool for Screenshot {
         let display_id = args["display"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'display' argument"))?;
+
+        // Wait before taking screenshot if specified (for apps to render)
+        let wait_seconds = args["wait_seconds"].as_f64().unwrap_or(0.0);
+        if wait_seconds > 0.0 {
+            tracing::info!(display = %display_id, wait_seconds = wait_seconds, "Waiting before screenshot");
+            tokio::time::sleep(std::time::Duration::from_secs_f64(wait_seconds)).await;
+        }
 
         // Generate filename
         let filename = args["filename"].as_str().map(|s| s.to_string()).unwrap_or_else(|| {
