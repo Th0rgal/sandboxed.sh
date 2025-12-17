@@ -1060,26 +1060,26 @@ impl Tool for I3Command {
     }
 
     fn description(&self) -> &str {
-        "Execute i3 window manager commands using i3-msg. Use this to control window layout and launch applications in the i3 environment.
+        "Execute i3 window manager commands using i3-msg. Use this to control window layout and launch applications.
+
+IMPORTANT - Application launch requirements:
+- Chromium: MUST use 'exec chromium --no-sandbox' (required when running as root)
+- Terminal with command: Use 'exec xterm -hold -e <cmd>' (-hold keeps window open after command exits)
+- Example: 'exec xterm -hold -e fastfetch' (shows fastfetch output and stays open)
 
 Common commands:
-- exec <app>: Launch an application (e.g., 'exec chromium', 'exec xterm -e fastfetch')
-- split h/v: Split current container horizontally/vertically for next window
+- exec <app>: Launch an application
+- split h/v: Split container horizontally/vertically for next window
 - focus left/right/up/down: Focus adjacent window
 - move left/right/up/down: Move focused window
-- resize grow/shrink width/height <px>: Resize window
 - layout tabbed/stacking/splitv/splith: Change container layout
 - fullscreen toggle: Toggle fullscreen
 - kill: Close focused window
 
-Layout tips for 'chrome left, terminal top-right, calculator bottom-right':
-1. exec chromium
-2. split h (prepare horizontal split for next window)
-3. focus right (if needed)
-4. split v (prepare vertical split on right side)
-5. exec xterm -e fastfetch
-6. focus down (if needed)
-7. exec xcalc"
+Layout example (chrome left, terminal right):
+1. exec chromium --no-sandbox
+2. split h
+3. exec xterm -hold -e fastfetch"
     }
 
     fn parameters_schema(&self) -> Value {
