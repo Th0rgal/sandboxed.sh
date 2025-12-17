@@ -13,6 +13,7 @@ mod file_ops;
 mod git;
 mod index;
 mod search;
+mod storage;
 mod terminal;
 mod ui;
 mod web;
@@ -97,6 +98,9 @@ impl ToolRegistry {
         // Frontend Tool UI (schemas for rich rendering in the dashboard)
         tools.insert("ui_optionList".to_string(), Arc::new(ui::UiOptionList));
         tools.insert("ui_dataTable".to_string(), Arc::new(ui::UiDataTable));
+
+        // Storage (image upload - requires Supabase)
+        tools.insert("upload_image".to_string(), Arc::new(storage::UploadImage));
 
         // Desktop automation (conditional on DESKTOP_ENABLED)
         if std::env::var("DESKTOP_ENABLED")

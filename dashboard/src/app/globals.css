@@ -386,3 +386,57 @@ select:focus-visible {
   background: transparent;
   padding: 0;
 }
+
+.prose-glass img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 0.5rem;
+  margin: 0.5rem 0;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.prose-glass ul,
+.prose-glass ol {
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+
+.prose-glass li {
+  margin: 0.25rem 0;
+}
+
+.prose-glass blockquote {
+  border-left: 3px solid rgb(var(--accent));
+  padding-left: 1rem;
+  margin: 0.5rem 0;
+  color: rgba(255, 255, 255, 0.7);
+  font-style: italic;
+}
+
+.prose-glass h1,
+.prose-glass h2,
+.prose-glass h3,
+.prose-glass h4 {
+  color: white;
+  font-weight: 600;
+  margin-top: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.prose-glass h1 {
+  font-size: 1.5rem;
+}
+
+.prose-glass h2 {
+  font-size: 1.25rem;
+}
+
+.prose-glass h3 {
+  font-size: 1.125rem;
+}
+
+.prose-glass hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  margin: 1rem 0;
+}

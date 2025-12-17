@@ -702,7 +702,7 @@ private struct FlowLayout: Layout {
     }
 }
 
-// MARK: - Markdown Text
+// MARK: - Markdown Text with Image Support
 
 private struct MarkdownText: View {
     let content: String
@@ -712,15 +712,142 @@ private struct MarkdownText: View {
     }
     
     var body: some View {
-        if let attributed = try? AttributedString(markdown: content, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
-            Text(attributed)
-                .font(.body)
-                .foregroundStyle(Theme.textPrimary)
-                .tint(Theme.accent)
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(parseMarkdownContent().enumerated()), id: \.offset) { _, element in
+                switch element {
+                case .text(let text):
+                    if let attributed = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+                        Text(attributed)
+                            .font(.body)
+                            .foregroundStyle(Theme.textPrimary)
+                            .tint(Theme.accent)
+                    } else {
+                        Text(text)
+                            .font(.body)
+                            .foregroundStyle(Theme.textPrimary)
+                    }
+                case .image(let alt, let url):
+                    MarkdownImageView(url: url, alt: alt)
+                }
+            }
+        }
+    }
+    
+    /// Parse markdown content into text and image elements
+    private func parseMarkdownContent() -> [MarkdownElement] {
+        var elements: [MarkdownElement] = []
+        var remaining = content
+        
+        // Regex to match markdown images: ![alt](url)
+        let imagePattern = #/!\[([^\]]*)\]\(([^)]+)\)/#
+        
+        while let match = remaining.firstMatch(of: imagePattern) {
+            // Add text before the image
+            let textBefore = String(remaining[remaining.startIndex..<match.range.lowerBound])
+            if !textBefore.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                elements.append(.text(textBefore))
+            }
+            
+            // Add the image
+            let alt = String(match.output.1)
+            let url = String(match.output.2)
+            elements.append(.image(alt: alt, url: url))
+            
+            // Continue with remaining content
+            remaining = String(remaining[match.range.upperBound...])
+        }
+        
+        // Add any remaining text
+        if !remaining.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            elements.append(.text(remaining))
+        }
+        
+        // If no elements were parsed, just return the original text
+        if elements.isEmpty && !content.isEmpty {
+            elements.append(.text(content))
+        }
+        
+        return elements
+    }
+}
+
+/// Represents a parsed markdown element
+private enum MarkdownElement {
+    case text(String)
+    case image(alt: String, url: String)
+}
+
+/// View for displaying markdown images with loading state
+private struct MarkdownImageView: View {
+    let url: String
+    let alt: String
+    
+    var body: some View {
+        if let imageURL = URL(string: url) {
+            AsyncImage(url: imageURL) { phase in
+                switch phase {
+                case .empty:
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading image...")
+                            .font(.caption)
+                            .foregroundStyle(Theme.textSecondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                    .background(Color.white.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    
+                case .success(let image):
+                    VStack(alignment: .leading, spacing: 4) {
+                        image
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(maxWidth: .infinity, maxHeight: 400)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(Theme.border, lineWidth: 0.5)
+                            )
+                        
+                        if !alt.isEmpty {
+                            Text(alt)
+                                .font(.caption)
+                                .foregroundStyle(Theme.textTertiary)
+                                .italic()
+                        }
+                    }
+                    
+                case .failure:
+                    HStack(spacing: 8) {
+                        Image(systemName: "photo.badge.exclamationmark")
+                            .foregroundStyle(Theme.error)
+                        Text("Failed to load image")
+                            .font(.caption)
+                            .foregroundStyle(Theme.textSecondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                    .background(Color.white.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    
+                @unknown default:
+                    EmptyView()
+                }
+            }
         } else {
-            Text(content)
-                .font(.body)
-                .foregroundStyle(Theme.textPrimary)
+            HStack(spacing: 8) {
+                Image(systemName: "link.badge.plus")
+                    .foregroundStyle(Theme.warning)
+                Text("Invalid image URL")
+                    .font(.caption)
+                    .foregroundStyle(Theme.textSecondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
+            .background(Color.white.opacity(0.05))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
         }
     }
 }

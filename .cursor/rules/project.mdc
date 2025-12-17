@@ -37,7 +37,7 @@ src/
 ├── memory/           # Supabase + pgvector persistence
 ├── mcp/              # MCP server registry + config
 ├── llm/              # OpenRouter client
-├── tools/            # File ops, terminal, git, web, search, desktop
+├── tools/            # File ops, terminal, git, web, search, desktop, storage
 ├── task/             # Task types + verification
 └── api/              # HTTP routes (axum)
 ```
@@ -97,6 +97,24 @@ When `DESKTOP_ENABLED=true`, the agent has access to desktop automation tools:
 | `desktop_scroll` | Scroll wheel at position |
 
 Setup: See `docs/DESKTOP_SETUP.md` and run `scripts/install_desktop.sh` on server.
+
+## Image Sharing
+
+The agent can share images in markdown using the `upload_image` tool:
+
+| Tool | Purpose |
+|------|---------|
+| `upload_image` | Upload local image to Supabase Storage, returns public URL |
+
+**Usage:**
+1. Take a screenshot or create an image file
+2. Use `upload_image` with the file path
+3. Include the returned markdown `![description](url)` in your response
+
+**Supabase Storage:**
+- Bucket: `images` (public, created in Supabase dashboard)
+- Public URL format: `https://<project>.supabase.co/storage/v1/object/public/images/<file>`
+- Supported formats: PNG, JPEG, GIF, WebP, SVG
 
 ## After Significant Changes
 
