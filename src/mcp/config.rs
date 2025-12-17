@@ -65,9 +65,9 @@ impl McpConfigStore {
         {
             let mut configs = self.configs.write().await;
             
-            // Check for duplicate endpoint
-            if configs.iter().any(|c| c.endpoint == config.endpoint) {
-                anyhow::bail!("MCP with endpoint {} already exists", config.endpoint);
+            // Check for duplicate name
+            if configs.iter().any(|c| c.name == config.name) {
+                anyhow::bail!("MCP with name '{}' already exists", config.name);
             }
             
             configs.push(config.clone());
