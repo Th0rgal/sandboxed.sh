@@ -273,18 +273,8 @@ impl Agent for ComplexityEstimator {
         let prompt = self.build_prompt(task);
         
         let messages = vec![
-            ChatMessage {
-                role: Role::System,
-                content: Some("You are a precise task complexity analyzer. Respond only with JSON.".to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            ChatMessage {
-                role: Role::User,
-                content: Some(prompt),
-                tool_calls: None,
-                tool_call_id: None,
-            },
+            ChatMessage::new(Role::System, "You are a precise task complexity analyzer. Respond only with JSON."),
+            ChatMessage::new(Role::User, prompt),
         ];
 
         // Use a fast, cheap model for complexity estimation

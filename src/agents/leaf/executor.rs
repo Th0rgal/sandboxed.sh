@@ -16,7 +16,7 @@ use crate::agents::{
 };
 use crate::api::control::{AgentEvent, ControlRunState};
 use crate::budget::ExecutionSignals;
-use crate::llm::{ChatMessage, Role, ToolCall};
+use crate::llm::{ChatMessage, MessageContent, Role, ToolCall};
 use crate::task::{Task, TokenUsageSummary};
 use crate::tools::ToolRegistry;
 
@@ -326,18 +326,8 @@ When task is complete, provide a clear summary of:
         // Build initial messages with reusable tools info
         let system_prompt = self.build_system_prompt(&ctx.working_dir_str(), &ctx.tools, &reusable_tools);
         let mut messages = vec![
-            ChatMessage {
-                role: Role::System,
-                content: Some(system_prompt),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            ChatMessage {
-                role: Role::User,
-                content: Some(task.description().to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
+            ChatMessage::new(Role::System, system_prompt),
+            ChatMessage::new(Role::User, task.description().to_string()),
         ];
 
         // Get tool schemas
@@ -474,7 +464,7 @@ When task is complete, provide a clear summary of:
                     // Add assistant message with tool calls
                     messages.push(ChatMessage {
                         role: Role::Assistant,
-                        content: response.content.clone(),
+                        content: response.content.clone().map(MessageContent::text),
                         tool_calls: Some(tool_calls.clone()),
                         tool_call_id: None,
                     });
@@ -646,10 +636,23 @@ When task is complete, provide a clear summary of:
                             tool_message_content
                         };
 
+                        // Check for vision image marker [VISION_IMAGE:url] and create multimodal content
+                        let message_content = if let Some(captures) = extract_vision_image_url(&truncated_content) {
+                            // Create multimodal content with text and image
+                            let text_without_marker = truncated_content.replace(&format!("[VISION_IMAGE:{}]", captures), "").trim().to_string();
+                            tracing::info!("Including vision image in context: {}", captures);
+                            MessageContent::multimodal(vec![
+                                crate::llm::ContentPart::text(text_without_marker),
+                                crate::llm::ContentPart::image_url(captures),
+                            ])
+                        } else {
+                            MessageContent::text(truncated_content)
+                        };
+
                         // Add tool result
                         messages.push(ChatMessage {
                             role: Role::Tool,
-                            content: Some(truncated_content),
+                            content: Some(message_content),
                             tool_calls: None,
                             tool_call_id: Some(tool_call.id.clone()),
                         });
@@ -885,5 +888,21 @@ impl LeafAgent for TaskExecutor {
     fn capability(&self) -> LeafCapability {
         LeafCapability::TaskExecution
     }
+}
+
+/// Extract vision image URL from tool result content.
+/// Looks for the marker format: [VISION_IMAGE:https://...]
+fn extract_vision_image_url(content: &str) -> Option<String> {
+    let marker_start = "[VISION_IMAGE:";
+    if let Some(start_idx) = content.find(marker_start) {
+        let url_start = start_idx + marker_start.len();
+        if let Some(end_idx) = content[url_start..].find(']') {
+            let url = &content[url_start..url_start + end_idx];
+            if url.starts_with("http") {
+                return Some(url.to_string());
+            }
+        }
+    }
+    None
 }
 

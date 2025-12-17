@@ -169,18 +169,8 @@ Respond ONLY with the JSON object."#,
         );
 
         let messages = vec![
-            ChatMessage {
-                role: Role::System,
-                content: Some("You are a precise task verifier. Respond only with JSON.".to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            ChatMessage {
-                role: Role::User,
-                content: Some(prompt),
-                tool_calls: None,
-                tool_call_id: None,
-            },
+            ChatMessage::new(Role::System, "You are a precise task verifier. Respond only with JSON."),
+            ChatMessage::new(Role::User, prompt),
         ];
 
         let model = "openai/gpt-4.1-mini";

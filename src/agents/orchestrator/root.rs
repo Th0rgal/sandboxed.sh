@@ -118,18 +118,8 @@ Respond ONLY with the JSON object."#,
         );
 
         let messages = vec![
-            crate::llm::ChatMessage {
-                role: crate::llm::Role::System,
-                content: Some("You are a precise task planner. Respond only with JSON.".to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            crate::llm::ChatMessage {
-                role: crate::llm::Role::User,
-                content: Some(prompt),
-                tool_calls: None,
-                tool_call_id: None,
-            },
+            crate::llm::ChatMessage::new(crate::llm::Role::System, "You are a precise task planner. Respond only with JSON."),
+            crate::llm::ChatMessage::new(crate::llm::Role::User, prompt),
         ];
 
         let response = ctx.llm

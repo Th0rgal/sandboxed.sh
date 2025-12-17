@@ -305,6 +305,8 @@ impl Tool for Screenshot {
 
 IMPORTANT: After launching applications with i3 exec commands, use wait_seconds (3-5s recommended) to let them render before capturing. Otherwise the screenshot may be black.
 
+Set return_image=true to SEE the screenshot yourself (vision). This lets you verify the layout is correct before responding.
+
 You MUST copy the returned markdown (e.g., '![screenshot](https://...)') directly into your response text for the user to see the image."
     }
 
@@ -319,6 +321,10 @@ You MUST copy the returned markdown (e.g., '![screenshot](https://...)') directl
                 "wait_seconds": {
                     "type": "number",
                     "description": "Seconds to wait before taking screenshot. Use 3-5 seconds after launching apps (chromium, xterm, etc.) to let them render. Default: 0"
+                },
+                "return_image": {
+                    "type": "boolean",
+                    "description": "If true, the screenshot image will be included in your context so you can SEE it (requires vision model). Use this to verify the desktop layout is correct. Default: false"
                 },
                 "upload": {
                     "type": "boolean",
@@ -422,20 +428,30 @@ You MUST copy the returned markdown (e.g., '![screenshot](https://...)') directl
 
         let metadata = std::fs::metadata(&filepath)?;
         let should_upload = args["upload"].as_bool().unwrap_or(true);
+        let return_image = args["return_image"].as_bool().unwrap_or(false);
         let description = args["description"].as_str().unwrap_or("screenshot");
 
         // Auto-upload to Supabase if enabled and configured
         if should_upload {
             if let Some((url, markdown)) = upload_screenshot_to_supabase(&filepath, description).await {
+                // Include vision marker if return_image is true
+                // Format: [VISION_IMAGE:url] - this will be parsed by the executor to add the image to context
+                let vision_marker = if return_image {
+                    format!("\n\n[VISION_IMAGE:{}]", url)
+                } else {
+                    String::new()
+                };
+                
                 // Return format that strongly encourages the LLM to include the markdown
                 return Ok(format!(
                     "Screenshot captured and uploaded successfully.\n\n\
                     INCLUDE THIS IN YOUR RESPONSE TO SHOW THE IMAGE:\n{}\n\n\
-                    Details: path={}, size={} bytes, url={}",
+                    Details: path={}, size={} bytes, url={}{}",
                     markdown,
                     filepath.display(),
                     metadata.len(),
-                    url
+                    url,
+                    vision_marker
                 ));
             }
             // Fall through to local-only if upload fails
