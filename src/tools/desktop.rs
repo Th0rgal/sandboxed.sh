@@ -301,7 +301,7 @@ impl Tool for Screenshot {
     }
 
     fn description(&self) -> &str {
-        "Take a screenshot of the virtual desktop. Returns the file path to the saved PNG image. You can then use read_file to view the image (supports vision)."
+        "Take a screenshot of the virtual desktop. Returns the file path to the saved PNG image. To share the screenshot with the user in chat, use upload_image with the returned path to get a public URL, then include the markdown in your response."
     }
 
     fn parameters_schema(&self) -> Value {
