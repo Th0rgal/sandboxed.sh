@@ -94,12 +94,15 @@ struct StatusBadge: View {
             Text(status.label)
                 .font(.system(size: compact ? 10 : 11, weight: .semibold))
                 .textCase(.uppercase)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
         }
         .foregroundStyle(status.color)
         .padding(.horizontal, compact ? 8 : 10)
         .padding(.vertical, compact ? 4 : 6)
         .background(status.backgroundColor)
         .clipShape(Capsule())
+        .fixedSize()
     }
 }
 

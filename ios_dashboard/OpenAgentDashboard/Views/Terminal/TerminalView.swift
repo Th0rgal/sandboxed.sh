@@ -173,28 +173,66 @@ struct TerminalView: View {
         
         /// Strip all non-SGR escape sequences (cursor movement, screen clear, etc.)
         private static func stripNonColorEscapes(_ text: String) -> String {
-            // Match all ANSI escape sequences
-            // SGR codes end in 'm', others end in A-Z (except m)
-            // Also handle OSC sequences (ESC ] ... BEL/ST)
-            let patterns = [
-                "\\x1B\\[[0-9;]*[A-LN-Za-ln-z]",  // CSI sequences except 'm'
-                "\\x1B\\][^\\x07\\x1B]*(?:\\x07|\\x1B\\\\)",  // OSC sequences
-                "\\x1B[\\(\\)][AB012]",  // Character set selection
-                "\\x1B[78DEHM]",  // Single-char escapes
-                "\\x1B\\[\\?[0-9;]*[hl]",  // Private mode set/reset
-            ]
-            
             var result = text
-            for pattern in patterns {
-                if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
-                    result = regex.stringByReplacingMatches(
-                        in: result,
-                        options: [],
-                        range: NSRange(result.startIndex..., in: result),
-                        withTemplate: ""
-                    )
-                }
+            
+            // Pattern 1: CSI sequences that are NOT color codes (not ending in 'm')
+            // This catches [47C (cursor forward), [1G (cursor to column), [2J (clear), etc.
+            // Using a more explicit pattern to catch all CSI commands except 'm'
+            let csiPattern = "\\x1B\\[([0-9]*;?)*[ABCDEFGHIJKLPSTXZcfghilnqrsu@`]"
+            if let regex = try? NSRegularExpression(pattern: csiPattern, options: []) {
+                result = regex.stringByReplacingMatches(
+                    in: result,
+                    options: [],
+                    range: NSRange(result.startIndex..., in: result),
+                    withTemplate: ""
+                )
             }
+            
+            // Pattern 2: Also catch any remaining [xxC or [xxA etc. patterns that might have slipped through
+            // This is a fallback for malformed sequences
+            let fallbackPattern = "\\[\\d+[A-Za-z]"
+            if let regex = try? NSRegularExpression(pattern: fallbackPattern, options: []) {
+                result = regex.stringByReplacingMatches(
+                    in: result,
+                    options: [],
+                    range: NSRange(result.startIndex..., in: result),
+                    withTemplate: ""
+                )
+            }
+            
+            // Pattern 3: OSC sequences (ESC ] ... BEL or ESC ] ... ST)
+            let oscPattern = "\\x1B\\][^\\x07\\x1B]*(?:\\x07|\\x1B\\\\)?"
+            if let regex = try? NSRegularExpression(pattern: oscPattern, options: []) {
+                result = regex.stringByReplacingMatches(
+                    in: result,
+                    options: [],
+                    range: NSRange(result.startIndex..., in: result),
+                    withTemplate: ""
+                )
+            }
+            
+            // Pattern 4: Private mode sequences (ESC [ ? ... h/l)
+            let privatePattern = "\\x1B\\[\\?[0-9;]*[hl]"
+            if let regex = try? NSRegularExpression(pattern: privatePattern, options: []) {
+                result = regex.stringByReplacingMatches(
+                    in: result,
+                    options: [],
+                    range: NSRange(result.startIndex..., in: result),
+                    withTemplate: ""
+                )
+            }
+            
+            // Pattern 5: Character set and single-char escapes
+            let miscPattern = "\\x1B[\\(\\)][AB012]|\\x1B[78DEHM=>]"
+            if let regex = try? NSRegularExpression(pattern: miscPattern, options: []) {
+                result = regex.stringByReplacingMatches(
+                    in: result,
+                    options: [],
+                    range: NSRange(result.startIndex..., in: result),
+                    withTemplate: ""
+                )
+            }
+            
             return result
         }
         
@@ -253,16 +291,27 @@ struct TerminalView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: 12) {
-                    // Status indicator
-                    HStack(spacing: 6) {
-                        StatusDot(status: connectionStatus, size: 6)
-                        Text(connectionStatus == .connected ? "Live" : connectionStatus.label)
+                // Unified status pill
+                HStack(spacing: 0) {
+                    // Status side
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(connectionStatus == .connected ? Theme.success : Theme.textMuted)
+                            .frame(width: 6, height: 6)
+                        Text(connectionStatus == .connected ? "Live" : "Off")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(connectionStatus == .connected ? Theme.success : Theme.textSecondary)
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(connectionStatus == .connected ? Theme.success.opacity(0.15) : Color.clear)
                     
-                    // Connect/Disconnect button
+                    // Divider
+                    Rectangle()
+                        .fill(Theme.border)
+                        .frame(width: 1)
+                    
+                    // Action side
                     Button {
                         if connectionStatus == .connected {
                             disconnect()
@@ -271,10 +320,18 @@ struct TerminalView: View {
                         }
                     } label: {
                         Text(connectionStatus == .connected ? "End" : "Connect")
-                            .font(.subheadline.weight(.medium))
+                            .font(.caption.weight(.medium))
                             .foregroundStyle(connectionStatus == .connected ? Theme.error : Theme.accent)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
                     }
                 }
+                .background(Theme.backgroundSecondary)
+                .clipShape(Capsule())
+                .overlay(
+                    Capsule()
+                        .stroke(Theme.border, lineWidth: 1)
+                )
             }
         }
         .onAppear {

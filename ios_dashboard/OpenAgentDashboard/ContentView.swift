@@ -214,7 +214,7 @@ struct LoginView: View {
 // MARK: - Main Tab View
 
 struct MainTabView: View {
-    @State private var selectedTab: TabItem = .control
+    private var nav = NavigationState.shared
     
     enum TabItem: String, CaseIterable {
         case control = "Control"
@@ -233,7 +233,10 @@ struct MainTabView: View {
     }
     
     var body: some View {
-        TabView(selection: $selectedTab) {
+        TabView(selection: Binding(
+            get: { nav.selectedTab },
+            set: { nav.selectedTab = $0 }
+        )) {
             ForEach(TabItem.allCases, id: \.rawValue) { tab in
                 NavigationStack {
                     tabContent(for: tab)
@@ -245,9 +248,6 @@ struct MainTabView: View {
             }
         }
         .tint(Theme.accent)
-        .onChange(of: selectedTab) { _, _ in
-            HapticService.selectionChanged()
-        }
     }
     
     @ViewBuilder

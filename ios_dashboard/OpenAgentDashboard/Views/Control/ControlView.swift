@@ -20,6 +20,7 @@ struct ControlView: View {
     @FocusState private var isInputFocused: Bool
     
     private let api = APIService.shared
+    private let nav = NavigationState.shared
     
     var body: some View {
         ZStack {
@@ -99,8 +100,22 @@ struct ControlView: View {
             }
         }
         .task {
-            await loadCurrentMission()
+            // Check if we're being opened with a specific mission from History
+            if let pendingId = nav.consumePendingMission() {
+                await loadMission(id: pendingId)
+            } else {
+                await loadCurrentMission()
+            }
             startStreaming()
+        }
+        .onChange(of: nav.pendingMissionId) { _, newId in
+            // Handle navigation from History while Control is already visible
+            if let missionId = newId {
+                nav.pendingMissionId = nil
+                Task {
+                    await loadMission(id: missionId)
+                }
+            }
         }
         .onDisappear {
             streamTask?.cancel()
@@ -305,6 +320,28 @@ struct ControlView: View {
                         content: entry.content
                     )
                 }
+            }
+        } catch {
+            print("Failed to load mission: \(error)")
+        }
+    }
+    
+    private func loadMission(id: String) async {
+        isLoading = true
+        defer { isLoading = false }
+        
+        do {
+            let missions = try await api.listMissions()
+            if let mission = missions.first(where: { $0.id == id }) {
+                currentMission = mission
+                messages = mission.history.enumerated().map { index, entry in
+                    ChatMessage(
+                        id: "\(mission.id)-\(index)",
+                        type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
+                        content: entry.content
+                    )
+                }
+                HapticService.success()
             }
         } catch {
             print("Failed to load mission: \(error)")

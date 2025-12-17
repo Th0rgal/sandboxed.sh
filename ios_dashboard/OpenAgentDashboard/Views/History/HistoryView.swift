@@ -17,6 +17,7 @@ struct HistoryView: View {
     @State private var errorMessage: String?
     
     private let api = APIService.shared
+    private let nav = NavigationState.shared
     
     enum StatusFilter: String, CaseIterable {
         case all = "All"
@@ -136,7 +137,9 @@ struct HistoryView: View {
                 if !filteredMissions.isEmpty {
                     Section {
                         ForEach(filteredMissions) { mission in
-                            NavigationLink(value: mission) {
+                            Button {
+                                nav.openMission(mission.id)
+                            } label: {
                                 MissionRow(mission: mission)
                             }
                             .buttonStyle(.plain)
@@ -178,9 +181,6 @@ struct HistoryView: View {
                 }
             }
             .padding()
-        }
-        .navigationDestination(for: Mission.self) { mission in
-            MissionDetailView(mission: mission)
         }
     }
     
