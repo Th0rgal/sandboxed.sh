@@ -471,14 +471,6 @@ When task is complete, provide a clear summary of:
             // Check for tool calls
             if let Some(tool_calls) = &response.tool_calls {
                 if !tool_calls.is_empty() {
-                    let tool_names: Vec<_> = tool_calls.iter().map(|tc| tc.function.name.as_str()).collect();
-                    tracing::info!(
-                        "Iteration {} has {} tool calls: {:?}, content_len={}",
-                        iteration + 1,
-                        tool_calls.len(),
-                        tool_names,
-                        response.content.as_ref().map(|c| c.len()).unwrap_or(0)
-                    );
                     // Add assistant message with tool calls
                     messages.push(ChatMessage {
                         role: Role::Assistant,
@@ -670,7 +662,7 @@ When task is complete, provide a clear summary of:
                     let called_complete_mission = tool_calls.iter().any(|tc| tc.function.name == "complete_mission");
                     if called_complete_mission {
                         if let Some(content) = response.content.as_ref().filter(|c| !c.trim().is_empty()) {
-                            tracing::info!("complete_mission called with content, returning early with {} chars", content.len());
+                            tracing::debug!("complete_mission called with content, returning early");
                             let signals = ExecutionSignals {
                                 iterations: iterations_completed,
                                 max_iterations: ctx.max_iterations as u32,
@@ -701,12 +693,6 @@ When task is complete, provide a clear summary of:
             }
 
             // No tool calls - final response
-            tracing::debug!(
-                "No tool calls, checking content: is_some={}, len={}, preview={}",
-                response.content.is_some(),
-                response.content.as_ref().map(|c| c.len()).unwrap_or(0),
-                response.content.as_ref().map(|c| c.chars().take(100).collect::<String>()).unwrap_or_default()
-            );
             if let Some(content) = response.content.filter(|c| !c.trim().is_empty()) {
                 let signals = ExecutionSignals {
                     iterations: iterations_completed,

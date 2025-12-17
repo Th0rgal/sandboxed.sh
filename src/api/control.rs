@@ -852,14 +852,6 @@ async fn control_actor_loop(
                     running_cancel = None;
                     match res {
                         Ok((_mid, user_msg, agent_result)) => {
-                            // Debug log the agent result
-                            tracing::info!(
-                                "Agent finished: success={}, output_len={}, output_preview={}",
-                                agent_result.success,
-                                agent_result.output.len(),
-                                &agent_result.output.chars().take(200).collect::<String>()
-                            );
-                            
                             // Append to conversation history.
                             history.push(("user".to_string(), user_msg));
                             history.push(("assistant".to_string(), agent_result.output.clone()));
