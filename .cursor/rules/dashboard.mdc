@@ -45,15 +45,79 @@ dashboard/src/
 ├── app/              # Next.js App Router pages
 │   ├── console/      # SSH terminal + file explorer
 │   ├── control/      # Task control panel
-│   ├── agents/       # Agent monitoring
+│   ├── agents/       # Agent tree visualization
 │   ├── modules/      # MCP module management
 │   └── settings/     # Configuration
 ├── components/
 │   ├── ui/           # Generic UI components
-│   └── tool-ui/      # Tool-specific UI (option-list, data-table)
+│   ├── tool-ui/      # Tool-specific UI (option-list, data-table)
+│   └── agent-tree/   # Agent tree visualization components
 ├── hooks/            # React hooks
 └── lib/              # Utilities (api, auth, settings)
 ```
+
+## Agent Tree Visualization
+
+Dynamic, animated tree visualization for hierarchical agent execution. Uses SVG + framer-motion for smooth animations.
+
+### Component Structure
+
+```
+components/agent-tree/
+├── index.ts              # Public exports
+├── types.ts              # Type definitions (AgentNode, LayoutNode, etc.)
+├── layout.ts             # Tree layout algorithm (modified Reingold-Tilford)
+├── demo-data.ts          # Demo tree generators for testing
+└── AgentTreeCanvas.tsx   # Main visualization component
+```
+
+### Usage
+
+```tsx
+import { 
+  AgentTreeCanvas, 
+  generateComplexTree, 
+  simulateTreeUpdates,
+  type AgentNode 
+} from '@/components/agent-tree';
+
+// With real data from backend
+<AgentTreeCanvas 
+  tree={agentTree} 
+  selectedNodeId={selectedId}
+  onSelectNode={(node) => setSelectedId(node?.id ?? null)} 
+/>
+
+// Demo mode (for testing without API)
+const [tree, setTree] = useState(generateComplexTree());
+useEffect(() => simulateTreeUpdates(tree, setTree), []);
+<AgentTreeCanvas tree={tree} />
+```
+
+### Node Display
+
+Each node shows:
+- **Icon**: Agent type (Bot, Brain, Cpu, Zap, Target, GitBranch)
+- **Name**: Truncated agent name
+- **Model**: LLM model used (e.g., `claude-sonnet-4.5`)
+- **Status**: Running (pulse), Completed (✓), Failed (✗), Pending (clock)
+- **Budget**: Spent / Allocated (e.g., `$0.35 / $9.00`)
+
+### Demo Modes
+
+Three demo tree generators for testing:
+- `generateSimpleTree()` – Basic orchestrator (5 nodes)
+- `generateComplexTree()` – Subtask decomposition (10-15 nodes)
+- `generateDeepTree(depth)` – Recursive nesting (50+ nodes)
+
+Use `simulateTreeUpdates(tree, setTree)` to simulate live status changes.
+
+### Interactions
+
+- **Pan**: Click and drag to move the tree
+- **Zoom**: Mouse wheel or +/- buttons
+- **Select**: Click a node to show details panel
+- **Reset**: Reset view button restores initial position
 
 ## Environment Variables
 
