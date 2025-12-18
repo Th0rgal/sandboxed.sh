@@ -223,6 +223,63 @@ impl SubtaskPlan {
             Ok(order)
         }
     }
+
+    /// Get execution waves for parallel processing.
+    /// 
+    /// Each wave contains indices of tasks that can be executed in parallel
+    /// (all their dependencies are in previous waves).
+    /// 
+    /// # Returns
+    /// Vector of waves, where each wave is a vector of subtask indices.
+    /// 
+    /// # Errors
+    /// Returns `Err` if there are circular dependencies.
+    pub fn execution_waves(&self) -> Result<Vec<Vec<usize>>, SubtaskPlanError> {
+        let n = self.subtasks.len();
+        let mut in_degree = vec![0usize; n];
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+        // Build adjacency list and compute in-degrees
+        for (i, subtask) in self.subtasks.iter().enumerate() {
+            for &dep in &subtask.dependencies {
+                adj[dep].push(i);
+                in_degree[i] += 1;
+            }
+        }
+
+        let mut waves = Vec::new();
+        let mut processed = 0;
+
+        // Initial wave: all tasks with no dependencies
+        let mut current_wave: Vec<usize> = in_degree
+            .iter()
+            .enumerate()
+            .filter(|(_, &d)| d == 0)
+            .map(|(i, _)| i)
+            .collect();
+
+        while !current_wave.is_empty() {
+            processed += current_wave.len();
+            waves.push(current_wave.clone());
+
+            let mut next_wave = Vec::new();
+            for &node in &current_wave {
+                for &next in &adj[node] {
+                    in_degree[next] -= 1;
+                    if in_degree[next] == 0 {
+                        next_wave.push(next);
+                    }
+                }
+            }
+            current_wave = next_wave;
+        }
+
+        if processed != n {
+            Err(SubtaskPlanError::CircularDependency)
+        } else {
+            Ok(waves)
+        }
+    }
 }
 
 /// Errors in subtask plan creation or execution.

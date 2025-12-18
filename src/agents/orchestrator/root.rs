@@ -301,6 +301,7 @@ Respond ONLY with the JSON object."#,
     }
 
     /// Execute subtasks with tree updates for visualization.
+    /// Uses wave-based parallel execution for independent tasks.
     async fn execute_subtasks_with_tree(
         &self,
         subtask_plan: SubtaskPlan,
@@ -310,61 +311,119 @@ Respond ONLY with the JSON object."#,
         ctx: &AgentContext,
     ) -> AgentResult {
         use super::NodeAgent;
-        use crate::api::control::AgentTreeNode;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        
+        // Get execution waves for parallel processing
+        let waves = match subtask_plan.execution_waves() {
+            Ok(w) => w,
+            Err(e) => return AgentResult::failure(format!("Invalid subtask dependencies: {}", e), 0),
+        };
         
         let mut tasks = match subtask_plan.into_tasks(parent_budget) {
             Ok(t) => t,
             Err(e) => return AgentResult::failure(format!("Failed to create subtasks: {}", e), 0),
         };
 
-        let mut results = Vec::new();
-        let mut total_cost = 0u64;
         let total_subtasks = tasks.len();
-
+        let num_waves = waves.len();
+        
         tracing::info!(
-            "RootAgent executing {} subtasks (child depth: {})",
+            "RootAgent executing {} subtasks in {} wave(s) (child depth: {})",
             total_subtasks,
+            num_waves,
             child_ctx.max_split_depth
         );
 
-        for (i, task) in tasks.iter_mut().enumerate() {
-            let subtask_id = format!("subtask-{}", i + 1);
+        // Wrap tree in Arc<Mutex> for thread-safe parallel updates
+        let tree = Arc::new(Mutex::new(root_tree.clone()));
+        let mut all_results = Vec::new();
+        let mut total_cost = 0u64;
+
+        // Execute each wave in parallel
+        for (wave_idx, wave) in waves.iter().enumerate() {
+            let is_parallel = wave.len() > 1;
             
-            // Update subtask status to running
-            if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == subtask_id) {
-                node.status = "running".to_string();
-            }
-            ctx.emit_tree(root_tree.clone());
-
             tracing::info!(
-                "RootAgent delegating subtask {}/{}: {}",
-                i + 1,
-                total_subtasks,
-                task.description().chars().take(80).collect::<String>()
+                "RootAgent wave {}/{}: {} task(s) {}",
+                wave_idx + 1,
+                num_waves,
+                wave.len(),
+                if is_parallel { "(parallel)" } else { "(sequential)" }
             );
 
-            // Create a NodeAgent and execute
-            let node_agent = NodeAgent::new(subtask_id.clone());
-            let result = node_agent.execute_with_tree(task, child_ctx, &subtask_id, root_tree, ctx).await;
-            total_cost += result.cost_cents;
-
-            // Update subtask status based on result
-            if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == subtask_id) {
-                node.status = if result.success { "completed".to_string() } else { "failed".to_string() };
-                node.budget_spent = result.cost_cents;
+            // Mark all tasks in this wave as running
+            {
+                let mut tree_guard = tree.lock().await;
+                for &idx in wave {
+                    let subtask_id = format!("subtask-{}", idx + 1);
+                    if let Some(node) = tree_guard.children.iter_mut().find(|n| n.id == subtask_id) {
+                        node.status = "running".to_string();
+                    }
+                }
+                ctx.emit_tree(tree_guard.clone());
             }
-            ctx.emit_tree(root_tree.clone());
 
-            tracing::info!(
-                "Subtask {}/{} {}: {}",
-                i + 1,
-                total_subtasks,
-                if result.success { "succeeded" } else { "failed" },
-                result.output.chars().take(100).collect::<String>()
-            );
+            // Execute tasks in this wave in parallel
+            let wave_futures: Vec<_> = wave.iter().map(|&idx| {
+                let subtask_id = format!("subtask-{}", idx + 1);
+                let task = tasks[idx].clone();
+                let child_ctx = child_ctx.clone();
+                let tree = Arc::clone(&tree);
+                let ctx = ctx.clone();
+                
+                async move {
+                    let mut task = task;
+                    let node_agent = NodeAgent::new(subtask_id.clone());
+                    
+                    tracing::info!(
+                        "RootAgent delegating subtask {}: {}",
+                        subtask_id,
+                        task.description().chars().take(80).collect::<String>()
+                    );
+                    
+                    // Execute (without tree updates for parallel - update after)
+                    let result = node_agent.execute(&mut task, &child_ctx).await;
+                    
+                    // Update tree with result
+                    {
+                        let mut tree_guard = tree.lock().await;
+                        if let Some(node) = tree_guard.children.iter_mut().find(|n| n.id == subtask_id) {
+                            node.status = if result.success { "completed".to_string() } else { "failed".to_string() };
+                            node.budget_spent = result.cost_cents;
+                        }
+                        ctx.emit_tree(tree_guard.clone());
+                    }
+                    
+                    tracing::info!(
+                        "Subtask {} {}: {}",
+                        subtask_id,
+                        if result.success { "succeeded" } else { "failed" },
+                        result.output.chars().take(100).collect::<String>()
+                    );
+                    
+                    (idx, result)
+                }
+            }).collect();
 
-            results.push(result);
+            // Wait for all tasks in wave to complete
+            let wave_results = futures::future::join_all(wave_futures).await;
+            
+            for (idx, result) in wave_results {
+                total_cost += result.cost_cents;
+                // Store result at correct index
+                while all_results.len() <= idx {
+                    all_results.push(None);
+                }
+                all_results[idx] = Some(result);
+            }
         }
+
+        // Collect results in order
+        let results: Vec<AgentResult> = all_results.into_iter().filter_map(|r| r).collect();
+
+        // Update the original tree from our Arc<Mutex> version
+        *root_tree = tree.lock().await.clone();
 
         // Update verifier to running
         if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == "verifier") {
@@ -385,13 +444,14 @@ Respond ONLY with the JSON object."#,
 
         if successes == total {
             AgentResult::success(
-                format!("All {} subtasks completed successfully", total),
+                format!("All {} subtasks completed successfully ({} waves)", total, num_waves),
                 total_cost,
             )
             .with_data(json!({
                 "subtasks_total": total,
                 "subtasks_succeeded": successes,
                 "recursive_execution": true,
+                "parallel_waves": num_waves,
                 "results": results.iter().map(|r| json!({
                     "success": r.success,
                     "output": &r.output,
@@ -400,13 +460,14 @@ Respond ONLY with the JSON object."#,
             }))
         } else {
             AgentResult::failure(
-                format!("{}/{} subtasks succeeded", successes, total),
+                format!("{}/{} subtasks succeeded ({} waves)", successes, total, num_waves),
                 total_cost,
             )
             .with_data(json!({
                 "subtasks_total": total,
                 "subtasks_succeeded": successes,
                 "recursive_execution": true,
+                "parallel_waves": num_waves,
                 "results": results.iter().map(|r| json!({
                     "success": r.success,
                     "output": &r.output,

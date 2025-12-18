@@ -19,6 +19,8 @@ import {
   Ban,
   ChevronRight,
   ChevronDown,
+  ChevronLeft,
+  X,
   Zap,
   GitBranch,
   Target,
@@ -792,26 +794,44 @@ export default function AgentsPage() {
         )}
       </div>
 
-      {/* Agent details panel */}
+      {/* Agent details panel (overlay) */}
       {selectedAgent && (
-        <div className="w-80 border-l border-white/[0.06] glass-panel p-4 animate-slide-in-right overflow-y-auto">
-          <div className="flex items-center gap-3 mb-6">
-            <div className={cn(
-              'flex h-10 w-10 items-center justify-center rounded-xl',
-              statusConfig[selectedAgent.status].bg
-            )}>
-              {(() => {
-                const Icon = agentIcons[selectedAgent.type];
-                return <Icon className={cn('h-5 w-5', statusConfig[selectedAgent.status].text)} />;
-              })()}
+        <div className="fixed right-0 top-0 z-50 h-full w-80 flex flex-col glass-panel border-l border-white/[0.06] animate-slide-in-right">
+          {/* Header */}
+          <div className="flex items-start justify-between border-b border-white/[0.06] p-4">
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setSelectedAgent(null)}
+                className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.04] hover:text-white transition-colors"
+              >
+                <ChevronLeft className="h-5 w-5" />
+              </button>
+              <div className={cn(
+                'flex h-10 w-10 items-center justify-center rounded-xl',
+                statusConfig[selectedAgent.status].bg
+              )}>
+                {(() => {
+                  const Icon = agentIcons[selectedAgent.type];
+                  return <Icon className={cn('h-5 w-5', statusConfig[selectedAgent.status].text)} />;
+                })()}
+              </div>
+              <div>
+                <h2 className="text-lg font-medium text-white">{selectedAgent.name}</h2>
+                <p className={cn('text-xs capitalize', statusConfig[selectedAgent.status].text)}>
+                  {selectedAgent.status}
+                </p>
+              </div>
             </div>
-            <div>
-              <h2 className="text-lg font-medium text-white">{selectedAgent.name}</h2>
-              <p className={cn('text-xs capitalize', statusConfig[selectedAgent.status].text)}>
-                {selectedAgent.status}
-              </p>
-            </div>
+            <button
+              onClick={() => setSelectedAgent(null)}
+              className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.04] hover:text-white transition-colors"
+            >
+              <X className="h-5 w-5" />
+            </button>
           </div>
+          
+          {/* Content */}
+          <div className="flex-1 overflow-y-auto p-4">
 
           <div className="space-y-5">
             <div>
@@ -903,6 +923,7 @@ export default function AgentsPage() {
                 </div>
               </div>
             )}
+            </div>
           </div>
         </div>
       )}
