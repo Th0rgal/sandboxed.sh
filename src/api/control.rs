@@ -287,6 +287,7 @@ pub enum ControlCommand {
     /// Start a mission in parallel (if slots available)
     StartParallel {
         mission_id: Uuid,
+        content: String,
         respond: oneshot::Sender<Result<(), String>>,
     },
     /// Cancel a specific mission
@@ -797,10 +798,17 @@ pub async fn list_running_missions(
     Ok(Json(running))
 }
 
+/// Request body for starting a mission in parallel.
+#[derive(Debug, Deserialize)]
+pub struct StartParallelRequest {
+    pub content: String,
+}
+
 /// Start a mission in parallel (if capacity allows).
 pub async fn start_mission_parallel(
     State(state): State<Arc<AppState>>,
     Path(mission_id): Path<Uuid>,
+    Json(req): Json<StartParallelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
     
@@ -809,6 +817,7 @@ pub async fn start_mission_parallel(
         .cmd_tx
         .send(ControlCommand::StartParallel {
             mission_id,
+            content: req.content,
             respond: tx,
         })
         .await
@@ -1062,7 +1071,7 @@ async fn control_actor_loop(
     current_tree: Arc<RwLock<Option<AgentTreeNode>>>,
     progress: Arc<RwLock<ExecutionProgress>>,
 ) {
-    // Queue stores (id, content, model_override)
+    // Queue stores (id, content, model_override) for the current/primary mission
     let mut queue: VecDeque<(Uuid, String, Option<String>)> = VecDeque::new();
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content) pairs (user/assistant)
     let pricing = Arc::new(ModelPricing::new());
@@ -1070,6 +1079,10 @@ async fn control_actor_loop(
     let mut running: Option<tokio::task::JoinHandle<(Uuid, String, crate::agents::AgentResult)>> =
         None;
     let mut running_cancel: Option<CancellationToken> = None;
+
+    // Parallel mission runners - each runs independently
+    let mut parallel_runners: std::collections::HashMap<Uuid, super::mission_runner::MissionRunner> =
+        std::collections::HashMap::new();
 
     // Helper to extract file paths from text (for mission summaries)
     fn extract_file_paths(text: &str) -> Vec<String> {
@@ -1343,54 +1356,95 @@ async fn control_actor_loop(
                             let _ = respond.send(Err("Memory not configured".to_string()));
                         }
                     }
-                    ControlCommand::StartParallel { mission_id, respond } => {
-                        // Parallel mission support: this is a placeholder for future implementation
-                        // Currently, missions run sequentially in the main queue
-                        // Full parallel execution requires spawning additional MissionRunner instances
+                    ControlCommand::StartParallel { mission_id, content, respond } => {
                         tracing::info!("StartParallel requested for mission {}", mission_id);
                         
-                        // Check if we have capacity
-                        let running_count = if running.is_some() { 1 } else { 0 };
+                        // Count currently running parallel missions
+                        let parallel_running = parallel_runners.values().filter(|r| r.is_running()).count();
+                        let main_running = if running.is_some() { 1 } else { 0 };
+                        let total_running = parallel_running + main_running;
                         let max_parallel = config.max_parallel_missions;
                         
-                        if running_count >= max_parallel {
+                        if total_running >= max_parallel {
                             let _ = respond.send(Err(format!(
-                                "Maximum parallel missions ({}) reached. Wait for current mission to complete or cancel it.",
-                                max_parallel
+                                "Maximum parallel missions ({}) reached. {} running.",
+                                max_parallel, total_running
+                            )));
+                        } else if parallel_runners.contains_key(&mission_id) {
+                            let _ = respond.send(Err(format!(
+                                "Mission {} is already running in parallel",
+                                mission_id
                             )));
                         } else {
-                            // For now, just acknowledge - full implementation would spawn a new MissionRunner
-                            let _ = respond.send(Ok(()));
-                            tracing::info!("Mission {} queued for parallel execution", mission_id);
+                            // Load mission to get model_override
+                            let model_override = match load_mission_from_db(&memory, mission_id).await {
+                                Ok(m) => m.model_override,
+                                Err(e) => {
+                                    let _ = respond.send(Err(format!("Failed to load mission: {}", e)));
+                                    continue;
+                                }
+                            };
+                            
+                            // Create a new MissionRunner
+                            let mut runner = super::mission_runner::MissionRunner::new(
+                                mission_id,
+                                model_override.clone(),
+                            );
+                            
+                            // Queue the initial message
+                            runner.queue_message(Uuid::new_v4(), content, model_override);
+                            
+                            // Start execution
+                            let started = runner.start_next(
+                                config.clone(),
+                                Arc::clone(&root_agent),
+                                memory.clone(),
+                                Arc::clone(&benchmarks),
+                                Arc::clone(&resolver),
+                                Arc::clone(&pricing),
+                                events_tx.clone(),
+                                Arc::clone(&tool_hub),
+                                Arc::clone(&status),
+                                mission_cmd_tx.clone(),
+                                Arc::new(RwLock::new(Some(mission_id))), // Each runner tracks its own mission
+                            );
+                            
+                            if started {
+                                tracing::info!("Mission {} started in parallel (model: {:?})", mission_id, runner.model_override);
+                                parallel_runners.insert(mission_id, runner);
+                                let _ = respond.send(Ok(()));
+                            } else {
+                                let _ = respond.send(Err("Failed to start mission execution".to_string()));
+                            }
                         }
                     }
                     ControlCommand::CancelMission { mission_id, respond } => {
-                        // Check if this is the current running mission
-                        let current = current_mission.read().await.clone();
-                        if current == Some(mission_id) {
-                            // Cancel the current execution
-                            if let Some(token) = &running_cancel {
-                                token.cancel();
-                                let _ = events_tx.send(AgentEvent::Error { 
-                                    message: format!("Mission {} cancelled", mission_id),
-                                    mission_id: Some(mission_id),
-                                });
-                                let _ = respond.send(Ok(()));
-                            } else {
-                                let _ = respond.send(Err("Mission not currently executing".to_string()));
-                            }
-                        } else {
-                            // Check if it's in the queue
-                            let original_len = queue.len();
-                            queue.retain(|(_, _, _)| {
-                                // Note: queue doesn't track mission_id, so this is limited
-                                // For full parallel support, we'd need to track mission_id in queue
-                                true
+                        // First check parallel runners
+                        if let Some(runner) = parallel_runners.get_mut(&mission_id) {
+                            runner.cancel();
+                            let _ = events_tx.send(AgentEvent::Error { 
+                                message: format!("Parallel mission {} cancelled", mission_id),
+                                mission_id: Some(mission_id),
                             });
-                            if queue.len() < original_len {
-                                let _ = respond.send(Ok(()));
+                            parallel_runners.remove(&mission_id);
+                            let _ = respond.send(Ok(()));
+                        } else {
+                            // Check if this is the current running mission
+                            let current = current_mission.read().await.clone();
+                            if current == Some(mission_id) {
+                                // Cancel the current execution
+                                if let Some(token) = &running_cancel {
+                                    token.cancel();
+                                    let _ = events_tx.send(AgentEvent::Error { 
+                                        message: format!("Mission {} cancelled", mission_id),
+                                        mission_id: Some(mission_id),
+                                    });
+                                    let _ = respond.send(Ok(()));
+                                } else {
+                                    let _ = respond.send(Err("Mission not currently executing".to_string()));
+                                }
                             } else {
-                                let _ = respond.send(Err(format!("Mission {} not found in queue", mission_id)));
+                                let _ = respond.send(Err(format!("Mission {} not found", mission_id)));
                             }
                         }
                     }
@@ -1398,16 +1452,22 @@ async fn control_actor_loop(
                         // Return info about currently running missions
                         let mut running_list = Vec::new();
                         
+                        // Add main mission if running
                         if running.is_some() {
                             if let Some(mission_id) = current_mission.read().await.clone() {
                                 running_list.push(super::mission_runner::RunningMissionInfo {
                                     mission_id,
-                                    model_override: None, // Could track this
+                                    model_override: None,
                                     state: "running".to_string(),
                                     queue_len: queue.len(),
                                     history_len: history.len(),
                                 });
                             }
+                        }
+                        
+                        // Add all parallel runners
+                        for runner in parallel_runners.values() {
+                            running_list.push(super::mission_runner::RunningMissionInfo::from(runner));
                         }
                         
                         let _ = respond.send(running_list);
@@ -1548,6 +1608,55 @@ async fn control_actor_loop(
                     }));
                 } else {
                     set_and_emit_status(&status, &events_tx, ControlRunState::Idle, 0).await;
+                }
+            }
+            // Poll parallel runners for completion
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                let mut completed_missions = Vec::new();
+                
+                for (mission_id, runner) in parallel_runners.iter_mut() {
+                    if runner.check_finished() {
+                        if let Some((msg_id, user_msg, result)) = runner.poll_completion().await {
+                            tracing::info!(
+                                "Parallel mission {} completed (success: {}, cost: {} cents)",
+                                mission_id, result.success, result.cost_cents
+                            );
+                            
+                            // Emit completion event with mission_id
+                            let _ = events_tx.send(AgentEvent::AssistantMessage {
+                                id: msg_id,
+                                content: result.output.clone(),
+                                success: result.success,
+                                cost_cents: result.cost_cents,
+                                model: result.model_used.clone(),
+                                mission_id: Some(*mission_id),
+                            });
+                            
+                            // Persist history for this mission
+                            if let Some(mem) = &memory {
+                                let messages: Vec<MissionMessage> = runner.history.iter()
+                                    .map(|(role, content)| MissionMessage {
+                                        role: role.clone(),
+                                        content: content.clone(),
+                                    })
+                                    .collect();
+                                if let Err(e) = mem.supabase.update_mission_history(*mission_id, &messages).await {
+                                    tracing::warn!("Failed to persist parallel mission history: {}", e);
+                                }
+                            }
+                            
+                            // If runner has no more queued messages, mark for cleanup
+                            if runner.queue.is_empty() && !runner.is_running() {
+                                completed_missions.push(*mission_id);
+                            }
+                        }
+                    }
+                }
+                
+                // Remove completed runners
+                for mid in completed_missions {
+                    parallel_runners.remove(&mid);
+                    tracing::info!("Parallel mission {} removed from runners", mid);
                 }
             }
         }
