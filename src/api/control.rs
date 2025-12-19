@@ -37,6 +37,10 @@ use super::routes::AppState;
 #[derive(Debug, Clone, Deserialize)]
 pub struct ControlMessageRequest {
     pub content: String,
+    /// Optional model override for this message.
+    /// If not specified, uses the server's default model.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -224,6 +228,8 @@ pub enum ControlCommand {
     UserMessage {
         id: Uuid,
         content: String,
+        /// Optional model override for this message
+        model: Option<String>,
     },
     ToolResult {
         tool_call_id: String,
@@ -388,7 +394,7 @@ pub async fn post_message(
     state
         .control
         .cmd_tx
-        .send(ControlCommand::UserMessage { id, content })
+        .send(ControlCommand::UserMessage { id, content, model: req.model })
         .await
         .map_err(|_| {
             (
@@ -809,7 +815,8 @@ async fn control_actor_loop(
     current_tree: Arc<RwLock<Option<AgentTreeNode>>>,
     progress: Arc<RwLock<ExecutionProgress>>,
 ) {
-    let mut queue: VecDeque<(Uuid, String)> = VecDeque::new();
+    // Queue stores (id, content, model_override)
+    let mut queue: VecDeque<(Uuid, String, Option<String>)> = VecDeque::new();
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content) pairs (user/assistant)
     let pricing = Arc::new(ModelPricing::new());
 
@@ -928,7 +935,7 @@ async fn control_actor_loop(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    ControlCommand::UserMessage { id, content } => {
+                    ControlCommand::UserMessage { id, content, model } => {
                         // Auto-create mission on first message if none exists
                         {
                             let mission_id = current_mission.read().await.clone();
@@ -940,7 +947,7 @@ async fn control_actor_loop(
                             }
                         }
 
-                        queue.push_back((id, content));
+                        queue.push_back((id, content, model));
                         set_and_emit_status(
                             &status,
                             &events_tx,
@@ -948,7 +955,7 @@ async fn control_actor_loop(
                             queue.len(),
                         ).await;
                         if running.is_none() {
-                            if let Some((mid, msg)) = queue.pop_front() {
+                            if let Some((mid, msg, model_override)) = queue.pop_front() {
                                 set_and_emit_status(&status, &events_tx, ControlRunState::Running, queue.len()).await;
                                 let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone() });
                                 let cfg = config.clone();
@@ -983,6 +990,7 @@ async fn control_actor_loop(
                                         cancel,
                                         hist_snapshot,
                                         msg.clone(),
+                                        model_override,
                                         Some(mission_ctrl),
                                         tree_ref,
                                         progress_ref,
@@ -1150,7 +1158,7 @@ async fn control_actor_loop(
                 }
 
                 // Start next queued message, if any.
-                if let Some((mid, msg)) = queue.pop_front() {
+                if let Some((mid, msg, model_override)) = queue.pop_front() {
                     set_and_emit_status(&status, &events_tx, ControlRunState::Running, queue.len()).await;
                     let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone() });
                     let cfg = config.clone();
@@ -1185,6 +1193,7 @@ async fn control_actor_loop(
                             cancel,
                             hist_snapshot,
                             msg.clone(),
+                            model_override,
                             Some(mission_ctrl),
                             tree_ref,
                             progress_ref,
@@ -1213,6 +1222,7 @@ async fn run_single_control_turn(
     cancel: CancellationToken,
     history: Vec<(String, String)>,
     user_message: String,
+    model_override: Option<String>,
     mission_control: Option<crate::tools::mission::MissionControl>,
     tree_snapshot: Arc<RwLock<Option<AgentTreeNode>>>,
     progress_snapshot: Arc<RwLock<ExecutionProgress>>,
@@ -1238,6 +1248,12 @@ async fn run_single_control_turn(
             return r;
         }
     };
+
+    // Apply model override if specified
+    if let Some(model) = model_override {
+        tracing::info!("Using model override: {}", model);
+        task.analysis_mut().requested_model = Some(model);
+    }
 
     // Context for agent execution.
     let llm = Arc::new(OpenRouterClient::new(config.api_key.clone()));
