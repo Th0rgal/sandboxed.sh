@@ -101,6 +101,11 @@ impl OpenRouterClient {
             return Err(Self::create_error(status, &body, retry_after));
         }
 
+        // Debug: Log raw response for Gemini models to see thought_signature format
+        if request.model.contains("gemini") {
+            tracing::info!("Gemini raw response body (first 2000 chars): {}", &body[..body.len().min(2000)]);
+        }
+
         let parsed: OpenRouterResponse = serde_json::from_str(&body).map_err(|e| {
             LlmError::parse_error(format!("Failed to parse response: {}, body: {}", e, body))
         })?;
@@ -136,14 +141,13 @@ impl OpenRouterClient {
                 // Check both ToolCall level and FunctionCall level
                 let has_tc_sig = tc.thought_signature.is_some();
                 let has_fn_sig = tc.function.thought_signature.is_some();
-                if has_tc_sig || has_fn_sig {
-                    tracing::debug!(
-                        "Tool call '{}' has thought_signature (tool_call: {}, function: {})",
-                        tc.function.name,
-                        has_tc_sig,
-                        has_fn_sig
-                    );
-                }
+                // Always log tool calls for Gemini debugging
+                tracing::info!(
+                    "Tool call '{}' thought_signature status: tool_call_level={}, function_level={}",
+                    tc.function.name,
+                    has_tc_sig,
+                    has_fn_sig
+                );
             }
         }
 
