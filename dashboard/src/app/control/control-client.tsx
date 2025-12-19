@@ -11,6 +11,7 @@ import {
   postControlToolResult,
   streamControl,
   loadMission,
+  getMission,
   createMission,
   setMissionStatus,
   getCurrentMission,
@@ -371,6 +372,13 @@ export default function ControlClient() {
   // Parallel missions state
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>([]);
   const [showParallelPanel, setShowParallelPanel] = useState(false);
+  
+  // Track which mission's events we're viewing (for parallel missions)
+  // This can differ from currentMission when viewing a parallel mission
+  const [viewingMissionId, setViewingMissionId] = useState<string | null>(null);
+  
+  // Store items per mission to preserve context when switching
+  const [missionItems, setMissionItems] = useState<Record<string, ChatItem[]>>({});
 
   // Attachment state
   const [attachments, setAttachments] = useState<
@@ -384,6 +392,12 @@ export default function ControlClient() {
   const statusMenuRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const viewingMissionIdRef = useRef<string | null>(null);
+  
+  // Keep ref in sync with state
+  useEffect(() => {
+    viewingMissionIdRef.current = viewingMissionId;
+  }, [viewingMissionId]);
 
   // Smart auto-scroll
   const { containerRef, endRef, isAtBottom, scrollToBottom } =
@@ -587,6 +601,42 @@ export default function ControlClient() {
     }
   };
 
+  // Handle switching which mission we're viewing
+  const handleViewMission = useCallback(async (missionId: string) => {
+    setViewingMissionId(missionId);
+    
+    // Check if we already have items for this mission
+    if (missionItems[missionId]) {
+      setItems(missionItems[missionId]);
+      return;
+    }
+    
+    // Load mission history from API
+    try {
+      const mission = await loadMission(missionId);
+      const historyItems = missionHistoryToItems(mission);
+      setMissionItems(prev => ({ ...prev, [missionId]: historyItems }));
+      setItems(historyItems);
+    } catch (err) {
+      console.error("Failed to load mission:", err);
+      // Still set viewing ID even if load fails
+    }
+  }, [missionItems, missionHistoryToItems]);
+
+  // Sync viewingMissionId with currentMission
+  useEffect(() => {
+    if (currentMission && !viewingMissionId) {
+      setViewingMissionId(currentMission.id);
+    }
+  }, [currentMission, viewingMissionId]);
+
+  // Save current items to missionItems when they change
+  useEffect(() => {
+    if (viewingMissionId && items.length > 0) {
+      setMissionItems(prev => ({ ...prev, [viewingMissionId]: items }));
+    }
+  }, [items, viewingMissionId]);
+
   // Handle creating a new mission
   const handleNewMission = async () => {
     try {
@@ -644,14 +694,17 @@ export default function ControlClient() {
     const handleEvent = (event: { type: string; data: unknown }) => {
       const data: unknown = event.data;
 
-      // Filter events by mission_id - only show events for current mission or events without mission_id
+      // Filter events by mission_id - only show events for the mission we're viewing
       if (isRecord(data) && data["mission_id"]) {
         const eventMissionId = String(data["mission_id"]);
-        // Get current mission ID from the URL or state
-        const urlMissionId = new URLSearchParams(window.location.search).get("mission");
-        if (urlMissionId && eventMissionId !== urlMissionId) {
-          // Event is for a different mission, ignore it for UI updates
-          // But still process status events to update parallel missions list
+        const viewingId = viewingMissionIdRef.current;
+        
+        // If we're viewing a specific mission and this event is for a different one,
+        // store it for that mission but don't display it
+        if (viewingId && eventMissionId !== viewingId) {
+          // Store event for the other mission (so it's there when we switch)
+          // For now, we'll just ignore non-status events for other missions
+          // Status events should still update the running missions indicator
           if (event.type !== "status") {
             return;
           }
@@ -1080,13 +1133,14 @@ export default function ControlClient() {
           </div>
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {runningMissions.map((mission) => {
-              const isCurrentMission = currentMission?.id === mission.mission_id;
+              const isViewingMission = viewingMissionId === mission.mission_id;
               return (
                 <div
                   key={mission.mission_id}
+                  onClick={() => handleViewMission(mission.mission_id)}
                   className={cn(
-                    "flex items-center justify-between rounded-lg border p-3 transition-colors",
-                    isCurrentMission
+                    "flex items-center justify-between rounded-lg border p-3 transition-colors cursor-pointer",
+                    isViewingMission
                       ? "border-indigo-500/30 bg-indigo-500/10"
                       : "border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04]"
                   )}
@@ -1108,28 +1162,16 @@ export default function ControlClient() {
                     </div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
-                    {!isCurrentMission && (
-                      <button
-                        onClick={async () => {
-                          try {
-                            setMissionLoading(true);
-                            const loaded = await loadMission(mission.mission_id);
-                            setCurrentMission(loaded);
-                            setItems(missionHistoryToItems(loaded));
-                            router.replace(`/control?mission=${mission.mission_id}`, { scroll: false });
-                          } catch {
-                            toast.error("Failed to load mission");
-                          } finally {
-                            setMissionLoading(false);
-                          }
-                        }}
-                        className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
-                      >
-                        View
-                      </button>
+                    {isViewingMission ? (
+                      <Check className="h-4 w-4 text-indigo-400" />
+                    ) : (
+                      <span className="text-xs text-white/40">Click to view</span>
                     )}
                     <button
-                      onClick={() => handleCancelMission(mission.mission_id)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleCancelMission(mission.mission_id);
+                      }}
                       className="p-1 rounded hover:bg-white/[0.04] text-white/40 hover:text-red-400 transition-colors"
                       title="Cancel mission"
                     >
