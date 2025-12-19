@@ -135,14 +135,35 @@ impl OpenRouterClient {
             }
         }
         
-        // Log if tool calls have thought_signatures attached (Gemini format)
-        if let Some(ref tool_calls) = choice.message.tool_calls {
+        // Post-process: For Gemini 3, copy reasoning_details.data to matching tool call's thought_signature
+        let mut tool_calls = choice.message.tool_calls;
+        if let (Some(ref mut tcs), Some(ref reasoning_blocks)) = (&mut tool_calls, &reasoning) {
+            for tc in tcs.iter_mut() {
+                // Find matching reasoning block by tool call id
+                if let Some(rb) = reasoning_blocks.iter().find(|r| r.id.as_ref() == Some(&tc.id)) {
+                    if let Some(ref data) = rb.data {
+                        // Copy the encrypted data to thought_signature on both levels for compatibility
+                        if tc.thought_signature.is_none() {
+                            tc.thought_signature = Some(data.clone());
+                            tracing::info!(
+                                "Copied reasoning_details.data to tool_call '{}' thought_signature",
+                                tc.function.name
+                            );
+                        }
+                        if tc.function.thought_signature.is_none() {
+                            tc.function.thought_signature = Some(data.clone());
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Log tool call thought_signature status after post-processing
+        if let Some(ref tool_calls) = tool_calls {
             for tc in tool_calls {
-                // Check both ToolCall level and FunctionCall level
                 let has_tc_sig = tc.thought_signature.is_some();
                 let has_fn_sig = tc.function.thought_signature.is_some();
-                // Always log tool calls for Gemini debugging
-                tracing::info!(
+                tracing::debug!(
                     "Tool call '{}' thought_signature status: tool_call_level={}, function_level={}",
                     tc.function.name,
                     has_tc_sig,
@@ -153,7 +174,7 @@ impl OpenRouterClient {
 
         Ok(ChatResponse {
             content: choice.message.content,
-            tool_calls: choice.message.tool_calls,
+            tool_calls,
             finish_reason: choice.finish_reason,
             usage: parsed
                 .usage
@@ -353,6 +374,8 @@ impl OpenRouterMessage {
                         reasoning_type: Some("thinking".to_string()),
                         format: None,
                         index: None,
+                        id: None,
+                        data: None,
                     }]);
                 }
                 serde_json::Value::Array(arr) => {

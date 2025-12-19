@@ -87,6 +87,10 @@ pub enum MessageContent {
 /// requests when using tool calls. The `thought_signature` is an encrypted hash that allows
 /// the model to resume its chain of thought.
 /// 
+/// For Gemini 3 via OpenRouter, the signature is in the `data` field of `reasoning_details`,
+/// which corresponds to a tool call `id`. We copy this to `thought_signature` on the matching
+/// tool call during post-processing.
+/// 
 /// Reference: https://openrouter.ai/docs/use-cases/reasoning-tokens
 /// Reference: https://ai.google.dev/gemini-api/docs/thought-signatures
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,23 +113,38 @@ pub struct ReasoningContent {
     )]
     pub thought_signature: Option<String>,
     
-    /// Type of reasoning block (e.g., "thinking", "reasoning.text")
+    /// Type of reasoning block (e.g., "thinking", "reasoning.text", "reasoning.encrypted")
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub reasoning_type: Option<String>,
     
-    /// Format of the reasoning content (e.g., "unknown")
+    /// Format of the reasoning content (e.g., "unknown", "google-gemini-v1")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     
     /// Index of the reasoning block (for ordered reasoning)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<u32>,
+    
+    /// ID matching a tool call (Gemini 3 format via OpenRouter)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    
+    /// Encrypted reasoning data (Gemini 3 format) - this is the actual thought_signature
+    /// that must be sent back with the matching tool call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
 }
 
 impl ReasoningContent {
     /// Check if this reasoning block has a thought signature that needs preservation.
+    /// For Gemini 3, this is in the `data` field.
     pub fn needs_preservation(&self) -> bool {
-        self.thought_signature.is_some()
+        self.thought_signature.is_some() || self.data.is_some()
+    }
+    
+    /// Get the effective thought signature (from thought_signature or data field).
+    pub fn get_thought_signature(&self) -> Option<&str> {
+        self.thought_signature.as_deref().or(self.data.as_deref())
     }
 }
 
