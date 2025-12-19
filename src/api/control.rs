@@ -1205,7 +1205,24 @@ async fn control_actor_loop(
                             }
                         }
 
-                        queue.push_back((id, content, model));
+                        // Use explicit model from message, or fall back to mission's model_override
+                        let effective_model = if model.is_some() {
+                            model
+                        } else {
+                            // Get current mission's model_override
+                            let mission_id = current_mission.read().await.clone();
+                            if let Some(mid) = mission_id {
+                                if let Ok(mission) = load_mission_from_db(&memory, mid).await {
+                                    mission.model_override
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        queue.push_back((id, content, effective_model));
                         set_and_emit_status(
                             &status,
                             &events_tx,
