@@ -274,6 +274,8 @@ pub enum ControlCommand {
     },
     /// Create a new mission
     CreateMission {
+        title: Option<String>,
+        model_override: Option<String>,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Update mission status
@@ -596,15 +598,31 @@ pub async fn get_mission(
 }
 
 /// Create a new mission and switch to it.
+/// Request body for creating a mission
+#[derive(Debug, Deserialize)]
+pub struct CreateMissionRequest {
+    pub title: Option<String>,
+    pub model_override: Option<String>,
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
+    body: Option<Json<CreateMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
+
+    let (title, model_override) = body
+        .map(|b| (b.title.clone(), b.model_override.clone()))
+        .unwrap_or((None, None));
 
     state
         .control
         .cmd_tx
-        .send(ControlCommand::CreateMission { respond: tx })
+        .send(ControlCommand::CreateMission {
+            title,
+            model_override,
+            respond: tx,
+        })
         .await
         .map_err(|_| {
             (
@@ -1143,10 +1161,19 @@ async fn control_actor_loop(
 
     // Helper to create a new mission
     async fn create_new_mission(memory: &Option<MemorySystem>, model_override: Option<&str>) -> Result<Mission, String> {
+        create_new_mission_with_title(memory, None, model_override).await
+    }
+
+    // Helper to create a new mission with title
+    async fn create_new_mission_with_title(
+        memory: &Option<MemorySystem>,
+        title: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Result<Mission, String> {
         let mem = memory.as_ref().ok_or("Memory not configured")?;
         let db_mission = mem
             .supabase
-            .create_mission(None, model_override)
+            .create_mission(title, model_override)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -1267,12 +1294,12 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { respond } => {
+                    ControlCommand::CreateMission { title, model_override, respond } => {
                         // First persist current mission history
                         persist_mission_history(&memory, &current_mission, &history).await;
 
-                        // Create a new mission (no model override for explicit creation)
-                        match create_new_mission(&memory, None).await {
+                        // Create a new mission with optional title and model override
+                        match create_new_mission_with_title(&memory, title.as_deref(), model_override.as_deref()).await {
                             Ok(mission) => {
                                 history.clear();
                                 *current_mission.write().await = Some(mission.id);
