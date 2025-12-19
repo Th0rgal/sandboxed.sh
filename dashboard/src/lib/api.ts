@@ -324,6 +324,48 @@ export async function loadMission(id: string): Promise<Mission> {
   return res.json();
 }
 
+// ==================== Parallel Missions ====================
+
+export interface RunningMissionInfo {
+  mission_id: string;
+  model_override: string | null;
+  state: "queued" | "running" | "waiting_for_tool" | "finished";
+  queue_len: number;
+  history_len: number;
+}
+
+// Get all running parallel missions
+export async function getRunningMissions(): Promise<RunningMissionInfo[]> {
+  const res = await apiFetch("/api/control/running");
+  if (!res.ok) throw new Error("Failed to fetch running missions");
+  return res.json();
+}
+
+// Start a mission in parallel
+export async function startMissionParallel(
+  missionId: string,
+  content: string
+): Promise<{ ok: boolean; mission_id: string }> {
+  const res = await apiFetch(`/api/control/missions/${missionId}/parallel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to start parallel mission: ${text}`);
+  }
+  return res.json();
+}
+
+// Cancel a specific mission
+export async function cancelMission(missionId: string): Promise<void> {
+  const res = await apiFetch(`/api/control/missions/${missionId}/cancel`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error("Failed to cancel mission");
+}
+
 // Set mission status
 export async function setMissionStatus(
   id: string,
@@ -342,8 +384,8 @@ export async function setMissionStatus(
 export type ControlRunState = "idle" | "running" | "waiting_for_tool";
 
 export type ControlAgentEvent =
-  | { type: "status"; state: ControlRunState; queue_len: number }
-  | { type: "user_message"; id: string; content: string }
+  | { type: "status"; state: ControlRunState; queue_len: number; mission_id?: string }
+  | { type: "user_message"; id: string; content: string; mission_id?: string }
   | {
       type: "assistant_message";
       id: string;
@@ -351,11 +393,12 @@ export type ControlAgentEvent =
       success: boolean;
       cost_cents: number;
       model: string | null;
+      mission_id?: string;
     }
-  | { type: "thinking"; content: string; done: boolean }
-  | { type: "tool_call"; tool_call_id: string; name: string; args: unknown }
-  | { type: "tool_result"; tool_call_id: string; name: string; result: unknown }
-  | { type: "error"; message: string };
+  | { type: "thinking"; content: string; done: boolean; mission_id?: string }
+  | { type: "tool_call"; tool_call_id: string; name: string; args: unknown; mission_id?: string }
+  | { type: "tool_result"; tool_call_id: string; name: string; result: unknown; mission_id?: string }
+  | { type: "error"; message: string; mission_id?: string };
 
 export async function postControlMessage(
   content: string

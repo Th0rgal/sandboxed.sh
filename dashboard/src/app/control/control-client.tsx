@@ -16,9 +16,12 @@ import {
   getCurrentMission,
   uploadFile,
   getProgress,
+  getRunningMissions,
+  cancelMission,
   type ControlRunState,
   type Mission,
   type MissionStatus,
+  type RunningMissionInfo,
 } from "@/lib/api";
 import {
   Send,
@@ -40,6 +43,8 @@ import {
   Paperclip,
   ArrowDown,
   Cpu,
+  Layers,
+  RefreshCw,
 } from "lucide-react";
 import {
   OptionList,
@@ -363,6 +368,10 @@ export default function ControlClient() {
   const [showStatusMenu, setShowStatusMenu] = useState(false);
   const [missionLoading, setMissionLoading] = useState(false);
 
+  // Parallel missions state
+  const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>([]);
+  const [showParallelPanel, setShowParallelPanel] = useState(false);
+
   // Attachment state
   const [attachments, setAttachments] = useState<
     { file: File; uploading: boolean }[]
@@ -543,6 +552,41 @@ export default function ControlClient() {
     }
   }, [searchParams, router, missionHistoryToItems]);
 
+  // Poll for running parallel missions
+  useEffect(() => {
+    const pollRunning = async () => {
+      try {
+        const running = await getRunningMissions();
+        setRunningMissions(running);
+        // Auto-show panel if there are parallel missions
+        if (running.length > 1) {
+          setShowParallelPanel(true);
+        }
+      } catch {
+        // Ignore errors
+      }
+    };
+
+    // Poll immediately and then every 3 seconds
+    pollRunning();
+    const interval = setInterval(pollRunning, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Handle cancelling a parallel mission
+  const handleCancelMission = async (missionId: string) => {
+    try {
+      await cancelMission(missionId);
+      toast.success("Mission cancelled");
+      // Refresh running list
+      const running = await getRunningMissions();
+      setRunningMissions(running);
+    } catch (err) {
+      console.error("Failed to cancel mission:", err);
+      toast.error("Failed to cancel mission");
+    }
+  };
+
   // Handle creating a new mission
   const handleNewMission = async () => {
     try {
@@ -599,6 +643,20 @@ export default function ControlClient() {
 
     const handleEvent = (event: { type: string; data: unknown }) => {
       const data: unknown = event.data;
+
+      // Filter events by mission_id - only show events for current mission or events without mission_id
+      if (isRecord(data) && data["mission_id"]) {
+        const eventMissionId = String(data["mission_id"]);
+        // Get current mission ID from the URL or state
+        const urlMissionId = new URLSearchParams(window.location.search).get("mission");
+        if (urlMissionId && eventMissionId !== urlMissionId) {
+          // Event is for a different mission, ignore it for UI updates
+          // But still process status events to update parallel missions list
+          if (event.type !== "status") {
+            return;
+          }
+        }
+      }
 
       if (event.type === "status" && isRecord(data)) {
         reconnectAttempts = 0;
@@ -942,6 +1000,23 @@ export default function ControlClient() {
             <span className="hidden sm:inline">New</span> Mission
           </button>
 
+          {/* Parallel missions indicator */}
+          {runningMissions.length > 0 && (
+            <button
+              onClick={() => setShowParallelPanel(!showParallelPanel)}
+              className={cn(
+                "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+                showParallelPanel
+                  ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
+                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
+              )}
+            >
+              <Layers className="h-4 w-4" />
+              <span className="font-medium tabular-nums">{runningMissions.length}</span>
+              <span className="hidden sm:inline">Running</span>
+            </button>
+          )}
+
           {/* Status panel */}
           <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
             {/* Run state indicator */}
@@ -983,6 +1058,90 @@ export default function ControlClient() {
           </div>
         </div>
       </div>
+
+      {/* Parallel Missions Panel */}
+      {showParallelPanel && runningMissions.length > 0 && (
+        <div className="mb-4 rounded-xl border border-white/[0.06] bg-white/[0.02] p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Layers className="h-4 w-4 text-indigo-400" />
+              <h3 className="text-sm font-medium text-white">Running Missions</h3>
+            </div>
+            <button
+              onClick={async () => {
+                const running = await getRunningMissions();
+                setRunningMissions(running);
+              }}
+              className="p-1 rounded hover:bg-white/[0.04] text-white/40 hover:text-white/70 transition-colors"
+              title="Refresh"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {runningMissions.map((mission) => {
+              const isCurrentMission = currentMission?.id === mission.mission_id;
+              return (
+                <div
+                  key={mission.mission_id}
+                  className={cn(
+                    "flex items-center justify-between rounded-lg border p-3 transition-colors",
+                    isCurrentMission
+                      ? "border-indigo-500/30 bg-indigo-500/10"
+                      : "border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04]"
+                  )}
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div
+                      className={cn(
+                        "h-2 w-2 rounded-full shrink-0",
+                        mission.state === "running" ? "bg-emerald-400 animate-pulse" : "bg-amber-400"
+                      )}
+                    />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-white truncate">
+                        {mission.model_override || "Default Model"}
+                      </p>
+                      <p className="text-xs text-white/40 truncate">
+                        {mission.mission_id.slice(0, 8)}... • {mission.state}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {!isCurrentMission && (
+                      <button
+                        onClick={async () => {
+                          try {
+                            setMissionLoading(true);
+                            const loaded = await loadMission(mission.mission_id);
+                            setCurrentMission(loaded);
+                            setItems(missionHistoryToItems(loaded));
+                            router.replace(`/control?mission=${mission.mission_id}`, { scroll: false });
+                          } catch {
+                            toast.error("Failed to load mission");
+                          } finally {
+                            setMissionLoading(false);
+                          }
+                        }}
+                        className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+                      >
+                        View
+                      </button>
+                    )}
+                    <button
+                      onClick={() => handleCancelMission(mission.mission_id)}
+                      className="p-1 rounded hover:bg-white/[0.04] text-white/40 hover:text-red-400 transition-colors"
+                      title="Cancel mission"
+                    >
+                      <XCircle className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Chat container */}
       <div className="flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative">
