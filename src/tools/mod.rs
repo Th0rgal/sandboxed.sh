@@ -298,6 +298,7 @@ impl ToolRegistry {
             );
         }
 
+        tracing::info!("Registry {} complete with {} total tools", registry_id, tools.len());
         Self { tools }
     }
 
