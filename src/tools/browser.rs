@@ -163,6 +163,58 @@ impl Tool for BrowserNavigate {
 /// Take a screenshot of the current page
 pub struct BrowserScreenshot;
 
+/// Get Supabase configuration from environment (for auto-upload).
+fn get_supabase_config() -> Option<(String, String)> {
+    let url = std::env::var("SUPABASE_URL").ok()?;
+    let key = std::env::var("SUPABASE_SERVICE_ROLE_KEY").ok()?;
+    
+    if url.is_empty() || key.is_empty() {
+        return None;
+    }
+    
+    Some((url, key))
+}
+
+/// Upload image bytes to Supabase Storage and return the public URL.
+async fn upload_to_supabase(
+    content: &[u8],
+    supabase_url: &str,
+    service_role_key: &str,
+) -> anyhow::Result<String> {
+    let file_id = uuid::Uuid::new_v4();
+    let upload_path = format!("{}.png", file_id);
+    
+    let storage_url = format!(
+        "{}/storage/v1/object/images/{}",
+        supabase_url.trim_end_matches('/'),
+        upload_path
+    );
+    
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&storage_url)
+        .header("apikey", service_role_key)
+        .header("Authorization", format!("Bearer {}", service_role_key))
+        .header("Content-Type", "image/png")
+        .header("x-upsert", "true")
+        .body(content.to_vec())
+        .send()
+        .await?;
+    
+    let status = resp.status();
+    if !status.is_success() {
+        let error_text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Failed to upload image: {} - {}", status, error_text);
+    }
+    
+    // Return public URL
+    Ok(format!(
+        "{}/storage/v1/object/public/images/{}",
+        supabase_url.trim_end_matches('/'),
+        upload_path
+    ))
+}
+
 #[async_trait]
 impl Tool for BrowserScreenshot {
     fn name(&self) -> &str {
@@ -170,16 +222,20 @@ impl Tool for BrowserScreenshot {
     }
 
     fn description(&self) -> &str {
-        "Take a screenshot of the current browser page. Returns the path to the saved PNG image. Use after navigating to see what's on the page."
+        "Take a screenshot of the current browser page. If cloud storage is configured, \
+        automatically uploads and returns markdown you can include in your response. \
+        Otherwise returns the local file path.\n\n\
+        IMPORTANT: When a 'markdown' field is returned, you MUST include it in your response \
+        for the user to see the image!"
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "filename": {
+                "description": {
                     "type": "string",
-                    "description": "Optional filename (without path). Defaults to screenshot_<timestamp>.png"
+                    "description": "Description of what the screenshot shows (used in alt text)"
                 },
                 "full_page": {
                     "type": "boolean",
@@ -190,35 +246,60 @@ impl Tool for BrowserScreenshot {
     }
 
     async fn execute(&self, args: Value, workspace: &Path) -> anyhow::Result<String> {
-        let filename = args["filename"].as_str().map(|s| s.to_string()).unwrap_or_else(|| {
-            format!("screenshot_{}.png", chrono::Utc::now().format("%Y%m%d_%H%M%S"))
-        });
+        let description = args["description"].as_str().unwrap_or("screenshot");
         let full_page = args["full_page"].as_bool().unwrap_or(false);
+        let filename = format!("screenshot_{}.png", chrono::Utc::now().format("%Y%m%d_%H%M%S"));
 
-        with_page(|page| async move {
-            // Configure screenshot
+        // Take the screenshot
+        let screenshot = with_page(|page| async move {
             let params = ScreenshotParams::builder()
                 .format(CaptureScreenshotFormat::Png)
                 .full_page(full_page)
                 .build();
-
-            // Take screenshot
-            let screenshot = page.screenshot(params).await?;
-
-            // Save to workspace/temp directory
-            let temp_dir = workspace.join("temp");
-            std::fs::create_dir_all(&temp_dir)?;
-            let file_path = temp_dir.join(&filename);
-            
-            std::fs::write(&file_path, &screenshot)?;
-
-            Ok(format!(
-                "Screenshot saved to: {}\nSize: {} bytes",
-                file_path.display(),
-                screenshot.len()
-            ))
+            Ok(page.screenshot(params).await?)
         })
-        .await
+        .await?;
+
+        // Save locally first (for backup/debugging)
+        let temp_dir = workspace.join("temp");
+        std::fs::create_dir_all(&temp_dir)?;
+        let file_path = temp_dir.join(&filename);
+        std::fs::write(&file_path, &screenshot)?;
+
+        // Try to upload to Supabase if configured
+        if let Some((supabase_url, service_role_key)) = get_supabase_config() {
+            match upload_to_supabase(&screenshot, &supabase_url, &service_role_key).await {
+                Ok(public_url) => {
+                    tracing::info!(
+                        local_path = %file_path.display(),
+                        public_url = %public_url,
+                        size = screenshot.len(),
+                        "Screenshot uploaded to Supabase"
+                    );
+                    
+                    let markdown = format!("![{}]({})", description, public_url);
+                    return Ok(json!({
+                        "success": true,
+                        "url": public_url,
+                        "markdown": markdown,
+                        "local_path": file_path.display().to_string(),
+                        "size_bytes": screenshot.len(),
+                        "message": "Screenshot uploaded! Include the 'markdown' value in your response for the user to see it."
+                    }).to_string());
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to upload screenshot to Supabase: {}", e);
+                    // Fall through to return local path
+                }
+            }
+        }
+
+        // No Supabase or upload failed - return local path
+        Ok(format!(
+            "Screenshot saved to: {}\nSize: {} bytes\n\nNote: Cloud storage not configured. Use upload_image tool to share this image.",
+            file_path.display(),
+            screenshot.len()
+        ))
     }
 }
 
