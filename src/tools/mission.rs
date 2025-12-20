@@ -95,7 +95,7 @@ impl Tool for CompleteMission {
         })
     }
 
-    async fn execute(&self, args: Value, _working_dir: &Path) -> anyhow::Result<String> {
+    async fn execute(&self, args: Value, working_dir: &Path) -> anyhow::Result<String> {
         let args: CompleteMissionArgs = serde_json::from_value(args)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
 
@@ -120,6 +120,35 @@ impl Tool for CompleteMission {
             return Ok("No active mission to complete. Start a mission first.".to_string());
         }
 
+        // Validate completion: check if output folder has any files
+        if status == MissionStatusValue::Completed {
+            let output_dir = working_dir.join("output");
+            let output_empty = if output_dir.exists() {
+                std::fs::read_dir(&output_dir)
+                    .map(|mut entries| entries.next().is_none())
+                    .unwrap_or(true)
+            } else {
+                true
+            };
+
+            // If output is empty and no summary provided, ask agent to continue
+            if output_empty && args.summary.is_none() {
+                tracing::warn!("complete_mission called with empty output folder and no summary");
+                return Ok(
+                    "⚠️ INCOMPLETE: The output/ folder is empty and no summary was provided.\n\n\
+                    You must either:\n\
+                    1. Create the requested deliverables in output/ and call complete_mission again, OR\n\
+                    2. Call complete_mission with a summary explaining why no files were needed\n\n\
+                    Do not call complete_mission without deliverables or explanation.".to_string()
+                );
+            }
+            
+            // Log if completing with empty output (but with summary)
+            if output_empty {
+                tracing::info!("Mission completing with empty output folder (summary provided)");
+            }
+        }
+
         // Send the command
         control
             .cmd_tx
@@ -135,9 +164,6 @@ impl Tool for CompleteMission {
             .map(|s| format!(" Summary: {}", s))
             .unwrap_or_default();
 
-        Ok(format!(
-            "Mission marked as {}.{}",
-            status, summary_msg
-        ))
+        Ok(format!("Mission marked as {}.{}", status, summary_msg))
     }
 }

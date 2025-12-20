@@ -253,6 +253,33 @@ You can read/write any file, execute any command, install any software, and sear
 ## Available Tools (API)
 {tool_descriptions}
 
+## Tool Selection Guide (IMPORTANT!)
+
+**For Web/HTTP tasks:**
+| Situation | Use These Tools | NOT These |
+|-----------|-----------------|-----------|
+| Static content (APIs, HTML) | `fetch_url`, `curl` | browser_* |
+| JavaScript sites, SPAs | `browser_navigate`, `browser_get_content` | fetch_url |
+| Cloudflare/bot-protected | `browser_*` tools | curl, fetch_url |
+| Form submission | `browser_type`, `browser_click` | curl POST |
+| Screenshots for debugging | `browser_screenshot` | desktop_* |
+
+**For File Operations:**
+| Task | Use These | NOT These |
+|------|-----------|-----------|
+| Read/write files | `read_file`, `write_file` | MCP filesystem_* |
+| List directories | `list_directory` | filesystem_list_directory |
+| Search in files | `grep_search` | run_command grep |
+
+**For Desktop GUI automation (ONLY when no CLI alternative exists):**
+- Use `desktop_*` tools ONLY for apps without CLI
+- NEVER use desktop tools for websites - use `browser_*` instead
+
+**Priority Order:**
+1. CLI tools (`curl`, `grep`, built-in file tools)
+2. Browser tools (`browser_*`) for web automation
+3. Desktop tools (`desktop_*`) only as last resort
+
 ## Philosophy: BE PROACTIVE
 - Install ANY software you need (`apt install`, `pip install`)
 - Check `/root/tools/` for existing reusable scripts
@@ -357,6 +384,19 @@ Run `ls -la /root/context/` to see what's available before doing anything else.
 {reusable_tools}
 ## Available Tools (API)
 {tool_descriptions}
+
+## Tool Selection Guide
+
+**For Web/HTTP tasks:**
+| Situation | Use These | Avoid |
+|-----------|-----------|-------|
+| Static content, APIs | `fetch_url`, `curl` | browser_* |
+| JavaScript/SPA sites | `browser_navigate`, `browser_get_content` | fetch_url |
+| Cloudflare-protected | `browser_*` tools | curl, fetch_url |
+
+**For File Operations:** Prefer built-in (`read_file`, `write_file`, `list_directory`) over MCP filesystem tools.
+
+**Priority:** CLI tools > browser_* > desktop_* (last resort only)
 
 ## Philosophy: BE PROACTIVE
 You are encouraged to **experiment and try things**:

@@ -14,7 +14,7 @@ import type {
   OptionListSelection,
   OptionListOption,
 } from "./schema";
-import { ActionButtons, normalizeActionsConfig } from "../shared";
+import { normalizeActionsConfig } from "../shared";
 import type { Action } from "../shared";
 import { cn, Button, Separator } from "./_adapter";
 import { Check } from "lucide-react";
@@ -70,21 +70,21 @@ function SelectionIndicator({
   isSelected,
   disabled,
 }: SelectionIndicatorProps) {
-  const shape = mode === "single" ? "rounded-full" : "rounded";
+  const shape = mode === "single" ? "rounded-full" : "rounded-sm";
 
   return (
     <div
       className={cn(
-        "flex size-4 shrink-0 items-center justify-center border-2 transition-colors",
+        "flex size-3.5 shrink-0 items-center justify-center border transition-all duration-150",
         shape,
-        isSelected && "border-primary bg-primary text-primary-foreground",
-        !isSelected && "border-muted-foreground/50",
-        disabled && "opacity-50"
+        isSelected && "border-indigo-500 bg-indigo-500 text-white",
+        !isSelected && "border-white/20 bg-white/[0.02]",
+        disabled && "opacity-40"
       )}
     >
-      {mode === "multi" && isSelected && <Check className="size-3" />}
+      {mode === "multi" && isSelected && <Check className="size-2.5 stroke-[3]" />}
       {mode === "single" && isSelected && (
-        <span className="size-2 rounded-full bg-current" />
+        <span className="size-1.5 rounded-full bg-current" />
       )}
     </div>
   );
@@ -115,53 +115,50 @@ function OptionItem({
   onFocus,
   buttonRef,
 }: OptionItemProps) {
-  const hasAdjacentOptions = !isFirst && !isLast;
-
   return (
-    <Button
+    <button
       ref={buttonRef}
       data-id={option.id}
-      variant="ghost"
-      size="lg"
       role="option"
+      type="button"
       aria-selected={isSelected}
       onClick={onToggle}
       onFocus={onFocus}
       tabIndex={tabIndex}
       disabled={isDisabled}
       className={cn(
-        "peer group relative h-auto min-h-[50px] w-full justify-start text-left text-sm font-medium",
-        "rounded-none border-0 bg-transparent px-0 py-2 text-base shadow-none transition-none hover:bg-transparent! @md/option-list:text-sm",
-        isFirst && "pb-2.5",
-        hasAdjacentOptions && "py-2.5"
+        "peer group relative flex w-full items-start gap-2.5 text-left transition-colors",
+        "py-2 px-0.5 -mx-0.5 rounded-lg",
+        "hover:bg-white/[0.03] focus-visible:bg-white/[0.03] focus-visible:outline-none",
+        isDisabled && "opacity-40 pointer-events-none",
+        isFirst && "pt-1",
+        isLast && "pb-1"
       )}
     >
-      <span
-        className={cn(
-          "bg-primary/5 absolute inset-0 -mx-3 -my-0.5 rounded-xl opacity-0 group-hover:opacity-100"
-        )}
-      />
-      <div className="relative flex items-start gap-3">
-        <span className="flex h-6 items-center">
-          <SelectionIndicator
-            mode={selectionMode}
-            isSelected={isSelected}
-            disabled={option.disabled}
-          />
+      <span className="flex h-5 items-center shrink-0">
+        <SelectionIndicator
+          mode={selectionMode}
+          isSelected={isSelected}
+          disabled={option.disabled}
+        />
+      </span>
+      {option.icon && (
+        <span className="flex h-5 items-center shrink-0 text-white/50">{option.icon}</span>
+      )}
+      <div className="flex flex-col gap-0.5 min-w-0">
+        <span className={cn(
+          "text-[13px] leading-5 text-pretty",
+          isSelected ? "text-white" : "text-white/80"
+        )}>
+          {option.label}
         </span>
-        {option.icon && (
-          <span className="flex h-6 items-center">{option.icon}</span>
+        {option.description && (
+          <span className="text-[11px] leading-4 text-white/40 text-pretty">
+            {option.description}
+          </span>
         )}
-        <div className="flex flex-col text-left">
-          <span className="leading-6 text-pretty">{option.label}</span>
-          {option.description && (
-            <span className="text-muted-foreground text-sm font-normal text-pretty">
-              {option.description}
-            </span>
-          )}
-        </div>
       </div>
-    </Button>
+    </button>
   );
 }
 
@@ -183,7 +180,7 @@ function OptionListConfirmation({
   return (
     <div
       className={cn(
-        "@container/option-list flex w-full max-w-md min-w-80 flex-col",
+        "@container/option-list flex w-full max-w-sm flex-col",
         "text-foreground",
         className
       )}
@@ -195,25 +192,25 @@ function OptionListConfirmation({
     >
       <div
         className={cn(
-          "bg-card/60 flex w-full flex-col overflow-hidden rounded-2xl border px-5 py-2.5 shadow-xs"
+          "bg-white/[0.02] flex w-full flex-col overflow-hidden rounded-xl border border-white/[0.04] px-3 py-2"
         )}
       >
         {confirmedOptions.map((option, index) => (
           <Fragment key={option.id}>
-            {index > 0 && <Separator orientation="horizontal" />}
-            <div className="flex items-start gap-3 py-1">
-              <span className="flex h-6 items-center">
-                <Check className="text-primary size-4 shrink-0" />
+            {index > 0 && <Separator className="my-1.5 opacity-30" orientation="horizontal" />}
+            <div className="flex items-start gap-2 py-0.5">
+              <span className="flex h-5 items-center shrink-0">
+                <Check className="text-emerald-400 size-3.5 stroke-[2.5]" />
               </span>
               {option.icon && (
-                <span className="flex h-6 items-center">{option.icon}</span>
+                <span className="flex h-5 items-center shrink-0 text-white/50">{option.icon}</span>
               )}
-              <div className="flex flex-col text-left">
-                <span className="text-base leading-6 font-medium text-pretty @md/option-list:text-sm">
+              <div className="flex flex-col min-w-0">
+                <span className="text-[13px] leading-5 text-white/90 text-pretty">
                   {option.label}
                 </span>
                 {option.description && (
-                  <span className="text-muted-foreground text-sm font-normal text-pretty">
+                  <span className="text-[11px] leading-4 text-white/40 text-pretty">
                     {option.description}
                   </span>
                 )}
@@ -561,7 +558,7 @@ export function OptionList({
   return (
     <div
       className={cn(
-        "@container/option-list flex w-full max-w-md min-w-80 flex-col gap-3",
+        "@container/option-list flex w-full max-w-sm flex-col gap-2",
         "text-foreground",
         className
       )}
@@ -572,7 +569,7 @@ export function OptionList({
     >
       <div
         className={cn(
-          "group/list bg-card flex w-full flex-col overflow-hidden rounded-2xl border px-4 py-1.5 shadow-xs"
+          "group/list bg-white/[0.02] backdrop-blur-sm flex w-full flex-col overflow-hidden rounded-xl border border-white/[0.04] px-3 py-1"
         )}
         role="listbox"
         aria-multiselectable={selectionMode === "multi"}
@@ -583,7 +580,7 @@ export function OptionList({
             <Fragment key={option.id}>
               {index > 0 && (
                 <Separator
-                  className="[@media(hover:hover)]:[&:has(+_:hover)]:opacity-0 [@media(hover:hover)]:[.peer:hover+&]:opacity-0"
+                  className="opacity-30 [@media(hover:hover)]:[&:has(+_:hover)]:opacity-0 [@media(hover:hover)]:[.peer:hover+&]:opacity-0"
                   orientation="horizontal"
                 />
               )}
@@ -606,16 +603,24 @@ export function OptionList({
         })}
       </div>
 
-      <div className="@container/actions">
-        <ActionButtons
-          actions={actionsWithDisabledState}
-          align={normalizedFooterActions.align}
-          confirmTimeout={normalizedFooterActions.confirmTimeout}
-          onAction={handleFooterAction}
-          onBeforeAction={
-            hasCustomResponseActions ? onBeforeResponseAction : undefined
-          }
-        />
+      <div className="flex items-center justify-end gap-2 pt-0.5">
+        {actionsWithDisabledState.map((action) => (
+          <Button
+            key={action.id}
+            variant={action.variant === "default" ? "default" : "ghost"}
+            size="sm"
+            onClick={() => handleFooterAction(action.id)}
+            disabled={action.disabled}
+            className={cn(
+              "h-7 px-3 text-xs font-medium rounded-lg",
+              action.variant === "default" 
+                ? "bg-indigo-500 hover:bg-indigo-600 text-white" 
+                : "text-white/50 hover:text-white/70 hover:bg-white/[0.04]"
+            )}
+          >
+            {action.label}
+          </Button>
+        ))}
       </div>
     </div>
   );
