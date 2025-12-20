@@ -554,6 +554,27 @@ struct ControlView: View {
     }
     
     private func handleStreamEvent(type: String, data: [String: Any]) {
+        // Filter events by mission_id - only show events for the current mission
+        // This prevents cross-mission contamination when parallel missions are running
+        let eventMissionId = data["mission_id"] as? String
+        let currentMissionId = currentMission?.id
+        
+        // Only allow status events from any mission (for global state)
+        // All other events must match the current mission
+        if type != "status" {
+            if let eventId = eventMissionId {
+                // Event has a mission_id - must match current mission
+                if eventId != currentMissionId {
+                    return // Skip events from other missions
+                }
+            } else if currentMissionId != nil {
+                // Event has NO mission_id (from main session)
+                // This is fine if we're on the current/main mission
+                // But we can't verify, so allow it for now
+                // TODO: Backend should always include mission_id
+            }
+        }
+        
         switch type {
         case "status":
             if let state = data["state"] as? String {
