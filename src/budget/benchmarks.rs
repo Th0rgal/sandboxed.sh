@@ -51,18 +51,26 @@ impl TaskType {
     /// Infer task type from task description.
     pub fn infer_from_description(description: &str) -> Self {
         let desc_lower = description.to_lowercase();
+        
+        // Helper: check if word exists as a whole word (not substring)
+        let has_word = |word: &str| {
+            desc_lower.split(|c: char| !c.is_alphanumeric())
+                .any(|w| w == word)
+        };
 
-        // Code indicators
-        if desc_lower.contains("code")
-            || desc_lower.contains("implement")
-            || desc_lower.contains("function")
-            || desc_lower.contains("bug")
-            || desc_lower.contains("debug")
-            || desc_lower.contains("refactor")
-            || desc_lower.contains("test")
-            || desc_lower.contains("compile")
-            || desc_lower.contains("script")
-            || desc_lower.contains("api")
+        // Code indicators (use word boundaries to avoid false positives like "interesting" matching "test")
+        if has_word("code")
+            || has_word("implement")
+            || has_word("function")
+            || has_word("bug")
+            || has_word("debug")
+            || has_word("refactor")
+            || has_word("test")
+            || has_word("tests")
+            || has_word("compile")
+            || has_word("script")
+            || has_word("api")
+            || desc_lower.contains("programming")
         {
             return Self::Code;
         }
@@ -94,6 +102,12 @@ impl TaskType {
             || desc_lower.contains("file")
             || desc_lower.contains("directory")
             || desc_lower.contains("command")
+            || desc_lower.contains("browser")
+            || desc_lower.contains("screenshot")
+            || desc_lower.contains("navigate")
+            || desc_lower.contains("website")
+            || desc_lower.contains("webpage")
+            || desc_lower.contains("url")
         {
             return Self::ToolCalling;
         }
