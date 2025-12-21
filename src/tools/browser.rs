@@ -276,43 +276,25 @@ async fn get_browser_session() -> anyhow::Result<Arc<Mutex<Option<BrowserSession
     Ok(state)
 }
 
+/// Local port for gost proxy forwarder
+const GOST_LOCAL_PORT: u16 = 18080;
+
 /// Launch a new Chrome instance with optional proxy configuration.
 /// 
-/// When proxy auth is needed, Chrome is launched on a virtual display (Xvfb)
-/// because headless mode doesn't support extensions properly.
+/// When proxy auth is needed, we start a local gost proxy forwarder that handles
+/// authentication with the upstream proxy. Chrome connects to the local proxy
+/// without needing any auth.
 async fn launch_browser(
     proxy_config: Option<ProxyConfig>,
 ) -> anyhow::Result<(Browser, chromiumoxide::Handler, Option<PathBuf>)> {
-    let needs_extension = proxy_config.as_ref().map(|p| p.username.is_some()).unwrap_or(false);
-    
-    // If proxy auth is needed, we must use a virtual display (extensions don't work in headless)
-    let use_virtual_display = needs_extension;
-    
-    let headless = if use_virtual_display {
-        false // Can't use headless with proxy auth extensions
-    } else {
-        std::env::var("BROWSER_HEADLESS")
-            .map(|v| v.to_lowercase() != "false" && v != "0")
-            .unwrap_or(true)
-    };
-
-    // Start Xvfb if we need a virtual display
-    let (virtual_display, _xvfb_process) = if use_virtual_display {
-        let disp = start_virtual_display().await?;
-        tracing::info!("Started virtual display: {}", disp);
-        (Some(disp), true)
-    } else {
-        (None, false)
-    };
+    let headless = std::env::var("BROWSER_HEADLESS")
+        .map(|v| v.to_lowercase() != "false" && v != "0")
+        .unwrap_or(true);
 
     let mut config_builder = BrowserConfig::builder();
 
-    // Configure display/headless mode
-    if let Some(ref disp) = virtual_display {
-        // Set DISPLAY environment for the browser process
-        std::env::set_var("DISPLAY", disp);
-        config_builder = config_builder.with_head();
-    } else if headless {
+    // Configure headless mode
+    if headless {
         config_builder = config_builder.arg("--headless=new");
     } else {
         config_builder = config_builder.with_head();
@@ -331,7 +313,7 @@ async fn launch_browser(
         .arg("--disable-translate");
 
     // Configure proxy if provided
-    let proxy_ext_dir = if let Some(ref proxy) = proxy_config {
+    if let Some(ref proxy) = proxy_config {
         tracing::info!(
             "Configuring browser proxy: {}://{}:{} (auth: {})",
             proxy.scheme,
@@ -340,32 +322,24 @@ async fn launch_browser(
             proxy.username.is_some()
         );
 
-        // Add proxy server argument
-        config_builder = config_builder.arg(&proxy.chrome_arg());
-
-        // If auth is needed, create and load the proxy extension
         if proxy.username.is_some() {
-            let ext_dir = proxy.create_extension()?;
-            tracing::info!("Created proxy auth extension at: {:?}", ext_dir);
-
-            // Load unpacked extension
-            config_builder = config_builder
-                .arg(format!("--load-extension={}", ext_dir.display()))
-                .arg("--disable-extensions-except=".to_string() + &ext_dir.display().to_string());
-
-            Some(ext_dir)
+            // Start local gost proxy forwarder to handle authentication
+            start_gost_forwarder(proxy).await?;
+            
+            // Point Chrome to local proxy (no auth needed)
+            config_builder = config_builder.arg(format!("--proxy-server=http://127.0.0.1:{}", GOST_LOCAL_PORT));
+            tracing::info!("Chrome using local proxy forwarder at 127.0.0.1:{}", GOST_LOCAL_PORT);
         } else {
-            None
+            // No auth needed, connect directly
+            config_builder = config_builder.arg(&proxy.chrome_arg());
         }
-    } else {
-        None
-    };
+    }
 
     let config = config_builder
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build browser config: {}", e))?;
 
-    tracing::info!("Launching Chrome browser (headless: {}, virtual_display: {:?})...", headless, virtual_display);
+    tracing::info!("Launching Chrome browser (headless: {})...", headless);
 
     let (browser, handler) = Browser::launch(config).await.map_err(|e| {
         anyhow::anyhow!(
@@ -376,7 +350,61 @@ async fn launch_browser(
 
     tracing::info!("Chrome browser launched successfully");
 
-    Ok((browser, handler, proxy_ext_dir))
+    Ok((browser, handler, None))
+}
+
+/// Start gost as a local proxy forwarder that handles upstream authentication.
+/// gost is a Go-based tunnel tool that supports proxy chaining with auth.
+async fn start_gost_forwarder(proxy: &ProxyConfig) -> anyhow::Result<()> {
+    use tokio::process::Command;
+    
+    // Check if gost is already running on our port
+    if let Ok(output) = Command::new("lsof")
+        .args(["-i", &format!(":{}", GOST_LOCAL_PORT)])
+        .output()
+        .await
+    {
+        if !output.stdout.is_empty() {
+            tracing::info!("gost proxy forwarder already running on port {}", GOST_LOCAL_PORT);
+            return Ok(());
+        }
+    }
+    
+    // Build upstream proxy URL with auth
+    let upstream_url = if let (Some(user), Some(pass)) = (&proxy.username, &proxy.password) {
+        format!(
+            "{}://{}:{}@{}:{}",
+            proxy.scheme, user, pass, proxy.host, proxy.port
+        )
+    } else {
+        format!("{}://{}:{}", proxy.scheme, proxy.host, proxy.port)
+    };
+    
+    // Start gost
+    let gost = Command::new("gost")
+        .args([
+            &format!("-L=:{}", GOST_LOCAL_PORT),
+            &format!("-F={}", upstream_url),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!(
+            "Failed to start gost proxy forwarder: {}. Make sure gost is installed.", e
+        ))?;
+    
+    // Wait for gost to be ready
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    
+    tracing::info!(
+        "Started gost proxy forwarder on 127.0.0.1:{} -> {}:{}",
+        GOST_LOCAL_PORT, proxy.host, proxy.port
+    );
+    
+    // Keep gost running (leak the handle intentionally)
+    std::mem::forget(gost);
+    
+    Ok(())
 }
 
 /// Start a virtual X11 display using Xvfb
