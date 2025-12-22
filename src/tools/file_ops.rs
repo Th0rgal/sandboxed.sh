@@ -58,7 +58,27 @@ impl Tool for ReadFile {
             return Err(anyhow::anyhow!("File not found: {} (resolved to: {})", path, resolution.resolved.display()));
         }
 
-        let content = tokio::fs::read_to_string(&resolution.resolved).await?;
+        // Try to read as UTF-8 text, detect binary files
+        let bytes = tokio::fs::read(&resolution.resolved).await?;
+        let content = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                // Binary file detected - don't try to display content
+                let ext = resolution.resolved.extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                return Ok(format!(
+                    "Binary file detected: {} ({} bytes)\n\n\
+                    Cannot display binary content directly. For this file type:\n\
+                    - .jar/.zip: Use `run_command` with `unzip -l` to list contents, or `jar tf` for JAR files\n\
+                    - .class: Use `run_command` with a Java decompiler like `javap -c` or `cfr`\n\
+                    - Images: Use appropriate tools to process\n\
+                    - Executables: Use `file` command to identify, `strings` to extract text",
+                    resolution.resolved.display(),
+                    resolution.resolved.metadata().map(|m| m.len()).unwrap_or(0)
+                ));
+            }
+        };
 
         // Handle optional line range
         let start_line = args["start_line"].as_u64().map(|n| n as usize);

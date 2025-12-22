@@ -15,6 +15,34 @@ use tokio::process::Command;
 
 use super::{resolve_path_simple as resolve_path, Tool};
 
+/// Sanitize command output to be safe for LLM consumption.
+/// Removes binary garbage while preserving valid text.
+fn sanitize_output(bytes: &[u8]) -> String {
+    // Check if output appears to be mostly binary
+    let non_printable_count = bytes.iter()
+        .filter(|&&b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t')
+        .count();
+    
+    // If more than 10% is non-printable (excluding newlines/tabs), it's likely binary
+    if bytes.len() > 100 && non_printable_count > bytes.len() / 10 {
+        return format!(
+            "[Binary output detected - {} bytes, {}% non-printable. \
+            Use appropriate tools to process binary data.]",
+            bytes.len(),
+            non_printable_count * 100 / bytes.len()
+        );
+    }
+    
+    // Convert to string, replacing invalid UTF-8
+    let text = String::from_utf8_lossy(bytes);
+    
+    // Remove null bytes and other problematic control characters
+    // Keep: newlines, tabs, carriage returns
+    text.chars()
+        .filter(|&c| c == '\n' || c == '\r' || c == '\t' || (c >= ' ' && c != '\u{FFFD}'))
+        .collect()
+}
+
 /// Dangerous command patterns that should be blocked.
 /// These patterns cause infinite loops or could damage the system.
 const DANGEROUS_PATTERNS: &[(&str, &str)] = &[
@@ -146,8 +174,8 @@ impl Tool for RunCommand {
             }
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = sanitize_output(&output.stdout);
+        let stderr = sanitize_output(&output.stderr);
         let exit_code = output.status.code().unwrap_or(-1);
         
         tracing::debug!("Command completed: exit={}, stdout_len={}, stderr_len={}", 
