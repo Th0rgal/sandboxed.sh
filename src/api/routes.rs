@@ -250,6 +250,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         dev_mode: state.config.dev_mode,
         auth_required: state.config.auth.auth_required(state.config.dev_mode),
+        max_iterations: state.config.max_iterations,
     })
 }
 

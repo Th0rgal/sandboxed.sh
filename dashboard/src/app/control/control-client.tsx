@@ -27,6 +27,7 @@ import {
   getModelDisplayName,
   filterAndSortModels,
   getModelCategory,
+  getHealth,
   type ControlRunState,
   type Mission,
   type MissionStatus,
@@ -423,6 +424,9 @@ export default function ControlClient() {
   // Model selection state
   const [availableModels, setAvailableModels] = useState<string[]>([]);
 
+  // Server configuration (fetched from health endpoint)
+  const [maxIterations, setMaxIterations] = useState<number>(50); // Default fallback
+
   // Check if the mission we're viewing is actually running (not just any mission)
   const viewingMissionIsRunning = useMemo(() => {
     if (!viewingMissionId) return runState !== "idle";
@@ -703,6 +707,19 @@ export default function ControlClient() {
       })
       .catch((err) => {
         console.error("Failed to fetch models:", err);
+      });
+  }, []);
+
+  // Fetch server configuration (max_iterations) from health endpoint
+  useEffect(() => {
+    getHealth()
+      .then((data) => {
+        if (data.max_iterations) {
+          setMaxIterations(data.max_iterations);
+        }
+      })
+      .catch((err) => {
+        console.error("Failed to fetch health:", err);
       });
   }, []);
 
@@ -1520,7 +1537,7 @@ export default function ControlClient() {
                       {currentMission.status === "interrupted" ? (
                         <>This mission was interrupted (server shutdown or cancellation). Click the <strong className="text-amber-400">Resume</strong> button in the mission menu to continue where you left off.</>
                       ) : currentMission.status === "blocked" ? (
-                        <>The agent reached its iteration limit (50). You can continue the mission to give it more iterations.</>
+                        <>The agent reached its iteration limit ({maxIterations}). You can continue the mission to give it more iterations.</>
                       ) : (
                         <>This mission was {currentMission.status} without any messages.
                         {currentMission.status === "completed" && " You can reactivate it to continue."}</>
@@ -1831,7 +1848,7 @@ export default function ControlClient() {
                     <Clock className="h-5 w-5 text-amber-400" />
                     <div className="text-sm">
                       <span className="text-amber-400 font-medium">Iteration limit reached</span>
-                      <span className="text-white/50 ml-1">— Agent used all 50 iterations</span>
+                      <span className="text-white/50 ml-1">— Agent used all {maxIterations} iterations</span>
                     </div>
                     <button
                       onClick={handleResumeMission}

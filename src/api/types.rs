@@ -145,6 +145,9 @@ pub struct HealthResponse {
 
     /// Whether auth is required for API requests (dev_mode=false)
     pub auth_required: bool,
+
+    /// Maximum iterations per agent (from MAX_ITERATIONS env var)
+    pub max_iterations: usize,
 }
 
 /// Login request for dashboard auth.

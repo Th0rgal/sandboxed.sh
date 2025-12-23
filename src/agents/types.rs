@@ -60,27 +60,8 @@ impl AgentType {
     }
 }
 
-/// Reason why agent execution terminated (for non-successful completions).
-/// 
-/// Used to determine whether auto-complete should trigger, avoiding substring matching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TerminalReason {
-    /// Agent hit the maximum iteration limit
-    MaxIterations,
-    /// Agent was cancelled by user
-    Cancelled,
-    /// Budget was exhausted
-    BudgetExhausted,
-    /// Agent stalled (no progress, timeouts)
-    Stalled,
-    /// Agent got stuck in an infinite loop
-    InfiniteLoop,
-    /// LLM API error
-    LlmError,
-}
-
 /// Result of an agent executing a task.
-/// 
+///
 /// # Invariants
 /// - If `success == true`, the task was completed
 /// - `cost_cents` reflects actual cost incurred
@@ -88,23 +69,18 @@ pub enum TerminalReason {
 pub struct AgentResult {
     /// Whether the task was successful
     pub success: bool,
-    
+
     /// Output or response from the agent
     pub output: String,
-    
+
     /// Cost incurred in cents
     pub cost_cents: u64,
-    
+
     /// Model used (if any)
     pub model_used: Option<String>,
-    
+
     /// Detailed result data (type-specific)
     pub data: Option<serde_json::Value>,
-    
-    /// If execution ended due to a terminal condition (not normal completion),
-    /// this indicates why. Used by auto-complete logic to avoid substring matching.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terminal_reason: Option<TerminalReason>,
 }
 
 impl AgentResult {
@@ -116,7 +92,6 @@ impl AgentResult {
             cost_cents,
             model_used: None,
             data: None,
-            terminal_reason: None,
         }
     }
 
@@ -128,7 +103,6 @@ impl AgentResult {
             cost_cents,
             model_used: None,
             data: None,
-            terminal_reason: None,
         }
     }
 
@@ -143,16 +117,10 @@ impl AgentResult {
         self.data = Some(data);
         self
     }
-    
-    /// Set the terminal reason (why execution ended abnormally).
-    pub fn with_terminal_reason(mut self, reason: TerminalReason) -> Self {
-        self.terminal_reason = Some(reason);
-        self
-    }
 }
 
 /// Complexity estimation for a task.
-/// 
+///
 /// # Invariants
 /// - `score` is in range [0.0, 1.0]
 /// - `should_split` is derived from score threshold
@@ -160,23 +128,23 @@ impl AgentResult {
 pub struct Complexity {
     /// Complexity score: 0.0 = trivial, 1.0 = extremely complex
     score: f64,
-    
+
     /// Human-readable explanation
     reasoning: String,
-    
+
     /// Whether the task should be split into subtasks
     should_split: bool,
-    
+
     /// Estimated token count for this task
     estimated_tokens: u64,
 }
 
 impl Complexity {
     /// Create a new complexity estimate.
-    /// 
+    ///
     /// # Preconditions
     /// - `score` is in [0.0, 1.0] (will be clamped if not)
-    /// 
+    ///
     /// # Postconditions
     /// - `self.score` is in [0.0, 1.0]
     /// - `self.should_split` is true if score > threshold (0.6)
@@ -240,25 +208,25 @@ impl Complexity {
 pub enum AgentError {
     #[error("Task error: {0}")]
     TaskError(String),
-    
+
     #[error("Budget exhausted: needed {needed} cents, had {available} cents")]
     BudgetExhausted { needed: u64, available: u64 },
-    
+
     #[error("No capable agent found for task")]
     NoCapableAgent,
-    
+
     #[error("LLM error: {0}")]
     LlmError(String),
-    
+
     #[error("Tool error: {0}")]
     ToolError(String),
-    
+
     #[error("Verification failed: {0}")]
     VerificationFailed(String),
-    
+
     #[error("Max iterations reached: {0}")]
     MaxIterations(usize),
-    
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -277,4 +245,3 @@ impl From<crate::budget::BudgetError> for AgentError {
         }
     }
 }
-

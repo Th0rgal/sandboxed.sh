@@ -38,6 +38,7 @@ export interface HealthResponse {
   version: string;
   dev_mode: boolean;
   auth_required: boolean;
+  max_iterations: number;
 }
 
 export interface LoginResponse {
@@ -775,10 +776,10 @@ export function uploadFile(
     
     xhr.open("POST", url);
     
-    // Add auth header
-    const token = typeof window !== "undefined" ? sessionStorage.getItem("token") : null;
-    if (token) {
-      xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    // Add auth header using the same method as other API calls
+    const headers = authHeader();
+    if (headers.Authorization) {
+      xhr.setRequestHeader("Authorization", headers.Authorization);
     }
     
     const formData = new FormData();
@@ -925,13 +926,22 @@ export async function downloadFromUrl(
   return res.json();
 }
 
-// Format bytes for display
+// Format bytes for display (handles up to petabyte scale)
 export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "-";
   if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+  if (bytes < 1024) return `${bytes} B`;
+  
+  const units = ["KB", "MB", "GB", "TB", "PB"] as const;
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex++;
+  }
+  
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
 // ==================== Models ====================
