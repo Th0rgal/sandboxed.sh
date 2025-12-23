@@ -345,5 +345,232 @@ pub async fn upload(
     Err((StatusCode::BAD_REQUEST, "missing file".to_string()))
 }
 
+// Chunked upload query params
+#[derive(Debug, Deserialize)]
+pub struct ChunkUploadQuery {
+    pub path: String,
+    pub upload_id: String,
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+}
 
+// Handle chunked file upload
+pub async fn upload_chunk(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ChunkUploadQuery>,
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Store chunks in temp directory organized by upload_id
+    let chunk_dir = std::env::temp_dir().join(format!("open_agent_chunks_{}", q.upload_id));
+    tokio::fs::create_dir_all(&chunk_dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create chunk dir: {}", e)))?;
+    
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    {
+        let chunk_path = chunk_dir.join(format!("chunk_{:06}", q.chunk_index));
+        let mut f = tokio::fs::File::create(&chunk_path)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        
+        let mut field = field;
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+        {
+            f.write_all(&chunk)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        f.flush().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "chunk_index": q.chunk_index,
+            "total_chunks": q.total_chunks,
+        })));
+    }
+    
+    Err((StatusCode::BAD_REQUEST, "missing chunk data".to_string()))
+}
 
+#[derive(Debug, Deserialize)]
+pub struct FinalizeUploadRequest {
+    pub path: String,
+    pub upload_id: String,
+    pub file_name: String,
+    pub total_chunks: u32,
+}
+
+// Finalize chunked upload by assembling chunks
+pub async fn upload_finalize(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<FinalizeUploadRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (cfg, key_file) = get_key_and_cfg(&state).await?;
+    
+    let chunk_dir = std::env::temp_dir().join(format!("open_agent_chunks_{}", req.upload_id));
+    let assembled_path = std::env::temp_dir().join(format!("open_agent_assembled_{}", req.upload_id));
+    
+    // Assemble chunks into single file
+    let mut assembled = tokio::fs::File::create(&assembled_path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create assembled file: {}", e)))?;
+    
+    for i in 0..req.total_chunks {
+        let chunk_path = chunk_dir.join(format!("chunk_{:06}", i));
+        let chunk_data = tokio::fs::read(&chunk_path)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read chunk {}: {}", i, e)))?;
+        assembled.write_all(&chunk_data)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write chunk {}: {}", i, e)))?;
+    }
+    assembled.flush().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    drop(assembled);
+    
+    // Move assembled file to destination
+    let remote_path = if req.path.ends_with('/') {
+        format!("{}{}", req.path, req.file_name)
+    } else {
+        format!("{}/{}", req.path, req.file_name)
+    };
+    
+    let target_dir = if req.path.ends_with('/') {
+        req.path.trim_end_matches('/').to_string()
+    } else {
+        req.path.clone()
+    };
+    
+    if is_localhost(&cfg.host) {
+        tokio::fs::create_dir_all(&target_dir)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create directory: {}", e)))?;
+        
+        if tokio::fs::rename(&assembled_path, &remote_path).await.is_err() {
+            tokio::fs::copy(&assembled_path, &remote_path)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to copy file: {}", e)))?;
+            let _ = tokio::fs::remove_file(&assembled_path).await;
+        }
+    } else {
+        ssh_exec(&cfg, key_file.path(), "mkdir", &["-p".into(), target_dir])
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create directory: {}", e)))?;
+        
+        let batch = format!("put -p \"{}\" \"{}\"\n", assembled_path.to_string_lossy(), remote_path);
+        sftp_batch(&cfg, key_file.path(), &batch)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let _ = tokio::fs::remove_file(&assembled_path).await;
+    }
+    
+    // Cleanup chunk directory
+    let _ = tokio::fs::remove_dir_all(&chunk_dir).await;
+    
+    Ok(Json(serde_json::json!({ "ok": true, "path": req.path, "name": req.file_name })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DownloadUrlRequest {
+    pub url: String,
+    pub path: String,
+    pub file_name: Option<String>,
+}
+
+// Download file from URL to server filesystem
+pub async fn download_from_url(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DownloadUrlRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (cfg, key_file) = get_key_and_cfg(&state).await?;
+    
+    // Download to temp file
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300)) // 5 min timeout
+        .build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create HTTP client: {}", e)))?;
+    
+    let response = client.get(&req.url)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to fetch URL: {}", e)))?;
+    
+    if !response.status().is_success() {
+        return Err((StatusCode::BAD_REQUEST, format!("URL returned error: {}", response.status())));
+    }
+    
+    // Try to get filename from Content-Disposition header or URL
+    let file_name = req.file_name.unwrap_or_else(|| {
+        response.headers()
+            .get("content-disposition")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| {
+                s.split("filename=").nth(1)
+                    .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
+            })
+            .unwrap_or_else(|| {
+                req.url.split('/').last()
+                    .and_then(|s| s.split('?').next())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("download_{}", uuid::Uuid::new_v4()))
+            })
+    });
+    
+    let tmp = std::env::temp_dir().join(format!("open_agent_url_{}", uuid::Uuid::new_v4()));
+    let mut f = tokio::fs::File::create(&tmp)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    let bytes = response.bytes()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read response: {}", e)))?;
+    
+    f.write_all(&bytes)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    f.flush().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    drop(f);
+    
+    // Move to destination
+    let remote_path = if req.path.ends_with('/') {
+        format!("{}{}", req.path, file_name)
+    } else {
+        format!("{}/{}", req.path, file_name)
+    };
+    
+    let target_dir = if req.path.ends_with('/') {
+        req.path.trim_end_matches('/').to_string()
+    } else {
+        req.path.clone()
+    };
+    
+    if is_localhost(&cfg.host) {
+        tokio::fs::create_dir_all(&target_dir)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create directory: {}", e)))?;
+        
+        if tokio::fs::rename(&tmp, &remote_path).await.is_err() {
+            tokio::fs::copy(&tmp, &remote_path)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to copy file: {}", e)))?;
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+    } else {
+        ssh_exec(&cfg, key_file.path(), "mkdir", &["-p".into(), target_dir])
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create directory: {}", e)))?;
+        
+        let batch = format!("put -p \"{}\" \"{}\"\n", tmp.to_string_lossy(), remote_path);
+        sftp_batch(&cfg, key_file.path(), &batch)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    
+    Ok(Json(serde_json::json!({ "ok": true, "path": req.path, "name": file_name })))
+}

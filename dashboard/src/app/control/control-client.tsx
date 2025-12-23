@@ -17,6 +17,9 @@ import {
   resumeMission,
   getCurrentMission,
   uploadFile,
+  uploadFileChunked,
+  downloadFromUrl,
+  formatBytes,
   getProgress,
   getRunningMissions,
   cancelMission,
@@ -28,6 +31,7 @@ import {
   type Mission,
   type MissionStatus,
   type RunningMissionInfo,
+  type UploadProgress,
 } from "@/lib/api";
 import {
   Send,
@@ -52,6 +56,8 @@ import {
   Layers,
   RefreshCw,
   PlayCircle,
+  Link2,
+  X,
 } from "lucide-react";
 import {
   OptionList,
@@ -406,6 +412,13 @@ export default function ControlClient() {
     { file: File; uploading: boolean }[]
   >([]);
   const [uploadQueue, setUploadQueue] = useState<string[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<{
+    fileName: string;
+    progress: UploadProgress;
+  } | null>(null);
+  const [showUrlInput, setShowUrlInput] = useState(false);
+  const [urlInput, setUrlInput] = useState("");
+  const [urlDownloading, setUrlDownloading] = useState(false);
 
   // Model selection state
   const [availableModels, setAvailableModels] = useState<string[]>([]);
@@ -499,13 +512,25 @@ export default function ControlClient() {
   // Handle file upload - wrapped in useCallback to avoid stale closures
   const handleFileUpload = useCallback(async (file: File) => {
     setUploadQueue((prev) => [...prev, file.name]);
+    setUploadProgress({ fileName: file.name, progress: { loaded: 0, total: file.size, percentage: 0 } });
 
     try {
       // Upload to mission-specific context folder if we have a mission
       const contextPath = currentMission?.id 
         ? `/root/context/${currentMission.id}/`
         : "/root/context/";
-      const result = await uploadFile(file, contextPath);
+      
+      // Use chunked upload for files > 10MB, regular for smaller
+      const useChunked = file.size > 10 * 1024 * 1024;
+      
+      const result = useChunked 
+        ? await uploadFileChunked(file, contextPath, (progress) => {
+            setUploadProgress({ fileName: file.name, progress });
+          })
+        : await uploadFile(file, contextPath, (progress) => {
+            setUploadProgress({ fileName: file.name, progress });
+          });
+      
       toast.success(`Uploaded ${result.name}`);
 
       // Add a message about the upload
@@ -518,8 +543,38 @@ export default function ControlClient() {
       toast.error(`Failed to upload ${file.name}`);
     } finally {
       setUploadQueue((prev) => prev.filter((name) => name !== file.name));
+      setUploadProgress(null);
     }
   }, [currentMission?.id]);
+
+  // Handle URL download
+  const handleUrlDownload = useCallback(async () => {
+    if (!urlInput.trim()) return;
+    
+    setUrlDownloading(true);
+    try {
+      const contextPath = currentMission?.id 
+        ? `/root/context/${currentMission.id}/`
+        : "/root/context/";
+      
+      const result = await downloadFromUrl(urlInput.trim(), contextPath);
+      toast.success(`Downloaded ${result.name}`);
+      
+      // Add a message about the download
+      setInput((prev) => {
+        const uploadNote = `[Downloaded: ${result.name}]`;
+        return prev ? `${prev}\n${uploadNote}` : uploadNote;
+      });
+      
+      setUrlInput("");
+      setShowUrlInput(false);
+    } catch (error) {
+      console.error("URL download failed:", error);
+      toast.error(`Failed to download from URL`);
+    } finally {
+      setUrlDownloading(false);
+    }
+  }, [urlInput, currentMission?.id]);
 
   // Handle paste to upload files
   useEffect(() => {
@@ -1812,8 +1867,32 @@ export default function ControlClient() {
 
         {/* Input */}
         <div className="border-t border-white/[0.06] bg-white/[0.01] p-4">
-          {/* Upload queue */}
-          {uploadQueue.length > 0 && (
+          {/* Upload progress */}
+          {uploadProgress && (
+            <div className="mx-auto max-w-3xl mb-3">
+              <div className="flex items-center gap-3 rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3">
+                <Loader className="h-4 w-4 animate-spin text-indigo-400" />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between text-sm mb-1">
+                    <span className="text-white/70 truncate">{uploadProgress.fileName}</span>
+                    <span className="text-white/50 ml-2 shrink-0">
+                      {formatBytes(uploadProgress.progress.loaded)} / {formatBytes(uploadProgress.progress.total)}
+                    </span>
+                  </div>
+                  <div className="h-1.5 bg-white/[0.06] rounded-full overflow-hidden">
+                    <div 
+                      className="h-full bg-indigo-500 rounded-full transition-all duration-300"
+                      style={{ width: `${uploadProgress.progress.percentage}%` }}
+                    />
+                  </div>
+                </div>
+                <span className="text-sm text-white/50 shrink-0">{uploadProgress.progress.percentage}%</span>
+              </div>
+            </div>
+          )}
+
+          {/* Upload queue (for files waiting) */}
+          {uploadQueue.length > 0 && !uploadProgress && (
             <div className="mx-auto max-w-3xl mb-3 flex flex-wrap gap-2">
               {uploadQueue.map((name) => (
                 <AttachmentPreview
@@ -1825,18 +1904,78 @@ export default function ControlClient() {
             </div>
           )}
 
+          {/* URL Input */}
+          {showUrlInput && (
+            <div className="mx-auto max-w-3xl mb-3">
+              <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                <Link2 className="h-4 w-4 text-white/40 shrink-0" />
+                <input
+                  type="url"
+                  value={urlInput}
+                  onChange={(e) => setUrlInput(e.target.value)}
+                  placeholder="Paste URL to download (Dropbox, Google Drive, direct link...)"
+                  className="flex-1 bg-transparent text-sm text-white placeholder:text-white/30 focus:outline-none"
+                  autoFocus
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleUrlDownload();
+                    } else if (e.key === "Escape") {
+                      setShowUrlInput(false);
+                      setUrlInput("");
+                    }
+                  }}
+                />
+                {urlDownloading ? (
+                  <Loader className="h-4 w-4 animate-spin text-indigo-400" />
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={handleUrlDownload}
+                      disabled={!urlInput.trim()}
+                      className="text-sm text-indigo-400 hover:text-indigo-300 disabled:text-white/20 disabled:cursor-not-allowed"
+                    >
+                      Download
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { setShowUrlInput(false); setUrlInput(""); }}
+                      className="text-white/40 hover:text-white/70"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </>
+                )}
+              </div>
+              <p className="text-xs text-white/30 mt-1.5 px-1">
+                Server will download the file directly — faster for large files
+              </p>
+            </div>
+          )}
+
           <form
             onSubmit={handleSubmit}
             className="mx-auto flex max-w-3xl gap-3 items-end"
           >
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
-              title="Attach files"
-            >
-              <Paperclip className="h-5 w-5" />
-            </button>
+            <div className="flex gap-1">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
+                title="Attach files"
+              >
+                <Paperclip className="h-5 w-5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowUrlInput(!showUrlInput)}
+                className={`p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0 ${showUrlInput ? 'text-indigo-400 border-indigo-500/30' : ''}`}
+                title="Download from URL"
+              >
+                <Link2 className="h-5 w-5" />
+              </button>
+            </div>
 
             <textarea
               ref={textareaRef}
