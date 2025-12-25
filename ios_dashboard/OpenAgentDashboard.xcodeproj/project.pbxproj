@@ -30,6 +30,7 @@
 		DA4634D7424AF3FC985987E7 /* GlassButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5267DE67017A858357F68424 /* GlassButton.swift */; };
 		FA7E68F22D16E1AC0B5F5E22 /* StatusBadge.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD6FB2E54DC07BE7A1EB08F8 /* StatusBadge.swift */; };
 		FF9C447978711CBA9185B8B0 /* OpenAgentDashboardApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 139C740B7D55C13F3B167EF3 /* OpenAgentDashboardApp.swift */; };
+		3425BC785C1C91F71D626BE5 /* RunningMissionsBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F50E98346B3C796078CAF21 /* RunningMissionsBar.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -59,6 +60,7 @@
 		D4AB47CF121ABA1946A4D879 /* Mission.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Mission.swift; sourceTree = "<group>"; };
 		EB5A4720378F06807FDE73E1 /* GlassCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassCard.swift; sourceTree = "<group>"; };
 		F51395D8FB559D3C79AAA0A4 /* OpenAgentDashboard.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = OpenAgentDashboard.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		7F50E98346B3C796078CAF21 /* RunningMissionsBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunningMissionsBar.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -100,6 +102,7 @@
 				5267DE67017A858357F68424 /* GlassButton.swift */,
 				EB5A4720378F06807FDE73E1 /* GlassCard.swift */,
 				2B9834D4EE32058824F9DF00 /* LoadingView.swift */,
+				7F50E98346B3C796078CAF21 /* RunningMissionsBar.swift */,
 				CD6FB2E54DC07BE7A1EB08F8 /* StatusBadge.swift */,
 				D09E84E812213CF7E52E4FEF /* ToolUI */,
 			);
@@ -282,6 +285,7 @@
 				3DD4D1D2E080C2F89C4881B7 /* ToolUIModels.swift in Sources */,
 				03176DF3878C25A0B557462C /* ToolUIOptionListView.swift in Sources */,
 				3361B14E949CB2A6E75B6962 /* ToolUIView.swift in Sources */,
+				3425BC785C1C91F71D626BE5 /* RunningMissionsBar.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
