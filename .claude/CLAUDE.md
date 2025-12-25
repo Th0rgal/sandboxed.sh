@@ -153,12 +153,12 @@ pub fn do_thing() -> Result<T, MyError> {
 }
 ```
 
-### Adding a New Leaf Agent
+### Adding a New Tool
 
-1. Create `src/agents/leaf/your_agent.rs`
-2. Implement `Agent` trait: `id()`, `agent_type()`, `execute()`
-3. Implement `LeafAgent` trait: `capability()` → add to `LeafCapability` enum
-4. Register in `RootAgent::new()` or relevant orchestrator
+1. Add to `src/tools/` (new file or extend existing)
+2. Implement `Tool` trait: `name()`, `description()`, `parameters()`, `call()`
+3. Register in `src/tools/mod.rs` → `create_tools()`
+4. Tool parameters use serde_json schema format
 5. Document pre/postconditions for provability
 
 ### Dashboard (Next.js + Bun)
@@ -189,11 +189,6 @@ pub fn do_thing() -> Result<T, MyError> {
 | Service | `systemctl status open_agent` |
 
 ## Adding New Components
-
-### New Tool
-1. Add to `src/tools/` (new file or extend existing)
-2. Implement `Tool` trait: `name()`, `description()`, `parameters()`, `call()`
-3. Register in `src/tools/mod.rs` → `create_tools()`
 
 ### New API Endpoint
 1. Add handler in `src/api/`

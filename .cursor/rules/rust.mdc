@@ -30,14 +30,6 @@ pub fn do_thing() -> Result<T, MyError> {
 }
 ```
 
-## Adding a New Leaf Agent
-
-1. Create `src/agents/leaf/your_agent.rs`
-2. Implement `Agent` trait: `id()`, `agent_type()`, `execute()`
-3. Implement `LeafAgent` trait: `capability()` → add to `LeafCapability` enum
-4. Register in `RootAgent::new()` or relevant orchestrator
-5. Document pre/postconditions for provability
-
 ## Adding a New Tool
 
 1. Add to `src/tools/` (new file or extend existing)
