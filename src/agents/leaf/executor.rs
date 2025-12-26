@@ -20,6 +20,10 @@ use std::path::Path;
 
 use crate::agents::{
     Agent, AgentContext, AgentId, AgentResult, AgentType, LeafAgent, LeafCapability, TerminalReason,
+    improvements::{
+        ExecutionThresholds, ToolCategory, ToolFailureTracker,
+        generate_pivot_prompt, generate_tool_failure_prompt, smart_truncate_result,
+    },
 };
 use crate::api::control::{AgentEvent, ControlRunState};
 use crate::budget::ExecutionSignals;
@@ -64,29 +68,8 @@ pub struct TaskExecutor {
 
 /// Categorize a tool name into a broader approach category.
 /// Used for tracking repeated failures of similar approaches.
-fn categorize_tool(tool_name: &str) -> String {
-    match tool_name {
-        // Static analysis tools
-        name if name.contains("slither") || name.contains("mythril") || 
-                name.contains("solhint") || name.contains("echidna") => "static_analysis".to_string(),
-        
-        // Code execution/compilation
-        "run_command" => "shell_command".to_string(),
-        name if name.contains("compile") || name.contains("build") => "compilation".to_string(),
-        
-        // File operations
-        "read_file" | "write_file" | "list_directory" | "search_files" => "file_ops".to_string(),
-        
-        // Network/API calls
-        name if name.contains("browser") || name.contains("http") || 
-                name.contains("fetch") || name.contains("curl") => "network".to_string(),
-        
-        // Git operations
-        name if name.contains("git") || name.contains("clone") => "git".to_string(),
-        
-        // Default: use the tool name itself
-        _ => tool_name.to_string(),
-    }
+fn categorize_tool(tool_name: &str) -> ToolCategory {
+    ToolCategory::from_tool_name(tool_name)
 }
 
 impl TaskExecutor {
@@ -693,20 +676,18 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
         let mut last_tool_calls: Vec<String> = Vec::new();
         let mut repetitive_actions = false;
         let mut repetition_count: u32 = 0;
-        const LOOP_WARNING_THRESHOLD: u32 = 2;  // Warn early
-        const LOOP_FORCE_COMPLETE_THRESHOLD: u32 = 4;  // Stop faster
         let mut last_tool_result: Option<String> = None;
         let mut has_error_messages = false;
         let mut iterations_completed = 0u32;
-        
+
+        // Load configurable thresholds from environment
+        let thresholds = ExecutionThresholds::from_env();
+
         // Track consecutive empty/reasoning-only responses (P0 fix for agent stalls)
         let mut empty_response_count: u32 = 0;
-        const EMPTY_RESPONSE_WARNING_THRESHOLD: u32 = 2;
-        const EMPTY_RESPONSE_FORCE_COMPLETE_THRESHOLD: u32 = 4;
-        
+
         // Track failed tool attempts by category (P3 fix for approach looping)
-        let mut failed_tool_attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-        const TOOL_FAILURE_THRESHOLD: u32 = 3;
+        let mut failure_tracker = ToolFailureTracker::new();
         
         // Track uploaded images that need to be included in the response
         // When upload_image succeeds, we store the (url, markdown) so we can warn
@@ -1022,18 +1003,19 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                         .iter()
                         .map(|tc| format!("{}:{}", tc.function.name, tc.function.arguments))
                         .collect();
-                    
+
                     if current_calls == last_tool_calls && !current_calls.is_empty() {
                         repetitive_actions = true;
                         repetition_count += 1;
+                        let repeated_tool = tool_calls.first().map(|tc| tc.function.name.as_str()).unwrap_or("unknown");
                         tracing::warn!(
                             "Loop detected: same tool call repeated {} times: {:?}",
                             repetition_count,
                             current_calls.first().map(|s| s.chars().take(100).collect::<String>())
                         );
-                        
+
                         // Force completion if stuck in a loop for too long
-                        if repetition_count >= LOOP_FORCE_COMPLETE_THRESHOLD {
+                        if repetition_count >= thresholds.loop_force_complete_threshold {
                             tracing::error!("Force completing due to infinite loop (repeated {} times)", repetition_count);
                             let signals = ExecutionSignals {
                                 iterations: iterations_completed,
@@ -1059,38 +1041,17 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                                 terminal_reason: Some(TerminalReason::InfiniteLoop),
                             };
                         }
-                        
-                        // Inject a warning message after threshold to try to break the loop
-                        if repetition_count >= LOOP_WARNING_THRESHOLD {
-                            let last_result_hint = last_tool_result
-                                .as_ref()
-                                .map(|r| {
-                                    let preview: String = r.chars().take(200).collect();
-                                    format!("\n\nLast result was: {}", preview)
-                                })
-                                .unwrap_or_default();
-                            
-                            // Calculate remaining attempts before termination
-                            let remaining = LOOP_FORCE_COMPLETE_THRESHOLD - repetition_count;
-                            let termination_warning = if remaining <= 1 {
-                                "The next repeated call WILL TERMINATE this task.".to_string()
-                            } else {
-                                format!("You have {} more attempts before this task is terminated.", remaining)
-                            };
-                            
-                            messages.push(ChatMessage::new(
-                                Role::User,
-                                format!(
-                                    "[CRITICAL SYSTEM WARNING] You have repeated the EXACT SAME tool call {} times. \
-                                    This is an infinite loop and you MUST stop.{}\n\n\
-                                    DO NOT call the same command again. Instead:\n\
-                                    1. If the path doesn't exist, try `find` or `ls` to locate the correct path\n\
-                                    2. If you've gathered enough info, call complete_mission with your findings\n\
-                                    3. Try a completely different approach\n\n\
-                                    {}",
-                                    repetition_count, last_result_hint, termination_warning
-                                )
-                            ));
+
+                        // Inject an enhanced warning message with category-specific suggestions
+                        if repetition_count >= thresholds.loop_warning_threshold {
+                            let remaining = thresholds.loop_force_complete_threshold - repetition_count;
+                            let pivot_prompt = generate_pivot_prompt(
+                                repeated_tool,
+                                repetition_count,
+                                last_tool_result.as_deref(),
+                                remaining,
+                            );
+                            messages.push(ChatMessage::new(Role::User, pivot_prompt));
                         }
                     } else {
                         // Reset counter if a different action is taken
@@ -1245,25 +1206,20 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                                     Err(e) => {
                                         failed_tool_calls += 1;
                                         has_error_messages = true;
-                                        
-                                        // P3 FIX: Track failed approaches by tool category
+
+                                        // Track failed approaches by tool category with enhanced suggestions
                                         let tool_category = categorize_tool(&tool_name);
-                                        let count = failed_tool_attempts.entry(tool_category.clone()).or_insert(0);
-                                        *count += 1;
-                                        
-                                        let s = if *count >= TOOL_FAILURE_THRESHOLD {
+                                        failure_tracker.record_failure(&tool_name, &e.to_string());
+                                        let failure_count = failure_tracker.failure_count(&tool_category);
+
+                                        let s = if failure_tracker.should_pivot(&tool_category, thresholds.tool_failure_threshold) {
                                             tracing::warn!(
                                                 "Tool category '{}' has failed {} times - suggesting pivot",
-                                                tool_category,
-                                                *count
+                                                tool_category.as_str(),
+                                                failure_count
                                             );
-                                            format!(
-                                                "Error: {}\n\n[SYSTEM NOTE: The '{}' approach has failed {} times. \
-                                                Consider: 1) Try a completely different tool/approach, \
-                                                2) Analyze what you DO have and produce partial results, \
-                                                3) Call complete_mission(blocked) if fundamentally stuck]",
-                                                e, tool_category, *count
-                                            )
+                                            let failure_prompt = generate_tool_failure_prompt(&tool_category, failure_count);
+                                            format!("Error: {}\n\n{}", e, failure_prompt)
                                         } else {
                                             format!("Error: {}", e)
                                         };
@@ -1281,24 +1237,8 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                             });
                         }
 
-                        // Truncate tool result if too large to prevent context overflow
-                        // Use char_indices to find a safe UTF-8 boundary for truncation
-                        let truncated_content = if tool_message_content.len() > max_tool_result_chars {
-                            // Find the last valid char boundary before or at max_tool_result_chars
-                            let safe_end = tool_message_content
-                                .char_indices()
-                                .take_while(|(i, _)| *i < max_tool_result_chars)
-                                .last()
-                                .map(|(i, c)| i + c.len_utf8())
-                                .unwrap_or(0);
-                            format!(
-                                "{}... [truncated, {} chars total. For large data, consider writing to a file and reading specific sections]",
-                                &tool_message_content[..safe_end],
-                                tool_message_content.len()
-                            )
-                        } else {
-                            tool_message_content
-                        };
+                        // Smart truncate tool result if too large, preserving useful information
+                        let truncated_content = smart_truncate_result(&tool_message_content, max_tool_result_chars);
                         
                         // Track last tool result for loop detection warnings
                         last_tool_result = Some(truncated_content.clone());
@@ -1467,7 +1407,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                 );
                 
                 // Force completion if too many empty responses
-                if empty_response_count >= EMPTY_RESPONSE_FORCE_COMPLETE_THRESHOLD {
+                if empty_response_count >= thresholds.empty_response_force_complete_threshold {
                     tracing::error!(
                         "Force completing: {} consecutive empty/reasoning-only responses",
                         empty_response_count
@@ -1505,7 +1445,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                 }
                 
                 // Inject a prompt to get the model to take action
-                if empty_response_count >= EMPTY_RESPONSE_WARNING_THRESHOLD {
+                if empty_response_count >= thresholds.empty_response_warning_threshold {
                     messages.push(ChatMessage::new(
                         Role::User,
                         format!(

@@ -26,6 +26,7 @@ use crate::agents::{
     leaf::TaskExecutor,
 };
 use crate::api::control::AgentTreeNode;
+use crate::budget::TaskType;
 use crate::task::Task;
 
 /// Simple agent - unified executor without orchestration overhead.
@@ -53,7 +54,8 @@ impl SimpleAgent {
     ///
     /// Priority:
     /// 1. Task's requested model (from mission override)
-    /// 2. Config default model (auto-upgraded via resolver)
+    /// 2. Benchmark-based selection (if benchmarks available and enabled)
+    /// 3. Config default model (auto-upgraded via resolver)
     async fn resolve_model(&self, task: &Task, ctx: &AgentContext) -> String {
         // Check for explicit model request (from mission override)
         if let Some(requested) = &task.analysis().requested_model {
@@ -72,6 +74,17 @@ impl SimpleAgent {
             return requested.clone();
         }
 
+        // Try benchmark-based model selection if available
+        if let Some(ref benchmarks) = ctx.benchmarks {
+            if let Some(model) = self.select_model_by_task(task.description(), benchmarks, ctx).await {
+                tracing::info!(
+                    "SimpleAgent: benchmark-based model selection: {}",
+                    model
+                );
+                return model;
+            }
+        }
+
         // Fall back to config default, resolved to latest version
         if let Some(resolver) = &ctx.resolver {
             let resolver = resolver.read().await;
@@ -86,6 +99,89 @@ impl SimpleAgent {
         } else {
             ctx.config.default_model.clone()
         }
+    }
+
+    /// Select model based on task type and benchmark scores.
+    ///
+    /// Uses task description to infer task type, then finds models
+    /// with highest capability scores for that type.
+    async fn select_model_by_task(
+        &self,
+        description: &str,
+        benchmarks: &crate::budget::SharedBenchmarkRegistry,
+        ctx: &AgentContext,
+    ) -> Option<String> {
+        // Check if benchmark-based selection is enabled
+        let use_benchmarks = std::env::var("USE_BENCHMARK_ROUTING")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+
+        if !use_benchmarks {
+            return None;
+        }
+
+        let benchmarks = benchmarks.read().await;
+
+        // Infer task type from description
+        let task_type = TaskType::infer_from_description(description);
+        tracing::debug!(
+            "SimpleAgent: inferred task type {:?} from description",
+            task_type
+        );
+
+        // Get top models for this task type
+        let top_models = benchmarks.top_models(task_type, 5);
+        if top_models.is_empty() {
+            tracing::debug!("SimpleAgent: no benchmark data for task type {:?}", task_type);
+            return None;
+        }
+
+        // Filter to preferred models (from CLAUDE.md: avoid Claude, prefer Gemini/Qwen/DeepSeek)
+        let preferred_providers = ["google/", "qwen/", "deepseek/", "x-ai/"];
+
+        for (model_id, score) in &top_models {
+            // Skip expensive Claude models
+            if model_id.starts_with("anthropic/claude") {
+                continue;
+            }
+
+            // Prefer our preferred providers
+            if preferred_providers.iter().any(|p| model_id.starts_with(p)) {
+                // Resolve to latest version if resolver available
+                let resolved = if let Some(resolver) = &ctx.resolver {
+                    let resolver_guard = resolver.read().await;
+                    resolver_guard.resolve(model_id).resolved
+                } else {
+                    model_id.to_string()
+                };
+
+                tracing::info!(
+                    "SimpleAgent: selected {} (score: {:.2}) for task type {:?}",
+                    resolved, score, task_type
+                );
+                return Some(resolved);
+            }
+        }
+
+        // If no preferred provider found, use the first non-Claude model
+        for (model_id, score) in &top_models {
+            if !model_id.starts_with("anthropic/") {
+                let resolved = if let Some(resolver) = &ctx.resolver {
+                    let resolver_guard = resolver.read().await;
+                    resolver_guard.resolve(model_id).resolved
+                } else {
+                    model_id.to_string()
+                };
+
+                tracing::info!(
+                    "SimpleAgent: selected {} (score: {:.2}) for task type {:?}",
+                    resolved, score, task_type
+                );
+                return Some(resolved);
+            }
+        }
+
+        None
     }
 
     /// Build a simple agent tree for visualization.

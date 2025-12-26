@@ -18,6 +18,7 @@
 //! - Mission completion via complete_mission tool
 
 mod context;
+pub mod improvements;
 pub mod leaf;
 pub mod orchestrator; // TODO: Remove after migration
 mod simple;
@@ -28,6 +29,10 @@ mod types;
 pub use simple::SimpleAgent;
 
 pub use context::AgentContext;
+pub use improvements::{
+    BlockerDetection, BlockerType, ExecutionThresholds, ToolCategory, ToolFailureTracker,
+    generate_pivot_prompt, generate_tool_failure_prompt, smart_truncate_result,
+};
 pub use tree::{AgentRef, AgentTree};
 pub use tuning::TuningParams;
 pub use types::{AgentError, AgentId, AgentResult, AgentType, Complexity, TerminalReason};

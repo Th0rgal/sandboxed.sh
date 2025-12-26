@@ -13,6 +13,7 @@
 //! flexibility for tasks that require broader access.
 
 mod browser;
+mod composite;
 mod desktop;
 mod directory;
 mod file_ops;
@@ -224,6 +225,18 @@ impl ToolRegistry {
 
         // Storage (image upload - requires Supabase)
         tools.insert("upload_image".to_string(), Arc::new(storage::UploadImage));
+
+        // Composite tools (higher-level workflow operations)
+        tools.insert(
+            "analyze_codebase".to_string(),
+            Arc::new(composite::AnalyzeCodebase),
+        );
+        tools.insert("deep_search".to_string(), Arc::new(composite::DeepSearch));
+        tools.insert(
+            "prepare_project".to_string(),
+            Arc::new(composite::PrepareProject),
+        );
+        tools.insert("debug_error".to_string(), Arc::new(composite::DebugError));
 
         // Browser automation (conditional on BROWSER_ENABLED)
         let browser_enabled = std::env::var("BROWSER_ENABLED").unwrap_or_default();
