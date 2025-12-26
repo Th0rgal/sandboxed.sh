@@ -150,31 +150,86 @@ struct AnyCodable: Codable {
     }
 }
 
+// MARK: - Progress Bar
+
+struct ToolUIProgress: Codable {
+    let id: String?
+    let title: String?
+    let current: Int
+    let total: Int
+    let status: String?
+
+    var percentage: Double {
+        guard total > 0 else { return 0 }
+        return Double(current) / Double(total)
+    }
+
+    var displayText: String {
+        "\(current)/\(total)"
+    }
+}
+
+// MARK: - Alert/Notification
+
+struct ToolUIAlert: Codable {
+    let id: String?
+    let title: String
+    let message: String?
+    let type: String? // "info", "success", "warning", "error"
+
+    var alertType: AlertType {
+        AlertType(rawValue: type ?? "info") ?? .info
+    }
+
+    enum AlertType: String {
+        case info, success, warning, error
+    }
+}
+
+// MARK: - Code Block
+
+struct ToolUICodeBlock: Codable {
+    let id: String?
+    let title: String?
+    let language: String?
+    let code: String
+    let lineNumbers: Bool?
+}
+
 // MARK: - Tool Call Wrapper
 
 enum ToolUIContent: Identifiable {
     case dataTable(ToolUIDataTable)
     case optionList(ToolUIOptionList)
+    case progress(ToolUIProgress)
+    case alert(ToolUIAlert)
+    case codeBlock(ToolUICodeBlock)
     case unknown(name: String, args: String)
-    
+
     var id: String {
         switch self {
         case .dataTable(let table):
             return table.id ?? UUID().uuidString
         case .optionList(let list):
             return list.id ?? UUID().uuidString
+        case .progress(let progress):
+            return progress.id ?? UUID().uuidString
+        case .alert(let alert):
+            return alert.id ?? UUID().uuidString
+        case .codeBlock(let code):
+            return code.id ?? UUID().uuidString
         case .unknown(let name, _):
             return "unknown-\(name)"
         }
     }
-    
+
     static func parse(name: String, args: [String: Any]) -> ToolUIContent? {
         guard let data = try? JSONSerialization.data(withJSONObject: args) else {
             return nil
         }
-        
+
         let decoder = JSONDecoder()
-        
+
         switch name {
         case "ui_dataTable":
             if let table = try? decoder.decode(ToolUIDataTable.self, from: data) {
@@ -184,16 +239,28 @@ enum ToolUIContent: Identifiable {
             if let list = try? decoder.decode(ToolUIOptionList.self, from: data) {
                 return .optionList(list)
             }
+        case "ui_progress":
+            if let progress = try? decoder.decode(ToolUIProgress.self, from: data) {
+                return .progress(progress)
+            }
+        case "ui_alert", "ui_notification":
+            if let alert = try? decoder.decode(ToolUIAlert.self, from: data) {
+                return .alert(alert)
+            }
+        case "ui_codeBlock", "ui_code":
+            if let code = try? decoder.decode(ToolUICodeBlock.self, from: data) {
+                return .codeBlock(code)
+            }
         default:
             break
         }
-        
+
         // Return unknown for any unrecognized UI tool
         if name.hasPrefix("ui_") {
             let argsString = String(data: data, encoding: .utf8) ?? "{}"
             return .unknown(name: name, args: argsString)
         }
-        
+
         return nil
     }
 }

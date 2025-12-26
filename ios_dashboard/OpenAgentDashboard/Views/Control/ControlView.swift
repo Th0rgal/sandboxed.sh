@@ -427,17 +427,37 @@ struct ControlView: View {
                     .lineSpacing(4)
             }
             
-            // Suggestion chips
-            VStack(spacing: 10) {
-                Text("Try asking:")
+            // Quick action templates
+            VStack(spacing: 12) {
+                Text("Quick actions:")
                     .font(.caption)
                     .foregroundStyle(Theme.textMuted)
-                
-                FlowLayout(spacing: 8) {
-                    suggestionChip("Write a Python script")
-                    suggestionChip("Debug this error")
-                    suggestionChip("Explain this code")
-                    suggestionChip("Create a file")
+
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                    quickActionButton(
+                        icon: "doc.text.fill",
+                        title: "Analyze files",
+                        prompt: "Read the files in /root/context and summarize what they contain",
+                        color: Theme.accent
+                    )
+                    quickActionButton(
+                        icon: "globe",
+                        title: "Search web",
+                        prompt: "Search the web for the latest news about ",
+                        color: Theme.success
+                    )
+                    quickActionButton(
+                        icon: "chevron.left.forwardslash.chevron.right",
+                        title: "Write code",
+                        prompt: "Write a Python script that ",
+                        color: Theme.warning
+                    )
+                    quickActionButton(
+                        icon: "terminal.fill",
+                        title: "Run command",
+                        prompt: "Run the command: ",
+                        color: Theme.info
+                    )
                 }
             }
             .padding(.top, 8)
@@ -464,6 +484,34 @@ struct ControlView: View {
                     Capsule()
                         .stroke(Theme.border, lineWidth: 1)
                 )
+        }
+    }
+
+    private func quickActionButton(icon: String, title: String, prompt: String, color: Color) -> some View {
+        Button {
+            inputText = prompt
+            isInputFocused = true
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 14))
+                    .foregroundStyle(color)
+                    .frame(width: 20)
+
+                Text(title)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Theme.textSecondary)
+
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Theme.backgroundSecondary)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Theme.border, lineWidth: 1)
+            )
         }
     }
     
@@ -984,7 +1032,7 @@ private struct MessageBubble: View {
             if !message.content.isEmpty {
                 CopyButton(isCopied: isCopied, onCopy: onCopy)
             }
-            
+
             VStack(alignment: .trailing, spacing: 4) {
                 Text(message.content)
                     .font(.body)
@@ -1000,6 +1048,11 @@ private struct MessageBubble: View {
                             topTrailingRadius: 20
                         )
                     )
+
+                // Timestamp
+                Text(message.timestamp, style: .time)
+                    .font(.caption2)
+                    .foregroundStyle(Theme.textMuted)
             }
         }
     }
@@ -1013,13 +1066,13 @@ private struct MessageBubble: View {
                         Image(systemName: success ? "checkmark.circle.fill" : "xmark.circle.fill")
                             .font(.caption2)
                             .foregroundStyle(success ? Theme.success : Theme.error)
-                        
+
                         if let model = message.displayModel {
                             Text(model)
                                 .font(.caption2.monospaced())
                                 .foregroundStyle(Theme.textTertiary)
                         }
-                        
+
                         if let cost = message.costFormatted {
                             Text("•")
                                 .foregroundStyle(Theme.textMuted)
@@ -1027,6 +1080,12 @@ private struct MessageBubble: View {
                                 .font(.caption2.monospaced())
                                 .foregroundStyle(Theme.success)
                         }
+
+                        Text("•")
+                            .foregroundStyle(Theme.textMuted)
+                        Text(message.timestamp, style: .time)
+                            .font(.caption2)
+                            .foregroundStyle(Theme.textMuted)
                     }
                 }
                 

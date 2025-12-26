@@ -2,8 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
-import Markdown from "react-markdown";
 import { toast } from "sonner";
+import { MarkdownContent } from "@/components/markdown-content";
 import { cn } from "@/lib/utils";
 import {
   cancelControl,
@@ -87,6 +87,7 @@ type ChatItem =
       kind: "user";
       id: string;
       content: string;
+      timestamp: number;
     }
   | {
       kind: "assistant";
@@ -95,6 +96,7 @@ type ChatItem =
       success: boolean;
       costCents: number;
       model: string | null;
+      timestamp: number;
     }
   | {
       kind: "thinking";
@@ -118,6 +120,7 @@ type ChatItem =
       kind: "system";
       id: string;
       content: string;
+      timestamp: number;
     }
   | {
       kind: "phase";
@@ -129,6 +132,11 @@ type ChatItem =
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function formatTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function statusLabel(state: ControlRunState): {
@@ -824,12 +832,17 @@ export default function ControlClient() {
 
   // Convert mission history to chat items
   const missionHistoryToItems = useCallback((mission: Mission): ChatItem[] => {
+    // Estimate timestamps based on mission creation time
+    const baseTime = new Date(mission.created_at).getTime();
     return mission.history.map((entry, i) => {
+      // Spread timestamps across history (rough estimate)
+      const timestamp = baseTime + i * 60000; // 1 minute apart
       if (entry.role === "user") {
         return {
           kind: "user" as const,
           id: `history-${mission.id}-${i}`,
           content: entry.content,
+          timestamp,
         };
       } else {
         return {
@@ -839,6 +852,7 @@ export default function ControlClient() {
           success: true,
           costCents: 0,
           model: null,
+          timestamp,
         };
       }
     });
@@ -1138,6 +1152,7 @@ export default function ControlClient() {
             kind: "user",
             id: String(data["id"] ?? Date.now()),
             content: String(data["content"] ?? ""),
+            timestamp: Date.now(),
           },
         ]);
         return;
@@ -1153,6 +1168,7 @@ export default function ControlClient() {
             success: Boolean(data["success"]),
             costCents: Number(data["cost_cents"] ?? 0),
             model: data["model"] ? String(data["model"]) : null,
+            timestamp: Date.now(),
           },
         ]);
         return;
@@ -1265,7 +1281,7 @@ export default function ControlClient() {
         } else {
           setItems((prev) => [
             ...prev,
-            { kind: "system", id: `err-${Date.now()}`, content: msg },
+            { kind: "system", id: `err-${Date.now()}`, content: msg, timestamp: Date.now() },
           ]);
           toast.error(msg);
         }
@@ -1789,7 +1805,40 @@ export default function ControlClient() {
                       Ask the agent to do something — messages queue while
                       it&apos;s busy
                     </p>
-                    <p className="mt-1 text-xs text-white/30">
+
+                    {/* Quick Action Templates */}
+                    <div className="mt-6 grid grid-cols-2 gap-2 max-w-md mx-auto">
+                      <button
+                        onClick={() => setInput("Read the files in /root/context and summarize what they contain")}
+                        className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-sm text-white/60 hover:bg-white/[0.08] hover:text-white/80 transition-colors text-left"
+                      >
+                        <FileText className="h-4 w-4 text-indigo-400 shrink-0" />
+                        <span>Analyze context files</span>
+                      </button>
+                      <button
+                        onClick={() => setInput("Search the web for the latest news about ")}
+                        className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-sm text-white/60 hover:bg-white/[0.08] hover:text-white/80 transition-colors text-left"
+                      >
+                        <Globe className="h-4 w-4 text-emerald-400 shrink-0" />
+                        <span>Search the web</span>
+                      </button>
+                      <button
+                        onClick={() => setInput("Write a Python script that ")}
+                        className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-sm text-white/60 hover:bg-white/[0.08] hover:text-white/80 transition-colors text-left"
+                      >
+                        <Code className="h-4 w-4 text-amber-400 shrink-0" />
+                        <span>Write code</span>
+                      </button>
+                      <button
+                        onClick={() => setInput("Run the command: ")}
+                        className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-sm text-white/60 hover:bg-white/[0.08] hover:text-white/80 transition-colors text-left"
+                      >
+                        <Terminal className="h-4 w-4 text-cyan-400 shrink-0" />
+                        <span>Run command</span>
+                      </button>
+                    </div>
+
+                    <p className="mt-4 text-xs text-white/30">
                       Tip: Paste files directly to upload to context folder
                     </p>
                   </>
@@ -1828,10 +1877,17 @@ export default function ControlClient() {
                         text={item.content}
                         className="self-start mt-2"
                       />
-                      <div className="max-w-[80%] rounded-2xl rounded-br-md bg-indigo-500 px-4 py-3 text-white selection-light">
-                        <p className="whitespace-pre-wrap text-sm">
-                          {item.content}
-                        </p>
+                      <div className="max-w-[80%]">
+                        <div className="rounded-2xl rounded-br-md bg-indigo-500 px-4 py-3 text-white selection-light">
+                          <p className="whitespace-pre-wrap text-sm">
+                            {item.content}
+                          </p>
+                        </div>
+                        <div className="mt-1 text-right">
+                          <span className="text-[10px] text-white/30">
+                            {formatTime(item.timestamp)}
+                          </span>
+                        </div>
                       </div>
                       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.08]">
                         <User className="h-4 w-4 text-white/60" />
@@ -1884,10 +1940,12 @@ export default function ControlClient() {
                               </span>
                             </>
                           )}
+                          <span>•</span>
+                          <span className="text-white/30">
+                            {formatTime(item.timestamp)}
+                          </span>
                         </div>
-                        <div className="prose-glass text-sm [&_p]:my-2 [&_code]:text-xs">
-                          <Markdown>{item.content}</Markdown>
-                        </div>
+                        <MarkdownContent content={item.content} />
                       </div>
                       <CopyButton
                         text={item.content}

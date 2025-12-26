@@ -9,6 +9,8 @@ import "xterm/css/xterm.css";
 import { authHeader, getValidJwt } from "@/lib/auth";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { CopyButton } from "@/components/ui/copy-button";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 
 type FsEntry = {
   name: string;
@@ -90,6 +92,249 @@ async function downloadFile(path: string) {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+async function fetchFileContent(path: string): Promise<string> {
+  const API_BASE = getRuntimeApiBase();
+  const res = await fetch(
+    `${API_BASE}/api/fs/download?path=${encodeURIComponent(path)}`,
+    {
+      headers: { ...authHeader() },
+    }
+  );
+  if (!res.ok) throw new Error(await res.text());
+  const text = await res.text();
+  return text;
+}
+
+// Get language from file extension for syntax highlighting
+function getLanguageFromPath(path: string): string {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  const languageMap: Record<string, string> = {
+    js: "javascript",
+    jsx: "jsx",
+    ts: "typescript",
+    tsx: "tsx",
+    py: "python",
+    rb: "ruby",
+    rs: "rust",
+    go: "go",
+    java: "java",
+    kt: "kotlin",
+    swift: "swift",
+    c: "c",
+    cpp: "cpp",
+    h: "c",
+    hpp: "cpp",
+    cs: "csharp",
+    php: "php",
+    sh: "bash",
+    bash: "bash",
+    zsh: "bash",
+    fish: "bash",
+    ps1: "powershell",
+    sql: "sql",
+    json: "json",
+    yaml: "yaml",
+    yml: "yaml",
+    toml: "toml",
+    xml: "xml",
+    html: "html",
+    htm: "html",
+    css: "css",
+    scss: "scss",
+    sass: "sass",
+    less: "less",
+    md: "markdown",
+    markdown: "markdown",
+    dockerfile: "dockerfile",
+    makefile: "makefile",
+    cmake: "cmake",
+    gitignore: "gitignore",
+    env: "bash",
+    ini: "ini",
+    conf: "ini",
+    cfg: "ini",
+    tex: "latex",
+    r: "r",
+    R: "r",
+    scala: "scala",
+    lua: "lua",
+    vim: "vim",
+    graphql: "graphql",
+    proto: "protobuf",
+  };
+  return languageMap[ext] || "text";
+}
+
+// Check if a file is likely text based on extension
+function isTextFile(path: string): boolean {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  const textExts = new Set([
+    "txt", "md", "markdown", "json", "yaml", "yml", "toml", "xml", "html", "htm",
+    "css", "scss", "sass", "less", "js", "jsx", "ts", "tsx", "py", "rb", "rs", "go",
+    "java", "kt", "swift", "c", "cpp", "h", "hpp", "cs", "php", "sh", "bash", "zsh",
+    "fish", "ps1", "sql", "dockerfile", "makefile", "cmake", "gitignore", "env",
+    "ini", "conf", "cfg", "tex", "r", "scala", "lua", "vim", "graphql", "proto",
+    "log", "csv", "tsv", "lock", "editorconfig", "prettierrc", "eslintrc",
+  ]);
+  // Also check for files without extension that are commonly text
+  const name = path.split("/").pop()?.toLowerCase() ?? "";
+  const textNames = new Set([
+    "dockerfile", "makefile", "readme", "license", "changelog", "authors",
+    "contributing", "todo", "gitignore", "dockerignore", "eslintignore",
+  ]);
+  return textExts.has(ext) || textNames.has(name);
+}
+
+// Check if a file is an image
+function isImageFile(path: string): boolean {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  return ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"].includes(ext);
+}
+
+// File Preview Modal Component
+function FilePreviewModal({
+  path,
+  onClose,
+}: {
+  path: string;
+  onClose: () => void;
+}) {
+  const [content, setContent] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const fileName = path.split("/").pop() ?? "file";
+  const language = getLanguageFromPath(path);
+  const isImage = isImageFile(path);
+
+  useEffect(() => {
+    async function loadFile() {
+      setLoading(true);
+      setError(null);
+      try {
+        if (isImage) {
+          // For images, we'll use the download URL directly
+          setContent("image");
+        } else {
+          const text = await fetchFileContent(path);
+          // Limit preview size
+          if (text.length > 500000) {
+            setContent(text.slice(0, 500000) + "\n\n... (file truncated, too large to preview)");
+          } else {
+            setContent(text);
+          }
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setLoading(false);
+      }
+    }
+    void loadFile();
+  }, [path, isImage]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="relative max-h-[85vh] max-w-[90vw] w-full max-w-4xl flex flex-col rounded-xl border border-[var(--border)] bg-[var(--background-secondary)] shadow-2xl overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
+          <div className="flex items-center gap-3">
+            <span className="text-lg">{isImage ? "🖼️" : "📄"}</span>
+            <div>
+              <h3 className="font-medium text-[var(--foreground)]">{fileName}</h3>
+              <p className="text-xs text-[var(--foreground-muted)]">{path}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {!isImage && content && (
+              <CopyButton text={content} className="h-8 w-8" />
+            )}
+            <button
+              className="flex h-8 items-center gap-1.5 rounded-md border border-[var(--border)] bg-[var(--background-tertiary)] px-3 text-xs text-[var(--foreground-muted)] hover:text-[var(--foreground)]"
+              onClick={() => void downloadFile(path)}
+            >
+              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+              Download
+            </button>
+            <button
+              className="flex h-8 w-8 items-center justify-center rounded-md text-[var(--foreground-muted)] hover:bg-[var(--background-tertiary)] hover:text-[var(--foreground)]"
+              onClick={onClose}
+            >
+              <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-auto min-h-0">
+          {loading ? (
+            <div className="flex items-center justify-center py-16">
+              <svg className="h-6 w-6 animate-spin text-[var(--foreground-muted)]" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+              </svg>
+            </div>
+          ) : error ? (
+            <div className="flex flex-col items-center justify-center py-16 text-red-400">
+              <svg className="h-8 w-8 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <p className="text-sm">{error}</p>
+            </div>
+          ) : isImage ? (
+            <div className="flex items-center justify-center p-8 bg-[var(--background)]">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={`${getRuntimeApiBase()}/api/fs/download?path=${encodeURIComponent(path)}`}
+                alt={fileName}
+                className="max-h-[60vh] max-w-full object-contain"
+              />
+            </div>
+          ) : (
+            <div className="text-sm">
+              <SyntaxHighlighter
+                language={language}
+                style={oneDark}
+                showLineNumbers
+                customStyle={{
+                  margin: 0,
+                  padding: "1rem",
+                  background: "transparent",
+                  fontSize: "0.8125rem",
+                }}
+                codeTagProps={{
+                  style: {
+                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+                  },
+                }}
+              >
+                {content || ""}
+              </SyntaxHighlighter>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        {!loading && !error && !isImage && content && (
+          <div className="border-t border-[var(--border)] px-4 py-2 text-xs text-[var(--foreground-muted)] flex items-center justify-between">
+            <span>{content.split("\n").length} lines</span>
+            <span className="uppercase tracking-wider">{language}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 async function uploadFiles(
@@ -407,12 +652,18 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
   const [isDragging, setIsDragging] = useState(false);
   const [isEditingPath, setIsEditingPath] = useState(false);
   const [editPath, setEditPath] = useState(cwd);
+  const [previewPath, setPreviewPath] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const pathInputRef = useRef<HTMLInputElement | null>(null);
   // Track the last loaded directory to avoid unnecessary reloads
   const lastLoadedDirRef = useRef<string | null>(null);
   const hasEverLoadedRef = useRef(false);
   const dragCounterRef = useRef(0);
+
+  // Check if a file can be previewed
+  const canPreview = useCallback((entry: FsEntry) => {
+    return entry.kind === "file" && (isTextFile(entry.path) || isImageFile(entry.path));
+  }, []);
 
   // Parse path into breadcrumb segments
   const breadcrumbs = useMemo(() => {
@@ -799,11 +1050,12 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
                   onClick={() => setSelected(e)}
                   onDoubleClick={() => {
                     if (e.kind === "dir") setCwd(e.path);
+                    else if (canPreview(e)) setPreviewPath(e.path);
                     else void downloadFile(e.path);
                   }}
                 >
                   <div className="col-span-7 flex items-center gap-2 truncate">
-                    <span className="text-base flex-shrink-0">{e.kind === "dir" ? "📁" : "📄"}</span>
+                    <span className="text-base flex-shrink-0">{e.kind === "dir" ? "📁" : canPreview(e) ? "👁️" : "📄"}</span>
                     <span className="truncate">{e.name}</span>
                   </div>
                   <div className="col-span-3 text-right text-[var(--foreground-muted)] tabular-nums">
@@ -829,6 +1081,18 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
                 </span>
               )}
               <div className="flex items-center gap-1">
+                {selected.kind === "file" && canPreview(selected) && (
+                  <button
+                    className="flex h-6 items-center gap-1 rounded border border-indigo-500/30 bg-indigo-500/10 px-2 text-indigo-300 hover:bg-indigo-500/20"
+                    onClick={() => setPreviewPath(selected.path)}
+                    title="Preview"
+                  >
+                    <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                    </svg>
+                  </button>
+                )}
                 {selected.kind === "file" && (
                   <button
                     className="flex h-6 items-center gap-1 rounded border border-[var(--border)] bg-[var(--background-tertiary)] px-2 text-[var(--foreground-muted)] hover:text-[var(--foreground)]"
@@ -874,6 +1138,14 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
           )}
         </div>
       </div>
+
+      {/* File Preview Modal */}
+      {previewPath && (
+        <FilePreviewModal
+          path={previewPath}
+          onClose={() => setPreviewPath(null)}
+        />
+      )}
     </div>
   );
 }
