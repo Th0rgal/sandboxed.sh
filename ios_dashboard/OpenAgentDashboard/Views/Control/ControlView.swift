@@ -21,8 +21,8 @@ struct ControlView: View {
     @State private var isAtBottom = true
     @State private var copiedMessageId: String?
 
-    // Connection state for SSE stream
-    @State private var connectionState: ConnectionState = .connected
+    // Connection state for SSE stream - starts as disconnected until first event received
+    @State private var connectionState: ConnectionState = .disconnected
     @State private var reconnectAttempt = 0
 
     // Parallel missions state

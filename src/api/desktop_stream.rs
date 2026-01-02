@@ -115,7 +115,7 @@ async fn handle_desktop_stream(mut socket: WebSocket, params: StreamParams) {
 
     // Spawn task to handle incoming messages
     let cmd_tx_clone = cmd_tx.clone();
-    let recv_task = tokio::spawn(async move {
+    let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 Message::Text(t) => {
@@ -136,7 +136,7 @@ async fn handle_desktop_stream(mut socket: WebSocket, params: StreamParams) {
     let mut frame_interval = Duration::from_millis(1000 / current_fps as u64);
 
     // Main streaming loop
-    let stream_task = tokio::spawn(async move {
+    let mut stream_task = tokio::spawn(async move {
         let mut frame_count: u64 = 0;
 
         loop {
@@ -204,10 +204,14 @@ async fn handle_desktop_stream(mut socket: WebSocket, params: StreamParams) {
         tracing::info!(frames = frame_count, "Desktop stream ended");
     });
 
-    // Wait for either task to complete
+    // Wait for either task to complete, then abort the other to prevent resource waste
     tokio::select! {
-        _ = recv_task => {}
-        _ = stream_task => {}
+        _ = &mut recv_task => {
+            stream_task.abort();
+        }
+        _ = &mut stream_task => {
+            recv_task.abort();
+        }
     }
 }
 
