@@ -200,11 +200,11 @@ export function DesktopStream({
     if (!containerRef.current) return;
 
     if (!isFullscreen) {
+      // Don't set state here - let the fullscreenchange event handler do it
+      // This prevents state desync if fullscreen request fails
       containerRef.current.requestFullscreen?.();
-      setIsFullscreen(true);
     } else {
       document.exitFullscreen?.();
-      setIsFullscreen(false);
     }
   }, [isFullscreen]);
 
@@ -216,14 +216,21 @@ export function DesktopStream({
     };
   }, [connect]);
 
-  // Listen for fullscreen changes
+  // Listen for fullscreen changes and errors
   useEffect(() => {
     const handleFullscreenChange = () => {
       setIsFullscreen(!!document.fullscreenElement);
     };
+    const handleFullscreenError = () => {
+      // Fullscreen request failed - ensure state reflects reality
+      setIsFullscreen(false);
+    };
     document.addEventListener("fullscreenchange", handleFullscreenChange);
-    return () =>
+    document.addEventListener("fullscreenerror", handleFullscreenError);
+    return () => {
       document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      document.removeEventListener("fullscreenerror", handleFullscreenError);
+    };
   }, []);
 
   return (

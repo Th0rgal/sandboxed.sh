@@ -26,6 +26,8 @@ final class DesktopStreamService {
 
     private var webSocket: URLSessionWebSocketTask?
     private var displayId: String?
+    // Connection ID to prevent stale callbacks from corrupting state
+    private var connectionId: UInt64 = 0
 
     // MARK: - Connection
 
@@ -33,6 +35,8 @@ final class DesktopStreamService {
         disconnect()
         self.displayId = displayId
         self.errorMessage = nil
+        // Increment connection ID to invalidate any pending callbacks from old connections
+        self.connectionId += 1
 
         guard let url = buildWebSocketURL(displayId: displayId) else {
             errorMessage = "Invalid URL"
@@ -53,8 +57,8 @@ final class DesktopStreamService {
         webSocket?.resume()
         // Note: isConnected will be set to true on first successful message receive
 
-        // Start receiving frames
-        receiveMessage()
+        // Start receiving frames with current connection ID
+        receiveMessage(forConnection: connectionId)
     }
 
     func disconnect() {
@@ -125,10 +129,14 @@ final class DesktopStreamService {
         }
     }
 
-    private func receiveMessage() {
+    private func receiveMessage(forConnection connId: UInt64) {
         webSocket?.receive { [weak self] result in
             Task { @MainActor in
                 guard let self = self else { return }
+
+                // Ignore callbacks from stale connections
+                // This prevents old WebSocket failures from corrupting new connection state
+                guard self.connectionId == connId else { return }
 
                 switch result {
                 case .success(let message):
@@ -137,8 +145,8 @@ final class DesktopStreamService {
                         self.isConnected = true
                     }
                     self.handleMessage(message)
-                    // Continue receiving
-                    self.receiveMessage()
+                    // Continue receiving with same connection ID
+                    self.receiveMessage(forConnection: connId)
 
                 case .failure(let error):
                     self.errorMessage = "Connection lost: \(error.localizedDescription)"
