@@ -45,6 +45,22 @@ cargo run --release
 
 The server starts on `http://127.0.0.1:3000` by default.
 
+### OpenCode Backend (External Agent)
+
+Open Agent can delegate execution to an OpenCode server instead of using its built-in agent loop.
+
+```bash
+# Point to a running OpenCode server
+export AGENT_BACKEND="opencode"
+export OPENCODE_BASE_URL="http://127.0.0.1:4096"
+
+# Optional: choose OpenCode agent (build/plan/etc)
+export OPENCODE_AGENT="build"
+
+# Optional: auto-allow all permissions for OpenCode sessions (default: true)
+export OPENCODE_PERMISSIVE="true"
+```
+
 ## API Reference
 
 ### Submit a Task
@@ -193,4 +209,3 @@ This writes a tuning file at `./.open_agent_calibration/.open_agent/tuning.json`
 ## License
 
 MIT
-

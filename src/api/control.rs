@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::agents::{AgentContext, AgentRef, TerminalReason};
 use crate::budget::{Budget, ModelPricing};
-use crate::config::Config;
+use crate::config::{AgentBackend, Config};
 use crate::llm::OpenRouterClient;
 use crate::mcp::McpRegistry;
 use crate::memory::{ContextBuilder, MemorySystem, MissionMessage};
@@ -2189,7 +2189,12 @@ async fn run_single_control_turn(
     convo.push_str(&history_context);
     convo.push_str("User:\n");
     convo.push_str(&user_message);
-    convo.push_str("\n\nInstructions:\n- Continue the conversation helpfully.\n- You may use tools to gather information or make changes.\n- When appropriate, use Tool UI tools (ui_*) for structured output or to ask for user selections.\n- For large data processing tasks (>10KB), use run_command to execute Python scripts rather than processing inline.\n- When you have fully completed the user's goal or determined it cannot be completed, use the complete_mission tool to mark the mission status.\n");
+    let instructions = if config.agent_backend == AgentBackend::OpenCode {
+        "\n\nInstructions:\n- Continue the conversation helpfully.\n- Use available tools as needed.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n"
+    } else {
+        "\n\nInstructions:\n- Continue the conversation helpfully.\n- You may use tools to gather information or make changes.\n- When appropriate, use Tool UI tools (ui_*) for structured output or to ask for user selections.\n- For large data processing tasks (>10KB), use run_command to execute Python scripts rather than processing inline.\n- When you have fully completed the user's goal or determined it cannot be completed, use the complete_mission tool to mark the mission status.\n"
+    };
+    convo.push_str(instructions);
 
     let budget = Budget::new(1000);
     let verification = VerificationCriteria::None;

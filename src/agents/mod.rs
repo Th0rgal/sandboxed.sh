@@ -20,6 +20,7 @@
 mod context;
 pub mod improvements;
 pub mod leaf;
+mod opencode;
 pub mod orchestrator; // TODO: Remove after migration
 mod simple;
 mod tree;
@@ -27,6 +28,7 @@ pub mod tuning;
 mod types;
 
 pub use simple::SimpleAgent;
+pub use opencode::OpenCodeAgent;
 
 pub use context::AgentContext;
 pub use improvements::{

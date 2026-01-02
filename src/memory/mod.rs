@@ -54,6 +54,11 @@ pub async fn init_memory(
         tracing::info!("Memory subsystem disabled (no Supabase config)");
         return None;
     }
+
+    if openrouter_key.trim().is_empty() {
+        tracing::warn!("Memory subsystem disabled (OPENROUTER_API_KEY not set)");
+        return None;
+    }
     
     let supabase = Arc::new(SupabaseClient::new(
         config.supabase_url.as_ref()?,
@@ -96,5 +101,4 @@ pub struct MemorySystem {
     pub writer: Arc<MemoryWriter>,
     pub retriever: Arc<MemoryRetriever>,
 }
-
 

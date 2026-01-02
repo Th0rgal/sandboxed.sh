@@ -1,12 +1,16 @@
 //! Configuration management for Open Agent.
 //!
 //! Configuration can be set via environment variables:
-//! - `OPENROUTER_API_KEY` - Required. Your OpenRouter API key.
+//! - `OPENROUTER_API_KEY` - Required for the local agent backend or memory embeddings.
 //! - `DEFAULT_MODEL` - Optional. The default LLM model to use. Defaults to `google/gemini-3-flash-preview`.
 //! - `WORKING_DIR` - Optional. Default working directory for relative paths. Defaults to `/root` in production, current directory in dev.
 //! - `HOST` - Optional. Server host. Defaults to `127.0.0.1`.
 //! - `PORT` - Optional. Server port. Defaults to `3000`.
 //! - `MAX_ITERATIONS` - Optional. Maximum agent loop iterations. Defaults to `50`.
+//! - `AGENT_BACKEND` - Optional. `local` or `opencode`. Defaults to `opencode` if `OPENCODE_BASE_URL` is set, otherwise `local`.
+//! - `OPENCODE_BASE_URL` - Optional. Base URL for OpenCode server. Defaults to `http://127.0.0.1:4096` when using OpenCode backend.
+//! - `OPENCODE_AGENT` - Optional. OpenCode agent name (e.g., `build`, `plan`).
+//! - `OPENCODE_PERMISSIVE` - Optional. If true, auto-allows all permissions for OpenCode sessions (default: true).
 //! - `CONSOLE_SSH_HOST` - Optional. Host for dashboard console/file explorer SSH (default: 127.0.0.1).
 //! - `CONSOLE_SSH_PORT` - Optional. SSH port (default: 22).
 //! - `CONSOLE_SSH_USER` - Optional. SSH user (default: root).
@@ -24,6 +28,25 @@
 use base64::Engine;
 use std::path::PathBuf;
 use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentBackend {
+    Local,
+    OpenCode,
+}
+
+impl AgentBackend {
+    fn from_env(value: &str) -> Result<Self, ConfigError> {
+        match value.trim().to_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "opencode" => Ok(Self::OpenCode),
+            other => Err(ConfigError::InvalidValue(
+                "AGENT_BACKEND".to_string(),
+                format!("unsupported backend '{}'", other),
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -259,6 +282,18 @@ pub struct Config {
 
     /// Context injection configuration
     pub context: ContextConfig,
+
+    /// Agent backend selection
+    pub agent_backend: AgentBackend,
+
+    /// OpenCode server base URL (if using OpenCode backend)
+    pub opencode_base_url: Option<String>,
+
+    /// Default OpenCode agent name (e.g., "build", "plan")
+    pub opencode_agent: Option<String>,
+
+    /// Whether to auto-allow all OpenCode permissions for created sessions
+    pub opencode_permissive: bool,
 }
 
 /// SSH configuration for the dashboard console + file explorer.
@@ -329,10 +364,36 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns `ConfigError::MissingEnvVar` if `OPENROUTER_API_KEY` is not set.
+    /// Returns `ConfigError::MissingEnvVar` if `OPENROUTER_API_KEY` is required but not set.
     pub fn from_env() -> Result<Self, ConfigError> {
-        let api_key = std::env::var("OPENROUTER_API_KEY")
-            .map_err(|_| ConfigError::MissingEnvVar("OPENROUTER_API_KEY".to_string()))?;
+        let api_key_env = std::env::var("OPENROUTER_API_KEY").ok();
+
+        let opencode_base_url_env = std::env::var("OPENCODE_BASE_URL").ok();
+        let agent_backend = match std::env::var("AGENT_BACKEND") {
+            Ok(value) => AgentBackend::from_env(&value)?,
+            Err(_) => {
+                if opencode_base_url_env.is_some() {
+                    AgentBackend::OpenCode
+                } else {
+                    AgentBackend::Local
+                }
+            }
+        };
+        let opencode_base_url = match agent_backend {
+            AgentBackend::OpenCode => Some(
+                opencode_base_url_env
+                    .unwrap_or_else(|| "http://127.0.0.1:4096".to_string()),
+            ),
+            AgentBackend::Local => opencode_base_url_env,
+        };
+        let opencode_agent = std::env::var("OPENCODE_AGENT").ok();
+        let opencode_permissive = std::env::var("OPENCODE_PERMISSIVE")
+            .ok()
+            .map(|v| {
+                parse_bool(&v).map_err(|e| ConfigError::InvalidValue("OPENCODE_PERMISSIVE".to_string(), e))
+            })
+            .transpose()?
+            .unwrap_or(true);
 
         let default_model = std::env::var("DEFAULT_MODEL")
             .unwrap_or_else(|_| "google/gemini-3-flash-preview".to_string());
@@ -431,6 +492,16 @@ impl Config {
             embed_dimension,
         };
 
+        // Determine if OpenRouter key is required.
+        let requires_openrouter =
+            agent_backend == AgentBackend::Local || memory.is_enabled();
+
+        let api_key = if requires_openrouter {
+            api_key_env.ok_or_else(|| ConfigError::MissingEnvVar("OPENROUTER_API_KEY".to_string()))?
+        } else {
+            api_key_env.unwrap_or_default()
+        };
+
         let console_ssh = ConsoleSshConfig {
             host: std::env::var("CONSOLE_SSH_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             port: std::env::var("CONSOLE_SSH_PORT")
@@ -462,6 +533,10 @@ impl Config {
             console_ssh,
             memory,
             context,
+            agent_backend,
+            opencode_base_url,
+            opencode_agent,
+            opencode_permissive,
         })
     }
 
@@ -481,6 +556,10 @@ impl Config {
             console_ssh: ConsoleSshConfig::default(),
             memory: MemoryConfig::default(),
             context: ContextConfig::default(),
+            agent_backend: AgentBackend::Local,
+            opencode_base_url: None,
+            opencode_agent: None,
+            opencode_permissive: true,
         }
     }
 }

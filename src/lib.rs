@@ -41,9 +41,9 @@ pub mod config;
 pub mod llm;
 pub mod mcp;
 pub mod memory;
+pub mod opencode;
 pub mod task;
 pub mod tools;
 
 pub use config::Config;
 pub use config::MemoryConfig;
-

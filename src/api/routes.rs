@@ -21,10 +21,9 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::agents::SimpleAgent;
-use crate::agents::{AgentContext, AgentRef};
+use crate::agents::{AgentContext, AgentRef, OpenCodeAgent, SimpleAgent};
 use crate::budget::ModelPricing;
-use crate::config::Config;
+use crate::config::{AgentBackend, Config};
 use crate::llm::OpenRouterClient;
 use crate::mcp::McpRegistry;
 use crate::memory::{self, MemorySystem};
@@ -57,8 +56,10 @@ pub struct AppState {
 
 /// Start the HTTP server.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    // Create the simple agent (replaces complex RootAgent hierarchy)
-    let root_agent: AgentRef = Arc::new(SimpleAgent::new());
+    let root_agent: AgentRef = match config.agent_backend {
+        AgentBackend::OpenCode => Arc::new(OpenCodeAgent::new(config.clone())),
+        AgentBackend::Local => Arc::new(SimpleAgent::new()),
+    };
 
     // Initialize memory system (optional - needs Supabase config)
     let memory = memory::init_memory(&config.memory, &config.api_key).await;
