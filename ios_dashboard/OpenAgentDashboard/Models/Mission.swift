@@ -192,8 +192,13 @@ struct RunningMissionInfo: Codable, Identifiable {
     }
     
     var displayModel: String {
-        guard let model = modelOverride else { return "Default" }
+        guard let model = modelOverride else { return missionId.prefix(8).uppercased() }
         return model.split(separator: "/").last.map(String.init) ?? model
+    }
+
+    /// Short identifier for the mission (first 8 chars of ID)
+    var shortId: String {
+        String(missionId.prefix(8)).uppercased()
     }
 }
 

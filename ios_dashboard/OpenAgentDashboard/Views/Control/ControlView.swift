@@ -20,13 +20,17 @@ struct ControlView: View {
     @State private var progress: ExecutionProgress?
     @State private var isAtBottom = true
     @State private var copiedMessageId: String?
-    
+
+    // Connection state for SSE stream
+    @State private var connectionState: ConnectionState = .connected
+    @State private var reconnectAttempt = 0
+
     // Parallel missions state
     @State private var runningMissions: [RunningMissionInfo] = []
     @State private var viewingMissionId: String?
     @State private var showRunningMissions = false
     @State private var pollingTask: Task<Void, Never>?
-    
+
     // Track pending fetch to prevent race conditions
     @State private var fetchingMissionId: String?
     
@@ -65,26 +69,39 @@ struct ControlView: View {
                     Text(currentMission?.displayTitle ?? "Control")
                         .font(.headline)
                         .foregroundStyle(Theme.textPrimary)
-                    
+
                     HStack(spacing: 4) {
-                        StatusDot(status: runState.statusType, size: 5)
-                        Text(runState.label)
-                            .font(.caption2)
-                            .foregroundStyle(Theme.textSecondary)
-                        
-                        if queueLength > 0 {
-                            Text("• \(queueLength) queued")
+                        // Show connection state or run state
+                        if !connectionState.isConnected {
+                            // Connection issue - show reconnecting/disconnected state
+                            Image(systemName: connectionState.icon)
+                                .font(.system(size: 9))
+                                .foregroundStyle(Theme.warning)
+                                .symbolEffect(.pulse, options: .repeating)
+                            Text(connectionState.label)
                                 .font(.caption2)
-                                .foregroundStyle(Theme.textTertiary)
-                        }
-                        
-                        // Progress indicator
-                        if let progress = progress, progress.total > 0 {
-                            Text("•")
-                                .foregroundStyle(Theme.textMuted)
-                            Text(progress.displayText)
-                                .font(.caption2.weight(.medium))
-                                .foregroundStyle(Theme.success)
+                                .foregroundStyle(Theme.warning)
+                        } else {
+                            // Connected - show normal run state
+                            StatusDot(status: runState.statusType, size: 5)
+                            Text(runState.label)
+                                .font(.caption2)
+                                .foregroundStyle(Theme.textSecondary)
+
+                            if queueLength > 0 {
+                                Text("• \(queueLength) queued")
+                                    .font(.caption2)
+                                    .foregroundStyle(Theme.textTertiary)
+                            }
+
+                            // Progress indicator
+                            if let progress = progress, progress.total > 0 {
+                                Text("•")
+                                    .foregroundStyle(Theme.textMuted)
+                                Text(progress.displayText)
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundStyle(Theme.success)
+                            }
                         }
                     }
                 }
@@ -195,6 +212,8 @@ struct ControlView: View {
         }
         .onDisappear {
             streamTask?.cancel()
+            connectionState = .connected
+            reconnectAttempt = 0
             pollingTask?.cancel()
         }
     }
@@ -512,33 +531,27 @@ struct ControlView: View {
     }
     
     // MARK: - Input
-    
+
     private var inputView: some View {
         VStack(spacing: 0) {
-            Divider()
-                .background(Theme.border)
-            
-            HStack(alignment: .bottom, spacing: 12) {
-                // Text input - borderless design with subtle focus glow
+            // ChatGPT-style input: clean outline, no fill, integrated send button
+            HStack(alignment: .bottom, spacing: 0) {
+                // Text input - minimal style with just a border
                 TextField("Message the agent...", text: $inputText, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(.body)
+                    .foregroundStyle(Theme.textPrimary)
                     .lineLimit(1...5)
-                    .padding(.horizontal, 16)
+                    .padding(.leading, 16)
+                    .padding(.trailing, 8)
                     .padding(.vertical, 12)
-                    .background(.ultraThinMaterial)
-                    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 22, style: .continuous)
-                            .stroke(isInputFocused ? Theme.accent.opacity(0.25) : .clear, lineWidth: 1)
-                    )
                     .focused($isInputFocused)
                     .submitLabel(.send)
                     .onSubmit {
                         sendMessage()
                     }
-                
-                // Send/Stop button
+
+                // Send/Stop button inside the input area
                 Button {
                     if runState != .idle {
                         Task { await cancelRun() }
@@ -547,22 +560,42 @@ struct ControlView: View {
                     }
                 } label: {
                     Image(systemName: runState != .idle ? "stop.fill" : "arrow.up")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 36, height: 36)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(
+                            runState != .idle ? .white :
+                            (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Theme.textMuted : .white)
+                        )
+                        .frame(width: 32, height: 32)
                         .background(
                             runState != .idle ? Theme.error :
-                            (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Theme.textMuted : Theme.accent)
+                            (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.clear : Theme.accent)
                         )
                         .clipShape(Circle())
+                        .overlay(
+                            Circle()
+                                .stroke(
+                                    inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && runState == .idle
+                                    ? Theme.border : Color.clear,
+                                    lineWidth: 1
+                                )
+                        )
                 }
                 .disabled(runState == .idle && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .animation(.easeInOut(duration: 0.15), value: runState)
+                .animation(.easeInOut(duration: 0.15), value: inputText.isEmpty)
+                .padding(.trailing, 6)
+                .padding(.bottom, 6)
             }
+            .background(Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke(Theme.border, lineWidth: 1)
+            )
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, 16)
-            .background(.thinMaterial)
+            .background(Theme.backgroundPrimary)
         }
     }
     
@@ -639,17 +672,22 @@ struct ControlView: View {
             currentMission = mission
             viewingMissionId = mission.id
             messages = []
-            
+
+            // Reset status for the new mission - it hasn't started yet
+            runState = .idle
+            queueLength = 0
+            progress = nil
+
             // Refresh running missions to show the new mission
             await refreshRunningMissions()
-            
+
             // Show the bar when creating new missions
             if !showRunningMissions && !runningMissions.isEmpty {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     showRunningMissions = true
                 }
             }
-            
+
             HapticService.success()
         } catch {
             print("Failed to create mission: \(error)")
@@ -725,9 +763,55 @@ struct ControlView: View {
     }
     
     private func startStreaming() {
-        streamTask = api.streamControl { eventType, data in
-            Task { @MainActor in
-                handleStreamEvent(type: eventType, data: data)
+        streamTask = Task {
+            // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+            let maxBackoff: UInt64 = 30
+            var currentBackoff: UInt64 = 1
+
+            while !Task.isCancelled {
+                // Reset connection state and attempt counter on new connection
+                await MainActor.run {
+                    if reconnectAttempt > 0 {
+                        connectionState = .reconnecting(attempt: reconnectAttempt)
+                    }
+                }
+
+                // Start streaming - this will block until the stream ends
+                let streamCompleted = await withCheckedContinuation { continuation in
+                    let innerTask = api.streamControl { eventType, data in
+                        Task { @MainActor in
+                            // Successfully received an event - we're connected
+                            if !self.connectionState.isConnected {
+                                self.connectionState = .connected
+                                self.reconnectAttempt = 0
+                                currentBackoff = 1
+                            }
+                            self.handleStreamEvent(type: eventType, data: data)
+                        }
+                    }
+
+                    // Wait for the stream task to complete
+                    Task {
+                        await innerTask.value
+                        continuation.resume(returning: true)
+                    }
+                }
+
+                // Stream ended - check if we should reconnect
+                guard !Task.isCancelled else { break }
+
+                // Update state to reconnecting
+                await MainActor.run {
+                    reconnectAttempt += 1
+                    connectionState = .reconnecting(attempt: reconnectAttempt)
+                }
+
+                // Wait before reconnecting (exponential backoff)
+                try? await Task.sleep(for: .seconds(currentBackoff))
+                currentBackoff = min(currentBackoff * 2, maxBackoff)
+
+                // Check cancellation again after sleep
+                guard !Task.isCancelled else { break }
             }
         }
     }
@@ -754,22 +838,38 @@ struct ControlView: View {
     
     private func switchToMission(id: String) async {
         guard id != viewingMissionId else { return }
-        
+
         // Set the target mission ID immediately for race condition tracking
         viewingMissionId = id
         fetchingMissionId = id
-        
+
         isLoading = true
-        
+
+        // Determine the run state for this mission from runningMissions
+        if let runningInfo = runningMissions.first(where: { $0.missionId == id }) {
+            // This mission is in the running list
+            if runningInfo.isRunning {
+                runState = .running
+            } else {
+                runState = .idle
+            }
+            queueLength = runningInfo.queueLen
+        } else {
+            // Not in the running list - assume idle
+            runState = .idle
+            queueLength = 0
+        }
+        progress = nil
+
         do {
             // Load the mission from API
             let mission = try await api.getMission(id: id)
-            
+
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
                 return // Another mission was requested, discard this response
             }
-            
+
             // If this is not a parallel mission, also update currentMission
             if runningMissions.contains(where: { $0.missionId == id }) {
                 // This is a parallel mission - just load its history
@@ -791,14 +891,14 @@ struct ControlView: View {
                     )
                 }
             }
-            
+
             isLoading = false
             HapticService.selectionChanged()
             shouldScrollToBottom = true
         } catch {
             // Race condition guard: only show error if this is still the mission we want
             guard fetchingMissionId == id else { return }
-            
+
             isLoading = false
             print("Failed to switch mission: \(error)")
             HapticService.error()
@@ -850,17 +950,34 @@ struct ControlView: View {
         
         switch type {
         case "status":
-            if let state = data["state"] as? String {
-                let newState = ControlRunState(rawValue: state) ?? .idle
-                runState = newState
-                
-                // Clear progress when idle
-                if newState == .idle {
-                    progress = nil
-                }
+            // Status events: only apply if viewing the mission this status is for
+            // - mission_id == nil: this is the main session's status (applies to currentMission)
+            // - mission_id == some_id: this is a parallel mission's status
+            let statusMissionId = eventMissionId
+            let shouldApply: Bool
+
+            if let statusId = statusMissionId {
+                // Status for a specific mission - only apply if we're viewing that mission
+                shouldApply = statusId == viewingId
+            } else {
+                // Status for main session - only apply if viewing the current (main) mission
+                // or if we don't have a current mission yet
+                shouldApply = viewingId == nil || viewingId == currentId
             }
-            if let queue = data["queue_len"] as? Int {
-                queueLength = queue
+
+            if shouldApply {
+                if let state = data["state"] as? String {
+                    let newState = ControlRunState(rawValue: state) ?? .idle
+                    runState = newState
+
+                    // Clear progress when idle
+                    if newState == .idle {
+                        progress = nil
+                    }
+                }
+                if let queue = data["queue_len"] as? Int {
+                    queueLength = queue
+                }
             }
             
         case "user_message":
@@ -949,12 +1066,21 @@ struct ControlView: View {
             
         case "error":
             if let errorMessage = data["message"] as? String {
-                let message = ChatMessage(
-                    id: "error-\(Date().timeIntervalSince1970)",
-                    type: .error,
-                    content: errorMessage
-                )
-                messages.append(message)
+                // Filter out connection-related errors - these are handled by the reconnection logic
+                // and shown in the status bar, not as chat messages
+                let isConnectionError = errorMessage.lowercased().contains("stream connection failed") ||
+                                        errorMessage.lowercased().contains("timed out") ||
+                                        errorMessage.lowercased().contains("network") ||
+                                        errorMessage.lowercased().contains("connection")
+
+                if !isConnectionError {
+                    let message = ChatMessage(
+                        id: "error-\(Date().timeIntervalSince1970)",
+                        type: .error,
+                        content: errorMessage
+                    )
+                    messages.append(message)
+                }
             }
             
         case "tool_call":

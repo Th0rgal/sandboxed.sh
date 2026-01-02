@@ -90,7 +90,7 @@ enum ControlRunState: String, Codable {
     case idle
     case running
     case waitingForTool = "waiting_for_tool"
-    
+
     var statusType: StatusType {
         switch self {
         case .idle: return .idle
@@ -98,12 +98,41 @@ enum ControlRunState: String, Codable {
         case .waitingForTool: return .pending
         }
     }
-    
+
     var label: String {
         switch self {
         case .idle: return "Idle"
         case .running: return "Running"
         case .waitingForTool: return "Waiting"
+        }
+    }
+}
+
+// MARK: - Connection State
+
+enum ConnectionState {
+    case connected
+    case reconnecting(attempt: Int)
+    case disconnected
+
+    var isConnected: Bool {
+        if case .connected = self { return true }
+        return false
+    }
+
+    var label: String {
+        switch self {
+        case .connected: return ""
+        case .reconnecting(let attempt): return attempt > 1 ? "Reconnecting (\(attempt))..." : "Reconnecting..."
+        case .disconnected: return "Disconnected"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .connected: return "wifi"
+        case .reconnecting: return "wifi.exclamationmark"
+        case .disconnected: return "wifi.slash"
         }
     }
 }

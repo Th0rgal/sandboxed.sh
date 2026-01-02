@@ -79,8 +79,8 @@ struct RunningMissionsBar: View {
                     .fill(Theme.success)
                     .frame(width: 6, height: 6)
                 
-                // Model name
-                Text(mission.displayModel ?? "Default")
+                // Model name or mission ID
+                Text(mission.displayModel ?? String(mission.id.prefix(8)).uppercased())
                     .font(.caption.weight(.medium))
                     .foregroundStyle(Theme.textPrimary)
                     .lineLimit(1)
