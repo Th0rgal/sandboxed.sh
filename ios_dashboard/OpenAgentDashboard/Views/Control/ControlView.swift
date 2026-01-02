@@ -1106,14 +1106,17 @@ struct ControlView: View {
             
         case "error":
             if let errorMessage = data["message"] as? String {
-                // Filter out connection-related errors - these are handled by the reconnection logic
-                // and shown in the status bar, not as chat messages
-                let isConnectionError = errorMessage.lowercased().contains("stream connection failed") ||
-                                        errorMessage.lowercased().contains("timed out") ||
-                                        errorMessage.lowercased().contains("network") ||
-                                        errorMessage.lowercased().contains("connection")
+                // Filter out SSE-specific reconnection errors - these are handled by the reconnection logic
+                // Use specific patterns to avoid filtering legitimate agent errors
+                let lower = errorMessage.lowercased()
+                let isSseReconnectError = lower.contains("stream connection failed") ||
+                                          lower.contains("sse connection") ||
+                                          lower.contains("event stream") ||
+                                          lower == "timed out" ||
+                                          lower == "connection reset" ||
+                                          lower == "connection closed"
 
-                if !isConnectionError {
+                if !isSseReconnectError {
                     let message = ChatMessage(
                         id: "error-\(Date().timeIntervalSince1970)",
                         type: .error,
