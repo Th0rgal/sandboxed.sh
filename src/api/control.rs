@@ -1996,18 +1996,30 @@ async fn control_actor_loop(
                         let mut interrupted_ids = Vec::new();
 
                         // Handle main mission - use running_mission_id (the actual mission being executed)
+                        // Note: We DON'T persist history here because:
+                        // 1. If current_mission == running_mission_id, history is correct
+                        // 2. If current_mission != running_mission_id (user created new mission),
+                        //    history was cleared and doesn't belong to running_mission_id
+                        // The running mission's history is already in DB from previous exchanges,
+                        // and any in-progress exchange will be lost (acceptable for shutdown).
                         if running.is_some() {
                             if let Some(mission_id) = running_mission_id {
-                                // Persist current history before marking as interrupted
-                                persist_mission_history(&memory, &current_mission, &history).await;
-                                
+                                // Only persist if the running mission is still current mission
+                                // (i.e., user didn't create a new mission while this one was running)
+                                let current_mid = current_mission.read().await.clone();
+                                if current_mid == Some(mission_id) {
+                                    persist_mission_history(&memory, &current_mission, &history).await;
+                                }
+                                // Note: If missions differ, don't persist - the local history
+                                // belongs to current_mission, not running_mission_id
+
                                 if let Some(mem) = &memory {
                                     if let Ok(()) = mem.supabase.update_mission_status(mission_id, "interrupted").await {
                                         interrupted_ids.push(mission_id);
                                         tracing::info!("Marked mission {} as interrupted", mission_id);
                                     }
                                 }
-                                
+
                                 // Cancel execution
                                 if let Some(token) = &running_cancel {
                                     token.cancel();

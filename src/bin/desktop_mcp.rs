@@ -141,6 +141,14 @@ fn get_working_dir() -> PathBuf {
 // Tool: desktop_start_session
 // -----------------------------------------------------------------------------
 
+/// Helper to kill a process by PID (best effort)
+fn kill_process(pid: u32) {
+    use std::process::Command;
+    let _ = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output();
+}
+
 fn tool_start_session(args: &Value) -> Result<String, String> {
     let display_num = DISPLAY_COUNTER.fetch_add(1, Ordering::SeqCst);
     let display_id = format!(":{}", display_num);
@@ -166,31 +174,40 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
     // Wait for Xvfb to be ready
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // Start i3 window manager
-    let i3 = std::process::Command::new("i3")
+    // Start i3 window manager - cleanup Xvfb on failure
+    let i3 = match std::process::Command::new("i3")
         .env("DISPLAY", &display_id)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("Failed to start i3: {}. Is i3 installed?", e))?;
+    {
+        Ok(i3) => i3,
+        Err(e) => {
+            kill_process(xvfb_pid);
+            return Err(format!("Failed to start i3: {}. Is i3 installed?", e));
+        }
+    };
 
     let i3_pid = i3.id();
 
     // Wait for i3 to initialize
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // Create screenshots directory
+    // Create screenshots directory - cleanup on failure
     let working_dir = get_working_dir();
     let screenshots_dir = working_dir.join("screenshots");
-    std::fs::create_dir_all(&screenshots_dir)
-        .map_err(|e| format!("Failed to create screenshots dir: {}", e))?;
+    if let Err(e) = std::fs::create_dir_all(&screenshots_dir) {
+        kill_process(i3_pid);
+        kill_process(xvfb_pid);
+        return Err(format!("Failed to create screenshots dir: {}", e));
+    }
 
     // Optionally launch browser
     let launch_browser = args.get("launch_browser").and_then(|v| v.as_bool()).unwrap_or(false);
     let (browser_pid, browser_info) = if launch_browser {
         let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
 
-        let chromium = std::process::Command::new("chromium")
+        let chromium = match std::process::Command::new("chromium")
             .args([
                 "--no-sandbox",
                 "--disable-gpu",
@@ -203,7 +220,14 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("Failed to start Chromium: {}", e))?;
+        {
+            Ok(c) => c,
+            Err(e) => {
+                kill_process(i3_pid);
+                kill_process(xvfb_pid);
+                return Err(format!("Failed to start Chromium: {}", e));
+            }
+        };
 
         let chromium_pid = chromium.id();
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -226,8 +250,14 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
     if let Some(pid) = browser_pid {
         session_info["browser_pid"] = json!(pid);
     }
-    std::fs::write(&session_file, serde_json::to_string_pretty(&session_info).unwrap())
-        .map_err(|e| format!("Failed to write session file: {}", e))?;
+    if let Err(e) = std::fs::write(&session_file, serde_json::to_string_pretty(&session_info).unwrap()) {
+        if let Some(pid) = browser_pid {
+            kill_process(pid);
+        }
+        kill_process(i3_pid);
+        kill_process(xvfb_pid);
+        return Err(format!("Failed to write session file: {}", e));
+    }
 
     Ok(format!(
         "{{\"success\": true, \"display\": \"{}\", \"resolution\": \"{}\", \"xvfb_pid\": {}, \"i3_pid\": {}, \"screenshots_dir\": \"{}\"{}}}",
@@ -896,10 +926,10 @@ fn execute_tool(name: &str, args: &Value) -> ToolResult {
 // MCP Server Main Loop
 // =============================================================================
 
-fn handle_request(request: JsonRpcRequest) -> JsonRpcResponse {
+fn handle_request(request: JsonRpcRequest) -> Option<JsonRpcResponse> {
     match request.method.as_str() {
         "initialize" => {
-            JsonRpcResponse::success(request.id, json!({
+            Some(JsonRpcResponse::success(request.id, json!({
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
                     "name": "desktop-mcp",
@@ -910,19 +940,19 @@ fn handle_request(request: JsonRpcRequest) -> JsonRpcResponse {
                         "listChanged": false
                     }
                 }
-            }))
+            })))
         }
 
         "notifications/initialized" | "initialized" => {
-            // Notification, no response needed but we return success anyway
-            JsonRpcResponse::success(request.id, json!({}))
+            // JSON-RPC 2.0: "The Server MUST NOT reply to a Notification"
+            None
         }
 
         "tools/list" => {
             let tools = get_tool_definitions();
-            JsonRpcResponse::success(request.id, json!({
+            Some(JsonRpcResponse::success(request.id, json!({
                 "tools": tools
-            }))
+            })))
         }
 
         "tools/call" => {
@@ -934,11 +964,11 @@ fn handle_request(request: JsonRpcRequest) -> JsonRpcResponse {
                 .unwrap_or(json!({}));
 
             let result = execute_tool(name, &args);
-            JsonRpcResponse::success(request.id, json!(result))
+            Some(JsonRpcResponse::success(request.id, json!(result)))
         }
 
         _ => {
-            JsonRpcResponse::error(request.id, -32601, format!("Method not found: {}", request.method))
+            Some(JsonRpcResponse::error(request.id, -32601, format!("Method not found: {}", request.method)))
         }
     }
 }
@@ -978,15 +1008,19 @@ fn main() {
             }
         };
 
-        let response = handle_request(request);
-        let json = serde_json::to_string(&response).unwrap();
-        eprintln!("[desktop-mcp] Sending: {}", json);
+        // Only send response if it's not a notification (per JSON-RPC 2.0 spec)
+        if let Some(response) = handle_request(request) {
+            let json = serde_json::to_string(&response).unwrap();
+            eprintln!("[desktop-mcp] Sending: {}", json);
 
-        if let Err(e) = writeln!(stdout, "{}", json) {
-            eprintln!("[desktop-mcp] Error writing response: {}", e);
-            break;
+            if let Err(e) = writeln!(stdout, "{}", json) {
+                eprintln!("[desktop-mcp] Error writing response: {}", e);
+                break;
+            }
+            let _ = stdout.flush();
+        } else {
+            eprintln!("[desktop-mcp] Notification received, no response sent");
         }
-        let _ = stdout.flush();
     }
 
     eprintln!("[desktop-mcp] Server shutting down");
