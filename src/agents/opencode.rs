@@ -164,7 +164,7 @@ impl Agent for OpenCodeAgent {
                 "agent": "OpenCodeAgent",
                 "session_id": session.id,
             })),
-            terminal_reason: None,
+            terminal_reason: Some(TerminalReason::Completed),
         }
     }
 }

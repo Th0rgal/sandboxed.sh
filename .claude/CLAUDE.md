@@ -64,15 +64,39 @@ src/
 └── api/              # HTTP routes (axum)
 ```
 
+## Execution Backends
+
+Open Agent supports two execution backends:
+
+### Local Backend (default without OpenCode)
+Uses the built-in agent loop with OpenRouter for LLM access.
+
+### OpenCode Backend (recommended for Claude Max)
+Delegates task execution to an external OpenCode server, enabling use of Claude Max subscription.
+
+```bash
+# Enable OpenCode backend
+AGENT_BACKEND=opencode
+OPENCODE_BASE_URL=http://127.0.0.1:4096
+OPENCODE_AGENT=build
+OPENCODE_PERMISSIVE=true
+```
+
+**Architecture with OpenCode:**
+```
+Dashboard → Open Agent API → OpenCode Server → Anthropic API (Claude Max)
+```
+
 ## Model Preferences
 
-**NEVER use Claude models** (anthropic/claude-*) - they are prohibitively expensive.
+**With OpenCode backend:** Use Claude models via your Claude Max subscription.
+- `anthropic/claude-opus-4-5-20251101` - Most capable, recommended
+- `anthropic/claude-sonnet-4-20250514` - Good balance of speed/capability
 
-**Preferred models (in order):**
-1. `google/gemini-3-flash-preview` - Fast, cheap, excellent tool use, **default**
+**With Local backend (OpenRouter):**
+1. `google/gemini-3-flash-preview` - Fast, cheap, excellent tool use
 2. `qwen/qwen3-235b-a22b-instruct` - Strong reasoning, affordable
 3. `deepseek/deepseek-v3.2` - Good value, capable
-4. `x-ai/grok-4.1-fast` - Fast alternative
 
 ## API Endpoints
 

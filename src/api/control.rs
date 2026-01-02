@@ -2004,8 +2004,11 @@ async fn control_actor_loop(
                                         
                                         if current_status.as_deref() == Some("active") {
                                             // Determine status based on terminal reason
-                                            // MaxIterations -> blocked (resumable) instead of failed
                                             let (status, new_status) = match agent_result.terminal_reason {
+                                                Some(TerminalReason::Completed) => {
+                                                    ("completed", MissionStatus::Completed)
+                                                }
+                                                // MaxIterations -> blocked (resumable) instead of failed
                                                 Some(TerminalReason::MaxIterations) => {
                                                     ("blocked", MissionStatus::Blocked)
                                                 }

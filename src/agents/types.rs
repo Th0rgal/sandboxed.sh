@@ -217,6 +217,8 @@ impl Complexity {
 /// Reason why agent execution terminated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalReason {
+    /// Task completed successfully
+    Completed,
     /// Task was cancelled by user
     Cancelled,
     /// Budget was exhausted
