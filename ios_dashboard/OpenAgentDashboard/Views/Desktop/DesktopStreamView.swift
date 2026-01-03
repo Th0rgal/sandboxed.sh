@@ -243,5 +243,5 @@ struct DesktopStreamView: View {
 // MARK: - Preview
 
 #Preview {
-    DesktopStreamView(displayId: ":99")
+    DesktopStreamView(displayId: ":101")
 }

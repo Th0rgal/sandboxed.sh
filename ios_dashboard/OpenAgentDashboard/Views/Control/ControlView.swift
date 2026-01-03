@@ -38,7 +38,8 @@ struct ControlView: View {
 
     // Desktop stream state
     @State private var showDesktopStream = false
-    @State private var desktopDisplayId = ":99"
+    @State private var desktopDisplayId = ":101"
+    private let availableDisplays = [":99", ":100", ":101", ":102"]
 
     @FocusState private var isInputFocused: Bool
     
@@ -153,11 +154,23 @@ struct ControlView: View {
                         Label("New Mission", systemImage: "plus")
                     }
 
-                    // Desktop stream option in menu too
-                    Button {
-                        showDesktopStream = true
+                    // Desktop stream option with display selector
+                    Menu {
+                        ForEach(availableDisplays, id: \.self) { display in
+                            Button {
+                                desktopDisplayId = display
+                                showDesktopStream = true
+                            } label: {
+                                HStack {
+                                    Text(display)
+                                    if display == desktopDisplayId {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
                     } label: {
-                        Label("View Desktop", systemImage: "display")
+                        Label("View Desktop (\(desktopDisplayId))", systemImage: "display")
                     }
 
                     if let mission = viewingMission {
