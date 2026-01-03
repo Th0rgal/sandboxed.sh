@@ -864,7 +864,18 @@ export default function ControlClient() {
     });
   }, []);
 
-  // Load mission from URL param on mount
+  // Load mission from URL param on mount (and retry on auth success)
+  const [authRetryTrigger, setAuthRetryTrigger] = useState(0);
+
+  // Listen for auth success to retry loading
+  useEffect(() => {
+    const onAuthSuccess = () => {
+      setAuthRetryTrigger((prev) => prev + 1);
+    };
+    window.addEventListener("openagent:auth:success", onAuthSuccess);
+    return () => window.removeEventListener("openagent:auth:success", onAuthSuccess);
+  }, []);
+
   useEffect(() => {
     const missionId = searchParams.get("mission");
     if (missionId) {
@@ -877,7 +888,10 @@ export default function ControlClient() {
         })
         .catch((err) => {
           console.error("Failed to load mission:", err);
-          toast.error("Failed to load mission");
+          // Only show error toast if this wasn't due to auth (authRetryTrigger > 0 means we already retried)
+          if (authRetryTrigger > 0) {
+            toast.error("Failed to load mission");
+          }
         })
         .finally(() => setMissionLoading(false));
     } else {
@@ -893,7 +907,7 @@ export default function ControlClient() {
           console.error("Failed to get current mission:", err);
         });
     }
-  }, [searchParams, router, missionHistoryToItems]);
+  }, [searchParams, router, missionHistoryToItems, authRetryTrigger]);
 
   // Poll for running parallel missions
   useEffect(() => {
@@ -916,7 +930,7 @@ export default function ControlClient() {
     return () => clearInterval(interval);
   }, []);
 
-  // Fetch available providers and models for mission creation
+  // Fetch available providers and models for mission creation (retry on auth success)
   useEffect(() => {
     listProviders()
       .then((data) => {
@@ -925,7 +939,7 @@ export default function ControlClient() {
       .catch((err) => {
         console.error("Failed to fetch providers:", err);
       });
-  }, []);
+  }, [authRetryTrigger]);
 
   // Fetch server configuration (max_iterations) from health endpoint
   useEffect(() => {

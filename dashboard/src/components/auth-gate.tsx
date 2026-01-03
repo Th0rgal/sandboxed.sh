@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { login, getHealth } from '@/lib/api';
-import { clearJwt, getValidJwt, setJwt } from '@/lib/auth';
+import { clearJwt, getValidJwt, setJwt, signalAuthSuccess } from '@/lib/auth';
 import { Lock } from 'lucide-react';
 
 export function AuthGate({ children }: { children: React.ReactNode }) {
@@ -61,6 +61,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
       setJwt(res.token, res.exp);
       setIsAuthed(true);
       setPassword('');
+      signalAuthSuccess();
     } catch {
       setError('Invalid password');
     } finally {
