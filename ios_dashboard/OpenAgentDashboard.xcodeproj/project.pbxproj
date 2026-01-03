@@ -17,20 +17,22 @@
 		3DD4D1D2E080C2F89C4881B7 /* ToolUIModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A6128ECBCA632D9E2D415F2 /* ToolUIModels.swift */; };
 		4B50B97618C0CC469FF64592 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 504A1222CE8971417834D229 /* Theme.swift */; };
 		4D0CF2666262F45370D000DF /* TerminalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AC6317C4EAD4DB9A8190209 /* TerminalView.swift */; };
+		51436A7671B1E3C8478F81A2 /* RunningMissionsBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7FC053808661C9A0E21E83C /* RunningMissionsBar.swift */; };
 		5152C5313CD5AC01276D0AE6 /* FileEntry.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA70A2A73D3A386EAFD69FC4 /* FileEntry.swift */; };
 		652A0AE498D69C9DB728B2DF /* ANSIParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD8D224B6758B664864F3987 /* ANSIParser.swift */; };
 		6865FE997D3E1D91D411F6BC /* LoadingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B9834D4EE32058824F9DF00 /* LoadingView.swift */; };
 		6B87076797C9DFA01E24CC76 /* FilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5908645A518F48B501390AB8 /* FilesView.swift */; };
+		7B064EE6C0C1039360CCE40B /* DesktopStreamService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A07EFDD6964AA3B251967041 /* DesktopStreamService.swift */; };
 		83BB0F0AAFE4F2735FF76B87 /* NavigationState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3729F39FBF53046124D05BC1 /* NavigationState.swift */; };
 		999ACAA94B0BD81A05288092 /* GlassCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB5A4720378F06807FDE73E1 /* GlassCard.swift */; };
 		9BC40E40E1B5622B24328AEB /* Mission.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4AB47CF121ABA1946A4D879 /* Mission.swift */; };
 		AA02567226057045DDD61CB1 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99B57FC3136B64DC87413CA6 /* ContentView.swift */; };
+		BD52A9FE6C97C3CC53810094 /* DesktopStreamView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCA36F5FA00B575DDD336598 /* DesktopStreamView.swift */; };
 		CA70EC5A864C3D007D42E781 /* ChatMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CB591B632D3EF26AB217976 /* ChatMessage.swift */; };
 		D64972881E36894950658708 /* APIService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBC90C32FEF604E025FFBF78 /* APIService.swift */; };
 		DA4634D7424AF3FC985987E7 /* GlassButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5267DE67017A858357F68424 /* GlassButton.swift */; };
 		FA7E68F22D16E1AC0B5F5E22 /* StatusBadge.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD6FB2E54DC07BE7A1EB08F8 /* StatusBadge.swift */; };
 		FF9C447978711CBA9185B8B0 /* OpenAgentDashboardApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 139C740B7D55C13F3B167EF3 /* OpenAgentDashboardApp.swift */; };
-		3425BC785C1C91F71D626BE5 /* RunningMissionsBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F50E98346B3C796078CAF21 /* RunningMissionsBar.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -51,6 +53,7 @@
 		66A48A20D2178760301256C9 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		8A6128ECBCA632D9E2D415F2 /* ToolUIModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolUIModels.swift; sourceTree = "<group>"; };
 		99B57FC3136B64DC87413CA6 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A07EFDD6964AA3B251967041 /* DesktopStreamService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopStreamService.swift; sourceTree = "<group>"; };
 		A4D419C8490A0C5FC4DCDF20 /* ToolUIOptionListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolUIOptionListView.swift; sourceTree = "<group>"; };
 		A84519FDE8FC75084938B292 /* ControlView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlView.swift; sourceTree = "<group>"; };
 		BA70A2A73D3A386EAFD69FC4 /* FileEntry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileEntry.swift; sourceTree = "<group>"; };
@@ -58,9 +61,10 @@
 		CD6FB2E54DC07BE7A1EB08F8 /* StatusBadge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBadge.swift; sourceTree = "<group>"; };
 		CD8D224B6758B664864F3987 /* ANSIParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ANSIParser.swift; sourceTree = "<group>"; };
 		D4AB47CF121ABA1946A4D879 /* Mission.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Mission.swift; sourceTree = "<group>"; };
+		E7FC053808661C9A0E21E83C /* RunningMissionsBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunningMissionsBar.swift; sourceTree = "<group>"; };
 		EB5A4720378F06807FDE73E1 /* GlassCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassCard.swift; sourceTree = "<group>"; };
 		F51395D8FB559D3C79AAA0A4 /* OpenAgentDashboard.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = OpenAgentDashboard.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		7F50E98346B3C796078CAF21 /* RunningMissionsBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunningMissionsBar.swift; sourceTree = "<group>"; };
+		FCA36F5FA00B575DDD336598 /* DesktopStreamView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopStreamView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -102,7 +106,7 @@
 				5267DE67017A858357F68424 /* GlassButton.swift */,
 				EB5A4720378F06807FDE73E1 /* GlassCard.swift */,
 				2B9834D4EE32058824F9DF00 /* LoadingView.swift */,
-				7F50E98346B3C796078CAF21 /* RunningMissionsBar.swift */,
+				E7FC053808661C9A0E21E83C /* RunningMissionsBar.swift */,
 				CD6FB2E54DC07BE7A1EB08F8 /* StatusBadge.swift */,
 				D09E84E812213CF7E52E4FEF /* ToolUI */,
 			);
@@ -122,11 +126,20 @@
 			children = (
 				2EF415E84544334B25BD8E26 /* Components */,
 				DABAA3652C0B0A54CFC3221B /* Control */,
+				A688A831235D3E218A0A6783 /* Desktop */,
 				0C1185300420EEF31B892A3A /* Files */,
 				5A40B212F0D2055C1C499FCC /* History */,
 				0D9369EE2F3374EAA1EF332E /* Terminal */,
 			);
 			path = Views;
+			sourceTree = "<group>";
+		};
+		A688A831235D3E218A0A6783 /* Desktop */ = {
+			isa = PBXGroup;
+			children = (
+				FCA36F5FA00B575DDD336598 /* DesktopStreamView.swift */,
+			);
+			path = Desktop;
 			sourceTree = "<group>";
 		};
 		AB86DCEEB152D8EA7E8CBD86 = {
@@ -187,6 +200,7 @@
 			children = (
 				CD8D224B6758B664864F3987 /* ANSIParser.swift */,
 				CBC90C32FEF604E025FFBF78 /* APIService.swift */,
+				A07EFDD6964AA3B251967041 /* DesktopStreamService.swift */,
 				3729F39FBF53046124D05BC1 /* NavigationState.swift */,
 				52DDF35DB8CD7D70F3CFC4A6 /* TerminalState.swift */,
 			);
@@ -268,6 +282,8 @@
 				CA70EC5A864C3D007D42E781 /* ChatMessage.swift in Sources */,
 				AA02567226057045DDD61CB1 /* ContentView.swift in Sources */,
 				02DB7F25245D03FF72DD8E2E /* ControlView.swift in Sources */,
+				7B064EE6C0C1039360CCE40B /* DesktopStreamService.swift in Sources */,
+				BD52A9FE6C97C3CC53810094 /* DesktopStreamView.swift in Sources */,
 				5152C5313CD5AC01276D0AE6 /* FileEntry.swift in Sources */,
 				6B87076797C9DFA01E24CC76 /* FilesView.swift in Sources */,
 				DA4634D7424AF3FC985987E7 /* GlassButton.swift in Sources */,
@@ -277,6 +293,7 @@
 				9BC40E40E1B5622B24328AEB /* Mission.swift in Sources */,
 				83BB0F0AAFE4F2735FF76B87 /* NavigationState.swift in Sources */,
 				FF9C447978711CBA9185B8B0 /* OpenAgentDashboardApp.swift in Sources */,
+				51436A7671B1E3C8478F81A2 /* RunningMissionsBar.swift in Sources */,
 				FA7E68F22D16E1AC0B5F5E22 /* StatusBadge.swift in Sources */,
 				0B5E1A6153270BFF21A54C23 /* TerminalState.swift in Sources */,
 				4D0CF2666262F45370D000DF /* TerminalView.swift in Sources */,
@@ -285,7 +302,6 @@
 				3DD4D1D2E080C2F89C4881B7 /* ToolUIModels.swift in Sources */,
 				03176DF3878C25A0B557462C /* ToolUIOptionListView.swift in Sources */,
 				3361B14E949CB2A6E75B6962 /* ToolUIView.swift in Sources */,
-				3425BC785C1C91F71D626BE5 /* RunningMissionsBar.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

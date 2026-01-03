@@ -279,13 +279,21 @@ impl Agent for OpenCodeAgent {
             });
         }
 
-        if response.info.error.is_some() {
+        if let Some(error) = &response.info.error {
             tree.status = "failed".to_string();
             if let Some(node) = tree.children.iter_mut().find(|n| n.id == "opencode") {
                 node.status = "failed".to_string();
             }
             ctx.emit_tree(tree);
-            return AgentResult::failure("OpenCode returned an error response", 0)
+            // Extract error message from the error value
+            let error_msg = if let Some(msg) = error.get("message").and_then(|v| v.as_str()) {
+                msg.to_string()
+            } else if let Some(s) = error.as_str() {
+                s.to_string()
+            } else {
+                error.to_string()
+            };
+            return AgentResult::failure(format!("OpenCode error: {}", error_msg), 0)
                 .with_terminal_reason(TerminalReason::LlmError);
         }
 
@@ -355,13 +363,21 @@ impl OpenCodeAgent {
             }
         };
 
-        if response.info.error.is_some() {
+        if let Some(error) = &response.info.error {
             tree.status = "failed".to_string();
             if let Some(node) = tree.children.iter_mut().find(|n| n.id == "opencode") {
                 node.status = "failed".to_string();
             }
             ctx.emit_tree(tree);
-            return AgentResult::failure("OpenCode returned an error response", 0)
+            // Extract error message from the error value
+            let error_msg = if let Some(msg) = error.get("message").and_then(|v| v.as_str()) {
+                msg.to_string()
+            } else if let Some(s) = error.as_str() {
+                s.to_string()
+            } else {
+                error.to_string()
+            };
+            return AgentResult::failure(format!("OpenCode error: {}", error_msg), 0)
                 .with_terminal_reason(TerminalReason::LlmError);
         }
 

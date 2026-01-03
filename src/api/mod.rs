@@ -18,6 +18,7 @@
 mod auth;
 mod console;
 pub mod control;
+mod desktop_stream;
 mod fs;
 pub mod mcp;
 pub mod mission_runner;

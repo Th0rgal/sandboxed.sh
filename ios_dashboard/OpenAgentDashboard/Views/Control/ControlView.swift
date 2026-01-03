@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import os
 
 struct ControlView: View {
     @State private var messages: [ChatMessage] = []
@@ -13,6 +14,7 @@ struct ControlView: View {
     @State private var runState: ControlRunState = .idle
     @State private var queueLength = 0
     @State private var currentMission: Mission?
+    @State private var viewingMission: Mission?
     @State private var isLoading = true
     @State private var streamTask: Task<Void, Never>?
     @State private var showMissionMenu = false
@@ -21,8 +23,8 @@ struct ControlView: View {
     @State private var isAtBottom = true
     @State private var copiedMessageId: String?
 
-    // Connection state for SSE stream
-    @State private var connectionState: ConnectionState = .connected
+    // Connection state for SSE stream - starts as disconnected until first event received
+    @State private var connectionState: ConnectionState = .disconnected
     @State private var reconnectAttempt = 0
 
     // Parallel missions state
@@ -33,7 +35,11 @@ struct ControlView: View {
 
     // Track pending fetch to prevent race conditions
     @State private var fetchingMissionId: String?
-    
+
+    // Desktop stream state
+    @State private var showDesktopStream = false
+    @State private var desktopDisplayId = ":99"
+
     @FocusState private var isInputFocused: Bool
     
     private let api = APIService.shared
@@ -61,12 +67,12 @@ struct ControlView: View {
                 inputView
             }
         }
-        .navigationTitle(currentMission?.displayTitle ?? "Control")
+        .navigationTitle(viewingMission?.displayTitle ?? "Control")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 2) {
-                    Text(currentMission?.displayTitle ?? "Control")
+                    Text(viewingMission?.displayTitle ?? "Control")
                         .font(.headline)
                         .foregroundStyle(Theme.textPrimary)
 
@@ -128,16 +134,35 @@ struct ControlView: View {
             }
             
             ToolbarItem(placement: .topBarTrailing) {
+                // Desktop stream button
+                Button {
+                    showDesktopStream = true
+                    HapticService.lightTap()
+                } label: {
+                    Image(systemName: "display")
+                        .font(.system(size: 14))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+            }
+
+            ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button {
                         Task { await createNewMission() }
                     } label: {
                         Label("New Mission", systemImage: "plus")
                     }
-                    
-                    if let mission = currentMission {
+
+                    // Desktop stream option in menu too
+                    Button {
+                        showDesktopStream = true
+                    } label: {
+                        Label("View Desktop", systemImage: "display")
+                    }
+
+                    if let mission = viewingMission {
                         Divider()
-                        
+
                         // Resume button for interrupted/blocked missions
                         if mission.canResume {
                             Button {
@@ -146,19 +171,19 @@ struct ControlView: View {
                                 Label("Resume Mission", systemImage: "play.circle")
                             }
                         }
-                        
+
                         Button {
                             Task { await setMissionStatus(.completed) }
                         } label: {
                             Label("Mark Complete", systemImage: "checkmark.circle")
                         }
-                        
+
                         Button(role: .destructive) {
                             Task { await setMissionStatus(.failed) }
                         } label: {
                             Label("Mark Failed", systemImage: "xmark.circle")
                         }
-                        
+
                         if mission.status != .active && !mission.canResume {
                             Button {
                                 Task { await setMissionStatus(.active) }
@@ -177,10 +202,10 @@ struct ControlView: View {
             // Check if we're being opened with a specific mission from History
             if let pendingId = nav.consumePendingMission() {
                 await loadMission(id: pendingId)
-                viewingMissionId = pendingId
+                // Also load the current mission in the background for main-session context
+                await loadCurrentMission(updateViewing: false)
             } else {
-                await loadCurrentMission()
-                viewingMissionId = currentMission?.id
+                await loadCurrentMission(updateViewing: true)
             }
             
             // Fetch initial running missions
@@ -200,21 +225,26 @@ struct ControlView: View {
                 nav.pendingMissionId = nil
                 Task {
                     await loadMission(id: missionId)
-                    viewingMissionId = missionId
                 }
             }
         }
         .onChange(of: currentMission?.id) { _, newId in
-            // Sync viewingMissionId with currentMission when it changes
-            if viewingMissionId == nil, let id = newId {
-                viewingMissionId = id
+            // Sync viewing mission with current mission if nothing is being viewed yet
+            if viewingMissionId == nil, let id = newId, let mission = currentMission, mission.id == id {
+                applyViewingMission(mission)
             }
         }
         .onDisappear {
             streamTask?.cancel()
-            connectionState = .connected
+            connectionState = .disconnected
             reconnectAttempt = 0
             pollingTask?.cancel()
+        }
+        .sheet(isPresented: $showDesktopStream) {
+            DesktopStreamView(displayId: desktopDisplayId)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationBackgroundInteraction(.enabled(upThrough: .medium))
         }
     }
     
@@ -601,25 +631,33 @@ struct ControlView: View {
     
     // MARK: - Actions
     
-    private func loadCurrentMission() async {
+    private func applyViewingMission(_ mission: Mission, scrollToBottom: Bool = true) {
+        viewingMission = mission
+        viewingMissionId = mission.id
+        messages = mission.history.enumerated().map { index, entry in
+            ChatMessage(
+                id: "\(mission.id)-\(index)",
+                type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
+                content: entry.content
+            )
+        }
+
+        if scrollToBottom {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                shouldScrollToBottom = true
+            }
+        }
+    }
+
+    private func loadCurrentMission(updateViewing: Bool) async {
         isLoading = true
         defer { isLoading = false }
 
         do {
             if let mission = try await api.getCurrentMission() {
                 currentMission = mission
-                viewingMissionId = mission.id
-                messages = mission.history.enumerated().map { index, entry in
-                    ChatMessage(
-                        id: "\(mission.id)-\(index)",
-                        type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
-                        content: entry.content
-                    )
-                }
-                
-                // Scroll to bottom after loading
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    shouldScrollToBottom = true
+                if updateViewing || viewingMissionId == nil || viewingMissionId == mission.id {
+                    applyViewingMission(mission)
                 }
             }
         } catch {
@@ -630,6 +668,9 @@ struct ControlView: View {
     private func loadMission(id: String) async {
         // Set target immediately for race condition tracking
         fetchingMissionId = id
+        let previousViewingMission = viewingMission
+        let previousViewingId = viewingMissionId
+        viewingMissionId = id
         
         isLoading = true
 
@@ -641,28 +682,25 @@ struct ControlView: View {
                 return // Another mission was requested, discard this response
             }
             
-            currentMission = mission
-            viewingMissionId = mission.id
-            messages = mission.history.enumerated().map { index, entry in
-                ChatMessage(
-                    id: "\(mission.id)-\(index)",
-                    type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
-                    content: entry.content
-                )
+            if currentMission?.id == mission.id {
+                currentMission = mission
             }
+            applyViewingMission(mission)
             isLoading = false
             HapticService.success()
-            
-            // Scroll to bottom after loading
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                shouldScrollToBottom = true
-            }
         } catch {
             // Race condition guard
             guard fetchingMissionId == id else { return }
             
             isLoading = false
             print("Failed to load mission: \(error)")
+            
+            // Revert viewing state to avoid filtering out events
+            if let fallback = previousViewingMission ?? currentMission {
+                applyViewingMission(fallback, scrollToBottom: false)
+            } else {
+                viewingMissionId = previousViewingId
+            }
         }
     }
     
@@ -670,8 +708,7 @@ struct ControlView: View {
         do {
             let mission = try await api.createMission()
             currentMission = mission
-            viewingMissionId = mission.id
-            messages = []
+            applyViewingMission(mission, scrollToBottom: false)
 
             // Reset status for the new mission - it hasn't started yet
             runState = .idle
@@ -696,11 +733,14 @@ struct ControlView: View {
     }
     
     private func setMissionStatus(_ status: MissionStatus) async {
-        guard let mission = currentMission else { return }
+        guard let mission = viewingMission else { return }
         
         do {
             try await api.setMissionStatus(id: mission.id, status: status)
-            currentMission?.status = status
+            viewingMission?.status = status
+            if currentMission?.id == mission.id {
+                currentMission?.status = status
+            }
             HapticService.success()
         } catch {
             print("Failed to set status: \(error)")
@@ -709,26 +749,17 @@ struct ControlView: View {
     }
     
     private func resumeMission() async {
-        guard let mission = currentMission, mission.canResume else { return }
+        guard let mission = viewingMission, mission.canResume else { return }
         
         do {
             let resumed = try await api.resumeMission(id: mission.id)
             currentMission = resumed
-            viewingMissionId = resumed.id
-            // Reload messages to get the resume prompt
-            messages = resumed.history.enumerated().map { index, entry in
-                ChatMessage(
-                    id: "\(resumed.id)-\(index)",
-                    type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
-                    content: entry.content
-                )
-            }
+            applyViewingMission(resumed)
             
             // Refresh running missions
             await refreshRunningMissions()
             
             HapticService.success()
-            shouldScrollToBottom = true
         } catch {
             print("Failed to resume mission: \(error)")
             HapticService.error()
@@ -777,14 +808,21 @@ struct ControlView: View {
                 }
 
                 // Start streaming - this will block until the stream ends
+                // Use OSAllocatedUnfairLock for thread-safe boolean access across actor boundaries
+                // Track successful (non-error) events separately from all events
+                let receivedSuccessfulEvent = OSAllocatedUnfairLock(initialState: false)
+
                 let streamCompleted = await withCheckedContinuation { continuation in
                     let innerTask = api.streamControl { eventType, data in
+                        // Only count non-error events as successful for backoff reset
+                        if eventType != "error" {
+                            receivedSuccessfulEvent.withLock { $0 = true }
+                        }
                         Task { @MainActor in
                             // Successfully received an event - we're connected
                             if !self.connectionState.isConnected {
                                 self.connectionState = .connected
                                 self.reconnectAttempt = 0
-                                currentBackoff = 1
                             }
                             self.handleStreamEvent(type: eventType, data: data)
                         }
@@ -795,6 +833,12 @@ struct ControlView: View {
                         await innerTask.value
                         continuation.resume(returning: true)
                     }
+                }
+
+                // Reset backoff only after receiving successful (non-error) events
+                // This prevents error events from resetting backoff when server is unavailable
+                if receivedSuccessfulEvent.withLock({ $0 }) {
+                    currentBackoff = 1
                 }
 
                 // Stream ended - check if we should reconnect
@@ -840,6 +884,11 @@ struct ControlView: View {
         guard id != viewingMissionId else { return }
 
         // Set the target mission ID immediately for race condition tracking
+        let previousViewingMission = viewingMission
+        let previousViewingId = viewingMissionId
+        let previousRunState = runState
+        let previousQueueLength = queueLength
+        let previousProgress = progress
         viewingMissionId = id
         fetchingMissionId = id
 
@@ -847,10 +896,13 @@ struct ControlView: View {
 
         // Determine the run state for this mission from runningMissions
         if let runningInfo = runningMissions.first(where: { $0.missionId == id }) {
-            // This mission is in the running list
-            if runningInfo.isRunning {
+            // This mission is in the running list - map state string to enum properly
+            switch runningInfo.state {
+            case "running":
                 runState = .running
-            } else {
+            case "waiting_for_tool":
+                runState = .waitingForTool
+            default:
                 runState = .idle
             }
             queueLength = runningInfo.queueLen
@@ -870,31 +922,14 @@ struct ControlView: View {
                 return // Another mission was requested, discard this response
             }
 
-            // If this is not a parallel mission, also update currentMission
-            if runningMissions.contains(where: { $0.missionId == id }) {
-                // This is a parallel mission - just load its history
-                messages = mission.history.enumerated().map { index, entry in
-                    ChatMessage(
-                        id: "\(mission.id)-\(index)",
-                        type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
-                        content: entry.content
-                    )
-                }
-            } else {
-                // This is the main mission - load it fully
+            // Update current mission if this is the main mission, and update the viewed mission
+            if currentMission?.id == mission.id {
                 currentMission = mission
-                messages = mission.history.enumerated().map { index, entry in
-                    ChatMessage(
-                        id: "\(mission.id)-\(index)",
-                        type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
-                        content: entry.content
-                    )
-                }
             }
+            applyViewingMission(mission)
 
             isLoading = false
             HapticService.selectionChanged()
-            shouldScrollToBottom = true
         } catch {
             // Race condition guard: only show error if this is still the mission we want
             guard fetchingMissionId == id else { return }
@@ -902,6 +937,16 @@ struct ControlView: View {
             isLoading = false
             print("Failed to switch mission: \(error)")
             HapticService.error()
+
+            // Revert viewing state and status indicators to avoid filtering out events
+            runState = previousRunState
+            queueLength = previousQueueLength
+            progress = previousProgress
+            if let fallback = previousViewingMission ?? currentMission {
+                applyViewingMission(fallback, scrollToBottom: false)
+            } else {
+                viewingMissionId = previousViewingId
+            }
         }
     }
     
@@ -1053,7 +1098,7 @@ struct ControlView: View {
             let total = data["total_subtasks"] as? Int ?? 0
             let completed = data["completed_subtasks"] as? Int ?? 0
             let current = data["current_subtask"] as? String
-            let depth = data["current_depth"] as? Int ?? 0
+            let depth = data["depth"] as? Int ?? data["current_depth"] as? Int ?? 0
             
             if total > 0 {
                 progress = ExecutionProgress(
@@ -1066,14 +1111,17 @@ struct ControlView: View {
             
         case "error":
             if let errorMessage = data["message"] as? String {
-                // Filter out connection-related errors - these are handled by the reconnection logic
-                // and shown in the status bar, not as chat messages
-                let isConnectionError = errorMessage.lowercased().contains("stream connection failed") ||
-                                        errorMessage.lowercased().contains("timed out") ||
-                                        errorMessage.lowercased().contains("network") ||
-                                        errorMessage.lowercased().contains("connection")
+                // Filter out SSE-specific reconnection errors - these are handled by the reconnection logic
+                // Use specific patterns to avoid filtering legitimate agent errors
+                let lower = errorMessage.lowercased()
+                let isSseReconnectError = lower.contains("stream connection failed") ||
+                                          lower.contains("sse connection") ||
+                                          lower.contains("event stream") ||
+                                          lower == "timed out" ||
+                                          lower == "connection reset" ||
+                                          lower == "connection closed"
 
-                if !isConnectionError {
+                if !isSseReconnectError {
                     let message = ChatMessage(
                         id: "error-\(Date().timeIntervalSince1970)",
                         type: .error,
@@ -1503,4 +1551,3 @@ private struct MarkdownText: View {
         ControlView()
     }
 }
-

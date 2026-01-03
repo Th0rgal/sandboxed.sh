@@ -32,6 +32,7 @@ use crate::tools::ToolRegistry;
 use super::auth;
 use super::console;
 use super::control;
+use super::desktop_stream;
 use super::fs;
 use super::mcp as mcp_api;
 use super::types::*;
@@ -103,7 +104,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/health", get(health))
         .route("/api/auth/login", post(auth::login))
         // WebSocket console uses subprotocol-based auth (browser can't set Authorization header)
-        .route("/api/console/ws", get(console::console_ws));
+        .route("/api/console/ws", get(console::console_ws))
+        // WebSocket desktop stream uses subprotocol-based auth
+        .route(
+            "/api/desktop/stream",
+            get(desktop_stream::desktop_stream_ws),
+        );
 
     // File upload routes with increased body limit (10GB)
     let upload_route = Router::new()

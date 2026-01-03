@@ -65,6 +65,9 @@ import {
   Code,
   FolderOpen,
   Trash2,
+  Monitor,
+  PanelRightClose,
+  PanelRight,
 } from "lucide-react";
 import {
   OptionList,
@@ -79,6 +82,7 @@ import {
 import { useScrollToBottom } from "@/hooks/use-scroll-to-bottom";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import { DesktopStream } from "@/components/desktop-stream";
 
 type ChatItem =
   | {
@@ -587,6 +591,7 @@ export default function ControlClient() {
 
   // Mission state
   const [currentMission, setCurrentMission] = useState<Mission | null>(null);
+  const [viewingMission, setViewingMission] = useState<Mission | null>(null);
   const [showStatusMenu, setShowStatusMenu] = useState(false);
   const [missionLoading, setMissionLoading] = useState(false);
 
@@ -629,6 +634,10 @@ export default function ControlClient() {
   // Server configuration (fetched from health endpoint)
   const [maxIterations, setMaxIterations] = useState<number>(50); // Default fallback
 
+  // Desktop stream state
+  const [showDesktopStream, setShowDesktopStream] = useState(false);
+  const [desktopDisplayId] = useState(":99");
+
   // Check if the mission we're viewing is actually running (not just any mission)
   const viewingMissionIsRunning = useMemo(() => {
     if (!viewingMissionId) return runState !== "idle";
@@ -647,6 +656,7 @@ export default function ControlClient() {
   const viewingMissionIdRef = useRef<string | null>(null);
   const runningMissionsRef = useRef<RunningMissionInfo[]>([]);
   const currentMissionRef = useRef<Mission | null>(null);
+  const viewingMissionRef = useRef<Mission | null>(null);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -660,6 +670,10 @@ export default function ControlClient() {
   useEffect(() => {
     currentMissionRef.current = currentMission;
   }, [currentMission]);
+
+  useEffect(() => {
+    viewingMissionRef.current = viewingMission;
+  }, [viewingMission]);
 
   // Smart auto-scroll
   const { containerRef, endRef, isAtBottom, scrollToBottom } =
@@ -856,19 +870,54 @@ export default function ControlClient() {
     });
   }, []);
 
-  // Load mission from URL param on mount
+  // Load mission from URL param on mount (and retry on auth success)
+  const [authRetryTrigger, setAuthRetryTrigger] = useState(0);
+
+  // Listen for auth success to retry loading
+  useEffect(() => {
+    const onAuthSuccess = () => {
+      setAuthRetryTrigger((prev) => prev + 1);
+    };
+    window.addEventListener("openagent:auth:success", onAuthSuccess);
+    return () => window.removeEventListener("openagent:auth:success", onAuthSuccess);
+  }, []);
+
   useEffect(() => {
     const missionId = searchParams.get("mission");
     if (missionId) {
+      const previousViewingMission = viewingMissionRef.current;
       setMissionLoading(true);
+      setViewingMissionId(missionId); // Set viewing ID immediately to prevent "Agent is working..." flash
+      fetchingMissionIdRef.current = missionId; // Track which mission we're loading
       loadMission(missionId)
         .then((mission) => {
+          // Race condition guard: only apply if this is still the mission we want
+          if (fetchingMissionIdRef.current !== missionId) return;
           setCurrentMission(mission);
+          setViewingMission(mission);
           setItems(missionHistoryToItems(mission));
         })
         .catch((err) => {
+          // Race condition guard: only handle error if this is still the mission we want
+          if (fetchingMissionIdRef.current !== missionId) return;
           console.error("Failed to load mission:", err);
-          toast.error("Failed to load mission");
+          // Show error toast for mission load failures (skip if likely a 401 during initial page load)
+          const is401 = err?.message?.includes("401") || err?.status === 401;
+          if (!is401) {
+            toast.error("Failed to load mission");
+          }
+
+          // Revert viewing state to the previous mission to avoid filtering out events
+          const fallbackMission = previousViewingMission ?? currentMissionRef.current;
+          if (fallbackMission) {
+            setViewingMissionId(fallbackMission.id);
+            setViewingMission(fallbackMission);
+            setItems(missionHistoryToItems(fallbackMission));
+          } else {
+            setViewingMissionId(null);
+            setViewingMission(null);
+            setItems([]);
+          }
         })
         .finally(() => setMissionLoading(false));
     } else {
@@ -876,6 +925,7 @@ export default function ControlClient() {
         .then((mission) => {
           if (mission) {
             setCurrentMission(mission);
+            setViewingMission(mission);
             setItems(missionHistoryToItems(mission));
             router.replace(`/control?mission=${mission.id}`, { scroll: false });
           }
@@ -884,7 +934,7 @@ export default function ControlClient() {
           console.error("Failed to get current mission:", err);
         });
     }
-  }, [searchParams, router, missionHistoryToItems]);
+  }, [searchParams, router, missionHistoryToItems, authRetryTrigger]);
 
   // Poll for running parallel missions
   useEffect(() => {
@@ -907,7 +957,7 @@ export default function ControlClient() {
     return () => clearInterval(interval);
   }, []);
 
-  // Fetch available providers and models for mission creation
+  // Fetch available providers and models for mission creation (retry on auth success)
   useEffect(() => {
     listProviders()
       .then((data) => {
@@ -916,7 +966,7 @@ export default function ControlClient() {
       .catch((err) => {
         console.error("Failed to fetch providers:", err);
       });
-  }, []);
+  }, [authRetryTrigger]);
 
   // Fetch server configuration (max_iterations) from health endpoint
   useEffect(() => {
@@ -951,6 +1001,9 @@ export default function ControlClient() {
   // Handle switching which mission we're viewing
   const handleViewMission = useCallback(
     async (missionId: string) => {
+      const previousViewingId = viewingMissionIdRef.current;
+      const previousViewingMission = viewingMissionRef.current;
+
       setViewingMissionId(missionId);
       fetchingMissionIdRef.current = missionId;
 
@@ -968,6 +1021,10 @@ export default function ControlClient() {
         setItems(historyItems);
         // Update cache with fresh data
         setMissionItems((prev) => ({ ...prev, [missionId]: historyItems }));
+        setViewingMission(mission);
+        if (currentMissionRef.current?.id === mission.id) {
+          setCurrentMission(mission);
+        }
       } catch (err) {
         console.error("Failed to load mission:", err);
         
@@ -976,10 +1033,19 @@ export default function ControlClient() {
           return;
         }
         
-        // Fallback to cached items if API fails
-        if (missionItems[missionId]) {
-          setItems(missionItems[missionId]);
+        // Revert viewing state to avoid filtering out events
+        const fallbackMission = previousViewingMission ?? currentMissionRef.current;
+        if (fallbackMission) {
+          setViewingMissionId(fallbackMission.id);
+          setViewingMission(fallbackMission);
+          setItems(missionHistoryToItems(fallbackMission));
+        } else if (previousViewingId && missionItems[previousViewingId]) {
+          setViewingMissionId(previousViewingId);
+          setViewingMission(null);
+          setItems(missionItems[previousViewingId]);
         } else {
+          setViewingMissionId(null);
+          setViewingMission(null);
           setItems([]);
         }
       }
@@ -987,10 +1053,14 @@ export default function ControlClient() {
     [missionItems, missionHistoryToItems]
   );
 
-  // Sync viewingMissionId with currentMission
+  // Sync viewingMissionId with currentMission only when there's no explicit viewing mission set
   useEffect(() => {
     if (currentMission && !viewingMissionId) {
       setViewingMissionId(currentMission.id);
+      setViewingMission(currentMission);
+    } else if (currentMission && viewingMissionId === currentMission.id) {
+      // Only update viewingMission if we're actually viewing the current mission
+      setViewingMission(currentMission);
     }
   }, [currentMission, viewingMissionId]);
 
@@ -1003,6 +1073,7 @@ export default function ControlClient() {
       setMissionLoading(true);
       const mission = await createMission(undefined, modelOverride);
       setCurrentMission(mission);
+      setViewingMission(mission);
       setViewingMissionId(mission.id); // Also update viewing to the new mission
       setItems([]);
       setShowParallelPanel(true); // Show the missions panel so user can see the new mission
@@ -1021,10 +1092,16 @@ export default function ControlClient() {
 
   // Handle setting mission status
   const handleSetStatus = async (status: MissionStatus) => {
-    if (!currentMission) return;
+    const mission = viewingMission ?? currentMission;
+    if (!mission) return;
     try {
-      await setMissionStatus(currentMission.id, status);
-      setCurrentMission({ ...currentMission, status });
+      await setMissionStatus(mission.id, status);
+      if (currentMission?.id === mission.id) {
+        setCurrentMission({ ...mission, status });
+      }
+      if (viewingMission?.id === mission.id) {
+        setViewingMission({ ...mission, status });
+      }
       setShowStatusMenu(false);
       toast.success(`Mission marked as ${status}`);
     } catch (err) {
@@ -1035,16 +1112,22 @@ export default function ControlClient() {
 
   // Handle resuming an interrupted mission
   const handleResumeMission = async (cleanWorkspace: boolean = false) => {
-    if (!currentMission || !["interrupted", "blocked"].includes(currentMission.status)) return;
+    const mission = viewingMission ?? currentMission;
+    if (!mission || !["interrupted", "blocked"].includes(mission.status)) return;
     try {
       setMissionLoading(true);
-      const resumed = await resumeMission(currentMission.id, cleanWorkspace);
+      const resumed = await resumeMission(mission.id, cleanWorkspace);
       setCurrentMission(resumed);
+      setViewingMission(resumed);
+      setViewingMissionId(resumed.id);
+      const historyItems = missionHistoryToItems(resumed);
+      setItems(historyItems);
+      setMissionItems((prev) => ({ ...prev, [resumed.id]: historyItems }));
       setShowStatusMenu(false);
       toast.success(
         cleanWorkspace 
           ? "Mission resumed with clean workspace" 
-          : (currentMission.status === "blocked" ? "Continuing mission" : "Mission resumed")
+          : (mission.status === "blocked" ? "Continuing mission" : "Mission resumed")
       );
     } catch (err) {
       console.error("Failed to resume mission:", err);
@@ -1116,30 +1199,45 @@ export default function ControlClient() {
         const newState =
           typeof st === "string" ? (st as ControlRunState) : "idle";
         const q = data["queue_len"];
-        setQueueLen(typeof q === "number" ? q : 0);
 
-        // Clear progress when idle
-        if (newState === "idle") {
-          setProgress(null);
+        // Status filtering: only apply status if it matches the mission we're viewing
+        const statusMissionId = typeof data["mission_id"] === "string" ? data["mission_id"] : null;
+        let shouldApplyStatus = true;
+
+        if (statusMissionId) {
+          // Status for a specific mission - only apply if viewing that mission
+          shouldApplyStatus = statusMissionId === viewingId;
+        } else {
+          // Status for main session - only apply if viewing main mission or no specific mission
+          shouldApplyStatus = !viewingId || viewingId === currentMissionId;
         }
 
-        // If we reconnected and agent is already running, add a visual indicator
-        setRunState((prevState) => {
-          // Only show reconnect notice if we weren't already tracking this as running
-          // and there's no active thinking/phase item (means we missed some events)
-          if (newState === "running" && prevState === "idle") {
-            setItems((prevItems) => {
-              const hasActiveThinking = prevItems.some(
-                (it) =>
-                  (it.kind === "thinking" && !it.done) || it.kind === "phase"
-              );
-              // If there's no active streaming item, the user is seeing stale state
-              // The "Agent is working..." indicator will show via the render logic
-              return prevItems;
-            });
+        if (shouldApplyStatus) {
+          setQueueLen(typeof q === "number" ? q : 0);
+
+          // Clear progress when idle
+          if (newState === "idle") {
+            setProgress(null);
           }
-          return newState;
-        });
+
+          // If we reconnected and agent is already running, add a visual indicator
+          setRunState((prevState) => {
+            // Only show reconnect notice if we weren't already tracking this as running
+            // and there's no active thinking/phase item (means we missed some events)
+            if (newState === "running" && prevState === "idle") {
+              setItems((prevItems) => {
+                const hasActiveThinking = prevItems.some(
+                  (it) =>
+                    (it.kind === "thinking" && !it.done) || it.kind === "phase"
+                );
+                // If there's no active streaming item, the user is seeing stale state
+                // The "Agent is working..." indicator will show via the render logic
+                return prevItems;
+              });
+            }
+            return newState;
+          });
+        }
         return;
       }
 
@@ -1354,13 +1452,14 @@ export default function ControlClient() {
     }
   };
 
-  const missionStatus = currentMission
-    ? missionStatusLabel(currentMission.status)
+  const activeMission = viewingMission ?? currentMission;
+  const missionStatus = activeMission
+    ? missionStatusLabel(activeMission.status)
     : null;
-  const missionTitle = currentMission?.title
-    ? currentMission.title.length > 60
-      ? currentMission.title.slice(0, 60) + "..."
-      : currentMission.title
+  const missionTitle = activeMission?.title
+    ? activeMission.title.length > 60
+      ? activeMission.title.slice(0, 60) + "..."
+      : activeMission.title
     : "New Mission";
 
   return (
@@ -1398,8 +1497,8 @@ export default function ControlClient() {
                 )}
               </div>
               <p className="text-xs text-white/40 truncate">
-                {currentMission
-                  ? `Mission ${currentMission.id.slice(0, 8)}...`
+                {activeMission
+                  ? `Mission ${activeMission.id.slice(0, 8)}...`
                   : "No active mission"}
               </p>
             </div>
@@ -1407,7 +1506,7 @@ export default function ControlClient() {
         </div>
 
         <div className="flex items-center gap-3 shrink-0 flex-wrap">
-          {currentMission && (
+          {activeMission && (
             <div className="relative" ref={statusMenuRef}>
               <button
                 onClick={() => setShowStatusMenu(!showStatusMenu)}
@@ -1432,7 +1531,7 @@ export default function ControlClient() {
                     <XCircle className="h-4 w-4 text-red-400" />
                     Mark Failed
                   </button>
-                  {(currentMission.status === "interrupted" || currentMission.status === "blocked") && (
+                  {(activeMission?.status === "interrupted" || activeMission?.status === "blocked") && (
                     <>
                       <button
                         onClick={() => handleResumeMission(false)}
@@ -1440,7 +1539,7 @@ export default function ControlClient() {
                         className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
                       >
                         <PlayCircle className="h-4 w-4 text-emerald-400" />
-                        {currentMission.status === "blocked" ? "Continue Mission" : "Resume Mission"}
+                        {activeMission?.status === "blocked" ? "Continue Mission" : "Resume Mission"}
                       </button>
                       <button
                         onClick={() => handleResumeMission(true)}
@@ -1449,11 +1548,11 @@ export default function ControlClient() {
                         title="Delete work folder and start fresh"
                       >
                         <Trash2 className="h-4 w-4 text-orange-400" />
-                        Clean & {currentMission.status === "blocked" ? "Continue" : "Resume"}
+                        Clean & {activeMission?.status === "blocked" ? "Continue" : "Resume"}
                       </button>
                     </>
                   )}
-                  {currentMission.status !== "active" && currentMission.status !== "interrupted" && currentMission.status !== "blocked" && (
+                  {activeMission?.status !== "active" && activeMission?.status !== "interrupted" && activeMission?.status !== "blocked" && (
                     <button
                       onClick={() => handleSetStatus("active")}
                       className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
@@ -1519,7 +1618,7 @@ export default function ControlClient() {
                       ))}
                     </select>
                     <p className="text-xs text-white/30 mt-1.5">
-                      Auto uses Claude Sonnet 4
+                      Auto uses Claude Opus 4.5
                     </p>
                   </div>
                   <div className="flex gap-2 pt-1">
@@ -1567,6 +1666,26 @@ export default function ControlClient() {
               <span className="hidden sm:inline">Running</span>
             </button>
           )}
+
+          {/* Desktop stream toggle */}
+          <button
+            onClick={() => setShowDesktopStream(!showDesktopStream)}
+            className={cn(
+              "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+              showDesktopStream
+                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
+            )}
+            title={showDesktopStream ? "Hide desktop stream" : "Show desktop stream"}
+          >
+            <Monitor className="h-4 w-4" />
+            <span className="hidden sm:inline">Desktop</span>
+            {showDesktopStream ? (
+              <PanelRightClose className="h-4 w-4" />
+            ) : (
+              <PanelRight className="h-4 w-4" />
+            )}
+          </button>
 
           {/* Status panel */}
           <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
@@ -1721,8 +1840,13 @@ export default function ControlClient() {
         </div>
       )}
 
-      {/* Chat container */}
-      <div className="flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative">
+      {/* Main content area - Chat and Desktop stream side by side */}
+      <div className="flex-1 min-h-0 flex gap-4">
+        {/* Chat container */}
+        <div className={cn(
+          "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative transition-all duration-300",
+          showDesktopStream && "flex-[2]"
+        )}>
         {/* Messages */}
         <div ref={containerRef} className="flex-1 overflow-y-auto p-6">
           {items.length === 0 ? (
@@ -1747,26 +1871,26 @@ export default function ControlClient() {
                       arrive.
                     </p>
                   </>
-                ) : currentMission && currentMission.status !== "active" ? (
+                ) : activeMission && activeMission.status !== "active" ? (
                   <>
                     <h2 className="text-lg font-medium text-white">
-                      {currentMission.status === "interrupted" 
+                      {activeMission.status === "interrupted" 
                         ? "Mission Interrupted" 
-                        : currentMission.status === "blocked"
+                        : activeMission.status === "blocked"
                         ? "Iteration Limit Reached"
                         : "No conversation history"}
                     </h2>
                     <p className="mt-2 text-sm text-white/40 max-w-sm">
-                      {currentMission.status === "interrupted" ? (
+                      {activeMission.status === "interrupted" ? (
                         <>This mission was interrupted (server shutdown or cancellation). Click the <strong className="text-amber-400">Resume</strong> button in the mission menu to continue where you left off.</>
-                      ) : currentMission.status === "blocked" ? (
+                      ) : activeMission.status === "blocked" ? (
                         <>The agent reached its iteration limit ({maxIterations}). You can continue the mission to give it more iterations.</>
                       ) : (
-                        <>This mission was {currentMission.status} without any messages.
-                        {currentMission.status === "completed" && " You can reactivate it to continue."}</>
+                        <>This mission was {activeMission.status} without any messages.
+                        {activeMission.status === "completed" && " You can reactivate it to continue."}</>
                       )}
                     </p>
-                    {currentMission.status === "blocked" && (
+                    {activeMission.status === "blocked" && (
                       <div className="mt-4 flex gap-2">
                         <button
                           onClick={() => handleResumeMission(false)}
@@ -2111,7 +2235,7 @@ export default function ControlClient() {
               })}
               
               {/* Continue banner for blocked missions */}
-              {currentMission?.status === "blocked" && items.length > 0 && (
+              {activeMission?.status === "blocked" && items.length > 0 && (
                 <div className="flex justify-center py-4">
                   <div className="flex items-center gap-3 rounded-xl bg-amber-500/10 border border-amber-500/20 px-5 py-3">
                     <Clock className="h-5 w-5 text-amber-400" />
@@ -2311,6 +2435,18 @@ export default function ControlClient() {
             )}
           </form>
         </div>
+      </div>
+
+        {/* Desktop Stream Panel */}
+        {showDesktopStream && (
+          <div className="flex-1 min-h-0 transition-all duration-300 animate-fade-in">
+            <DesktopStream
+              displayId={desktopDisplayId}
+              className="h-full"
+              onClose={() => setShowDesktopStream(false)}
+            />
+          </div>
+        )}
       </div>
     </div>
   );

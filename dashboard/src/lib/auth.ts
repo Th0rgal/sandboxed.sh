@@ -50,3 +50,8 @@ export function signalAuthRequired(): void {
   if (typeof window === 'undefined') return;
   window.dispatchEvent(new CustomEvent('openagent:auth:required'));
 }
+
+export function signalAuthSuccess(): void {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new CustomEvent('openagent:auth:success'));
+}

@@ -2,7 +2,7 @@
 //!
 //! Open Agent uses OpenCode as its execution backend. Configuration can be set via environment variables:
 //! - `OPENROUTER_API_KEY` - Optional. Only required for memory embeddings.
-//! - `DEFAULT_MODEL` - Optional. The default LLM model to use. Defaults to `claude-sonnet-4-20250514`.
+//! - `DEFAULT_MODEL` - Optional. The default LLM model to use. Defaults to `claude-opus-4-5-20251101`.
 //! - `WORKING_DIR` - Optional. Default working directory for relative paths. Defaults to `/root` in production, current directory in dev.
 //! - `HOST` - Optional. Server host. Defaults to `127.0.0.1`.
 //! - `PORT` - Optional. Server port. Defaults to `3000`.
@@ -359,7 +359,7 @@ impl Config {
             .unwrap_or(true);
 
         let default_model = std::env::var("DEFAULT_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+            .unwrap_or_else(|_| "claude-opus-4-5-20251101".to_string());
 
         // WORKING_DIR: default working directory for relative paths.
         // In production (release build), default to /root. In dev, default to current directory.

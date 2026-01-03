@@ -1716,7 +1716,8 @@ async fn control_actor_loop(
                         if running.is_none() {
                             if let Some((mid, msg, model_override)) = queue.pop_front() {
                                 set_and_emit_status(&status, &events_tx, ControlRunState::Running, queue.len()).await;
-                                let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), mission_id: None });
+                                let current_mid = current_mission.read().await.clone();
+                                let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), mission_id: current_mid });
                                 let cfg = config.clone();
                                 let agent = Arc::clone(&root_agent);
                                 let mem = memory.clone();
@@ -1735,9 +1736,10 @@ async fn control_actor_loop(
                                 };
                                 let tree_ref = Arc::clone(&current_tree);
                                 let progress_ref = Arc::clone(&progress);
-                                running_cancel = Some(cancel.clone());
                                 // Capture which mission this task is working on
-                                running_mission_id = current_mission.read().await.clone();
+                                let mission_id = current_mission.read().await.clone();
+                                running_cancel = Some(cancel.clone());
+                                running_mission_id = mission_id;
                                 running = Some(tokio::spawn(async move {
                                     let result = run_single_control_turn(
                                         cfg,
@@ -1757,6 +1759,7 @@ async fn control_actor_loop(
                                         Some(mission_ctrl),
                                         tree_ref,
                                         progress_ref,
+                                        mission_id,
                                     )
                                     .await;
                                     (mid, msg, result)
@@ -2034,6 +2037,7 @@ async fn control_actor_loop(
                                                 Some(mission_ctrl),
                                                 tree_ref,
                                                 progress_ref,
+                                                Some(mission_id),
                                             )
                                             .await;
                                             (mid, msg, result)
@@ -2320,11 +2324,14 @@ async fn control_actor_loop(
                                 success: agent_result.success,
                                 cost_cents: agent_result.cost_cents,
                                 model: agent_result.model_used,
-                                mission_id: None,
+                                mission_id: completed_mission_id,
                             });
                         }
                         Err(e) => {
-                            let _ = events_tx.send(AgentEvent::Error { message: format!("Control session task join failed: {}", e), mission_id: None });
+                            let _ = events_tx.send(AgentEvent::Error {
+                                message: format!("Control session task join failed: {}", e),
+                                mission_id: completed_mission_id,
+                            });
                         }
                     }
                 }
@@ -2332,7 +2339,8 @@ async fn control_actor_loop(
                 // Start next queued message, if any.
                 if let Some((mid, msg, model_override)) = queue.pop_front() {
                     set_and_emit_status(&status, &events_tx, ControlRunState::Running, queue.len()).await;
-                    let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), mission_id: None });
+                    let current_mid = current_mission.read().await.clone();
+                    let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), mission_id: current_mid });
                     let cfg = config.clone();
                     let agent = Arc::clone(&root_agent);
                     let mem = memory.clone();
@@ -2353,7 +2361,8 @@ async fn control_actor_loop(
                     let progress_ref = Arc::clone(&progress);
                     running_cancel = Some(cancel.clone());
                     // Capture which mission this task is working on
-                    running_mission_id = current_mission.read().await.clone();
+                    let mission_id = current_mission.read().await.clone();
+                    running_mission_id = mission_id;
                     running = Some(tokio::spawn(async move {
                         let result = run_single_control_turn(
                             cfg,
@@ -2373,6 +2382,7 @@ async fn control_actor_loop(
                             Some(mission_ctrl),
                             tree_ref,
                             progress_ref,
+                            mission_id,
                         )
                         .await;
                         (mid, msg, result)
@@ -2452,6 +2462,7 @@ async fn run_single_control_turn(
     mission_control: Option<crate::tools::mission::MissionControl>,
     tree_snapshot: Arc<RwLock<Option<AgentTreeNode>>>,
     progress_snapshot: Arc<RwLock<ExecutionProgress>>,
+    mission_id: Option<Uuid>,
 ) -> crate::agents::AgentResult {
     // Build a task prompt that includes conversation context with size limits.
     // Uses ContextBuilder with config-driven limits to prevent context overflow.
@@ -2507,6 +2518,7 @@ async fn run_single_control_turn(
     ctx.resolver = Some(resolver);
     ctx.tree_snapshot = Some(tree_snapshot);
     ctx.progress_snapshot = Some(progress_snapshot);
+    ctx.mission_id = mission_id;
     ctx.mcp = Some(mcp);
 
     let result = root_agent.execute(&mut task, &ctx).await;
