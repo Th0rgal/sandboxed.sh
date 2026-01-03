@@ -797,10 +797,11 @@ struct ControlView: View {
             do {
                 let (messageId, _) = try await api.sendMessage(content: content)
 
-                // Replace temp ID with server-assigned ID
+                // Replace temp ID with server-assigned ID, preserving timestamp
                 // This allows SSE handler to correctly deduplicate
                 if let index = messages.firstIndex(where: { $0.id == tempId }) {
-                    messages[index] = ChatMessage(id: messageId, type: .user, content: content)
+                    let originalTimestamp = messages[index].timestamp
+                    messages[index] = ChatMessage(id: messageId, type: .user, content: content, timestamp: originalTimestamp)
                 }
 
                 // If we don't have a current mission, the backend may have just created one
@@ -1090,16 +1091,16 @@ struct ControlView: View {
                 // Skip if we already have this message with this ID
                 guard !messages.contains(where: { $0.id == id }) else { break }
 
-                // Check if there's a pending temp message (SSE arrived before API response)
-                // Match by position: find FIRST temp message, since SSE events arrive in server order
-                // which matches the order messages were sent
+                // Check if there's a pending temp message with matching content (SSE arrived before API response)
+                // We verify content to avoid mismatching with messages from other sessions/devices
                 if let tempIndex = messages.firstIndex(where: {
-                    $0.type == .user && $0.id.hasPrefix("temp-")
+                    $0.type == .user && $0.id.hasPrefix("temp-") && $0.content == content
                 }) {
-                    // Replace temp ID with server ID, keeping original content/timestamp
-                    messages[tempIndex] = ChatMessage(id: id, type: .user, content: messages[tempIndex].content)
+                    // Replace temp ID with server ID, preserving original timestamp
+                    let originalTimestamp = messages[tempIndex].timestamp
+                    messages[tempIndex] = ChatMessage(id: id, type: .user, content: content, timestamp: originalTimestamp)
                 } else {
-                    // No temp message found, add new (message came from another client/session)
+                    // No matching temp message found, add new (message came from another client/session)
                     let message = ChatMessage(id: id, type: .user, content: content)
                     messages.append(message)
                 }

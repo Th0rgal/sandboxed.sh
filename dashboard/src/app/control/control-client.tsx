@@ -1287,11 +1287,13 @@ export default function ControlClient() {
           // Skip if already added with this ID
           if (prev.some((item) => item.id === msgId)) return prev;
 
-          // Check if there's a pending temp message (SSE arrived before API response)
-          // Match by position: find FIRST temp message, since SSE events arrive in server order
-          // which matches the order messages were sent
+          // Check if there's a pending temp message with matching content (SSE arrived before API response)
+          // We verify content to avoid mismatching with messages from other sessions/devices
           const tempIndex = prev.findIndex(
-            (item) => item.kind === "user" && item.id.startsWith("temp-")
+            (item) =>
+              item.kind === "user" &&
+              item.id.startsWith("temp-") &&
+              item.content === msgContent
           );
 
           if (tempIndex !== -1) {
@@ -1301,7 +1303,7 @@ export default function ControlClient() {
             return updated;
           }
 
-          // No temp message found, add new (message came from another client/session)
+          // No matching temp message found, add new (message came from another client/session)
           return [
             ...prev,
             {
