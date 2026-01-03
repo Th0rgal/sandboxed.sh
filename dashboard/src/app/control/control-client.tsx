@@ -1408,7 +1408,15 @@ export default function ControlClient() {
             const toolName = toolItem.name;
             // Check for desktop_start_session (with or without desktop_ prefix from MCP)
             if (toolName === "desktop_start_session" || toolName === "desktop_desktop_start_session") {
-              const result = data["result"];
+              let result = data["result"];
+              // Handle case where result is a JSON string that needs parsing
+              if (typeof result === "string") {
+                try {
+                  result = JSON.parse(result);
+                } catch {
+                  // Not valid JSON, leave as-is
+                }
+              }
               if (isRecord(result) && typeof result["display"] === "string") {
                 const display = result["display"];
                 setDesktopDisplayId(display);

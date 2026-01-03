@@ -1239,11 +1239,17 @@ struct ControlView: View {
             }
 
         case "tool_result":
-            if let name = data["name"] as? String,
-               let result = data["result"] as? [String: Any] {
+            if let name = data["name"] as? String {
                 // Extract display ID from desktop_start_session tool result
                 if name == "desktop_start_session" || name == "desktop_desktop_start_session" {
-                    if let display = result["display"] as? String {
+                    // Handle result as either a dictionary or a JSON string
+                    var resultDict: [String: Any]? = data["result"] as? [String: Any]
+                    if resultDict == nil, let resultString = data["result"] as? String,
+                       let jsonData = resultString.data(using: .utf8),
+                       let parsed = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                        resultDict = parsed
+                    }
+                    if let display = resultDict?["display"] as? String {
                         desktopDisplayId = display
                         // Auto-open desktop stream when session starts
                         showDesktopStream = true
