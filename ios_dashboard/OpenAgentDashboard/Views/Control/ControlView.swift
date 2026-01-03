@@ -1094,7 +1094,7 @@ struct ControlView: View {
                 // Check if there's a pending temp message with matching content (SSE arrived before API response)
                 // We verify content to avoid mismatching with messages from other sessions/devices
                 if let tempIndex = messages.firstIndex(where: {
-                    $0.type == .user && $0.id.hasPrefix("temp-") && $0.content == content
+                    $0.isUser && $0.id.hasPrefix("temp-") && $0.content == content
                 }) {
                     // Replace temp ID with server ID, preserving original timestamp
                     let originalTimestamp = messages[tempIndex].timestamp
