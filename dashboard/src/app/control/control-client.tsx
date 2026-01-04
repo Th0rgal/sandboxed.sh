@@ -750,10 +750,73 @@ export default function ControlClient() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
+  const compressImageFile = useCallback(async (file: File) => {
+    if (!file.type.startsWith("image/")) return file;
+    if (file.type === "image/gif" || file.type === "image/svg+xml") return file;
+
+    const maxDimension = 1280;
+    const minBytesForCompression = 300 * 1024;
+
+    if (file.size < minBytesForCompression) {
+      return file;
+    }
+
+    let bitmap: ImageBitmap | null = null;
+    try {
+      bitmap = await createImageBitmap(file);
+    } catch {
+      return file;
+    }
+
+    const maxSide = Math.max(bitmap.width, bitmap.height);
+    const scale = Math.min(1, maxDimension / maxSide);
+    if (scale === 1 && file.size < minBytesForCompression) {
+      bitmap.close();
+      return file;
+    }
+
+    const targetWidth = Math.max(1, Math.round(bitmap.width * scale));
+    const targetHeight = Math.max(1, Math.round(bitmap.height * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      bitmap.close();
+      return file;
+    }
+
+    ctx.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
+    bitmap.close();
+
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, "image/jpeg", 0.8)
+    );
+    if (!blob) return file;
+
+    if (blob.size >= file.size && scale === 1) return file;
+
+    const baseName = file.name.replace(/\.[^.]+$/, "") || "image";
+    const compressedName = `${baseName}-compressed.jpg`;
+    return new File([blob], compressedName, {
+      type: "image/jpeg",
+      lastModified: Date.now(),
+    });
+  }, []);
+
   // Handle file upload - wrapped in useCallback to avoid stale closures
   const handleFileUpload = useCallback(async (file: File) => {
-    setUploadQueue((prev) => [...prev, file.name]);
-    setUploadProgress({ fileName: file.name, progress: { loaded: 0, total: file.size, percentage: 0 } });
+    let fileToUpload = file;
+    try {
+      fileToUpload = await compressImageFile(file);
+    } catch (error) {
+      console.warn("Image compression failed, using original file", error);
+    }
+
+    const displayName = fileToUpload.name;
+    setUploadQueue((prev) => [...prev, displayName]);
+    setUploadProgress({ fileName: displayName, progress: { loaded: 0, total: fileToUpload.size, percentage: 0 } });
 
     try {
       // Upload to mission-specific context folder if we have a mission
@@ -762,14 +825,14 @@ export default function ControlClient() {
         : "/root/context/";
       
       // Use chunked upload for files > 10MB, regular for smaller
-      const useChunked = file.size > 10 * 1024 * 1024;
+      const useChunked = fileToUpload.size > 10 * 1024 * 1024;
       
       const result = useChunked 
-        ? await uploadFileChunked(file, contextPath, (progress) => {
-            setUploadProgress({ fileName: file.name, progress });
+        ? await uploadFileChunked(fileToUpload, contextPath, (progress) => {
+            setUploadProgress({ fileName: displayName, progress });
           })
-        : await uploadFile(file, contextPath, (progress) => {
-            setUploadProgress({ fileName: file.name, progress });
+        : await uploadFile(fileToUpload, contextPath, (progress) => {
+            setUploadProgress({ fileName: displayName, progress });
           });
       
       toast.success(`Uploaded ${result.name}`);
@@ -781,12 +844,12 @@ export default function ControlClient() {
       });
     } catch (error) {
       console.error("Upload failed:", error);
-      toast.error(`Failed to upload ${file.name}`);
+      toast.error(`Failed to upload ${displayName}`);
     } finally {
-      setUploadQueue((prev) => prev.filter((name) => name !== file.name));
+      setUploadQueue((prev) => prev.filter((name) => name !== displayName));
       setUploadProgress(null);
     }
-  }, [currentMission?.id]);
+  }, [compressImageFile, currentMission?.id]);
 
   // Handle URL download
   const handleUrlDownload = useCallback(async () => {
@@ -835,6 +898,11 @@ export default function ControlClient() {
       }
 
       if (files.length === 0) return;
+
+      const textData = event.clipboardData?.getData("text/plain") ?? "";
+      if (textData.trim().length > 0) {
+        return;
+      }
 
       // Prevent default paste for files
       event.preventDefault();
