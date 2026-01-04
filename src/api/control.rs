@@ -537,18 +537,36 @@ impl MissionStore for InMemoryMissionStore {
         exclude: &[Uuid],
     ) -> Result<usize, String> {
         let mut missions = self.missions.write().await;
-        let before = missions.len();
-        missions.retain(|id, mission| {
-            if exclude.contains(id) {
-                return true;
-            }
-            let title = mission.title.clone().unwrap_or_default();
-            let title_empty = title.trim().is_empty() || title == "Untitled Mission";
-            let history_empty = mission.history.is_empty();
-            let active = mission.status == MissionStatus::Active;
-            !(active && history_empty && title_empty)
-        });
-        Ok(before.saturating_sub(missions.len()))
+
+        // Collect IDs of missions to delete
+        let to_delete: Vec<Uuid> = missions
+            .iter()
+            .filter(|(id, mission)| {
+                if exclude.contains(id) {
+                    return false;
+                }
+                let title = mission.title.clone().unwrap_or_default();
+                let title_empty = title.trim().is_empty() || title == "Untitled Mission";
+                let history_empty = mission.history.is_empty();
+                let active = mission.status == MissionStatus::Active;
+                active && history_empty && title_empty
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        // Remove missions
+        for id in &to_delete {
+            missions.remove(id);
+        }
+        drop(missions);
+
+        // Also clean up orphaned tree data
+        let mut trees = self.trees.write().await;
+        for id in &to_delete {
+            trees.remove(id);
+        }
+
+        Ok(to_delete.len())
     }
 
     async fn get_stale_active_missions(&self, stale_hours: u64) -> Result<Vec<Mission>, String> {
