@@ -64,5 +64,9 @@ path = "src/main.rs"
 name = "desktop-mcp"
 path = "src/bin/desktop_mcp.rs"
 
+[[bin]]
+name = "host-mcp"
+path = "src/bin/host_mcp.rs"
+
 [dev-dependencies]
 tokio-test = "0.4"
