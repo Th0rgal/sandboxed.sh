@@ -850,10 +850,10 @@ export default function ControlClient() {
       
       toast.success(`Uploaded ${result.name}`);
 
-      // Add a message about the upload
+      // Add a message about the upload at the beginning
       setInput((prev) => {
         const uploadNote = `[Uploaded: ${result.name}]`;
-        return prev ? `${prev}\n${uploadNote}` : uploadNote;
+        return prev ? `${uploadNote}\n${prev}` : uploadNote;
       });
     } catch (error) {
       console.error("Upload failed:", error);
@@ -1927,15 +1927,15 @@ export default function ControlClient() {
               <button
                 onClick={() => setShowDisplaySelector(!showDisplaySelector)}
                 className={cn(
-                  "flex items-center gap-1 rounded-r-lg border-y border-r px-2 py-2 text-sm transition-colors",
+                  "flex items-center gap-1.5 rounded-r-lg border-y border-r px-3 py-2 text-sm transition-colors",
                   showDesktopStream
                     ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
                     : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
                 )}
                 title="Select display"
               >
-                <span className="text-xs font-mono">{desktopDisplayId}</span>
-                <ChevronDown className="h-3 w-3" />
+                <span className="text-sm font-mono">{desktopDisplayId}</span>
+                <ChevronDown className="h-3.5 w-3.5" />
               </button>
               {showDisplaySelector && (
                 <div className="absolute right-0 top-full mt-1 z-50 min-w-[120px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
