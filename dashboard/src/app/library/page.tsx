@@ -170,7 +170,9 @@ export default function LibraryPage() {
       await saveLibraryMcps(parsed);
       setMcps(parsed);
       setMcpDirty(false);
-      await loadData();
+      // Refresh status only (not data since we just saved the new state)
+      const statusData = await getLibraryStatus();
+      setStatus(statusData);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save MCPs');
     } finally {
