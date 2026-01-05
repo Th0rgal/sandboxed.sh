@@ -8,7 +8,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -22,7 +22,59 @@ use crate::library::{
 };
 
 /// Shared library state.
-pub type SharedLibrary = Arc<RwLock<Option<LibraryStore>>>;
+pub type SharedLibrary = Arc<RwLock<Option<Arc<LibraryStore>>>>;
+
+const LIBRARY_REMOTE_HEADER: &str = "x-openagent-library-remote";
+
+fn extract_library_remote(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(LIBRARY_REMOTE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+async fn ensure_library(
+    state: &super::routes::AppState,
+    headers: &HeaderMap,
+) -> Result<Arc<LibraryStore>, (StatusCode, String)> {
+    let remote = extract_library_remote(headers).or_else(|| state.config.library_remote.clone());
+    let remote = remote.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Library not configured. Set a Git repo in Settings.".to_string(),
+        )
+    })?;
+
+    {
+        let library_guard = state.library.read().await;
+        if let Some(library) = library_guard.as_ref() {
+            if library.remote() == remote {
+                return Ok(Arc::clone(library));
+            }
+        }
+    }
+
+    let mut library_guard = state.library.write().await;
+    if let Some(library) = library_guard.as_ref() {
+        if library.remote() == remote {
+            return Ok(Arc::clone(library));
+        }
+    }
+
+    match LibraryStore::new(state.config.library_path.clone(), &remote).await {
+        Ok(store) => {
+            let store = Arc::new(store);
+            *library_guard = Some(Arc::clone(&store));
+            Ok(store)
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to initialize library: {}", e),
+        )),
+    }
+}
 
 /// Create library routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -70,12 +122,9 @@ pub struct SaveContentRequest {
 /// GET /api/library/status - Get git status of the library.
 async fn get_status(
     State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<LibraryStatus>, (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .status()
         .await
@@ -86,12 +135,9 @@ async fn get_status(
 /// POST /api/library/sync - Pull latest changes from remote.
 async fn sync_library(
     State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .sync()
         .await
@@ -102,13 +148,10 @@ async fn sync_library(
 /// POST /api/library/commit - Commit all changes.
 async fn commit_library(
     State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
     Json(req): Json<CommitRequest>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .commit(&req.message)
         .await
@@ -119,12 +162,9 @@ async fn commit_library(
 /// POST /api/library/push - Push changes to remote.
 async fn push_library(
     State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .push()
         .await
@@ -139,12 +179,9 @@ async fn push_library(
 /// GET /api/library/mcps - Get all MCP server definitions.
 async fn get_mcps(
     State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<HashMap<String, McpServer>>, (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .get_mcp_servers()
         .await
@@ -155,13 +192,10 @@ async fn get_mcps(
 /// PUT /api/library/mcps - Save all MCP server definitions.
 async fn save_mcps(
     State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
     Json(servers): Json<HashMap<String, McpServer>>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .save_mcp_servers(&servers)
         .await
@@ -176,12 +210,9 @@ async fn save_mcps(
 /// GET /api/library/skills - List all skills.
 async fn list_skills(
     State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<SkillSummary>>, (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .list_skills()
         .await
@@ -193,12 +224,9 @@ async fn list_skills(
 async fn get_skill(
     State(state): State<Arc<super::routes::AppState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<Skill>, (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .get_skill(&name)
         .await
@@ -216,13 +244,10 @@ async fn get_skill(
 async fn save_skill(
     State(state): State<Arc<super::routes::AppState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<SaveContentRequest>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .save_skill(&name, &req.content)
         .await
@@ -234,12 +259,9 @@ async fn save_skill(
 async fn delete_skill(
     State(state): State<Arc<super::routes::AppState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .delete_skill(&name)
         .await
@@ -251,12 +273,9 @@ async fn delete_skill(
 async fn get_skill_reference(
     State(state): State<Arc<super::routes::AppState>>,
     Path((name, path)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .get_skill_reference(&name, &path)
         .await
@@ -274,13 +293,10 @@ async fn get_skill_reference(
 async fn save_skill_reference(
     State(state): State<Arc<super::routes::AppState>>,
     Path((name, path)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(req): Json<SaveContentRequest>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .save_skill_reference(&name, &path, &req.content)
         .await
@@ -295,12 +311,9 @@ async fn save_skill_reference(
 /// GET /api/library/commands - List all commands.
 async fn list_commands(
     State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<CommandSummary>>, (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .list_commands()
         .await
@@ -312,12 +325,9 @@ async fn list_commands(
 async fn get_command(
     State(state): State<Arc<super::routes::AppState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<Command>, (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .get_command(&name)
         .await
@@ -335,13 +345,10 @@ async fn get_command(
 async fn save_command(
     State(state): State<Arc<super::routes::AppState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<SaveContentRequest>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .save_command(&name, &req.content)
         .await
@@ -353,12 +360,9 @@ async fn save_command(
 async fn delete_command(
     State(state): State<Arc<super::routes::AppState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library_guard = state.library.read().await;
-    let library = library_guard
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Library not initialized".to_string()))?;
-
+    let library = ensure_library(&state, &headers).await?;
     library
         .delete_command(&name)
         .await

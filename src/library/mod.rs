@@ -9,7 +9,7 @@ mod git;
 pub mod types;
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -28,6 +28,7 @@ impl LibraryStore {
     pub async fn new(path: PathBuf, remote: &str) -> Result<Self> {
         // Clone if the repo doesn't exist
         git::clone_if_needed(&path, remote).await?;
+        git::ensure_remote(&path, remote).await?;
 
         Ok(Self {
             path,
@@ -454,9 +455,10 @@ impl LibraryStore {
     /// List reference files in a skill directory (excluding SKILL.md).
     async fn list_references(&self, skill_dir: &Path) -> Result<Vec<String>> {
         let mut references = Vec::new();
+        let mut visited = HashSet::new();
 
         // Recursively walk the directory
-        self.collect_references(skill_dir, skill_dir, &mut references)
+        self.collect_references(skill_dir, skill_dir, &mut references, &mut visited)
             .await?;
 
         references.sort();
@@ -464,14 +466,27 @@ impl LibraryStore {
     }
 
     /// Recursively collect reference file paths.
+    /// Uses a visited set to prevent symlink loops from causing infinite recursion.
     #[async_recursion::async_recursion]
     async fn collect_references(
         &self,
         base_dir: &Path,
         current_dir: &Path,
         references: &mut Vec<String>,
+        visited: &mut HashSet<PathBuf>,
     ) -> Result<()> {
         if !current_dir.exists() {
+            return Ok(());
+        }
+
+        // Canonicalize to get the real path, detecting symlinks
+        let canonical_path = match current_dir.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // Skip if we can't resolve the path
+        };
+
+        // Skip if we've already visited this directory (symlink loop detection)
+        if !visited.insert(canonical_path) {
             return Ok(());
         }
 
@@ -486,12 +501,18 @@ impl LibraryStore {
                 continue;
             }
 
-            if entry_path.is_dir() {
-                // Recurse into subdirectories
-                self.collect_references(base_dir, &entry_path, references)
+            // Use symlink_metadata to check file type without following symlinks
+            let metadata = match fs::symlink_metadata(&entry_path).await {
+                Ok(m) => m,
+                Err(_) => continue, // Skip if we can't get metadata
+            };
+
+            if metadata.is_dir() {
+                // Recurse into subdirectories (will detect loops via visited set)
+                self.collect_references(base_dir, &entry_path, references, visited)
                     .await?;
-            } else {
-                // Add relative path from skill directory
+            } else if metadata.is_file() {
+                // Only add regular files (not symlinks)
                 let relative_path = entry_path
                     .strip_prefix(base_dir)
                     .unwrap_or(&entry_path)
@@ -499,6 +520,7 @@ impl LibraryStore {
                     .to_string();
                 references.push(relative_path);
             }
+            // Skip symlinks to files to prevent symlink attacks
         }
 
         Ok(())

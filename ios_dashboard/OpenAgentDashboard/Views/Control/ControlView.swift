@@ -784,6 +784,10 @@ struct ControlView: View {
     private func loadWorkspaces() async {
         do {
             workspaces = try await api.listWorkspaces()
+            // Validate selected workspace still exists, reset to default if not
+            if let selected = selectedWorkspaceId, !workspaces.contains(where: { $0.id == selected }) {
+                selectedWorkspaceId = nil
+            }
             // Default to host workspace if none selected
             if selectedWorkspaceId == nil, let defaultWorkspace = workspaces.first(where: { $0.isDefault }) {
                 selectedWorkspaceId = defaultWorkspace.id

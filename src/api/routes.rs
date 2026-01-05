@@ -92,6 +92,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Load model resolver for auto-upgrading outdated model names
     let resolver = crate::budget::load_resolver(&config.working_dir.to_string_lossy());
 
+    // Initialize workspace store
+    let workspaces = Arc::new(workspace::WorkspaceStore::new(config.working_dir.clone()));
+
     // Spawn the single global control session actor.
     let control_state = control::ControlHub::new(
         config.clone(),
@@ -100,9 +103,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         Arc::clone(&benchmarks),
         Arc::clone(&resolver),
         Arc::clone(&mcp),
+        Arc::clone(&workspaces),
     );
 
-    // Initialize configuration library (optional - only if LIBRARY_REMOTE is set)
+    // Initialize configuration library (optional - can also be configured at runtime)
     let library: library_api::SharedLibrary = Arc::new(RwLock::new(None));
     if let Some(library_remote) = config.library_remote.clone() {
         let library_clone = Arc::clone(&library);
@@ -111,7 +115,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             match crate::library::LibraryStore::new(library_path, &library_remote).await {
                 Ok(store) => {
                     tracing::info!("Configuration library initialized from {}", library_remote);
-                    *library_clone.write().await = Some(store);
+                    *library_clone.write().await = Some(Arc::new(store));
                 }
                 Err(e) => {
                     tracing::warn!("Failed to initialize configuration library: {}", e);
@@ -119,11 +123,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             }
         });
     } else {
-        tracing::info!("Configuration library disabled (LIBRARY_REMOTE not set)");
+        tracing::info!("Configuration library disabled (no remote configured)");
     }
-
-    // Initialize workspace store
-    let workspaces = Arc::new(workspace::WorkspaceStore::new(config.working_dir.clone()));
 
     let state = Arc::new(AppState {
         config: config.clone(),
