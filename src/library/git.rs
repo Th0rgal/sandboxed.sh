@@ -37,7 +37,8 @@ pub async fn clone_if_needed(path: &Path, remote: &str) -> Result<bool> {
 /// Ensure the repository has the expected remote configured.
 ///
 /// Precondition: `path` is either a git repository or does not exist.
-/// Postcondition: if a git repository exists at `path`, its `origin` remote URL equals `remote`.
+/// Postcondition: if a git repository exists at `path`, its `origin` remote URL equals `remote`
+/// and the repository is tracking content from that remote.
 pub async fn ensure_remote(path: &Path, remote: &str) -> Result<()> {
     if !path.exists() || !path.join(".git").exists() {
         return Ok(());
@@ -48,6 +49,13 @@ pub async fn ensure_remote(path: &Path, remote: &str) -> Result<()> {
         return Ok(());
     }
 
+    tracing::info!(
+        old_remote = ?current,
+        new_remote = %remote,
+        "Switching library remote"
+    );
+
+    // Update the remote URL
     let output = Command::new("git")
         .current_dir(path)
         .args(["remote", "set-url", "origin", remote])
@@ -55,23 +63,81 @@ pub async fn ensure_remote(path: &Path, remote: &str) -> Result<()> {
         .await
         .context("Failed to execute git remote set-url")?;
 
-    if output.status.success() {
-        return Ok(());
+    if !output.status.success() {
+        // Try adding remote if it doesn't exist
+        let output = Command::new("git")
+            .current_dir(path)
+            .args(["remote", "add", "origin", remote])
+            .output()
+            .await
+            .context("Failed to execute git remote add")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git remote add failed: {}", stderr);
+        }
     }
 
+    // Fetch from the new remote
+    tracing::info!("Fetching from new remote");
     let output = Command::new("git")
         .current_dir(path)
-        .args(["remote", "add", "origin", remote])
+        .args(["fetch", "origin"])
         .output()
         .await
-        .context("Failed to execute git remote add")?;
+        .context("Failed to execute git fetch")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git remote add failed: {}", stderr);
+        anyhow::bail!("git fetch failed: {}", stderr);
+    }
+
+    // Try to find the default branch (main or master)
+    let default_branch = detect_default_branch(path).await?;
+
+    // Reset to the new remote's default branch
+    tracing::info!(branch = %default_branch, "Resetting to remote's default branch");
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(["checkout", "-B", &default_branch, &format!("origin/{}", default_branch)])
+        .output()
+        .await
+        .context("Failed to execute git checkout")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git checkout failed: {}", stderr);
     }
 
     Ok(())
+}
+
+/// Detect the default branch of the remote (main or master).
+async fn detect_default_branch(path: &Path) -> Result<String> {
+    // Try 'main' first
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(["rev-parse", "--verify", "origin/main"])
+        .output()
+        .await?;
+
+    if output.status.success() {
+        return Ok("main".to_string());
+    }
+
+    // Fall back to 'master'
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(["rev-parse", "--verify", "origin/master"])
+        .output()
+        .await?;
+
+    if output.status.success() {
+        return Ok("master".to_string());
+    }
+
+    // Default to 'main' if neither exists (new repo)
+    Ok("main".to_string())
 }
 
 /// Get the current git status of a repository.
