@@ -1,5 +1,5 @@
 import { authHeader, clearJwt, signalAuthRequired } from "./auth";
-import { getRuntimeApiBase, getRuntimeTaskDefaults } from "./settings";
+import { getRuntimeApiBase, getRuntimeLibraryRemote } from "./settings";
 
 function apiUrl(pathOrUrl: string): string {
   if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
@@ -52,6 +52,10 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
     ...(init?.headers ? (init.headers as Record<string, string>) : {}),
     ...authHeader(),
   };
+  const libraryRemote = getRuntimeLibraryRemote();
+  if (libraryRemote) {
+    headers["x-openagent-library-remote"] = libraryRemote;
+  }
 
   const res = await fetch(apiUrl(path), { ...init, headers });
   if (res.status === 401) {
@@ -59,6 +63,28 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
     signalAuthRequired();
   }
   return res;
+}
+
+export class LibraryUnavailableError extends Error {
+  status: number;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "LibraryUnavailableError";
+    this.status = 503;
+  }
+}
+
+async function ensureLibraryResponse(
+  res: Response,
+  fallbackMessage: string
+): Promise<Response> {
+  if (res.ok) return res;
+  const text = await res.text().catch(() => "");
+  if (res.status === 503) {
+    throw new LibraryUnavailableError(text || "Library not initialized");
+  }
+  throw new Error(text || fallbackMessage);
 }
 
 export interface CreateTaskRequest {
@@ -127,15 +153,10 @@ export async function getTask(id: string): Promise<TaskState> {
 export async function createTask(
   request: CreateTaskRequest
 ): Promise<{ id: string; status: string }> {
-  const defaults = getRuntimeTaskDefaults();
-  const merged: CreateTaskRequest = {
-    ...defaults,
-    ...request,
-  };
   const res = await apiFetch("/api/task", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(merged),
+    body: JSON.stringify(request),
   });
   if (!res.ok) throw new Error("Failed to create task");
   return res.json();
@@ -1168,14 +1189,14 @@ export interface Command {
 // Git status
 export async function getLibraryStatus(): Promise<LibraryStatus> {
   const res = await apiFetch("/api/library/status");
-  if (!res.ok) throw new Error("Failed to fetch library status");
+  await ensureLibraryResponse(res, "Failed to fetch library status");
   return res.json();
 }
 
 // Sync (git pull)
 export async function syncLibrary(): Promise<void> {
   const res = await apiFetch("/api/library/sync", { method: "POST" });
-  if (!res.ok) throw new Error("Failed to sync library");
+  await ensureLibraryResponse(res, "Failed to sync library");
 }
 
 // Commit changes
@@ -1185,19 +1206,19 @@ export async function commitLibrary(message: string): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message }),
   });
-  if (!res.ok) throw new Error("Failed to commit library");
+  await ensureLibraryResponse(res, "Failed to commit library");
 }
 
 // Push changes
 export async function pushLibrary(): Promise<void> {
   const res = await apiFetch("/api/library/push", { method: "POST" });
-  if (!res.ok) throw new Error("Failed to push library");
+  await ensureLibraryResponse(res, "Failed to push library");
 }
 
 // Get MCP servers
 export async function getLibraryMcps(): Promise<Record<string, McpServerDef>> {
   const res = await apiFetch("/api/library/mcps");
-  if (!res.ok) throw new Error("Failed to fetch MCPs");
+  await ensureLibraryResponse(res, "Failed to fetch MCPs");
   return res.json();
 }
 
@@ -1210,20 +1231,20 @@ export async function saveLibraryMcps(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(servers),
   });
-  if (!res.ok) throw new Error("Failed to save MCPs");
+  await ensureLibraryResponse(res, "Failed to save MCPs");
 }
 
 // List skills
 export async function listLibrarySkills(): Promise<SkillSummary[]> {
   const res = await apiFetch("/api/library/skills");
-  if (!res.ok) throw new Error("Failed to fetch skills");
+  await ensureLibraryResponse(res, "Failed to fetch skills");
   return res.json();
 }
 
 // Get skill
 export async function getLibrarySkill(name: string): Promise<Skill> {
   const res = await apiFetch(`/api/library/skills/${encodeURIComponent(name)}`);
-  if (!res.ok) throw new Error("Failed to fetch skill");
+  await ensureLibraryResponse(res, "Failed to fetch skill");
   return res.json();
 }
 
@@ -1237,7 +1258,7 @@ export async function saveLibrarySkill(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content }),
   });
-  if (!res.ok) throw new Error("Failed to save skill");
+  await ensureLibraryResponse(res, "Failed to save skill");
 }
 
 // Delete skill
@@ -1245,20 +1266,20 @@ export async function deleteLibrarySkill(name: string): Promise<void> {
   const res = await apiFetch(`/api/library/skills/${encodeURIComponent(name)}`, {
     method: "DELETE",
   });
-  if (!res.ok) throw new Error("Failed to delete skill");
+  await ensureLibraryResponse(res, "Failed to delete skill");
 }
 
 // List commands
 export async function listLibraryCommands(): Promise<CommandSummary[]> {
   const res = await apiFetch("/api/library/commands");
-  if (!res.ok) throw new Error("Failed to fetch commands");
+  await ensureLibraryResponse(res, "Failed to fetch commands");
   return res.json();
 }
 
 // Get command
 export async function getLibraryCommand(name: string): Promise<Command> {
   const res = await apiFetch(`/api/library/commands/${encodeURIComponent(name)}`);
-  if (!res.ok) throw new Error("Failed to fetch command");
+  await ensureLibraryResponse(res, "Failed to fetch command");
   return res.json();
 }
 
@@ -1272,7 +1293,7 @@ export async function saveLibraryCommand(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content }),
   });
-  if (!res.ok) throw new Error("Failed to save command");
+  await ensureLibraryResponse(res, "Failed to save command");
 }
 
 // Delete command
@@ -1280,7 +1301,7 @@ export async function deleteLibraryCommand(name: string): Promise<void> {
   const res = await apiFetch(`/api/library/commands/${encodeURIComponent(name)}`, {
     method: "DELETE",
   });
-  if (!res.ok) throw new Error("Failed to delete command");
+  await ensureLibraryResponse(res, "Failed to delete command");
 }
 
 // ==================== Workspaces ====================

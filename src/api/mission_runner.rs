@@ -77,6 +77,9 @@ pub struct MissionRunner {
     /// Model override for this mission (if any)
     pub model_override: Option<String>,
 
+    /// Workspace ID where this mission should run
+    pub workspace_id: Uuid,
+
     /// Current state
     pub state: MissionRunState,
 
@@ -110,10 +113,11 @@ pub struct MissionRunner {
 
 impl MissionRunner {
     /// Create a new mission runner.
-    pub fn new(mission_id: Uuid, model_override: Option<String>) -> Self {
+    pub fn new(mission_id: Uuid, model_override: Option<String>, workspace_id: Uuid) -> Self {
         Self {
             mission_id,
             model_override,
+            workspace_id,
             state: MissionRunState::Queued,
             queue: VecDeque::new(),
             history: Vec::new(),
@@ -214,6 +218,7 @@ impl MissionRunner {
         benchmarks: SharedBenchmarkRegistry,
         resolver: SharedModelResolver,
         mcp: Arc<McpRegistry>,
+        workspaces: workspace::SharedWorkspaceStore,
         pricing: Arc<ModelPricing>,
         events_tx: broadcast::Sender<AgentEvent>,
         tool_hub: Arc<FrontendToolHub>,
@@ -241,6 +246,7 @@ impl MissionRunner {
         let tree_ref = Arc::clone(&self.tree_snapshot);
         let progress_ref = Arc::clone(&self.progress_snapshot);
         let mission_id = self.mission_id;
+        let workspace_id = self.workspace_id;
         let model_override = msg.model_override;
         let user_message = msg.content.clone();
         let msg_id = msg.id;
@@ -266,6 +272,7 @@ impl MissionRunner {
                 benchmarks,
                 resolver,
                 mcp,
+                workspaces,
                 pricing,
                 events_tx,
                 tool_hub,
@@ -278,6 +285,7 @@ impl MissionRunner {
                 tree_ref,
                 progress_ref,
                 mission_id,
+                Some(workspace_id),
             )
             .await;
             (msg_id, user_message, result)
@@ -354,6 +362,7 @@ async fn run_mission_turn(
     benchmarks: SharedBenchmarkRegistry,
     resolver: SharedModelResolver,
     mcp: Arc<McpRegistry>,
+    workspaces: workspace::SharedWorkspaceStore,
     pricing: Arc<ModelPricing>,
     events_tx: broadcast::Sender<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
@@ -366,6 +375,7 @@ async fn run_mission_turn(
     tree_snapshot: Arc<RwLock<Option<AgentTreeNode>>>,
     progress_snapshot: Arc<RwLock<ExecutionProgress>>,
     mission_id: Uuid,
+    workspace_id: Option<Uuid>,
 ) -> AgentResult {
     // Build context with history (use base working dir for context lookup)
     let base_working_dir = config.working_dir.to_string_lossy().to_string();
@@ -440,8 +450,10 @@ async fn run_mission_turn(
     let llm = Arc::new(OpenRouterClient::new(config.api_key.clone()));
 
     // Ensure mission workspace exists and is configured for OpenCode.
+    let workspace_root =
+        workspace::resolve_workspace_root(&workspaces, &config, workspace_id).await;
     let mission_work_dir =
-        match workspace::prepare_mission_workspace(&config, &mcp, mission_id).await {
+        match workspace::prepare_mission_workspace_in(&workspace_root, &mcp, mission_id).await {
             Ok(dir) => {
                 tracing::info!(
                     "Mission {} workspace directory: {}",
@@ -452,7 +464,7 @@ async fn run_mission_turn(
             }
             Err(e) => {
                 tracing::warn!("Failed to prepare mission workspace, using default: {}", e);
-                config.working_dir.clone()
+                workspace_root
             }
         };
 

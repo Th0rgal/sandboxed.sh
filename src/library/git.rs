@@ -34,6 +34,46 @@ pub async fn clone_if_needed(path: &Path, remote: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Ensure the repository has the expected remote configured.
+///
+/// Precondition: `path` is either a git repository or does not exist.
+/// Postcondition: if a git repository exists at `path`, its `origin` remote URL equals `remote`.
+pub async fn ensure_remote(path: &Path, remote: &str) -> Result<()> {
+    if !path.exists() || !path.join(".git").exists() {
+        return Ok(());
+    }
+
+    let current = get_remote(path).await.ok();
+    if current.as_deref() == Some(remote) {
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(["remote", "set-url", "origin", remote])
+        .output()
+        .await
+        .context("Failed to execute git remote set-url")?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(["remote", "add", "origin", remote])
+        .output()
+        .await
+        .context("Failed to execute git remote add")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git remote add failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
 /// Get the current git status of a repository.
 pub async fn status(path: &Path) -> Result<LibraryStatus> {
     // Get current branch

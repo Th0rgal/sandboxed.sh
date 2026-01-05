@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::RwLock;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -229,16 +230,31 @@ pub fn workspaces_root(working_dir: &Path) -> PathBuf {
     working_dir.join("workspaces")
 }
 
+/// Root directory for workspace folders under a specific workspace path.
+pub fn workspaces_root_for(root: &Path) -> PathBuf {
+    root.join("workspaces")
+}
+
 /// Workspace directory for a mission.
 pub fn mission_workspace_dir(working_dir: &Path, mission_id: Uuid) -> PathBuf {
-    let short_id = &mission_id.to_string()[..8];
-    workspaces_root(working_dir).join(format!("mission-{}", short_id))
+    mission_workspace_dir_for_root(working_dir, mission_id)
 }
 
 /// Workspace directory for a task.
 pub fn task_workspace_dir(working_dir: &Path, task_id: Uuid) -> PathBuf {
+    task_workspace_dir_for_root(working_dir, task_id)
+}
+
+/// Workspace directory for a mission under a specific workspace root.
+pub fn mission_workspace_dir_for_root(root: &Path, mission_id: Uuid) -> PathBuf {
+    let short_id = &mission_id.to_string()[..8];
+    workspaces_root_for(root).join(format!("mission-{}", short_id))
+}
+
+/// Workspace directory for a task under a specific workspace root.
+pub fn task_workspace_dir_for_root(root: &Path, task_id: Uuid) -> PathBuf {
     let short_id = &task_id.to_string()[..8];
-    workspaces_root(working_dir).join(format!("task-{}", short_id))
+    workspaces_root_for(root).join(format!("task-{}", short_id))
 }
 
 fn opencode_entry_from_mcp(config: &McpServerConfig, workspace_dir: &Path) -> serde_json::Value {
@@ -314,7 +330,16 @@ pub async fn prepare_mission_workspace(
     mcp: &McpRegistry,
     mission_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
-    let dir = mission_workspace_dir(&config.working_dir, mission_id);
+    prepare_mission_workspace_in(&config.working_dir, mcp, mission_id).await
+}
+
+/// Prepare a workspace directory for a mission under a specific workspace root.
+pub async fn prepare_mission_workspace_in(
+    workspace_root: &Path,
+    mcp: &McpRegistry,
+    mission_id: Uuid,
+) -> anyhow::Result<PathBuf> {
+    let dir = mission_workspace_dir_for_root(workspace_root, mission_id);
     prepare_workspace_dir(&dir).await?;
     let mcp_configs = mcp.list_configs().await;
     write_opencode_config(&dir, mcp_configs).await?;
@@ -327,7 +352,7 @@ pub async fn prepare_task_workspace(
     mcp: &McpRegistry,
     task_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
-    let dir = task_workspace_dir(&config.working_dir, task_id);
+    let dir = task_workspace_dir_for_root(&config.working_dir, task_id);
     prepare_workspace_dir(&dir).await?;
     let mcp_configs = mcp.list_configs().await;
     write_opencode_config(&dir, mcp_configs).await?;
@@ -359,4 +384,25 @@ pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::
     }
 
     Ok(count)
+}
+
+/// Resolve the workspace root path for a mission.
+/// Falls back to `config.working_dir` if the workspace is missing.
+pub async fn resolve_workspace_root(
+    workspaces: &SharedWorkspaceStore,
+    config: &Config,
+    workspace_id: Option<Uuid>,
+) -> PathBuf {
+    let id = workspace_id.unwrap_or(DEFAULT_WORKSPACE_ID);
+    match workspaces.get(id).await {
+        Some(ws) => ws.path,
+        None => {
+            warn!(
+                "Workspace {} not found; using default working_dir {}",
+                id,
+                config.working_dir.display()
+            );
+            config.working_dir.clone()
+        }
+    }
 }

@@ -938,6 +938,7 @@ pub struct ControlHub {
     benchmarks: crate::budget::SharedBenchmarkRegistry,
     resolver: crate::budget::SharedModelResolver,
     mcp: Arc<McpRegistry>,
+    workspaces: workspace::SharedWorkspaceStore,
 }
 
 impl ControlHub {
@@ -948,6 +949,7 @@ impl ControlHub {
         benchmarks: crate::budget::SharedBenchmarkRegistry,
         resolver: crate::budget::SharedModelResolver,
         mcp: Arc<McpRegistry>,
+        workspaces: workspace::SharedWorkspaceStore,
     ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -957,6 +959,7 @@ impl ControlHub {
             benchmarks,
             resolver,
             mcp,
+            workspaces,
         }
     }
 
@@ -986,6 +989,7 @@ impl ControlHub {
             Arc::clone(&self.benchmarks),
             Arc::clone(&self.resolver),
             Arc::clone(&self.mcp),
+            Arc::clone(&self.workspaces),
             mission_store,
         );
         sessions.insert(user.id.clone(), state.clone());
@@ -1799,6 +1803,7 @@ fn spawn_control_session(
     benchmarks: crate::budget::SharedBenchmarkRegistry,
     resolver: crate::budget::SharedModelResolver,
     mcp: Arc<McpRegistry>,
+    workspaces: workspace::SharedWorkspaceStore,
     mission_store: Arc<dyn MissionStore>,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
@@ -1840,6 +1845,7 @@ fn spawn_control_session(
         benchmarks,
         resolver,
         mcp,
+        workspaces,
         cmd_rx,
         mission_cmd_rx,
         mission_cmd_tx,
@@ -1924,6 +1930,7 @@ async fn control_actor_loop(
     benchmarks: crate::budget::SharedBenchmarkRegistry,
     resolver: crate::budget::SharedModelResolver,
     mcp: Arc<McpRegistry>,
+    workspaces: workspace::SharedWorkspaceStore,
     mut cmd_rx: mpsc::Receiver<ControlCommand>,
     mut mission_cmd_rx: mpsc::Receiver<crate::tools::mission::MissionControlCommand>,
     mission_cmd_tx: mpsc::Sender<crate::tools::mission::MissionControlCommand>,
@@ -2056,6 +2063,7 @@ async fn control_actor_loop(
     async fn resume_mission_impl(
         mission_store: &Arc<dyn MissionStore>,
         config: &Config,
+        workspaces: &workspace::SharedWorkspaceStore,
         mission_id: Uuid,
         clean_workspace: bool,
     ) -> Result<(Mission, String), String> {
@@ -2073,7 +2081,9 @@ async fn control_actor_loop(
         }
 
         // Clean workspace if requested
-        let mission_dir = workspace::mission_workspace_dir(&config.working_dir, mission_id);
+        let workspace_root =
+            workspace::resolve_workspace_root(workspaces, config, Some(mission.workspace_id)).await;
+        let mission_dir = workspace::mission_workspace_dir_for_root(&workspace_root, mission_id);
 
         if clean_workspace && mission_dir.exists() {
             tracing::info!(
@@ -2268,6 +2278,7 @@ async fn control_actor_loop(
                                 let bench = Arc::clone(&benchmarks);
                                 let res = Arc::clone(&resolver);
                                 let mcp_ref = Arc::clone(&mcp);
+                                let workspaces_ref = Arc::clone(&workspaces);
                                 let events = events_tx.clone();
                                 let tools_hub = Arc::clone(&tool_hub);
                                 let status_ref = Arc::clone(&status);
@@ -2282,6 +2293,28 @@ async fn control_actor_loop(
                                 let progress_ref = Arc::clone(&progress);
                                 // Capture which mission this task is working on
                                 let mission_id = current_mission.read().await.clone();
+                                let workspace_id = if let Some(mid) = mission_id {
+                                    match mission_store.get_mission(mid).await {
+                                        Ok(Some(mission)) => Some(mission.workspace_id),
+                                        Ok(None) => {
+                                            tracing::warn!(
+                                                "Mission {} not found while resolving workspace",
+                                                mid
+                                            );
+                                            None
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to load mission {} for workspace: {}",
+                                                mid,
+                                                e
+                                            );
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
                                 running_cancel = Some(cancel.clone());
                                 running_mission_id = mission_id;
                                 // Reset activity timer when new task starts to avoid false stall warnings
@@ -2294,6 +2327,7 @@ async fn control_actor_loop(
                                         bench,
                                         res,
                                         mcp_ref,
+                                        workspaces_ref,
                                         pricing,
                                         events,
                                         tools_hub,
@@ -2306,6 +2340,7 @@ async fn control_actor_loop(
                                         tree_ref,
                                         progress_ref,
                                         mission_id,
+                                        workspace_id,
                                     )
                                     .await;
                                     (mid, msg, result)
@@ -2447,6 +2482,7 @@ async fn control_actor_loop(
                             let mut runner = super::mission_runner::MissionRunner::new(
                                 mission_id,
                                 model_override.clone(),
+                                mission.workspace_id,
                             );
 
                             // Load existing history into runner to preserve conversation context
@@ -2465,6 +2501,7 @@ async fn control_actor_loop(
                                 Arc::clone(&benchmarks),
                                 Arc::clone(&resolver),
                                 Arc::clone(&mcp),
+                                Arc::clone(&workspaces),
                                 Arc::clone(&pricing),
                                 events_tx.clone(),
                                 Arc::clone(&tool_hub),
@@ -2545,6 +2582,7 @@ async fn control_actor_loop(
                         match resume_mission_impl(
                             &mission_store,
                             &config,
+                            &workspaces,
                             mission_id,
                             clean_workspace,
                         )
@@ -2587,6 +2625,7 @@ async fn control_actor_loop(
                                         let bench = Arc::clone(&benchmarks);
                                         let res = Arc::clone(&resolver);
                                         let mcp_ref = Arc::clone(&mcp);
+                                        let workspaces_ref = Arc::clone(&workspaces);
                                         let events = events_tx.clone();
                                         let tools_hub = Arc::clone(&tool_hub);
                                         let status_ref = Arc::clone(&status);
@@ -2599,6 +2638,7 @@ async fn control_actor_loop(
                                         };
                                         let tree_ref = Arc::clone(&current_tree);
                                         let progress_ref = Arc::clone(&progress);
+                                        let workspace_id = Some(mission.workspace_id);
                                         running_cancel = Some(cancel.clone());
                                         // Capture which mission this task is working on (the resumed mission)
                                         running_mission_id = Some(mission_id);
@@ -2610,6 +2650,7 @@ async fn control_actor_loop(
                                                 bench,
                                                 res,
                                                 mcp_ref,
+                                                workspaces_ref,
                                                 pricing,
                                                 events,
                                                 tools_hub,
@@ -2622,6 +2663,7 @@ async fn control_actor_loop(
                                                 tree_ref,
                                                 progress_ref,
                                                 Some(mission_id),
+                                                workspace_id,
                                             )
                                             .await;
                                             (mid, msg, result)
@@ -2959,6 +3001,7 @@ async fn control_actor_loop(
                     let bench = Arc::clone(&benchmarks);
                     let res = Arc::clone(&resolver);
                     let mcp_ref = Arc::clone(&mcp);
+                    let workspaces_ref = Arc::clone(&workspaces);
                     let events = events_tx.clone();
                     let tools_hub = Arc::clone(&tool_hub);
                     let status_ref = Arc::clone(&status);
@@ -2974,6 +3017,28 @@ async fn control_actor_loop(
                     running_cancel = Some(cancel.clone());
                     // Capture which mission this task is working on
                     let mission_id = current_mission.read().await.clone();
+                    let workspace_id = if let Some(mid) = mission_id {
+                        match mission_store.get_mission(mid).await {
+                            Ok(Some(mission)) => Some(mission.workspace_id),
+                            Ok(None) => {
+                                tracing::warn!(
+                                    "Mission {} not found while resolving workspace",
+                                    mid
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to load mission {} for workspace: {}",
+                                    mid,
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     running_mission_id = mission_id;
                     // Reset activity timer when new task starts to avoid false stall warnings
                     main_runner_last_activity = std::time::Instant::now();
@@ -2985,6 +3050,7 @@ async fn control_actor_loop(
                             bench,
                             res,
                             mcp_ref,
+                            workspaces_ref,
                             pricing,
                             events,
                             tools_hub,
@@ -2997,6 +3063,7 @@ async fn control_actor_loop(
                             tree_ref,
                             progress_ref,
                             mission_id,
+                            workspace_id,
                         )
                         .await;
                         (mid, msg, result)
@@ -3097,6 +3164,7 @@ async fn run_single_control_turn(
     benchmarks: crate::budget::SharedBenchmarkRegistry,
     resolver: crate::budget::SharedModelResolver,
     mcp: Arc<McpRegistry>,
+    workspaces: workspace::SharedWorkspaceStore,
     pricing: Arc<ModelPricing>,
     events_tx: broadcast::Sender<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
@@ -3109,14 +3177,17 @@ async fn run_single_control_turn(
     tree_snapshot: Arc<RwLock<Option<AgentTreeNode>>>,
     progress_snapshot: Arc<RwLock<ExecutionProgress>>,
     mission_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
 ) -> crate::agents::AgentResult {
     // Ensure a workspace directory for this mission (if applicable).
     let working_dir_path = if let Some(mid) = mission_id {
-        match workspace::prepare_mission_workspace(&config, &mcp, mid).await {
+        let workspace_root =
+            workspace::resolve_workspace_root(&workspaces, &config, workspace_id).await;
+        match workspace::prepare_mission_workspace_in(&workspace_root, &mcp, mid).await {
             Ok(dir) => dir,
             Err(e) => {
                 tracing::warn!("Failed to prepare mission workspace: {}", e);
-                config.working_dir.clone()
+                workspace_root
             }
         }
     } else {

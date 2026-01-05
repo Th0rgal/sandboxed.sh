@@ -283,7 +283,7 @@ pub struct Config {
     pub library_path: PathBuf,
 
     /// Git remote URL for the configuration library.
-    /// Set via LIBRARY_REMOTE env var. If not set, library features are disabled.
+    /// Set via LIBRARY_REMOTE env var. Runtime settings can override this.
     pub library_remote: Option<String>,
 }
 

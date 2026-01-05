@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { toast } from 'sonner';
 import { getHealth, HealthResponse } from '@/lib/api';
-import { Server, Bot, Cpu, Wallet, Save, RefreshCw, AlertTriangle } from 'lucide-react';
+import { Server, Bot, Save, RefreshCw, AlertTriangle, GitBranch } from 'lucide-react';
 import { readSavedSettings, writeSavedSettings } from '@/lib/settings';
 import { cn } from '@/lib/utils';
 
@@ -14,26 +14,21 @@ export default function SettingsPage() {
   
   // Form state
   const [apiUrl, setApiUrl] = useState(() => readSavedSettings().apiUrl ?? 'http://127.0.0.1:3000');
-  const [defaultModel, setDefaultModel] = useState(
-    () => readSavedSettings().defaultModel ?? 'google/gemini-3-flash-preview'
-  );
-  const [defaultBudget, setDefaultBudget] = useState(() => readSavedSettings().defaultBudget ?? '1000');
+  const [libraryRepo, setLibraryRepo] = useState(() => readSavedSettings().libraryRepo ?? '');
   
   // Track original values for unsaved changes
   const [originalValues, setOriginalValues] = useState({
     apiUrl: readSavedSettings().apiUrl ?? 'http://127.0.0.1:3000',
-    defaultModel: readSavedSettings().defaultModel ?? 'google/gemini-3-flash-preview',
-    defaultBudget: readSavedSettings().defaultBudget ?? '1000',
+    libraryRepo: readSavedSettings().libraryRepo ?? '',
   });
   
   // Validation state
   const [urlError, setUrlError] = useState<string | null>(null);
-  const [budgetError, setBudgetError] = useState<string | null>(null);
+  const [repoError, setRepoError] = useState<string | null>(null);
   
   // Check if there are unsaved changes
   const hasUnsavedChanges = apiUrl !== originalValues.apiUrl || 
-    defaultModel !== originalValues.defaultModel || 
-    defaultBudget !== originalValues.defaultBudget;
+    libraryRepo !== originalValues.libraryRepo;
 
   // Validate URL
   const validateUrl = useCallback((url: string) => {
@@ -51,18 +46,17 @@ export default function SettingsPage() {
     }
   }, []);
 
-  // Validate budget
-  const validateBudget = useCallback((budget: string) => {
-    const num = parseInt(budget, 10);
-    if (isNaN(num) || num < 0) {
-      setBudgetError('Budget must be a positive number');
+  const validateRepo = useCallback((repo: string) => {
+    const trimmed = repo.trim();
+    if (!trimmed) {
+      setRepoError(null);
+      return true;
+    }
+    if (/\s/.test(trimmed)) {
+      setRepoError('Repository URL cannot contain spaces');
       return false;
     }
-    if (num > 1000000) {
-      setBudgetError('Budget seems too high (max $10,000)');
-      return false;
-    }
-    setBudgetError(null);
+    setRepoError(null);
     return true;
   }, []);
 
@@ -106,19 +100,19 @@ export default function SettingsPage() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [apiUrl, defaultModel, defaultBudget]);
+  }, [apiUrl, libraryRepo]);
 
   const handleSave = () => {
     const urlValid = validateUrl(apiUrl);
-    const budgetValid = validateBudget(defaultBudget);
+    const repoValid = validateRepo(libraryRepo);
     
-    if (!urlValid || !budgetValid) {
+    if (!urlValid || !repoValid) {
       toast.error('Please fix validation errors before saving');
       return;
     }
 
-    writeSavedSettings({ apiUrl, defaultModel, defaultBudget });
-    setOriginalValues({ apiUrl, defaultModel, defaultBudget });
+    writeSavedSettings({ apiUrl, libraryRepo });
+    setOriginalValues({ apiUrl, libraryRepo });
     toast.success('Settings saved!');
   };
 
@@ -233,72 +227,42 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          {/* Default Model */}
+          {/* Configuration Library */}
           <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
             <div className="flex items-center gap-3 mb-4">
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10">
-                <Cpu className="h-5 w-5 text-indigo-400" />
+                <GitBranch className="h-5 w-5 text-indigo-400" />
               </div>
               <div>
-                <h2 className="text-sm font-medium text-white">Default Model</h2>
-                <p className="text-xs text-white/40">Choose the AI model for tasks</p>
+                <h2 className="text-sm font-medium text-white">Configuration Library</h2>
+                <p className="text-xs text-white/40">Git repo for MCPs, skills, and commands</p>
               </div>
             </div>
 
             <div>
               <label className="block text-xs font-medium text-white/60 mb-1.5">
-                Model ID
-              </label>
-              <select
-                value={defaultModel}
-                onChange={(e) => setDefaultModel(e.target.value)}
-                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none transition-colors"
-              >
-                <option value="google/gemini-3-flash-preview">Gemini 3 Flash (Recommended)</option>
-                <option value="qwen/qwen3-235b-a22b-instruct">Qwen 3 235B (Reasoning)</option>
-                <option value="deepseek/deepseek-v3.2">DeepSeek V3.2 (Value)</option>
-                <option value="x-ai/grok-4.1-fast">Grok 4.1 Fast</option>
-                <option value="openai/gpt-4.1">GPT-4.1</option>
-                <option value="openai/gpt-4.1-mini">GPT-4.1 Mini (Budget)</option>
-              </select>
-            </div>
-          </div>
-
-          {/* Budget */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10">
-                <Wallet className="h-5 w-5 text-indigo-400" />
-              </div>
-              <div>
-                <h2 className="text-sm font-medium text-white">Default Budget</h2>
-                <p className="text-xs text-white/40">Maximum spend per task</p>
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">
-                Budget per task (cents)
+                Library Repo (optional)
               </label>
               <input
-                type="number"
-                value={defaultBudget}
+                type="text"
+                value={libraryRepo}
                 onChange={(e) => {
-                  setDefaultBudget(e.target.value);
-                  validateBudget(e.target.value);
+                  setLibraryRepo(e.target.value);
+                  validateRepo(e.target.value);
                 }}
+                placeholder="https://github.com/your/library.git"
                 className={cn(
                   "w-full rounded-lg border bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:outline-none transition-colors",
-                  budgetError 
+                  repoError 
                     ? "border-red-500/50 focus:border-red-500/50" 
                     : "border-white/[0.06] focus:border-indigo-500/50"
                 )}
               />
-              {budgetError ? (
-                <p className="mt-1.5 text-xs text-red-400">{budgetError}</p>
+              {repoError ? (
+                <p className="mt-1.5 text-xs text-red-400">{repoError}</p>
               ) : (
                 <p className="mt-1.5 text-xs text-white/30">
-                  {defaultBudget ? `$${(parseInt(defaultBudget) / 100).toFixed(2)}` : '$0.00'} per task
+                  Leave blank to disable library features.
                 </p>
               )}
             </div>
@@ -339,10 +303,10 @@ export default function SettingsPage() {
           {/* Save Button */}
           <button
             onClick={handleSave}
-            disabled={!!urlError || !!budgetError}
+            disabled={!!urlError || !!repoError}
             className={cn(
               "w-full flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium text-white transition-colors",
-              urlError || budgetError
+              urlError || repoError
                 ? "bg-white/10 cursor-not-allowed opacity-50"
                 : "bg-indigo-500 hover:bg-indigo-600"
             )}

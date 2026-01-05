@@ -46,10 +46,9 @@ export function RecentTasks() {
     const fetchMissions = async () => {
       try {
         const data = await listMissions();
-        // Sort by updated_at descending and take top 5
+        // Sort by updated_at descending
         const sorted = data
-          .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
-          .slice(0, 5);
+          .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
         setMissions(sorted);
       } catch (error) {
         console.error("Failed to fetch missions:", error);
@@ -64,8 +63,8 @@ export function RecentTasks() {
   }, []);
 
   return (
-    <div>
-      <div className="mb-4 flex items-center justify-between">
+    <div className="flex flex-col h-full">
+      <div className="mb-4 flex items-center justify-between flex-shrink-0">
         <h3 className="text-sm font-medium text-white">Recent Missions</h3>
         <span className="flex items-center gap-1.5 rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-400">
           <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
@@ -78,7 +77,7 @@ export function RecentTasks() {
       ) : missions.length === 0 ? (
         <p className="text-xs text-white/40">No missions yet</p>
       ) : (
-        <div className="space-y-2">
+        <div className="flex-1 overflow-y-auto space-y-2 min-h-0">
           {missions.map((mission) => {
             const Icon = statusIcons[mission.status] || Clock;
             const color = statusColors[mission.status] || "text-white/40";
@@ -110,7 +109,7 @@ export function RecentTasks() {
 
       <Link
         href="/history"
-        className="mt-4 flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+        className="mt-4 flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 transition-colors flex-shrink-0"
       >
         View all <ArrowRight className="h-3 w-3" />
       </Link>
