@@ -1,5 +1,61 @@
 # Open Agent Development Progress
 
+## Iteration 3 Summary
+
+### Architecture Investigation ✅
+
+**OpenCode Backend Analysis**:
+- Confirmed backend exclusively uses OpenCode (hardcoded in `src/api/routes.rs:70`)
+- Despite `.env.example` mentioning "local" backend option, it's not implemented
+- Architecture comment: "Always use OpenCode backend"
+- OpenCode requires OAuth authentication (not API key)
+
+**Blocker Documentation**:
+- Created comprehensive BLOCKERS.md documenting all issues
+- Identified 2 critical blockers, 3 medium priority issues
+- Proposed 4 resolution options with effort estimates
+- Documented architectural findings and improvement suggestions
+
+### Testing Attempts ⚠️
+
+**Playwright Tests**:
+- Attempted execution but tests hang indefinitely
+- Dev server confirmed running on port 3001
+- Browsers installed (Firefox, Webkit)
+- Issue likely related to webServer config or async loading
+- 13 tests created but not yet validated
+
+**Mission Testing**:
+- Blocked by OpenCode authentication
+- Cannot proceed with 10 planned mission tests
+- Mission 1 failed with OAuth token refresh error
+- Documented in MISSION_TESTS.md
+
+### Key Findings 📋
+
+1. **Critical Dependency**: OpenCode is single point of failure
+2. **Authentication Model**: OAuth (not API key) creates automation challenges
+3. **No Alternative Backend**: "Local" backend mentioned but not implemented
+4. **Testing Blocked**: Cannot validate core functionality without auth resolution
+
+### Recommendations 💡
+
+**Immediate** (User Action Required):
+- Re-authenticate OpenCode: `opencode auth login`
+- Completes OAuth flow in browser
+- Unblocks all mission testing
+
+**Short-term** (4-8 hours development):
+- Implement direct Anthropic or OpenRouter backend
+- Bypass OpenCode dependency for testing
+- Use API keys instead of OAuth
+
+**Long-term** (8-16 hours development):
+- Hybrid backend architecture
+- Support OpenCode, Anthropic, and OpenRouter
+- User chooses via `AGENT_BACKEND` env var
+- Graceful degradation if OpenCode unavailable
+
 ## Iteration 2 Summary
 
 ### Completed Features
