@@ -740,6 +740,7 @@ export default function ControlClient() {
   const [showDesktopStream, setShowDesktopStream] = useState(false);
   const [desktopDisplayId, setDesktopDisplayId] = useState(":101");
   const [showDisplaySelector, setShowDisplaySelector] = useState(false);
+  const [hasDesktopSession, setHasDesktopSession] = useState(false);
 
   // Check if the mission we're viewing is actually running (not just any mission)
   const viewingMissionIsRunning = useMemo(() => {
@@ -1104,6 +1105,7 @@ export default function ControlClient() {
             setViewingMissionId(null);
             setViewingMission(null);
             setItems([]);
+            setHasDesktopSession(false);
           }
         })
         .finally(() => setMissionLoading(false));
@@ -1209,6 +1211,8 @@ export default function ControlClient() {
 
         const historyItems = missionHistoryToItems(mission);
         setItems(historyItems);
+        // Reset desktop session state when switching missions
+        setHasDesktopSession(false);
         // Update cache with fresh data
         setMissionItems((prev) => ({ ...prev, [missionId]: historyItems }));
         setViewingMission(mission);
@@ -1239,6 +1243,7 @@ export default function ControlClient() {
           setViewingMissionId(null);
           setViewingMission(null);
           setItems([]);
+          setHasDesktopSession(false);
           router.replace(`/control`, { scroll: false });
         }
       }
@@ -1269,6 +1274,7 @@ export default function ControlClient() {
       setViewingMission(mission);
       setViewingMissionId(mission.id); // Also update viewing to the new mission
       setItems([]);
+      setHasDesktopSession(false);
       setShowParallelPanel(true); // Show the missions panel so user can see the new mission
       // Refresh running missions to get accurate state
       const running = await getRunningMissions();
@@ -1604,12 +1610,18 @@ export default function ControlClient() {
           if (isRecord(result) && typeof result["display"] === "string") {
             const display = result["display"];
             setDesktopDisplayId(display);
+            setHasDesktopSession(true);
             // Auto-open desktop stream when session starts
             setShowDesktopStream(true);
           }
         }
+        // Handle desktop session close
+        if (eventToolName === "desktop_close_session" || eventToolName === "desktop_desktop_close_session") {
+          setHasDesktopSession(false);
+          setShowDesktopStream(false);
+        }
 
-        // If eventToolName wasn't available, check stored items for desktop_start_session
+        // If eventToolName wasn't available, check stored items for desktop session tools
         // Use itemsRef for synchronous read to avoid side effects in state updaters
         if (!eventToolName) {
           const toolItem = itemsRef.current.find(
@@ -1631,8 +1643,14 @@ export default function ControlClient() {
               if (isRecord(result) && typeof result["display"] === "string") {
                 const display = result["display"];
                 setDesktopDisplayId(display);
+                setHasDesktopSession(true);
                 setShowDesktopStream(true);
               }
+            }
+            // Check for desktop_close_session
+            if (toolName === "desktop_close_session" || toolName === "desktop_desktop_close_session") {
+              setHasDesktopSession(false);
+              setShowDesktopStream(false);
             }
           }
         }
@@ -1790,11 +1808,6 @@ export default function ControlClient() {
   const missionStatus = activeMission
     ? missionStatusLabel(activeMission.status)
     : null;
-  const missionTitle = activeMission?.title
-    ? activeMission.title.length > 60
-      ? activeMission.title.slice(0, 60) + "..."
-      : activeMission.title
-    : "New Mission";
 
   return (
     <div className="flex h-screen flex-col p-6">
@@ -1808,97 +1821,93 @@ export default function ControlClient() {
       />
 
       {/* Header */}
-      <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-4 min-w-0 flex-1">
-          <div className="flex items-center gap-3 min-w-0">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-indigo-500/20">
-              <Target className="h-5 w-5 text-indigo-400" />
+      <div className="mb-6 flex items-center justify-between gap-4">
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-500/20">
+              <Target className="h-4 w-4 text-indigo-400" />
             </div>
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <h1 className="text-lg font-semibold text-white truncate">
-                  {missionLoading ? "Loading..." : missionTitle}
-                </h1>
-                {missionStatus && (
-                  <span
-                    className={cn(
-                      "px-2 py-0.5 rounded-full text-xs font-medium shrink-0",
-                      missionStatus.className
-                    )}
-                  >
-                    {missionStatus.label}
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-white/40 truncate">
-                {activeMission
-                  ? `Mission ${activeMission.id.slice(0, 8)}...`
-                  : "No active mission"}
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-3 shrink-0 flex-wrap">
-          {activeMission && (
-            <div className="relative" ref={statusMenuRef}>
-              <button
-                onClick={() => setShowStatusMenu(!showStatusMenu)}
-                className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] transition-colors"
-              >
-                <span className="hidden sm:inline">Set</span> Status
-                <ChevronDown className="h-4 w-4" />
-              </button>
-              {showStatusMenu && (
-                <div className="absolute right-0 top-full mt-1 w-40 rounded-lg border border-white/[0.06] bg-[#1a1a1a] py-1 shadow-xl z-10">
-                  <button
-                    onClick={() => handleSetStatus("completed")}
-                    className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
-                  >
-                    <CheckCircle className="h-4 w-4 text-emerald-400" />
-                    Mark Complete
-                  </button>
-                  <button
-                    onClick={() => handleSetStatus("failed")}
-                    className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
-                  >
-                    <XCircle className="h-4 w-4 text-red-400" />
-                    Mark Failed
-                  </button>
-                  {(activeMission?.status === "interrupted" || activeMission?.status === "blocked") && (
-                    <>
-                      <button
-                        onClick={() => handleResumeMission(false)}
-                        disabled={missionLoading}
-                        className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
-                      >
-                        <PlayCircle className="h-4 w-4 text-emerald-400" />
-                        {activeMission?.status === "blocked" ? "Continue Mission" : "Resume Mission"}
-                      </button>
-                      <button
-                        onClick={() => handleResumeMission(true)}
-                        disabled={missionLoading}
-                        className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
-                        title="Delete work folder and start fresh"
-                      >
-                        <Trash2 className="h-4 w-4 text-orange-400" />
-                        Clean & {activeMission?.status === "blocked" ? "Continue" : "Resume"}
-                      </button>
-                    </>
+            <span className="text-sm font-medium text-white/60">
+              {activeMission ? activeMission.id.slice(0, 8) : "No mission"}
+            </span>
+            {activeMission && missionStatus && (
+              <div className="relative" ref={statusMenuRef}>
+                <button
+                  onClick={() => setShowStatusMenu(!showStatusMenu)}
+                  className={cn(
+                    "flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium transition-colors hover:opacity-80",
+                    missionStatus.className
                   )}
-                  {activeMission?.status !== "active" && activeMission?.status !== "interrupted" && activeMission?.status !== "blocked" && (
+                >
+                  {missionStatus.label}
+                  <ChevronDown className="h-3 w-3" />
+                </button>
+                {showStatusMenu && (
+                  <div className="absolute left-0 top-full mt-1 w-44 rounded-lg border border-white/[0.06] bg-[#1a1a1a] py-1 shadow-xl z-10">
                     <button
-                      onClick={() => handleSetStatus("active")}
+                      onClick={() => handleSetStatus("completed")}
                       className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
                     >
-                      <Clock className="h-4 w-4 text-indigo-400" />
-                      Reactivate
+                      <CheckCircle className="h-4 w-4 text-emerald-400" />
+                      Mark Complete
                     </button>
-                  )}
-                </div>
-              )}
-            </div>
+                    <button
+                      onClick={() => handleSetStatus("failed")}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
+                    >
+                      <XCircle className="h-4 w-4 text-red-400" />
+                      Mark Failed
+                    </button>
+                    {(activeMission?.status === "interrupted" || activeMission?.status === "blocked") && (
+                      <>
+                        <button
+                          onClick={() => handleResumeMission(false)}
+                          disabled={missionLoading}
+                          className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
+                        >
+                          <PlayCircle className="h-4 w-4 text-emerald-400" />
+                          {activeMission?.status === "blocked" ? "Continue" : "Resume"}
+                        </button>
+                        <button
+                          onClick={() => handleResumeMission(true)}
+                          disabled={missionLoading}
+                          className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
+                          title="Delete work folder and start fresh"
+                        >
+                          <Trash2 className="h-4 w-4 text-orange-400" />
+                          Clean & {activeMission?.status === "blocked" ? "Continue" : "Resume"}
+                        </button>
+                      </>
+                    )}
+                    {activeMission?.status !== "active" && activeMission?.status !== "interrupted" && activeMission?.status !== "blocked" && (
+                      <button
+                        onClick={() => handleSetStatus("active")}
+                        className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
+                      >
+                        <Clock className="h-4 w-4 text-indigo-400" />
+                        Reactivate
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          {/* Running missions indicator - compact line under mission info */}
+          {(runningMissions.length > 0 || currentMission) && (
+            <button
+              onClick={() => setShowParallelPanel(!showParallelPanel)}
+              className="flex items-center gap-1.5 text-xs text-white/40 hover:text-white/60 transition-colors ml-12"
+            >
+              <Layers className="h-3 w-3" />
+              <span className="font-medium tabular-nums">{runningMissions.length}</span>
+              <span>running</span>
+              <ChevronDown className={cn("h-3 w-3 transition-transform", showParallelPanel && "rotate-180")} />
+            </button>
           )}
+        </div>
+
+        <div className="flex items-center gap-3 shrink-0">
 
           <div className="relative" ref={newMissionDialogRef}>
             <button
@@ -1982,85 +1991,68 @@ export default function ControlClient() {
             )}
           </div>
 
-          {/* Parallel missions indicator */}
-          {(runningMissions.length > 0 || currentMission) && (
-            <button
-              onClick={() => setShowParallelPanel(!showParallelPanel)}
-              className={cn(
-                "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
-                showParallelPanel
-                  ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
-                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
-              )}
-            >
-              <Layers className="h-4 w-4" />
-              <span className="font-medium tabular-nums">
-                {runningMissions.length}
-              </span>
-              <span className="hidden sm:inline">Running</span>
-            </button>
-          )}
-
-          {/* Desktop stream toggle with display selector */}
-          <div className="relative flex items-center">
-            <button
-              onClick={() => setShowDesktopStream(!showDesktopStream)}
-              className={cn(
-                "flex items-center gap-2 rounded-l-lg border px-3 py-2 text-sm transition-colors",
-                showDesktopStream
-                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
-              )}
-              title={showDesktopStream ? "Hide desktop stream" : "Show desktop stream"}
-            >
-              <Monitor className="h-4 w-4" />
-              <span className="hidden sm:inline">Desktop</span>
-              {showDesktopStream ? (
-                <PanelRightClose className="h-4 w-4" />
-              ) : (
-                <PanelRight className="h-4 w-4" />
-              )}
-            </button>
-            <div className="relative">
+          {/* Desktop stream toggle with display selector - only shown when a desktop session is active */}
+          {hasDesktopSession && (
+            <div className="relative flex items-center">
               <button
-                onClick={() => setShowDisplaySelector(!showDisplaySelector)}
+                onClick={() => setShowDesktopStream(!showDesktopStream)}
                 className={cn(
-                  "flex items-center gap-1.5 rounded-r-lg border-y border-r px-3 py-2 text-sm transition-colors",
+                  "flex items-center gap-2 rounded-l-lg border px-3 py-2 text-sm transition-colors",
                   showDesktopStream
                     ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
                     : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
                 )}
-                title="Select display"
+                title={showDesktopStream ? "Hide desktop stream" : "Show desktop stream"}
               >
-                <span className="text-sm font-mono">{desktopDisplayId}</span>
-                <ChevronDown className="h-3.5 w-3.5" />
+                <Monitor className="h-4 w-4" />
+                <span className="hidden sm:inline">Desktop</span>
+                {showDesktopStream ? (
+                  <PanelRightClose className="h-4 w-4" />
+                ) : (
+                  <PanelRight className="h-4 w-4" />
+                )}
               </button>
-              {showDisplaySelector && (
-                <div className="absolute right-0 top-full mt-1 z-50 min-w-[120px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
-                  {[":99", ":100", ":101", ":102"].map((display) => (
-                    <button
-                      key={display}
-                      onClick={() => {
-                        setDesktopDisplayId(display);
-                        setShowDisplaySelector(false);
-                      }}
-                      className={cn(
-                        "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
-                        desktopDisplayId === display
-                          ? "text-emerald-400"
-                          : "text-white/70"
-                      )}
-                    >
-                      {display}
-                      {desktopDisplayId === display && (
-                        <CheckCircle className="ml-auto h-3.5 w-3.5" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              )}
+              <div className="relative">
+                <button
+                  onClick={() => setShowDisplaySelector(!showDisplaySelector)}
+                  className={cn(
+                    "flex items-center gap-1.5 rounded-r-lg border-y border-r px-3 py-2 text-sm transition-colors",
+                    showDesktopStream
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                      : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
+                  )}
+                  title="Select display"
+                >
+                  <span className="text-sm font-mono">{desktopDisplayId}</span>
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </button>
+                {showDisplaySelector && (
+                  <div className="absolute right-0 top-full mt-1 z-50 min-w-[120px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
+                    {[":99", ":100", ":101", ":102"].map((display) => (
+                      <button
+                        key={display}
+                        onClick={() => {
+                          setDesktopDisplayId(display);
+                          setShowDisplaySelector(false);
+                        }}
+                        className={cn(
+                          "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
+                          desktopDisplayId === display
+                            ? "text-emerald-400"
+                            : "text-white/70"
+                        )}
+                      >
+                        {display}
+                        {desktopDisplayId === display && (
+                          <CheckCircle className="ml-auto h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
+          )}
 
           {/* Status panel */}
           <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
