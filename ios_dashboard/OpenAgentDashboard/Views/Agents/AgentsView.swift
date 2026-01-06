@@ -7,16 +7,7 @@
 
 import SwiftUI
 
-struct AgentConfig: Identifiable, Codable {
-    let id: String
-    var name: String
-    var model_id: String
-    var mcp_servers: [String]
-    var skills: [String]
-    var commands: [String]
-    let created_at: String
-    let updated_at: String
-}
+// AgentConfig model is now in Models/AgentConfig.swift
 
 struct AgentsView: View {
     @State private var agents: [AgentConfig] = []

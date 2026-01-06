@@ -131,11 +131,11 @@ struct WorkspaceCard: View {
                         .font(.headline)
                         .foregroundColor(.white)
                     Spacer()
-                    StatusBadge(status: workspace.status)
+                    WorkspaceStatusBadge(status: workspace.status)
                 }
 
                 HStack {
-                    Text(workspace.workspace_type)
+                    Text(workspace.workspaceType.displayName)
                         .font(.caption)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
@@ -180,7 +180,7 @@ struct WorkspaceDetailView: View {
                             Text("Type")
                                 .font(.caption)
                                 .foregroundColor(.white.opacity(0.4))
-                            Text(workspace.workspace_type)
+                            Text(workspace.workspaceType.displayName)
                                 .foregroundColor(.white)
                         }
 
@@ -189,7 +189,7 @@ struct WorkspaceDetailView: View {
                                 .font(.caption)
                                 .foregroundColor(.white.opacity(0.4))
                             HStack {
-                                StatusBadge(status: workspace.status)
+                                WorkspaceStatusBadge(status: workspace.status)
                                 Spacer()
                             }
                         }
@@ -212,7 +212,7 @@ struct WorkspaceDetailView: View {
                                 .foregroundColor(.white.opacity(0.8))
                         }
 
-                        if let errorMessage = workspace.error_message {
+                        if let errorMessage = workspace.errorMessage {
                             VStack(alignment: .leading, spacing: 8) {
                                 Text("Error")
                                     .font(.caption)

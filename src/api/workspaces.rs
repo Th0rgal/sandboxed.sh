@@ -26,6 +26,7 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/", post(create_workspace))
         .route("/:id", get(get_workspace))
         .route("/:id", delete(delete_workspace))
+        .route("/:id/build", post(build_workspace))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +238,16 @@ async fn delete_workspace(
         ));
     }
 
+    // If it's a chroot workspace, destroy the chroot first
+    if let Some(ws) = state.workspaces.get(id).await {
+        if ws.workspace_type == WorkspaceType::Chroot {
+            if let Err(e) = crate::workspace::destroy_chroot_workspace(&ws).await {
+                tracing::warn!("Failed to destroy chroot: {}", e);
+                // Continue with deletion anyway
+            }
+        }
+    }
+
     if state.workspaces.delete(id).await {
         Ok((
             StatusCode::OK,
@@ -244,6 +255,45 @@ async fn delete_workspace(
         ))
     } else {
         Err((StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))
+    }
+}
+
+/// POST /api/workspaces/:id/build - Build a chroot workspace.
+async fn build_workspace(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
+    let mut workspace = state
+        .workspaces
+        .get(id)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
+
+    if workspace.workspace_type != WorkspaceType::Chroot {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Workspace is not a chroot type".to_string(),
+        ));
+    }
+
+    // Build the chroot
+    match crate::workspace::build_chroot_workspace(&mut workspace, None).await {
+        Ok(()) => {
+            // Update in store
+            state.workspaces.update(workspace.clone()).await;
+            Ok(Json(workspace.into()))
+        }
+        Err(e) => {
+            // Update status to error and save
+            workspace.status = WorkspaceStatus::Error;
+            workspace.error_message = Some(e.to_string());
+            state.workspaces.update(workspace.clone()).await;
+
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build chroot: {}", e),
+            ))
+        }
     }
 }
 

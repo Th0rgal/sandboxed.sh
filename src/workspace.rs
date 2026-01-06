@@ -7,7 +7,7 @@
 //! ## Workspace Types
 //!
 //! - **Host**: Execute directly on the remote host environment
-//! - **Chroot**: Execute inside an isolated chroot environment (future)
+//! - **Chroot**: Execute inside an isolated chroot environment
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ use tokio::sync::RwLock;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::chroot::{self, ChrootDistro};
 use crate::config::Config;
 use crate::mcp::{McpRegistry, McpServerConfig, McpTransport};
 
@@ -36,7 +37,7 @@ pub const DEFAULT_WORKSPACE_ID: Uuid = Uuid::nil();
 pub enum WorkspaceType {
     /// Execute directly on remote host
     Host,
-    /// Execute inside isolated chroot environment (future)
+    /// Execute inside isolated chroot environment
     Chroot,
 }
 
@@ -405,4 +406,65 @@ pub async fn resolve_workspace_root(
             config.working_dir.clone()
         }
     }
+}
+
+/// Build a chroot workspace.
+pub async fn build_chroot_workspace(
+    workspace: &mut Workspace,
+    distro: Option<ChrootDistro>,
+) -> anyhow::Result<()> {
+    if workspace.workspace_type != WorkspaceType::Chroot {
+        return Err(anyhow::anyhow!(
+            "Workspace is not a chroot type"
+        ));
+    }
+
+    // Check if already built
+    if chroot::is_chroot_created(&workspace.path).await {
+        tracing::info!("Chroot already exists at {}", workspace.path.display());
+        workspace.status = WorkspaceStatus::Ready;
+        return Ok(());
+    }
+
+    // Update status to building
+    workspace.status = WorkspaceStatus::Building;
+
+    let distro = distro.unwrap_or_default();
+
+    tracing::info!(
+        "Building chroot workspace at {} with distro {}",
+        workspace.path.display(),
+        distro.as_str()
+    );
+
+    // Create the chroot
+    match chroot::create_chroot(&workspace.path, distro).await {
+        Ok(()) => {
+            workspace.status = WorkspaceStatus::Ready;
+            workspace.error_message = None;
+            tracing::info!("Chroot workspace built successfully");
+            Ok(())
+        }
+        Err(e) => {
+            workspace.status = WorkspaceStatus::Error;
+            workspace.error_message = Some(format!("Chroot build failed: {}", e));
+            tracing::error!("Failed to build chroot: {}", e);
+            Err(anyhow::anyhow!("Chroot build failed: {}", e))
+        }
+    }
+}
+
+/// Destroy a chroot workspace.
+pub async fn destroy_chroot_workspace(workspace: &Workspace) -> anyhow::Result<()> {
+    if workspace.workspace_type != WorkspaceType::Chroot {
+        return Err(anyhow::anyhow!(
+            "Workspace is not a chroot type"
+        ));
+    }
+
+    tracing::info!("Destroying chroot workspace at {}", workspace.path.display());
+
+    chroot::destroy_chroot(&workspace.path).await?;
+
+    Ok(())
 }

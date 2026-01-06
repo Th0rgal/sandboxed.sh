@@ -100,7 +100,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Initialize agent configuration store
     let agents = Arc::new(crate::agent_config::AgentStore::new(
         config.working_dir.join(".openagent/agents.json"),
-    ));
+    ).await);
 
     // Spawn the single global control session actor.
     let control_state = control::ControlHub::new(

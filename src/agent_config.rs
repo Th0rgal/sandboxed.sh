@@ -57,7 +57,7 @@ pub struct AgentStore {
 }
 
 impl AgentStore {
-    pub fn new(storage_path: PathBuf) -> Self {
+    pub async fn new(storage_path: PathBuf) -> Self {
         let store = Self {
             agents: Arc::new(RwLock::new(HashMap::new())),
             storage_path,
@@ -65,7 +65,7 @@ impl AgentStore {
 
         // Load existing agents
         if let Ok(loaded) = store.load_from_disk() {
-            let mut agents = store.agents.blocking_write();
+            let mut agents = store.agents.write().await;
             *agents = loaded;
         }
 

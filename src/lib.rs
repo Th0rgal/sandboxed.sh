@@ -37,6 +37,7 @@ pub mod agent_config;
 pub mod agents;
 pub mod api;
 pub mod budget;
+pub mod chroot;
 pub mod config;
 pub mod library;
 pub mod llm;
