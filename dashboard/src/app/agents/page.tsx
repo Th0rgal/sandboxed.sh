@@ -86,6 +86,19 @@ export default function AgentsPage() {
     loadData();
   }, []);
 
+  // Handle Escape key for modals
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (showNewAgentDialog) setShowNewAgentDialog(false);
+      }
+    };
+    if (showNewAgentDialog) {
+      document.addEventListener('keydown', handleKeyDown);
+      return () => document.removeEventListener('keydown', handleKeyDown);
+    }
+  }, [showNewAgentDialog]);
+
   const loadAgent = async (id: string) => {
     try {
       const agent = await getAgent(id);
@@ -186,7 +199,7 @@ export default function AgentsPage() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-full">
+      <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
         <Loader className="h-8 w-8 animate-spin text-white/40" />
       </div>
     );
@@ -220,8 +233,8 @@ export default function AgentsPage() {
         </button>
       </div>
 
-      <div className="flex-1 min-h-0 rounded-xl bg-white/[0.02] border border-white/[0.06] overflow-hidden">
-        <div className="flex flex-1 min-h-0 items-stretch">
+      <div className="flex-1 min-h-0 rounded-xl bg-white/[0.02] border border-white/[0.06] overflow-hidden flex flex-col">
+        <div className="flex flex-1 min-h-0">
           {/* Agent List */}
           <div className="w-64 border-r border-white/[0.06] flex flex-col min-h-0">
             <div className="p-3 border-b border-white/[0.06]">

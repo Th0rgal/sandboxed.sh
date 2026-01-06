@@ -48,6 +48,20 @@ export default function WorkspacesPage() {
     loadData();
   }, []);
 
+  // Handle Escape key for modals
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (selectedWorkspace) setSelectedWorkspace(null);
+        if (showNewWorkspaceDialog) setShowNewWorkspaceDialog(false);
+      }
+    };
+    if (selectedWorkspace || showNewWorkspaceDialog) {
+      document.addEventListener('keydown', handleKeyDown);
+      return () => document.removeEventListener('keydown', handleKeyDown);
+    }
+  }, [selectedWorkspace, showNewWorkspaceDialog]);
+
   const loadWorkspace = async (id: string) => {
     try {
       const workspace = await getWorkspace(id);
@@ -93,7 +107,7 @@ export default function WorkspacesPage() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-full">
+      <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
         <Loader className="h-8 w-8 animate-spin text-white/40" />
       </div>
     );
