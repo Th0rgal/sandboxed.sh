@@ -123,21 +123,167 @@ impl Workspace {
 // Workspace Store
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// In-memory store for workspaces.
+/// Persistent store for workspaces with JSON file backing.
 pub struct WorkspaceStore {
     workspaces: RwLock<HashMap<Uuid, Workspace>>,
+    storage_path: PathBuf,
+    working_dir: PathBuf,
 }
 
 impl WorkspaceStore {
-    /// Create a new workspace store with the default host workspace.
-    pub fn new(working_dir: PathBuf) -> Self {
-        let mut workspaces = HashMap::new();
-        let host = Workspace::default_host(working_dir);
-        workspaces.insert(host.id, host);
+    /// Create a new workspace store, loading existing data from disk.
+    ///
+    /// This also scans for orphaned chroot directories and restores them.
+    pub async fn new(working_dir: PathBuf) -> Self {
+        let storage_path = working_dir.join(".openagent/workspaces.json");
 
-        Self {
-            workspaces: RwLock::new(workspaces),
+        let store = Self {
+            workspaces: RwLock::new(HashMap::new()),
+            storage_path,
+            working_dir: working_dir.clone(),
+        };
+
+        // Load existing workspaces from disk
+        let mut workspaces = match store.load_from_disk() {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                tracing::warn!("Failed to load workspaces from disk: {}", e);
+                HashMap::new()
+            }
+        };
+
+        // Ensure default host workspace exists
+        if !workspaces.contains_key(&DEFAULT_WORKSPACE_ID) {
+            let host = Workspace::default_host(working_dir.clone());
+            workspaces.insert(host.id, host);
         }
+
+        // Scan for orphaned chroots and restore them
+        let orphaned = store.scan_orphaned_chroots(&workspaces).await;
+        for workspace in orphaned {
+            tracing::info!(
+                "Restored orphaned chroot workspace: {} at {}",
+                workspace.name,
+                workspace.path.display()
+            );
+            workspaces.insert(workspace.id, workspace);
+        }
+
+        // Store workspaces
+        {
+            let mut guard = store.workspaces.write().await;
+            *guard = workspaces;
+        }
+
+        // Save to disk to persist any recovered workspaces
+        if let Err(e) = store.save_to_disk().await {
+            tracing::error!("Failed to save workspaces to disk: {}", e);
+        }
+
+        store
+    }
+
+    /// Load workspaces from disk.
+    fn load_from_disk(&self) -> Result<HashMap<Uuid, Workspace>, std::io::Error> {
+        if !self.storage_path.exists() {
+            return Ok(HashMap::new());
+        }
+
+        let contents = std::fs::read_to_string(&self.storage_path)?;
+        let workspaces: Vec<Workspace> = serde_json::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        Ok(workspaces.into_iter().map(|w| (w.id, w)).collect())
+    }
+
+    /// Save workspaces to disk.
+    async fn save_to_disk(&self) -> Result<(), std::io::Error> {
+        let workspaces = self.workspaces.read().await;
+        let workspaces_vec: Vec<&Workspace> = workspaces.values().collect();
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.storage_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let contents = serde_json::to_string_pretty(&workspaces_vec)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        std::fs::write(&self.storage_path, contents)?;
+        Ok(())
+    }
+
+    /// Scan for chroot directories that exist on disk but aren't in the store.
+    async fn scan_orphaned_chroots(&self, known: &HashMap<Uuid, Workspace>) -> Vec<Workspace> {
+        let chroots_dir = self.working_dir.join(".openagent/chroots");
+
+        if !chroots_dir.exists() {
+            return Vec::new();
+        }
+
+        // Get all known chroot paths
+        let known_paths: std::collections::HashSet<PathBuf> = known
+            .values()
+            .filter(|w| w.workspace_type == WorkspaceType::Chroot)
+            .map(|w| w.path.clone())
+            .collect();
+
+        let mut orphaned = Vec::new();
+
+        // Read chroots directory
+        let entries = match std::fs::read_dir(&chroots_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!("Failed to read chroots directory: {}", e);
+                return Vec::new();
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // Skip non-directories
+            if !path.is_dir() {
+                continue;
+            }
+
+            // Check if this path is known
+            if known_paths.contains(&path) {
+                continue;
+            }
+
+            // Get the directory name as workspace name
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            // Check if it looks like a valid chroot (has basic structure)
+            let is_valid_chroot = path.join("etc").exists() || path.join("bin").exists();
+
+            // Determine status based on filesystem state
+            let status = if is_valid_chroot {
+                WorkspaceStatus::Ready
+            } else {
+                // Incomplete chroot - might have been interrupted
+                WorkspaceStatus::Pending
+            };
+
+            let workspace = Workspace {
+                id: Uuid::new_v4(),
+                name,
+                workspace_type: WorkspaceType::Chroot,
+                path,
+                status,
+                error_message: None,
+                config: serde_json::json!({}),
+                created_at: Utc::now(), // We don't know the actual creation time
+            };
+
+            orphaned.push(workspace);
+        }
+
+        orphaned
     }
 
     /// List all workspaces.
@@ -164,20 +310,37 @@ impl WorkspaceStore {
     /// Add a new workspace.
     pub async fn add(&self, workspace: Workspace) -> Uuid {
         let id = workspace.id;
-        let mut guard = self.workspaces.write().await;
-        guard.insert(id, workspace);
+        {
+            let mut guard = self.workspaces.write().await;
+            guard.insert(id, workspace);
+        }
+
+        if let Err(e) = self.save_to_disk().await {
+            tracing::error!("Failed to save workspaces to disk: {}", e);
+        }
+
         id
     }
 
     /// Update a workspace.
     pub async fn update(&self, workspace: Workspace) -> bool {
-        let mut guard = self.workspaces.write().await;
-        if guard.contains_key(&workspace.id) {
-            guard.insert(workspace.id, workspace);
-            true
-        } else {
-            false
+        let updated = {
+            let mut guard = self.workspaces.write().await;
+            if guard.contains_key(&workspace.id) {
+                guard.insert(workspace.id, workspace);
+                true
+            } else {
+                false
+            }
+        };
+
+        if updated {
+            if let Err(e) = self.save_to_disk().await {
+                tracing::error!("Failed to save workspaces to disk: {}", e);
+            }
         }
+
+        updated
     }
 
     /// Delete a workspace (cannot delete the default host workspace).
@@ -185,8 +348,19 @@ impl WorkspaceStore {
         if id == DEFAULT_WORKSPACE_ID {
             return false; // Cannot delete default workspace
         }
-        let mut guard = self.workspaces.write().await;
-        guard.remove(&id).is_some()
+
+        let existed = {
+            let mut guard = self.workspaces.write().await;
+            guard.remove(&id).is_some()
+        };
+
+        if existed {
+            if let Err(e) = self.save_to_disk().await {
+                tracing::error!("Failed to save workspaces to disk: {}", e);
+            }
+        }
+
+        existed
     }
 }
 

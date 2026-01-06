@@ -21,6 +21,7 @@
 //! - `DELETE /api/agents/{id}` - Delete agent configuration
 
 pub mod agents;
+pub mod ai_providers;
 mod auth;
 mod console;
 pub mod control;

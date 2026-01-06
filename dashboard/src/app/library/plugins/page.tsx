@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { toast } from 'sonner';
-import { type McpServerDef } from '@/lib/api';
+import { type Plugin } from '@/lib/api';
 import {
   AlertCircle,
   Check,
@@ -16,146 +16,78 @@ import {
   X,
   Plug,
   Settings,
+  ToggleLeft,
+  ToggleRight,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
-import { CopyButton } from '@/components/ui/copy-button';
 import { useLibrary } from '@/contexts/library-context';
 
-type McpEntry = {
-  name: string;
-  def: McpServerDef;
+type PluginEntry = {
+  id: string;
+  plugin: Plugin;
 };
 
-type McpFormState = {
-  name: string;
-  type: McpServerDef['type'];
-  url: string;
-  command: string; // Full command string (will be split into array)
-  env: string;
-  headers: string;
+type PluginFormState = {
+  id: string;
+  package: string;
+  description: string;
+  enabled: boolean;
+  ui: {
+    icon: string;
+    label: string;
+    hint: string;
+    category: string;
+  };
 };
 
-const typeLabels: Record<McpServerDef['type'], string> = {
-  local: 'Local',
-  remote: 'Remote',
-};
-
-function formatEndpoint(def: McpServerDef): string {
-  if (def.type === 'remote') return def.url ?? '';
-  const parts = def.command ?? [];
-  return parts.join(' ');
-}
-
-function serializeCommand(command?: string[]): string {
-  if (!command || command.length === 0) return '';
-  // Join with newlines for multi-line editing
-  return command.join('\n');
-}
-
-function parseCommand(value: string): string[] {
-  // Split by newlines for multi-line format, or by spaces for single-line
-  const trimmed = value.trim();
-  if (!trimmed) return [];
-  if (trimmed.includes('\n')) {
-    return trimmed.split('\n').map((line) => line.trim()).filter(Boolean);
-  }
-  // Single line: split by spaces but preserve quoted strings
-  return trimmed.split(/\s+/).filter(Boolean);
-}
-
-function serializeEnv(env?: Record<string, string>): string {
-  if (!env || Object.keys(env).length === 0) return '';
-  return Object.entries(env)
-    .map(([key, value]) => `${key}=${value}`)
-    .join('\n');
-}
-
-function parseEnv(value: string): { env: Record<string, string>; error?: string } {
-  const trimmed = value.trim();
-  if (!trimmed) return { env: {} };
-  const env: Record<string, string> = {};
-  for (const rawLine of trimmed.split('\n')) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    const idx = line.indexOf('=');
-    if (idx <= 0) {
-      return { env: {}, error: `Invalid env line: "${rawLine}"` };
-    }
-    const key = line.slice(0, idx).trim();
-    const val = line.slice(idx + 1).trim();
-    if (!key) {
-      return { env: {}, error: `Invalid env key in line: "${rawLine}"` };
-    }
-    env[key] = val;
-  }
-  return { env };
-}
-
-function serializeHeaders(headers?: Record<string, string>): string {
-  if (!headers || Object.keys(headers).length === 0) return '';
-  return Object.entries(headers)
-    .map(([key, value]) => `${key}: ${value}`)
-    .join('\n');
-}
-
-function parseHeaders(value: string): { headers: Record<string, string>; error?: string } {
-  const trimmed = value.trim();
-  if (!trimmed) return { headers: {} };
-  const headers: Record<string, string> = {};
-  for (const rawLine of trimmed.split('\n')) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    const idx = line.indexOf(':');
-    if (idx <= 0) {
-      return { headers: {}, error: `Invalid header line: "${rawLine}"` };
-    }
-    const key = line.slice(0, idx).trim();
-    const val = line.slice(idx + 1).trim();
-    if (!key) {
-      return { headers: {}, error: `Invalid header key in line: "${rawLine}"` };
-    }
-    headers[key] = val;
-  }
-  return { headers };
-}
-
-function buildFormState(entry?: McpEntry): McpFormState {
+function buildFormState(entry?: PluginEntry): PluginFormState {
   if (!entry) {
     return {
-      name: '',
-      type: 'local',
-      url: '',
-      command: '',
-      env: '',
-      headers: '',
+      id: '',
+      package: '',
+      description: '',
+      enabled: true,
+      ui: {
+        icon: '',
+        label: '',
+        hint: '',
+        category: '',
+      },
     };
   }
 
   return {
-    name: entry.name,
-    type: entry.def.type,
-    url: entry.def.type === 'remote' ? entry.def.url ?? '' : '',
-    command: entry.def.type === 'local' ? serializeCommand(entry.def.command) : '',
-    env: entry.def.type === 'local' ? serializeEnv(entry.def.env) : '',
-    headers: entry.def.type === 'remote' ? serializeHeaders(entry.def.headers) : '',
+    id: entry.id,
+    package: entry.plugin.package,
+    description: entry.plugin.description ?? '',
+    enabled: entry.plugin.enabled ?? true,
+    ui: {
+      icon: entry.plugin.ui?.icon ?? '',
+      label: entry.plugin.ui?.label ?? '',
+      hint: entry.plugin.ui?.hint ?? '',
+      category: entry.plugin.ui?.category ?? '',
+    },
   };
 }
 
-function McpCard({
+function PluginCard({
   entry,
   isSelected,
   onSelect,
+  onToggle,
 }: {
-  entry: McpEntry;
+  entry: PluginEntry;
   isSelected: boolean;
-  onSelect: (entry: McpEntry | null) => void;
+  onSelect: (entry: PluginEntry | null) => void;
+  onToggle: (id: string, enabled: boolean) => void;
 }) {
-  const endpoint = formatEndpoint(entry.def);
-  const commandParts = entry.def.type === 'local' ? entry.def.command ?? [] : [];
-
   const handleSelect = () => onSelect(isSelected ? null : entry);
+  const handleToggle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    onToggle(entry.id, !entry.plugin.enabled);
+  };
 
   return (
     <div
@@ -183,62 +115,61 @@ function McpCard({
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h3 className="font-medium text-white truncate">{entry.name}</h3>
-            <span className="tag">{typeLabels[entry.def.type]}</span>
+            <h3 className="font-medium text-white truncate">{entry.plugin.ui?.label || entry.id}</h3>
+            {entry.plugin.ui?.category && (
+              <span className="tag">{entry.plugin.ui.category}</span>
+            )}
           </div>
-          <div className="flex items-center gap-1 group">
-            <p className="text-xs text-white/40 truncate">
-              {endpoint || 'No endpoint configured'}
-            </p>
-            {endpoint && <CopyButton text={endpoint} showOnHover label="Copied endpoint" />}
-          </div>
+          <p className="text-xs text-white/40 truncate">
+            {entry.plugin.package || 'No package specified'}
+          </p>
         </div>
+        <button
+          onClick={handleToggle}
+          className="flex-shrink-0 p-1 rounded hover:bg-white/[0.08] transition-colors"
+          title={entry.plugin.enabled ? 'Disable plugin' : 'Enable plugin'}
+        >
+          {entry.plugin.enabled ? (
+            <ToggleRight className="h-6 w-6 text-emerald-400" />
+          ) : (
+            <ToggleLeft className="h-6 w-6 text-white/30" />
+          )}
+        </button>
       </div>
 
-      <div className="flex flex-wrap gap-1 mb-3">
-        {commandParts.slice(0, 3).map((part, idx) => (
-          <span key={idx} className="tag">
-            {part}
-          </span>
-        ))}
-        {commandParts.length > 3 && <span className="tag">+{commandParts.length - 3}</span>}
-        {entry.def.type === 'local' && commandParts.length === 0 && (
-          <span className="text-[10px] text-white/30">No command</span>
-        )}
-      </div>
+      {entry.plugin.description && (
+        <p className="text-xs text-white/50 mb-3 line-clamp-2">{entry.plugin.description}</p>
+      )}
 
       <div className="flex items-center justify-between pt-3 border-t border-white/[0.04]">
         <span className="text-[10px] text-white/30">
-          {entry.def.type === 'remote' ? 'Remote MCP' : 'Local MCP'}
+          {entry.plugin.ui?.hint || 'Plugin'}
         </span>
-        <span className="text-[10px] text-white/40">Library config</span>
+        <span className={cn(
+          'text-[10px]',
+          entry.plugin.enabled ? 'text-emerald-400' : 'text-white/30'
+        )}>
+          {entry.plugin.enabled ? 'Enabled' : 'Disabled'}
+        </span>
       </div>
     </div>
   );
 }
 
-function McpDetailPanel({
+function PluginDetailPanel({
   entry,
   onClose,
   onEdit,
   onDelete,
 }: {
-  entry: McpEntry;
+  entry: PluginEntry;
   onClose: () => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
-  const endpoint = formatEndpoint(entry.def);
-  const commandParts = entry.def.type === 'local' ? entry.def.command ?? [] : [];
-  const envEntries = entry.def.type === 'local' ? Object.entries(entry.def.env ?? {}) : [];
-  const headerEntries = entry.def.type === 'remote' ? Object.entries(entry.def.headers ?? {}) : [];
-
-  // Handle Escape key to close panel
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose();
-      }
+      if (e.key === 'Escape') onClose();
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
@@ -257,10 +188,15 @@ function McpDetailPanel({
         <div className="flex items-start justify-between border-b border-white/[0.06] p-4">
           <div>
             <div className="flex items-center gap-2">
-              <h2 className="text-lg font-semibold text-white">{entry.name}</h2>
-              <span className="tag">{typeLabels[entry.def.type]}</span>
+              <h2 className="text-lg font-semibold text-white">{entry.plugin.ui?.label || entry.id}</h2>
+              <span className={cn(
+                'tag',
+                entry.plugin.enabled ? 'text-emerald-400 border-emerald-400/20' : ''
+              )}>
+                {entry.plugin.enabled ? 'Enabled' : 'Disabled'}
+              </span>
             </div>
-            <p className="text-xs text-white/40 mt-1">mcp/servers.json</p>
+            <p className="text-xs text-white/40 mt-1">plugins.json</p>
           </div>
           <button
             onClick={onClose}
@@ -272,67 +208,43 @@ function McpDetailPanel({
 
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
           <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-4">
-            <p className="text-xs text-white/40 mb-2">Endpoint</p>
-            <div className="flex items-center gap-2 group">
-              <p className="text-sm text-white break-all">
-                {endpoint || 'Not configured'}
-              </p>
-              {endpoint && <CopyButton text={endpoint} showOnHover label="Copied endpoint" />}
-            </div>
+            <p className="text-xs text-white/40 mb-2">Plugin ID</p>
+            <p className="text-sm text-white">{entry.id}</p>
           </div>
 
-          {entry.def.type === 'local' && (
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-4">
+            <p className="text-xs text-white/40 mb-2">Package</p>
+            <p className="text-sm text-white">{entry.plugin.package || 'Not specified'}</p>
+          </div>
+
+          {entry.plugin.description && (
             <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-4">
-              <p className="text-xs text-white/40 mb-2">Command Parts</p>
-              {commandParts.length === 0 ? (
-                <p className="text-sm text-white/40">No command configured</p>
-              ) : (
-                <div className="flex flex-wrap gap-1">
-                  {commandParts.map((part, idx) => (
-                    <span key={idx} className="tag">
-                      {part}
-                    </span>
-                  ))}
-                </div>
-              )}
+              <p className="text-xs text-white/40 mb-2">Description</p>
+              <p className="text-sm text-white/70">{entry.plugin.description}</p>
             </div>
           )}
 
-          {entry.def.type === 'local' && (
-            <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-4">
-              <p className="text-xs text-white/40 mb-2">Environment</p>
-              {envEntries.length === 0 ? (
-                <p className="text-sm text-white/40">No environment variables</p>
-              ) : (
-                <div className="space-y-2">
-                  {envEntries.map(([key, value]) => (
-                    <div key={key} className="flex items-center justify-between text-sm">
-                      <span className="text-white/70">{key}</span>
-                      <span className="text-white/40 truncate max-w-[200px]">{value}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-4">
+            <p className="text-xs text-white/40 mb-2">UI Metadata</p>
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between">
+                <span className="text-white/50">Icon</span>
+                <span className="text-white">{entry.plugin.ui?.icon || '-'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-white/50">Label</span>
+                <span className="text-white">{entry.plugin.ui?.label || '-'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-white/50">Hint</span>
+                <span className="text-white">{entry.plugin.ui?.hint || '-'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-white/50">Category</span>
+                <span className="text-white">{entry.plugin.ui?.category || '-'}</span>
+              </div>
             </div>
-          )}
-
-          {entry.def.type === 'remote' && (
-            <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-4">
-              <p className="text-xs text-white/40 mb-2">Headers</p>
-              {headerEntries.length === 0 ? (
-                <p className="text-sm text-white/40">No headers configured</p>
-              ) : (
-                <div className="space-y-2">
-                  {headerEntries.map(([key, value]) => (
-                    <div key={key} className="flex items-center justify-between text-sm">
-                      <span className="text-white/70">{key}</span>
-                      <span className="text-white/40 truncate max-w-[200px]">{value}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+          </div>
         </div>
 
         <div className="border-t border-white/[0.06] p-4 flex items-center gap-2">
@@ -355,7 +267,7 @@ function McpDetailPanel({
   );
 }
 
-function McpFormModal({
+function PluginFormModal({
   open,
   title,
   initial,
@@ -364,11 +276,11 @@ function McpFormModal({
 }: {
   open: boolean;
   title: string;
-  initial?: McpEntry;
+  initial?: PluginEntry;
   onClose: () => void;
-  onSave: (name: string, def: McpServerDef) => Promise<void>;
+  onSave: (id: string, plugin: Plugin) => Promise<void>;
 }) {
-  const [form, setForm] = useState<McpFormState>(() => buildFormState(initial));
+  const [form, setForm] = useState<PluginFormState>(() => buildFormState(initial));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -379,13 +291,10 @@ function McpFormModal({
     setLoading(false);
   }, [open, initial]);
 
-  // Handle Escape key to close modal
   useEffect(() => {
     if (!open) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose();
-      }
+      if (e.key === 'Escape') onClose();
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
@@ -393,59 +302,47 @@ function McpFormModal({
 
   if (!open) return null;
 
-  const updateForm = (updates: Partial<McpFormState>) => {
+  const updateForm = (updates: Partial<PluginFormState>) => {
     setForm((prev) => ({ ...prev, ...updates }));
+  };
+
+  const updateUI = (updates: Partial<PluginFormState['ui']>) => {
+    setForm((prev) => ({ ...prev, ui: { ...prev.ui, ...updates } }));
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
 
-    const name = form.name.trim();
-    if (!name) {
-      setError('Name is required');
+    const id = form.id.trim();
+    if (!id) {
+      setError('Plugin ID is required');
       return;
     }
 
-    if (form.type === 'remote') {
-      if (!form.url.trim()) {
-        setError('Endpoint URL is required');
-        return;
-      }
-    } else {
-      if (!form.command.trim()) {
-        setError('Command is required');
-        return;
-      }
-    }
-
-    const parsedEnv = form.type === 'local' ? parseEnv(form.env) : { env: {} };
-    if (parsedEnv.error) {
-      setError(parsedEnv.error);
+    if (!form.ui.label.trim()) {
+      setError('Display label is required');
       return;
     }
 
-    const parsedHeaders = form.type === 'remote' ? parseHeaders(form.headers) : { headers: {} };
-    if (parsedHeaders.error) {
-      setError(parsedHeaders.error);
-      return;
-    }
-
-    const def: McpServerDef =
-      form.type === 'remote'
-        ? { type: 'remote', url: form.url.trim(), headers: parsedHeaders.headers }
-        : {
-            type: 'local',
-            command: parseCommand(form.command),
-            env: parsedEnv.env,
-          };
+    const plugin: Plugin = {
+      package: form.package.trim(),
+      description: form.description.trim() || null,
+      enabled: form.enabled,
+      ui: {
+        icon: form.ui.icon.trim() || null,
+        label: form.ui.label.trim(),
+        hint: form.ui.hint.trim() || null,
+        category: form.ui.category.trim() || null,
+      },
+    };
 
     setLoading(true);
     try {
-      await onSave(name, def);
+      await onSave(id, plugin);
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save MCP');
+      setError(err instanceof Error ? err.message : 'Failed to save plugin');
     } finally {
       setLoading(false);
     }
@@ -453,7 +350,7 @@ function McpFormModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in">
-      <div className="w-full max-w-md rounded-2xl glass-panel border border-white/[0.08] p-6 animate-slide-up">
+      <div className="w-full max-w-md rounded-2xl glass-panel border border-white/[0.08] p-6 animate-slide-up max-h-[90vh] overflow-y-auto">
         <div className="mb-6 flex items-center justify-between">
           <h2 className="text-lg font-semibold text-white">{title}</h2>
           <button
@@ -467,78 +364,100 @@ function McpFormModal({
         <form onSubmit={handleSubmit}>
           <div className="space-y-4">
             <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">Name</label>
+              <label className="block text-xs font-medium text-white/60 mb-1.5">Plugin ID</label>
               <input
                 type="text"
-                value={form.name}
-                onChange={(e) => updateForm({ name: e.target.value })}
-                placeholder="e.g., Supabase MCP"
+                value={form.id}
+                onChange={(e) => updateForm({ id: e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-') })}
+                placeholder="e.g., ralph-wiggum"
                 className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
                 required
+                disabled={!!initial}
               />
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">Type</label>
-              <select
-                value={form.type}
-                onChange={(e) => updateForm({ type: e.target.value as McpServerDef['type'] })}
-                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none transition-colors"
-              >
-                <option value="local">Local (stdio)</option>
-                <option value="remote">Remote (HTTP)</option>
-              </select>
+              <label className="block text-xs font-medium text-white/60 mb-1.5">Package Name</label>
+              <input
+                type="text"
+                value={form.package}
+                onChange={(e) => updateForm({ package: e.target.value })}
+                placeholder="e.g., @opencode/ralph-wiggum"
+                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
+              />
             </div>
 
-            {form.type === 'remote' ? (
-              <>
+            <div>
+              <label className="block text-xs font-medium text-white/60 mb-1.5">Description</label>
+              <textarea
+                value={form.description}
+                onChange={(e) => updateForm({ description: e.target.value })}
+                placeholder="What this plugin does..."
+                rows={2}
+                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors resize-none"
+              />
+            </div>
+
+            <div className="pt-2 border-t border-white/[0.06]">
+              <p className="text-xs font-medium text-white/60 mb-3">UI Display Settings</p>
+
+              <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-medium text-white/60 mb-1.5">Endpoint URL</label>
+                  <label className="block text-xs text-white/40 mb-1">Icon (Lucide)</label>
                   <input
                     type="text"
-                    value={form.url}
-                    onChange={(e) => updateForm({ url: e.target.value })}
-                    placeholder="https://mcp.example.com/mcp"
-                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
+                    value={form.ui.icon}
+                    onChange={(e) => updateUI({ icon: e.target.value })}
+                    placeholder="zap"
+                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-white/40 mb-1">Label *</label>
+                  <input
+                    type="text"
+                    value={form.ui.label}
+                    onChange={(e) => updateUI({ label: e.target.value })}
+                    placeholder="Ralph Wiggum"
+                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
                     required
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-white/60 mb-1.5">Headers (Key: Value)</label>
-                  <textarea
-                    value={form.headers}
-                    onChange={(e) => updateForm({ headers: e.target.value })}
-                    placeholder="Authorization: Bearer ..."
-                    rows={3}
-                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors resize-none"
-                  />
-                </div>
-              </>
-            ) : (
-              <>
-                <div>
-                  <label className="block text-xs font-medium text-white/60 mb-1.5">Command (one part per line or space-separated)</label>
-                  <textarea
-                    value={form.command}
-                    onChange={(e) => updateForm({ command: e.target.value })}
-                    placeholder="npx&#10;@playwright/mcp@latest"
-                    rows={3}
-                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors resize-none"
-                    required
+                  <label className="block text-xs text-white/40 mb-1">Hint</label>
+                  <input
+                    type="text"
+                    value={form.ui.hint}
+                    onChange={(e) => updateUI({ hint: e.target.value })}
+                    placeholder="continuous running"
+                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-white/60 mb-1.5">Environment (KEY=VALUE)</label>
-                  <textarea
-                    value={form.env}
-                    onChange={(e) => updateForm({ env: e.target.value })}
-                    placeholder="OPENAI_API_KEY=..."
-                    rows={3}
-                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors resize-none"
+                  <label className="block text-xs text-white/40 mb-1">Category</label>
+                  <input
+                    type="text"
+                    value={form.ui.category}
+                    onChange={(e) => updateUI({ category: e.target.value })}
+                    placeholder="automation"
+                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
                   />
                 </div>
-              </>
-            )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="enabled"
+                checked={form.enabled}
+                onChange={(e) => updateForm({ enabled: e.target.checked })}
+                className="rounded border-white/20 bg-white/5 text-indigo-500"
+              />
+              <label htmlFor="enabled" className="text-sm text-white/70">
+                Enable plugin by default
+              </label>
+            </div>
 
             {error && (
               <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3">
@@ -560,7 +479,7 @@ function McpFormModal({
               disabled={loading}
               className="rounded-lg bg-indigo-500 hover:bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {loading ? 'Saving...' : 'Save MCP'}
+              {loading ? 'Saving...' : 'Save Plugin'}
             </button>
           </div>
         </form>
@@ -569,10 +488,10 @@ function McpFormModal({
   );
 }
 
-export default function McpsPage() {
+export default function PluginsPage() {
   const {
     status,
-    mcps,
+    plugins,
     loading,
     error,
     libraryUnavailable,
@@ -582,60 +501,55 @@ export default function McpsPage() {
     commit,
     push,
     clearError,
-    saveMcps,
+    savePlugins,
     syncing,
     committing,
     pushing,
   } = useLibrary();
 
-  const [selectedName, setSelectedName] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showAddModal, setShowAddModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const [pendingDelete, setPendingDelete] = useState<McpEntry | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<PluginEntry | null>(null);
   const [commitMessage, setCommitMessage] = useState('');
   const [showCommitDialog, setShowCommitDialog] = useState(false);
 
-  const entries = useMemo<McpEntry[]>(() => {
-    return Object.entries(mcps)
-      .map(([name, def]) => ({ name, def }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }, [mcps]);
+  const entries = useMemo<PluginEntry[]>(() => {
+    return Object.entries(plugins)
+      .map(([id, plugin]) => ({ id, plugin }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+  }, [plugins]);
 
   const selectedEntry = useMemo(
-    () => entries.find((entry) => entry.name === selectedName) ?? null,
-    [entries, selectedName]
+    () => entries.find((entry) => entry.id === selectedId) ?? null,
+    [entries, selectedId]
   );
 
   const filteredEntries = useMemo(() => {
     if (!searchQuery.trim()) return entries;
     const query = searchQuery.toLowerCase();
     return entries.filter((entry) => {
-      const endpoint = formatEndpoint(entry.def).toLowerCase();
-      const command = entry.def.type === 'local' ? (entry.def.command ?? []).join(' ').toLowerCase() : '';
       return (
-        entry.name.toLowerCase().includes(query) ||
-        endpoint.includes(query) ||
-        command.includes(query)
+        entry.id.toLowerCase().includes(query) ||
+        entry.plugin.package.toLowerCase().includes(query) ||
+        (entry.plugin.ui?.label ?? '').toLowerCase().includes(query) ||
+        (entry.plugin.description ?? '').toLowerCase().includes(query)
       );
     });
   }, [entries, searchQuery]);
 
-  // Clear selection if the selected item no longer exists
   useEffect(() => {
-    if (selectedName && !mcps[selectedName]) {
-      setSelectedName(null);
+    if (selectedId && !plugins[selectedId]) {
+      setSelectedId(null);
     }
-  }, [mcps, selectedName]);
+  }, [plugins, selectedId]);
 
-  // Handle Escape key for commit dialog
   useEffect(() => {
     if (!showCommitDialog) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setShowCommitDialog(false);
-      }
+      if (e.key === 'Escape') setShowCommitDialog(false);
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
@@ -645,7 +559,7 @@ export default function McpsPage() {
     try {
       await sync();
     } catch {
-      // Error is handled by context
+      // Error handled by context
     }
   };
 
@@ -656,7 +570,7 @@ export default function McpsPage() {
       setCommitMessage('');
       setShowCommitDialog(false);
     } catch {
-      // Error is handled by context
+      // Error handled by context
     }
   };
 
@@ -664,34 +578,45 @@ export default function McpsPage() {
     try {
       await push();
     } catch {
-      // Error is handled by context
+      // Error handled by context
     }
   };
 
-  const handleAddMcp = async (name: string, def: McpServerDef) => {
-    if (mcps[name]) {
-      throw new Error(`MCP "${name}" already exists`);
-    }
-    const next = { ...mcps, [name]: def };
-    await saveMcps(next);
-    setSelectedName(name);
-    toast.success(`Added ${name}`);
+  const handleTogglePlugin = async (id: string, enabled: boolean) => {
+    const current = plugins[id];
+    if (!current) return;
+
+    const next = {
+      ...plugins,
+      [id]: { ...current, enabled },
+    };
+    await savePlugins(next);
+    toast.success(`${enabled ? 'Enabled' : 'Disabled'} ${current.ui?.label || id}`);
   };
 
-  const handleUpdateMcp = async (name: string, def: McpServerDef) => {
+  const handleAddPlugin = async (id: string, plugin: Plugin) => {
+    if (plugins[id]) {
+      throw new Error(`Plugin "${id}" already exists`);
+    }
+    const next = { ...plugins, [id]: plugin };
+    await savePlugins(next);
+    setSelectedId(id);
+    toast.success(`Added ${plugin.ui?.label || id}`);
+  };
+
+  const handleUpdatePlugin = async (id: string, plugin: Plugin) => {
     if (!selectedEntry) return;
-    if (name !== selectedEntry.name && mcps[name]) {
-      throw new Error(`MCP "${name}" already exists`);
+    const next = { ...plugins };
+    if (id !== selectedEntry.id) {
+      delete next[selectedEntry.id];
     }
-    const next = { ...mcps };
-    delete next[selectedEntry.name];
-    next[name] = def;
-    await saveMcps(next);
-    setSelectedName(name);
-    toast.success(`Saved ${name}`);
+    next[id] = plugin;
+    await savePlugins(next);
+    setSelectedId(id);
+    toast.success(`Saved ${plugin.ui?.label || id}`);
   };
 
-  const requestDelete = (entry: McpEntry) => {
+  const requestDelete = (entry: PluginEntry) => {
     setPendingDelete(entry);
     setShowDeleteConfirm(true);
   };
@@ -699,15 +624,15 @@ export default function McpsPage() {
   const handleDelete = async () => {
     if (!pendingDelete) return;
     try {
-      const next = { ...mcps };
-      delete next[pendingDelete.name];
-      await saveMcps(next);
-      toast.success(`Removed ${pendingDelete.name}`);
-      if (selectedName === pendingDelete.name) {
-        setSelectedName(null);
+      const next = { ...plugins };
+      delete next[pendingDelete.id];
+      await savePlugins(next);
+      toast.success(`Removed ${pendingDelete.plugin.ui?.label || pendingDelete.id}`);
+      if (selectedId === pendingDelete.id) {
+        setSelectedId(null);
       }
     } catch {
-      toast.error(`Failed to remove ${pendingDelete.name}`);
+      toast.error(`Failed to remove ${pendingDelete.id}`);
     } finally {
       setShowDeleteConfirm(false);
       setPendingDelete(null);
@@ -761,13 +686,9 @@ export default function McpsPage() {
                   </div>
                   {(status.ahead > 0 || status.behind > 0) && (
                     <div className="text-xs text-white/40">
-                      {status.ahead > 0 && (
-                        <span className="text-emerald-400">+{status.ahead}</span>
-                      )}
+                      {status.ahead > 0 && <span className="text-emerald-400">+{status.ahead}</span>}
                       {status.ahead > 0 && status.behind > 0 && ' / '}
-                      {status.behind > 0 && (
-                        <span className="text-amber-400">-{status.behind}</span>
-                      )}
+                      {status.behind > 0 && <span className="text-amber-400">-{status.behind}</span>}
                     </div>
                   )}
                 </div>
@@ -807,15 +728,15 @@ export default function McpsPage() {
 
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h1 className="text-xl font-semibold text-white">MCP Servers</h1>
-              <p className="text-sm text-white/40">Configure MCP definitions stored in your library repo.</p>
+              <h1 className="text-xl font-semibold text-white">Plugins</h1>
+              <p className="text-sm text-white/40">Manage OpenCode plugins stored in your library repo.</p>
             </div>
             <button
               onClick={() => setShowAddModal(true)}
               className="flex items-center gap-2 rounded-lg bg-indigo-500 hover:bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors"
             >
               <Plus className="h-4 w-4" />
-              Add MCP
+              Add Plugin
             </button>
           </div>
 
@@ -825,7 +746,7 @@ export default function McpsPage() {
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search MCPs..."
+              placeholder="Search plugins..."
               className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] pl-10 pr-4 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
             />
           </div>
@@ -834,52 +755,53 @@ export default function McpsPage() {
             <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-8 text-center">
               <p className="text-sm text-white/40">
                 {entries.length === 0
-                  ? 'No MCP servers configured yet.'
-                  : 'No MCPs match your search.'}
+                  ? 'No plugins configured yet. Add your first plugin to get started.'
+                  : 'No plugins match your search.'}
               </p>
             </div>
           ) : (
             <div className="grid gap-4 md:grid-cols-2">
               {filteredEntries.map((entry) => (
-                <McpCard
-                  key={entry.name}
+                <PluginCard
+                  key={entry.id}
                   entry={entry}
-                  isSelected={selectedName === entry.name}
-                  onSelect={(next) => setSelectedName(next?.name ?? null)}
+                  isSelected={selectedId === entry.id}
+                  onSelect={(next) => setSelectedId(next?.id ?? null)}
+                  onToggle={handleTogglePlugin}
                 />
               ))}
             </div>
           )}
 
           {selectedEntry && (
-            <McpDetailPanel
+            <PluginDetailPanel
               entry={selectedEntry}
-              onClose={() => setSelectedName(null)}
+              onClose={() => setSelectedId(null)}
               onEdit={() => setShowEditModal(true)}
               onDelete={() => requestDelete(selectedEntry)}
             />
           )}
 
-          <McpFormModal
+          <PluginFormModal
             open={showAddModal}
-            title="Add MCP Server"
+            title="Add Plugin"
             onClose={() => setShowAddModal(false)}
-            onSave={handleAddMcp}
+            onSave={handleAddPlugin}
           />
 
-          <McpFormModal
+          <PluginFormModal
             open={showEditModal}
-            title={selectedEntry ? `Edit ${selectedEntry.name}` : 'Edit MCP'}
+            title={selectedEntry ? `Edit ${selectedEntry.plugin.ui?.label || selectedEntry.id}` : 'Edit Plugin'}
             initial={selectedEntry ?? undefined}
             onClose={() => setShowEditModal(false)}
-            onSave={handleUpdateMcp}
+            onSave={handleUpdatePlugin}
           />
 
           <ConfirmDialog
             open={showDeleteConfirm}
-            title={`Remove ${pendingDelete?.name}?`}
-            description="This will remove the MCP definition from your library repo. This action cannot be undone."
-            confirmLabel="Remove MCP"
+            title={`Remove ${pendingDelete?.plugin.ui?.label || pendingDelete?.id}?`}
+            description="This will remove the plugin from your library repo. This action cannot be undone."
+            confirmLabel="Remove Plugin"
             variant="danger"
             onConfirm={handleDelete}
             onCancel={() => {

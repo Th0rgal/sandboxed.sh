@@ -20,6 +20,10 @@ import {
   FileCode,
   Bot,
   Server,
+  Puzzle,
+  ScrollText,
+  Users,
+  Wrench,
 } from 'lucide-react';
 
 type NavItem = {
@@ -41,8 +45,12 @@ const navigation: NavItem[] = [
     icon: Library,
     children: [
       { name: 'MCP Servers', href: '/library/mcps', icon: Plug },
+      { name: 'Plugins', href: '/library/plugins', icon: Puzzle },
       { name: 'Skills', href: '/library/skills', icon: FileCode },
       { name: 'Commands', href: '/library/commands', icon: Terminal },
+      { name: 'Rules', href: '/library/rules', icon: ScrollText },
+      { name: 'Agents', href: '/library/agents', icon: Users },
+      { name: 'Tools', href: '/library/tools', icon: Wrench },
     ],
   },
   { name: 'Settings', href: '/settings', icon: Settings },

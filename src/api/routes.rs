@@ -29,6 +29,7 @@ use crate::mcp::McpRegistry;
 use crate::tools::ToolRegistry;
 use crate::workspace;
 
+use super::ai_providers as ai_providers_api;
 use super::auth::{self, AuthUser};
 use super::console;
 use super::control;
@@ -63,6 +64,8 @@ pub struct AppState {
     pub agents: Arc<crate::agent_config::AgentStore>,
     /// OpenCode connection store
     pub opencode_connections: Arc<crate::opencode_config::OpenCodeStore>,
+    /// AI Provider store
+    pub ai_providers: Arc<crate::ai_providers::AIProviderStore>,
     /// Secrets store for encrypted credentials
     pub secrets: Option<Arc<crate::secrets::SecretsStore>>,
 }
@@ -88,8 +91,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Load model resolver for auto-upgrading outdated model names
     let resolver = crate::budget::load_resolver(&config.working_dir.to_string_lossy());
 
-    // Initialize workspace store
-    let workspaces = Arc::new(workspace::WorkspaceStore::new(config.working_dir.clone()));
+    // Initialize workspace store (loads from disk and recovers orphaned chroots)
+    let workspaces = Arc::new(workspace::WorkspaceStore::new(config.working_dir.clone()).await);
 
     // Initialize agent configuration store
     let agents = Arc::new(crate::agent_config::AgentStore::new(
@@ -99,6 +102,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Initialize OpenCode connection store
     let opencode_connections = Arc::new(crate::opencode_config::OpenCodeStore::new(
         config.working_dir.join(".openagent/opencode_connections.json"),
+    ).await);
+
+    // Initialize AI provider store
+    let ai_providers = Arc::new(crate::ai_providers::AIProviderStore::new(
+        config.working_dir.join(".openagent/ai_providers.json"),
     ).await);
 
     // Initialize secrets store
@@ -155,6 +163,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         workspaces,
         agents,
         opencode_connections,
+        ai_providers,
         secrets,
     });
 
@@ -279,6 +288,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/agents", super::agents::routes())
         // OpenCode connection endpoints
         .nest("/api/opencode/connections", opencode_api::routes())
+        // AI Provider endpoints
+        .nest("/api/ai/providers", ai_providers_api::routes())
         // Secrets management endpoints
         .nest("/api/secrets", secrets_api::routes())
         .layer(middleware::from_fn_with_state(

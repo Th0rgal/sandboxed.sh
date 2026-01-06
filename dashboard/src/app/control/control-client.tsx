@@ -36,6 +36,7 @@ import {
   type Workspace,
   type AgentConfig,
 } from "@/lib/api";
+import { useLibrary } from "@/contexts/library-context";
 import {
   Send,
   Square,
@@ -712,6 +713,9 @@ export default function ControlClient() {
   // Workspaces and agents for mission creation
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [agents, setAgents] = useState<AgentConfig[]>([]);
+
+  // Library context for plugins (hooks)
+  const { plugins } = useLibrary();
 
   // Parallel missions state
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
@@ -2091,27 +2095,38 @@ export default function ControlClient() {
                     </div>
                   )}
 
-                  {/* Hooks */}
+                  {/* Hooks (Plugins) */}
                   <div>
                     <label className="block text-xs text-white/50 mb-1.5">
                       Hooks
                     </label>
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={newMissionHooks.includes("ralph-wiggum")}
-                        onChange={(e) => {
-                          if (e.target.checked) {
-                            setNewMissionHooks([...newMissionHooks, "ralph-wiggum"]);
-                          } else {
-                            setNewMissionHooks(newMissionHooks.filter((h) => h !== "ralph-wiggum"));
-                          }
-                        }}
-                        className="rounded border-white/20 bg-white/5 text-indigo-500 focus:ring-indigo-500/50"
-                      />
-                      <span className="text-sm text-white/80">Ralph Wiggum</span>
-                      <span className="text-xs text-white/40">(continuous running)</span>
-                    </label>
+                    <div className="space-y-1.5">
+                      {Object.entries(plugins)
+                        .filter(([_, plugin]) => plugin.enabled)
+                        .map(([id, plugin]) => (
+                          <label key={id} className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={newMissionHooks.includes(id)}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setNewMissionHooks([...newMissionHooks, id]);
+                                } else {
+                                  setNewMissionHooks(newMissionHooks.filter((h) => h !== id));
+                                }
+                              }}
+                              className="rounded border-white/20 bg-white/5 text-indigo-500 focus:ring-indigo-500/50"
+                            />
+                            <span className="text-sm text-white/80">{plugin.ui?.label || id}</span>
+                            {plugin.ui?.hint && (
+                              <span className="text-xs text-white/40">({plugin.ui.hint})</span>
+                            )}
+                          </label>
+                        ))}
+                      {Object.keys(plugins).filter(id => plugins[id].enabled).length === 0 && (
+                        <p className="text-xs text-white/40">No plugins available. Add plugins in Library → Plugins.</p>
+                      )}
+                    </div>
                   </div>
 
                   <div className="flex gap-2 pt-1">

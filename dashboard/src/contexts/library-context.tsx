@@ -22,11 +22,32 @@ import {
   deleteLibrarySkill,
   saveLibraryCommand,
   deleteLibraryCommand,
+  getLibraryPlugins,
+  saveLibraryPlugins,
+  listLibraryRules,
+  getLibraryRule,
+  saveLibraryRule,
+  deleteLibraryRule,
+  listLibraryAgents,
+  getLibraryAgent as apiGetLibraryAgent,
+  saveLibraryAgent as apiSaveLibraryAgent,
+  deleteLibraryAgent,
+  listLibraryTools,
+  getLibraryTool as apiGetLibraryTool,
+  saveLibraryTool as apiSaveLibraryTool,
+  deleteLibraryTool,
   LibraryUnavailableError,
   type LibraryStatus,
   type McpServerDef,
   type SkillSummary,
   type CommandSummary,
+  type Plugin,
+  type RuleSummary,
+  type Rule,
+  type LibraryAgentSummary,
+  type LibraryAgent,
+  type LibraryToolSummary,
+  type LibraryTool,
 } from '@/lib/api';
 
 interface LibraryContextValue {
@@ -35,6 +56,10 @@ interface LibraryContextValue {
   mcps: Record<string, McpServerDef>;
   skills: SkillSummary[];
   commands: CommandSummary[];
+  plugins: Record<string, Plugin>;
+  rules: RuleSummary[];
+  libraryAgents: LibraryAgentSummary[];
+  libraryTools: LibraryToolSummary[];
   loading: boolean;
   error: string | null;
   libraryUnavailable: boolean;
@@ -58,6 +83,28 @@ interface LibraryContextValue {
   // Command operations
   saveCommand: (name: string, content: string) => Promise<void>;
   removeCommand: (name: string) => Promise<void>;
+
+  // Plugin operations
+  savePlugins: (plugins: Record<string, Plugin>) => Promise<void>;
+  refreshPlugins: () => Promise<void>;
+
+  // Rule operations
+  getRule: (name: string) => Promise<Rule>;
+  saveRule: (name: string, content: string) => Promise<void>;
+  removeRule: (name: string) => Promise<void>;
+  refreshRules: () => Promise<void>;
+
+  // Library Agent operations
+  getLibraryAgent: (name: string) => Promise<LibraryAgent>;
+  saveLibraryAgent: (name: string, content: string) => Promise<void>;
+  removeLibraryAgent: (name: string) => Promise<void>;
+  refreshLibraryAgents: () => Promise<void>;
+
+  // Library Tool operations
+  getLibraryTool: (name: string) => Promise<LibraryTool>;
+  saveLibraryTool: (name: string, content: string) => Promise<void>;
+  removeLibraryTool: (name: string) => Promise<void>;
+  refreshLibraryTools: () => Promise<void>;
 
   // Operation states
   syncing: boolean;
@@ -84,6 +131,10 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
   const [mcps, setMcps] = useState<Record<string, McpServerDef>>({});
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [commands, setCommands] = useState<CommandSummary[]>([]);
+  const [plugins, setPlugins] = useState<Record<string, Plugin>>({});
+  const [rules, setRules] = useState<RuleSummary[]>([]);
+  const [libraryAgents, setLibraryAgents] = useState<LibraryAgentSummary[]>([]);
+  const [libraryTools, setLibraryTools] = useState<LibraryToolSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [libraryUnavailable, setLibraryUnavailable] = useState(false);
@@ -100,17 +151,25 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       setLibraryUnavailable(false);
       setLibraryUnavailableMessage(null);
 
-      const [statusData, mcpsData, skillsData, commandsData] = await Promise.all([
+      const [statusData, mcpsData, skillsData, commandsData, pluginsData, rulesData, agentsData, toolsData] = await Promise.all([
         getLibraryStatus(),
         getLibraryMcps(),
         listLibrarySkills(),
         listLibraryCommands(),
+        getLibraryPlugins().catch(() => ({})), // May not exist yet
+        listLibraryRules().catch(() => []),
+        listLibraryAgents().catch(() => []),
+        listLibraryTools().catch(() => []),
       ]);
 
       setStatus(statusData);
       setMcps(mcpsData);
       setSkills(skillsData);
       setCommands(commandsData);
+      setPlugins(pluginsData);
+      setRules(rulesData);
+      setLibraryAgents(agentsData);
+      setLibraryTools(toolsData);
     } catch (err) {
       if (err instanceof LibraryUnavailableError) {
         setLibraryUnavailable(true);
@@ -119,6 +178,10 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
         setMcps({});
         setSkills([]);
         setCommands([]);
+        setPlugins({});
+        setRules([]);
+        setLibraryAgents([]);
+        setLibraryTools([]);
         return;
       }
       setError(err instanceof Error ? err.message : 'Failed to load library data');
@@ -215,6 +278,106 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
     await refreshStatus();
   }, [refreshStatus]);
 
+  // Plugin operations
+  const _savePlugins = useCallback(async (newPlugins: Record<string, Plugin>) => {
+    await saveLibraryPlugins(newPlugins);
+    setPlugins(newPlugins);
+    await refreshStatus();
+  }, [refreshStatus]);
+
+  const refreshPlugins = useCallback(async () => {
+    try {
+      const pluginsData = await getLibraryPlugins();
+      setPlugins(pluginsData);
+    } catch {
+      // Silently fail - plugins may not exist yet
+    }
+  }, []);
+
+  // Rule operations
+  const saveRule = useCallback(async (name: string, content: string) => {
+    await saveLibraryRule(name, content);
+    const rulesData = await listLibraryRules();
+    setRules(rulesData);
+    await refreshStatus();
+  }, [refreshStatus]);
+
+  const removeRule = useCallback(async (name: string) => {
+    await deleteLibraryRule(name);
+    setRules((prev) => prev.filter((r) => r.name !== name));
+    await refreshStatus();
+  }, [refreshStatus]);
+
+  const refreshRules = useCallback(async () => {
+    try {
+      const rulesData = await listLibraryRules();
+      setRules(rulesData);
+    } catch {
+      // Silently fail
+    }
+  }, []);
+
+  // Rule getter
+  const getRule = useCallback(async (name: string): Promise<Rule> => {
+    return getLibraryRule(name);
+  }, []);
+
+  // Library Agent operations
+  const getLibraryAgent = useCallback(async (name: string): Promise<LibraryAgent> => {
+    return apiGetLibraryAgent(name);
+  }, []);
+
+  const saveLibraryAgentFn = useCallback(async (name: string, content: string) => {
+    // Build a LibraryAgent object from content
+    const agent: LibraryAgent = { name, content };
+    await apiSaveLibraryAgent(name, agent);
+    const agentsData = await listLibraryAgents();
+    setLibraryAgents(agentsData);
+    await refreshStatus();
+  }, [refreshStatus]);
+
+  const removeLibraryAgent = useCallback(async (name: string) => {
+    await deleteLibraryAgent(name);
+    setLibraryAgents((prev) => prev.filter((a) => a.name !== name));
+    await refreshStatus();
+  }, [refreshStatus]);
+
+  const refreshLibraryAgents = useCallback(async () => {
+    try {
+      const agentsData = await listLibraryAgents();
+      setLibraryAgents(agentsData);
+    } catch {
+      // Silently fail
+    }
+  }, []);
+
+  // Library Tool operations
+  const getLibraryTool = useCallback(async (name: string): Promise<LibraryTool> => {
+    return apiGetLibraryTool(name);
+  }, []);
+
+  const saveLibraryToolFn = useCallback(async (name: string, content: string) => {
+    await apiSaveLibraryTool(name, content);
+    const toolsData = await listLibraryTools();
+    setLibraryTools(toolsData);
+    await refreshStatus();
+  }, [refreshStatus]);
+
+  const removeLibraryTool = useCallback(async (name: string) => {
+    await deleteLibraryTool(name);
+    setLibraryTools((prev) => prev.filter((t) => t.name !== name));
+    await refreshStatus();
+  }, [refreshStatus]);
+
+  const refreshLibraryTools = useCallback(async () => {
+    try {
+      const toolsData = await listLibraryTools();
+      setLibraryTools(toolsData);
+    } catch {
+      // Silently fail
+    }
+  }, []);
+
   const clearError = useCallback(() => {
     setError(null);
   }, []);
@@ -225,6 +388,10 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       mcps,
       skills,
       commands,
+      plugins,
+      rules,
+      libraryAgents,
+      libraryTools,
       loading,
       error,
       libraryUnavailable,
@@ -240,6 +407,20 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       removeSkill,
       saveCommand,
       removeCommand,
+      savePlugins: _savePlugins,
+      refreshPlugins,
+      getRule,
+      saveRule,
+      removeRule,
+      refreshRules,
+      getLibraryAgent,
+      saveLibraryAgent: saveLibraryAgentFn,
+      removeLibraryAgent,
+      refreshLibraryAgents,
+      getLibraryTool,
+      saveLibraryTool: saveLibraryToolFn,
+      removeLibraryTool,
+      refreshLibraryTools,
       syncing,
       committing,
       pushing,
@@ -249,6 +430,10 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       mcps,
       skills,
       commands,
+      plugins,
+      rules,
+      libraryAgents,
+      libraryTools,
       loading,
       error,
       libraryUnavailable,
@@ -264,6 +449,20 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       removeSkill,
       saveCommand,
       removeCommand,
+      _savePlugins,
+      refreshPlugins,
+      getRule,
+      saveRule,
+      removeRule,
+      refreshRules,
+      getLibraryAgent,
+      saveLibraryAgentFn,
+      removeLibraryAgent,
+      refreshLibraryAgents,
+      getLibraryTool,
+      saveLibraryToolFn,
+      removeLibraryTool,
+      refreshLibraryTools,
       syncing,
       committing,
       pushing,

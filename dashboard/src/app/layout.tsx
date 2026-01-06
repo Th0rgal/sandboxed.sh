@@ -4,6 +4,7 @@ import { Toaster } from "sonner";
 import "./globals.css";
 import { Sidebar } from "@/components/sidebar";
 import { AuthGate } from "@/components/auth-gate";
+import { LibraryProvider } from "@/contexts/library-context";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -34,8 +35,10 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         <AuthGate>
-          <Sidebar />
-          <main className="ml-56 min-h-screen">{children}</main>
+          <LibraryProvider>
+            <Sidebar />
+            <main className="ml-56 min-h-screen">{children}</main>
+          </LibraryProvider>
         </AuthGate>
         <Toaster
           theme="dark"

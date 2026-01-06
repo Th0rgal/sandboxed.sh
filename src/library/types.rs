@@ -3,21 +3,192 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP Server Types (OpenCode-aligned format)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn default_true() -> bool {
+    true
+}
+
 /// MCP server definition from mcp/servers.json.
-/// Matches the existing format in the skills repo.
+/// Aligned with OpenCode format: "local" (stdio) and "remote" (http).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum McpServer {
-    Stdio {
-        command: String,
-        #[serde(default)]
-        args: Vec<String>,
+    /// Local MCP server (stdio-based)
+    Local {
+        /// Command array: ["npx", "@playwright/mcp@latest"]
+        command: Vec<String>,
         #[serde(default)]
         env: HashMap<String, String>,
+        #[serde(default = "default_true")]
+        enabled: bool,
     },
-    Http {
+    /// Remote MCP server (HTTP-based)
+    Remote {
         url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        #[serde(default = "default_true")]
+        enabled: bool,
     },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plugin Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// UI metadata for a plugin (used by dashboard).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginUI {
+    /// Lucide icon name (e.g., "zap", "refresh-cw")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Display name (e.g., "Ralph Wiggum")
+    pub label: String,
+    /// Short description/hint (e.g., "continuous running")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// Category for grouping (e.g., "automation", "observability")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+}
+
+/// Plugin definition from plugins.json.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Plugin {
+    /// npm package name (e.g., "oh-my-opencode", "@opencode/ralph-wiggum")
+    pub package: String,
+    /// Description of what this plugin does
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether the plugin is enabled
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// UI metadata for dashboard display
+    pub ui: PluginUI,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule Types (AGENTS.md style instructions)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Rule summary for listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleSummary {
+    /// Rule name (filename without .md)
+    pub name: String,
+    /// Description from frontmatter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root (e.g., "rule/code-style.md")
+    pub path: String,
+}
+
+/// Full rule with content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rule {
+    /// Rule name
+    pub name: String,
+    /// Description from frontmatter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root
+    pub path: String,
+    /// Full markdown content
+    pub content: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Library Agent Types (OpenCode agent definitions)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Library agent summary for listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryAgentSummary {
+    /// Agent name (filename without .md)
+    pub name: String,
+    /// Description from frontmatter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root
+    pub path: String,
+}
+
+/// Full library agent definition.
+/// These are OpenCode agent definitions stored as markdown with YAML frontmatter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryAgent {
+    /// Agent name
+    pub name: String,
+    /// Description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root
+    pub path: String,
+    /// Full markdown content (frontmatter + body)
+    pub content: String,
+    /// Model ID (e.g., "claude-sonnet-4-20250514") - extracted from frontmatter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Tool patterns: {"read": true, "write": false, "playwright_*": true}
+    #[serde(default)]
+    pub tools: HashMap<String, bool>,
+    /// Permission levels: {"bash": "ask", "write": "allow"}
+    #[serde(default)]
+    pub permissions: HashMap<String, String>,
+    /// Skills to include by name
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Rules to include by name
+    #[serde(default)]
+    pub rules: Vec<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Library Tool Types (TypeScript tool definitions)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Library tool summary for listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryToolSummary {
+    /// Tool name (filename without .ts)
+    pub name: String,
+    /// Description extracted from code comments or export
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root (e.g., "tool/database-query.ts")
+    pub path: String,
+}
+
+/// Full library tool with content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryTool {
+    /// Tool name
+    pub name: String,
+    /// Description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root
+    pub path: String,
+    /// Full TypeScript content
+    pub content: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Skill Types (supports multiple .md files per skill)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single markdown file within a skill folder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillFile {
+    /// File name (e.g., "SKILL.md", "examples.md")
+    pub name: String,
+    /// Path relative to skill folder
+    pub path: String,
+    /// Full file content
+    pub content: String,
 }
 
 /// Skill summary for listing (without full content).
@@ -26,8 +197,9 @@ pub struct SkillSummary {
     /// Skill name (folder name, e.g., "frontend-development")
     pub name: String,
     /// Description from SKILL.md frontmatter
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Path relative to library root (e.g., "skills/frontend-development")
+    /// Path relative to library root (e.g., "skill/frontend-development")
     pub path: String,
 }
 
@@ -37,14 +209,23 @@ pub struct Skill {
     /// Skill name (folder name)
     pub name: String,
     /// Description from SKILL.md frontmatter
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Path relative to library root
     pub path: String,
-    /// Full SKILL.md content
+    /// Primary SKILL.md content (for backwards compatibility)
     pub content: String,
-    /// List of reference files in references/ folder
+    /// All markdown files in the skill folder
+    #[serde(default)]
+    pub files: Vec<SkillFile>,
+    /// List of non-.md reference files
+    #[serde(default)]
     pub references: Vec<String>,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Command Types
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Command summary for listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,8 +233,9 @@ pub struct CommandSummary {
     /// Command name (filename without .md, e.g., "review-pr")
     pub name: String,
     /// Description from frontmatter
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Path relative to library root (e.g., "commands/review-pr.md")
+    /// Path relative to library root (e.g., "command/review-pr.md")
     pub path: String,
 }
 
@@ -63,6 +245,7 @@ pub struct Command {
     /// Command name
     pub name: String,
     /// Description from frontmatter
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Path relative to library root
     pub path: String,
@@ -70,12 +253,17 @@ pub struct Command {
     pub content: String,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Library Status
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Git status for the library repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibraryStatus {
     /// Absolute path to the library
     pub path: String,
     /// Git remote URL if configured
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
     /// Current branch name
     pub branch: String,
@@ -88,6 +276,23 @@ pub struct LibraryStatus {
     /// List of modified/untracked files
     pub modified_files: Vec<String>,
 }
+
+/// Migration report showing what changed during library structure migration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MigrationReport {
+    /// Directories that were renamed
+    pub directories_renamed: Vec<(String, String)>,
+    /// Files that were converted (e.g., MCP format changes)
+    pub files_converted: Vec<String>,
+    /// Errors encountered during migration
+    pub errors: Vec<String>,
+    /// Whether migration was successful overall
+    pub success: bool,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper Functions
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Parse YAML frontmatter from markdown content.
 /// Returns (frontmatter, body) where frontmatter is the parsed YAML.
@@ -126,4 +331,65 @@ pub fn extract_name(frontmatter: &Option<serde_yaml::Value>) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     })
+}
+
+/// Extract model from YAML frontmatter.
+pub fn extract_model(frontmatter: &Option<serde_yaml::Value>) -> Option<String> {
+    frontmatter.as_ref().and_then(|fm| {
+        fm.get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    })
+}
+
+/// Extract tools map from YAML frontmatter.
+pub fn extract_tools(frontmatter: &Option<serde_yaml::Value>) -> HashMap<String, bool> {
+    frontmatter
+        .as_ref()
+        .and_then(|fm| fm.get("tools"))
+        .and_then(|v| v.as_mapping())
+        .map(|mapping| {
+            mapping
+                .iter()
+                .filter_map(|(k, v)| {
+                    let key = k.as_str()?.to_string();
+                    let value = v.as_bool()?;
+                    Some((key, value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract permissions map from YAML frontmatter.
+pub fn extract_permissions(frontmatter: &Option<serde_yaml::Value>) -> HashMap<String, String> {
+    frontmatter
+        .as_ref()
+        .and_then(|fm| fm.get("permissions"))
+        .and_then(|v| v.as_mapping())
+        .map(|mapping| {
+            mapping
+                .iter()
+                .filter_map(|(k, v)| {
+                    let key = k.as_str()?.to_string();
+                    let value = v.as_str()?.to_string();
+                    Some((key, value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract string array from YAML frontmatter field.
+pub fn extract_string_array(frontmatter: &Option<serde_yaml::Value>, field: &str) -> Vec<String> {
+    frontmatter
+        .as_ref()
+        .and_then(|fm| fm.get(field))
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }

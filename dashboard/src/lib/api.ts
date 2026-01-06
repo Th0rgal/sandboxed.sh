@@ -1168,12 +1168,24 @@ export interface LibraryStatus {
   modified_files: string[];
 }
 
+// MCP Server definition (OpenCode-aligned format)
 export interface McpServerDef {
-  type: "stdio" | "http";
-  command?: string;
-  args?: string[];
+  type: "local" | "remote";
+  // Local (stdio) server fields
+  command?: string[];
   env?: Record<string, string>;
+  // Remote (HTTP) server fields
   url?: string;
+  headers?: Record<string, string>;
+  // Common
+  enabled?: boolean;
+}
+
+// Skill file within a skill folder
+export interface SkillFile {
+  name: string;
+  path: string;
+  content: string;
 }
 
 export interface SkillSummary {
@@ -1187,7 +1199,78 @@ export interface Skill {
   description: string | null;
   path: string;
   content: string;
+  files: SkillFile[];
   references: string[];
+}
+
+// Plugin types
+export interface PluginUI {
+  icon: string | null;
+  label: string;
+  hint: string | null;
+  category: string | null;
+}
+
+export interface Plugin {
+  package: string;
+  description: string | null;
+  enabled: boolean;
+  ui: PluginUI;
+}
+
+// Rule types
+export interface RuleSummary {
+  name: string;
+  description: string | null;
+  path: string;
+}
+
+export interface Rule {
+  name: string;
+  description: string | null;
+  path: string;
+  content: string;
+}
+
+// Library Agent types
+export interface LibraryAgentSummary {
+  name: string;
+  description: string | null;
+  path: string;
+}
+
+export interface LibraryAgent {
+  name: string;
+  description: string | null;
+  path: string;
+  content: string;
+  model: string | null;
+  tools: Record<string, boolean>;
+  permissions: Record<string, string>;
+  skills: string[];
+  rules: string[];
+}
+
+// Library Tool types
+export interface LibraryToolSummary {
+  name: string;
+  description: string | null;
+  path: string;
+}
+
+export interface LibraryTool {
+  name: string;
+  description: string | null;
+  path: string;
+  content: string;
+}
+
+// Migration report
+export interface MigrationReport {
+  directories_renamed: [string, string][];
+  files_converted: string[];
+  errors: string[];
+  success: boolean;
 }
 
 export interface CommandSummary {
@@ -1397,6 +1480,157 @@ export async function deleteLibraryCommand(name: string): Promise<void> {
     method: "DELETE",
   });
   await ensureLibraryResponse(res, "Failed to delete command");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plugins
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Get all plugins
+export async function getLibraryPlugins(): Promise<Record<string, Plugin>> {
+  const res = await apiFetch("/api/library/plugins");
+  await ensureLibraryResponse(res, "Failed to fetch plugins");
+  return res.json();
+}
+
+// Save all plugins
+export async function saveLibraryPlugins(
+  plugins: Record<string, Plugin>
+): Promise<void> {
+  const res = await apiFetch("/api/library/plugins", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(plugins),
+  });
+  await ensureLibraryResponse(res, "Failed to save plugins");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rules
+// ─────────────────────────────────────────────────────────────────────────────
+
+// List rules
+export async function listLibraryRules(): Promise<RuleSummary[]> {
+  const res = await apiFetch("/api/library/rule");
+  await ensureLibraryResponse(res, "Failed to fetch rules");
+  return res.json();
+}
+
+// Get rule
+export async function getLibraryRule(name: string): Promise<Rule> {
+  const res = await apiFetch(`/api/library/rule/${encodeURIComponent(name)}`);
+  await ensureLibraryResponse(res, "Failed to fetch rule");
+  return res.json();
+}
+
+// Save rule
+export async function saveLibraryRule(
+  name: string,
+  content: string
+): Promise<void> {
+  const res = await apiFetch(`/api/library/rule/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  await ensureLibraryResponse(res, "Failed to save rule");
+}
+
+// Delete rule
+export async function deleteLibraryRule(name: string): Promise<void> {
+  const res = await apiFetch(`/api/library/rule/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+  await ensureLibraryResponse(res, "Failed to delete rule");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Library Agents
+// ─────────────────────────────────────────────────────────────────────────────
+
+// List library agents
+export async function listLibraryAgents(): Promise<LibraryAgentSummary[]> {
+  const res = await apiFetch("/api/library/agent");
+  await ensureLibraryResponse(res, "Failed to fetch library agents");
+  return res.json();
+}
+
+// Get library agent
+export async function getLibraryAgent(name: string): Promise<LibraryAgent> {
+  const res = await apiFetch(`/api/library/agent/${encodeURIComponent(name)}`);
+  await ensureLibraryResponse(res, "Failed to fetch library agent");
+  return res.json();
+}
+
+// Save library agent
+export async function saveLibraryAgent(
+  name: string,
+  agent: LibraryAgent
+): Promise<void> {
+  const res = await apiFetch(`/api/library/agent/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(agent),
+  });
+  await ensureLibraryResponse(res, "Failed to save library agent");
+}
+
+// Delete library agent
+export async function deleteLibraryAgent(name: string): Promise<void> {
+  const res = await apiFetch(`/api/library/agent/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+  await ensureLibraryResponse(res, "Failed to delete library agent");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Library Tools
+// ─────────────────────────────────────────────────────────────────────────────
+
+// List library tools
+export async function listLibraryTools(): Promise<LibraryToolSummary[]> {
+  const res = await apiFetch("/api/library/tool");
+  await ensureLibraryResponse(res, "Failed to fetch library tools");
+  return res.json();
+}
+
+// Get library tool
+export async function getLibraryTool(name: string): Promise<LibraryTool> {
+  const res = await apiFetch(`/api/library/tool/${encodeURIComponent(name)}`);
+  await ensureLibraryResponse(res, "Failed to fetch library tool");
+  return res.json();
+}
+
+// Save library tool
+export async function saveLibraryTool(
+  name: string,
+  content: string
+): Promise<void> {
+  const res = await apiFetch(`/api/library/tool/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  await ensureLibraryResponse(res, "Failed to save library tool");
+}
+
+// Delete library tool
+export async function deleteLibraryTool(name: string): Promise<void> {
+  const res = await apiFetch(`/api/library/tool/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+  await ensureLibraryResponse(res, "Failed to delete library tool");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Library Migration
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Migrate library structure to new format
+export async function migrateLibrary(): Promise<MigrationReport> {
+  const res = await apiFetch("/api/library/migrate", { method: "POST" });
+  await ensureLibraryResponse(res, "Failed to migrate library");
+  return res.json();
 }
 
 // ==================== Workspaces ====================
@@ -1611,6 +1845,139 @@ export async function testOpenCodeConnection(id: string): Promise<TestConnection
 export async function setDefaultOpenCodeConnection(id: string): Promise<OpenCodeConnection> {
   const res = await apiFetch(`/api/opencode/connections/${id}/default`, { method: "POST" });
   if (!res.ok) throw new Error("Failed to set default OpenCode connection");
+  return res.json();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI Provider API
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type AIProviderType =
+  | "anthropic"
+  | "openai"
+  | "google"
+  | "amazon-bedrock"
+  | "azure"
+  | "open-router"
+  | "mistral"
+  | "groq"
+  | "xai"
+  | "deep-infra"
+  | "cerebras"
+  | "cohere"
+  | "together-ai"
+  | "perplexity"
+  | "github-copilot"
+  | "custom";
+
+export interface AIProviderTypeInfo {
+  id: string;
+  name: string;
+  uses_oauth: boolean;
+  env_var: string | null;
+}
+
+export interface AIProviderStatus {
+  type: "unknown" | "connected" | "needs_auth" | "error";
+  auth_url?: string;
+  message?: string;
+}
+
+export interface AIProvider {
+  id: string;
+  provider_type: AIProviderType;
+  provider_type_name: string;
+  name: string;
+  has_api_key: boolean;
+  base_url: string | null;
+  enabled: boolean;
+  is_default: boolean;
+  uses_oauth: boolean;
+  status: AIProviderStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AIProviderAuthResponse {
+  success: boolean;
+  message: string;
+  auth_url: string | null;
+}
+
+// List all AI providers
+export async function listAIProviders(): Promise<AIProvider[]> {
+  const res = await apiFetch("/api/ai/providers");
+  if (!res.ok) throw new Error("Failed to list AI providers");
+  return res.json();
+}
+
+// List available provider types
+export async function listAIProviderTypes(): Promise<AIProviderTypeInfo[]> {
+  const res = await apiFetch("/api/ai/providers/types");
+  if (!res.ok) throw new Error("Failed to list AI provider types");
+  return res.json();
+}
+
+// Get provider by ID
+export async function getAIProvider(id: string): Promise<AIProvider> {
+  const res = await apiFetch(`/api/ai/providers/${id}`);
+  if (!res.ok) throw new Error("Failed to get AI provider");
+  return res.json();
+}
+
+// Create new provider
+export async function createAIProvider(data: {
+  provider_type: AIProviderType;
+  name: string;
+  api_key?: string;
+  base_url?: string;
+  enabled?: boolean;
+}): Promise<AIProvider> {
+  const res = await apiFetch("/api/ai/providers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error("Failed to create AI provider");
+  return res.json();
+}
+
+// Update provider
+export async function updateAIProvider(
+  id: string,
+  data: {
+    name?: string;
+    api_key?: string | null;
+    base_url?: string | null;
+    enabled?: boolean;
+  }
+): Promise<AIProvider> {
+  const res = await apiFetch(`/api/ai/providers/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error("Failed to update AI provider");
+  return res.json();
+}
+
+// Delete provider
+export async function deleteAIProvider(id: string): Promise<void> {
+  const res = await apiFetch(`/api/ai/providers/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error("Failed to delete AI provider");
+}
+
+// Authenticate provider (initiate OAuth or check API key)
+export async function authenticateAIProvider(id: string): Promise<AIProviderAuthResponse> {
+  const res = await apiFetch(`/api/ai/providers/${id}/auth`, { method: "POST" });
+  if (!res.ok) throw new Error("Failed to authenticate AI provider");
+  return res.json();
+}
+
+// Set default provider
+export async function setDefaultAIProvider(id: string): Promise<AIProvider> {
+  const res = await apiFetch(`/api/ai/providers/${id}/default`, { method: "POST" });
+  if (!res.ok) throw new Error("Failed to set default AI provider");
   return res.json();
 }
 
