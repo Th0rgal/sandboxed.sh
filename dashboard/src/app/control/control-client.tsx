@@ -24,6 +24,8 @@ import {
   getRunningMissions,
   cancelMission,
   listProviders,
+  listWorkspaces,
+  listAgents,
   getHealth,
   type ControlRunState,
   type Mission,
@@ -31,6 +33,8 @@ import {
   type RunningMissionInfo,
   type UploadProgress,
   type Provider,
+  type Workspace,
+  type AgentConfig,
 } from "@/lib/api";
 import {
   Send,
@@ -700,7 +704,14 @@ export default function ControlClient() {
   // New mission dialog state
   const [showNewMissionDialog, setShowNewMissionDialog] = useState(false);
   const [newMissionModel, setNewMissionModel] = useState("");
+  const [newMissionWorkspace, setNewMissionWorkspace] = useState("");
+  const [newMissionAgent, setNewMissionAgent] = useState("");
+  const [newMissionHooks, setNewMissionHooks] = useState<string[]>([]);
   const newMissionDialogRef = useRef<HTMLDivElement>(null);
+
+  // Workspaces and agents for mission creation
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [agents, setAgents] = useState<AgentConfig[]>([]);
 
   // Parallel missions state
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
@@ -1180,6 +1191,25 @@ export default function ControlClient() {
       });
   }, [authRetryTrigger]);
 
+  // Fetch workspaces and agents for mission creation
+  useEffect(() => {
+    listWorkspaces()
+      .then((data) => {
+        setWorkspaces(data);
+      })
+      .catch((err) => {
+        console.error("Failed to fetch workspaces:", err);
+      });
+
+    listAgents()
+      .then((data) => {
+        setAgents(data);
+      })
+      .catch((err) => {
+        console.error("Failed to fetch agents:", err);
+      });
+  }, [authRetryTrigger]);
+
   // Fetch server configuration (max_iterations) from health endpoint
   useEffect(() => {
     getHealth()
@@ -1289,10 +1319,20 @@ export default function ControlClient() {
   // and could be from any mission. We only cache when explicitly loading from API.
 
   // Handle creating a new mission
-  const handleNewMission = async (modelOverride?: string) => {
+  const handleNewMission = async (options?: {
+    modelOverride?: string;
+    workspaceId?: string;
+    agentId?: string;
+    hooks?: string[];
+  }) => {
     try {
       setMissionLoading(true);
-      const mission = await createMission(undefined, modelOverride);
+      const mission = await createMission({
+        modelOverride: options?.modelOverride,
+        workspaceId: options?.workspaceId,
+        agentId: options?.agentId,
+        hooks: options?.hooks,
+      });
       setCurrentMission(mission);
       setViewingMission(mission);
       setViewingMissionId(mission.id); // Also update viewing to the new mission
@@ -1936,18 +1976,19 @@ export default function ControlClient() {
               <span className="hidden sm:inline">New</span> Mission
             </button>
             {showNewMissionDialog && (
-              <div className="absolute right-0 top-full mt-1 w-80 rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl z-10">
+              <div className="absolute right-0 top-full mt-1 w-96 rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl z-10">
                 <h3 className="text-sm font-medium text-white mb-3">
                   Create New Mission
                 </h3>
                 <div className="space-y-3">
+                  {/* Workspace selection */}
                   <div>
                     <label className="block text-xs text-white/50 mb-1.5">
-                      Model
+                      Workspace
                     </label>
                     <select
-                      value={newMissionModel}
-                      onChange={(e) => setNewMissionModel(e.target.value)}
+                      value={newMissionWorkspace}
+                      onChange={(e) => setNewMissionWorkspace(e.target.value)}
                       className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
                       style={{
                         backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`,
@@ -1958,34 +1999,129 @@ export default function ControlClient() {
                       }}
                     >
                       <option value="" className="bg-[#1a1a1a]">
-                        Auto (default)
+                        Host (default)
                       </option>
-                      {/* Group models by provider */}
-                      {providers.map((provider) => (
-                        provider.models.length > 0 && (
-                          <optgroup
-                            key={provider.id}
-                            label={`${provider.name}${provider.billing === "subscription" ? " (included)" : ""}`}
-                            className="bg-[#1a1a1a]"
-                          >
-                            {provider.models.map((model) => (
-                              <option key={model.id} value={model.id} className="bg-[#1a1a1a]">
-                                {model.name}
-                              </option>
-                            ))}
-                          </optgroup>
-                        )
+                      {workspaces
+                        .filter((ws) => ws.status === "ready")
+                        .map((workspace) => (
+                          <option key={workspace.id} value={workspace.id} className="bg-[#1a1a1a]">
+                            {workspace.name} ({workspace.workspace_type})
+                          </option>
+                        ))}
+                    </select>
+                    <p className="text-xs text-white/30 mt-1.5">
+                      Where the mission will run
+                    </p>
+                  </div>
+
+                  {/* Agent selection */}
+                  <div>
+                    <label className="block text-xs text-white/50 mb-1.5">
+                      Agent Configuration
+                    </label>
+                    <select
+                      value={newMissionAgent}
+                      onChange={(e) => {
+                        setNewMissionAgent(e.target.value);
+                        // When agent is selected, clear model override (agent includes model)
+                        if (e.target.value) {
+                          setNewMissionModel("");
+                        }
+                      }}
+                      className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
+                      style={{
+                        backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`,
+                        backgroundPosition: "right 0.5rem center",
+                        backgroundRepeat: "no-repeat",
+                        backgroundSize: "1.5em 1.5em",
+                        paddingRight: "2.5rem",
+                      }}
+                    >
+                      <option value="" className="bg-[#1a1a1a]">
+                        Default (no agent)
+                      </option>
+                      {agents.map((agent) => (
+                        <option key={agent.id} value={agent.id} className="bg-[#1a1a1a]">
+                          {agent.name}
+                        </option>
                       ))}
                     </select>
                     <p className="text-xs text-white/30 mt-1.5">
-                      Auto uses Claude Opus 4.5
+                      Pre-configured model, MCPs, skills & commands
                     </p>
                   </div>
+
+                  {/* Model override - only shown when no agent selected */}
+                  {!newMissionAgent && (
+                    <div>
+                      <label className="block text-xs text-white/50 mb-1.5">
+                        Model Override
+                      </label>
+                      <select
+                        value={newMissionModel}
+                        onChange={(e) => setNewMissionModel(e.target.value)}
+                        className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
+                        style={{
+                          backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`,
+                          backgroundPosition: "right 0.5rem center",
+                          backgroundRepeat: "no-repeat",
+                          backgroundSize: "1.5em 1.5em",
+                          paddingRight: "2.5rem",
+                        }}
+                      >
+                        <option value="" className="bg-[#1a1a1a]">
+                          Auto (Claude Opus 4.5)
+                        </option>
+                        {providers.map((provider) => (
+                          provider.models.length > 0 && (
+                            <optgroup
+                              key={provider.id}
+                              label={`${provider.name}${provider.billing === "subscription" ? " (included)" : ""}`}
+                              className="bg-[#1a1a1a]"
+                            >
+                              {provider.models.map((model) => (
+                                <option key={model.id} value={model.id} className="bg-[#1a1a1a]">
+                                  {model.name}
+                                </option>
+                              ))}
+                            </optgroup>
+                          )
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  {/* Hooks */}
+                  <div>
+                    <label className="block text-xs text-white/50 mb-1.5">
+                      Hooks
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={newMissionHooks.includes("ralph-wiggum")}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setNewMissionHooks([...newMissionHooks, "ralph-wiggum"]);
+                          } else {
+                            setNewMissionHooks(newMissionHooks.filter((h) => h !== "ralph-wiggum"));
+                          }
+                        }}
+                        className="rounded border-white/20 bg-white/5 text-indigo-500 focus:ring-indigo-500/50"
+                      />
+                      <span className="text-sm text-white/80">Ralph Wiggum</span>
+                      <span className="text-xs text-white/40">(continuous running)</span>
+                    </label>
+                  </div>
+
                   <div className="flex gap-2 pt-1">
                     <button
                       onClick={() => {
                         setShowNewMissionDialog(false);
                         setNewMissionModel("");
+                        setNewMissionWorkspace("");
+                        setNewMissionAgent("");
+                        setNewMissionHooks([]);
                       }}
                       className="flex-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] transition-colors"
                     >
@@ -1993,9 +2129,17 @@ export default function ControlClient() {
                     </button>
                     <button
                       onClick={() => {
-                        handleNewMission(newMissionModel || undefined);
+                        handleNewMission({
+                          modelOverride: newMissionModel || undefined,
+                          workspaceId: newMissionWorkspace || undefined,
+                          agentId: newMissionAgent || undefined,
+                          hooks: newMissionHooks.length > 0 ? newMissionHooks : undefined,
+                        });
                         setShowNewMissionDialog(false);
                         setNewMissionModel("");
+                        setNewMissionWorkspace("");
+                        setNewMissionAgent("");
+                        setNewMissionHooks([]);
                       }}
                       disabled={missionLoading}
                       className="flex-1 rounded-lg bg-indigo-500 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"

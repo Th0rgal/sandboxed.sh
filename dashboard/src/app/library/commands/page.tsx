@@ -1,19 +1,9 @@
 'use client';
 
-import { useEffect, useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import {
-  getLibraryStatus,
-  syncLibrary,
-  commitLibrary,
-  pushLibrary,
-  listLibraryCommands,
   getLibraryCommand,
-  saveLibraryCommand,
-  deleteLibraryCommand,
-  type LibraryStatus,
-  type CommandSummary,
   type Command,
-  LibraryUnavailableError,
 } from '@/lib/api';
 import {
   GitBranch,
@@ -29,20 +19,28 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
+import { useLibrary } from '@/contexts/library-context';
 
 export default function CommandsPage() {
-  const [status, setStatus] = useState<LibraryStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
-  const [committing, setCommitting] = useState(false);
-  const [pushing, setPushing] = useState(false);
-  const [commitMessage, setCommitMessage] = useState('');
-  const [showCommitDialog, setShowCommitDialog] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [libraryUnavailable, setLibraryUnavailable] = useState(false);
-  const [libraryUnavailableMessage, setLibraryUnavailableMessage] = useState<string | null>(null);
+  const {
+    status,
+    commands,
+    loading,
+    error,
+    libraryUnavailable,
+    libraryUnavailableMessage,
+    refresh,
+    sync,
+    commit,
+    push,
+    clearError,
+    saveCommand,
+    removeCommand,
+    syncing,
+    committing,
+    pushing,
+  } = useLibrary();
 
-  const [commands, setCommands] = useState<CommandSummary[]>([]);
   const [selectedCommand, setSelectedCommand] = useState<Command | null>(null);
   const [commandContent, setCommandContent] = useState('');
   const [commandDirty, setCommandDirty] = useState(false);
@@ -50,80 +48,51 @@ export default function CommandsPage() {
   const [loadingCommand, setLoadingCommand] = useState(false);
   const [showNewCommandDialog, setShowNewCommandDialog] = useState(false);
   const [newCommandName, setNewCommandName] = useState('');
+  const [commitMessage, setCommitMessage] = useState('');
+  const [showCommitDialog, setShowCommitDialog] = useState(false);
 
   // Ref to track content for dirty flag comparison
   const commandContentRef = useRef(commandContent);
   commandContentRef.current = commandContent;
 
-  const loadData = async () => {
-    try {
-      setLoading(true);
-      setError(null);
-      setLibraryUnavailable(false);
-      setLibraryUnavailableMessage(null);
-      const [statusData, commandsData] = await Promise.all([
-        getLibraryStatus(),
-        listLibraryCommands(),
-      ]);
-      setStatus(statusData);
-      setCommands(commandsData);
-    } catch (err) {
-      if (err instanceof LibraryUnavailableError) {
-        setLibraryUnavailable(true);
-        setLibraryUnavailableMessage(err.message);
-        setStatus(null);
-        setCommands([]);
-        setSelectedCommand(null);
-        setCommandContent('');
-        setCommandDirty(false);
-        return;
-      }
-      setError(err instanceof Error ? err.message : 'Failed to load commands');
-    } finally {
-      setLoading(false);
-    }
-  };
-
+  // Handle Escape key for dialogs
   useEffect(() => {
-    loadData();
-  }, []);
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (showCommitDialog) setShowCommitDialog(false);
+        if (showNewCommandDialog) setShowNewCommandDialog(false);
+      }
+    };
+    if (showCommitDialog || showNewCommandDialog) {
+      document.addEventListener('keydown', handleKeyDown);
+      return () => document.removeEventListener('keydown', handleKeyDown);
+    }
+  }, [showCommitDialog, showNewCommandDialog]);
 
   const handleSync = async () => {
     try {
-      setSyncing(true);
-      await syncLibrary();
-      await loadData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to sync');
-    } finally {
-      setSyncing(false);
+      await sync();
+    } catch {
+      // Error is handled by context
     }
   };
 
   const handleCommit = async () => {
     if (!commitMessage.trim()) return;
     try {
-      setCommitting(true);
-      await commitLibrary(commitMessage);
+      await commit(commitMessage);
       setCommitMessage('');
       setShowCommitDialog(false);
-      await loadData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to commit');
-    } finally {
-      setCommitting(false);
+    } catch {
+      // Error is handled by context
     }
   };
 
   const handlePush = async () => {
     try {
-      setPushing(true);
-      await pushLibrary();
-      await loadData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to push');
-    } finally {
-      setPushing(false);
+      await push();
+    } catch {
+      // Error is handled by context
     }
   };
 
@@ -135,7 +104,7 @@ export default function CommandsPage() {
       setCommandContent(command.content);
       setCommandDirty(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load command');
+      console.error('Failed to load command:', err);
     } finally {
       setLoadingCommand(false);
     }
@@ -146,14 +115,13 @@ export default function CommandsPage() {
     const contentBeingSaved = commandContent;
     try {
       setCommandSaving(true);
-      await saveLibraryCommand(selectedCommand.name, contentBeingSaved);
-      await loadData();
+      await saveCommand(selectedCommand.name, contentBeingSaved);
       // Only clear dirty if content hasn't changed during save
       if (commandContentRef.current === contentBeingSaved) {
         setCommandDirty(false);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save command');
+      console.error('Failed to save command:', err);
     } finally {
       setCommandSaving(false);
     }
@@ -169,13 +137,12 @@ Describe what this command does.
 `;
     try {
       setCommandSaving(true);
-      await saveLibraryCommand(newCommandName, template);
-      await loadData();
+      await saveCommand(newCommandName, template);
       setShowNewCommandDialog(false);
       setNewCommandName('');
       await loadCommand(newCommandName);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create command');
+      console.error('Failed to create command:', err);
     } finally {
       setCommandSaving(false);
     }
@@ -185,34 +152,33 @@ Describe what this command does.
     if (!selectedCommand) return;
     if (!confirm(`Delete command "${selectedCommand.name}"?`)) return;
     try {
-      await deleteLibraryCommand(selectedCommand.name);
+      await removeCommand(selectedCommand.name);
       setSelectedCommand(null);
       setCommandContent('');
-      await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete command');
+      console.error('Failed to delete command:', err);
     }
   };
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-full">
+      <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
         <Loader className="h-8 w-8 animate-spin text-white/40" />
       </div>
     );
   }
 
   return (
-    <div className="p-6 max-w-6xl mx-auto space-y-4">
+    <div className="min-h-screen flex flex-col p-6 max-w-6xl mx-auto space-y-4">
       {libraryUnavailable ? (
-        <LibraryUnavailable message={libraryUnavailableMessage} onConfigured={loadData} />
+        <LibraryUnavailable message={libraryUnavailableMessage} onConfigured={refresh} />
       ) : (
         <>
           {error && (
             <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 flex items-center gap-2">
               <AlertCircle className="h-4 w-4 flex-shrink-0" />
               {error}
-              <button onClick={() => setError(null)} className="ml-auto">
+              <button onClick={clearError} className="ml-auto">
                 <X className="h-4 w-4" />
               </button>
             </div>
@@ -287,10 +253,10 @@ Describe what this command does.
           )}
 
           {/* Commands Editor */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] overflow-hidden">
-            <div className="flex h-[500px]">
+          <div className="flex-1 min-h-0 rounded-xl bg-white/[0.02] border border-white/[0.06] overflow-hidden">
+            <div className="flex flex-1 min-h-0 items-stretch">
               {/* Commands List */}
-              <div className="w-64 border-r border-white/[0.06] flex flex-col">
+              <div className="w-64 border-r border-white/[0.06] flex flex-col min-h-0">
                 <div className="p-3 border-b border-white/[0.06] flex items-center justify-between">
                   <span className="text-xs font-medium text-white/60">
                     Commands{commands.length ? ` (${commands.length})` : ''}
@@ -302,7 +268,7 @@ Describe what this command does.
                     <Plus className="h-3.5 w-3.5 text-white/60" />
                   </button>
                 </div>
-                <div className="flex-1 overflow-y-auto p-2">
+                <div className="flex-1 min-h-0 overflow-y-auto p-2">
                   {commands.length === 0 ? (
                     <p className="text-xs text-white/40 text-center py-4">No commands yet</p>
                   ) : (
@@ -328,7 +294,7 @@ Describe what this command does.
               </div>
 
               {/* Commands Editor */}
-              <div className="flex-1 flex flex-col">
+              <div className="flex-1 min-h-0 flex flex-col">
                 {selectedCommand ? (
                   <>
                     <div className="p-3 border-b border-white/[0.06] flex items-center justify-between">
@@ -361,7 +327,7 @@ Describe what this command does.
                         </button>
                       </div>
                     </div>
-                    <div className="flex-1 p-3 overflow-hidden">
+                    <div className="flex-1 min-h-0 p-3 overflow-hidden">
                       {loadingCommand ? (
                         <div className="flex items-center justify-center h-full">
                           <Loader className="h-5 w-5 animate-spin text-white/40" />

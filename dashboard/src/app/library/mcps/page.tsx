@@ -1,18 +1,8 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
-import {
-  getLibraryStatus,
-  syncLibrary,
-  commitLibrary,
-  pushLibrary,
-  getLibraryMcps,
-  saveLibraryMcps,
-  type LibraryStatus,
-  type McpServerDef,
-  LibraryUnavailableError,
-} from '@/lib/api';
+import { type McpServerDef } from '@/lib/api';
 import {
   AlertCircle,
   Check,
@@ -31,6 +21,7 @@ import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { CopyButton } from '@/components/ui/copy-button';
+import { useLibrary } from '@/contexts/library-context';
 
 type McpEntry = {
   name: string;
@@ -131,12 +122,23 @@ function McpCard({
   const endpoint = formatEndpoint(entry.def);
   const args = entry.def.type === 'stdio' ? entry.def.args ?? [] : [];
 
+  const handleSelect = () => onSelect(isSelected ? null : entry);
+
   return (
-    <button
-      onClick={() => onSelect(isSelected ? null : entry)}
+    <div
+      role="button"
+      tabIndex={0}
+      aria-pressed={isSelected}
+      onClick={handleSelect}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          handleSelect();
+        }
+      }}
       className={cn(
-        'w-full rounded-xl p-4 text-left transition-all',
-        'bg-white/[0.02] border hover:bg-white/[0.04]',
+        'w-full rounded-xl p-4 text-left transition-all cursor-pointer',
+        'bg-white/[0.02] border hover:bg-white/[0.04] focus:outline-none focus:ring-1 focus:ring-indigo-500/40',
         isSelected
           ? 'border-indigo-500/50 ring-1 ring-indigo-500/30'
           : 'border-white/[0.04] hover:border-white/[0.08]'
@@ -178,7 +180,7 @@ function McpCard({
         </span>
         <span className="text-[10px] text-white/40">Library config</span>
       </div>
-    </button>
+    </div>
   );
 }
 
@@ -313,6 +315,18 @@ function McpFormModal({
     setError(null);
     setLoading(false);
   }, [open, initial]);
+
+  // Handle Escape key to close modal
+  useEffect(() => {
+    if (!open) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [open, onClose]);
 
   if (!open) return null;
 
@@ -486,24 +500,32 @@ function McpFormModal({
 }
 
 export default function McpsPage() {
-  const [status, setStatus] = useState<LibraryStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
-  const [committing, setCommitting] = useState(false);
-  const [pushing, setPushing] = useState(false);
-  const [commitMessage, setCommitMessage] = useState('');
-  const [showCommitDialog, setShowCommitDialog] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [libraryUnavailable, setLibraryUnavailable] = useState(false);
-  const [libraryUnavailableMessage, setLibraryUnavailableMessage] = useState<string | null>(null);
+  const {
+    status,
+    mcps,
+    loading,
+    error,
+    libraryUnavailable,
+    libraryUnavailableMessage,
+    refresh,
+    sync,
+    commit,
+    push,
+    clearError,
+    saveMcps,
+    syncing,
+    committing,
+    pushing,
+  } = useLibrary();
 
-  const [mcps, setMcps] = useState<Record<string, McpServerDef>>({});
   const [selectedName, setSelectedName] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showAddModal, setShowAddModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<McpEntry | null>(null);
+  const [commitMessage, setCommitMessage] = useState('');
+  const [showCommitDialog, setShowCommitDialog] = useState(false);
 
   const entries = useMemo<McpEntry[]>(() => {
     return Object.entries(mcps)
@@ -530,85 +552,50 @@ export default function McpsPage() {
     });
   }, [entries, searchQuery]);
 
-  const loadData = useCallback(async () => {
-    try {
-      setLoading(true);
-      setError(null);
-      setLibraryUnavailable(false);
-      setLibraryUnavailableMessage(null);
-      const [statusData, mcpsData] = await Promise.all([
-        getLibraryStatus(),
-        getLibraryMcps(),
-      ]);
-      setStatus(statusData);
-      setMcps(mcpsData);
-      // Clear selection if the selected item no longer exists
-      setSelectedName((prev) => (prev && !mcpsData[prev] ? null : prev));
-    } catch (err) {
-      if (err instanceof LibraryUnavailableError) {
-        setLibraryUnavailable(true);
-        setLibraryUnavailableMessage(err.message);
-        setStatus(null);
-        setMcps({});
-        setSelectedName(null);
-        return;
-      }
-      setError(err instanceof Error ? err.message : 'Failed to load MCPs');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
+  // Clear selection if the selected item no longer exists
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    if (selectedName && !mcps[selectedName]) {
+      setSelectedName(null);
+    }
+  }, [mcps, selectedName]);
+
+  // Handle Escape key for commit dialog
+  useEffect(() => {
+    if (!showCommitDialog) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setShowCommitDialog(false);
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [showCommitDialog]);
 
   const handleSync = async () => {
     try {
-      setSyncing(true);
-      await syncLibrary();
-      await loadData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to sync');
-    } finally {
-      setSyncing(false);
+      await sync();
+    } catch {
+      // Error is handled by context
     }
   };
 
   const handleCommit = async () => {
     if (!commitMessage.trim()) return;
     try {
-      setCommitting(true);
-      await commitLibrary(commitMessage);
+      await commit(commitMessage);
       setCommitMessage('');
       setShowCommitDialog(false);
-      await loadData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to commit');
-    } finally {
-      setCommitting(false);
+    } catch {
+      // Error is handled by context
     }
   };
 
   const handlePush = async () => {
     try {
-      setPushing(true);
-      await pushLibrary();
-      await loadData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to push');
-    } finally {
-      setPushing(false);
+      await push();
+    } catch {
+      // Error is handled by context
     }
-  };
-
-  const saveNext = async (next: Record<string, McpServerDef>, name?: string) => {
-    await saveLibraryMcps(next);
-    setMcps(next);
-    if (name) setSelectedName(name);
-    // Refresh status only (not MCPs since we just saved the new state)
-    const statusData = await getLibraryStatus();
-    setStatus(statusData);
   };
 
   const handleAddMcp = async (name: string, def: McpServerDef) => {
@@ -616,7 +603,8 @@ export default function McpsPage() {
       throw new Error(`MCP "${name}" already exists`);
     }
     const next = { ...mcps, [name]: def };
-    await saveNext(next, name);
+    await saveMcps(next);
+    setSelectedName(name);
     toast.success(`Added ${name}`);
   };
 
@@ -628,7 +616,8 @@ export default function McpsPage() {
     const next = { ...mcps };
     delete next[selectedEntry.name];
     next[name] = def;
-    await saveNext(next, name);
+    await saveMcps(next);
+    setSelectedName(name);
     toast.success(`Saved ${name}`);
   };
 
@@ -642,12 +631,12 @@ export default function McpsPage() {
     try {
       const next = { ...mcps };
       delete next[pendingDelete.name];
-      await saveNext(next);
+      await saveMcps(next);
       toast.success(`Removed ${pendingDelete.name}`);
       if (selectedName === pendingDelete.name) {
         setSelectedName(null);
       }
-    } catch (err) {
+    } catch {
       toast.error(`Failed to remove ${pendingDelete.name}`);
     } finally {
       setShowDeleteConfirm(false);
@@ -657,7 +646,7 @@ export default function McpsPage() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-full">
+      <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
         <Loader className="h-8 w-8 animate-spin text-white/40" />
       </div>
     );
@@ -666,14 +655,14 @@ export default function McpsPage() {
   return (
     <div className="p-6 max-w-6xl mx-auto space-y-4">
       {libraryUnavailable ? (
-        <LibraryUnavailable message={libraryUnavailableMessage} onConfigured={loadData} />
+        <LibraryUnavailable message={libraryUnavailableMessage} onConfigured={refresh} />
       ) : (
         <>
           {error && (
             <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 flex items-center gap-2">
               <AlertCircle className="h-4 w-4 flex-shrink-0" />
               {error}
-              <button onClick={() => setError(null)} className="ml-auto">
+              <button onClick={clearError} className="ml-auto">
                 <X className="h-4 w-4" />
               </button>
             </div>

@@ -1,19 +1,9 @@
 'use client';
 
-import { useEffect, useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import {
-  getLibraryStatus,
-  syncLibrary,
-  commitLibrary,
-  pushLibrary,
-  listLibrarySkills,
   getLibrarySkill,
-  saveLibrarySkill,
-  deleteLibrarySkill,
-  type LibraryStatus,
-  type SkillSummary,
   type Skill,
-  LibraryUnavailableError,
 } from '@/lib/api';
 import {
   GitBranch,
@@ -29,20 +19,28 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
+import { useLibrary } from '@/contexts/library-context';
 
 export default function SkillsPage() {
-  const [status, setStatus] = useState<LibraryStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
-  const [committing, setCommitting] = useState(false);
-  const [pushing, setPushing] = useState(false);
-  const [commitMessage, setCommitMessage] = useState('');
-  const [showCommitDialog, setShowCommitDialog] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [libraryUnavailable, setLibraryUnavailable] = useState(false);
-  const [libraryUnavailableMessage, setLibraryUnavailableMessage] = useState<string | null>(null);
+  const {
+    status,
+    skills,
+    loading,
+    error,
+    libraryUnavailable,
+    libraryUnavailableMessage,
+    refresh,
+    sync,
+    commit,
+    push,
+    clearError,
+    saveSkill,
+    removeSkill,
+    syncing,
+    committing,
+    pushing,
+  } = useLibrary();
 
-  const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [selectedSkill, setSelectedSkill] = useState<Skill | null>(null);
   const [skillContent, setSkillContent] = useState('');
   const [skillDirty, setSkillDirty] = useState(false);
@@ -50,80 +48,51 @@ export default function SkillsPage() {
   const [loadingSkill, setLoadingSkill] = useState(false);
   const [showNewSkillDialog, setShowNewSkillDialog] = useState(false);
   const [newSkillName, setNewSkillName] = useState('');
+  const [commitMessage, setCommitMessage] = useState('');
+  const [showCommitDialog, setShowCommitDialog] = useState(false);
 
   // Ref to track content for dirty flag comparison
   const skillContentRef = useRef(skillContent);
   skillContentRef.current = skillContent;
 
-  const loadData = async () => {
-    try {
-      setLoading(true);
-      setError(null);
-      setLibraryUnavailable(false);
-      setLibraryUnavailableMessage(null);
-      const [statusData, skillsData] = await Promise.all([
-        getLibraryStatus(),
-        listLibrarySkills(),
-      ]);
-      setStatus(statusData);
-      setSkills(skillsData);
-    } catch (err) {
-      if (err instanceof LibraryUnavailableError) {
-        setLibraryUnavailable(true);
-        setLibraryUnavailableMessage(err.message);
-        setStatus(null);
-        setSkills([]);
-        setSelectedSkill(null);
-        setSkillContent('');
-        setSkillDirty(false);
-        return;
-      }
-      setError(err instanceof Error ? err.message : 'Failed to load skills');
-    } finally {
-      setLoading(false);
-    }
-  };
-
+  // Handle Escape key for dialogs
   useEffect(() => {
-    loadData();
-  }, []);
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (showCommitDialog) setShowCommitDialog(false);
+        if (showNewSkillDialog) setShowNewSkillDialog(false);
+      }
+    };
+    if (showCommitDialog || showNewSkillDialog) {
+      document.addEventListener('keydown', handleKeyDown);
+      return () => document.removeEventListener('keydown', handleKeyDown);
+    }
+  }, [showCommitDialog, showNewSkillDialog]);
 
   const handleSync = async () => {
     try {
-      setSyncing(true);
-      await syncLibrary();
-      await loadData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to sync');
-    } finally {
-      setSyncing(false);
+      await sync();
+    } catch {
+      // Error is handled by context
     }
   };
 
   const handleCommit = async () => {
     if (!commitMessage.trim()) return;
     try {
-      setCommitting(true);
-      await commitLibrary(commitMessage);
+      await commit(commitMessage);
       setCommitMessage('');
       setShowCommitDialog(false);
-      await loadData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to commit');
-    } finally {
-      setCommitting(false);
+    } catch {
+      // Error is handled by context
     }
   };
 
   const handlePush = async () => {
     try {
-      setPushing(true);
-      await pushLibrary();
-      await loadData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to push');
-    } finally {
-      setPushing(false);
+      await push();
+    } catch {
+      // Error is handled by context
     }
   };
 
@@ -135,7 +104,8 @@ export default function SkillsPage() {
       setSkillContent(skill.content);
       setSkillDirty(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load skill');
+      // Use local error state for skill-specific errors
+      console.error('Failed to load skill:', err);
     } finally {
       setLoadingSkill(false);
     }
@@ -146,14 +116,13 @@ export default function SkillsPage() {
     const contentBeingSaved = skillContent;
     try {
       setSkillSaving(true);
-      await saveLibrarySkill(selectedSkill.name, contentBeingSaved);
-      await loadData();
+      await saveSkill(selectedSkill.name, contentBeingSaved);
       // Only clear dirty if content hasn't changed during save
       if (skillContentRef.current === contentBeingSaved) {
         setSkillDirty(false);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save skill');
+      console.error('Failed to save skill:', err);
     } finally {
       setSkillSaving(false);
     }
@@ -171,13 +140,12 @@ Describe what this skill does.
 `;
     try {
       setSkillSaving(true);
-      await saveLibrarySkill(newSkillName, template);
-      await loadData();
+      await saveSkill(newSkillName, template);
       setShowNewSkillDialog(false);
       setNewSkillName('');
       await loadSkill(newSkillName);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create skill');
+      console.error('Failed to create skill:', err);
     } finally {
       setSkillSaving(false);
     }
@@ -187,34 +155,33 @@ Describe what this skill does.
     if (!selectedSkill) return;
     if (!confirm(`Delete skill "${selectedSkill.name}"?`)) return;
     try {
-      await deleteLibrarySkill(selectedSkill.name);
+      await removeSkill(selectedSkill.name);
       setSelectedSkill(null);
       setSkillContent('');
-      await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete skill');
+      console.error('Failed to delete skill:', err);
     }
   };
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-full">
+      <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
         <Loader className="h-8 w-8 animate-spin text-white/40" />
       </div>
     );
   }
 
   return (
-    <div className="p-6 max-w-6xl mx-auto space-y-4">
+    <div className="min-h-screen flex flex-col p-6 max-w-6xl mx-auto space-y-4">
       {libraryUnavailable ? (
-        <LibraryUnavailable message={libraryUnavailableMessage} onConfigured={loadData} />
+        <LibraryUnavailable message={libraryUnavailableMessage} onConfigured={refresh} />
       ) : (
         <>
           {error && (
             <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 flex items-center gap-2">
               <AlertCircle className="h-4 w-4 flex-shrink-0" />
               {error}
-              <button onClick={() => setError(null)} className="ml-auto">
+              <button onClick={clearError} className="ml-auto">
                 <X className="h-4 w-4" />
               </button>
             </div>
@@ -289,10 +256,10 @@ Describe what this skill does.
           )}
 
           {/* Skills Editor */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] overflow-hidden">
-            <div className="flex h-[500px]">
+          <div className="flex-1 min-h-0 rounded-xl bg-white/[0.02] border border-white/[0.06] overflow-hidden">
+            <div className="flex flex-1 min-h-0 items-stretch">
               {/* Skills List */}
-              <div className="w-64 border-r border-white/[0.06] flex flex-col">
+              <div className="w-64 border-r border-white/[0.06] flex flex-col min-h-0">
                 <div className="p-3 border-b border-white/[0.06] flex items-center justify-between">
                   <span className="text-xs font-medium text-white/60">
                     Skills{skills.length ? ` (${skills.length})` : ''}
@@ -304,7 +271,7 @@ Describe what this skill does.
                     <Plus className="h-3.5 w-3.5 text-white/60" />
                   </button>
                 </div>
-                <div className="flex-1 overflow-y-auto p-2">
+                <div className="flex-1 min-h-0 overflow-y-auto p-2">
                   {skills.length === 0 ? (
                     <p className="text-xs text-white/40 text-center py-4">No skills yet</p>
                   ) : (
@@ -330,7 +297,7 @@ Describe what this skill does.
               </div>
 
               {/* Skills Editor */}
-              <div className="flex-1 flex flex-col">
+              <div className="flex-1 min-h-0 flex flex-col">
                 {selectedSkill ? (
                   <>
                     <div className="p-3 border-b border-white/[0.06] flex items-center justify-between">
@@ -363,7 +330,7 @@ Describe what this skill does.
                         </button>
                       </div>
                     </div>
-                    <div className="flex-1 p-3 overflow-hidden">
+                    <div className="flex-1 min-h-0 p-3 overflow-hidden">
                       {loadingSkill ? (
                         <div className="flex items-center justify-center h-full">
                           <Loader className="h-5 w-5 animate-spin text-white/40" />

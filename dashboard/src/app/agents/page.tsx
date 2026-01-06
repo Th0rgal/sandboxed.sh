@@ -193,7 +193,7 @@ export default function AgentsPage() {
   }
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-4">
+    <div className="min-h-screen flex flex-col p-6 max-w-7xl mx-auto space-y-4">
       {error && (
         <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 flex items-center gap-2">
           <AlertCircle className="h-4 w-4 flex-shrink-0" />
@@ -220,16 +220,16 @@ export default function AgentsPage() {
         </button>
       </div>
 
-      <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] overflow-hidden">
-        <div className="flex h-[600px]">
+      <div className="flex-1 min-h-0 rounded-xl bg-white/[0.02] border border-white/[0.06] overflow-hidden">
+        <div className="flex flex-1 min-h-0 items-stretch">
           {/* Agent List */}
-          <div className="w-64 border-r border-white/[0.06] flex flex-col">
+          <div className="w-64 border-r border-white/[0.06] flex flex-col min-h-0">
             <div className="p-3 border-b border-white/[0.06]">
               <span className="text-xs font-medium text-white/60">
                 Agents{agents.length ? ` (${agents.length})` : ''}
               </span>
             </div>
-            <div className="flex-1 overflow-y-auto p-2">
+            <div className="flex-1 min-h-0 overflow-y-auto p-2">
               {agents.length === 0 ? (
                 <p className="text-xs text-white/40 text-center py-4">No agents yet</p>
               ) : (
@@ -253,7 +253,7 @@ export default function AgentsPage() {
           </div>
 
           {/* Agent Editor */}
-          <div className="flex-1 flex flex-col overflow-hidden">
+          <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
             {editedAgent && selectedAgent ? (
               <>
                 <div className="p-4 border-b border-white/[0.06] flex items-center justify-between">
@@ -293,7 +293,7 @@ export default function AgentsPage() {
                   </div>
                 </div>
 
-                <div className="flex-1 overflow-y-auto p-4 space-y-6">
+                <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-6">
                   {/* Model Selection */}
                   <div>
                     <div className="flex items-center gap-2 mb-3">

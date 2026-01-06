@@ -397,7 +397,7 @@ pub async fn upload(
     let (cfg, key_file) = get_key_and_cfg(&state).await?;
 
     // Expect one file field.
-    while let Some(field) = multipart
+    if let Some(field) = multipart
         .next_field()
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
@@ -518,7 +518,7 @@ pub async fn upload_chunk(
         )
     })?;
 
-    while let Some(field) = multipart
+    if let Some(field) = multipart
         .next_field()
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?

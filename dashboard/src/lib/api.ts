@@ -342,13 +342,30 @@ export async function getCurrentMission(): Promise<Mission | null> {
 }
 
 // Create a new mission
+export interface CreateMissionOptions {
+  title?: string;
+  modelOverride?: string;
+  workspaceId?: string;
+  agentId?: string;
+  hooks?: string[];
+}
+
 export async function createMission(
-  title?: string,
-  modelOverride?: string
+  options?: CreateMissionOptions
 ): Promise<Mission> {
-  const body: { title?: string; model_override?: string } = {};
-  if (title) body.title = title;
-  if (modelOverride) body.model_override = modelOverride;
+  const body: {
+    title?: string;
+    model_override?: string;
+    workspace_id?: string;
+    agent_id?: string;
+    hooks?: string[];
+  } = {};
+
+  if (options?.title) body.title = options.title;
+  if (options?.modelOverride) body.model_override = options.modelOverride;
+  if (options?.workspaceId) body.workspace_id = options.workspaceId;
+  if (options?.agentId) body.agent_id = options.agentId;
+  if (options?.hooks && options.hooks.length > 0) body.hooks = options.hooks;
 
   const res = await apiFetch("/api/control/missions", {
     method: "POST",

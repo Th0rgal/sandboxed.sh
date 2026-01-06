@@ -558,6 +558,12 @@ fn looks_like_user_prompt(content: &str) -> bool {
 fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option<OpenCodeEvent> {
     let part = props.get("part")?;
     let part_type = part.get("type").and_then(|v| v.as_str())?;
+
+    // Handle tool parts - extract tool call/result events from state changes
+    if part_type == "tool" {
+        return handle_tool_part_update(part);
+    }
+
     if !matches!(part_type, "text" | "reasoning" | "thinking") {
         return None;
     }
@@ -599,9 +605,104 @@ fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option
     }
 
     if matches!(part_type, "reasoning" | "thinking") {
+        tracing::debug!(
+            part_type = %part_type,
+            content_len = content.len(),
+            "Emitting Thinking event"
+        );
         Some(OpenCodeEvent::Thinking { content })
     } else {
         Some(OpenCodeEvent::TextDelta { content })
+    }
+}
+
+/// Handle tool part updates from message.part.updated events.
+/// OpenCode sends tool calls/results via message.part.updated with part.type = "tool"
+fn handle_tool_part_update(part: &serde_json::Value) -> Option<OpenCodeEvent> {
+    tracing::debug!(part = ?part, "Handling tool part update");
+
+    let state_obj = part.get("state")?;
+    let status = state_obj.get("status").and_then(|v| v.as_str())?;
+
+    tracing::debug!(status = %status, "Tool part status");
+
+    // Extract common fields
+    let tool_call_id = part
+        .get("callID")
+        .or_else(|| part.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let tool_name = part
+        .get("tool")
+        .or_else(|| part.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    match status {
+        // Tool is starting to run - emit ToolCall event
+        "running" => {
+            let args = state_obj
+                .get("input")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+
+            tracing::info!(
+                tool_call_id = %tool_call_id,
+                name = %tool_name,
+                "OpenCode tool_call event from message.part.updated"
+            );
+
+            Some(OpenCodeEvent::ToolCall {
+                tool_call_id,
+                name: tool_name,
+                args,
+            })
+        }
+        // Tool completed - emit ToolResult event
+        "completed" => {
+            let result = state_obj
+                .get("output")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+
+            tracing::info!(
+                tool_call_id = %tool_call_id,
+                name = %tool_name,
+                "OpenCode tool_result event from message.part.updated"
+            );
+
+            Some(OpenCodeEvent::ToolResult {
+                tool_call_id,
+                name: tool_name,
+                result,
+            })
+        }
+        // Tool errored - emit ToolResult with error
+        "error" => {
+            let error_msg = state_obj
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
+            let result = serde_json::json!({ "error": error_msg });
+
+            tracing::info!(
+                tool_call_id = %tool_call_id,
+                name = %tool_name,
+                error = %error_msg,
+                "OpenCode tool error from message.part.updated"
+            );
+
+            Some(OpenCodeEvent::ToolResult {
+                tool_call_id,
+                name: tool_name,
+                result,
+            })
+        }
+        // pending or other states - don't emit events yet
+        _ => None,
     }
 }
 
@@ -619,6 +720,13 @@ fn parse_sse_event(
 
     let event_type = json.get("type")?.as_str()?;
     let props = json.get("properties").cloned().unwrap_or(json!({}));
+
+    // Log all event types for debugging
+    tracing::debug!(
+        event_type = %event_type,
+        session_id = %session_id,
+        "OpenCode SSE event received"
+    );
 
     // Filter by session ID if the event has one
     let event_session_id = props
@@ -651,7 +759,10 @@ fn parse_sse_event(
         }
 
         // Message part streaming events
-        "message.part.updated" => handle_part_update(&props, state),
+        "message.part.updated" => {
+            tracing::debug!(props = ?props, "message.part.updated event");
+            handle_part_update(&props, state)
+        }
 
         // Tool call events
         "tool.call" | "tool.calling" | "message.tool_call" => {
@@ -672,6 +783,12 @@ fn parse_sse_event(
                 .or(props.get("input"))
                 .cloned()
                 .unwrap_or(json!({}));
+
+            tracing::info!(
+                tool_call_id = %tool_call_id,
+                name = %name,
+                "OpenCode tool_call event parsed"
+            );
 
             Some(OpenCodeEvent::ToolCall {
                 tool_call_id,
@@ -725,7 +842,15 @@ fn parse_sse_event(
             Some(OpenCodeEvent::Error { message })
         }
 
-        _ => None,
+        _ => {
+            // Log unknown event types to help debug which events OpenCode sends
+            tracing::debug!(
+                event_type = %event_type,
+                props = ?props,
+                "Unknown OpenCode SSE event type"
+            );
+            None
+        }
     }
 }
 

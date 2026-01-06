@@ -600,6 +600,8 @@ impl SupabaseClient {
         title: Option<&str>,
         model_override: Option<&str>,
         workspace_id: Option<Uuid>,
+        agent_id: Option<Uuid>,
+        hooks: Option<Vec<String>>,
     ) -> anyhow::Result<DbMission> {
         let mut body = serde_json::json!({
             "title": title,
@@ -615,6 +617,16 @@ impl SupabaseClient {
         // Add workspace_id if provided
         if let Some(ws_id) = workspace_id {
             body["workspace_id"] = serde_json::Value::String(ws_id.to_string());
+        }
+
+        // Add agent_id if provided
+        if let Some(a_id) = agent_id {
+            body["agent_id"] = serde_json::Value::String(a_id.to_string());
+        }
+
+        // Add hooks if provided
+        if let Some(h) = hooks {
+            body["hooks"] = serde_json::json!(h);
         }
 
         let resp = self

@@ -326,6 +326,12 @@ pub struct DbMission {
     /// Workspace ID where this mission runs
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<Uuid>,
+    /// Agent configuration ID for this mission
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<Uuid>,
+    /// Hooks to run for this mission (e.g., "ralph-wiggum")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<Vec<String>>,
     /// Conversation history as JSON array of {role, content} objects
     pub history: serde_json::Value,
     /// Final agent tree snapshot (saved when mission completes)
