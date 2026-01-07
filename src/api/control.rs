@@ -67,10 +67,6 @@ fn build_history_context(history: &[(String, String)], max_chars: usize) -> Stri
 #[derive(Debug, Clone, Deserialize)]
 pub struct ControlMessageRequest {
     pub content: String,
-    /// Optional model override for this message.
-    /// If not specified, uses the server's default model.
-    #[serde(default)]
-    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -353,8 +349,6 @@ pub enum ControlCommand {
     UserMessage {
         id: Uuid,
         content: String,
-        /// Optional model override for this message
-        model: Option<String>,
     },
     ToolResult {
         tool_call_id: String,
@@ -370,10 +364,9 @@ pub enum ControlCommand {
     /// Create a new mission
     CreateMission {
         title: Option<String>,
-        model_override: Option<String>,
         workspace_id: Option<Uuid>,
-        agent_id: Option<Uuid>,
-        hooks: Option<Vec<String>>,
+        /// Agent name from library (e.g., "code-reviewer")
+        agent: Option<String>,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Update mission status
@@ -386,8 +379,6 @@ pub enum ControlCommand {
     StartParallel {
         mission_id: Uuid,
         content: String,
-        /// Model override from API request (takes priority over DB)
-        model: Option<String>,
         respond: oneshot::Sender<Result<(), String>>,
     },
     /// Cancel a specific mission
@@ -448,18 +439,12 @@ pub struct Mission {
     pub id: Uuid,
     pub status: MissionStatus,
     pub title: Option<String>,
-    /// Model override requested for this mission
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_override: Option<String>,
     /// Workspace ID where this mission runs (defaults to host workspace)
     #[serde(default = "default_workspace_id")]
     pub workspace_id: Uuid,
-    /// Agent configuration ID for this mission (optional)
+    /// Agent name from library (e.g., "code-reviewer")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<Uuid>,
-    /// Hooks to run for this mission (e.g., "ralph-wiggum")
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hooks: Vec<String>,
+    pub agent: Option<String>,
     pub history: Vec<MissionHistoryEntry>,
     pub created_at: String,
     pub updated_at: String,
@@ -500,10 +485,8 @@ trait MissionStore: Send + Sync {
     async fn create_mission(
         &self,
         title: Option<&str>,
-        model_override: Option<&str>,
         workspace_id: Option<Uuid>,
-        agent_id: Option<Uuid>,
-        hooks: Option<Vec<String>>,
+        agent: Option<&str>,
     ) -> Result<Mission, String>;
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String>;
     async fn update_mission_history(
@@ -564,20 +547,16 @@ impl MissionStore for InMemoryMissionStore {
     async fn create_mission(
         &self,
         title: Option<&str>,
-        model_override: Option<&str>,
         workspace_id: Option<Uuid>,
-        agent_id: Option<Uuid>,
-        hooks: Option<Vec<String>>,
+        agent: Option<&str>,
     ) -> Result<Mission, String> {
         let now = now_string();
         let mission = Mission {
             id: Uuid::new_v4(),
             status: MissionStatus::Active,
             title: title.map(|s| s.to_string()),
-            model_override: model_override.map(|s| s.to_string()),
             workspace_id: workspace_id.unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID),
-            agent_id,
-            hooks: hooks.unwrap_or_default(),
+            agent: agent.map(|s| s.to_string()),
             history: vec![],
             created_at: now.clone(),
             updated_at: now,
@@ -881,7 +860,6 @@ pub async fn post_message(
         .send(ControlCommand::UserMessage {
             id,
             content,
-            model: req.model,
         })
         .await
         .map_err(|_| {
@@ -987,13 +965,10 @@ pub async fn get_mission(
 #[derive(Debug, Deserialize)]
 pub struct CreateMissionRequest {
     pub title: Option<String>,
-    pub model_override: Option<String>,
     /// Workspace ID to run the mission in (defaults to host workspace)
     pub workspace_id: Option<Uuid>,
-    /// Agent ID to use for this mission (provides default model, MCPs, skills, commands)
-    pub agent_id: Option<Uuid>,
-    /// Hooks to enable for this mission (e.g., ["ralph-wiggum"])
-    pub hooks: Option<Vec<String>>,
+    /// Agent name from library (e.g., "code-reviewer")
+    pub agent: Option<String>,
 }
 
 pub async fn create_mission(
@@ -1003,19 +978,17 @@ pub async fn create_mission(
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
-    let (title, model_override, workspace_id, agent_id, hooks) = body
-        .map(|b| (b.title.clone(), b.model_override.clone(), b.workspace_id, b.agent_id, b.hooks.clone()))
-        .unwrap_or((None, None, None, None, None));
+    let (title, workspace_id, agent) = body
+        .map(|b| (b.title.clone(), b.workspace_id, b.agent.clone()))
+        .unwrap_or((None, None, None));
 
     let control = control_for_user(&state, &user).await;
     control
         .cmd_tx
         .send(ControlCommand::CreateMission {
             title,
-            model_override,
             workspace_id,
-            agent_id,
-            hooks,
+            agent,
             respond: tx,
         })
         .await
@@ -1315,9 +1288,6 @@ pub async fn list_running_missions(
 #[derive(Debug, Deserialize)]
 pub struct StartParallelRequest {
     pub content: String,
-    /// Optional model override for this parallel mission
-    #[serde(default)]
-    pub model: Option<String>,
 }
 
 /// Start a mission in parallel (if capacity allows).
@@ -1335,7 +1305,6 @@ pub async fn start_mission_parallel(
         .send(ControlCommand::StartParallel {
             mission_id,
             content: req.content,
-            model: req.model,
             respond: tx,
         })
         .await
@@ -1592,6 +1561,10 @@ pub async fn stream(
                 result = rx.recv() => {
                     match result {
                         Ok(ev) => {
+                            // DEBUG: Log events being sent via SSE
+                            if matches!(ev, AgentEvent::Thinking { .. }) {
+                                tracing::info!(event = ?ev.event_name(), "Sending Thinking event via SSE");
+                            }
                             let sse = Event::default().event(ev.event_name()).json_data(&ev).unwrap();
                             yield Ok(sse);
                         }
@@ -1760,8 +1733,8 @@ async fn control_actor_loop(
     progress: Arc<RwLock<ExecutionProgress>>,
     mission_store: Arc<dyn MissionStore>,
 ) {
-    // Queue stores (id, content, model_override) for the current/primary mission
-    let mut queue: VecDeque<(Uuid, String, Option<String>)> = VecDeque::new();
+    // Queue stores (id, content) for the current/primary mission
+    let mut queue: VecDeque<(Uuid, String)> = VecDeque::new();
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content) pairs (user/assistant)
     let mut running: Option<tokio::task::JoinHandle<(Uuid, String, crate::agents::AgentResult)>> =
         None;
@@ -1859,22 +1832,19 @@ async fn control_actor_loop(
     // Helper to create a new mission
     async fn create_new_mission(
         mission_store: &Arc<dyn MissionStore>,
-        model_override: Option<&str>,
     ) -> Result<Mission, String> {
-        create_new_mission_with_title(mission_store, None, model_override, None, None, None).await
+        create_new_mission_with_title(mission_store, None, None, None).await
     }
 
     // Helper to create a new mission with title
     async fn create_new_mission_with_title(
         mission_store: &Arc<dyn MissionStore>,
         title: Option<&str>,
-        model_override: Option<&str>,
         workspace_id: Option<Uuid>,
-        agent_id: Option<Uuid>,
-        hooks: Option<Vec<String>>,
+        agent: Option<&str>,
     ) -> Result<Mission, String> {
         mission_store
-            .create_mission(title, model_override, workspace_id, agent_id, hooks)
+            .create_mission(title, workspace_id, agent)
             .await
     }
 
@@ -2040,40 +2010,21 @@ async fn control_actor_loop(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    ControlCommand::UserMessage { id, content, model } => {
+                    ControlCommand::UserMessage { id, content } => {
                         // Auto-create mission on first message if none exists
                         {
                             let mission_id = current_mission.read().await.clone();
                             if mission_id.is_none() {
                                 if let Ok(new_mission) =
-                                    create_new_mission(&mission_store, model.as_deref()).await
+                                    create_new_mission(&mission_store).await
                                 {
                                     *current_mission.write().await = Some(new_mission.id);
-                                    tracing::info!("Auto-created mission: {} (model: {:?})", new_mission.id, model);
+                                    tracing::info!("Auto-created mission: {}", new_mission.id);
                                 }
                             }
                         }
 
-                        // Use explicit model from message, or fall back to mission's model_override
-                        let effective_model = if model.is_some() {
-                            model
-                        } else {
-                            // Get current mission's model_override
-                            let mission_id = current_mission.read().await.clone();
-                            if let Some(mid) = mission_id {
-                                if let Ok(mission) =
-                                    load_mission_record(&mission_store, mid).await
-                                {
-                                    mission.model_override
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        };
-
-                        queue.push_back((id, content, effective_model));
+                        queue.push_back((id, content));
                         set_and_emit_status(
                             &status,
                             &events_tx,
@@ -2081,7 +2032,7 @@ async fn control_actor_loop(
                             queue.len(),
                         ).await;
                         if running.is_none() {
-                            if let Some((mid, msg, model_override)) = queue.pop_front() {
+                            if let Some((mid, msg)) = queue.pop_front() {
                                 set_and_emit_status(&status, &events_tx, ControlRunState::Running, queue.len()).await;
                                 let current_mid = current_mission.read().await.clone();
                                 let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), mission_id: current_mid });
@@ -2146,7 +2097,6 @@ async fn control_actor_loop(
                                         cancel,
                                         hist_snapshot,
                                         msg.clone(),
-                                        model_override,
                                         Some(mission_ctrl),
                                         tree_ref,
                                         progress_ref,
@@ -2203,7 +2153,7 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, model_override, workspace_id, agent_id, hooks, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, respond } => {
                         // First persist current mission history
                         persist_mission_history(
                             &mission_store,
@@ -2212,14 +2162,12 @@ async fn control_actor_loop(
                         )
                         .await;
 
-                        // Create a new mission with optional title, model override, workspace, agent, and hooks
+                        // Create a new mission with optional title, workspace, and agent
                         match create_new_mission_with_title(
                             &mission_store,
                             title.as_deref(),
-                            model_override.as_deref(),
                             workspace_id,
-                            agent_id,
-                            hooks,
+                            agent.as_deref(),
                         )
                         .await {
                             Ok(mission) => {
@@ -2255,8 +2203,8 @@ async fn control_actor_loop(
                         }
                         let _ = respond.send(result);
                     }
-                    ControlCommand::StartParallel { mission_id, content, model, respond } => {
-                        tracing::info!("StartParallel requested for mission {} with model {:?}", mission_id, model);
+                    ControlCommand::StartParallel { mission_id, content, respond } => {
+                        tracing::info!("StartParallel requested for mission {}", mission_id);
 
                         // Count currently running parallel missions
                         let parallel_running = parallel_runners.values().filter(|r| r.is_running()).count();
@@ -2275,7 +2223,7 @@ async fn control_actor_loop(
                                 mission_id
                             )));
                         } else {
-                            // Load mission to get DB model_override and existing history
+                            // Load mission to get existing history
                             let mission = match load_mission_record(
                                 &mission_store,
                                 mission_id,
@@ -2288,13 +2236,9 @@ async fn control_actor_loop(
                                 }
                             };
 
-                            // Request model takes priority over DB model
-                            let model_override = model.or(mission.model_override);
-
                             // Create a new MissionRunner
                             let mut runner = super::mission_runner::MissionRunner::new(
                                 mission_id,
-                                model_override.clone(),
                                 mission.workspace_id,
                             );
 
@@ -2304,7 +2248,7 @@ async fn control_actor_loop(
                             }
 
                             // Queue the initial message
-                            runner.queue_message(Uuid::new_v4(), content, model_override);
+                            runner.queue_message(Uuid::new_v4(), content);
 
                             // Start execution
                             let started = runner.start_next(
@@ -2320,7 +2264,7 @@ async fn control_actor_loop(
                             );
 
                             if started {
-                                tracing::info!("Mission {} started in parallel (model: {:?})", mission_id, runner.model_override);
+                                tracing::info!("Mission {} started in parallel", mission_id);
                                 parallel_runners.insert(mission_id, runner);
                                 let _ = respond.send(Ok(()));
                             } else {
@@ -2369,7 +2313,6 @@ async fn control_actor_loop(
                             if let Some(mission_id) = running_mission_id {
                                 running_list.push(super::mission_runner::RunningMissionInfo {
                                     mission_id,
-                                    model_override: None,
                                     state: "running".to_string(),
                                     queue_len: queue.len(),
                                     history_len: history.len(),
@@ -2421,11 +2364,11 @@ async fn control_actor_loop(
 
                                 // Queue the resume prompt as a message
                                 let msg_id = Uuid::new_v4();
-                                queue.push_back((msg_id, resume_prompt, mission.model_override.clone()));
+                                queue.push_back((msg_id, resume_prompt));
 
                                 // Start execution if not already running
                                 if running.is_none() {
-                                    if let Some((mid, msg, model_override)) = queue.pop_front() {
+                                    if let Some((mid, msg)) = queue.pop_front() {
                                         set_and_emit_status(&status, &events_tx, ControlRunState::Running, queue.len()).await;
                                         let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), mission_id: Some(mission_id) });
                                         let cfg = config.clone();
@@ -2459,7 +2402,6 @@ async fn control_actor_loop(
                                                 cancel,
                                                 hist_snapshot,
                                                 msg.clone(),
-                                                model_override,
                                                 Some(mission_ctrl),
                                                 tree_ref,
                                                 progress_ref,
@@ -2786,7 +2728,7 @@ async fn control_actor_loop(
                 }
 
                 // Start next queued message, if any.
-                if let Some((mid, msg, model_override)) = queue.pop_front() {
+                if let Some((mid, msg)) = queue.pop_front() {
                     set_and_emit_status(&status, &events_tx, ControlRunState::Running, queue.len()).await;
                     let current_mid = current_mission.read().await.clone();
                     let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), mission_id: current_mid });
@@ -2851,7 +2793,6 @@ async fn control_actor_loop(
                             cancel,
                             hist_snapshot,
                             msg.clone(),
-                            model_override,
                             Some(mission_ctrl),
                             tree_ref,
                             progress_ref,
@@ -2961,7 +2902,6 @@ async fn run_single_control_turn(
     cancel: CancellationToken,
     history: Vec<(String, String)>,
     user_message: String,
-    model_override: Option<String>,
     mission_control: Option<crate::tools::mission::MissionControl>,
     tree_snapshot: Arc<RwLock<Option<AgentTreeNode>>>,
     progress_snapshot: Arc<RwLock<ExecutionProgress>>,
@@ -3005,12 +2945,6 @@ async fn run_single_control_turn(
             return r;
         }
     };
-
-    // Apply model override if specified
-    if let Some(model) = model_override {
-        tracing::info!("Using model override: {}", model);
-        task.analysis_mut().requested_model = Some(model);
-    }
 
     // Context for agent execution.
     let mut ctx = AgentContext::new(config.clone(), working_dir_path);

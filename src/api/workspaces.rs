@@ -9,7 +9,7 @@
 use axum::{
     extract::{Path as AxumPath, State},
     http::StatusCode,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::workspace::{Workspace, WorkspaceStatus, WorkspaceType};
+use crate::workspace::{self, Workspace, WorkspaceStatus, WorkspaceType};
 
 /// Create workspace routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -25,8 +25,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/", get(list_workspaces))
         .route("/", post(create_workspace))
         .route("/:id", get(get_workspace))
+        .route("/:id", put(update_workspace))
         .route("/:id", delete(delete_workspace))
         .route("/:id/build", post(build_workspace))
+        .route("/:id/sync", post(sync_workspace))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -42,6 +44,22 @@ pub struct CreateWorkspaceRequest {
     pub workspace_type: WorkspaceType,
     /// Working directory path (optional, defaults based on type)
     pub path: Option<PathBuf>,
+    /// Skill names from library to sync to this workspace
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Plugin identifiers for hooks
+    #[serde(default)]
+    pub plugins: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateWorkspaceRequest {
+    /// Human-readable name (optional update)
+    pub name: Option<String>,
+    /// Skill names from library to sync to this workspace
+    pub skills: Option<Vec<String>>,
+    /// Plugin identifiers for hooks
+    pub plugins: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,6 +71,8 @@ pub struct WorkspaceResponse {
     pub status: WorkspaceStatus,
     pub error_message: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub skills: Vec<String>,
+    pub plugins: Vec<String>,
 }
 
 impl From<Workspace> for WorkspaceResponse {
@@ -65,6 +85,8 @@ impl From<Workspace> for WorkspaceResponse {
             status: w.status,
             error_message: w.error_message,
             created_at: w.created_at,
+            skills: w.skills,
+            plugins: w.plugins,
         }
     }
 }
@@ -201,11 +223,38 @@ async fn create_workspace(
             error_message: None,
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            skills: req.skills,
+            plugins: req.plugins,
         },
-        WorkspaceType::Chroot => Workspace::new_chroot(req.name, path),
+        WorkspaceType::Chroot => {
+            let mut ws = Workspace::new_chroot(req.name, path);
+            ws.skills = req.skills;
+            ws.plugins = req.plugins;
+            ws
+        }
     };
 
     let id = state.workspaces.add(workspace.clone()).await;
+
+    // Sync skills to workspace if any are specified
+    if !workspace.skills.is_empty() {
+        let library_guard = state.library.read().await;
+        if let Some(library) = library_guard.as_ref() {
+            if let Err(e) = workspace::sync_workspace_skills(&workspace, library).await {
+                tracing::warn!(
+                    workspace = %workspace.name,
+                    error = %e,
+                    "Failed to sync skills to workspace during creation"
+                );
+            }
+        } else {
+            tracing::warn!(
+                workspace = %workspace.name,
+                "Library not initialized, cannot sync skills"
+            );
+        }
+    }
+
     let response: WorkspaceResponse = workspace.into();
 
     tracing::info!("Created workspace: {} ({})", response.name, id);
@@ -224,6 +273,103 @@ async fn get_workspace(
         .await
         .map(|w| Json(w.into()))
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))
+}
+
+/// PUT /api/workspaces/:id - Update a workspace.
+async fn update_workspace(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<UpdateWorkspaceRequest>,
+) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
+    let mut workspace = state
+        .workspaces
+        .get(id)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
+
+    // Validate name if provided
+    if let Some(ref name) = req.name {
+        validate_workspace_name(name)?;
+        workspace.name = name.clone();
+    }
+
+    // Update skills if provided
+    let skills_changed = if let Some(skills) = req.skills {
+        workspace.skills = skills;
+        true
+    } else {
+        false
+    };
+
+    // Update plugins if provided
+    if let Some(plugins) = req.plugins {
+        workspace.plugins = plugins;
+    }
+
+    // Save the updated workspace
+    state.workspaces.update(workspace.clone()).await;
+
+    // Sync skills if they changed
+    if skills_changed && !workspace.skills.is_empty() {
+        let library_guard = state.library.read().await;
+        if let Some(library) = library_guard.as_ref() {
+            if let Err(e) = workspace::sync_workspace_skills(&workspace, library).await {
+                tracing::warn!(
+                    workspace = %workspace.name,
+                    error = %e,
+                    "Failed to sync skills to workspace during update"
+                );
+            }
+        } else {
+            tracing::warn!(
+                workspace = %workspace.name,
+                "Library not initialized, cannot sync skills"
+            );
+        }
+    }
+
+    tracing::info!("Updated workspace: {} ({})", workspace.name, id);
+
+    Ok(Json(workspace.into()))
+}
+
+/// POST /api/workspaces/:id/sync - Manually sync skills to workspace.
+async fn sync_workspace(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
+    let workspace = state
+        .workspaces
+        .get(id)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
+
+    // Get library
+    let library_guard = state.library.read().await;
+    let library = library_guard.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Library not initialized".to_string(),
+        )
+    })?;
+
+    // Sync skills to workspace
+    workspace::sync_workspace_skills(&workspace, library)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to sync skills: {}", e),
+            )
+        })?;
+
+    tracing::info!(
+        "Synced skills to workspace: {} ({})",
+        workspace.name,
+        id
+    );
+
+    Ok(Json(workspace.into()))
 }
 
 /// DELETE /api/workspaces/:id - Delete a workspace.

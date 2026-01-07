@@ -98,19 +98,17 @@ final class APIService {
         try await get("/api/control/missions/current")
     }
     
-    func createMission(workspaceId: String? = nil, title: String? = nil, modelOverride: String? = nil) async throws -> Mission {
+    func createMission(workspaceId: String? = nil, title: String? = nil) async throws -> Mission {
         struct CreateMissionRequest: Encodable {
             let workspaceId: String?
             let title: String?
-            let modelOverride: String?
 
             enum CodingKeys: String, CodingKey {
                 case workspaceId = "workspace_id"
                 case title
-                case modelOverride = "model_override"
             }
         }
-        return try await post("/api/control/missions", body: CreateMissionRequest(workspaceId: workspaceId, title: title, modelOverride: modelOverride))
+        return try await post("/api/control/missions", body: CreateMissionRequest(workspaceId: workspaceId, title: title))
     }
     
     func loadMission(id: String) async throws -> Mission {

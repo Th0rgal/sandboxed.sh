@@ -103,10 +103,17 @@ impl LibraryStore {
             .await
             .context("Failed to read mcp/servers.json")?;
 
-        let servers: HashMap<String, McpServer> =
-            serde_json::from_str(&content).context("Failed to parse mcp/servers.json")?;
-
-        Ok(servers)
+        // Be lenient with parse errors - log warning and return empty
+        match serde_json::from_str::<HashMap<String, McpServer>>(&content) {
+            Ok(servers) => Ok(servers),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse mcp/servers.json, returning empty map: {}",
+                    e
+                );
+                Ok(HashMap::new())
+            }
+        }
     }
 
     /// Save MCP server definitions.
@@ -773,10 +780,17 @@ impl LibraryStore {
             .await
             .context("Failed to read plugins.json")?;
 
-        let plugins: HashMap<String, Plugin> =
-            serde_json::from_str(&content).context("Failed to parse plugins.json")?;
-
-        Ok(plugins)
+        // Be lenient with parse errors - log warning and return empty
+        match serde_json::from_str::<HashMap<String, Plugin>>(&content) {
+            Ok(plugins) => Ok(plugins),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse plugins.json, returning empty map: {}",
+                    e
+                );
+                Ok(HashMap::new())
+            }
+        }
     }
 
     /// Save all plugins to plugins.json.

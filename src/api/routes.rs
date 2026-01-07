@@ -53,8 +53,6 @@ pub struct AppState {
     pub library: library_api::SharedLibrary,
     /// Workspace store
     pub workspaces: workspace::SharedWorkspaceStore,
-    /// Agent configuration store
-    pub agents: Arc<crate::agent_config::AgentStore>,
     /// OpenCode connection store
     pub opencode_connections: Arc<crate::opencode_config::OpenCodeStore>,
     /// AI Provider store
@@ -63,6 +61,8 @@ pub struct AppState {
     pub pending_oauth: Arc<RwLock<HashMap<crate::ai_providers::ProviderType, crate::ai_providers::PendingOAuth>>>,
     /// Secrets store for encrypted credentials
     pub secrets: Option<Arc<crate::secrets::SecretsStore>>,
+    /// Console session pool for WebSocket reconnection
+    pub console_pool: Arc<console::SessionPool>,
 }
 
 /// Start the HTTP server.
@@ -82,11 +82,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Initialize workspace store (loads from disk and recovers orphaned chroots)
     let workspaces = Arc::new(workspace::WorkspaceStore::new(config.working_dir.clone()).await);
-
-    // Initialize agent configuration store
-    let agents = Arc::new(crate::agent_config::AgentStore::new(
-        config.working_dir.join(".openagent/agents.json"),
-    ).await);
 
     // Initialize OpenCode connection store
     let opencode_connections = Arc::new(crate::opencode_config::OpenCodeStore::new(
@@ -110,6 +105,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             None
         }
     };
+
+    // Initialize console session pool for WebSocket reconnection
+    let console_pool = Arc::new(console::SessionPool::new());
+    Arc::clone(&console_pool).start_cleanup_task();
 
     // Spawn the single global control session actor.
     let control_state = control::ControlHub::new(
@@ -147,11 +146,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         mcp,
         library,
         workspaces,
-        agents,
         opencode_connections,
         ai_providers,
         pending_oauth,
         secrets,
+        console_pool,
     });
 
     let public_routes = Router::new()
@@ -267,8 +266,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/library", library_api::routes())
         // Workspace management endpoints
         .nest("/api/workspaces", workspaces_api::routes())
-        // Agent configuration endpoints
-        .nest("/api/agents", super::agents::routes())
         // OpenCode connection endpoints
         .nest("/api/opencode/connections", opencode_api::routes())
         // AI Provider endpoints

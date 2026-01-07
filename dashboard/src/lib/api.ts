@@ -312,7 +312,6 @@ export interface Mission {
   id: string;
   status: MissionStatus;
   title: string | null;
-  model_override: string | null;
   history: MissionHistoryEntry[];
   created_at: string;
   updated_at: string;
@@ -344,10 +343,9 @@ export async function getCurrentMission(): Promise<Mission | null> {
 // Create a new mission
 export interface CreateMissionOptions {
   title?: string;
-  modelOverride?: string;
   workspaceId?: string;
-  agentId?: string;
-  hooks?: string[];
+  /** Agent name from library (e.g., "code-reviewer") */
+  agent?: string;
 }
 
 export async function createMission(
@@ -355,17 +353,13 @@ export async function createMission(
 ): Promise<Mission> {
   const body: {
     title?: string;
-    model_override?: string;
     workspace_id?: string;
-    agent_id?: string;
-    hooks?: string[];
+    agent?: string;
   } = {};
 
   if (options?.title) body.title = options.title;
-  if (options?.modelOverride) body.model_override = options.modelOverride;
   if (options?.workspaceId) body.workspace_id = options.workspaceId;
-  if (options?.agentId) body.agent_id = options.agentId;
-  if (options?.hooks && options.hooks.length > 0) body.hooks = options.hooks;
+  if (options?.agent) body.agent = options.agent;
 
   const res = await apiFetch("/api/control/missions", {
     method: "POST",
@@ -389,7 +383,6 @@ export async function loadMission(id: string): Promise<Mission> {
 
 export interface RunningMissionInfo {
   mission_id: string;
-  model_override: string | null;
   state: "queued" | "running" | "waiting_for_tool" | "finished";
   queue_len: number;
   history_len: number;
@@ -1549,6 +1542,8 @@ export interface Workspace {
   status: WorkspaceStatus;
   error_message: string | null;
   created_at: string;
+  skills: string[];
+  plugins: string[];
 }
 
 // List workspaces
@@ -1570,6 +1565,8 @@ export async function createWorkspace(data: {
   name: string;
   workspace_type: WorkspaceType;
   path?: string;
+  skills?: string[];
+  plugins?: string[];
 }): Promise<Workspace> {
   const res = await apiFetch("/api/workspaces", {
     method: "POST",
@@ -1580,82 +1577,37 @@ export async function createWorkspace(data: {
   return res.json();
 }
 
-// Delete workspace
-export async function deleteWorkspace(id: string): Promise<void> {
-  const res = await apiFetch(`/api/workspaces/${id}`, { method: "DELETE" });
-  if (!res.ok) throw new Error("Failed to delete workspace");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Agent Configuration API
-// ─────────────────────────────────────────────────────────────────────────────
-
-export interface AgentConfig {
-  id: string;
-  name: string;
-  model_id: string;
-  mcp_servers: string[];
-  skills: string[];
-  commands: string[];
-  created_at: string;
-  updated_at: string;
-}
-
-// List all agents
-export async function listAgents(): Promise<AgentConfig[]> {
-  const res = await apiFetch("/api/agents");
-  if (!res.ok) throw new Error("Failed to list agents");
-  return res.json();
-}
-
-// Get agent by ID
-export async function getAgent(id: string): Promise<AgentConfig> {
-  const res = await apiFetch(`/api/agents/${id}`);
-  if (!res.ok) throw new Error("Failed to get agent");
-  return res.json();
-}
-
-// Create new agent
-export async function createAgent(data: {
-  name: string;
-  model_id: string;
-  mcp_servers?: string[];
-  skills?: string[];
-  commands?: string[];
-}): Promise<AgentConfig> {
-  const res = await apiFetch("/api/agents", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error("Failed to create agent");
-  return res.json();
-}
-
-// Update agent
-export async function updateAgent(
+// Update workspace
+export async function updateWorkspace(
   id: string,
   data: {
     name?: string;
-    model_id?: string;
-    mcp_servers?: string[];
     skills?: string[];
-    commands?: string[];
+    plugins?: string[];
   }
-): Promise<AgentConfig> {
-  const res = await apiFetch(`/api/agents/${id}`, {
+): Promise<Workspace> {
+  const res = await apiFetch(`/api/workspaces/${id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) throw new Error("Failed to update agent");
+  if (!res.ok) throw new Error("Failed to update workspace");
   return res.json();
 }
 
-// Delete agent
-export async function deleteAgent(id: string): Promise<void> {
-  const res = await apiFetch(`/api/agents/${id}`, { method: "DELETE" });
-  if (!res.ok) throw new Error("Failed to delete agent");
+// Sync workspace skills
+export async function syncWorkspace(id: string): Promise<Workspace> {
+  const res = await apiFetch(`/api/workspaces/${id}/sync`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error("Failed to sync workspace");
+  return res.json();
+}
+
+// Delete workspace
+export async function deleteWorkspace(id: string): Promise<void> {
+  const res = await apiFetch(`/api/workspaces/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error("Failed to delete workspace");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

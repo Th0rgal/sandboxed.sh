@@ -605,13 +605,20 @@ fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option
     }
 
     if matches!(part_type, "reasoning" | "thinking") {
-        tracing::debug!(
+        tracing::info!(
             part_type = %part_type,
             content_len = content.len(),
-            "Emitting Thinking event"
+            content_preview = %content.chars().take(100).collect::<String>(),
+            "Emitting Thinking event from SSE"
         );
         Some(OpenCodeEvent::Thinking { content })
     } else {
+        tracing::info!(
+            part_type = %part_type,
+            content_len = content.len(),
+            content_preview = %content.chars().take(100).collect::<String>(),
+            "Emitting TextDelta event from SSE"
+        );
         Some(OpenCodeEvent::TextDelta { content })
     }
 }
@@ -722,7 +729,7 @@ fn parse_sse_event(
     let props = json.get("properties").cloned().unwrap_or(json!({}));
 
     // Log all event types for debugging
-    tracing::debug!(
+    tracing::info!(
         event_type = %event_type,
         session_id = %session_id,
         "OpenCode SSE event received"
@@ -760,7 +767,13 @@ fn parse_sse_event(
 
         // Message part streaming events
         "message.part.updated" => {
-            tracing::debug!(props = ?props, "message.part.updated event");
+            let part_type = props.get("part").and_then(|p| p.get("type")).and_then(|v| v.as_str());
+            tracing::info!(
+                part_type = ?part_type,
+                has_delta = props.get("delta").is_some(),
+                delta_len = props.get("delta").and_then(|v| v.as_str()).map(|s| s.len()),
+                "message.part.updated event received"
+            );
             handle_part_update(&props, state)
         }
 
@@ -887,6 +900,27 @@ pub fn extract_text(parts: &[serde_json::Value]) -> String {
         }
     }
     out.join("\n")
+}
+
+/// Extract reasoning/thinking content from message parts.
+/// This handles both "reasoning" and "thinking" part types.
+pub fn extract_reasoning(parts: &[serde_json::Value]) -> Option<String> {
+    let mut out = Vec::new();
+    for part in parts {
+        let part_type = part.get("type").and_then(|v| v.as_str());
+        if matches!(part_type, Some("reasoning") | Some("thinking")) {
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    out.push(text.to_string());
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join("\n"))
+    }
 }
 
 fn split_model(model: &str) -> Option<(String, String)> {

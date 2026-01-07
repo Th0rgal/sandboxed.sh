@@ -56,7 +56,6 @@ struct Mission: Codable, Identifiable, Hashable {
     let id: String
     var status: MissionStatus
     let title: String?
-    let modelOverride: String?
     let workspaceId: String?
     let history: [MissionHistoryEntry]
     let createdAt: String
@@ -74,7 +73,6 @@ struct Mission: Codable, Identifiable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case id, status, title, history, resumable
-        case modelOverride = "model_override"
         case workspaceId = "workspace_id"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
@@ -86,7 +84,6 @@ struct Mission: Codable, Identifiable, Hashable {
         id = try container.decode(String.self, forKey: .id)
         status = try container.decode(MissionStatus.self, forKey: .status)
         title = try container.decodeIfPresent(String.self, forKey: .title)
-        modelOverride = try container.decodeIfPresent(String.self, forKey: .modelOverride)
         workspaceId = try container.decodeIfPresent(String.self, forKey: .workspaceId)
         history = try container.decode([MissionHistoryEntry].self, forKey: .history)
         createdAt = try container.decode(String.self, forKey: .createdAt)
@@ -94,17 +91,12 @@ struct Mission: Codable, Identifiable, Hashable {
         interruptedAt = try container.decodeIfPresent(String.self, forKey: .interruptedAt)
         resumable = try container.decodeIfPresent(Bool.self, forKey: .resumable) ?? false
     }
-    
+
     var displayTitle: String {
         if let title = title, !title.isEmpty {
             return title.count > 60 ? String(title.prefix(60)) + "..." : title
         }
         return "Untitled Mission"
-    }
-    
-    var displayModel: String? {
-        guard let model = modelOverride else { return nil }
-        return model.split(separator: "/").last.map(String.init)
     }
     
     var updatedDate: Date? {
@@ -156,47 +148,39 @@ struct TaskState: Codable, Identifiable {
 
 struct RunningMissionInfo: Codable, Identifiable {
     let missionId: String
-    let modelOverride: String?
     let state: String
     let queueLen: Int
     let historyLen: Int
     let secondsSinceActivity: Int
     let expectedDeliverables: Int
-    
+
     var id: String { missionId }
-    
+
     enum CodingKeys: String, CodingKey {
         case missionId = "mission_id"
-        case modelOverride = "model_override"
         case state
         case queueLen = "queue_len"
         case historyLen = "history_len"
         case secondsSinceActivity = "seconds_since_activity"
         case expectedDeliverables = "expected_deliverables"
     }
-    
+
     // Memberwise initializer for previews and testing
-    init(missionId: String, modelOverride: String?, state: String, queueLen: Int, historyLen: Int, secondsSinceActivity: Int, expectedDeliverables: Int) {
+    init(missionId: String, state: String, queueLen: Int, historyLen: Int, secondsSinceActivity: Int, expectedDeliverables: Int) {
         self.missionId = missionId
-        self.modelOverride = modelOverride
         self.state = state
         self.queueLen = queueLen
         self.historyLen = historyLen
         self.secondsSinceActivity = secondsSinceActivity
         self.expectedDeliverables = expectedDeliverables
     }
-    
+
     var isRunning: Bool {
         state == "running" || state == "waiting_for_tool"
     }
-    
+
     var isStalled: Bool {
         isRunning && secondsSinceActivity > 60
-    }
-    
-    var displayModel: String {
-        guard let model = modelOverride else { return missionId.prefix(8).uppercased() }
-        return model.split(separator: "/").last.map(String.init) ?? model
     }
 
     /// Short identifier for the mission (first 8 chars of ID)

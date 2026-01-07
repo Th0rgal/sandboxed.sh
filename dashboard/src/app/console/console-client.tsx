@@ -430,7 +430,7 @@ function generateTabId(): string {
 }
 
 // Terminal Tab Component
-function TerminalTab({ tabId, isActive }: { tabId: string; isActive: boolean }) {
+function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isActive: boolean; onStatusChange?: (status: "disconnected" | "connecting" | "connected" | "error", reconnect: () => void) => void }) {
   const termElRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -475,9 +475,7 @@ function TerminalTab({ tabId, isActive }: { tabId: string; isActive: boolean }) 
     const API_BASE = getRuntimeApiBase();
     const u = new URL(`${API_BASE}/api/console/ws`);
     u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-    
-    term.writeln(`\x1b[90mConnecting to ${u.host}...\x1b[0m`);
-    
+
     let didOpen = false;
     const ws = new WebSocket(u.toString(), proto);
     wsRef.current = ws;
@@ -486,8 +484,7 @@ function TerminalTab({ tabId, isActive }: { tabId: string; isActive: boolean }) 
       if (!mountedRef.current || wsSeqRef.current !== seq) return;
       didOpen = true;
       setWsStatus("connected");
-      term.writeln(isReconnect ? "\x1b[1;32mReconnected.\x1b[0m" : "\x1b[1;32mConnected.\x1b[0m");
-      // Fit and send dimensions after connection
+      // Fit and send dimensions immediately after connection
       setTimeout(() => {
         if (!mountedRef.current || wsSeqRef.current !== seq) return;
         try {
@@ -503,27 +500,16 @@ function TerminalTab({ tabId, isActive }: { tabId: string; isActive: boolean }) 
     ws.onerror = () => {
       if (mountedRef.current && wsSeqRef.current === seq) {
         setWsStatus("error");
-        if (!didOpen) {
-          term.writeln("\x1b[1;31mFailed to connect. Server may be offline or blocking WebSocket.\x1b[0m");
-        } else {
-          term.writeln("\x1b[1;31mConnection error.\x1b[0m");
-        }
       }
     };
     ws.onclose = (e) => {
       if (mountedRef.current && wsSeqRef.current === seq) {
         setWsStatus("disconnected");
-        // Code 1006 = abnormal closure (connection failed or was terminated)
-        // Code 1000 = normal closure
-        // Code 1001 = going away
+        // Only show error for unexpected closures, not normal disconnects
         if (e.code === 1006 && !didOpen) {
-          term.writeln("\x1b[1;33mConnection failed (code: 1006).\x1b[0m");
-          term.writeln("\x1b[90mPossible causes:\x1b[0m");
-          term.writeln("\x1b[90m  - SSH console not configured on server\x1b[0m");
-          term.writeln("\x1b[90m  - Backend not running or unreachable\x1b[0m");
-          term.writeln("\x1b[90m  - Authentication failed\x1b[0m");
-        } else if (e.code !== 1000) {
-          term.writeln(`\x1b[1;33mDisconnected (code: ${e.code}).\x1b[0m`);
+          term.writeln("\x1b[90mConnection failed. Check that SSH console is configured.\x1b[0m");
+        } else if (e.code !== 1000 && e.code !== 1001 && didOpen) {
+          term.writeln("\x1b[90mDisconnected.\x1b[0m");
         }
       }
     };
@@ -554,7 +540,7 @@ function TerminalTab({ tabId, isActive }: { tabId: string; isActive: boolean }) 
         convertEol: true,
         allowProposedApi: true,
         theme: {
-          background: "transparent",
+          background: "#0d0d0d",
         },
       });
       const fit = new FitAddon();
@@ -650,43 +636,22 @@ function TerminalTab({ tabId, isActive }: { tabId: string; isActive: boolean }) 
     }
   }, [isActive]);
 
+  // Report status changes to parent
+  useEffect(() => {
+    if (isActive && onStatusChange) {
+      onStatusChange(wsStatus, reconnect);
+    }
+  }, [wsStatus, reconnect, isActive, onStatusChange]);
+
   return (
     <div
       className={[
-        "absolute inset-0 flex h-full min-h-0 flex-col p-4",
+        "absolute inset-0 h-full min-h-0",
         isActive ? "opacity-100" : "pointer-events-none opacity-0",
       ].join(" ")}
       aria-label={`terminal-tab-${tabId}`}
-    >
-      <div className="mb-3 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span
-            className={
-              wsStatus === "connected"
-                ? "h-2 w-2 rounded-full bg-emerald-500"
-                : wsStatus === "connecting"
-                ? "h-2 w-2 rounded-full bg-yellow-500 animate-pulse"
-                : wsStatus === "error"
-                ? "h-2 w-2 rounded-full bg-red-500"
-                : "h-2 w-2 rounded-full bg-gray-500"
-            }
-          />
-          <span className="text-xs text-[var(--foreground-muted)]">
-            {wsStatus}
-          </span>
-        </div>
-        <button
-          className="rounded-md border border-[var(--border)] bg-[var(--background-tertiary)] px-2 py-1 text-xs text-[var(--foreground)] hover:bg-[var(--background-tertiary)]/70"
-          onClick={reconnect}
-        >
-          Reconnect
-        </button>
-      </div>
-      <div
-        className="flex-1 min-h-0 rounded-md border border-[var(--border)] bg-[var(--background)] overflow-hidden"
-        ref={termElRef}
-      />
-    </div>
+      ref={termElRef}
+    />
   );
 }
 
@@ -854,7 +819,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
       <div className="mb-2 flex items-center gap-1.5">
         {/* Navigation buttons */}
         <button
-          className="flex h-7 w-7 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--background-tertiary)] text-[var(--foreground-muted)] hover:bg-[var(--background-tertiary)]/70 hover:text-[var(--foreground)] disabled:opacity-40"
+          className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--foreground-muted)] hover:bg-white/[0.05] hover:text-[var(--foreground)] disabled:opacity-40 transition-colors"
           onClick={() => {
             const parts = cwd.split("/").filter(Boolean);
             if (parts.length === 0) return;
@@ -868,9 +833,9 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
           </svg>
         </button>
-        
+
         <button
-          className="flex h-7 w-7 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--background-tertiary)] text-[var(--foreground-muted)] hover:bg-[var(--background-tertiary)]/70 hover:text-[var(--foreground)]"
+          className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--foreground-muted)] hover:bg-white/[0.05] hover:text-[var(--foreground)] transition-colors"
           onClick={() => void refreshDir(cwd, true)}
           title="Refresh"
         >
@@ -879,14 +844,14 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
           </svg>
         </button>
 
-        <div className="mx-1 h-4 w-px bg-[var(--border)]" />
+        <div className="mx-1 h-4 w-px bg-white/10" />
 
         {/* Quick nav buttons */}
         <button
-          className={`flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs transition-colors ${
-            cwd === "/root/context" 
-              ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-300" 
-              : "border-[var(--border)] bg-[var(--background-tertiary)] text-[var(--foreground-muted)] hover:bg-[var(--background-tertiary)]/70 hover:text-[var(--foreground)]"
+          className={`flex h-7 items-center gap-1.5 rounded-md px-2 text-xs transition-colors ${
+            cwd === "/root/context"
+              ? "bg-indigo-500/15 text-indigo-300"
+              : "text-[var(--foreground-muted)] hover:bg-white/[0.05] hover:text-[var(--foreground)]"
           }`}
           onClick={() => setCwd("/root/context")}
           title="User input files"
@@ -895,10 +860,10 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
           <span>context</span>
         </button>
         <button
-          className={`flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs transition-colors ${
-            cwd.startsWith("/root/work") 
-              ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-300" 
-              : "border-[var(--border)] bg-[var(--background-tertiary)] text-[var(--foreground-muted)] hover:bg-[var(--background-tertiary)]/70 hover:text-[var(--foreground)]"
+          className={`flex h-7 items-center gap-1.5 rounded-md px-2 text-xs transition-colors ${
+            cwd.startsWith("/root/work")
+              ? "bg-indigo-500/15 text-indigo-300"
+              : "text-[var(--foreground-muted)] hover:bg-white/[0.05] hover:text-[var(--foreground)]"
           }`}
           onClick={() => setCwd("/root/work")}
           title="Agent workspace"
@@ -907,10 +872,10 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
           <span>work</span>
         </button>
         <button
-          className={`flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs transition-colors ${
-            cwd.startsWith("/root/tools") 
-              ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-300" 
-              : "border-[var(--border)] bg-[var(--background-tertiary)] text-[var(--foreground-muted)] hover:bg-[var(--background-tertiary)]/70 hover:text-[var(--foreground)]"
+          className={`flex h-7 items-center gap-1.5 rounded-md px-2 text-xs transition-colors ${
+            cwd.startsWith("/root/tools")
+              ? "bg-indigo-500/15 text-indigo-300"
+              : "text-[var(--foreground-muted)] hover:bg-white/[0.05] hover:text-[var(--foreground)]"
           }`}
           onClick={() => setCwd("/root/tools")}
           title="Reusable tools"
@@ -923,7 +888,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
 
         {/* Action buttons */}
         <button
-          className="flex h-7 items-center gap-1.5 rounded-md border border-[var(--border)] bg-[var(--background-tertiary)] px-2 text-xs text-[var(--foreground-muted)] hover:bg-[var(--background-tertiary)]/70 hover:text-[var(--foreground)]"
+          className="flex h-7 items-center gap-1.5 rounded-md px-2 text-xs text-[var(--foreground-muted)] hover:bg-white/[0.05] hover:text-[var(--foreground)] transition-colors"
           onClick={async () => {
             const name = prompt("New folder name");
             if (!name) return;
@@ -956,7 +921,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
           }}
         />
         <button
-          className="flex h-7 items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 text-xs text-indigo-300 hover:bg-indigo-500/20"
+          className="flex h-7 items-center gap-1.5 rounded-md bg-indigo-500/15 px-2 text-xs text-indigo-300 hover:bg-indigo-500/25 transition-colors"
           onClick={() => fileInputRef.current?.click()}
           title="Upload files"
         >
@@ -1042,10 +1007,10 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
 
       {/* Main content area with drag-drop */}
       <div
-        className={`flex-1 min-h-0 rounded-md border transition-colors relative ${
+        className={`flex-1 min-h-0 rounded-lg border transition-colors relative ${
           isDragging
             ? "border-indigo-500 bg-indigo-500/5"
-            : "border-[var(--border)] bg-[var(--background)]/30"
+            : "border-white/10 bg-black/20"
         }`}
         onDragEnter={handleDragEnter}
         onDragLeave={handleDragLeave}
@@ -1066,7 +1031,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
 
         <div className="h-full flex flex-col">
           {/* Header */}
-          <div className="grid grid-cols-12 gap-2 border-b border-[var(--border)] px-3 py-1.5 text-[10px] uppercase tracking-wider text-[var(--foreground-muted)]">
+          <div className="grid grid-cols-12 gap-2 border-b border-white/5 px-3 py-1.5 text-[10px] uppercase tracking-wider text-[var(--foreground-muted)]">
             <div className="col-span-7">Name</div>
             <div className="col-span-3 text-right">Size</div>
             <div className="col-span-2 text-right">Type</div>
@@ -1123,7 +1088,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
 
           {/* Footer with selection info */}
           {selected && (
-            <div className="border-t border-[var(--border)] px-3 py-2 flex items-center gap-3 text-xs bg-white/[0.02]">
+            <div className="border-t border-white/5 px-3 py-2 flex items-center gap-3 text-xs bg-white/[0.02]">
               <span className="text-[var(--foreground-muted)] truncate flex-1">
                 {selected.path}
               </span>
@@ -1135,7 +1100,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
               <div className="flex items-center gap-1">
                 {selected.kind === "file" && canPreview(selected) && (
                   <button
-                    className="flex h-6 items-center gap-1 rounded border border-indigo-500/30 bg-indigo-500/10 px-2 text-indigo-300 hover:bg-indigo-500/20"
+                    className="flex h-6 items-center gap-1 rounded bg-indigo-500/15 px-2 text-indigo-300 hover:bg-indigo-500/25 transition-colors"
                     onClick={() => setPreviewPath(selected.path)}
                     title="Preview"
                   >
@@ -1147,7 +1112,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
                 )}
                 {selected.kind === "file" && (
                   <button
-                    className="flex h-6 items-center gap-1 rounded border border-[var(--border)] bg-[var(--background-tertiary)] px-2 text-[var(--foreground-muted)] hover:text-[var(--foreground)]"
+                    className="flex h-6 items-center gap-1 rounded px-2 text-[var(--foreground-muted)] hover:bg-white/[0.05] hover:text-[var(--foreground)] transition-colors"
                     onClick={() => void downloadFile(selected.path)}
                     title="Download"
                   >
@@ -1158,7 +1123,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
                 )}
                 {selected.kind === "dir" && (
                   <button
-                    className="flex h-6 items-center gap-1 rounded border border-[var(--border)] bg-[var(--background-tertiary)] px-2 text-[var(--foreground-muted)] hover:text-[var(--foreground)]"
+                    className="flex h-6 items-center gap-1 rounded px-2 text-[var(--foreground-muted)] hover:bg-white/[0.05] hover:text-[var(--foreground)] transition-colors"
                     onClick={() => setCwd(selected.path)}
                     title="Open folder"
                   >
@@ -1168,7 +1133,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
                   </button>
                 )}
                 <button
-                  className="flex h-6 items-center gap-1 rounded border border-red-500/30 bg-red-500/10 px-2 text-red-300 hover:bg-red-500/20"
+                  className="flex h-6 items-center gap-1 rounded bg-red-500/15 px-2 text-red-300 hover:bg-red-500/25 transition-colors"
                   onClick={async () => {
                     if (!confirm(`Delete ${selected.name}?`)) return;
                     try {
@@ -1250,6 +1215,22 @@ export default function ConsoleClient() {
   const [activeTabId, setActiveTabId] = useState<string>(initialActiveTabId);
   const [showNewTabMenu, setShowNewTabMenu] = useState(false);
 
+  // Terminal status tracking (for the active terminal tab)
+  const [terminalStatus, setTerminalStatus] = useState<{
+    status: "disconnected" | "connecting" | "connected" | "error";
+    reconnect: () => void;
+  } | null>(null);
+
+  const activeTab = tabs.find(t => t.id === activeTabId);
+  const isTerminalActive = activeTab?.type === "terminal";
+
+  const handleTerminalStatusChange = useCallback((
+    status: "disconnected" | "connecting" | "connected" | "error",
+    reconnect: () => void
+  ) => {
+    setTerminalStatus({ status, reconnect });
+  }, []);
+
   // Save tabs to localStorage whenever they change
   useEffect(() => {
     saveTabs(tabs, activeTabId);
@@ -1282,44 +1263,60 @@ export default function ConsoleClient() {
   };
 
   return (
-    <div className="flex min-h-screen flex-col px-8 pt-8 pb-0">
-      <div className="mb-6 flex items-start justify-between gap-6">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-[var(--foreground)]">
-            Console
-          </h1>
-          <p className="mt-1 text-sm text-[var(--foreground-muted)]">
-            Root shell + remote file explorer (SFTP). Keep this behind your dashboard password.
-          </p>
-        </div>
-      </div>
+    <div className="flex min-h-screen flex-col p-4">
+      {/* Main panel with integrated tab bar */}
+      <div className="relative flex-1 min-h-0 flex flex-col rounded-lg border border-white/10 bg-[#0d0d0d] overflow-hidden">
+        {/* Tab bar - inside the panel */}
+        <div className="flex items-center border-b border-white/5 bg-white/[0.02]">
+          <div className="flex items-center gap-1 flex-1">
+            {tabs.map((tab) => (
+              <div
+                key={tab.id}
+                className={`group flex items-center gap-2 px-3 py-2 text-sm cursor-pointer border-b-2 -mb-px transition-colors ${
+                  activeTabId === tab.id
+                    ? "border-indigo-500/70 text-[var(--foreground)] bg-white/[0.03]"
+                    : "border-transparent text-[var(--foreground-muted)] hover:text-[var(--foreground)] hover:bg-white/[0.02]"
+                }`}
+                onClick={() => setActiveTabId(tab.id)}
+              >
+                <span className="text-sm opacity-70">
+                  {tab.type === "terminal" ? "⌨️" : "📁"}
+                </span>
+                <span>{tab.title}</span>
+                {tabs.length > 1 && (
+                  <button
+                    className="ml-1 opacity-0 group-hover:opacity-100 hover:bg-white/10 rounded p-0.5 transition-opacity"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeTab(tab.id);
+                    }}
+                  >
+                    <svg
+                      className="w-3 h-3"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M6 18L18 6M6 6l12 12"
+                      />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            ))}
 
-      {/* Tab bar */}
-      <div className="flex items-center gap-1 border-b border-[var(--border)] mb-4">
-        {tabs.map((tab) => (
-          <div
-            key={tab.id}
-            className={`group flex items-center gap-2 px-3 py-2 text-sm cursor-pointer border-b-2 transition-colors ${
-              activeTabId === tab.id
-                ? "border-[var(--accent)] text-[var(--foreground)] bg-[var(--background-secondary)]/50"
-                : "border-transparent text-[var(--foreground-muted)] hover:text-[var(--foreground)] hover:bg-[var(--background-tertiary)]/30"
-            }`}
-            onClick={() => setActiveTabId(tab.id)}
-          >
-            <span className="text-base">
-              {tab.type === "terminal" ? "⌨️" : "📁"}
-            </span>
-            <span>{tab.title}</span>
-            {tabs.length > 1 && (
+            {/* Add tab button */}
+            <div className="relative">
               <button
-                className="ml-1 opacity-0 group-hover:opacity-100 hover:bg-[var(--background-tertiary)] rounded p-0.5 transition-opacity"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  closeTab(tab.id);
-                }}
+                className="flex items-center justify-center w-7 h-7 text-[var(--foreground-muted)] hover:text-[var(--foreground)] hover:bg-white/[0.05] rounded transition-colors"
+                onClick={() => setShowNewTabMenu(!showNewTabMenu)}
               >
                 <svg
-                  className="w-3 h-3"
+                  className="w-3.5 h-3.5"
                   fill="none"
                   stroke="currentColor"
                   viewBox="0 0 24 24"
@@ -1328,77 +1325,84 @@ export default function ConsoleClient() {
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     strokeWidth={2}
-                    d="M6 18L18 6M6 6l12 12"
+                    d="M12 4v16m8-8H4"
                   />
                 </svg>
               </button>
-            )}
+
+              {showNewTabMenu && (
+                <>
+                  <div
+                    className="fixed inset-0 z-10"
+                    onClick={() => setShowNewTabMenu(false)}
+                  />
+                  <div className="absolute left-0 top-full mt-1 z-20 rounded-md border border-white/10 bg-[#1a1a1a] shadow-lg py-1 min-w-[140px]">
+                    <button
+                      className="w-full px-3 py-2 text-left text-sm text-[var(--foreground)] hover:bg-white/[0.05] flex items-center gap-2"
+                      onClick={() => addTab("terminal")}
+                    >
+                      <span>⌨️</span> New Terminal
+                    </button>
+                    <button
+                      className="w-full px-3 py-2 text-left text-sm text-[var(--foreground)] hover:bg-white/[0.05] flex items-center gap-2"
+                      onClick={() => addTab("files")}
+                    >
+                      <span>📁</span> New Files
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
-        ))}
 
-        {/* Add tab button */}
-        <div className="relative">
-          <button
-            className="flex items-center justify-center w-8 h-8 text-[var(--foreground-muted)] hover:text-[var(--foreground)] hover:bg-[var(--background-tertiary)]/30 rounded transition-colors"
-            onClick={() => setShowNewTabMenu(!showNewTabMenu)}
-          >
-            <svg
-              className="w-4 h-4"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M12 4v16m8-8H4"
-              />
-            </svg>
-          </button>
-
-          {showNewTabMenu && (
-            <>
-              <div
-                className="fixed inset-0 z-10"
-                onClick={() => setShowNewTabMenu(false)}
-              />
-              <div className="absolute left-0 top-full mt-1 z-20 rounded-md border border-[var(--border)] bg-[var(--background-secondary)] shadow-lg py-1 min-w-[140px]">
-                <button
-                  className="w-full px-3 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--background-tertiary)] flex items-center gap-2"
-                  onClick={() => addTab("terminal")}
-                >
-                  <span>⌨️</span> New Terminal
-                </button>
-                <button
-                  className="w-full px-3 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--background-tertiary)] flex items-center gap-2"
-                  onClick={() => addTab("files")}
-                >
-                  <span>📁</span> New Files
-                </button>
+          {/* Status indicator (for terminal tabs) */}
+          {isTerminalActive && terminalStatus && (
+            <div className="flex items-center gap-3 px-3">
+              <div className="flex items-center gap-2">
+                <span
+                  className={
+                    terminalStatus.status === "connected"
+                      ? "h-2 w-2 rounded-full bg-emerald-500"
+                      : terminalStatus.status === "connecting"
+                      ? "h-2 w-2 rounded-full bg-yellow-500 animate-pulse"
+                      : terminalStatus.status === "error"
+                      ? "h-2 w-2 rounded-full bg-red-500"
+                      : "h-2 w-2 rounded-full bg-gray-500"
+                  }
+                />
+                <span className="text-xs text-[var(--foreground-muted)]">
+                  {terminalStatus.status}
+                </span>
               </div>
-            </>
+              <button
+                className="rounded px-2 py-1 text-xs text-[var(--foreground-muted)] hover:text-[var(--foreground)] hover:bg-white/[0.05] transition-colors"
+                onClick={terminalStatus.reconnect}
+              >
+                Reconnect
+              </button>
+            </div>
           )}
         </div>
-      </div>
 
-      {/* Tab content */}
-      <div className="relative flex-1 min-h-0 panel rounded-lg border border-[var(--border)] bg-[var(--background-secondary)]/70 p-0 backdrop-blur-xl overflow-hidden">
-        {tabs.map((tab) =>
-          tab.type === "terminal" ? (
-            <TerminalTab
-              key={tab.id}
-              tabId={tab.id}
-              isActive={activeTabId === tab.id}
-            />
-          ) : (
-            <FilesTab
-              key={tab.id}
-              tabId={tab.id}
-              isActive={activeTabId === tab.id}
-            />
-          )
-        )}
+        {/* Tab content */}
+        <div className="relative flex-1 min-h-0">
+          {tabs.map((tab) =>
+            tab.type === "terminal" ? (
+              <TerminalTab
+                key={tab.id}
+                tabId={tab.id}
+                isActive={activeTabId === tab.id}
+                onStatusChange={handleTerminalStatusChange}
+              />
+            ) : (
+              <FilesTab
+                key={tab.id}
+                tabId={tab.id}
+                isActive={activeTabId === tab.id}
+              />
+            )
+          )}
+        </div>
       </div>
     </div>
   );

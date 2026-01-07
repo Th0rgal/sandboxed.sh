@@ -11,8 +11,17 @@ Open Agent is a managed control plane for OpenCode-based agents. The backend **d
 ## Core Concepts
 
 - **Library**: Git-backed config repo (skills, commands, agents, MCPs). `src/library/`.
-- **Workspaces**: host or chroot environments. `src/workspace.rs` creates per-mission dirs and writes OpenCode config for MCPs.
-- **Missions**: a prompt + agent + workspace. Execution is delegated to OpenCode and streamed to the UI.
+- **Workspaces**: Host or chroot environments with their own skills and plugins. `src/workspace.rs` manages workspace lifecycle and syncs skills to `.opencode/skill/`.
+- **Missions**: Agent selection + workspace + conversation. Execution is delegated to OpenCode and streamed to the UI.
+
+## Scoping Model
+
+- **Global**: Auth, providers, MCPs (run on HOST machine), agents, commands
+- **Per-Workspace**: Skills, plugins/hooks, installed software (chroot only), file isolation
+- **Per-Mission**: Agent selection, workspace selection, conversation history
+
+MCPs are global because they run as child processes on the host, not inside chroots.
+Skills and plugins are synced to workspace `.opencode/` directories.
 
 ## Design Guardrails
 

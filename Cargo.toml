@@ -59,6 +59,7 @@ rand = "0.8"
 base64 = "0.22"
 bytes = "1"
 portable-pty = "0.9"
+md5 = "0.7"
 tokio-util = { version = "0.7", features = ["io"] }
 # Keep MSRV-compatible idna_adapter for the production builder (rustc 1.75).
 idna_adapter = "=1.1.0"

@@ -35,7 +35,6 @@ type NavItem = {
 const navigation: NavItem[] = [
   { name: 'Overview', href: '/', icon: LayoutDashboard },
   { name: 'Mission', href: '/control', icon: MessageSquare },
-  { name: 'Agents', href: '/agents', icon: Bot },
   { name: 'Workspaces', href: '/workspaces', icon: Server },
   { name: 'Console', href: '/console', icon: Terminal },
   {
@@ -43,6 +42,7 @@ const navigation: NavItem[] = [
     href: '/config',
     icon: FileText,
     children: [
+      { name: 'Agents', href: '/agents', icon: Bot },
       { name: 'Commands', href: '/config/commands', icon: Terminal },
       { name: 'Skills', href: '/config/skills', icon: FileCode },
       { name: 'Rules', href: '/config/rules', icon: ScrollText },
@@ -73,7 +73,7 @@ export function Sidebar() {
 
   // Auto-expand sections if we're on their subpages
   useEffect(() => {
-    if (pathname.startsWith('/config')) {
+    if (pathname.startsWith('/config') || pathname.startsWith('/agents')) {
       setExpandedItems((prev) => new Set([...prev, 'Config']));
     }
     if (pathname.startsWith('/extensions')) {

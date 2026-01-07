@@ -169,7 +169,7 @@ Describe what this command does.
   }
 
   return (
-    <div className="min-h-screen flex flex-col p-6 max-w-6xl mx-auto space-y-4">
+    <div className="min-h-screen flex flex-col p-6 max-w-7xl mx-auto space-y-4">
       {libraryUnavailable ? (
         <LibraryUnavailable message={libraryUnavailableMessage} onConfigured={refresh} />
       ) : (

@@ -79,8 +79,8 @@ struct RunningMissionsBar: View {
                     .fill(Theme.success)
                     .frame(width: 6, height: 6)
                 
-                // Model name or mission ID
-                Text(mission.displayModel ?? String(mission.id.prefix(8)).uppercased())
+                // Mission ID
+                Text(String(mission.id.prefix(8)).uppercased())
                     .font(.caption.weight(.medium))
                     .foregroundStyle(Theme.textPrimary)
                     .lineLimit(1)
@@ -145,8 +145,8 @@ struct RunningMissionsBar: View {
                             }
                         }
 
-                    // Model name
-                    Text(mission.displayModel)
+                    // Mission ID
+                    Text(mission.shortId)
                         .font(.caption.weight(.medium))
                         .foregroundStyle(Theme.textPrimary)
                         .lineLimit(1)
@@ -220,7 +220,6 @@ struct RunningMissionsBar: View {
             runningMissions: [
                 RunningMissionInfo(
                     missionId: "abc12345-6789-0000-0000-000000000001",
-                    modelOverride: "deepseek/deepseek-v3.2",
                     state: "running",
                     queueLen: 0,
                     historyLen: 5,
@@ -229,7 +228,6 @@ struct RunningMissionsBar: View {
                 ),
                 RunningMissionInfo(
                     missionId: "def12345-6789-0000-0000-000000000002",
-                    modelOverride: "qwen/qwen3-235b",
                     state: "running",
                     queueLen: 1,
                     historyLen: 3,
@@ -238,7 +236,6 @@ struct RunningMissionsBar: View {
                 ),
                 RunningMissionInfo(
                     missionId: "ghi12345-6789-0000-0000-000000000003",
-                    modelOverride: nil,
                     state: "running",
                     queueLen: 0,
                     historyLen: 10,

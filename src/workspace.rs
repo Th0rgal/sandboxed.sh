@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::chroot::{self, ChrootDistro};
 use crate::config::Config;
+use crate::library::LibraryStore;
 use crate::mcp::{McpRegistry, McpServerConfig, McpTransport};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,6 +88,12 @@ pub struct Workspace {
     pub config: serde_json::Value,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
+    /// Skill names from library to sync to this workspace
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Plugin identifiers for hooks
+    #[serde(default)]
+    pub plugins: Vec<String>,
 }
 
 impl Workspace {
@@ -101,6 +108,8 @@ impl Workspace {
             error_message: None,
             config: serde_json::json!({}),
             created_at: Utc::now(),
+            skills: Vec::new(),
+            plugins: Vec::new(),
         }
     }
 
@@ -115,6 +124,8 @@ impl Workspace {
             error_message: None,
             config: serde_json::json!({}),
             created_at: Utc::now(),
+            skills: Vec::new(),
+            plugins: Vec::new(),
         }
     }
 }
@@ -278,6 +289,8 @@ impl WorkspaceStore {
                 error_message: None,
                 config: serde_json::json!({}),
                 created_at: Utc::now(), // We don't know the actual creation time
+                skills: Vec::new(),
+                plugins: Vec::new(),
             };
 
             orphaned.push(workspace);
@@ -478,6 +491,108 @@ async fn write_opencode_config(
 
     let config_path = workspace_dir.join("opencode.json");
     tokio::fs::write(config_path, serde_json::to_string_pretty(&config_json)?).await?;
+    Ok(())
+}
+
+/// Skill content to be written to the workspace.
+pub struct SkillContent {
+    /// Skill name (folder name)
+    pub name: String,
+    /// Primary SKILL.md content
+    pub content: String,
+    /// Additional markdown files (name, content)
+    pub files: Vec<(String, String)>,
+}
+
+/// Write skill files to the workspace's `.opencode/skill/` directory.
+/// This makes skills available to OpenCode when running in this workspace.
+/// OpenCode looks for skills in `.opencode/{skill,skills}/**/SKILL.md`
+pub async fn write_skills_to_workspace(
+    workspace_dir: &Path,
+    skills: &[SkillContent],
+) -> anyhow::Result<()> {
+    if skills.is_empty() {
+        return Ok(());
+    }
+
+    let skills_dir = workspace_dir.join(".opencode").join("skill");
+    tokio::fs::create_dir_all(&skills_dir).await?;
+
+    for skill in skills {
+        let skill_dir = skills_dir.join(&skill.name);
+        tokio::fs::create_dir_all(&skill_dir).await?;
+
+        // Write SKILL.md
+        let skill_md_path = skill_dir.join("SKILL.md");
+        tokio::fs::write(&skill_md_path, &skill.content).await?;
+
+        // Write additional files
+        for (file_name, file_content) in &skill.files {
+            let file_path = skill_dir.join(file_name);
+            tokio::fs::write(&file_path, file_content).await?;
+        }
+
+        tracing::debug!(
+            skill = %skill.name,
+            workspace = %workspace_dir.display(),
+            "Wrote skill to workspace"
+        );
+    }
+
+    tracing::info!(
+        count = skills.len(),
+        workspace = %workspace_dir.display(),
+        "Wrote skills to workspace"
+    );
+
+    Ok(())
+}
+
+/// Sync skills from library to workspace's `.opencode/skill/` directory.
+/// Called when workspace is created, updated, or before mission execution.
+pub async fn sync_workspace_skills(workspace: &Workspace, library: &LibraryStore) -> anyhow::Result<()> {
+    if workspace.skills.is_empty() {
+        tracing::debug!(
+            workspace = %workspace.name,
+            "No skills to sync for workspace"
+        );
+        return Ok(());
+    }
+
+    let mut skills_to_write: Vec<SkillContent> = Vec::new();
+
+    for skill_name in &workspace.skills {
+        match library.get_skill(skill_name).await {
+            Ok(skill) => {
+                skills_to_write.push(SkillContent {
+                    name: skill.name,
+                    content: skill.content,
+                    files: skill
+                        .files
+                        .into_iter()
+                        .map(|f| (f.name, f.content))
+                        .collect(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    skill = %skill_name,
+                    workspace = %workspace.name,
+                    error = %e,
+                    "Failed to load skill from library, skipping"
+                );
+            }
+        }
+    }
+
+    write_skills_to_workspace(&workspace.path, &skills_to_write).await?;
+
+    tracing::info!(
+        workspace = %workspace.name,
+        skills = ?workspace.skills,
+        "Synced skills to workspace"
+    );
+
     Ok(())
 }
 

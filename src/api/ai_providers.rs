@@ -27,6 +27,22 @@ use crate::ai_providers::{AuthMethod, PendingOAuth, ProviderType};
 
 /// Anthropic OAuth client ID (from opencode-anthropic-auth plugin)
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_CONSOLE_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
+
+fn anthropic_client_id() -> String {
+    ANTHROPIC_CLIENT_ID
+        .strip_prefix("urn:uuid:")
+        .unwrap_or(ANTHROPIC_CLIENT_ID)
+        .to_string()
+}
+
+fn anthropic_redirect_uri(mode: &str, client_id: &str) -> String {
+    if mode == "max" {
+        format!("urn:uuid:{}", client_id)
+    } else {
+        ANTHROPIC_CONSOLE_REDIRECT_URI.to_string()
+    }
+}
 
 /// Create AI provider routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -1147,15 +1163,14 @@ async fn oauth_authorize(
                     format!("Failed to parse URL: {}", e),
                 )
             })?;
+            let client_id = anthropic_client_id();
+            let redirect_uri = anthropic_redirect_uri(mode, &client_id);
 
             url.query_pairs_mut()
                 .append_pair("code", "true")
-                .append_pair("client_id", ANTHROPIC_CLIENT_ID)
+                .append_pair("client_id", &client_id)
                 .append_pair("response_type", "code")
-                .append_pair(
-                    "redirect_uri",
-                    "https://console.anthropic.com/oauth/code/callback",
-                )
+                .append_pair("redirect_uri", &redirect_uri)
                 .append_pair("scope", "org:create_api_key user:profile user:inference")
                 .append_pair("code_challenge", &challenge)
                 .append_pair("code_challenge_method", "S256")
@@ -1219,6 +1234,8 @@ async fn oauth_callback(
 
     match provider_type {
         ProviderType::Anthropic => {
+            let client_id = anthropic_client_id();
+            let redirect_uri = anthropic_redirect_uri(&pending.mode, &client_id);
             // Exchange code for tokens
             let code = req.code.clone();
             let splits: Vec<&str> = code.split('#').collect();
@@ -1232,8 +1249,8 @@ async fn oauth_callback(
                     "code": code_part,
                     "state": state_part,
                     "grant_type": "authorization_code",
-                    "client_id": ANTHROPIC_CLIENT_ID,
-                    "redirect_uri": "https://console.anthropic.com/oauth/code/callback",
+                    "client_id": client_id,
+                    "redirect_uri": redirect_uri,
                     "code_verifier": pending.verifier
                 }))
                 .send()

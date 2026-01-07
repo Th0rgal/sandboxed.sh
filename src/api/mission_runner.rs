@@ -62,16 +62,12 @@ pub enum MissionHealth {
 pub struct QueuedMessage {
     pub id: Uuid,
     pub content: String,
-    pub model_override: Option<String>,
 }
 
 /// Isolated runner for a single mission.
 pub struct MissionRunner {
     /// Mission ID
     pub mission_id: Uuid,
-
-    /// Model override for this mission (if any)
-    pub model_override: Option<String>,
 
     /// Workspace ID where this mission should run
     pub workspace_id: Uuid,
@@ -109,10 +105,9 @@ pub struct MissionRunner {
 
 impl MissionRunner {
     /// Create a new mission runner.
-    pub fn new(mission_id: Uuid, model_override: Option<String>, workspace_id: Uuid) -> Self {
+    pub fn new(mission_id: Uuid, workspace_id: Uuid) -> Self {
         Self {
             mission_id,
-            model_override,
             workspace_id,
             state: MissionRunState::Queued,
             queue: VecDeque::new(),
@@ -189,11 +184,10 @@ impl MissionRunner {
     }
 
     /// Queue a message for this mission.
-    pub fn queue_message(&mut self, id: Uuid, content: String, model_override: Option<String>) {
+    pub fn queue_message(&mut self, id: Uuid, content: String) {
         self.queue.push_back(QueuedMessage {
             id,
             content,
-            model_override: model_override.or_else(|| self.model_override.clone()),
         });
     }
 
@@ -239,7 +233,6 @@ impl MissionRunner {
         let progress_ref = Arc::clone(&self.progress_snapshot);
         let mission_id = self.mission_id;
         let workspace_id = self.workspace_id;
-        let model_override = msg.model_override;
         let user_message = msg.content.clone();
         let msg_id = msg.id;
 
@@ -268,7 +261,6 @@ impl MissionRunner {
                 cancel,
                 hist_snapshot,
                 user_message.clone(),
-                model_override,
                 Some(mission_ctrl),
                 tree_ref,
                 progress_ref,
@@ -369,7 +361,6 @@ async fn run_mission_turn(
     cancel: CancellationToken,
     history: Vec<(String, String)>,
     user_message: String,
-    model_override: Option<String>,
     mission_control: Option<crate::tools::mission::MissionControl>,
     tree_snapshot: Arc<RwLock<Option<AgentTreeNode>>>,
     progress_snapshot: Arc<RwLock<ExecutionProgress>>,
@@ -436,12 +427,6 @@ async fn run_mission_turn(
         }
     };
 
-    // Apply model override if specified
-    if let Some(model) = model_override {
-        tracing::info!("Mission using model override: {}", model);
-        task.analysis_mut().requested_model = Some(model);
-    }
-
     // Ensure mission workspace exists and is configured for OpenCode.
     let workspace_root =
         workspace::resolve_workspace_root(&workspaces, &config, workspace_id).await;
@@ -479,7 +464,6 @@ async fn run_mission_turn(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RunningMissionInfo {
     pub mission_id: Uuid,
-    pub model_override: Option<String>,
     pub state: String,
     pub queue_len: usize,
     pub history_len: usize,
@@ -491,7 +475,6 @@ impl From<&MissionRunner> for RunningMissionInfo {
     fn from(runner: &MissionRunner) -> Self {
         Self {
             mission_id: runner.mission_id,
-            model_override: runner.model_override.clone(),
             state: match runner.state {
                 MissionRunState::Queued => "queued".to_string(),
                 MissionRunState::Running => "running".to_string(),

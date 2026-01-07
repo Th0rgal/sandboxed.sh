@@ -50,6 +50,9 @@ import {
   type LibraryTool,
 } from '@/lib/api';
 
+// Re-export types for consumers
+export type { LibraryAgentSummary };
+
 interface LibraryContextValue {
   // State
   status: LibraryStatus | null;

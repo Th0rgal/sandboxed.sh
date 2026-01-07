@@ -25,7 +25,6 @@ import {
   cancelMission,
   listProviders,
   listWorkspaces,
-  listAgents,
   getHealth,
   type ControlRunState,
   type Mission,
@@ -34,9 +33,8 @@ import {
   type UploadProgress,
   type Provider,
   type Workspace,
-  type AgentConfig,
 } from "@/lib/api";
-import { useLibrary } from "@/contexts/library-context";
+import { useLibrary, type LibraryAgentSummary } from "@/contexts/library-context";
 import {
   Send,
   Square,
@@ -122,6 +120,7 @@ type ChatItem =
       content: string;
       done: boolean;
       startTime: number;
+      endTime?: number;
     }
   | {
       kind: "tool";
@@ -403,8 +402,9 @@ function ThinkingItem({
     return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
   };
 
-  const duration = item.done
-    ? formatDuration(Math.floor((Date.now() - item.startTime) / 1000))
+  // Use endTime for completed thinking, otherwise use elapsed time for active thinking
+  const duration = item.done && item.endTime
+    ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
     : formatDuration(elapsedSeconds);
 
   return (
@@ -704,18 +704,16 @@ export default function ControlClient() {
 
   // New mission dialog state
   const [showNewMissionDialog, setShowNewMissionDialog] = useState(false);
-  const [newMissionModel, setNewMissionModel] = useState("");
   const [newMissionWorkspace, setNewMissionWorkspace] = useState("");
   const [newMissionAgent, setNewMissionAgent] = useState("");
   const [newMissionHooks, setNewMissionHooks] = useState<string[]>([]);
   const newMissionDialogRef = useRef<HTMLDivElement>(null);
 
-  // Workspaces and agents for mission creation
+  // Workspaces for mission creation
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
-  const [agents, setAgents] = useState<AgentConfig[]>([]);
 
-  // Library context for plugins (hooks)
-  const { plugins } = useLibrary();
+  // Library context for plugins (hooks) and agents
+  const { plugins, libraryAgents } = useLibrary();
 
   // Parallel missions state
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
@@ -1111,6 +1109,11 @@ export default function ControlClient() {
   useEffect(() => {
     const missionId = searchParams.get("mission");
     if (missionId) {
+      // Skip loading if we already have this mission in state (e.g., after handleNewMission)
+      if (viewingMissionRef.current?.id === missionId) {
+        setViewingMissionId(missionId);
+        return;
+      }
       const previousViewingMission = viewingMissionRef.current;
       setMissionLoading(true);
       setViewingMissionId(missionId); // Set viewing ID immediately to prevent "Agent is working..." flash
@@ -1203,14 +1206,6 @@ export default function ControlClient() {
       })
       .catch((err) => {
         console.error("Failed to fetch workspaces:", err);
-      });
-
-    listAgents()
-      .then((data) => {
-        setAgents(data);
-      })
-      .catch((err) => {
-        console.error("Failed to fetch agents:", err);
       });
   }, [authRetryTrigger]);
 
@@ -1324,17 +1319,15 @@ export default function ControlClient() {
 
   // Handle creating a new mission
   const handleNewMission = async (options?: {
-    modelOverride?: string;
     workspaceId?: string;
-    agentId?: string;
+    agent?: string;
     hooks?: string[];
   }) => {
     try {
       setMissionLoading(true);
       const mission = await createMission({
-        modelOverride: options?.modelOverride,
         workspaceId: options?.workspaceId,
-        agentId: options?.agentId,
+        agent: options?.agent,
         hooks: options?.hooks,
       });
       setCurrentMission(mission);
@@ -1428,6 +1421,9 @@ export default function ControlClient() {
 
     const handleEvent = (event: { type: string; data: unknown }) => {
       const data: unknown = event.data;
+
+      // DEBUG: Log all SSE events
+      console.log("[SSE Event]", event.type, data);
 
       // Filter events by mission_id - only show events for the mission we're viewing
       const viewingId = viewingMissionIdRef.current;
@@ -1599,6 +1595,14 @@ export default function ControlClient() {
       if (event.type === "thinking" && isRecord(data)) {
         const content = String(data["content"] ?? "");
         const done = Boolean(data["done"]);
+        const now = Date.now();
+
+        // DEBUG: Log thinking event details
+        console.log("[Thinking Event]", {
+          content: content.substring(0, 100) + (content.length > 100 ? "..." : ""),
+          contentLength: content.length,
+          done,
+        });
 
         setItems((prev) => {
           // Remove phase items when thinking starts
@@ -1614,9 +1618,12 @@ export default function ControlClient() {
             >;
             updated[existingIdx] = {
               ...existing,
-              // Replace content instead of appending - backend sends cumulative content
-              content,
+              // When done marker arrives with empty content, preserve existing content
+              // Backend sends cumulative content normally, but final done marker may be empty
+              content: content || existing.content,
               done,
+              // Set endTime when marking as done
+              ...(done && { endTime: now }),
             };
             return updated;
           } else {
@@ -1624,10 +1631,12 @@ export default function ControlClient() {
               ...filtered,
               {
                 kind: "thinking" as const,
-                id: `thinking-${Date.now()}`,
+                id: `thinking-${now}`,
                 content,
                 done,
-                startTime: Date.now(),
+                startTime: now,
+                // Set endTime if creating a pre-done item (unlikely but handle it)
+                ...(done && { endTime: now }),
               },
             ];
           }
@@ -2027,10 +2036,6 @@ export default function ControlClient() {
                       value={newMissionAgent}
                       onChange={(e) => {
                         setNewMissionAgent(e.target.value);
-                        // When agent is selected, clear model override (agent includes model)
-                        if (e.target.value) {
-                          setNewMissionModel("");
-                        }
                       }}
                       className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
                       style={{
@@ -2044,56 +2049,16 @@ export default function ControlClient() {
                       <option value="" className="bg-[#1a1a1a]">
                         Default (no agent)
                       </option>
-                      {agents.map((agent) => (
-                        <option key={agent.id} value={agent.id} className="bg-[#1a1a1a]">
+                      {libraryAgents.map((agent) => (
+                        <option key={agent.name} value={agent.name} className="bg-[#1a1a1a]">
                           {agent.name}
                         </option>
                       ))}
                     </select>
                     <p className="text-xs text-white/30 mt-1.5">
-                      Pre-configured model, MCPs, skills & commands
+                      Pre-configured model, tools & instructions from library
                     </p>
                   </div>
-
-                  {/* Model override - only shown when no agent selected */}
-                  {!newMissionAgent && (
-                    <div>
-                      <label className="block text-xs text-white/50 mb-1.5">
-                        Model Override
-                      </label>
-                      <select
-                        value={newMissionModel}
-                        onChange={(e) => setNewMissionModel(e.target.value)}
-                        className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
-                        style={{
-                          backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`,
-                          backgroundPosition: "right 0.5rem center",
-                          backgroundRepeat: "no-repeat",
-                          backgroundSize: "1.5em 1.5em",
-                          paddingRight: "2.5rem",
-                        }}
-                      >
-                        <option value="" className="bg-[#1a1a1a]">
-                          Auto (Claude Opus 4.5)
-                        </option>
-                        {providers.map((provider) => (
-                          provider.models.length > 0 && (
-                            <optgroup
-                              key={provider.id}
-                              label={`${provider.name}${provider.billing === "subscription" ? " (included)" : ""}`}
-                              className="bg-[#1a1a1a]"
-                            >
-                              {provider.models.map((model) => (
-                                <option key={model.id} value={model.id} className="bg-[#1a1a1a]">
-                                  {model.name}
-                                </option>
-                              ))}
-                            </optgroup>
-                          )
-                        ))}
-                      </select>
-                    </div>
-                  )}
 
                   {/* Hooks (Plugins) */}
                   <div>
@@ -2133,7 +2098,6 @@ export default function ControlClient() {
                     <button
                       onClick={() => {
                         setShowNewMissionDialog(false);
-                        setNewMissionModel("");
                         setNewMissionWorkspace("");
                         setNewMissionAgent("");
                         setNewMissionHooks([]);
@@ -2145,13 +2109,11 @@ export default function ControlClient() {
                     <button
                       onClick={() => {
                         handleNewMission({
-                          modelOverride: newMissionModel || undefined,
                           workspaceId: newMissionWorkspace || undefined,
-                          agentId: newMissionAgent || undefined,
+                          agent: newMissionAgent || undefined,
                           hooks: newMissionHooks.length > 0 ? newMissionHooks : undefined,
                         });
                         setShowNewMissionDialog(false);
-                        setNewMissionModel("");
                         setNewMissionWorkspace("");
                         setNewMissionAgent("");
                         setNewMissionHooks([]);
@@ -2339,7 +2301,7 @@ export default function ControlClient() {
               >
                 <div className="h-1.5 w-1.5 rounded-full shrink-0 bg-emerald-400" />
                 <span className="text-xs font-medium text-white truncate max-w-[140px]">
-                  {currentMission.model_override?.split("/").pop() || "Default"}
+                  Mission
                 </span>
                 <span className="text-[10px] text-white/40 tabular-nums">
                   {currentMission.id.slice(0, 8)}
@@ -2387,7 +2349,7 @@ export default function ControlClient() {
                   )}
                 />
                 <span className="text-xs font-medium text-white truncate max-w-[140px]">
-                  {mission.model_override?.split("/").pop() || "Default"}
+                  Mission
                 </span>
                 <span className="text-[10px] text-white/40 tabular-nums">
                   {mission.mission_id.slice(0, 8)}

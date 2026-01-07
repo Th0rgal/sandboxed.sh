@@ -398,14 +398,6 @@ private struct MissionRow: View {
                     Text("\(mission.history.count) messages")
                         .font(.caption)
                         .foregroundStyle(Theme.textTertiary)
-                    
-                    if let model = mission.displayModel {
-                        Text("•")
-                            .foregroundStyle(Theme.textMuted)
-                        Text(model)
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(Theme.textTertiary)
-                    }
                 }
             }
             

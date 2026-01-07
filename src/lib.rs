@@ -33,7 +33,6 @@
 //! - `task`: Task definitions and lightweight cost tracking
 //! - `opencode`: OpenCode API client
 
-pub mod agent_config;
 pub mod agents;
 pub mod ai_providers;
 pub mod api;
@@ -48,7 +47,6 @@ pub mod task;
 pub mod tools;
 pub mod workspace;
 
-pub use agent_config::{AgentConfig, AgentStore};
 pub use ai_providers::{AIProvider, AIProviderStore, ProviderType};
 pub use config::Config;
 pub use opencode_config::{OpenCodeConnection, OpenCodeStore};

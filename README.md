@@ -14,6 +14,7 @@ A managed control panel for OpenCode-based agents. Install it on your server to 
 
 1. **Backend (Rust/Axum)**
    - Manages workspaces + chroot lifecycle.
+   - Syncs skills and plugins to workspace `.opencode/` directories.
    - Writes OpenCode workspace config (per-mission `opencode.json`).
    - Delegates execution to an OpenCode server and streams events.
    - Syncs the Library repo.
@@ -30,9 +31,10 @@ A managed control panel for OpenCode-based agents. Install it on your server to 
 ## Key concepts
 
 - **Library**: Git repo containing agent configs (skills, commands, MCPs, tools).
-- **Workspaces**: Execution environments (host or chroot) with their own paths.
-- **Agents**: Library-defined capabilities and MCP subsets.
-- **Missions**: A specific agent + workspace + prompt with streaming telemetry.
+- **Workspaces**: Execution environments (host or chroot) with their own skills and plugins. Skills are synced to `.opencode/skill/` for OpenCode to discover.
+- **Agents**: Library-defined capabilities (model, permissions, rules). Selected per-mission.
+- **Missions**: Agent selection + workspace + conversation with streaming telemetry.
+- **MCPs**: Global MCP servers run on the host machine (not inside chroots).
 
 ## Quick start
 

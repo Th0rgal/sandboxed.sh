@@ -14,13 +14,7 @@
 //! - `POST /api/mcp/{id}/disable` - Disable an MCP server
 //! - `GET /api/tools` - List all tools (built-in + MCP)
 //! - `POST /api/tools/{name}/toggle` - Enable/disable a tool
-//! - `GET /api/agents` - List all agent configurations
-//! - `POST /api/agents` - Create a new agent configuration
-//! - `GET /api/agents/{id}` - Get agent configuration details
-//! - `PUT /api/agents/{id}` - Update agent configuration
-//! - `DELETE /api/agents/{id}` - Delete agent configuration
 
-pub mod agents;
 pub mod ai_providers;
 mod auth;
 mod console;

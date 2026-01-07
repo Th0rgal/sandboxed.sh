@@ -1,0 +1,39 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "desktop": {
+      "command": [
+        "desktop-mcp"
+      ],
+      "enabled": true,
+      "environment": {
+        "DESKTOP_RESOLUTION": "1920x1080",
+        "OPEN_AGENT_WORKSPACE": "/Users/thomas/conductor/workspaces/open_agent/santa-fe-v2/workspaces/mission-547aefd0"
+      },
+      "type": "local"
+    },
+    "host": {
+      "command": [
+        "host-mcp"
+      ],
+      "enabled": true,
+      "environment": {
+        "OPEN_AGENT_WORKSPACE": "/Users/thomas/conductor/workspaces/open_agent/santa-fe-v2/workspaces/mission-547aefd0"
+      },
+      "type": "local"
+    },
+    "playwright": {
+      "command": [
+        "npx",
+        "@playwright/mcp@latest",
+        "--isolated",
+        "--no-sandbox"
+      ],
+      "enabled": true,
+      "environment": {
+        "OPEN_AGENT_WORKSPACE": "/Users/thomas/conductor/workspaces/open_agent/santa-fe-v2/workspaces/mission-547aefd0"
+      },
+      "type": "local"
+    }
+  }
+}
