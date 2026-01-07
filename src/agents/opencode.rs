@@ -159,8 +159,15 @@ impl OpenCodeAgent {
 
     /// Forward an OpenCode event to the control broadcast channel.
     fn forward_event(&self, oc_event: &OpenCodeEvent, ctx: &AgentContext) {
+        tracing::warn!(
+            event_type = ?std::mem::discriminant(oc_event),
+            has_control_events = ctx.control_events.is_some(),
+            mission_id = ?ctx.mission_id,
+            "forward_event called"
+        );
+
         let Some(events_tx) = &ctx.control_events else {
-            tracing::trace!("forward_event: no control_events channel, skipping");
+            tracing::warn!("forward_event: no control_events channel, skipping");
             return;
         };
 
@@ -223,7 +230,20 @@ impl OpenCodeAgent {
             OpenCodeEvent::MessageComplete { .. } => return, // Don't forward completion marker
         };
 
-        let _ = events_tx.send(agent_event);
+        match events_tx.send(agent_event) {
+            Ok(receiver_count) => {
+                tracing::warn!(
+                    receiver_count = receiver_count,
+                    "Successfully sent event to broadcast channel"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Failed to send event to broadcast channel (no receivers?)"
+                );
+            }
+        }
     }
 }
 
@@ -334,6 +354,10 @@ impl Agent for OpenCodeAgent {
                     event = event_rx.recv() => {
                         match event {
                             Some(oc_event) => {
+                                tracing::warn!(
+                                    event_type = ?std::mem::discriminant(&oc_event),
+                                    "Received event from OpenCode SSE channel"
+                                );
                                 last_event_time = Instant::now();
                                 stuck_tool_warned = false; // Reset warning on new event
 

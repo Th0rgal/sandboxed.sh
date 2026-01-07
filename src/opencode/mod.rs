@@ -729,9 +729,10 @@ fn parse_sse_event(
     let props = json.get("properties").cloned().unwrap_or(json!({}));
 
     // Log all event types for debugging
-    tracing::info!(
+    tracing::warn!(
         event_type = %event_type,
         session_id = %session_id,
+        props_keys = ?props.as_object().map(|o| o.keys().collect::<Vec<_>>()),
         "OpenCode SSE event received"
     );
 
@@ -741,8 +742,22 @@ fn parse_sse_event(
         .or_else(|| props.get("info").and_then(|v| v.get("sessionID")))
         .or_else(|| props.get("part").and_then(|v| v.get("sessionID")))
         .and_then(|v| v.as_str());
+
+    tracing::warn!(
+        event_session_id = ?event_session_id,
+        our_session_id = %session_id,
+        event_type = %event_type,
+        "Checking session ID filter"
+    );
+
     if let Some(event_session_id) = event_session_id {
         if event_session_id != session_id {
+            tracing::warn!(
+                event_session_id = %event_session_id,
+                our_session_id = %session_id,
+                event_type = %event_type,
+                "SKIPPING event - session ID mismatch"
+            );
             return None;
         }
     }
