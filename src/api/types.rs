@@ -15,7 +15,7 @@ pub struct CreateTaskRequest {
     /// Optional working directory for relative paths (agent has full system access regardless)
     pub working_dir: Option<String>,
 
-    /// Optional budget in cents (default: 1000 = $10)
+    /// Optional budget limit in cents (default: 1000 = $10, tracking only)
     pub budget_cents: Option<u64>,
 }
 

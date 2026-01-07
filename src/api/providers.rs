@@ -1,7 +1,6 @@
-//! Provider management API.
+//! Provider catalog API.
 //!
-//! Provides endpoints for listing available LLM providers and their models.
-//! The provider system supports multiple billing types (subscription vs pay-per-token).
+//! Provides endpoints for listing available providers and their models for UI selection.
 
 use std::sync::Arc;
 

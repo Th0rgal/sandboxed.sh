@@ -57,34 +57,37 @@ struct Mission: Codable, Identifiable, Hashable {
     var status: MissionStatus
     let title: String?
     let modelOverride: String?
+    let workspaceId: String?
     let history: [MissionHistoryEntry]
     let createdAt: String
     let updatedAt: String
     let interruptedAt: String?
     let resumable: Bool
-    
+
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
     }
-    
+
     static func == (lhs: Mission, rhs: Mission) -> Bool {
         lhs.id == rhs.id
     }
-    
+
     enum CodingKeys: String, CodingKey {
         case id, status, title, history, resumable
         case modelOverride = "model_override"
+        case workspaceId = "workspace_id"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
         case interruptedAt = "interrupted_at"
     }
-    
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
         status = try container.decode(MissionStatus.self, forKey: .status)
         title = try container.decodeIfPresent(String.self, forKey: .title)
         modelOverride = try container.decodeIfPresent(String.self, forKey: .modelOverride)
+        workspaceId = try container.decodeIfPresent(String.self, forKey: .workspaceId)
         history = try container.decode([MissionHistoryEntry].self, forKey: .history)
         createdAt = try container.decode(String.self, forKey: .createdAt)
         updatedAt = try container.decode(String.self, forKey: .updatedAt)

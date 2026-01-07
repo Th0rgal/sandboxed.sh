@@ -1,224 +1,77 @@
-# Open Agent
+# Open Agent Panel
 
-A minimal autonomous coding agent with full machine access, implemented in Rust.
+A managed control panel for OpenCode-based agents. Install it on your server to run missions in isolated workspaces, stream live telemetry to the dashboards, and keep all agent configs synced through a Git-backed Library.
 
-## Features
+## What it does
 
-- **HTTP API** for task submission and monitoring
-- **Tool-based agent loop** following the "tools in a loop" pattern
-- **Full toolset**: file operations, terminal, machine-wide search, web access, git
-- **OpenRouter integration** for LLM access (supports any model)
-- **SSE streaming** for real-time task progress
-- **AI-maintainable** Rust codebase with strong typing
-
-## Quick Start
-
-### Prerequisites
-
-- Rust 1.70+ (install via [rustup](https://rustup.rs/))
-- An OpenRouter API key ([get one here](https://openrouter.ai/))
-
-### Installation
-
-```bash
-git clone <repo-url>
-cd open_agent
-cargo build --release
-```
-
-### Running
-
-```bash
-# Set your API key
-export OPENROUTER_API_KEY="sk-or-v1-..."
-
-# Optional: configure model (default: anthropic/claude-sonnet-4.5)
-export DEFAULT_MODEL="anthropic/claude-sonnet-4.5"
-
-# Optional: default working directory for relative paths (absolute paths work everywhere)
-# In production this is typically /root
-export WORKING_DIR="."
-
-# Start the server
-cargo run --release
-```
-
-The server starts on `http://127.0.0.1:3000` by default.
-
-### OpenCode Backend (Required)
-
-Open Agent delegates execution to an OpenCode server. OpenCode must be running and reachable.
-
-```bash
-# Point to a running OpenCode server
-export OPENCODE_BASE_URL="http://127.0.0.1:4096"
-
-# Optional: choose OpenCode agent (build/plan/etc)
-export OPENCODE_AGENT="build"
-
-# Optional: auto-allow all permissions for OpenCode sessions (default: true)
-export OPENCODE_PERMISSIVE="true"
-```
-
-## API Reference
-
-### Submit a Task
-
-```bash
-curl -X POST http://localhost:3000/api/task \
-  -H "Content-Type: application/json" \
-  -d '{"task": "Create a Python script that prints Hello World"}'
-```
-
-Response:
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "pending"
-}
-```
-
-### Get Task Status
-
-```bash
-curl http://localhost:3000/api/task/{id}
-```
-
-Response:
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "completed",
-  "task": "Create a Python script that prints Hello World",
-  "model": "openai/gpt-4.1-mini",
-  "iterations": 3,
-  "result": "I've created hello.py with a simple Hello World script...",
-  "log": [...]
-}
-```
-
-### Stream Task Progress (SSE)
-
-```bash
-curl http://localhost:3000/api/task/{id}/stream
-```
-
-Events:
-- `log` - Execution log entries (tool calls, results)
-- `done` - Task completion with final status
-
-### Health Check
-
-```bash
-curl http://localhost:3000/api/health
-```
-
-## Available Tools
-
-| Tool | Description |
-|------|-------------|
-| `read_file` | Read file contents (any path on the machine) with optional line range |
-| `write_file` | Write/create files anywhere on the machine |
-| `delete_file` | Delete files anywhere on the machine |
-| `list_directory` | List directory contents anywhere on the machine |
-| `search_files` | Search for files by name pattern (machine-wide; scope with `path`) |
-| `run_command` | Execute shell commands (optionally in a specified `cwd`) |
-| `grep_search` | Search file contents with regex (machine-wide; scope with `path`) |
-| `web_search` | Search the web (DuckDuckGo) |
-| `fetch_url` | Fetch URL contents |
-| `git_status` | Get git status for any repo path |
-| `git_diff` | Show git diff for any repo path |
-| `git_commit` | Create git commits for any repo path |
-| `git_log` | Show git log for any repo path |
-
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENROUTER_API_KEY` | (required) | Your OpenRouter API key |
-| `DEFAULT_MODEL` | `anthropic/claude-sonnet-4.5` | Default LLM model |
-| `WORKING_DIR` | `.` (dev) / `/root` (prod) | Default working directory for relative paths (agent still has full machine access) |
-| `HOST` | `127.0.0.1` | Server bind address |
-| `PORT` | `3000` | Server port |
-| `MAX_ITERATIONS` | `50` | Max agent loop iterations |
-| `OPEN_AGENT_USERS` | (optional) | JSON array of multi-user accounts (enables multi-user auth) |
-| `DASHBOARD_PASSWORD` | (optional) | Single-tenant dashboard password (legacy auth) |
-| `JWT_SECRET` | (required for auth) | HMAC secret for JWT signing |
-
-### Multi-user Auth
-
-Provide `OPEN_AGENT_USERS` to enable multi-user login:
-
-```bash
-export JWT_SECRET="your-secret"
-export OPEN_AGENT_USERS='[{"id":"alice","username":"alice","password":"..."}]'
-```
-
-When multi-user auth is enabled, the memory system is disabled to avoid cross-user leakage.
+- **Mission control**: start, stop, and monitor missions on a remote machine.
+- **Workspace isolation**: host or chroot workspaces with per-mission directories.
+- **Library sync**: Git-backed configs for skills, commands, agents, and MCPs.
+- **Provider management**: manage OpenCode auth/providers from the dashboard.
+- **Live telemetry**: stream thinking/tool events to web and iOS clients.
 
 ## Architecture
 
-```
-┌─────────────────┐     ┌─────────────────┐
-│   HTTP Client   │────▶│   HTTP API      │
-└─────────────────┘     │   (axum)        │
-                        └────────┬────────┘
-                                 │
-                        ┌────────▼────────┐
-                        │   Agent Loop    │◀──────┐
-                        │                 │       │
-                        └────────┬────────┘       │
-                                 │                │
-                   ┌─────────────┼─────────────┐  │
-                   ▼             ▼             ▼  │
-            ┌──────────┐  ┌──────────┐  ┌──────────┐
-            │   LLM    │  │  Tools   │  │  Tools   │
-            │(OpenRouter)│ │(file,git)│ │(term,web)│
-            └──────────┘  └──────────┘  └──────────┘
-                   │
-                   └──────────────────────────────┘
-                            (results fed back)
-```
+1. **Backend (Rust/Axum)**
+   - Manages workspaces + chroot lifecycle.
+   - Writes OpenCode workspace config (per-mission `opencode.json`).
+   - Delegates execution to an OpenCode server and streams events.
+   - Syncs the Library repo.
 
-## Development
+2. **Web dashboard (Next.js)**
+   - Mission timeline, logs, and controls.
+   - Library editor and MCP management.
+   - Workspace and agent configuration.
 
+3. **iOS dashboard (SwiftUI)**
+   - Mission monitoring on the go.
+   - Picture-in-Picture for desktop automation.
+
+## Key concepts
+
+- **Library**: Git repo containing agent configs (skills, commands, MCPs, tools).
+- **Workspaces**: Execution environments (host or chroot) with their own paths.
+- **Agents**: Library-defined capabilities and MCP subsets.
+- **Missions**: A specific agent + workspace + prompt with streaming telemetry.
+
+## Quick start
+
+### Prerequisites
+- Rust 1.75+
+- Bun 1.0+ (dashboard)
+- An OpenCode server reachable from the backend
+- Ubuntu/Debian recommended if you need chroot workspaces
+
+### Backend
 ```bash
-# Run with debug logging
-RUST_LOG=debug cargo run
+# Required: OpenCode endpoint
+export OPENCODE_BASE_URL="http://127.0.0.1:4096"
 
-# Run tests
-cargo test
+# Optional defaults
+export DEFAULT_MODEL="claude-opus-4-5-20251101"
+export WORKING_DIR="/root"
+export LIBRARY_REMOTE="git@github.com:your-org/agent-library.git"
 
-# Format code
-cargo fmt
-
-# Check for issues
-cargo clippy
+cargo run --release
 ```
 
-## Dashboard (Bun)
-
-The dashboard lives in `dashboard/` and uses **Bun** as the package manager.
-
+### Web dashboard
 ```bash
 cd dashboard
 bun install
-PORT=3001 bun dev
+bun dev
 ```
+Open `http://localhost:3001`.
 
-## Calibration (Trial-and-Error Tuning)
+### iOS app
+Open `ios_dashboard` in Xcode and run on a device or simulator.
 
-Open Agent supports empirical tuning of its **difficulty (complexity)** and **cost** estimation via a calibration harness.
+## Repository layout
 
-### Run calibrator
-
-```bash
-export OPENROUTER_API_KEY="sk-or-v1-..."
-cargo run --release --bin calibrate -- --workspace ./.open_agent_calibration --model openai/gpt-4.1-mini --write-tuning
-```
-
-This writes a tuning file at `./.open_agent_calibration/.openagent/tuning.json`. Move/copy it to your real workspace as `./.openagent/tuning.json` to enable it.
+- `src/` — Rust backend
+- `dashboard/` — Next.js web app
+- `ios_dashboard/` — SwiftUI iOS app
+- `docs/` — ops + setup docs
 
 ## License
-
 MIT

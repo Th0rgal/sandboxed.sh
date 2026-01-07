@@ -934,20 +934,4 @@ impl McpRegistry {
         }
     }
 
-    /// Get tool schemas in LLM-compatible format for all connected MCP tools.
-    pub async fn get_tool_schemas(&self) -> Vec<crate::llm::ToolDefinition> {
-        self.list_tools()
-            .await
-            .into_iter()
-            .filter(|t| t.enabled)
-            .map(|t| crate::llm::ToolDefinition {
-                tool_type: "function".to_string(),
-                function: crate::llm::FunctionDefinition {
-                    name: t.name,
-                    description: t.description,
-                    parameters: t.parameters_schema,
-                },
-            })
-            .collect()
-    }
 }

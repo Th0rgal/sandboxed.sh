@@ -329,7 +329,7 @@ impl Tool for FetchUrl {
 
             // Return path with preview (safe for UTF-8)
             let preview_len = std::cmp::min(2000, display_content.len());
-            let safe_end = crate::memory::safe_truncate_index(&display_content, preview_len);
+            let safe_end = super::safe_truncate_index(&display_content, preview_len);
             let preview = &display_content[..safe_end];
 
             Ok(format!(

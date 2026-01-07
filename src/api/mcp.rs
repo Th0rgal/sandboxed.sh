@@ -1,5 +1,6 @@
 //! MCP management API endpoints.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::{
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::mcp::{AddMcpRequest, McpServerState};
+use crate::tools::ToolRegistry;
 use crate::workspace;
 
 use super::routes::AppState;
@@ -150,6 +152,20 @@ pub enum ToolSource {
 /// List all available tools (built-in + MCP).
 pub async fn list_tools(State(state): State<Arc<AppState>>) -> Json<Vec<ToolInfo>> {
     let mut tools = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Add built-in tools
+    let registry = ToolRegistry::new();
+    for tool in registry.list_tools() {
+        if seen.insert(tool.name.clone()) {
+            tools.push(ToolInfo {
+                name: tool.name,
+                description: tool.description,
+                source: ToolSource::Builtin,
+                enabled: true,
+            });
+        }
+    }
 
     // Add MCP tools
     let mcp_tools = state.mcp.list_tools().await;
@@ -162,15 +178,17 @@ pub async fn list_tools(State(state): State<Arc<AppState>>) -> Json<Vec<ToolInfo
             .map(|s| s.config.name.clone())
             .unwrap_or_default();
 
-        tools.push(ToolInfo {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            source: ToolSource::Mcp {
-                id: t.mcp_id,
-                name: mcp_name,
-            },
-            enabled: t.enabled,
-        });
+        if seen.insert(t.name.clone()) {
+            tools.push(ToolInfo {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                source: ToolSource::Mcp {
+                    id: t.mcp_id,
+                    name: mcp_name,
+                },
+                enabled: t.enabled,
+            });
+        }
     }
 
     // Sort by name for stable ordering

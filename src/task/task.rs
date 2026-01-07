@@ -1,82 +1,63 @@
-//! Core Task type with budget and verification criteria.
+//! Core Task type with lightweight cost tracking.
 //!
 //! # Invariants
-//! - `budget.allocated_cents <= budget.total_cents`
-//! - `id` is unique within an agent tree execution
+//! - `id` is unique within an execution context
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::verification::VerificationCriteria;
-use crate::budget::Budget;
-
 /// Analysis and telemetry for a task.
 ///
 /// This is mutable, but only via explicit `analysis_mut()` accessor on `Task`.
-///
-/// # Design Notes (Provability)
-/// - This is intended as *auxiliary metadata*; it must not affect the logical
-///   correctness of task execution.
-/// - In future proofs, we can treat this as observational data (logs).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskAnalysis {
-    /// Estimated complexity score in [0.0, 1.0]
-    pub complexity_score: Option<f64>,
-    /// Reasoning for complexity estimate
-    pub complexity_reasoning: Option<String>,
-    /// Whether the task should be split (per estimator)
-    pub should_split: Option<bool>,
-    /// Estimated total tokens for completing the task (input + output)
-    pub estimated_total_tokens: Option<u64>,
-
-    /// User-requested model (if specified) - used as minimum capability floor
+    /// User-requested model (if specified)
     pub requested_model: Option<String>,
     /// Model chosen for execution (if selected)
     pub selected_model: Option<String>,
     /// Estimated cost in cents (if computed)
     pub estimated_cost_cents: Option<u64>,
-
-    /// Actual usage aggregated over all LLM calls during execution
-    pub actual_usage: Option<TokenUsageSummary>,
-
-    /// Last output from executor (for verification)
-    pub last_output: Option<String>,
 }
 
-/// Aggregate token usage (LLM telemetry).
-///
-/// # Invariants
-/// - `total_tokens == prompt_tokens + completion_tokens` (enforced in constructor)
+/// Lightweight cost tracking for a task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenUsageSummary {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
+pub struct TaskCost {
+    /// Optional budget limit in cents (None = uncapped)
+    budget_cents: Option<u64>,
+    /// Total spent so far in cents
+    spent_cents: u64,
 }
 
-impl TokenUsageSummary {
-    /// Create a new token usage summary.
-    ///
-    /// # Postcondition
-    /// `total_tokens == prompt_tokens + completion_tokens`
-    pub fn new(prompt_tokens: u64, completion_tokens: u64) -> Self {
+impl TaskCost {
+    /// Create a new cost tracker with an optional budget cap.
+    pub fn new(budget_cents: Option<u64>) -> Self {
         Self {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            budget_cents,
+            spent_cents: 0,
         }
     }
 
-    /// Add another usage summary.
-    ///
-    /// # Postcondition
-    /// Totals are component-wise sums.
-    pub fn add(&self, other: &TokenUsageSummary) -> TokenUsageSummary {
-        TokenUsageSummary::new(
-            self.prompt_tokens.saturating_add(other.prompt_tokens),
-            self.completion_tokens
-                .saturating_add(other.completion_tokens),
-        )
+    pub fn budget_cents(&self) -> Option<u64> {
+        self.budget_cents
+    }
+
+    pub fn spent_cents(&self) -> u64 {
+        self.spent_cents
+    }
+
+    pub fn remaining_cents(&self) -> Option<u64> {
+        self.budget_cents
+            .map(|budget| budget.saturating_sub(self.spent_cents))
+    }
+
+    /// Record additional spend (saturating).
+    pub fn record_spend(&mut self, cents: u64) {
+        self.spent_cents = self.spent_cents.saturating_add(cents);
+    }
+
+    /// Set total spent explicitly (overwrites).
+    pub fn set_spent(&mut self, cents: u64) {
+        self.spent_cents = cents;
     }
 }
 
@@ -139,12 +120,6 @@ pub enum TaskStatus {
 
 impl TaskStatus {
     /// Check if the task is in a terminal state.
-    ///
-    /// # Returns
-    /// `true` if the task is Completed, Failed, or Cancelled.
-    ///
-    /// # Property
-    /// `is_terminal() => !can_transition()`
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -153,9 +128,6 @@ impl TaskStatus {
     }
 
     /// Check if the task is still active (can make progress).
-    ///
-    /// # Returns
-    /// `true` if the task is Pending or Running.
     pub fn is_active(&self) -> bool {
         matches!(self, TaskStatus::Pending | TaskStatus::Running)
     }
@@ -163,13 +135,8 @@ impl TaskStatus {
 
 /// A task to be executed by an agent.
 ///
-/// # Invariants
-/// - `budget.allocated_cents <= budget.total_cents`
-/// - If `parent_id.is_some()`, this is a subtask
-///
-/// # Design for Provability
+/// # Design Notes
 /// - All fields are immutable after construction (except status via explicit transitions)
-/// - Budget constraints are checked at construction time
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     /// Unique identifier for this task
@@ -178,11 +145,8 @@ pub struct Task {
     /// Human-readable description of what to accomplish
     description: String,
 
-    /// How to verify the task was completed correctly
-    verification: VerificationCriteria,
-
-    /// Budget constraints for this task
-    budget: Budget,
+    /// Cost tracking for this task
+    cost: TaskCost,
 
     /// Analysis and telemetry (optional)
     analysis: TaskAnalysis,
@@ -198,7 +162,6 @@ impl Task {
     /// Create a new task with the given parameters.
     ///
     /// # Preconditions
-    /// - `budget.allocated_cents <= budget.total_cents`
     /// - `description` is non-empty
     ///
     /// # Postconditions
@@ -207,42 +170,19 @@ impl Task {
     ///
     /// # Errors
     /// Returns `Err` if preconditions are violated.
-    pub fn new(
-        description: String,
-        verification: VerificationCriteria,
-        budget: Budget,
-    ) -> Result<Self, TaskError> {
+    pub fn new(description: String, budget_cents: Option<u64>) -> Result<Self, TaskError> {
         if description.is_empty() {
             return Err(TaskError::EmptyDescription);
         }
 
-        // Budget invariant is enforced by Budget::new()
-
         Ok(Self {
             id: TaskId::new(),
             description,
-            verification,
-            budget,
+            cost: TaskCost::new(budget_cents),
             analysis: TaskAnalysis::default(),
             parent_id: None,
             status: TaskStatus::Pending,
         })
-    }
-
-    /// Create a subtask with a parent reference.
-    ///
-    /// # Preconditions
-    /// - Same as `new()`
-    /// - `parent_id` refers to an existing task
-    pub fn new_subtask(
-        description: String,
-        verification: VerificationCriteria,
-        budget: Budget,
-        parent_id: TaskId,
-    ) -> Result<Self, TaskError> {
-        let mut task = Self::new(description, verification, budget)?;
-        task.parent_id = Some(parent_id);
-        Ok(task)
     }
 
     // Getters - all return references to preserve immutability semantics
@@ -255,16 +195,12 @@ impl Task {
         &self.description
     }
 
-    pub fn verification(&self) -> &VerificationCriteria {
-        &self.verification
+    pub fn cost(&self) -> &TaskCost {
+        &self.cost
     }
 
-    pub fn budget(&self) -> &Budget {
-        &self.budget
-    }
-
-    pub fn budget_mut(&mut self) -> &mut Budget {
-        &mut self.budget
+    pub fn cost_mut(&mut self) -> &mut TaskCost {
+        &mut self.cost
     }
 
     pub fn analysis(&self) -> &TaskAnalysis {
@@ -273,16 +209,6 @@ impl Task {
 
     pub fn analysis_mut(&mut self) -> &mut TaskAnalysis {
         &mut self.analysis
-    }
-
-    /// Get the last executor output (for verification).
-    pub fn last_output(&self) -> Option<&str> {
-        self.analysis.last_output.as_deref()
-    }
-
-    /// Set the last executor output.
-    pub fn set_last_output(&mut self, output: String) {
-        self.analysis.last_output = Some(output);
     }
 
     pub fn parent_id(&self) -> Option<TaskId> {
@@ -301,12 +227,6 @@ impl Task {
     // State transitions - explicit and validated
 
     /// Transition the task to Running state.
-    ///
-    /// # Precondition
-    /// `self.status == Pending`
-    ///
-    /// # Errors
-    /// Returns `Err` if the task is not in Pending state.
     pub fn start(&mut self) -> Result<(), TaskError> {
         match &self.status {
             TaskStatus::Pending => {
@@ -321,9 +241,6 @@ impl Task {
     }
 
     /// Transition the task to Completed state.
-    ///
-    /// # Precondition
-    /// `self.status == Running`
     pub fn complete(&mut self) -> Result<(), TaskError> {
         match &self.status {
             TaskStatus::Running => {
@@ -338,9 +255,6 @@ impl Task {
     }
 
     /// Transition the task to Failed state.
-    ///
-    /// # Precondition
-    /// `self.status == Running`
     pub fn fail(&mut self, reason: String) -> Result<(), TaskError> {
         match &self.status {
             TaskStatus::Running => {
@@ -355,9 +269,6 @@ impl Task {
     }
 
     /// Transition the task to Cancelled state.
-    ///
-    /// # Precondition
-    /// `self.status.is_active()`
     pub fn cancel(&mut self) -> Result<(), TaskError> {
         if self.status.is_active() {
             self.status = TaskStatus::Cancelled;
@@ -379,7 +290,4 @@ pub enum TaskError {
 
     #[error("Invalid state transition from {from} to {to}")]
     InvalidTransition { from: String, to: String },
-
-    #[error("Budget error: {0}")]
-    BudgetError(String),
 }

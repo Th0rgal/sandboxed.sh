@@ -41,6 +41,11 @@ struct ControlView: View {
     @State private var desktopDisplayId = ":101"
     private let availableDisplays = [":99", ":100", ":101", ":102"]
 
+    // Workspace selection state
+    @State private var workspaces: [Workspace] = []
+    @State private var showNewMissionSheet = false
+    @State private var selectedWorkspaceId: String? = nil
+
     @FocusState private var isInputFocused: Bool
     
     private let api = APIService.shared
@@ -149,7 +154,10 @@ struct ControlView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button {
-                        Task { await createNewMission() }
+                        Task {
+                            await loadWorkspaces()
+                            showNewMissionSheet = true
+                        }
                     } label: {
                         Label("New Mission", systemImage: "plus")
                     }
@@ -258,6 +266,21 @@ struct ControlView: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+        }
+        .sheet(isPresented: $showNewMissionSheet) {
+            NewMissionSheet(
+                workspaces: workspaces,
+                selectedWorkspaceId: $selectedWorkspaceId,
+                onCreate: { workspaceId in
+                    showNewMissionSheet = false
+                    Task { await createNewMission(workspaceId: workspaceId) }
+                },
+                onCancel: {
+                    showNewMissionSheet = false
+                }
+            )
+            .presentationDetents([.medium])
+            .presentationDragIndicator(.visible)
         }
     }
     
@@ -730,9 +753,9 @@ struct ControlView: View {
         }
     }
     
-    private func createNewMission() async {
+    private func createNewMission(workspaceId: String? = nil) async {
         do {
-            let mission = try await api.createMission()
+            let mission = try await api.createMission(workspaceId: workspaceId)
             currentMission = mission
             applyViewingMission(mission, scrollToBottom: false)
 
@@ -755,6 +778,24 @@ struct ControlView: View {
         } catch {
             print("Failed to create mission: \(error)")
             HapticService.error()
+        }
+    }
+
+    private func loadWorkspaces() async {
+        do {
+            workspaces = try await api.listWorkspaces()
+            // Validate selected workspace still exists, reset to default if not
+            if let selected = selectedWorkspaceId, !workspaces.contains(where: { $0.id == selected }) {
+                selectedWorkspaceId = nil
+            }
+            // Default to host workspace if none selected
+            if selectedWorkspaceId == nil, let defaultWorkspace = workspaces.first(where: { $0.isDefault }) {
+                selectedWorkspaceId = defaultWorkspace.id
+            }
+        } catch {
+            print("Failed to load workspaces: \(error)")
+            workspaces = []
+            selectedWorkspaceId = nil
         }
     }
     

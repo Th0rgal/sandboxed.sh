@@ -146,6 +146,21 @@ export default function HistoryPage() {
     fetchData();
   }, []);
 
+  // Handle Escape key for modal
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && previewMissionId) {
+        setPreviewMissionId(null);
+        setPreviewTree(null);
+        fetchingTreeMissionIdRef.current = null;
+      }
+    };
+    if (previewMissionId) {
+      document.addEventListener("keydown", handleKeyDown);
+      return () => document.removeEventListener("keydown", handleKeyDown);
+    }
+  }, [previewMissionId]);
+
   // Load tree for preview
   const handlePreviewTree = useCallback(async (missionId: string) => {
     if (previewMissionId === missionId) {

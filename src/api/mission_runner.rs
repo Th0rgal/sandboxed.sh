@@ -19,13 +19,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agents::{AgentContext, AgentRef, AgentResult};
-use crate::budget::{Budget, ModelPricing, SharedBenchmarkRegistry, SharedModelResolver};
 use crate::config::Config;
-use crate::llm::OpenRouterClient;
 use crate::mcp::McpRegistry;
-use crate::memory::{ContextBuilder, MemorySystem};
-use crate::task::{extract_deliverables, DeliverableSet, VerificationCriteria};
-use crate::tools::ToolRegistry;
+use crate::task::{extract_deliverables, DeliverableSet};
 use crate::workspace;
 
 use super::control::{
@@ -77,6 +73,9 @@ pub struct MissionRunner {
     /// Model override for this mission (if any)
     pub model_override: Option<String>,
 
+    /// Workspace ID where this mission should run
+    pub workspace_id: Uuid,
+
     /// Current state
     pub state: MissionRunState,
 
@@ -110,10 +109,11 @@ pub struct MissionRunner {
 
 impl MissionRunner {
     /// Create a new mission runner.
-    pub fn new(mission_id: Uuid, model_override: Option<String>) -> Self {
+    pub fn new(mission_id: Uuid, model_override: Option<String>, workspace_id: Uuid) -> Self {
         Self {
             mission_id,
             model_override,
+            workspace_id,
             state: MissionRunState::Queued,
             queue: VecDeque::new(),
             history: Vec::new(),
@@ -210,11 +210,8 @@ impl MissionRunner {
         &mut self,
         config: Config,
         root_agent: AgentRef,
-        memory: Option<MemorySystem>,
-        benchmarks: SharedBenchmarkRegistry,
-        resolver: SharedModelResolver,
         mcp: Arc<McpRegistry>,
-        pricing: Arc<ModelPricing>,
+        workspaces: workspace::SharedWorkspaceStore,
         events_tx: broadcast::Sender<AgentEvent>,
         tool_hub: Arc<FrontendToolHub>,
         status: Arc<RwLock<ControlStatus>>,
@@ -241,6 +238,7 @@ impl MissionRunner {
         let tree_ref = Arc::clone(&self.tree_snapshot);
         let progress_ref = Arc::clone(&self.progress_snapshot);
         let mission_id = self.mission_id;
+        let workspace_id = self.workspace_id;
         let model_override = msg.model_override;
         let user_message = msg.content.clone();
         let msg_id = msg.id;
@@ -262,11 +260,8 @@ impl MissionRunner {
             let result = run_mission_turn(
                 config,
                 root_agent,
-                memory,
-                benchmarks,
-                resolver,
                 mcp,
-                pricing,
+                workspaces,
                 events_tx,
                 tool_hub,
                 status,
@@ -278,6 +273,7 @@ impl MissionRunner {
                 tree_ref,
                 progress_ref,
                 mission_id,
+                Some(workspace_id),
             )
             .await;
             (msg_id, user_message, result)
@@ -346,15 +342,27 @@ impl MissionRunner {
     }
 }
 
+/// Build a history context string from conversation history.
+fn build_history_context(history: &[(String, String)], max_chars: usize) -> String {
+    let mut result = String::new();
+    let mut total_chars = 0;
+    for (role, content) in history.iter().rev() {
+        let entry = format!("{}: {}\n\n", role.to_uppercase(), content);
+        if total_chars + entry.len() > max_chars && !result.is_empty() {
+            break;
+        }
+        result = format!("{}{}", entry, result);
+        total_chars += entry.len();
+    }
+    result
+}
+
 /// Execute a single turn for a mission.
 async fn run_mission_turn(
     config: Config,
     root_agent: AgentRef,
-    memory: Option<MemorySystem>,
-    benchmarks: SharedBenchmarkRegistry,
-    resolver: SharedModelResolver,
     mcp: Arc<McpRegistry>,
-    pricing: Arc<ModelPricing>,
+    workspaces: workspace::SharedWorkspaceStore,
     events_tx: broadcast::Sender<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
     status: Arc<RwLock<ControlStatus>>,
@@ -366,11 +374,11 @@ async fn run_mission_turn(
     tree_snapshot: Arc<RwLock<Option<AgentTreeNode>>>,
     progress_snapshot: Arc<RwLock<ExecutionProgress>>,
     mission_id: Uuid,
+    workspace_id: Option<Uuid>,
 ) -> AgentResult {
-    // Build context with history (use base working dir for context lookup)
-    let base_working_dir = config.working_dir.to_string_lossy().to_string();
-    let context_builder = ContextBuilder::new(&config.context, &base_working_dir);
-    let history_context = context_builder.build_history_context(&history);
+    // Build context with history
+    let max_history_chars = config.context.max_history_total_chars;
+    let history_context = build_history_context(&history, max_history_chars);
 
     // Extract deliverables to include in instructions
     let deliverable_set = extract_deliverables(&user_message);
@@ -421,9 +429,7 @@ async fn run_mission_turn(
     convo.push_str(multi_step_instructions);
     convo.push_str("\n");
 
-    let budget = Budget::new(1000);
-    let verification = VerificationCriteria::None;
-    let mut task = match crate::task::Task::new(convo, verification, budget) {
+    let mut task = match crate::task::Task::new(convo, Some(1000)) {
         Ok(t) => t,
         Err(e) => {
             return AgentResult::failure(format!("Failed to create task: {}", e), 0);
@@ -436,12 +442,11 @@ async fn run_mission_turn(
         task.analysis_mut().requested_model = Some(model);
     }
 
-    // Create LLM client
-    let llm = Arc::new(OpenRouterClient::new(config.api_key.clone()));
-
     // Ensure mission workspace exists and is configured for OpenCode.
+    let workspace_root =
+        workspace::resolve_workspace_root(&workspaces, &config, workspace_id).await;
     let mission_work_dir =
-        match workspace::prepare_mission_workspace(&config, &mcp, mission_id).await {
+        match workspace::prepare_mission_workspace_in(&workspace_root, &mcp, mission_id).await {
             Ok(dir) => {
                 tracing::info!(
                     "Mission {} workspace directory: {}",
@@ -452,26 +457,16 @@ async fn run_mission_turn(
             }
             Err(e) => {
                 tracing::warn!("Failed to prepare mission workspace, using default: {}", e);
-                config.working_dir.clone()
+                workspace_root
             }
         };
 
-    let tools = ToolRegistry::empty();
-    let mut ctx = AgentContext::with_memory(
-        config.clone(),
-        llm,
-        tools,
-        pricing,
-        mission_work_dir,
-        memory,
-    );
+    let mut ctx = AgentContext::new(config.clone(), mission_work_dir);
     ctx.mission_control = mission_control;
     ctx.control_events = Some(events_tx);
     ctx.frontend_tool_hub = Some(tool_hub);
     ctx.control_status = Some(status);
     ctx.cancel_token = Some(cancel);
-    ctx.benchmarks = Some(benchmarks);
-    ctx.resolver = Some(resolver);
     ctx.tree_snapshot = Some(tree_snapshot);
     ctx.progress_snapshot = Some(progress_snapshot);
     ctx.mission_id = Some(mission_id);

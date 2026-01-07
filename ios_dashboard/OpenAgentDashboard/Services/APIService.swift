@@ -98,8 +98,19 @@ final class APIService {
         try await get("/api/control/missions/current")
     }
     
-    func createMission() async throws -> Mission {
-        try await post("/api/control/missions", body: EmptyBody())
+    func createMission(workspaceId: String? = nil, title: String? = nil, modelOverride: String? = nil) async throws -> Mission {
+        struct CreateMissionRequest: Encodable {
+            let workspaceId: String?
+            let title: String?
+            let modelOverride: String?
+
+            enum CodingKeys: String, CodingKey {
+                case workspaceId = "workspace_id"
+                case title
+                case modelOverride = "model_override"
+            }
+        }
+        return try await post("/api/control/missions", body: CreateMissionRequest(workspaceId: workspaceId, title: title, modelOverride: modelOverride))
     }
     
     func loadMission(id: String) async throws -> Mission {
@@ -273,8 +284,74 @@ final class APIService {
         return uploadResponse.path
     }
     
+    // MARK: - Workspaces
+
+    // MARK: - Agents
+
+    func listAgents(completion: @escaping (Result<[AgentConfig], Error>) -> Void) {
+        Task {
+            do {
+                let agents: [AgentConfig] = try await get("/api/agents")
+                completion(.success(agents))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    func createAgent(name: String, modelId: String, completion: @escaping (Result<AgentConfig, Error>) -> Void) {
+        Task {
+            do {
+                struct CreateAgentRequest: Encodable {
+                    let name: String
+                    let model_id: String
+                }
+                let agent: AgentConfig = try await post("/api/agents", body: CreateAgentRequest(name: name, model_id: modelId))
+                completion(.success(agent))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    // MARK: - Workspaces
+
+    func listWorkspaces() async throws -> [Workspace] {
+        try await get("/api/workspaces")
+    }
+
+    func listWorkspaces(completion: @escaping (Result<[Workspace], Error>) -> Void) {
+        Task {
+            do {
+                let workspaces: [Workspace] = try await get("/api/workspaces")
+                completion(.success(workspaces))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    func createWorkspace(name: String, type: WorkspaceType, completion: @escaping (Result<Workspace, Error>) -> Void) {
+        Task {
+            do {
+                struct CreateWorkspaceRequest: Encodable {
+                    let name: String
+                    let workspace_type: String
+                }
+                let workspace: Workspace = try await post("/api/workspaces", body: CreateWorkspaceRequest(name: name, workspace_type: type.rawValue))
+                completion(.success(workspace))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    func getWorkspace(id: String) async throws -> Workspace {
+        try await get("/api/workspaces/\(id)")
+    }
+
     // MARK: - SSE Streaming
-    
+
     func streamControl(onEvent: @escaping (String, [String: Any]) -> Void) -> Task<Void, Never> {
         Task {
             guard let url = URL(string: "\(baseURL)/api/control/stream") else { return }

@@ -420,9 +420,9 @@ export function DesktopStream({
         ) : (
           <div className="flex flex-col items-center gap-3 text-white/60">
             <Monitor className="w-12 h-12 text-red-400/60" />
-            <span className="text-sm text-red-400">
+            <p className="max-w-[85%] text-sm text-red-400 text-center break-words whitespace-pre-wrap">
               {errorMessage || "Connection lost"}
-            </span>
+            </p>
             <button
               onClick={connect}
               className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-indigo-500 text-white text-sm hover:bg-indigo-600 transition-colors"

@@ -36,3 +36,21 @@ targets:
     entitlements:
       path: OpenAgentDashboard/OpenAgentDashboard.entitlements
       properties: {}
+
+  OpenAgentDashboardTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: OpenAgentDashboardTests
+        excludes:
+          - "**/.DS_Store"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: md.thomas.openagent.dashboard.tests
+        PRODUCT_NAME: OpenAgentDashboardTests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Open Agent.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Open Agent"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+    dependencies:
+      - target: OpenAgentDashboard

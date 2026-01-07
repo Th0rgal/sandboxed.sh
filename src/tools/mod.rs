@@ -19,7 +19,6 @@ mod file_ops;
 mod git;
 mod github;
 mod index;
-pub mod memory;
 pub mod mission;
 mod search;
 mod storage;
@@ -115,6 +114,20 @@ pub fn resolve_path_simple(path_str: &str, workspace: &Path) -> PathBuf {
     }
 }
 
+/// Safely truncate a string to a maximum number of bytes at a valid UTF-8 boundary.
+///
+/// Returns an index that is safe to use for slicing without breaking multi-byte characters.
+pub fn safe_truncate_index(s: &str, max: usize) -> usize {
+    if s.len() <= max {
+        return s.len();
+    }
+    let mut idx = max;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 // ============================================================================
 // Tool Trait and Registry
 // ============================================================================
@@ -122,7 +135,6 @@ pub fn resolve_path_simple(path_str: &str, workspace: &Path) -> PathBuf {
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::llm::{FunctionDefinition, ToolDefinition};
 
 /// Information about a tool for display purposes.
 #[derive(Debug, Clone)]
@@ -158,7 +170,7 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     /// Create a new registry with all default tools.
     pub fn new() -> Self {
-        Self::with_options(None, None)
+        Self::with_mission_control(None)
     }
 
     /// Create an empty registry (no built-in tools).
@@ -170,14 +182,6 @@ impl ToolRegistry {
 
     /// Create a new registry with all default tools and optional mission control.
     pub fn with_mission_control(mission_control: Option<mission::MissionControl>) -> Self {
-        Self::with_options(mission_control, None)
-    }
-
-    /// Create a new registry with all options.
-    pub fn with_options(
-        mission_control: Option<mission::MissionControl>,
-        shared_memory: Option<memory::SharedMemory>,
-    ) -> Self {
         let registry_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         tracing::debug!("Creating ToolRegistry {}", registry_id);
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
@@ -290,18 +294,6 @@ impl ToolRegistry {
         };
         tools.insert("complete_mission".to_string(), mission_tool);
 
-        // Memory tools (if memory system is available)
-        if let Some(mem) = shared_memory {
-            tools.insert(
-                "search_memory".to_string(),
-                Arc::new(memory::SearchMemory::new(Arc::clone(&mem))),
-            );
-            tools.insert(
-                "store_fact".to_string(),
-                Arc::new(memory::StoreFact::new(Arc::clone(&mem))),
-            );
-        }
-
         tracing::info!(
             "Registry {} complete with {} total tools",
             registry_id,
@@ -324,21 +316,6 @@ impl ToolRegistry {
     /// Check if a tool exists by name.
     pub fn has_tool(&self, name: &str) -> bool {
         self.tools.contains_key(name)
-    }
-
-    /// Get tool schemas in LLM-compatible format.
-    pub fn get_tool_schemas(&self) -> Vec<ToolDefinition> {
-        self.tools
-            .values()
-            .map(|t| ToolDefinition {
-                tool_type: "function".to_string(),
-                function: FunctionDefinition {
-                    name: t.name().to_string(),
-                    description: t.description().to_string(),
-                    parameters: t.parameters_schema(),
-                },
-            })
-            .collect()
     }
 
     /// Execute a tool by name.

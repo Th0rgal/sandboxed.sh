@@ -15,10 +15,6 @@ import type { AgentNode, LayoutNode, LayoutEdge } from './types';
 import { computeLayout, getTreeStats } from './layout';
 import {
   Bot,
-  Brain,
-  Cpu,
-  Zap,
-  Target,
   GitBranch,
   CheckCircle,
   XCircle,
@@ -81,12 +77,8 @@ const STATUS_COLORS = {
 
 // Agent type icons
 const AGENT_ICONS = {
-  Root: Bot,
-  Node: GitBranch,
-  ComplexityEstimator: Brain,
-  ModelSelector: Cpu,
-  TaskExecutor: Zap,
-  Verifier: Target,
+  OpenCode: Bot,
+  OpenCodeSession: GitBranch,
 };
 
 interface AgentTreeCanvasProps {
@@ -180,7 +172,7 @@ function AnimatedNode({
 }) {
   const { agent, x, y } = layoutNode;
   const colors = STATUS_COLORS[agent.status];
-  const Icon = AGENT_ICONS[agent.type];
+  const Icon = AGENT_ICONS[agent.type] ?? Bot;
   
   // Format model name (remove provider prefix)
   const displayModel = agent.model 

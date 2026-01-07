@@ -1,0 +1,730 @@
+//! Library management API endpoints.
+//!
+//! Provides endpoints for managing the configuration library:
+//! - Git operations (status, sync, commit, push)
+//! - MCP server CRUD
+//! - Skills CRUD
+//! - Commands CRUD
+//! - Plugins CRUD
+//! - Rules CRUD
+//! - Library Agents CRUD
+//! - Library Tools CRUD
+//! - Migration
+
+use axum::{
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    routing::{delete, get, post, put},
+    Json, Router,
+};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use crate::library::{
+    Command, CommandSummary, LibraryAgent, LibraryAgentSummary, LibraryStatus, LibraryStore,
+    LibraryTool, LibraryToolSummary, McpServer, MigrationReport, Plugin, Rule, RuleSummary, Skill,
+    SkillSummary,
+};
+
+/// Shared library state.
+pub type SharedLibrary = Arc<RwLock<Option<Arc<LibraryStore>>>>;
+
+const LIBRARY_REMOTE_HEADER: &str = "x-openagent-library-remote";
+
+fn extract_library_remote(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(LIBRARY_REMOTE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+async fn ensure_library(
+    state: &super::routes::AppState,
+    headers: &HeaderMap,
+) -> Result<Arc<LibraryStore>, (StatusCode, String)> {
+    let remote = extract_library_remote(headers).or_else(|| state.config.library_remote.clone());
+    let remote = remote.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Library not configured. Set a Git repo in Settings.".to_string(),
+        )
+    })?;
+
+    {
+        let library_guard = state.library.read().await;
+        if let Some(library) = library_guard.as_ref() {
+            if library.remote() == remote {
+                return Ok(Arc::clone(library));
+            }
+        }
+    }
+
+    let mut library_guard = state.library.write().await;
+    if let Some(library) = library_guard.as_ref() {
+        if library.remote() == remote {
+            return Ok(Arc::clone(library));
+        }
+    }
+
+    match LibraryStore::new(state.config.library_path.clone(), &remote).await {
+        Ok(store) => {
+            let store = Arc::new(store);
+            *library_guard = Some(Arc::clone(&store));
+            Ok(store)
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to initialize library: {}", e),
+        )),
+    }
+}
+
+/// Create library routes.
+pub fn routes() -> Router<Arc<super::routes::AppState>> {
+    Router::new()
+        // Git operations
+        .route("/status", get(get_status))
+        .route("/sync", post(sync_library))
+        .route("/commit", post(commit_library))
+        .route("/push", post(push_library))
+        // MCP servers
+        .route("/mcps", get(get_mcps))
+        .route("/mcps", put(save_mcps))
+        // Skills (new path: /skill, also supports legacy /skills)
+        .route("/skill", get(list_skills))
+        .route("/skill/import", post(import_skill))
+        .route("/skill/:name", get(get_skill))
+        .route("/skill/:name", put(save_skill))
+        .route("/skill/:name", delete(delete_skill))
+        .route("/skill/:name/files/*path", get(get_skill_reference))
+        .route("/skill/:name/files/*path", put(save_skill_reference))
+        .route("/skill/:name/files/*path", delete(delete_skill_reference))
+        // Legacy skills routes (backwards compatibility)
+        .route("/skills", get(list_skills))
+        .route("/skills/import", post(import_skill))
+        .route("/skills/:name", get(get_skill))
+        .route("/skills/:name", put(save_skill))
+        .route("/skills/:name", delete(delete_skill))
+        .route("/skills/:name/references/*path", get(get_skill_reference))
+        .route("/skills/:name/references/*path", put(save_skill_reference))
+        .route("/skills/:name/references/*path", delete(delete_skill_reference))
+        // Commands (new path: /command, also supports legacy /commands)
+        .route("/command", get(list_commands))
+        .route("/command/:name", get(get_command))
+        .route("/command/:name", put(save_command))
+        .route("/command/:name", delete(delete_command))
+        // Legacy commands routes (backwards compatibility)
+        .route("/commands", get(list_commands))
+        .route("/commands/:name", get(get_command))
+        .route("/commands/:name", put(save_command))
+        .route("/commands/:name", delete(delete_command))
+        // Plugins
+        .route("/plugins", get(get_plugins))
+        .route("/plugins", put(save_plugins))
+        // Rules
+        .route("/rule", get(list_rules))
+        .route("/rule/:name", get(get_rule))
+        .route("/rule/:name", put(save_rule))
+        .route("/rule/:name", delete(delete_rule))
+        // Library Agents
+        .route("/agent", get(list_library_agents))
+        .route("/agent/:name", get(get_library_agent))
+        .route("/agent/:name", put(save_library_agent))
+        .route("/agent/:name", delete(delete_library_agent))
+        // Library Tools
+        .route("/tool", get(list_library_tools))
+        .route("/tool/:name", get(get_library_tool))
+        .route("/tool/:name", put(save_library_tool))
+        .route("/tool/:name", delete(delete_library_tool))
+        // Migration
+        .route("/migrate", post(migrate_library))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Request/Response Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CommitRequest {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveContentRequest {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportSkillRequest {
+    /// Git repository URL
+    url: String,
+    /// Optional path within the repository (for monorepos)
+    path: Option<String>,
+    /// Target skill name (defaults to last path component)
+    name: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Git Operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/status - Get git status of the library.
+async fn get_status(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<LibraryStatus>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .status()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// POST /api/library/sync - Pull latest changes from remote.
+async fn sync_library(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .sync()
+        .await
+        .map(|_| (StatusCode::OK, "Synced successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// POST /api/library/commit - Commit all changes.
+async fn commit_library(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CommitRequest>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .commit(&req.message)
+        .await
+        .map(|_| (StatusCode::OK, "Committed successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// POST /api/library/push - Push changes to remote.
+async fn push_library(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .push()
+        .await
+        .map(|_| (StatusCode::OK, "Pushed successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP Servers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/mcps - Get all MCP server definitions.
+async fn get_mcps(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<HashMap<String, McpServer>>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .get_mcp_servers()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// PUT /api/library/mcps - Save all MCP server definitions.
+async fn save_mcps(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    Json(servers): Json<HashMap<String, McpServer>>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_mcp_servers(&servers)
+        .await
+        .map(|_| (StatusCode::OK, "MCPs saved successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Skills
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/skills - List all skills.
+async fn list_skills(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SkillSummary>>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .list_skills()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// GET /api/library/skills/:name - Get a skill by name.
+async fn get_skill(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Skill>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .get_skill(&name)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                (StatusCode::NOT_FOUND, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
+}
+
+/// PUT /api/library/skills/:name - Save a skill.
+async fn save_skill(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<SaveContentRequest>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_skill(&name, &req.content)
+        .await
+        .map(|_| (StatusCode::OK, "Skill saved successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// DELETE /api/library/skills/:name - Delete a skill.
+async fn delete_skill(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .delete_skill(&name)
+        .await
+        .map(|_| (StatusCode::OK, "Skill deleted successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// GET /api/library/skills/:name/references/*path - Get a reference file.
+async fn get_skill_reference(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path((name, path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .get_skill_reference(&name, &path)
+        .await
+        .map(|content| (StatusCode::OK, content))
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                (StatusCode::NOT_FOUND, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
+}
+
+/// PUT /api/library/skills/:name/references/*path - Save a reference file.
+async fn save_skill_reference(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path((name, path)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(req): Json<SaveContentRequest>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_skill_reference(&name, &path, &req.content)
+        .await
+        .map(|_| (StatusCode::OK, "Reference saved successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// DELETE /api/library/skills/:name/references/*path - Delete a reference file.
+async fn delete_skill_reference(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path((name, path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .delete_skill_reference(&name, &path)
+        .await
+        .map(|_| (StatusCode::OK, "Reference deleted successfully".to_string()))
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                (StatusCode::NOT_FOUND, e.to_string())
+            } else if e.to_string().contains("Cannot delete SKILL.md") {
+                (StatusCode::BAD_REQUEST, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
+}
+
+/// POST /api/library/skills/import - Import a skill from a Git URL.
+async fn import_skill(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ImportSkillRequest>,
+) -> Result<Json<Skill>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+
+    // Determine target name
+    let target_name = req.name.clone().unwrap_or_else(|| {
+        // Extract from path or URL
+        if let Some(ref path) = req.path {
+            path.rsplit('/').next().unwrap_or("imported-skill").to_string()
+        } else {
+            req.url
+                .rsplit('/')
+                .next()
+                .map(|s| s.trim_end_matches(".git"))
+                .unwrap_or("imported-skill")
+                .to_string()
+        }
+    });
+
+    library
+        .import_skill_from_git(&req.url, req.path.as_deref(), &target_name)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            if e.to_string().contains("already exists") {
+                (StatusCode::CONFLICT, e.to_string())
+            } else if e.to_string().contains("No SKILL.md found") {
+                (StatusCode::BAD_REQUEST, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Commands
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/commands - List all commands.
+async fn list_commands(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<CommandSummary>>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .list_commands()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// GET /api/library/commands/:name - Get a command by name.
+async fn get_command(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Command>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .get_command(&name)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                (StatusCode::NOT_FOUND, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
+}
+
+/// PUT /api/library/commands/:name - Save a command.
+async fn save_command(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<SaveContentRequest>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_command(&name, &req.content)
+        .await
+        .map(|_| (StatusCode::OK, "Command saved successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// DELETE /api/library/commands/:name - Delete a command.
+async fn delete_command(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .delete_command(&name)
+        .await
+        .map(|_| (StatusCode::OK, "Command deleted successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plugins
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/plugins - Get all plugins.
+async fn get_plugins(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<HashMap<String, Plugin>>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .get_plugins()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// PUT /api/library/plugins - Save all plugins.
+async fn save_plugins(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    Json(plugins): Json<HashMap<String, Plugin>>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_plugins(&plugins)
+        .await
+        .map(|_| (StatusCode::OK, "Plugins saved successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rules
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/rule - List all rules.
+async fn list_rules(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<RuleSummary>>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .list_rules()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// GET /api/library/rule/:name - Get a rule by name.
+async fn get_rule(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Rule>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .get_rule(&name)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                (StatusCode::NOT_FOUND, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
+}
+
+/// PUT /api/library/rule/:name - Save a rule.
+async fn save_rule(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<SaveContentRequest>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_rule(&name, &req.content)
+        .await
+        .map(|_| (StatusCode::OK, "Rule saved successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// DELETE /api/library/rule/:name - Delete a rule.
+async fn delete_rule(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .delete_rule(&name)
+        .await
+        .map(|_| (StatusCode::OK, "Rule deleted successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Library Agents
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/agent - List all library agents.
+async fn list_library_agents(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<LibraryAgentSummary>>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .list_library_agents()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// GET /api/library/agent/:name - Get a library agent by name.
+async fn get_library_agent(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<LibraryAgent>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .get_library_agent(&name)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                (StatusCode::NOT_FOUND, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
+}
+
+/// PUT /api/library/agent/:name - Save a library agent.
+async fn save_library_agent(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(agent): Json<LibraryAgent>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_library_agent(&name, &agent)
+        .await
+        .map(|_| (StatusCode::OK, "Agent saved successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// DELETE /api/library/agent/:name - Delete a library agent.
+async fn delete_library_agent(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .delete_library_agent(&name)
+        .await
+        .map(|_| (StatusCode::OK, "Agent deleted successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Library Tools
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/tool - List all library tools.
+async fn list_library_tools(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<LibraryToolSummary>>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .list_library_tools()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// GET /api/library/tool/:name - Get a library tool by name.
+async fn get_library_tool(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<LibraryTool>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .get_library_tool(&name)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                (StatusCode::NOT_FOUND, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
+}
+
+/// PUT /api/library/tool/:name - Save a library tool.
+async fn save_library_tool(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<SaveContentRequest>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_library_tool(&name, &req.content)
+        .await
+        .map(|_| (StatusCode::OK, "Tool saved successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// DELETE /api/library/tool/:name - Delete a library tool.
+async fn delete_library_tool(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .delete_library_tool(&name)
+        .await
+        .map(|_| (StatusCode::OK, "Tool deleted successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Migration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// POST /api/library/migrate - Migrate library structure to new format.
+async fn migrate_library(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<MigrationReport>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .migrate_structure()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}

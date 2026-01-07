@@ -1,3 +1,5 @@
+context/
+context/**
 reports/
 reports/**
 
@@ -40,3 +42,4 @@ Thumbs.db
 
 # npm lockfile (we use bun)
 dashboard/package-lock.json
+.openagent/

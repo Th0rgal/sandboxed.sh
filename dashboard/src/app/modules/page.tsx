@@ -97,12 +97,23 @@ function McpCard({
 }) {
   const status = statusConfig[mcp.status];
 
+  const handleSelect = () => onSelect(isSelected ? null : mcp);
+
   return (
-    <button
-      onClick={() => onSelect(isSelected ? null : mcp)}
+    <div
+      role="button"
+      tabIndex={0}
+      aria-pressed={isSelected}
+      onClick={handleSelect}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          handleSelect();
+        }
+      }}
       className={cn(
-        "w-full rounded-xl p-4 text-left transition-all",
-        "bg-white/[0.02] border hover:bg-white/[0.04]",
+        "w-full rounded-xl p-4 text-left transition-all cursor-pointer",
+        "bg-white/[0.02] border hover:bg-white/[0.04] focus:outline-none focus:ring-1 focus:ring-indigo-500/40",
         isSelected
           ? "border-indigo-500/50 ring-1 ring-indigo-500/30"
           : "border-white/[0.04] hover:border-white/[0.08]"
@@ -179,7 +190,7 @@ function McpCard({
         </span>
         <Toggle checked={mcp.enabled} onChange={() => {}} />
       </div>
-    </button>
+    </div>
   );
 }
 
@@ -202,6 +213,17 @@ function McpDetailPanel({
     mcp.tool_calls + mcp.tool_errors > 0
       ? ((mcp.tool_calls / (mcp.tool_calls + mcp.tool_errors)) * 100).toFixed(1)
       : "100.0";
+
+  // Handle Escape key to close panel
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
 
   return (
     <>
@@ -426,6 +448,17 @@ function AddMcpModal({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Handle Escape key to close modal
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim() || !endpoint.trim()) return;
@@ -550,6 +583,17 @@ function ConfigureMcpModal({
   const [description, setDescription] = useState(mcp.description || "");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Handle Escape key to close modal
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

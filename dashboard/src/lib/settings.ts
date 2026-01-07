@@ -1,7 +1,6 @@
 export type SavedSettings = Partial<{
   apiUrl: string;
-  defaultModel: string;
-  defaultBudget: string; // cents, stored as string for form input
+  libraryRepo: string;
 }>;
 
 const STORAGE_KEY = 'settings';
@@ -14,8 +13,7 @@ export function readSavedSettings(): SavedSettings {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     const out: SavedSettings = {};
     if (typeof parsed.apiUrl === 'string') out.apiUrl = parsed.apiUrl;
-    if (typeof parsed.defaultModel === 'string') out.defaultModel = parsed.defaultModel;
-    if (typeof parsed.defaultBudget === 'string') out.defaultBudget = parsed.defaultBudget;
+    if (typeof parsed.libraryRepo === 'string') out.libraryRepo = parsed.libraryRepo;
     return out;
   } catch {
     return {};
@@ -40,19 +38,12 @@ export function getRuntimeApiBase(): string {
   return normalizeBaseUrl(saved || envBase);
 }
 
-export function getRuntimeTaskDefaults(): { model?: string; budget_cents?: number } {
-  if (typeof window === 'undefined') return {};
-  const saved = readSavedSettings();
-  const out: { model?: string; budget_cents?: number } = {};
-  if (saved.defaultModel && saved.defaultModel.trim()) out.model = saved.defaultModel.trim();
-  if (saved.defaultBudget && saved.defaultBudget.trim()) {
-    const n = Number(saved.defaultBudget);
-    if (Number.isFinite(n) && n > 0) out.budget_cents = Math.floor(n);
-  }
-  return out;
+export function getRuntimeLibraryRemote(): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const saved = readSavedSettings().libraryRepo;
+  const trimmed = saved?.trim();
+  return trimmed ? trimmed : undefined;
 }
-
-
 
 
 

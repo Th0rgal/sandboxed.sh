@@ -58,6 +58,7 @@ enum Theme {
     /// Border color with low opacity
     static let border = Color.white.opacity(0.06)
     static let borderElevated = Color.white.opacity(0.08)
+    static let borderSubtle = Color.white.opacity(0.04)
 
     // MARK: - Accent
     // Single accent color for primary actions - indigo per style guide

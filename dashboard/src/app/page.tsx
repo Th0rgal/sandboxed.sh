@@ -164,11 +164,11 @@ export default function OverviewPage() {
       </div>
 
       {/* Right sidebar - no glass panel wrapper, just border */}
-      <div className="w-80 border-l border-white/[0.06] p-4 flex flex-col">
-        <div className="flex-1">
+      <div className="w-80 h-screen border-l border-white/[0.06] p-4 flex flex-col overflow-hidden">
+        <div className="flex-1 min-h-0 overflow-hidden">
           <RecentTasks />
         </div>
-        <div className="mt-4">
+        <div className="mt-4 flex-shrink-0">
           <ConnectionStatus />
         </div>
       </div>

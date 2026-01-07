@@ -26,17 +26,42 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agents::{AgentContext, AgentRef, TerminalReason};
-use crate::budget::{Budget, ModelPricing};
-use crate::config::{AuthMode, Config};
-use crate::llm::OpenRouterClient;
+use crate::config::Config;
 use crate::mcp::McpRegistry;
-use crate::memory::{ContextBuilder, MemorySystem, MissionMessage};
-use crate::task::VerificationCriteria;
-use crate::tools::ToolRegistry;
 use crate::workspace;
 
 use super::auth::AuthUser;
 use super::routes::AppState;
+
+/// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
+fn safe_truncate_index(s: &str, max: usize) -> usize {
+    if s.len() <= max {
+        return s.len();
+    }
+    // Find a char boundary at or before max
+    let mut idx = max;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Build a simple history context from conversation history.
+fn build_history_context(history: &[(String, String)], max_chars: usize) -> String {
+    let mut result = String::new();
+    let mut total_chars = 0;
+
+    for (role, content) in history.iter().rev() {
+        let entry = format!("{}: {}\n\n", role.to_uppercase(), content);
+        if total_chars + entry.len() > max_chars && !result.is_empty() {
+            break;
+        }
+        result = format!("{}{}", entry, result);
+        total_chars += entry.len();
+    }
+
+    result
+}
 
 /// Message posted by a user to the control session.
 #[derive(Debug, Clone, Deserialize)]
@@ -209,7 +234,7 @@ pub enum AgentEvent {
     },
     /// Agent phase update (for showing preparation steps)
     AgentPhase {
-        /// Phase name: "estimating_complexity", "selecting_model", "splitting_task", "executing", "verifying"
+        /// Phase name: "executing", "delegating", etc.
         phase: String,
         /// Optional details about what's happening
         detail: Option<String>,
@@ -248,7 +273,7 @@ pub enum AgentEvent {
 pub struct AgentTreeNode {
     pub id: String,
     #[serde(rename = "type")]
-    pub node_type: String, // "Root", "Node", "ComplexityEstimator", "ModelSelector", "TaskExecutor", "Verifier"
+    pub node_type: String, // e.g. "Root", "Worker"
     pub name: String,
     pub description: String,
     pub status: String, // "pending", "running", "completed", "failed"
@@ -346,6 +371,9 @@ pub enum ControlCommand {
     CreateMission {
         title: Option<String>,
         model_override: Option<String>,
+        workspace_id: Option<Uuid>,
+        agent_id: Option<Uuid>,
+        hooks: Option<Vec<String>>,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Update mission status
@@ -423,6 +451,15 @@ pub struct Mission {
     /// Model override requested for this mission
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+    /// Workspace ID where this mission runs (defaults to host workspace)
+    #[serde(default = "default_workspace_id")]
+    pub workspace_id: Uuid,
+    /// Agent configuration ID for this mission (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<Uuid>,
+    /// Hooks to run for this mission (e.g., "ralph-wiggum")
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<String>,
     pub history: Vec<MissionHistoryEntry>,
     pub created_at: String,
     pub updated_at: String,
@@ -432,6 +469,10 @@ pub struct Mission {
     /// Whether this mission can be resumed
     #[serde(default)]
     pub resumable: bool,
+}
+
+fn default_workspace_id() -> Uuid {
+    crate::workspace::DEFAULT_WORKSPACE_ID
 }
 
 /// A single entry in the mission history.
@@ -460,6 +501,9 @@ trait MissionStore: Send + Sync {
         &self,
         title: Option<&str>,
         model_override: Option<&str>,
+        workspace_id: Option<Uuid>,
+        agent_id: Option<Uuid>,
+        hooks: Option<Vec<String>>,
     ) -> Result<Mission, String>;
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String>;
     async fn update_mission_history(
@@ -521,6 +565,9 @@ impl MissionStore for InMemoryMissionStore {
         &self,
         title: Option<&str>,
         model_override: Option<&str>,
+        workspace_id: Option<Uuid>,
+        agent_id: Option<Uuid>,
+        hooks: Option<Vec<String>>,
     ) -> Result<Mission, String> {
         let now = now_string();
         let mission = Mission {
@@ -528,6 +575,9 @@ impl MissionStore for InMemoryMissionStore {
             status: MissionStatus::Active,
             title: title.map(|s| s.to_string()),
             model_override: model_override.map(|s| s.to_string()),
+            workspace_id: workspace_id.unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID),
+            agent_id,
+            hooks: hooks.unwrap_or_default(),
             history: vec![],
             created_at: now.clone(),
             updated_at: now,
@@ -667,201 +717,6 @@ impl MissionStore for InMemoryMissionStore {
     }
 }
 
-#[derive(Clone)]
-struct SupabaseMissionStore {
-    memory: MemorySystem,
-}
-
-impl SupabaseMissionStore {
-    fn new(memory: MemorySystem) -> Self {
-        Self { memory }
-    }
-
-    fn mission_from_db(db_mission: crate::memory::DbMission) -> Mission {
-        let history: Vec<MissionHistoryEntry> =
-            serde_json::from_value(db_mission.history.clone()).unwrap_or_default();
-        let status = match db_mission.status.as_str() {
-            "completed" => MissionStatus::Completed,
-            "failed" => MissionStatus::Failed,
-            "interrupted" => MissionStatus::Interrupted,
-            "blocked" => MissionStatus::Blocked,
-            "not_feasible" => MissionStatus::NotFeasible,
-            _ => MissionStatus::Active,
-        };
-        Mission {
-            id: db_mission.id,
-            status,
-            title: db_mission.title,
-            model_override: db_mission.model_override,
-            history,
-            created_at: db_mission.created_at.clone(),
-            updated_at: db_mission.updated_at.clone(),
-            interrupted_at: if matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked)
-            {
-                Some(db_mission.updated_at)
-            } else {
-                None
-            },
-            resumable: matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked),
-        }
-    }
-}
-
-#[async_trait]
-impl MissionStore for SupabaseMissionStore {
-    fn is_persistent(&self) -> bool {
-        true
-    }
-
-    async fn list_missions(&self, limit: usize, offset: usize) -> Result<Vec<Mission>, String> {
-        let missions = self
-            .memory
-            .supabase
-            .list_missions(limit, offset)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(missions
-            .into_iter()
-            .map(SupabaseMissionStore::mission_from_db)
-            .collect())
-    }
-
-    async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String> {
-        let mission = self
-            .memory
-            .supabase
-            .get_mission(id)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(mission.map(SupabaseMissionStore::mission_from_db))
-    }
-
-    async fn create_mission(
-        &self,
-        title: Option<&str>,
-        model_override: Option<&str>,
-    ) -> Result<Mission, String> {
-        let mission = self
-            .memory
-            .supabase
-            .create_mission(title, model_override)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(SupabaseMissionStore::mission_from_db(mission))
-    }
-
-    async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String> {
-        self.memory
-            .supabase
-            .update_mission_status(id, &status.to_string())
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn update_mission_history(
-        &self,
-        id: Uuid,
-        history: &[MissionHistoryEntry],
-    ) -> Result<(), String> {
-        let messages: Vec<MissionMessage> = history
-            .iter()
-            .map(|entry| MissionMessage {
-                role: entry.role.clone(),
-                content: entry.content.clone(),
-            })
-            .collect();
-        self.memory
-            .supabase
-            .update_mission_history(id, &messages)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn update_mission_title(&self, id: Uuid, title: &str) -> Result<(), String> {
-        self.memory
-            .supabase
-            .update_mission_title(id, title)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn update_mission_tree(&self, id: Uuid, tree: &AgentTreeNode) -> Result<(), String> {
-        let tree_json = serde_json::to_value(tree).map_err(|e| e.to_string())?;
-        self.memory
-            .supabase
-            .update_mission_tree(id, &tree_json)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn get_mission_tree(&self, id: Uuid) -> Result<Option<AgentTreeNode>, String> {
-        let mission = self
-            .memory
-            .supabase
-            .get_mission(id)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(mission
-            .and_then(|m| m.final_tree)
-            .and_then(|v| serde_json::from_value(v).ok()))
-    }
-
-    async fn delete_mission(&self, id: Uuid) -> Result<bool, String> {
-        self.memory
-            .supabase
-            .delete_mission(id)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn delete_empty_untitled_missions_excluding(
-        &self,
-        exclude: &[Uuid],
-    ) -> Result<usize, String> {
-        self.memory
-            .supabase
-            .delete_empty_untitled_missions_excluding(exclude)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn get_stale_active_missions(&self, stale_hours: u64) -> Result<Vec<Mission>, String> {
-        let missions = self
-            .memory
-            .supabase
-            .get_stale_active_missions(stale_hours)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(missions
-            .into_iter()
-            .map(SupabaseMissionStore::mission_from_db)
-            .collect())
-    }
-
-    async fn insert_mission_summary(
-        &self,
-        mission_id: Uuid,
-        summary: &str,
-        key_files: &[String],
-        success: bool,
-    ) -> Result<(), String> {
-        let embedding = self.memory.embedder.embed(summary).await.ok();
-        self.memory
-            .supabase
-            .insert_mission_summary(
-                mission_id,
-                summary,
-                key_files,
-                &[],
-                success,
-                embedding.as_deref(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-}
-
 /// Shared tool hub used to await frontend tool results.
 #[derive(Debug)]
 pub struct FrontendToolHub {
@@ -921,29 +776,23 @@ pub struct ControlHub {
     sessions: Arc<RwLock<HashMap<String, ControlState>>>,
     config: Config,
     root_agent: AgentRef,
-    memory: Option<MemorySystem>,
-    benchmarks: crate::budget::SharedBenchmarkRegistry,
-    resolver: crate::budget::SharedModelResolver,
     mcp: Arc<McpRegistry>,
+    workspaces: workspace::SharedWorkspaceStore,
 }
 
 impl ControlHub {
     pub fn new(
         config: Config,
         root_agent: AgentRef,
-        memory: Option<MemorySystem>,
-        benchmarks: crate::budget::SharedBenchmarkRegistry,
-        resolver: crate::budget::SharedModelResolver,
         mcp: Arc<McpRegistry>,
+        workspaces: workspace::SharedWorkspaceStore,
     ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
             root_agent,
-            memory,
-            benchmarks,
-            resolver,
             mcp,
+            workspaces,
         }
     }
 
@@ -955,24 +804,12 @@ impl ControlHub {
         if let Some(existing) = sessions.get(&user.id).cloned() {
             return existing;
         }
-        let use_in_memory = matches!(
-            self.config.auth.auth_mode(self.config.dev_mode),
-            AuthMode::MultiUser
-        ) || self.memory.is_none();
-        let mission_store: Arc<dyn MissionStore> = if use_in_memory {
-            Arc::new(InMemoryMissionStore::new())
-        } else if let Some(memory) = self.memory.clone() {
-            Arc::new(SupabaseMissionStore::new(memory))
-        } else {
-            Arc::new(InMemoryMissionStore::new())
-        };
+        let mission_store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
         let state = spawn_control_session(
             self.config.clone(),
             Arc::clone(&self.root_agent),
-            self.memory.clone(),
-            Arc::clone(&self.benchmarks),
-            Arc::clone(&self.resolver),
             Arc::clone(&self.mcp),
+            Arc::clone(&self.workspaces),
             mission_store,
         );
         sessions.insert(user.id.clone(), state.clone());
@@ -984,7 +821,7 @@ impl ControlHub {
     }
 }
 
-/// Execution progress for showing "Subtask X of Y"
+/// Execution progress for showing overall mission progress
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ExecutionProgress {
     /// Total number of subtasks
@@ -1151,6 +988,12 @@ pub async fn get_mission(
 pub struct CreateMissionRequest {
     pub title: Option<String>,
     pub model_override: Option<String>,
+    /// Workspace ID to run the mission in (defaults to host workspace)
+    pub workspace_id: Option<Uuid>,
+    /// Agent ID to use for this mission (provides default model, MCPs, skills, commands)
+    pub agent_id: Option<Uuid>,
+    /// Hooks to enable for this mission (e.g., ["ralph-wiggum"])
+    pub hooks: Option<Vec<String>>,
 }
 
 pub async fn create_mission(
@@ -1160,9 +1003,9 @@ pub async fn create_mission(
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
-    let (title, model_override) = body
-        .map(|b| (b.title.clone(), b.model_override.clone()))
-        .unwrap_or((None, None));
+    let (title, model_override, workspace_id, agent_id, hooks) = body
+        .map(|b| (b.title.clone(), b.model_override.clone(), b.workspace_id, b.agent_id, b.hooks.clone()))
+        .unwrap_or((None, None, None, None, None));
 
     let control = control_for_user(&state, &user).await;
     control
@@ -1170,6 +1013,9 @@ pub async fn create_mission(
         .send(ControlCommand::CreateMission {
             title,
             model_override,
+            workspace_id,
+            agent_id,
+            hooks,
             respond: tx,
         })
         .await
@@ -1779,10 +1625,8 @@ pub async fn stream(
 fn spawn_control_session(
     config: Config,
     root_agent: AgentRef,
-    memory: Option<MemorySystem>,
-    benchmarks: crate::budget::SharedBenchmarkRegistry,
-    resolver: crate::budget::SharedModelResolver,
     mcp: Arc<McpRegistry>,
+    workspaces: workspace::SharedWorkspaceStore,
     mission_store: Arc<dyn MissionStore>,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
@@ -1820,10 +1664,8 @@ fn spawn_control_session(
     tokio::spawn(control_actor_loop(
         config.clone(),
         root_agent,
-        memory.clone(),
-        benchmarks,
-        resolver,
         mcp,
+        workspaces,
         cmd_rx,
         mission_cmd_rx,
         mission_cmd_tx,
@@ -1904,10 +1746,8 @@ async fn stale_mission_cleanup_loop(
 async fn control_actor_loop(
     config: Config,
     root_agent: AgentRef,
-    memory: Option<MemorySystem>,
-    benchmarks: crate::budget::SharedBenchmarkRegistry,
-    resolver: crate::budget::SharedModelResolver,
     mcp: Arc<McpRegistry>,
+    workspaces: workspace::SharedWorkspaceStore,
     mut cmd_rx: mpsc::Receiver<ControlCommand>,
     mut mission_cmd_rx: mpsc::Receiver<crate::tools::mission::MissionControlCommand>,
     mission_cmd_tx: mpsc::Sender<crate::tools::mission::MissionControlCommand>,
@@ -1923,8 +1763,6 @@ async fn control_actor_loop(
     // Queue stores (id, content, model_override) for the current/primary mission
     let mut queue: VecDeque<(Uuid, String, Option<String>)> = VecDeque::new();
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content) pairs (user/assistant)
-    let pricing = Arc::new(ModelPricing::new());
-
     let mut running: Option<tokio::task::JoinHandle<(Uuid, String, crate::agents::AgentResult)>> =
         None;
     let mut running_cancel: Option<CancellationToken> = None;
@@ -1992,7 +1830,7 @@ async fn control_actor_loop(
                             .unwrap_or(true);
                         if should_update {
                             let title = if content.len() > 100 {
-                                let safe_end = crate::memory::safe_truncate_index(content, 100);
+                                let safe_end = safe_truncate_index(content, 100);
                                 format!("{}...", &content[..safe_end])
                             } else {
                                 content.clone()
@@ -2023,7 +1861,7 @@ async fn control_actor_loop(
         mission_store: &Arc<dyn MissionStore>,
         model_override: Option<&str>,
     ) -> Result<Mission, String> {
-        create_new_mission_with_title(mission_store, None, model_override).await
+        create_new_mission_with_title(mission_store, None, model_override, None, None, None).await
     }
 
     // Helper to create a new mission with title
@@ -2031,14 +1869,20 @@ async fn control_actor_loop(
         mission_store: &Arc<dyn MissionStore>,
         title: Option<&str>,
         model_override: Option<&str>,
+        workspace_id: Option<Uuid>,
+        agent_id: Option<Uuid>,
+        hooks: Option<Vec<String>>,
     ) -> Result<Mission, String> {
-        mission_store.create_mission(title, model_override).await
+        mission_store
+            .create_mission(title, model_override, workspace_id, agent_id, hooks)
+            .await
     }
 
     // Helper to build resume context for an interrupted or blocked mission
     async fn resume_mission_impl(
         mission_store: &Arc<dyn MissionStore>,
         config: &Config,
+        workspaces: &workspace::SharedWorkspaceStore,
         mission_id: Uuid,
         clean_workspace: bool,
     ) -> Result<(Mission, String), String> {
@@ -2056,7 +1900,9 @@ async fn control_actor_loop(
         }
 
         // Clean workspace if requested
-        let mission_dir = workspace::mission_workspace_dir(&config.working_dir, mission_id);
+        let workspace_root =
+            workspace::resolve_workspace_root(workspaces, config, Some(mission.workspace_id)).await;
+        let mission_dir = workspace::mission_workspace_dir_for_root(&workspace_root, mission_id);
 
         if clean_workspace && mission_dir.exists() {
             tracing::info!(
@@ -2247,15 +2093,12 @@ async fn control_actor_loop(
 
                                 let cfg = config.clone();
                                 let agent = Arc::clone(&root_agent);
-                                let mem = memory.clone();
-                                let bench = Arc::clone(&benchmarks);
-                                let res = Arc::clone(&resolver);
                                 let mcp_ref = Arc::clone(&mcp);
+                                let workspaces_ref = Arc::clone(&workspaces);
                                 let events = events_tx.clone();
                                 let tools_hub = Arc::clone(&tool_hub);
                                 let status_ref = Arc::clone(&status);
                                 let cancel = CancellationToken::new();
-                                let pricing = Arc::clone(&pricing);
                                 let hist_snapshot = history.clone();
                                 let mission_ctrl = crate::tools::mission::MissionControl {
                                     current_mission_id: Arc::clone(&current_mission),
@@ -2265,6 +2108,28 @@ async fn control_actor_loop(
                                 let progress_ref = Arc::clone(&progress);
                                 // Capture which mission this task is working on
                                 let mission_id = current_mission.read().await.clone();
+                                let workspace_id = if let Some(mid) = mission_id {
+                                    match mission_store.get_mission(mid).await {
+                                        Ok(Some(mission)) => Some(mission.workspace_id),
+                                        Ok(None) => {
+                                            tracing::warn!(
+                                                "Mission {} not found while resolving workspace",
+                                                mid
+                                            );
+                                            None
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to load mission {} for workspace: {}",
+                                                mid,
+                                                e
+                                            );
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
                                 running_cancel = Some(cancel.clone());
                                 running_mission_id = mission_id;
                                 // Reset activity timer when new task starts to avoid false stall warnings
@@ -2273,11 +2138,8 @@ async fn control_actor_loop(
                                     let result = run_single_control_turn(
                                         cfg,
                                         agent,
-                                        mem,
-                                        bench,
-                                        res,
                                         mcp_ref,
-                                        pricing,
+                                        workspaces_ref,
                                         events,
                                         tools_hub,
                                         status_ref,
@@ -2289,6 +2151,7 @@ async fn control_actor_loop(
                                         tree_ref,
                                         progress_ref,
                                         mission_id,
+                                        workspace_id,
                                     )
                                     .await;
                                     (mid, msg, result)
@@ -2340,7 +2203,7 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, model_override, respond } => {
+                    ControlCommand::CreateMission { title, model_override, workspace_id, agent_id, hooks, respond } => {
                         // First persist current mission history
                         persist_mission_history(
                             &mission_store,
@@ -2349,11 +2212,14 @@ async fn control_actor_loop(
                         )
                         .await;
 
-                        // Create a new mission with optional title and model override
+                        // Create a new mission with optional title, model override, workspace, agent, and hooks
                         match create_new_mission_with_title(
                             &mission_store,
                             title.as_deref(),
                             model_override.as_deref(),
+                            workspace_id,
+                            agent_id,
+                            hooks,
                         )
                         .await {
                             Ok(mission) => {
@@ -2429,6 +2295,7 @@ async fn control_actor_loop(
                             let mut runner = super::mission_runner::MissionRunner::new(
                                 mission_id,
                                 model_override.clone(),
+                                mission.workspace_id,
                             );
 
                             // Load existing history into runner to preserve conversation context
@@ -2443,11 +2310,8 @@ async fn control_actor_loop(
                             let started = runner.start_next(
                                 config.clone(),
                                 Arc::clone(&root_agent),
-                                memory.clone(),
-                                Arc::clone(&benchmarks),
-                                Arc::clone(&resolver),
                                 Arc::clone(&mcp),
-                                Arc::clone(&pricing),
+                                Arc::clone(&workspaces),
                                 events_tx.clone(),
                                 Arc::clone(&tool_hub),
                                 Arc::clone(&status),
@@ -2527,6 +2391,7 @@ async fn control_actor_loop(
                         match resume_mission_impl(
                             &mission_store,
                             &config,
+                            &workspaces,
                             mission_id,
                             clean_workspace,
                         )
@@ -2565,15 +2430,12 @@ async fn control_actor_loop(
                                         let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), mission_id: Some(mission_id) });
                                         let cfg = config.clone();
                                         let agent = Arc::clone(&root_agent);
-                                        let mem = memory.clone();
-                                        let bench = Arc::clone(&benchmarks);
-                                        let res = Arc::clone(&resolver);
                                         let mcp_ref = Arc::clone(&mcp);
+                                        let workspaces_ref = Arc::clone(&workspaces);
                                         let events = events_tx.clone();
                                         let tools_hub = Arc::clone(&tool_hub);
                                         let status_ref = Arc::clone(&status);
                                         let cancel = CancellationToken::new();
-                                        let pricing = Arc::clone(&pricing);
                                         let hist_snapshot = history.clone();
                                         let mission_ctrl = crate::tools::mission::MissionControl {
                                             current_mission_id: Arc::clone(&current_mission),
@@ -2581,6 +2443,7 @@ async fn control_actor_loop(
                                         };
                                         let tree_ref = Arc::clone(&current_tree);
                                         let progress_ref = Arc::clone(&progress);
+                                        let workspace_id = Some(mission.workspace_id);
                                         running_cancel = Some(cancel.clone());
                                         // Capture which mission this task is working on (the resumed mission)
                                         running_mission_id = Some(mission_id);
@@ -2588,11 +2451,8 @@ async fn control_actor_loop(
                                             let result = run_single_control_turn(
                                                 cfg,
                                                 agent,
-                                                mem,
-                                                bench,
-                                                res,
                                                 mcp_ref,
-                                                pricing,
+                                                workspaces_ref,
                                                 events,
                                                 tools_hub,
                                                 status_ref,
@@ -2604,6 +2464,7 @@ async fn control_actor_loop(
                                                 tree_ref,
                                                 progress_ref,
                                                 Some(mission_id),
+                                                workspace_id,
                                             )
                                             .await;
                                             (mid, msg, result)
@@ -2818,7 +2679,7 @@ async fn control_actor_loop(
                                             // Use safe_truncate_index for UTF-8 safe truncation
                                             let title = if user_msg.len() > 100 {
                                                 let safe_end =
-                                                    crate::memory::safe_truncate_index(&user_msg, 100);
+                                                    safe_truncate_index(&user_msg, 100);
                                                 format!("{}...", &user_msg[..safe_end])
                                             } else {
                                                 user_msg.clone()
@@ -2937,15 +2798,12 @@ async fn control_actor_loop(
 
                     let cfg = config.clone();
                     let agent = Arc::clone(&root_agent);
-                    let mem = memory.clone();
-                    let bench = Arc::clone(&benchmarks);
-                    let res = Arc::clone(&resolver);
                     let mcp_ref = Arc::clone(&mcp);
+                    let workspaces_ref = Arc::clone(&workspaces);
                     let events = events_tx.clone();
                     let tools_hub = Arc::clone(&tool_hub);
                     let status_ref = Arc::clone(&status);
                     let cancel = CancellationToken::new();
-                    let pricing = Arc::clone(&pricing);
                     let hist_snapshot = history.clone();
                     let mission_ctrl = crate::tools::mission::MissionControl {
                         current_mission_id: Arc::clone(&current_mission),
@@ -2956,6 +2814,28 @@ async fn control_actor_loop(
                     running_cancel = Some(cancel.clone());
                     // Capture which mission this task is working on
                     let mission_id = current_mission.read().await.clone();
+                    let workspace_id = if let Some(mid) = mission_id {
+                        match mission_store.get_mission(mid).await {
+                            Ok(Some(mission)) => Some(mission.workspace_id),
+                            Ok(None) => {
+                                tracing::warn!(
+                                    "Mission {} not found while resolving workspace",
+                                    mid
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to load mission {} for workspace: {}",
+                                    mid,
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     running_mission_id = mission_id;
                     // Reset activity timer when new task starts to avoid false stall warnings
                     main_runner_last_activity = std::time::Instant::now();
@@ -2963,11 +2843,8 @@ async fn control_actor_loop(
                         let result = run_single_control_turn(
                             cfg,
                             agent,
-                            mem,
-                            bench,
-                            res,
                             mcp_ref,
-                            pricing,
+                            workspaces_ref,
                             events,
                             tools_hub,
                             status_ref,
@@ -2979,6 +2856,7 @@ async fn control_actor_loop(
                             tree_ref,
                             progress_ref,
                             mission_id,
+                            workspace_id,
                         )
                         .await;
                         (mid, msg, result)
@@ -3075,11 +2953,8 @@ async fn control_actor_loop(
 async fn run_single_control_turn(
     config: Config,
     root_agent: AgentRef,
-    memory: Option<MemorySystem>,
-    benchmarks: crate::budget::SharedBenchmarkRegistry,
-    resolver: crate::budget::SharedModelResolver,
     mcp: Arc<McpRegistry>,
-    pricing: Arc<ModelPricing>,
+    workspaces: workspace::SharedWorkspaceStore,
     events_tx: broadcast::Sender<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
     status: Arc<RwLock<ControlStatus>>,
@@ -3091,14 +2966,17 @@ async fn run_single_control_turn(
     tree_snapshot: Arc<RwLock<Option<AgentTreeNode>>>,
     progress_snapshot: Arc<RwLock<ExecutionProgress>>,
     mission_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
 ) -> crate::agents::AgentResult {
     // Ensure a workspace directory for this mission (if applicable).
     let working_dir_path = if let Some(mid) = mission_id {
-        match workspace::prepare_mission_workspace(&config, &mcp, mid).await {
+        let workspace_root =
+            workspace::resolve_workspace_root(&workspaces, &config, workspace_id).await;
+        match workspace::prepare_mission_workspace_in(&workspace_root, &mcp, mid).await {
             Ok(dir) => dir,
             Err(e) => {
                 tracing::warn!("Failed to prepare mission workspace: {}", e);
-                config.working_dir.clone()
+                workspace_root
             }
         }
     } else {
@@ -3106,16 +2984,13 @@ async fn run_single_control_turn(
     };
 
     // Build a task prompt that includes conversation context with size limits.
-    // Uses ContextBuilder with config-driven limits to prevent context overflow.
-    let working_dir = working_dir_path.to_string_lossy().to_string();
-    let context_builder = ContextBuilder::new(&config.context, &working_dir);
     let history_for_prompt = match history.last() {
         Some((role, content)) if role == "user" && content == &user_message => {
             &history[..history.len() - 1]
         }
         _ => history.as_slice(),
     };
-    let history_context = context_builder.build_history_context(history_for_prompt);
+    let history_context = build_history_context(history_for_prompt, config.context.max_history_total_chars);
 
     let mut convo = String::new();
     convo.push_str(&history_context);
@@ -3123,9 +2998,7 @@ async fn run_single_control_turn(
     convo.push_str(&user_message);
     convo.push_str("\n\nInstructions:\n- Continue the conversation helpfully.\n- Use available tools as needed.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n");
 
-    let budget = Budget::new(1000);
-    let verification = VerificationCriteria::None;
-    let mut task = match crate::task::Task::new(convo, verification, budget) {
+    let mut task = match crate::task::Task::new(convo, Some(1000)) {
         Ok(t) => t,
         Err(e) => {
             let r = crate::agents::AgentResult::failure(format!("Failed to create task: {}", e), 0);
@@ -3140,24 +3013,12 @@ async fn run_single_control_turn(
     }
 
     // Context for agent execution.
-    let llm = Arc::new(OpenRouterClient::new(config.api_key.clone()));
-
-    let tools = ToolRegistry::empty();
-    let mut ctx = AgentContext::with_memory(
-        config.clone(),
-        llm,
-        tools,
-        pricing,
-        working_dir_path,
-        memory,
-    );
+    let mut ctx = AgentContext::new(config.clone(), working_dir_path);
     ctx.mission_control = mission_control;
     ctx.control_events = Some(events_tx);
     ctx.frontend_tool_hub = Some(tool_hub);
     ctx.control_status = Some(status);
     ctx.cancel_token = Some(cancel);
-    ctx.benchmarks = Some(benchmarks);
-    ctx.resolver = Some(resolver);
     ctx.tree_snapshot = Some(tree_snapshot);
     ctx.progress_snapshot = Some(progress_snapshot);
     ctx.mission_id = mission_id;

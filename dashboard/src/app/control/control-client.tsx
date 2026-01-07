@@ -24,6 +24,8 @@ import {
   getRunningMissions,
   cancelMission,
   listProviders,
+  listWorkspaces,
+  listAgents,
   getHealth,
   type ControlRunState,
   type Mission,
@@ -31,7 +33,10 @@ import {
   type RunningMissionInfo,
   type UploadProgress,
   type Provider,
+  type Workspace,
+  type AgentConfig,
 } from "@/lib/api";
+import { useLibrary } from "@/contexts/library-context";
 import {
   Send,
   Square,
@@ -700,7 +705,17 @@ export default function ControlClient() {
   // New mission dialog state
   const [showNewMissionDialog, setShowNewMissionDialog] = useState(false);
   const [newMissionModel, setNewMissionModel] = useState("");
+  const [newMissionWorkspace, setNewMissionWorkspace] = useState("");
+  const [newMissionAgent, setNewMissionAgent] = useState("");
+  const [newMissionHooks, setNewMissionHooks] = useState<string[]>([]);
   const newMissionDialogRef = useRef<HTMLDivElement>(null);
+
+  // Workspaces and agents for mission creation
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [agents, setAgents] = useState<AgentConfig[]>([]);
+
+  // Library context for plugins (hooks)
+  const { plugins } = useLibrary();
 
   // Parallel missions state
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
@@ -740,6 +755,7 @@ export default function ControlClient() {
   const [showDesktopStream, setShowDesktopStream] = useState(false);
   const [desktopDisplayId, setDesktopDisplayId] = useState(":101");
   const [showDisplaySelector, setShowDisplaySelector] = useState(false);
+  const [hasDesktopSession, setHasDesktopSession] = useState(false);
 
   // Check if the mission we're viewing is actually running (not just any mission)
   const viewingMissionIsRunning = useMemo(() => {
@@ -1030,6 +1046,29 @@ export default function ControlClient() {
   };
 
   // Convert mission history to chat items
+  // Helper to check if mission history has an active desktop session
+  // A session is active if there's a start without a subsequent close
+  const missionHasDesktopSession = useCallback((mission: Mission): boolean => {
+    let hasSession = false;
+    for (const entry of mission.history) {
+      // Check for session start
+      if (
+        entry.content.includes("desktop_start_session") ||
+        entry.content.includes("desktop_desktop_start_session")
+      ) {
+        hasSession = true;
+      }
+      // Check for session close (must come after start check to handle same entry)
+      if (
+        entry.content.includes("desktop_close_session") ||
+        entry.content.includes("desktop_desktop_close_session")
+      ) {
+        hasSession = false;
+      }
+    }
+    return hasSession;
+  }, []);
+
   const missionHistoryToItems = useCallback((mission: Mission): ChatItem[] => {
     // Estimate timestamps based on mission creation time
     const baseTime = new Date(mission.created_at).getTime();
@@ -1104,6 +1143,7 @@ export default function ControlClient() {
             setViewingMissionId(null);
             setViewingMission(null);
             setItems([]);
+            setHasDesktopSession(false);
           }
         })
         .finally(() => setMissionLoading(false));
@@ -1152,6 +1192,25 @@ export default function ControlClient() {
       })
       .catch((err) => {
         console.error("Failed to fetch providers:", err);
+      });
+  }, [authRetryTrigger]);
+
+  // Fetch workspaces and agents for mission creation
+  useEffect(() => {
+    listWorkspaces()
+      .then((data) => {
+        setWorkspaces(data);
+      })
+      .catch((err) => {
+        console.error("Failed to fetch workspaces:", err);
+      });
+
+    listAgents()
+      .then((data) => {
+        setAgents(data);
+      })
+      .catch((err) => {
+        console.error("Failed to fetch agents:", err);
       });
   }, [authRetryTrigger]);
 
@@ -1209,6 +1268,8 @@ export default function ControlClient() {
 
         const historyItems = missionHistoryToItems(mission);
         setItems(historyItems);
+        // Check if mission has an active desktop session in its history
+        setHasDesktopSession(missionHasDesktopSession(mission));
         // Update cache with fresh data
         setMissionItems((prev) => ({ ...prev, [missionId]: historyItems }));
         setViewingMission(mission);
@@ -1239,6 +1300,7 @@ export default function ControlClient() {
           setViewingMissionId(null);
           setViewingMission(null);
           setItems([]);
+          setHasDesktopSession(false);
           router.replace(`/control`, { scroll: false });
         }
       }
@@ -1261,14 +1323,25 @@ export default function ControlClient() {
   // and could be from any mission. We only cache when explicitly loading from API.
 
   // Handle creating a new mission
-  const handleNewMission = async (modelOverride?: string) => {
+  const handleNewMission = async (options?: {
+    modelOverride?: string;
+    workspaceId?: string;
+    agentId?: string;
+    hooks?: string[];
+  }) => {
     try {
       setMissionLoading(true);
-      const mission = await createMission(undefined, modelOverride);
+      const mission = await createMission({
+        modelOverride: options?.modelOverride,
+        workspaceId: options?.workspaceId,
+        agentId: options?.agentId,
+        hooks: options?.hooks,
+      });
       setCurrentMission(mission);
       setViewingMission(mission);
       setViewingMissionId(mission.id); // Also update viewing to the new mission
       setItems([]);
+      setHasDesktopSession(false);
       setShowParallelPanel(true); // Show the missions panel so user can see the new mission
       // Refresh running missions to get accurate state
       const running = await getRunningMissions();
@@ -1604,12 +1677,18 @@ export default function ControlClient() {
           if (isRecord(result) && typeof result["display"] === "string") {
             const display = result["display"];
             setDesktopDisplayId(display);
+            setHasDesktopSession(true);
             // Auto-open desktop stream when session starts
             setShowDesktopStream(true);
           }
         }
+        // Handle desktop session close
+        if (eventToolName === "desktop_close_session" || eventToolName === "desktop_desktop_close_session") {
+          setHasDesktopSession(false);
+          setShowDesktopStream(false);
+        }
 
-        // If eventToolName wasn't available, check stored items for desktop_start_session
+        // If eventToolName wasn't available, check stored items for desktop session tools
         // Use itemsRef for synchronous read to avoid side effects in state updaters
         if (!eventToolName) {
           const toolItem = itemsRef.current.find(
@@ -1631,8 +1710,14 @@ export default function ControlClient() {
               if (isRecord(result) && typeof result["display"] === "string") {
                 const display = result["display"];
                 setDesktopDisplayId(display);
+                setHasDesktopSession(true);
                 setShowDesktopStream(true);
               }
+            }
+            // Check for desktop_close_session
+            if (toolName === "desktop_close_session" || toolName === "desktop_desktop_close_session") {
+              setHasDesktopSession(false);
+              setShowDesktopStream(false);
             }
           }
         }
@@ -1790,11 +1875,6 @@ export default function ControlClient() {
   const missionStatus = activeMission
     ? missionStatusLabel(activeMission.status)
     : null;
-  const missionTitle = activeMission?.title
-    ? activeMission.title.length > 60
-      ? activeMission.title.slice(0, 60) + "..."
-      : activeMission.title
-    : "New Mission";
 
   return (
     <div className="flex h-screen flex-col p-6">
@@ -1808,49 +1888,36 @@ export default function ControlClient() {
       />
 
       {/* Header */}
-      <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-4 min-w-0 flex-1">
-          <div className="flex items-center gap-3 min-w-0">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-indigo-500/20">
-              <Target className="h-5 w-5 text-indigo-400" />
-            </div>
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <h1 className="text-lg font-semibold text-white truncate">
-                  {missionLoading ? "Loading..." : missionTitle}
-                </h1>
-                {missionStatus && (
-                  <span
-                    className={cn(
-                      "px-2 py-0.5 rounded-full text-xs font-medium shrink-0",
-                      missionStatus.className
-                    )}
-                  >
-                    {missionStatus.label}
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-white/40 truncate">
-                {activeMission
-                  ? `Mission ${activeMission.id.slice(0, 8)}...`
-                  : "No active mission"}
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-3 shrink-0 flex-wrap">
-          {activeMission && (
+      <div className="mb-6 flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => (runningMissions.length > 0 || currentMission) && setShowParallelPanel(!showParallelPanel)}
+            className={cn(
+              "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors",
+              (runningMissions.length > 0 || currentMission) ? "cursor-pointer hover:bg-indigo-500/30" : "cursor-default",
+              showParallelPanel ? "bg-indigo-500/30" : "bg-indigo-500/20"
+            )}
+            title={runningMissions.length > 0 ? `${runningMissions.length} running mission${runningMissions.length > 1 ? 's' : ''}` : 'Missions'}
+          >
+            <Layers className="h-4 w-4 text-indigo-400" />
+          </button>
+          <span className="text-sm font-medium text-white/60">
+            {activeMission ? activeMission.id.slice(0, 8) : "No mission"}
+          </span>
+          {activeMission && missionStatus && (
             <div className="relative" ref={statusMenuRef}>
               <button
                 onClick={() => setShowStatusMenu(!showStatusMenu)}
-                className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] transition-colors"
+                className={cn(
+                  "flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium transition-colors hover:opacity-80",
+                  missionStatus.className
+                )}
               >
-                <span className="hidden sm:inline">Set</span> Status
-                <ChevronDown className="h-4 w-4" />
+                {missionStatus.label}
+                <ChevronDown className="h-3 w-3" />
               </button>
               {showStatusMenu && (
-                <div className="absolute right-0 top-full mt-1 w-40 rounded-lg border border-white/[0.06] bg-[#1a1a1a] py-1 shadow-xl z-10">
+                <div className="absolute left-0 top-full mt-1 w-44 rounded-lg border border-white/[0.06] bg-[#1a1a1a] py-1 shadow-xl z-10">
                   <button
                     onClick={() => handleSetStatus("completed")}
                     className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
@@ -1873,7 +1940,7 @@ export default function ControlClient() {
                         className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
                       >
                         <PlayCircle className="h-4 w-4 text-emerald-400" />
-                        {activeMission?.status === "blocked" ? "Continue Mission" : "Resume Mission"}
+                        {activeMission?.status === "blocked" ? "Continue" : "Resume"}
                       </button>
                       <button
                         onClick={() => handleResumeMission(true)}
@@ -1899,6 +1966,9 @@ export default function ControlClient() {
               )}
             </div>
           )}
+        </div>
+
+        <div className="flex items-center gap-3 shrink-0">
 
           <div className="relative" ref={newMissionDialogRef}>
             <button
@@ -1910,18 +1980,19 @@ export default function ControlClient() {
               <span className="hidden sm:inline">New</span> Mission
             </button>
             {showNewMissionDialog && (
-              <div className="absolute right-0 top-full mt-1 w-80 rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl z-10">
+              <div className="absolute right-0 top-full mt-1 w-96 rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl z-10">
                 <h3 className="text-sm font-medium text-white mb-3">
                   Create New Mission
                 </h3>
                 <div className="space-y-3">
+                  {/* Workspace selection */}
                   <div>
                     <label className="block text-xs text-white/50 mb-1.5">
-                      Model
+                      Workspace
                     </label>
                     <select
-                      value={newMissionModel}
-                      onChange={(e) => setNewMissionModel(e.target.value)}
+                      value={newMissionWorkspace}
+                      onChange={(e) => setNewMissionWorkspace(e.target.value)}
                       className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
                       style={{
                         backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`,
@@ -1932,34 +2003,140 @@ export default function ControlClient() {
                       }}
                     >
                       <option value="" className="bg-[#1a1a1a]">
-                        Auto (default)
+                        Host (default)
                       </option>
-                      {/* Group models by provider */}
-                      {providers.map((provider) => (
-                        provider.models.length > 0 && (
-                          <optgroup
-                            key={provider.id}
-                            label={`${provider.name}${provider.billing === "subscription" ? " (included)" : ""}`}
-                            className="bg-[#1a1a1a]"
-                          >
-                            {provider.models.map((model) => (
-                              <option key={model.id} value={model.id} className="bg-[#1a1a1a]">
-                                {model.name}
-                              </option>
-                            ))}
-                          </optgroup>
-                        )
+                      {workspaces
+                        .filter((ws) => ws.status === "ready" && ws.id !== "00000000-0000-0000-0000-000000000000")
+                        .map((workspace) => (
+                          <option key={workspace.id} value={workspace.id} className="bg-[#1a1a1a]">
+                            {workspace.name} ({workspace.workspace_type})
+                          </option>
+                        ))}
+                    </select>
+                    <p className="text-xs text-white/30 mt-1.5">
+                      Where the mission will run
+                    </p>
+                  </div>
+
+                  {/* Agent selection */}
+                  <div>
+                    <label className="block text-xs text-white/50 mb-1.5">
+                      Agent Configuration
+                    </label>
+                    <select
+                      value={newMissionAgent}
+                      onChange={(e) => {
+                        setNewMissionAgent(e.target.value);
+                        // When agent is selected, clear model override (agent includes model)
+                        if (e.target.value) {
+                          setNewMissionModel("");
+                        }
+                      }}
+                      className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
+                      style={{
+                        backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`,
+                        backgroundPosition: "right 0.5rem center",
+                        backgroundRepeat: "no-repeat",
+                        backgroundSize: "1.5em 1.5em",
+                        paddingRight: "2.5rem",
+                      }}
+                    >
+                      <option value="" className="bg-[#1a1a1a]">
+                        Default (no agent)
+                      </option>
+                      {agents.map((agent) => (
+                        <option key={agent.id} value={agent.id} className="bg-[#1a1a1a]">
+                          {agent.name}
+                        </option>
                       ))}
                     </select>
                     <p className="text-xs text-white/30 mt-1.5">
-                      Auto uses Claude Opus 4.5
+                      Pre-configured model, MCPs, skills & commands
                     </p>
                   </div>
+
+                  {/* Model override - only shown when no agent selected */}
+                  {!newMissionAgent && (
+                    <div>
+                      <label className="block text-xs text-white/50 mb-1.5">
+                        Model Override
+                      </label>
+                      <select
+                        value={newMissionModel}
+                        onChange={(e) => setNewMissionModel(e.target.value)}
+                        className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
+                        style={{
+                          backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`,
+                          backgroundPosition: "right 0.5rem center",
+                          backgroundRepeat: "no-repeat",
+                          backgroundSize: "1.5em 1.5em",
+                          paddingRight: "2.5rem",
+                        }}
+                      >
+                        <option value="" className="bg-[#1a1a1a]">
+                          Auto (Claude Opus 4.5)
+                        </option>
+                        {providers.map((provider) => (
+                          provider.models.length > 0 && (
+                            <optgroup
+                              key={provider.id}
+                              label={`${provider.name}${provider.billing === "subscription" ? " (included)" : ""}`}
+                              className="bg-[#1a1a1a]"
+                            >
+                              {provider.models.map((model) => (
+                                <option key={model.id} value={model.id} className="bg-[#1a1a1a]">
+                                  {model.name}
+                                </option>
+                              ))}
+                            </optgroup>
+                          )
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  {/* Hooks (Plugins) */}
+                  <div>
+                    <label className="block text-xs text-white/50 mb-1.5">
+                      Hooks
+                    </label>
+                    <div className="space-y-1.5">
+                      {Object.entries(plugins)
+                        .filter(([_, plugin]) => plugin.enabled)
+                        .map(([id, plugin]) => (
+                          <label key={id} className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={newMissionHooks.includes(id)}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setNewMissionHooks([...newMissionHooks, id]);
+                                } else {
+                                  setNewMissionHooks(newMissionHooks.filter((h) => h !== id));
+                                }
+                              }}
+                              className="rounded border-white/20 bg-white/5 text-indigo-500 focus:ring-indigo-500/50"
+                            />
+                            <span className="text-sm text-white/80">{plugin.ui?.label || id}</span>
+                            {plugin.ui?.hint && (
+                              <span className="text-xs text-white/40">({plugin.ui.hint})</span>
+                            )}
+                          </label>
+                        ))}
+                      {Object.keys(plugins).filter(id => plugins[id].enabled).length === 0 && (
+                        <p className="text-xs text-white/40">No plugins available. Add plugins in Library → Plugins.</p>
+                      )}
+                    </div>
+                  </div>
+
                   <div className="flex gap-2 pt-1">
                     <button
                       onClick={() => {
                         setShowNewMissionDialog(false);
                         setNewMissionModel("");
+                        setNewMissionWorkspace("");
+                        setNewMissionAgent("");
+                        setNewMissionHooks([]);
                       }}
                       className="flex-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] transition-colors"
                     >
@@ -1967,9 +2144,17 @@ export default function ControlClient() {
                     </button>
                     <button
                       onClick={() => {
-                        handleNewMission(newMissionModel || undefined);
+                        handleNewMission({
+                          modelOverride: newMissionModel || undefined,
+                          workspaceId: newMissionWorkspace || undefined,
+                          agentId: newMissionAgent || undefined,
+                          hooks: newMissionHooks.length > 0 ? newMissionHooks : undefined,
+                        });
                         setShowNewMissionDialog(false);
                         setNewMissionModel("");
+                        setNewMissionWorkspace("");
+                        setNewMissionAgent("");
+                        setNewMissionHooks([]);
                       }}
                       disabled={missionLoading}
                       className="flex-1 rounded-lg bg-indigo-500 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
@@ -1982,85 +2167,68 @@ export default function ControlClient() {
             )}
           </div>
 
-          {/* Parallel missions indicator */}
-          {(runningMissions.length > 0 || currentMission) && (
-            <button
-              onClick={() => setShowParallelPanel(!showParallelPanel)}
-              className={cn(
-                "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
-                showParallelPanel
-                  ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
-                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
-              )}
-            >
-              <Layers className="h-4 w-4" />
-              <span className="font-medium tabular-nums">
-                {runningMissions.length}
-              </span>
-              <span className="hidden sm:inline">Running</span>
-            </button>
-          )}
-
-          {/* Desktop stream toggle with display selector */}
-          <div className="relative flex items-center">
-            <button
-              onClick={() => setShowDesktopStream(!showDesktopStream)}
-              className={cn(
-                "flex items-center gap-2 rounded-l-lg border px-3 py-2 text-sm transition-colors",
-                showDesktopStream
-                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
-              )}
-              title={showDesktopStream ? "Hide desktop stream" : "Show desktop stream"}
-            >
-              <Monitor className="h-4 w-4" />
-              <span className="hidden sm:inline">Desktop</span>
-              {showDesktopStream ? (
-                <PanelRightClose className="h-4 w-4" />
-              ) : (
-                <PanelRight className="h-4 w-4" />
-              )}
-            </button>
-            <div className="relative">
+          {/* Desktop stream toggle with display selector - only shown when a desktop session is active */}
+          {hasDesktopSession && (
+            <div className="relative flex items-center">
               <button
-                onClick={() => setShowDisplaySelector(!showDisplaySelector)}
+                onClick={() => setShowDesktopStream(!showDesktopStream)}
                 className={cn(
-                  "flex items-center gap-1.5 rounded-r-lg border-y border-r px-3 py-2 text-sm transition-colors",
+                  "flex items-center gap-2 rounded-l-lg border px-3 py-2 text-sm transition-colors",
                   showDesktopStream
                     ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
                     : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
                 )}
-                title="Select display"
+                title={showDesktopStream ? "Hide desktop stream" : "Show desktop stream"}
               >
-                <span className="text-sm font-mono">{desktopDisplayId}</span>
-                <ChevronDown className="h-3.5 w-3.5" />
+                <Monitor className="h-4 w-4" />
+                <span className="hidden sm:inline">Desktop</span>
+                {showDesktopStream ? (
+                  <PanelRightClose className="h-4 w-4" />
+                ) : (
+                  <PanelRight className="h-4 w-4" />
+                )}
               </button>
-              {showDisplaySelector && (
-                <div className="absolute right-0 top-full mt-1 z-50 min-w-[120px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
-                  {[":99", ":100", ":101", ":102"].map((display) => (
-                    <button
-                      key={display}
-                      onClick={() => {
-                        setDesktopDisplayId(display);
-                        setShowDisplaySelector(false);
-                      }}
-                      className={cn(
-                        "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
-                        desktopDisplayId === display
-                          ? "text-emerald-400"
-                          : "text-white/70"
-                      )}
-                    >
-                      {display}
-                      {desktopDisplayId === display && (
-                        <CheckCircle className="ml-auto h-3.5 w-3.5" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              )}
+              <div className="relative">
+                <button
+                  onClick={() => setShowDisplaySelector(!showDisplaySelector)}
+                  className={cn(
+                    "flex items-center gap-1.5 rounded-r-lg border-y border-r px-3 py-2 text-sm transition-colors",
+                    showDesktopStream
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                      : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
+                  )}
+                  title="Select display"
+                >
+                  <span className="text-sm font-mono">{desktopDisplayId}</span>
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </button>
+                {showDisplaySelector && (
+                  <div className="absolute right-0 top-full mt-1 z-50 min-w-[120px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
+                    {[":99", ":100", ":101", ":102"].map((display) => (
+                      <button
+                        key={display}
+                        onClick={() => {
+                          setDesktopDisplayId(display);
+                          setShowDisplaySelector(false);
+                        }}
+                        className={cn(
+                          "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
+                          desktopDisplayId === display
+                            ? "text-emerald-400"
+                            : "text-white/70"
+                        )}
+                      >
+                        {display}
+                        {desktopDisplayId === display && (
+                          <CheckCircle className="ml-auto h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
+          )}
 
           {/* Status panel */}
           <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
@@ -2337,38 +2505,6 @@ export default function ControlClient() {
                       Ask the agent to do something — messages queue while
                       it&apos;s busy
                     </p>
-
-                    {/* Quick Action Templates */}
-                    <div className="mt-6 grid grid-cols-2 gap-2 max-w-md mx-auto">
-                      <button
-                        onClick={() => setInput("Read the files in /root/context and summarize what they contain")}
-                        className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-sm text-white/60 hover:bg-white/[0.08] hover:text-white/80 transition-colors text-left"
-                      >
-                        <FileText className="h-4 w-4 text-indigo-400 shrink-0" />
-                        <span>Analyze context files</span>
-                      </button>
-                      <button
-                        onClick={() => setInput("Search the web for the latest news about ")}
-                        className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-sm text-white/60 hover:bg-white/[0.08] hover:text-white/80 transition-colors text-left"
-                      >
-                        <Globe className="h-4 w-4 text-emerald-400 shrink-0" />
-                        <span>Search the web</span>
-                      </button>
-                      <button
-                        onClick={() => setInput("Write a Python script that ")}
-                        className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-sm text-white/60 hover:bg-white/[0.08] hover:text-white/80 transition-colors text-left"
-                      >
-                        <Code className="h-4 w-4 text-amber-400 shrink-0" />
-                        <span>Write code</span>
-                      </button>
-                      <button
-                        onClick={() => setInput("Run the command: ")}
-                        className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-sm text-white/60 hover:bg-white/[0.08] hover:text-white/80 transition-colors text-left"
-                      >
-                        <Terminal className="h-4 w-4 text-cyan-400 shrink-0" />
-                        <span>Run command</span>
-                      </button>
-                    </div>
 
                     <p className="mt-4 text-xs text-white/30">
                       Tip: Paste files directly to upload to context folder

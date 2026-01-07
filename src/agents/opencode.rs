@@ -160,30 +160,50 @@ impl OpenCodeAgent {
     /// Forward an OpenCode event to the control broadcast channel.
     fn forward_event(&self, oc_event: &OpenCodeEvent, ctx: &AgentContext) {
         let Some(events_tx) = &ctx.control_events else {
+            tracing::trace!("forward_event: no control_events channel, skipping");
             return;
         };
 
         let agent_event = match oc_event {
-            OpenCodeEvent::Thinking { content } => AgentEvent::Thinking {
-                content: content.clone(),
-                done: false,
-                mission_id: ctx.mission_id,
-            },
-            OpenCodeEvent::TextDelta { content } => AgentEvent::Thinking {
-                content: content.clone(),
-                done: false,
-                mission_id: ctx.mission_id,
-            },
+            OpenCodeEvent::Thinking { content } => {
+                tracing::debug!(
+                    content_len = content.len(),
+                    "Forwarding Thinking event to control broadcast"
+                );
+                AgentEvent::Thinking {
+                    content: content.clone(),
+                    done: false,
+                    mission_id: ctx.mission_id,
+                }
+            }
+            OpenCodeEvent::TextDelta { content } => {
+                tracing::trace!(
+                    content_len = content.len(),
+                    "Forwarding TextDelta as Thinking event"
+                );
+                AgentEvent::Thinking {
+                    content: content.clone(),
+                    done: false,
+                    mission_id: ctx.mission_id,
+                }
+            }
             OpenCodeEvent::ToolCall {
                 tool_call_id,
                 name,
                 args,
-            } => AgentEvent::ToolCall {
-                tool_call_id: tool_call_id.clone(),
-                name: name.clone(),
-                args: args.clone(),
-                mission_id: ctx.mission_id,
-            },
+            } => {
+                tracing::info!(
+                    tool_call_id = %tool_call_id,
+                    name = %name,
+                    "Forwarding tool_call event to control broadcast"
+                );
+                AgentEvent::ToolCall {
+                    tool_call_id: tool_call_id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                    mission_id: ctx.mission_id,
+                }
+            }
             OpenCodeEvent::ToolResult {
                 tool_call_id,
                 name,
@@ -221,7 +241,7 @@ impl Agent for OpenCodeAgent {
 
     async fn execute(&self, task: &mut Task, ctx: &AgentContext) -> AgentResult {
         let task_desc = task.description().chars().take(60).collect::<String>();
-        let budget_cents = task.budget().total_cents();
+        let budget_cents = task.cost().budget_cents().unwrap_or(0);
 
         let mut tree = self.build_tree(&task_desc, budget_cents);
         ctx.emit_tree(tree.clone());

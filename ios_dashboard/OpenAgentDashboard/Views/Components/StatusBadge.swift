@@ -133,6 +133,26 @@ struct StatusDot: View {
     }
 }
 
+/// A wrapper view that displays a WorkspaceStatus as a StatusBadge
+struct WorkspaceStatusBadge: View {
+    let status: WorkspaceStatus
+    var showIcon: Bool = true
+    var compact: Bool = false
+
+    private var statusType: StatusType {
+        switch status {
+        case .pending: return .pending
+        case .building: return .running
+        case .ready: return .completed
+        case .error: return .error
+        }
+    }
+
+    var body: some View {
+        StatusBadge(status: statusType, showIcon: showIcon, compact: compact)
+    }
+}
+
 #Preview {
     VStack(spacing: 16) {
         HStack(spacing: 8) {
@@ -140,21 +160,21 @@ struct StatusDot: View {
             StatusBadge(status: .running)
             StatusBadge(status: .completed)
         }
-        
+
         HStack(spacing: 8) {
             StatusBadge(status: .failed)
             StatusBadge(status: .cancelled)
             StatusBadge(status: .active)
         }
-        
+
         HStack(spacing: 8) {
             StatusBadge(status: .connected, compact: true)
             StatusBadge(status: .disconnected, compact: true)
             StatusBadge(status: .connecting, compact: true)
         }
-        
+
         Divider()
-        
+
         HStack(spacing: 16) {
             ForEach([StatusType.active, .completed, .failed, .idle], id: \.label) { status in
                 StatusDot(status: status)

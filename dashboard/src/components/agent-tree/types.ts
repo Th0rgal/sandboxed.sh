@@ -5,12 +5,8 @@
  */
 
 export type AgentType = 
-  | 'Root' 
-  | 'Node' 
-  | 'ComplexityEstimator' 
-  | 'ModelSelector' 
-  | 'TaskExecutor' 
-  | 'Verifier';
+  | 'OpenCode' 
+  | 'OpenCodeSession';
 
 export type AgentStatus = 
   | 'running' 
