@@ -162,12 +162,24 @@ impl OpenCodeClient {
             let mut last_event_time = std::time::Instant::now();
             let mut event_count = 0u64;
 
+            tracing::warn!(session_id = %session_id_clone, "SSE consumer task started, waiting for chunks");
+
             loop {
                 tokio::select! {
                     chunk_result = stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
+                                tracing::warn!(
+                                    session_id = %session_id_clone,
+                                    chunk_len = chunk.len(),
+                                    "Received SSE chunk"
+                                );
                                 if let Ok(text) = std::str::from_utf8(&chunk) {
+                                    tracing::warn!(
+                                        session_id = %session_id_clone,
+                                        text_preview = %text.chars().take(100).collect::<String>(),
+                                        "SSE chunk text"
+                                    );
                                     buffer.push_str(text);
                                     last_event_time = std::time::Instant::now();
 
