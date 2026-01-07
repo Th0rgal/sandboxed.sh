@@ -1,19 +1,25 @@
 /**
  * Demo Data Generator
- * 
- * Generates fake but realistic agent tree data for testing the visualization
- * without consuming API resources.
+ *
+ * Generates fake but realistic OpenCode session trees for testing the
+ * visualization without consuming API resources.
  */
 
-import type { AgentNode, AgentStatus, AgentType } from './types';
+import type { AgentNode, AgentStatus } from './types';
 
 const MODELS = [
   'claude-3.5-haiku',
-  'claude-3.5-sonnet', 
+  'claude-3.5-sonnet',
   'claude-sonnet-4.5',
   'gpt-4o-mini',
   'gpt-4o',
   'gemini-2.0-flash',
+];
+
+const PHASES = [
+  { id: 'bootstrap', name: 'Bootstrap', description: 'Prepare workspace + config' },
+  { id: 'execute', name: 'Execution', description: 'Run tools and commands' },
+  { id: 'review', name: 'Review', description: 'Summarize results' },
 ];
 
 function randomModel(): string {
@@ -40,288 +46,193 @@ function randomStatus(bias: 'early' | 'middle' | 'late' = 'middle'): AgentStatus
   }
 }
 
-function createLeafAgents(parentId: string, status: AgentStatus): AgentNode[] {
-  const isCompleted = status === 'completed';
-  const isRunning = status === 'running';
-  
-  return [
-    {
-      id: `${parentId}-executor`,
-      type: 'TaskExecutor' as AgentType,
-      status: isRunning ? 'running' : isCompleted ? 'completed' : 'pending',
-      name: 'Task Executor',
-      description: 'Execute task using tools',
-      model: randomModel(),
-      budgetAllocated: 500,
-      budgetSpent: isCompleted ? Math.floor(Math.random() * 400 + 50) : isRunning ? Math.floor(Math.random() * 200) : 0,
-    },
-    {
-      id: `${parentId}-verifier`,
-      type: 'Verifier' as AgentType,
-      status: isCompleted ? 'completed' : 'pending',
-      name: 'Verifier',
-      description: 'Verify task completion',
-      model: randomModel(),
-      budgetAllocated: 50,
-      budgetSpent: isCompleted ? Math.floor(Math.random() * 30 + 5) : 0,
-    },
-  ];
+function createSessionNode({
+  id,
+  status,
+  name,
+  description,
+  budgetAllocated,
+  budgetSpent,
+  complexity,
+  children,
+}: {
+  id: string;
+  status: AgentStatus;
+  name: string;
+  description: string;
+  budgetAllocated: number;
+  budgetSpent: number;
+  complexity?: number;
+  children?: AgentNode[];
+}): AgentNode {
+  return {
+    id,
+    type: 'OpenCodeSession',
+    status,
+    name,
+    description,
+    model: randomModel(),
+    budgetAllocated,
+    budgetSpent,
+    complexity,
+    children,
+  };
 }
 
 /**
- * Generate a simple tree with just the orchestrator agents
+ * Generate a simple tree with a single OpenCode session.
  */
 export function generateSimpleTree(): AgentNode {
+  const status: AgentStatus = 'running';
+  const budgetAllocated = 1000;
+  const budgetSpent = 120;
+
   return {
     id: 'root',
-    type: 'Root',
-    status: 'running',
-    name: 'Root Agent',
-    description: 'Mission orchestrator',
-    model: 'claude-sonnet-4.5',
-    budgetAllocated: 1000,
-    budgetSpent: 150,
+    type: 'OpenCode',
+    status,
+    name: 'OpenCode Agent',
+    description: 'Delegating mission to OpenCode',
+    model: randomModel(),
+    budgetAllocated,
+    budgetSpent,
     children: [
-      {
-        id: 'complexity',
-        type: 'ComplexityEstimator',
-        status: 'completed',
-        name: 'Complexity Estimator',
-        description: 'Estimate task difficulty',
-        model: 'claude-3.5-haiku',
-        budgetAllocated: 10,
-        budgetSpent: 5,
-        complexity: 0.72,
-      },
-      {
-        id: 'model-selector',
-        type: 'ModelSelector',
-        status: 'completed',
-        name: 'Model Selector',
-        description: 'Select optimal model',
-        model: 'claude-3.5-haiku',
-        budgetAllocated: 10,
-        budgetSpent: 3,
-      },
-      {
-        id: 'executor',
-        type: 'TaskExecutor',
-        status: 'running',
-        name: 'Task Executor',
-        description: 'Execute main task',
-        model: 'claude-sonnet-4.5',
-        budgetAllocated: 900,
-        budgetSpent: 125,
-      },
-      {
-        id: 'verifier',
-        type: 'Verifier',
-        status: 'pending',
-        name: 'Verifier',
-        description: 'Verify task completion',
-        model: 'claude-3.5-haiku',
-        budgetAllocated: 80,
-        budgetSpent: 0,
-      },
+      createSessionNode({
+        id: 'session',
+        status,
+        name: 'OpenCode Session',
+        description: 'Executing mission in workspace',
+        budgetAllocated,
+        budgetSpent,
+        complexity: 0.6,
+      }),
     ],
   };
 }
 
 /**
- * Generate a complex tree with subtasks and nested agents
+ * Generate a richer tree with multiple phases and nested sessions.
  */
 export function generateComplexTree(): AgentNode {
-  const subtasks: AgentNode[] = [];
-  const numSubtasks = Math.floor(Math.random() * 3) + 3; // 3-5 subtasks
-  
-  for (let i = 0; i < numSubtasks; i++) {
-    const bias = i < numSubtasks / 3 ? 'late' : i < (numSubtasks * 2) / 3 ? 'middle' : 'early';
+  const phaseNodes = PHASES.map((phase, index) => {
+    const bias = index === 0 ? 'late' : index === 1 ? 'middle' : 'early';
     const status = randomStatus(bias);
-    
-    subtasks.push({
-      id: `subtask-${i + 1}`,
-      type: 'Node',
+    const budgetAllocated = Math.floor(1200 / PHASES.length);
+    const budgetSpent =
+      status === 'completed'
+        ? Math.floor(Math.random() * 120 + 40)
+        : status === 'running'
+        ? Math.floor(Math.random() * 80 + 20)
+        : 0;
+
+    const children =
+      status === 'running'
+        ? [
+            createSessionNode({
+              id: `${phase.id}-tools`,
+              status: 'running',
+              name: 'Tool Runs',
+              description: 'Active tool execution',
+              budgetAllocated: Math.floor(budgetAllocated / 2),
+              budgetSpent: Math.floor(budgetSpent / 2),
+              complexity: 0.4,
+            }),
+          ]
+        : undefined;
+
+    return createSessionNode({
+      id: phase.id,
       status,
-      name: `Subtask ${i + 1}`,
-      description: getSubtaskDescription(i),
-      model: randomModel(),
-      budgetAllocated: Math.floor(800 / numSubtasks),
-      budgetSpent: status === 'completed' 
-        ? Math.floor(Math.random() * 100 + 30)
-        : status === 'running' 
-        ? Math.floor(Math.random() * 50)
-        : 0,
+      name: phase.name,
+      description: phase.description,
+      budgetAllocated,
+      budgetSpent,
       complexity: Math.random() * 0.5 + 0.3,
-      children: createLeafAgents(`subtask-${i + 1}`, status),
+      children,
     });
-  }
+  });
 
   return {
     id: 'root',
-    type: 'Root',
+    type: 'OpenCode',
     status: 'running',
-    name: 'Root Agent',
-    description: 'Build a full-stack web application',
-    model: 'claude-sonnet-4.5',
+    name: 'OpenCode Agent',
+    description: 'Multi-phase mission execution',
+    model: randomModel(),
     budgetAllocated: 2000,
-    budgetSpent: 450,
-    children: [
-      {
-        id: 'complexity',
-        type: 'ComplexityEstimator',
-        status: 'completed',
-        name: 'Complexity Estimator',
-        description: 'Estimate task difficulty',
-        model: 'claude-3.5-haiku',
-        budgetAllocated: 10,
-        budgetSpent: 5,
-        complexity: 0.85,
-      },
-      {
-        id: 'model-selector',
-        type: 'ModelSelector',
-        status: 'completed',
-        name: 'Model Selector',
-        description: 'Select optimal model',
-        model: 'claude-3.5-haiku',
-        budgetAllocated: 10,
-        budgetSpent: 3,
-      },
-      ...subtasks,
-      {
-        id: 'verifier',
-        type: 'Verifier',
-        status: 'pending',
-        name: 'Verifier',
-        description: 'Verify full task completion',
-        model: 'claude-3.5-sonnet',
-        budgetAllocated: 100,
-        budgetSpent: 0,
-      },
-    ],
+    budgetSpent: 420,
+    children: phaseNodes,
   };
 }
 
 /**
- * Generate a deeply nested tree for stress testing
+ * Generate a deeply nested tree for stress testing.
  */
 export function generateDeepTree(depth: number = 4): AgentNode {
   function createNode(level: number, index: number, parentId: string): AgentNode {
     const id = `${parentId}-${index}`;
     const isLeaf = level >= depth;
     const status = randomStatus(level === 1 ? 'late' : level === depth ? 'early' : 'middle');
-    
-    return {
+
+    return createSessionNode({
       id,
-      type: isLeaf ? 'TaskExecutor' : 'Node',
       status,
-      name: isLeaf ? `Executor ${index}` : `Node ${level}.${index}`,
-      description: isLeaf ? 'Execute leaf task' : `Process level ${level}`,
-      model: randomModel(),
-      budgetAllocated: Math.floor(1000 / Math.pow(2, level)),
-      budgetSpent: status === 'completed' ? Math.floor(Math.random() * 50 + 10) : 0,
+      name: isLeaf ? `Session ${index}` : `Phase ${level}.${index}`,
+      description: isLeaf ? 'Execute tools in workspace' : 'Coordinate nested session',
+      budgetAllocated: Math.floor(1200 / Math.pow(1.5, level)),
+      budgetSpent: status === 'completed' ? Math.floor(Math.random() * 60 + 10) : 0,
       complexity: isLeaf ? undefined : Math.random() * 0.6 + 0.2,
-      children: isLeaf 
-        ? undefined 
-        : Array.from({ length: Math.floor(Math.random() * 2) + 2 }, (_, i) => 
+      children: isLeaf
+        ? undefined
+        : Array.from({ length: Math.floor(Math.random() * 2) + 2 }, (_, i) =>
             createNode(level + 1, i + 1, id)
           ),
-    };
+    });
   }
 
   return {
     id: 'root',
-    type: 'Root',
+    type: 'OpenCode',
     status: 'running',
-    name: 'Root Agent',
-    description: 'Complex recursive task decomposition',
-    model: 'claude-sonnet-4.5',
+    name: 'OpenCode Agent',
+    description: 'Nested session stress test',
+    model: randomModel(),
     budgetAllocated: 5000,
     budgetSpent: 1200,
-    children: [
-      {
-        id: 'complexity',
-        type: 'ComplexityEstimator',
-        status: 'completed',
-        name: 'Complexity Estimator',
-        description: 'Estimate task difficulty',
-        model: 'claude-3.5-haiku',
-        budgetAllocated: 10,
-        budgetSpent: 5,
-        complexity: 0.95,
-      },
-      {
-        id: 'model-selector',
-        type: 'ModelSelector',
-        status: 'completed',
-        name: 'Model Selector',
-        description: 'Select optimal model',
-        model: 'claude-3.5-haiku',
-        budgetAllocated: 10,
-        budgetSpent: 3,
-      },
-      createNode(1, 1, 'branch-a'),
-      createNode(1, 2, 'branch-b'),
-      {
-        id: 'verifier',
-        type: 'Verifier',
-        status: 'pending',
-        name: 'Final Verifier',
-        description: 'Verify all branches completed',
-        model: 'claude-3.5-sonnet',
-        budgetAllocated: 150,
-        budgetSpent: 0,
-      },
-    ],
+    children: [createNode(1, 1, 'branch-a'), createNode(1, 2, 'branch-b')],
   };
 }
 
-function getSubtaskDescription(index: number): string {
-  const descriptions = [
-    'Set up project structure and dependencies',
-    'Implement database schema and migrations',
-    'Create API endpoints and routes',
-    'Build frontend components',
-    'Add authentication and authorization',
-    'Write tests and documentation',
-    'Configure deployment pipeline',
-  ];
-  return descriptions[index % descriptions.length];
-}
-
 /**
- * Simulate real-time updates to the tree
+ * Simulate real-time updates to the tree.
  */
 export function simulateTreeUpdates(
   tree: AgentNode,
   onUpdate: (tree: AgentNode) => void
 ): () => void {
   let currentTree = JSON.parse(JSON.stringify(tree)) as AgentNode;
-  
+
   const updateNode = (node: AgentNode): boolean => {
-    // Progress running nodes
     if (node.status === 'running') {
       node.budgetSpent = Math.min(
         node.budgetAllocated,
         node.budgetSpent + Math.floor(Math.random() * 10 + 5)
       );
-      
-      // Sometimes complete the node
+
       if (Math.random() < 0.15) {
         node.status = Math.random() < 0.9 ? 'completed' : 'failed';
         return true;
       }
     }
-    
-    // Start pending nodes if siblings are done
+
     if (node.status === 'pending' && Math.random() < 0.1) {
       node.status = 'running';
       return true;
     }
-    
+
     return false;
   };
-  
+
   const walkTree = (node: AgentNode): boolean => {
     let changed = updateNode(node);
     if (node.children) {
@@ -331,13 +242,13 @@ export function simulateTreeUpdates(
     }
     return changed;
   };
-  
+
   const interval = setInterval(() => {
     if (walkTree(currentTree)) {
       currentTree = JSON.parse(JSON.stringify(currentTree));
       onUpdate(currentTree);
     }
   }, 1000);
-  
+
   return () => clearInterval(interval);
 }
