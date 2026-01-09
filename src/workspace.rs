@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::nspawn::{self, NspawnDistro};
 use crate::config::Config;
 use crate::library::LibraryStore;
-use crate::mcp::{McpRegistry, McpServerConfig, McpTransport};
+use crate::mcp::{McpRegistry, McpScope, McpServerConfig, McpTransport};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Workspace Types
@@ -95,6 +95,18 @@ pub struct Workspace {
     /// Additional configuration
     #[serde(default)]
     pub config: serde_json::Value,
+    /// Workspace template name (if created from a template)
+    #[serde(default)]
+    pub template: Option<String>,
+    /// Preferred Linux distribution for container workspaces
+    #[serde(default)]
+    pub distro: Option<String>,
+    /// Environment variables always loaded for this workspace
+    #[serde(default)]
+    pub env_vars: HashMap<String, String>,
+    /// Init script to run when the workspace is built/rebuilt
+    #[serde(default)]
+    pub init_script: Option<String>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Skill names from library to sync to this workspace
@@ -119,6 +131,10 @@ impl Workspace {
             status: WorkspaceStatus::Ready,
             error_message: None,
             config: serde_json::json!({}),
+            template: None,
+            distro: None,
+            env_vars: HashMap::new(),
+            init_script: None,
             created_at: Utc::now(),
             skills: Vec::new(),
             tools: Vec::new(),
@@ -136,6 +152,10 @@ impl Workspace {
             status: WorkspaceStatus::Pending,
             error_message: None,
             config: serde_json::json!({}),
+            template: None,
+            distro: None,
+            env_vars: HashMap::new(),
+            init_script: None,
             created_at: Utc::now(),
             skills: Vec::new(),
             tools: Vec::new(),
@@ -181,6 +201,15 @@ impl WorkspaceStore {
         if !workspaces.contains_key(&DEFAULT_WORKSPACE_ID) {
             let host = Workspace::default_host(working_dir.clone());
             workspaces.insert(host.id, host);
+        }
+        if let Some(host) = workspaces.get_mut(&DEFAULT_WORKSPACE_ID) {
+            if !host.skills.is_empty() {
+                host.skills.clear();
+                tracing::info!(
+                    workspace = %host.name,
+                    "Cleared default host workspace skills list to allow all library skills"
+                );
+            }
         }
 
         // Scan for orphaned containers and restore them
@@ -308,6 +337,10 @@ impl WorkspaceStore {
                     status,
                     error_message: None,
                     config: serde_json::json!({}),
+                    template: None,
+                    distro: None,
+                    env_vars: HashMap::new(),
+                    init_script: None,
                     created_at: Utc::now(), // We don't know the actual creation time
                     skills: Vec::new(),
                     tools: Vec::new(),
@@ -472,6 +505,7 @@ fn opencode_entry_from_mcp(
     workspace_dir: &Path,
     workspace_root: &Path,
     workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
 ) -> serde_json::Value {
     fn resolve_command_path(cmd: &str) -> String {
         let cmd_path = Path::new(cmd);
@@ -507,11 +541,18 @@ fn opencode_entry_from_mcp(
         McpTransport::Stdio { command, args, env } => {
             let mut entry = serde_json::Map::new();
             entry.insert("type".to_string(), json!("local"));
-            let mut cmd = vec![resolve_command_path(command)];
-            cmd.extend(args.clone());
-            entry.insert("command".to_string(), json!(cmd));
-            entry.insert("enabled".to_string(), json!(config.enabled));
+
             let mut merged_env = env.clone();
+            if !workspace_env.is_empty() {
+                for (key, value) in workspace_env {
+                    merged_env.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+                let workspace_env_json =
+                    serde_json::to_string(workspace_env).unwrap_or_else(|_| "{}".to_string());
+                merged_env
+                    .entry("OPEN_AGENT_WORKSPACE_ENV_VARS".to_string())
+                    .or_insert(workspace_env_json);
+            }
             merged_env
                 .entry("OPEN_AGENT_WORKSPACE".to_string())
                 .or_insert_with(|| workspace_dir.to_string_lossy().to_string());
@@ -521,9 +562,48 @@ fn opencode_entry_from_mcp(
             merged_env
                 .entry("OPEN_AGENT_WORKSPACE_TYPE".to_string())
                 .or_insert_with(|| workspace_type.as_str().to_string());
-            if !merged_env.is_empty() {
-                entry.insert("environment".to_string(), json!(merged_env));
+
+            let use_nspawn = config.scope == McpScope::Workspace
+                && workspace_type == WorkspaceType::Chroot;
+
+            if use_nspawn {
+                let rel = workspace_dir
+                    .strip_prefix(workspace_root)
+                    .unwrap_or_else(|_| Path::new(""));
+                let rel_str = if rel.as_os_str().is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/{}", rel.to_string_lossy())
+                };
+
+                let mut nspawn_env = merged_env.clone();
+                nspawn_env.insert("OPEN_AGENT_WORKSPACE".to_string(), rel_str.clone());
+                nspawn_env.insert("OPEN_AGENT_WORKSPACE_ROOT".to_string(), "/".to_string());
+
+                let mut cmd = vec![
+                    resolve_command_path("systemd-nspawn"),
+                    "-D".to_string(),
+                    workspace_root.to_string_lossy().to_string(),
+                    "--quiet".to_string(),
+                    "--console=pipe".to_string(),
+                    "--chdir".to_string(),
+                    rel_str,
+                ];
+                for (key, value) in &nspawn_env {
+                    cmd.push(format!("--setenv={}={}", key, value));
+                }
+                cmd.push(command.clone());
+                cmd.extend(args.clone());
+                entry.insert("command".to_string(), json!(cmd));
+            } else {
+                let mut cmd = vec![resolve_command_path(command)];
+                cmd.extend(args.clone());
+                entry.insert("command".to_string(), json!(cmd));
+                if !merged_env.is_empty() {
+                    entry.insert("environment".to_string(), json!(merged_env));
+                }
             }
+            entry.insert("enabled".to_string(), json!(config.enabled));
             serde_json::Value::Object(entry)
         }
     }
@@ -534,6 +614,8 @@ async fn write_opencode_config(
     mcp_configs: Vec<McpServerConfig>,
     workspace_root: &Path,
     workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+    skill_allowlist: Option<&[String]>,
 ) -> anyhow::Result<()> {
     let mut mcp_map = serde_json::Map::new();
     let mut used = std::collections::HashSet::new();
@@ -550,7 +632,13 @@ async fn write_opencode_config(
         let key = unique_key(&base, &mut used);
         mcp_map.insert(
             key,
-            opencode_entry_from_mcp(&config, workspace_dir, workspace_root, workspace_type),
+            opencode_entry_from_mcp(
+                &config,
+                workspace_dir,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+            ),
         );
     }
 
@@ -561,18 +649,45 @@ async fn write_opencode_config(
     );
     config_json.insert("mcp".to_string(), serde_json::Value::Object(mcp_map));
 
-    // Prevent OpenCode's builtin bash tool from running on the host when we're
-    // targeting an isolated workspace. This forces tool usage through MCP,
-    // which we route via systemd-nspawn.
-    if workspace_type == WorkspaceType::Chroot {
-        let mut tools = serde_json::Map::new();
-        tools.insert("bash".to_string(), json!(false));
-        tools.insert("desktop_*".to_string(), json!(true));
-        tools.insert("playwright_*".to_string(), json!(true));
-        tools.insert("browser_*".to_string(), json!(false));
-        tools.insert("host_*".to_string(), json!(true));
-        config_json.insert("tools".to_string(), serde_json::Value::Object(tools));
+    if let Some(skills) = skill_allowlist {
+        if !skills.is_empty() {
+            let mut skill_permissions = serde_json::Map::new();
+            skill_permissions.insert("*".to_string(), json!("deny"));
+            for skill in skills {
+                skill_permissions.insert(skill.clone(), json!("allow"));
+            }
+            let mut permission = serde_json::Map::new();
+            permission.insert(
+                "skill".to_string(),
+                serde_json::Value::Object(skill_permissions),
+            );
+            config_json.insert(
+                "permission".to_string(),
+                serde_json::Value::Object(permission),
+            );
+        }
     }
+
+    // Prevent OpenCode's builtin bash tool from running on the host. For isolated
+    // workspaces, allow MCP-hosted browser/desktop tools. For host workspaces,
+    // keep browser/desktop tools disabled by default.
+    let mut tools = serde_json::Map::new();
+    tools.insert("bash".to_string(), json!(false));
+    match workspace_type {
+        WorkspaceType::Chroot => {
+            tools.insert("desktop_*".to_string(), json!(true));
+            tools.insert("playwright_*".to_string(), json!(true));
+            tools.insert("browser_*".to_string(), json!(true));
+            tools.insert("host_*".to_string(), json!(true));
+        }
+        WorkspaceType::Host => {
+            tools.insert("desktop_*".to_string(), json!(false));
+            tools.insert("playwright_*".to_string(), json!(false));
+            tools.insert("browser_*".to_string(), json!(false));
+            tools.insert("host_*".to_string(), json!(true));
+        }
+    }
+    config_json.insert("tools".to_string(), serde_json::Value::Object(tools));
 
     let config_value = serde_json::Value::Object(config_json);
     let config_payload = serde_json::to_string_pretty(&config_value)?;
@@ -680,10 +795,34 @@ pub async fn write_skills_to_workspace(
     Ok(())
 }
 
+async fn resolve_workspace_skill_names(
+    workspace: &Workspace,
+    library: &LibraryStore,
+) -> anyhow::Result<Vec<String>> {
+    if !workspace.skills.is_empty() {
+        return Ok(workspace.skills.clone());
+    }
+
+    // Default host workspace should expose all library skills when none are explicitly configured.
+    if workspace.id == DEFAULT_WORKSPACE_ID && workspace.workspace_type == WorkspaceType::Host {
+        let skills = library.list_skills().await?;
+        let names: Vec<String> = skills.into_iter().map(|skill| skill.name).collect();
+        tracing::debug!(
+            workspace = %workspace.name,
+            count = names.len(),
+            "Using all library skills for default host workspace"
+        );
+        return Ok(names);
+    }
+
+    Ok(Vec::new())
+}
+
 /// Sync skills from library to workspace's `.opencode/skill/` directory.
 /// Called when workspace is created, updated, or before mission execution.
 pub async fn sync_workspace_skills(workspace: &Workspace, library: &LibraryStore) -> anyhow::Result<()> {
-    sync_skills_to_dir(&workspace.path, &workspace.skills, &workspace.name, library).await
+    let skill_names = resolve_workspace_skill_names(workspace, library).await?;
+    sync_skills_to_dir(&workspace.path, &skill_names, &workspace.name, library).await
 }
 
 /// Sync skills from library to a specific directory's `.opencode/skill/` folder.
@@ -851,11 +990,14 @@ pub async fn prepare_custom_workspace(
 ) -> anyhow::Result<PathBuf> {
     prepare_workspace_dir(&workspace_dir).await?;
     let mcp_configs = mcp.list_configs().await;
+    let workspace_env = HashMap::new();
     write_opencode_config(
         &workspace_dir,
         mcp_configs,
         &workspace_dir,
         WorkspaceType::Host,
+        &workspace_env,
+        None,
     )
     .await?;
     Ok(workspace_dir)
@@ -880,7 +1022,20 @@ pub async fn prepare_mission_workspace_in(
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
     let mcp_configs = mcp.list_configs().await;
-    write_opencode_config(&dir, mcp_configs, &workspace.path, workspace.workspace_type).await?;
+    let skill_allowlist = if workspace.skills.is_empty() {
+        None
+    } else {
+        Some(workspace.skills.as_slice())
+    };
+    write_opencode_config(
+        &dir,
+        mcp_configs,
+        &workspace.path,
+        workspace.workspace_type,
+        &workspace.env_vars,
+        skill_allowlist,
+    )
+    .await?;
     Ok(dir)
 }
 
@@ -895,15 +1050,40 @@ pub async fn prepare_mission_workspace_with_skills(
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
     let mcp_configs = mcp.list_configs().await;
-    write_opencode_config(&dir, mcp_configs, &workspace.path, workspace.workspace_type).await?;
+    let skill_allowlist = if workspace.skills.is_empty() {
+        None
+    } else {
+        Some(workspace.skills.as_slice())
+    };
+    write_opencode_config(
+        &dir,
+        mcp_configs,
+        &workspace.path,
+        workspace.workspace_type,
+        &workspace.env_vars,
+        skill_allowlist,
+    )
+    .await?;
 
     // Sync skills and tools from workspace to mission directory
     if let Some(lib) = library {
         let context = format!("mission-{}", mission_id);
 
         // Sync skills
-        if !workspace.skills.is_empty() {
-            if let Err(e) = sync_skills_to_dir(&dir, &workspace.skills, &context, lib).await {
+        let skill_names = match resolve_workspace_skill_names(workspace, lib).await {
+            Ok(names) => names,
+            Err(e) => {
+                tracing::warn!(
+                    mission = %mission_id,
+                    workspace = %workspace.name,
+                    error = %e,
+                    "Failed to resolve skills from library"
+                );
+                Vec::new()
+            }
+        };
+        if !skill_names.is_empty() {
+            if let Err(e) = sync_skills_to_dir(&dir, &skill_names, &context, lib).await {
                 tracing::warn!(
                     mission = %mission_id,
                     workspace = %workspace.name,
@@ -938,11 +1118,14 @@ pub async fn prepare_task_workspace(
     let dir = task_workspace_dir_for_root(&config.working_dir, task_id);
     prepare_workspace_dir(&dir).await?;
     let mcp_configs = mcp.list_configs().await;
+    let workspace_env = HashMap::new();
     write_opencode_config(
         &dir,
         mcp_configs,
         &config.working_dir,
         WorkspaceType::Host,
+        &workspace_env,
+        None,
     )
     .await?;
     Ok(dir)
@@ -979,6 +1162,7 @@ pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::
 
     let mut count = 0;
     let mcp_configs = mcp.list_configs().await;
+    let workspace_env = HashMap::new();
 
     let mut entries = tokio::fs::read_dir(&root).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -986,7 +1170,14 @@ pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::
         if !path.is_dir() {
             continue;
         }
-        if write_opencode_config(&path, mcp_configs.clone(), &config.working_dir, WorkspaceType::Host)
+        if write_opencode_config(
+            &path,
+            mcp_configs.clone(),
+            &config.working_dir,
+            WorkspaceType::Host,
+            &workspace_env,
+            None,
+        )
             .await
             .is_ok()
         {
@@ -1042,6 +1233,7 @@ pub async fn resolve_workspace(
 pub async fn build_chroot_workspace(
     workspace: &mut Workspace,
     distro: Option<NspawnDistro>,
+    force_rebuild: bool,
 ) -> anyhow::Result<()> {
     if workspace.workspace_type != WorkspaceType::Chroot {
         return Err(anyhow::anyhow!(
@@ -1056,25 +1248,33 @@ pub async fn build_chroot_workspace(
 
     // Check if already built with the right distro
     if nspawn::is_container_ready(&workspace.path) {
-        if let Some(existing) = nspawn::detect_container_distro(&workspace.path).await {
-            if existing == distro {
+        if !force_rebuild {
+            if let Some(existing) = nspawn::detect_container_distro(&workspace.path).await {
+                if existing == distro {
+                    tracing::info!(
+                        "Container already exists at {} with distro {}",
+                        workspace.path.display(),
+                        distro.as_str()
+                    );
+                    workspace.status = WorkspaceStatus::Ready;
+                    return Ok(());
+                }
                 tracing::info!(
-                    "Container already exists at {} with distro {}",
+                    "Container exists at {} with distro {}, rebuilding to {}",
+                    workspace.path.display(),
+                    existing.as_str(),
+                    distro.as_str()
+                );
+            } else {
+                tracing::info!(
+                    "Container exists at {} with unknown distro, rebuilding to {}",
                     workspace.path.display(),
                     distro.as_str()
                 );
-                workspace.status = WorkspaceStatus::Ready;
-                return Ok(());
             }
-            tracing::info!(
-                "Container exists at {} with distro {}, rebuilding to {}",
-                workspace.path.display(),
-                existing.as_str(),
-                distro.as_str()
-            );
         } else {
             tracing::info!(
-                "Container exists at {} with unknown distro, rebuilding to {}",
+                "Forcing rebuild of container at {} to distro {}",
                 workspace.path.display(),
                 distro.as_str()
             );
@@ -1091,6 +1291,12 @@ pub async fn build_chroot_workspace(
     // Create the container
     match nspawn::create_container(&workspace.path, distro).await {
         Ok(()) => {
+            if let Err(e) = run_workspace_init_script(workspace).await {
+                workspace.status = WorkspaceStatus::Error;
+                workspace.error_message = Some(format!("Init script failed: {}", e));
+                tracing::error!("Init script failed: {}", e);
+                return Err(e);
+            }
             workspace.status = WorkspaceStatus::Ready;
             workspace.error_message = None;
             tracing::info!("Container workspace built successfully");
@@ -1103,6 +1309,64 @@ pub async fn build_chroot_workspace(
             Err(anyhow::anyhow!("Container build failed: {}", e))
         }
     }
+}
+
+async fn run_workspace_init_script(workspace: &Workspace) -> anyhow::Result<()> {
+    let script = workspace
+        .init_script
+        .as_ref()
+        .map(|s| s.trim())
+        .unwrap_or("");
+
+    if script.is_empty() {
+        return Ok(());
+    }
+
+    let script_path = workspace.path.join("openagent-init.sh");
+    tokio::fs::write(&script_path, script).await?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        tokio::fs::set_permissions(&script_path, perms).await?;
+    }
+
+    let shell = if workspace.path.join("bin/bash").exists() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+
+    let mut config = nspawn::NspawnConfig::default();
+    config.env = workspace.env_vars.clone();
+
+    let command = vec![shell.to_string(), "/openagent-init.sh".to_string()];
+    let output = nspawn::execute_in_container(&workspace.path, &command, &config).await?;
+
+    // Clean up the script file after execution.
+    let _ = tokio::fs::remove_file(&script_path).await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut message = String::new();
+        if !stderr.trim().is_empty() {
+            message.push_str(stderr.trim());
+        }
+        if !stdout.trim().is_empty() {
+            if !message.is_empty() {
+                message.push_str(" | ");
+            }
+            message.push_str(stdout.trim());
+        }
+        if message.is_empty() {
+            message = "Init script failed with no output".to_string();
+        }
+        return Err(anyhow::anyhow!(message));
+    }
+
+    Ok(())
 }
 
 /// Destroy a container workspace.

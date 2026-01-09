@@ -13,10 +13,12 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::library::WorkspaceTemplate;
 use crate::nspawn::NspawnDistro;
 use crate::workspace::{self, Workspace, WorkspaceStatus, WorkspaceType};
 
@@ -54,6 +56,14 @@ pub struct CreateWorkspaceRequest {
     /// Plugin identifiers for hooks
     #[serde(default)]
     pub plugins: Vec<String>,
+    /// Optional workspace template name
+    pub template: Option<String>,
+    /// Preferred Linux distribution for container workspaces
+    pub distro: Option<String>,
+    /// Environment variables always loaded in this workspace
+    pub env_vars: Option<HashMap<String, String>>,
+    /// Init script to run when the workspace is built/rebuilt
+    pub init_script: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +76,14 @@ pub struct UpdateWorkspaceRequest {
     pub tools: Option<Vec<String>>,
     /// Plugin identifiers for hooks
     pub plugins: Option<Vec<String>>,
+    /// Optional workspace template name
+    pub template: Option<String>,
+    /// Preferred Linux distribution for container workspaces
+    pub distro: Option<String>,
+    /// Environment variables always loaded in this workspace
+    pub env_vars: Option<HashMap<String, String>>,
+    /// Init script to run when the workspace is built/rebuilt
+    pub init_script: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +98,10 @@ pub struct WorkspaceResponse {
     pub skills: Vec<String>,
     pub tools: Vec<String>,
     pub plugins: Vec<String>,
+    pub template: Option<String>,
+    pub distro: Option<String>,
+    pub env_vars: HashMap<String, String>,
+    pub init_script: Option<String>,
 }
 
 impl From<Workspace> for WorkspaceResponse {
@@ -95,6 +117,10 @@ impl From<Workspace> for WorkspaceResponse {
             skills: w.skills,
             tools: w.tools,
             plugins: w.plugins,
+            template: w.template,
+            distro: w.distro,
+            env_vars: w.env_vars,
+            init_script: w.init_script,
         }
     }
 }
@@ -205,9 +231,35 @@ async fn create_workspace(
     // Validate workspace name for path traversal
     validate_workspace_name(&req.name)?;
 
+    let mut workspace_type = req.workspace_type;
+    let mut template_data: Option<WorkspaceTemplate> = None;
+
+    if let Some(template_name) = req.template.as_ref() {
+        // Templates always require an isolated (chroot) workspace
+        workspace_type = WorkspaceType::Chroot;
+
+        let library = {
+            let guard = state.library.read().await;
+            guard.as_ref().map(Arc::clone)
+        }
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Library not initialized".to_string(),
+            )
+        })?;
+
+        template_data = Some(
+            library
+                .get_workspace_template(template_name)
+                .await
+                .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?,
+        );
+    }
+
     // Host workspaces require a custom path - the root working directory is reserved
     // for the default host workspace (which is created automatically).
-    if req.workspace_type == WorkspaceType::Host && req.path.is_none() {
+    if workspace_type == WorkspaceType::Host && req.path.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             "Host workspaces require a custom path. The root working directory is reserved for the default host workspace.".to_string(),
@@ -217,7 +269,7 @@ async fn create_workspace(
     // Determine path
     let path = match &req.path {
         Some(custom_path) => resolve_custom_path(&state.config.working_dir, custom_path)?,
-        None => match req.workspace_type {
+        None => match workspace_type {
             WorkspaceType::Host => {
                 // This should be unreachable due to the check above, but keeping for safety
                 return Err((
@@ -236,7 +288,40 @@ async fn create_workspace(
         },
     };
 
-    let workspace = match req.workspace_type {
+    let mut env_vars = template_data
+        .as_ref()
+        .map(|t| t.env_vars.clone())
+        .unwrap_or_default();
+    if let Some(custom_env) = req.env_vars.clone() {
+        env_vars.extend(custom_env);
+    }
+    env_vars = sanitize_env_vars(env_vars);
+
+    let mut skills = template_data
+        .as_ref()
+        .map(|t| t.skills.clone())
+        .unwrap_or_default();
+    if !req.skills.is_empty() {
+        skills.extend(req.skills.clone());
+    }
+    skills = sanitize_skill_list(skills);
+
+    let mut init_script = template_data.as_ref().map(|t| t.init_script.clone());
+    if let Some(custom_script) = req.init_script.clone() {
+        init_script = Some(custom_script);
+    }
+    init_script = normalize_init_script(init_script);
+
+    let mut distro = template_data.as_ref().and_then(|t| t.distro.clone());
+    if let Some(custom_distro) = req.distro.as_ref() {
+        distro = Some(custom_distro.to_string());
+    }
+    let distro = match distro {
+        Some(value) => Some(normalize_distro_value(&value)?),
+        None => None,
+    };
+
+    let workspace = match workspace_type {
         WorkspaceType::Host => Workspace {
             id: Uuid::new_v4(),
             name: req.name,
@@ -245,16 +330,24 @@ async fn create_workspace(
             status: WorkspaceStatus::Ready,
             error_message: None,
             config: serde_json::json!({}),
+            template: req.template.clone(),
+            distro,
+            env_vars,
+            init_script,
             created_at: chrono::Utc::now(),
-            skills: req.skills,
+            skills,
             tools: req.tools,
             plugins: req.plugins,
         },
         WorkspaceType::Chroot => {
             let mut ws = Workspace::new_chroot(req.name, path);
-            ws.skills = req.skills;
+            ws.skills = skills;
             ws.tools = req.tools;
             ws.plugins = req.plugins;
+            ws.template = req.template.clone();
+            ws.distro = distro;
+            ws.env_vars = env_vars;
+            ws.init_script = init_script;
             ws
         }
     };
@@ -330,7 +423,7 @@ async fn update_workspace(
 
     // Update skills if provided
     let skills_changed = if let Some(skills) = req.skills {
-        workspace.skills = skills;
+        workspace.skills = sanitize_skill_list(skills);
         true
     } else {
         false
@@ -347,6 +440,32 @@ async fn update_workspace(
     // Update plugins if provided
     if let Some(plugins) = req.plugins {
         workspace.plugins = plugins;
+    }
+
+    if let Some(template) = req.template {
+        let trimmed = template.trim();
+        if trimmed.is_empty() {
+            workspace.template = None;
+        } else {
+            workspace.template = Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(distro) = req.distro {
+        let trimmed = distro.trim();
+        if trimmed.is_empty() {
+            workspace.distro = None;
+        } else {
+            workspace.distro = Some(normalize_distro_value(trimmed)?);
+        }
+    }
+
+    if let Some(env_vars) = req.env_vars {
+        workspace.env_vars = sanitize_env_vars(env_vars);
+    }
+
+    if let Some(init_script) = req.init_script {
+        workspace.init_script = normalize_init_script(Some(init_script));
     }
 
     // Save the updated workspace
@@ -479,20 +598,66 @@ pub struct BuildWorkspaceRequest {
     /// Linux distribution to use (defaults to "ubuntu-noble")
     /// Options: "ubuntu-noble", "ubuntu-jammy", "debian-bookworm", "arch-linux"
     pub distro: Option<String>,
+    /// Force rebuild even if the container already exists
+    pub rebuild: Option<bool>,
 }
 
 /// Parse a distro string into a NspawnDistro enum.
 fn parse_distro(s: &str) -> Result<NspawnDistro, String> {
-    match s {
-        "ubuntu-noble" | "noble" => Ok(NspawnDistro::UbuntuNoble),
-        "ubuntu-jammy" | "jammy" => Ok(NspawnDistro::UbuntuJammy),
-        "debian-bookworm" | "bookworm" => Ok(NspawnDistro::DebianBookworm),
-        "arch-linux" | "archlinux" | "arch" => Ok(NspawnDistro::ArchLinux),
-        _ => Err(format!(
-            "Unknown distro '{}'. Supported: ubuntu-noble, ubuntu-jammy, debian-bookworm, arch-linux",
-            s
-        )),
+    NspawnDistro::parse(s).ok_or_else(|| {
+        format!(
+            "Unknown distro '{}'. Supported: {}",
+            s,
+            NspawnDistro::supported_values().join(", ")
+        )
+    })
+}
+
+fn normalize_distro_value(value: &str) -> Result<String, (StatusCode, String)> {
+    NspawnDistro::parse(value)
+        .map(|d| d.api_value().to_string())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Unknown distro '{}'. Supported: {}",
+                    value,
+                    NspawnDistro::supported_values().join(", ")
+                ),
+            )
+        })
+}
+
+fn normalize_init_script(value: Option<String>) -> Option<String> {
+    value.and_then(|script| {
+        if script.trim().is_empty() {
+            None
+        } else {
+            Some(script)
+        }
+    })
+}
+
+fn sanitize_env_vars(env_vars: HashMap<String, String>) -> HashMap<String, String> {
+    env_vars
+        .into_iter()
+        .filter(|(key, _)| !key.trim().is_empty())
+        .collect()
+}
+
+fn sanitize_skill_list(skills: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for skill in skills {
+        let trimmed = skill.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
     }
+    out
 }
 
 /// POST /api/workspaces/:id/build - Build a container workspace.
@@ -514,11 +679,29 @@ async fn build_workspace(
         ));
     }
 
-    // Parse distro from request
-    let distro = body
-        .and_then(|b| b.distro.as_ref().map(|d| parse_distro(d)))
+    let force_rebuild = body
+        .as_ref()
+        .and_then(|b| b.rebuild)
+        .unwrap_or(false);
+
+    // Parse distro from request (or stored workspace default)
+    let distro_override = body
+        .as_ref()
+        .and_then(|b| b.distro.as_ref())
+        .map(|d| parse_distro(d))
         .transpose()
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    let distro = match distro_override {
+        Some(distro) => {
+            workspace.distro = Some(distro.api_value().to_string());
+            Some(distro)
+        }
+        None => match workspace.distro.as_ref() {
+            Some(value) => Some(parse_distro(value).map_err(|e| (StatusCode::BAD_REQUEST, e))?),
+            None => None,
+        },
+    };
 
     // Check if already building (prevents concurrent builds)
     if workspace.status == WorkspaceStatus::Building {
@@ -529,7 +712,7 @@ async fn build_workspace(
     }
 
     // If ready and no distro override requested, no-op
-    if workspace.status == WorkspaceStatus::Ready && distro.is_none() {
+    if workspace.status == WorkspaceStatus::Ready && distro.is_none() && !force_rebuild {
         return Ok(Json(workspace.into()));
     }
 
@@ -538,7 +721,7 @@ async fn build_workspace(
     state.workspaces.update(workspace.clone()).await;
 
     // Build the container
-    match crate::workspace::build_chroot_workspace(&mut workspace, distro).await {
+    match crate::workspace::build_chroot_workspace(&mut workspace, distro, force_rebuild).await {
         Ok(()) => {
             // Update in store
             state.workspaces.update(workspace.clone()).await;
@@ -547,7 +730,9 @@ async fn build_workspace(
         Err(e) => {
             // Update status to error and save
             workspace.status = WorkspaceStatus::Error;
-            workspace.error_message = Some(e.to_string());
+            if workspace.error_message.is_none() {
+                workspace.error_message = Some(e.to_string());
+            }
             state.workspaces.update(workspace.clone()).await;
 
             Err((

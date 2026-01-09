@@ -25,10 +25,12 @@ import {
   formatBytes,
   getProgress,
   getRunningMissions,
+  isNetworkError,
   cancelMission,
   listProviders,
   listWorkspaces,
   getHealth,
+  type StreamDiagnosticUpdate,
   type ControlRunState,
   type Mission,
   type MissionStatus,
@@ -84,6 +86,37 @@ import {
   File,
   ExternalLink,
 } from "lucide-react";
+
+type StreamDiagnosticsState = {
+  phase: "idle" | "connecting" | "open" | "streaming" | "closed" | "error";
+  url: string | null;
+  status?: number;
+  contentType?: string | null;
+  cacheControl?: string | null;
+  transferEncoding?: string | null;
+  contentEncoding?: string | null;
+  server?: string | null;
+  via?: string | null;
+  lastEventAt?: number;
+  lastChunkAt?: number;
+  bytes: number;
+  lastError?: string | null;
+};
+
+function formatDiagAge(ts?: number) {
+  if (!ts) return "—";
+  const deltaMs = Date.now() - ts;
+  if (deltaMs < 0) return "—";
+  const secs = Math.floor(deltaMs / 1000);
+  if (secs < 5) return "just now";
+  if (secs < 60) return `${secs}s ago`;
+  const mins = Math.floor(secs / 60);
+  const rem = secs % 60;
+  if (mins < 60) return `${mins}m ${rem}s ago`;
+  const hrs = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return `${hrs}h ${remMins}m ago`;
+}
 import {
   OptionList,
   OptionListErrorBoundary,
@@ -969,6 +1002,14 @@ export default function ControlClient() {
     "connected" | "disconnected" | "reconnecting"
   >("disconnected");
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
+  const [showStreamDiagnostics, setShowStreamDiagnostics] = useState(false);
+  const [streamDiagnostics, setStreamDiagnostics] = useState<StreamDiagnosticsState>({
+    phase: "idle",
+    url: null,
+    bytes: 0,
+    lastError: null,
+  });
+  const [diagTick, setDiagTick] = useState(0);
 
   // Progress state (for "Subtask X of Y" indicator)
   const [progress, setProgress] = useState<{
@@ -989,6 +1030,11 @@ export default function ControlClient() {
 
   // Library context for agents
   const { libraryAgents } = useLibrary();
+
+  useEffect(() => {
+    const interval = setInterval(() => setDiagTick((prev) => prev + 1), 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Parallel missions state
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
@@ -1567,8 +1613,66 @@ export default function ControlClient() {
       const missions = await listMissions();
       setRecentMissions(missions);
     } catch (err) {
+      if (isNetworkError(err)) return;
       console.error("Failed to fetch missions:", err);
     }
+  }, []);
+
+  const handleStreamDiagnostics = useCallback((update: StreamDiagnosticUpdate) => {
+    setStreamDiagnostics((prev) => {
+      const next: StreamDiagnosticsState = { ...prev };
+      if (update.url) next.url = update.url;
+
+      switch (update.phase) {
+        case "connecting":
+          next.phase = "connecting";
+          next.lastError = null;
+          next.bytes = 0;
+          next.status = undefined;
+          next.contentType = undefined;
+          next.cacheControl = undefined;
+          next.transferEncoding = undefined;
+          next.contentEncoding = undefined;
+          next.server = undefined;
+          next.via = undefined;
+          next.lastEventAt = undefined;
+          next.lastChunkAt = undefined;
+          break;
+        case "open":
+          next.phase = "open";
+          next.status = update.status;
+          if (update.headers) {
+            next.contentType = update.headers["content-type"] ?? null;
+            next.cacheControl = update.headers["cache-control"] ?? null;
+            next.transferEncoding = update.headers["transfer-encoding"] ?? null;
+            next.contentEncoding = update.headers["content-encoding"] ?? null;
+            next.server = update.headers["server"] ?? null;
+            next.via = update.headers["via"] ?? null;
+          }
+          break;
+        case "chunk":
+          next.phase = next.phase === "error" ? "error" : "streaming";
+          next.lastChunkAt = update.timestamp;
+          if (typeof update.bytes === "number") next.bytes = update.bytes;
+          break;
+        case "event":
+          next.phase = next.phase === "error" ? "error" : "streaming";
+          next.lastEventAt = update.timestamp;
+          if (typeof update.bytes === "number") next.bytes = update.bytes;
+          break;
+        case "closed":
+          next.phase = "closed";
+          break;
+        case "error":
+          next.phase = "error";
+          next.lastError = update.error ?? next.lastError ?? "Stream error";
+          if (typeof update.bytes === "number") next.bytes = update.bytes;
+          if (typeof update.status === "number") next.status = update.status;
+          break;
+      }
+
+      return next;
+    });
   }, []);
 
   // Refresh recent missions periodically (after the callback is defined)
@@ -1585,6 +1689,7 @@ export default function ControlClient() {
         setProviders(data.providers);
       })
       .catch((err) => {
+        if (isNetworkError(err)) return;
         console.error("Failed to fetch providers:", err);
       });
   }, [authRetryTrigger]);
@@ -1596,6 +1701,7 @@ export default function ControlClient() {
         setWorkspaces(data);
       })
       .catch((err) => {
+        if (isNetworkError(err)) return;
         console.error("Failed to fetch workspaces:", err);
       });
   }, [authRetryTrigger]);
@@ -1609,6 +1715,7 @@ export default function ControlClient() {
         }
       })
       .catch((err) => {
+        if (isNetworkError(err)) return;
         console.error("Failed to fetch health:", err);
       });
   }, []);
@@ -1724,7 +1831,7 @@ export default function ControlClient() {
       setViewingMissionId(mission.id); // Also update viewing to the new mission
       setItems([]);
       setHasDesktopSession(false);
-      setShowParallelPanel(true); // Show the missions panel so user can see the new mission
+      setShowParallelPanel(false); // Keep the mission switcher closed after creating a mission
       // Refresh running missions to get accurate state
       const running = await getRunningMissions();
       setRunningMissions(running);
@@ -2241,7 +2348,7 @@ export default function ControlClient() {
 
     const connect = () => {
       cleanup?.();
-      cleanup = streamControl(handleEvent);
+      cleanup = streamControl(handleEvent, handleStreamDiagnostics);
     };
 
     connect();
@@ -2257,6 +2364,49 @@ export default function ControlClient() {
 
   const status = useMemo(() => statusLabel(runState), [runState]);
   const StatusIcon = status.Icon;
+
+  const streamHints = useMemo(() => {
+    const hints: string[] = [];
+    const ct = streamDiagnostics.contentType;
+    if (ct && !ct.toLowerCase().includes("text/event-stream")) {
+      hints.push(`Content-Type is "${ct}" (expected text/event-stream).`);
+    }
+    const ce = streamDiagnostics.contentEncoding;
+    if (ce && ce !== "identity") {
+      hints.push(`Content-Encoding is "${ce}". Disable gzip for SSE.`);
+    }
+    if (
+      streamDiagnostics.phase === "open" ||
+      streamDiagnostics.phase === "streaming"
+    ) {
+      const lastChunkAge = streamDiagnostics.lastChunkAt
+        ? Date.now() - streamDiagnostics.lastChunkAt
+        : null;
+      if (lastChunkAge !== null && lastChunkAge > 30000) {
+        hints.push("No SSE chunks for >30s. Likely proxy buffering or connection drops.");
+      }
+    }
+    if (typeof streamDiagnostics.status === "number" && streamDiagnostics.status >= 400) {
+      hints.push(`Stream request returned HTTP ${streamDiagnostics.status}.`);
+    }
+    return hints;
+  }, [streamDiagnostics, diagTick]);
+
+  const handleCopyDiagnostics = useCallback(async () => {
+    const payload = {
+      captured_at: new Date().toISOString(),
+      connection_state: connectionState,
+      reconnect_attempt: reconnectAttempt,
+      stream: streamDiagnostics,
+      user_agent: typeof navigator !== "undefined" ? navigator.userAgent : undefined,
+    };
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+      toast.success("Copied stream diagnostics");
+    } catch {
+      toast.error("Failed to copy diagnostics");
+    }
+  }, [connectionState, reconnectAttempt, streamDiagnostics]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -2699,6 +2849,130 @@ export default function ControlClient() {
               </>
             )}
 
+            {/* Stream diagnostics toggle */}
+            <div className="relative">
+              <button
+                onClick={() => setShowStreamDiagnostics((prev) => !prev)}
+                className="flex items-center gap-2 rounded-md border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5 text-xs text-white/70 transition-colors hover:bg-white/[0.04]"
+                title="Stream diagnostics"
+              >
+                <span
+                  className={cn(
+                    "h-2 w-2 rounded-full",
+                    (streamDiagnostics.phase === "streaming" || streamDiagnostics.phase === "open") &&
+                      "bg-emerald-400",
+                    streamDiagnostics.phase === "connecting" && "bg-amber-400 animate-pulse",
+                    streamDiagnostics.phase === "error" && "bg-red-400",
+                    streamDiagnostics.phase === "closed" && "bg-white/30",
+                    streamDiagnostics.phase === "idle" && "bg-white/20"
+                  )}
+                />
+                Stream
+                <ChevronDown className="h-3 w-3 text-white/50" />
+              </button>
+
+              {showStreamDiagnostics && (
+                <div className="absolute right-0 top-full z-50 mt-2 w-[360px] rounded-lg border border-white/[0.08] bg-[#121214] p-3 shadow-xl">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-white/80">Stream diagnostics</span>
+                    <button
+                      onClick={handleCopyDiagnostics}
+                      className="text-[11px] text-white/50 hover:text-white/80 transition-colors"
+                    >
+                      Copy
+                    </button>
+                  </div>
+
+                  <div className="mt-2 space-y-1 text-xs text-white/70">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-white/40">Phase</span>
+                      <span className="font-mono text-white/80">{streamDiagnostics.phase}</span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-white/40">URL</span>
+                      <span className="max-w-[230px] truncate font-mono text-white/80">
+                        {streamDiagnostics.url ?? "—"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-white/40">Status</span>
+                      <span className="font-mono text-white/80">
+                        {typeof streamDiagnostics.status === "number"
+                          ? streamDiagnostics.status
+                          : "—"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-white/40">Content-Type</span>
+                      <span className="max-w-[230px] truncate font-mono text-white/80">
+                        {streamDiagnostics.contentType ?? "—"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-white/40">Content-Encoding</span>
+                      <span className="max-w-[230px] truncate font-mono text-white/80">
+                        {streamDiagnostics.contentEncoding ?? "—"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-white/40">Cache-Control</span>
+                      <span className="max-w-[230px] truncate font-mono text-white/80">
+                        {streamDiagnostics.cacheControl ?? "—"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-white/40">Transfer-Encoding</span>
+                      <span className="max-w-[230px] truncate font-mono text-white/80">
+                        {streamDiagnostics.transferEncoding ?? "—"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-white/40">Server/Via</span>
+                      <span className="max-w-[230px] truncate font-mono text-white/80">
+                        {[streamDiagnostics.server, streamDiagnostics.via]
+                          .filter(Boolean)
+                          .join(" • ") || "—"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-white/40">Last event</span>
+                      <span className="font-mono text-white/80">
+                        {formatDiagAge(streamDiagnostics.lastEventAt)}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-white/40">Last chunk</span>
+                      <span className="font-mono text-white/80">
+                        {formatDiagAge(streamDiagnostics.lastChunkAt)}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-white/40">Bytes</span>
+                      <span className="font-mono text-white/80">
+                        {streamDiagnostics.bytes.toLocaleString()}
+                      </span>
+                    </div>
+                  </div>
+
+                  {streamDiagnostics.lastError && (
+                    <div className="mt-2 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-1 text-xs text-red-300">
+                      {streamDiagnostics.lastError}
+                    </div>
+                  )}
+
+                  {streamHints.length > 0 && (
+                    <div className="mt-2 space-y-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200">
+                      {streamHints.map((hint) => (
+                        <div key={hint}>{hint}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="h-4 w-px bg-white/[0.08]" />
+
             {/* Run state indicator */}
             <div className={cn("flex items-center gap-2", status.className)}>
               <StatusIcon
@@ -2893,7 +3167,7 @@ export default function ControlClient() {
                         </div>
                         <div className="mt-1 text-right flex items-center justify-end gap-2">
                           {isQueued && (
-                            <span className="text-[10px] text-amber-400/80">
+                            <span className="text-[10px] text-white/30">
                               Queued
                             </span>
                           )}

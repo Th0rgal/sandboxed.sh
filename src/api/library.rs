@@ -25,8 +25,9 @@ use tokio::sync::RwLock;
 use crate::library::{
     Command, CommandSummary, GitAuthor, LibraryAgent, LibraryAgentSummary, LibraryStatus,
     LibraryStore, LibraryTool, LibraryToolSummary, McpServer, MigrationReport, Plugin, Rule,
-    RuleSummary, Skill, SkillSummary,
+    RuleSummary, Skill, SkillSummary, WorkspaceTemplate, WorkspaceTemplateSummary,
 };
+use crate::nspawn::NspawnDistro;
 
 /// Shared library state.
 pub type SharedLibrary = Arc<RwLock<Option<Arc<LibraryStore>>>>;
@@ -162,6 +163,11 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/tool/:name", get(get_library_tool))
         .route("/tool/:name", put(save_library_tool))
         .route("/tool/:name", delete(delete_library_tool))
+        // Workspace Templates
+        .route("/workspace-template", get(list_workspace_templates))
+        .route("/workspace-template/:name", get(get_workspace_template))
+        .route("/workspace-template/:name", put(save_workspace_template))
+        .route("/workspace-template/:name", delete(delete_workspace_template))
         // Migration
         .route("/migrate", post(migrate_library))
 }
@@ -188,6 +194,30 @@ pub struct ImportSkillRequest {
     path: Option<String>,
     /// Target skill name (defaults to last path component)
     name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveWorkspaceTemplateRequest {
+    pub description: Option<String>,
+    pub distro: Option<String>,
+    pub skills: Option<Vec<String>>,
+    pub env_vars: Option<HashMap<String, String>>,
+    pub init_script: Option<String>,
+}
+
+fn sanitize_skill_list(skills: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for skill in skills {
+        let trimmed = skill.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -732,6 +762,95 @@ async fn delete_library_tool(
         .delete_library_tool(&name)
         .await
         .map(|_| (StatusCode::OK, "Tool deleted successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Workspace Templates
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/workspace-template - List workspace templates.
+async fn list_workspace_templates(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<WorkspaceTemplateSummary>>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .list_workspace_templates()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// GET /api/library/workspace-template/:name - Get workspace template.
+async fn get_workspace_template(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<WorkspaceTemplate>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .get_workspace_template(&name)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                (StatusCode::NOT_FOUND, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
+}
+
+/// PUT /api/library/workspace-template/:name - Save workspace template.
+async fn save_workspace_template(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<SaveWorkspaceTemplateRequest>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    if let Some(distro) = req.distro.as_ref() {
+        if NspawnDistro::parse(distro).is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Unknown distro '{}'. Supported: {}",
+                    distro,
+                    NspawnDistro::supported_values().join(", ")
+                ),
+            ));
+        }
+    }
+
+    let library = ensure_library(&state, &headers).await?;
+    let template = WorkspaceTemplate {
+        name: name.clone(),
+        description: req.description.clone(),
+        path: format!("workspace-template/{}.json", name),
+        distro: req.distro.clone(),
+        skills: sanitize_skill_list(req.skills.unwrap_or_default()),
+        env_vars: req.env_vars.unwrap_or_default(),
+        init_script: req.init_script.unwrap_or_default(),
+    };
+
+    library
+        .save_workspace_template(&name, &template)
+        .await
+        .map(|_| (StatusCode::OK, "Workspace template saved successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// DELETE /api/library/workspace-template/:name - Delete workspace template.
+async fn delete_workspace_template(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .delete_workspace_template(&name)
+        .await
+        .map(|_| (StatusCode::OK, "Workspace template deleted successfully".to_string()))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 

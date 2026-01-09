@@ -46,6 +46,31 @@ pub enum NspawnDistro {
 }
 
 impl NspawnDistro {
+    /// Parse a distro string from API/user input.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ubuntu-noble" | "noble" => Some(Self::UbuntuNoble),
+            "ubuntu-jammy" | "jammy" => Some(Self::UbuntuJammy),
+            "debian-bookworm" | "bookworm" => Some(Self::DebianBookworm),
+            "arch-linux" | "archlinux" | "arch" => Some(Self::ArchLinux),
+            _ => None,
+        }
+    }
+
+    /// Canonical API value for this distro.
+    pub fn api_value(&self) -> &'static str {
+        match self {
+            Self::UbuntuNoble => "ubuntu-noble",
+            Self::UbuntuJammy => "ubuntu-jammy",
+            Self::DebianBookworm => "debian-bookworm",
+            Self::ArchLinux => "arch-linux",
+        }
+    }
+
+    pub fn supported_values() -> &'static [&'static str] {
+        &["ubuntu-noble", "ubuntu-jammy", "debian-bookworm", "arch-linux"]
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::UbuntuNoble => "noble",
@@ -86,6 +111,7 @@ pub struct NspawnConfig {
     pub display: Option<String>,
     pub network_mode: NetworkMode,
     pub ephemeral: bool,
+    pub env: std::collections::HashMap<String, String>,
 }
 
 impl Default for NspawnConfig {
@@ -95,6 +121,7 @@ impl Default for NspawnConfig {
             display: None,
             network_mode: NetworkMode::Host,
             ephemeral: false,
+            env: std::collections::HashMap::new(),
         }
     }
 }
@@ -246,6 +273,15 @@ pub async fn execute_in_container(
 
     if let Some(display) = config.display.as_ref() {
         cmd.arg(format!("--setenv=DISPLAY={}", display));
+    }
+
+    if !config.env.is_empty() {
+        for (key, value) in &config.env {
+            if key.trim().is_empty() {
+                continue;
+            }
+            cmd.arg(format!("--setenv={}={}", key, value));
+        }
     }
 
     cmd.args(command);

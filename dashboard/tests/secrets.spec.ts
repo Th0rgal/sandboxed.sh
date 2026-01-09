@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 
 test.describe('Library - Secrets', () => {
   test('should load Secrets page', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
 
     // Wait for page to load
     await page.waitForTimeout(2000);
@@ -16,7 +16,7 @@ test.describe('Library - Secrets', () => {
   });
 
   test('should show page description', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     // Should show the description text
@@ -25,7 +25,7 @@ test.describe('Library - Secrets', () => {
   });
 
   test('should show appropriate state based on initialization', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     // Page should show one of three states:
@@ -48,7 +48,7 @@ test.describe('Library - Secrets', () => {
   });
 
   test('should show Initialize Secrets dialog when not initialized', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const initializeButton = page.getByRole('button', { name: /Initialize Secrets System/i });
@@ -80,7 +80,7 @@ test.describe('Library - Secrets', () => {
 
 test.describe('Library - Secrets Unlock Flow', () => {
   test('should show Unlock dialog when locked', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     // Check if we're in locked state
@@ -113,7 +113,7 @@ test.describe('Library - Secrets Unlock Flow', () => {
   });
 
   test('should disable Unlock button when passphrase is empty', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const unlockButton = page.getByRole('button', { name: /Unlock Secrets/i });
@@ -151,7 +151,7 @@ test.describe('Library - Secrets Unlock Flow', () => {
   });
 
   test('should show error on invalid passphrase', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const unlockButton = page.getByRole('button', { name: /Unlock Secrets/i });
@@ -197,7 +197,7 @@ test.describe('Library - Secrets Unlock Flow', () => {
 
 test.describe('Library - Secrets Unlocked State', () => {
   test('should show registries sidebar when unlocked', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     // Check if unlocked (registries visible)
@@ -218,7 +218,7 @@ test.describe('Library - Secrets Unlocked State', () => {
   });
 
   test('should show Lock button when unlocked', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const lockButton = page.getByRole('button', { name: /^Lock$/i });
@@ -231,7 +231,7 @@ test.describe('Library - Secrets Unlocked State', () => {
   });
 
   test('should show Add Secret button when unlocked', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const addSecretButton = page.getByRole('button', { name: /Add Secret/i });
@@ -243,7 +243,7 @@ test.describe('Library - Secrets Unlocked State', () => {
   });
 
   test('should open Add Secret dialog', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const addSecretButton = page.getByRole('button', { name: /Add Secret/i });
@@ -274,7 +274,7 @@ test.describe('Library - Secrets Unlocked State', () => {
   });
 
   test('should disable Add Secret button when fields are empty', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const addSecretButton = page.getByRole('button', { name: /Add Secret/i });
@@ -307,7 +307,7 @@ test.describe('Library - Secrets Unlocked State', () => {
   });
 
   test('should select different secret types in Add Secret dialog', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const addSecretButton = page.getByRole('button', { name: /Add Secret/i });
@@ -342,7 +342,7 @@ test.describe('Library - Secrets Unlocked State', () => {
   });
 
   test('should select registry from sidebar', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const registriesHeader = page.getByText('Registries');
@@ -375,7 +375,7 @@ test.describe('Library - Secrets Unlocked State', () => {
 
 test.describe('Library - Secrets Actions', () => {
   test('should show reveal, copy, and delete buttons for secrets', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const registriesHeader = page.getByText('Registries');
@@ -411,7 +411,7 @@ test.describe('Library - Secrets Actions', () => {
   });
 
   test('should toggle reveal state when clicking eye icon', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const registriesHeader = page.getByText('Registries');
@@ -463,7 +463,7 @@ test.describe('Library - Secrets Actions', () => {
   });
 
   test('should show copy confirmation feedback', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const registriesHeader = page.getByText('Registries');
@@ -502,7 +502,7 @@ test.describe('Library - Secrets Actions', () => {
   });
 
   test('should show confirmation dialog when deleting secret', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const registriesHeader = page.getByText('Registries');
@@ -543,7 +543,7 @@ test.describe('Library - Secrets Actions', () => {
 
 test.describe('Library - Secrets Lock/Unlock Toggle', () => {
   test('should lock secrets when clicking Lock button', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const lockButton = page.getByRole('button', { name: /^Lock$/i });
@@ -567,7 +567,7 @@ test.describe('Library - Secrets Lock/Unlock Toggle', () => {
   });
 
   test('should clear revealed secrets when locking', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const lockButton = page.getByRole('button', { name: /^Lock$/i });
@@ -610,7 +610,7 @@ test.describe('Library - Secrets Lock/Unlock Toggle', () => {
 
 test.describe('Library - Secrets Integration', () => {
   test('should create a new secret', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const addSecretButton = page.getByRole('button', { name: /Add Secret/i });
@@ -654,7 +654,7 @@ test.describe('Library - Secrets Integration', () => {
   });
 
   test('should show secret type badges correctly', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const registriesHeader = page.getByText('Registries');
@@ -692,7 +692,7 @@ test.describe('Library - Secrets Integration', () => {
   });
 
   test('should show secret count in registry sidebar', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const registriesHeader = page.getByText('Registries');
@@ -721,7 +721,7 @@ test.describe('Library - Secrets Integration', () => {
 
 test.describe('Library - Secrets Error Handling', () => {
   test('should show error message and allow dismissal', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     // Try to trigger an error by unlocking with wrong passphrase
@@ -772,7 +772,7 @@ test.describe('Library - Secrets Error Handling', () => {
   });
 
   test('should handle keyboard shortcuts in dialogs', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const addSecretButton = page.getByRole('button', { name: /Add Secret/i });
@@ -805,7 +805,7 @@ test.describe('Library - Secrets Error Handling', () => {
 test.describe('Library - Secrets Visual States', () => {
   test('should show loading spinner while fetching status', async ({ page }) => {
     // Navigate and immediately check for loader
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
 
     // There should be a brief loading state
     const loader = page.locator('.animate-spin');
@@ -818,7 +818,7 @@ test.describe('Library - Secrets Visual States', () => {
   });
 
   test('should show loading spinner while fetching secrets', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const registriesHeader = page.getByText('Registries');
@@ -850,7 +850,7 @@ test.describe('Library - Secrets Visual States', () => {
   });
 
   test('should highlight selected registry in sidebar', async ({ page }) => {
-    await page.goto('/library/secrets');
+    await page.goto('/settings/secrets');
     await page.waitForTimeout(2000);
 
     const registriesHeader = page.getByText('Registries');

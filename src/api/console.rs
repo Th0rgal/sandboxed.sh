@@ -177,15 +177,26 @@ async fn handle_console(socket: WebSocket, state: Arc<AppState>, session_key: St
     };
 
     if let Some(session) = existing_session {
-        let mut s = session.lock().await;
-        if !s.in_use && s.to_pty_tx.is_closed() == false {
-            // Reuse this session
-            s.in_use = true;
-            s.disconnected_at = None;
-            tracing::debug!("Reusing pooled console session: {}", session_key);
-            drop(s);
-            handle_existing_session(socket, session, state, session_key).await;
-            return;
+        let (can_reuse, child_killer) = {
+            let s = session.lock().await;
+            (!s.in_use && !s.to_pty_tx.is_closed(), s.child_killer.clone())
+        };
+
+        if can_reuse {
+            if child_has_exited(&child_killer).await {
+                let mut sessions = state.console_pool.sessions.write().await;
+                sessions.remove(&session_key);
+            } else {
+                let mut s = session.lock().await;
+                if !s.in_use && !s.to_pty_tx.is_closed() {
+                    s.in_use = true;
+                    s.disconnected_at = None;
+                    tracing::debug!("Reusing pooled console session: {}", session_key);
+                    drop(s);
+                    handle_existing_session(socket, session, state, session_key).await;
+                    return;
+                }
+            }
         }
     }
 
@@ -606,34 +617,67 @@ fn read_runtime_display() -> Option<String> {
     }
 }
 
+async fn child_has_exited(
+    child_killer: &Arc<Mutex<Option<Box<dyn portable_pty::Child + Send>>>>,
+) -> bool {
+    let mut guard = child_killer.lock().await;
+    match guard.as_mut() {
+        Some(child) => match child.try_wait() {
+            Ok(Some(_status)) => {
+                *guard = None;
+                true
+            }
+            Ok(None) => false,
+            Err(_) => {
+                *guard = None;
+                true
+            }
+        },
+        None => true,
+    }
+}
+
 /// Terminate any existing systemd-nspawn container for the given machine name.
 /// This ensures we don't get "Directory tree is currently busy" errors when
 /// spawning a new container session.
 async fn terminate_stale_container(machine_name: &str) {
-    // Check if machine is running
-    let status = tokio::process::Command::new("machinectl")
-        .args(["show", machine_name, "--property=State"])
-        .output()
-        .await;
+    let status = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::process::Command::new("machinectl")
+            .args(["show", machine_name, "--property=State"])
+            .output(),
+    )
+    .await;
 
-    let is_running = match status {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.contains("State=running")
+    let output = match status {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => return,
+        Err(_) => {
+            tracing::warn!(
+                "Timed out while checking machinectl state for '{}'",
+                machine_name
+            );
+            return;
         }
-        Err(_) => false,
     };
 
-    if is_running {
+    if !output.status.success() {
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("State=") {
         tracing::info!(
             "Terminating stale container '{}' before spawning new session",
             machine_name
         );
-        let _ = tokio::process::Command::new("machinectl")
-            .args(["terminate", machine_name])
-            .output()
-            .await;
-        // Give it a moment to fully terminate
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::process::Command::new("machinectl")
+                .args(["terminate", machine_name])
+                .output(),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
@@ -651,14 +695,26 @@ async fn handle_workspace_shell(
     };
 
     if let Some(session) = existing_session {
-        let mut s = session.lock().await;
-        if !s.in_use && !s.to_pty_tx.is_closed() {
-            s.in_use = true;
-            s.disconnected_at = None;
-            tracing::debug!("Reusing pooled workspace shell session: {}", session_key);
-            drop(s);
-            handle_existing_session(socket, session, state, session_key).await;
-            return;
+        let (can_reuse, child_killer) = {
+            let s = session.lock().await;
+            (!s.in_use && !s.to_pty_tx.is_closed(), s.child_killer.clone())
+        };
+
+        if can_reuse {
+            if child_has_exited(&child_killer).await {
+                let mut sessions = state.console_pool.sessions.write().await;
+                sessions.remove(&session_key);
+            } else {
+                let mut s = session.lock().await;
+                if !s.in_use && !s.to_pty_tx.is_closed() {
+                    s.in_use = true;
+                    s.disconnected_at = None;
+                    tracing::debug!("Reusing pooled workspace shell session: {}", session_key);
+                    drop(s);
+                    handle_existing_session(socket, session, state, session_key).await;
+                    return;
+                }
+            }
         }
     }
 
@@ -728,14 +784,22 @@ async fn handle_new_workspace_shell(
             cmd.arg("--setenv=TERM=xterm-256color");
             cmd.arg(format!("--setenv=WORKSPACE_ID={}", workspace_id));
             cmd.arg(format!("--setenv=WORKSPACE_NAME={}", workspace.name));
+            for (key, value) in &workspace.env_vars {
+                if key.trim().is_empty() {
+                    continue;
+                }
+                cmd.arg(format!("--setenv={}={}", key, value));
+            }
 
             // Try to use bash if available, fallback to sh
             let bash_path = workspace.path.join("bin/bash");
             if bash_path.exists() {
                 cmd.arg("/bin/bash");
                 cmd.arg("--login");
+                cmd.arg("-i");
             } else {
                 cmd.arg("/bin/sh");
+                cmd.arg("-i");
             }
             cmd
         }
@@ -752,6 +816,12 @@ async fn handle_new_workspace_shell(
     cmd.env("TERM", "xterm-256color");
     cmd.env("WORKSPACE_ID", workspace_id.to_string());
     cmd.env("WORKSPACE_NAME", &workspace.name);
+    for (key, value) in &workspace.env_vars {
+        if key.trim().is_empty() {
+            continue;
+        }
+        cmd.env(key, value);
+    }
 
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
@@ -763,6 +833,18 @@ async fn handle_new_workspace_shell(
             return;
         }
     };
+
+    if let Ok(Some(status)) = child.try_wait() {
+        tracing::warn!("Workspace shell exited immediately: {:?}", status);
+        let _ = socket
+            .send(Message::Text(format!(
+                "Workspace shell exited immediately: {:?}",
+                status
+            )))
+            .await;
+        let _ = socket.close().await;
+        return;
+    }
     drop(pair.slave);
 
     let mut reader = match pair.master.try_clone_reader() {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::mcp::{McpRegistry, McpTransport};
+use crate::mcp::{McpRegistry, McpScope, McpTransport};
 
 /// OpenCode connection configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,7 +291,11 @@ fn resolve_opencode_config_path() -> PathBuf {
         }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home).join(".opencode").join("opencode.json")
+    // OpenCode stores its config under ~/.config/opencode by default.
+    PathBuf::from(home)
+        .join(".config")
+        .join("opencode")
+        .join("opencode.json")
 }
 
 pub async fn ensure_global_config(mcp: &McpRegistry) -> anyhow::Result<()> {
@@ -299,6 +303,8 @@ pub async fn ensure_global_config(mcp: &McpRegistry) -> anyhow::Result<()> {
     if let Some(parent) = config_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let legacy_path = PathBuf::from(home).join(".opencode").join("opencode.json");
 
     let mut root: Value = if config_path.exists() {
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap_or_default();
@@ -314,6 +320,9 @@ pub async fn ensure_global_config(mcp: &McpRegistry) -> anyhow::Result<()> {
     let mcp_configs = mcp.list_configs().await;
     let mut mcp_entries = serde_json::Map::new();
     for config in mcp_configs.iter().filter(|c| c.enabled) {
+        if config.scope != McpScope::Global {
+            continue;
+        }
         if config.name == "desktop" || config.name == "playwright" {
             continue;
         }
@@ -337,14 +346,24 @@ pub async fn ensure_global_config(mcp: &McpRegistry) -> anyhow::Result<()> {
         .as_object_mut()
         .expect("tools object");
     tools_obj.insert("bash".to_string(), json!(false));
-    tools_obj.insert("desktop_*".to_string(), json!(false));
-    tools_obj.insert("playwright_*".to_string(), json!(false));
-    tools_obj.insert("browser_*".to_string(), json!(false));
+    tools_obj.insert("desktop_*".to_string(), json!(true));
+    tools_obj.insert("playwright_*".to_string(), json!(true));
+    tools_obj.insert("browser_*".to_string(), json!(true));
     tools_obj.insert("host_*".to_string(), json!(true));
 
     let payload = serde_json::to_string_pretty(&root)?;
     tokio::fs::write(&config_path, payload).await?;
     tracing::info!(path = %config_path.display(), "Ensured OpenCode global config");
+
+    // Keep legacy ~/.opencode/opencode.json (if present) in sync to avoid conflicts.
+    if legacy_path != config_path && legacy_path.exists() {
+        if let Some(parent) = legacy_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let payload = serde_json::to_string_pretty(&root)?;
+        tokio::fs::write(&legacy_path, payload).await?;
+        tracing::info!(path = %legacy_path.display(), "Synced legacy OpenCode config");
+    }
 
     Ok(())
 }

@@ -332,12 +332,16 @@ impl OpenCodeClient {
     async fn send_message_internal(
         &self,
         session_id: &str,
-        _directory: &str,
+        directory: &str,
         content: &str,
         model: Option<&str>,
         agent: Option<&str>,
     ) -> anyhow::Result<OpenCodeMessageResponse> {
-        let url = format!("{}/session/{}/message", self.base_url, session_id);
+        let mut url = format!("{}/session/{}/message", self.base_url, session_id);
+        if !directory.is_empty() {
+            url.push_str("?directory=");
+            url.push_str(&urlencoding::encode(directory));
+        }
 
         let mut body = serde_json::Map::new();
         body.insert(

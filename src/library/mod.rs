@@ -13,6 +13,7 @@ mod git;
 pub mod types;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -21,6 +22,22 @@ use tracing::info;
 pub use git::GitAuthor;
 pub use types::*;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceTemplateConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distro: Option<String>,
+    #[serde(default)]
+    skills: Vec<String>,
+    #[serde(default)]
+    env_vars: HashMap<String, String>,
+    #[serde(default)]
+    init_script: String,
+}
+
 // Directory constants (OpenCode-aligned structure)
 const SKILL_DIR: &str = "skill";
 const COMMAND_DIR: &str = "command";
@@ -28,6 +45,7 @@ const AGENT_DIR: &str = "agent";
 const TOOL_DIR: &str = "tool";
 const RULE_DIR: &str = "rule";
 const PLUGINS_FILE: &str = "plugins.json";
+const WORKSPACE_TEMPLATE_DIR: &str = "workspace-template";
 
 // Legacy directory names (for migration)
 const LEGACY_SKILLS_DIR: &str = "skills";
@@ -1147,6 +1165,140 @@ impl LibraryStore {
             fs::remove_file(&tool_path)
                 .await
                 .context("Failed to delete tool file")?;
+        }
+
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Workspace Templates (workspace-template/*.json)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// List all workspace templates with their summaries.
+    pub async fn list_workspace_templates(&self) -> Result<Vec<WorkspaceTemplateSummary>> {
+        let templates_dir = self.path.join(WORKSPACE_TEMPLATE_DIR);
+
+        if !templates_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut templates = Vec::new();
+        let mut entries = fs::read_dir(&templates_dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let entry_path = entry.path();
+
+            // Only process .json files
+            let Some(ext) = entry_path.extension() else {
+                continue;
+            };
+            if ext != "json" {
+                continue;
+            }
+
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let name = file_name.trim_end_matches(".json").to_string();
+
+            let content = fs::read_to_string(&entry_path).await.ok();
+            let config = content
+                .as_ref()
+                .and_then(|c| serde_json::from_str::<WorkspaceTemplateConfig>(c).ok());
+
+            let description = config.as_ref().and_then(|c| c.description.clone());
+            let distro = config.as_ref().and_then(|c| c.distro.clone());
+            let skills = config
+                .as_ref()
+                .map(|c| c.skills.clone())
+                .unwrap_or_default();
+            let template_name = config
+                .as_ref()
+                .and_then(|c| c.name.clone())
+                .unwrap_or_else(|| name.clone());
+
+            templates.push(WorkspaceTemplateSummary {
+                name: template_name,
+                description,
+                distro,
+                skills,
+                path: format!("{}/{}", WORKSPACE_TEMPLATE_DIR, file_name),
+            });
+        }
+
+        templates.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(templates)
+    }
+
+    /// Get a workspace template by name with full content.
+    pub async fn get_workspace_template(&self, name: &str) -> Result<WorkspaceTemplate> {
+        Self::validate_name(name)?;
+        let template_path = self
+            .path
+            .join(WORKSPACE_TEMPLATE_DIR)
+            .join(format!("{}.json", name));
+
+        if !template_path.exists() {
+            anyhow::bail!("Workspace template not found: {}", name);
+        }
+
+        let content = fs::read_to_string(&template_path)
+            .await
+            .context("Failed to read workspace template file")?;
+
+        let config: WorkspaceTemplateConfig = serde_json::from_str(&content)
+            .context("Failed to parse workspace template file")?;
+
+        Ok(WorkspaceTemplate {
+            name: config.name.unwrap_or_else(|| name.to_string()),
+            description: config.description,
+            path: format!("{}/{}.json", WORKSPACE_TEMPLATE_DIR, name),
+            distro: config.distro,
+            skills: config.skills,
+            env_vars: config.env_vars,
+            init_script: config.init_script,
+        })
+    }
+
+    /// Save a workspace template.
+    pub async fn save_workspace_template(
+        &self,
+        name: &str,
+        template: &WorkspaceTemplate,
+    ) -> Result<()> {
+        Self::validate_name(name)?;
+        let templates_dir = self.path.join(WORKSPACE_TEMPLATE_DIR);
+        let template_path = templates_dir.join(format!("{}.json", name));
+
+        fs::create_dir_all(&templates_dir).await?;
+
+        let config = WorkspaceTemplateConfig {
+            name: Some(name.to_string()),
+            description: template.description.clone(),
+            distro: template.distro.clone(),
+            skills: template.skills.clone(),
+            env_vars: template.env_vars.clone(),
+            init_script: template.init_script.clone(),
+        };
+
+        let content = serde_json::to_string_pretty(&config)?;
+        fs::write(&template_path, content)
+            .await
+            .context("Failed to write workspace template file")?;
+
+        Ok(())
+    }
+
+    /// Delete a workspace template.
+    pub async fn delete_workspace_template(&self, name: &str) -> Result<()> {
+        Self::validate_name(name)?;
+        let template_path = self
+            .path
+            .join(WORKSPACE_TEMPLATE_DIR)
+            .join(format!("{}.json", name));
+
+        if template_path.exists() {
+            fs::remove_file(&template_path)
+                .await
+                .context("Failed to delete workspace template file")?;
         }
 
         Ok(())

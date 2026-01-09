@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { toast } from '@/components/toast';
-import { type McpServerDef, type McpServerState, type McpTransport, type McpStatus, listMcps, enableMcp, disableMcp, refreshMcp, updateMcp } from '@/lib/api';
+import { type McpScope, type McpServerDef, type McpServerState, type McpTransport, type McpStatus, type UpdateMcpRequest, listMcps, enableMcp, disableMcp, refreshMcp, updateMcp } from '@/lib/api';
 import {
   AlertCircle,
   Check,
@@ -301,6 +301,16 @@ function RuntimeMcpCard({
           <div className="flex items-center gap-2">
             <h3 className="font-medium text-white truncate">{mcp.name}</h3>
             <span className="tag bg-cyan-500/10 text-cyan-400 border-cyan-500/20">Runtime</span>
+            <span
+              className={cn(
+                'tag',
+                mcp.scope === 'workspace'
+                  ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                  : 'bg-white/[0.04] text-white/50 border-white/[0.08]'
+              )}
+            >
+              {mcp.scope === 'workspace' ? 'Workspace' : 'Global'}
+            </span>
           </div>
           <div className="flex items-center gap-1 group">
             <p className="text-xs text-white/40 truncate">
@@ -376,13 +386,14 @@ function RuntimeMcpDetailPanel({
 }: {
   mcp: McpServerState;
   onClose: () => void;
-  onUpdate: (id: string, transport: McpTransport) => Promise<void>;
+  onUpdate: (id: string, updates: UpdateMcpRequest) => Promise<void>;
   onRefresh: (id: string) => Promise<void>;
 }) {
   const isStdio = 'stdio' in (mcp.transport ?? {});
   const isHttp = 'http' in (mcp.transport ?? {});
   const stdioConfig = isStdio ? (mcp.transport as { stdio: { command: string; args: string[]; env: Record<string, string> } }).stdio : null;
   const httpConfig = isHttp ? (mcp.transport as { http: { endpoint: string; headers: Record<string, string> } }).http : null;
+  const [scope, setScope] = useState<McpScope>(mcp.scope ?? 'global');
 
   // For stdio: env vars; for http: headers
   const [keyValuePairs, setKeyValuePairs] = useState<Array<{ key: string; value: string }>>(
@@ -410,7 +421,8 @@ function RuntimeMcpDetailPanel({
       const config = (mcp.transport as { http: { endpoint: string; headers: Record<string, string> } }).http;
       setKeyValuePairs(Object.entries(config?.headers ?? {}).map(([key, value]) => ({ key, value })));
     }
-  }, [mcp.transport]);
+    setScope(mcp.scope ?? 'global');
+  }, [mcp.transport, mcp.scope]);
 
   // Handle Escape key to close panel
   useEffect(() => {
@@ -471,7 +483,7 @@ function RuntimeMcpDetailPanel({
         return;
       }
 
-      await onUpdate(mcp.id, transport);
+      await onUpdate(mcp.id, { transport, scope });
       toast.success(isStdio ? 'Saved environment variables' : 'Saved headers');
     } catch {
       toast.error('Failed to save');
@@ -515,6 +527,16 @@ function RuntimeMcpDetailPanel({
             <div className="flex items-center gap-2">
               <h2 className="text-lg font-semibold text-white">{mcp.name}</h2>
               <span className="tag bg-cyan-500/10 text-cyan-400 border-cyan-500/20">Runtime</span>
+              <span
+                className={cn(
+                  'tag',
+                  scope === 'workspace'
+                    ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                    : 'bg-white/[0.04] text-white/50 border-white/[0.08]'
+                )}
+              >
+                {scope === 'workspace' ? 'Workspace' : 'Global'}
+              </span>
             </div>
             <div className="flex items-center gap-2 mt-1">
               <span className={cn(
@@ -540,6 +562,23 @@ function RuntimeMcpDetailPanel({
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-4">
+            <p className="text-xs text-white/40 mb-2">Scope</p>
+            <div className="flex items-center gap-2">
+              <select
+                value={scope}
+                onChange={(e) => setScope(e.target.value as McpScope)}
+                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-2 py-2 text-xs text-white focus:border-cyan-500/50 focus:outline-none"
+              >
+                <option value="global">Global (host-level)</option>
+                <option value="workspace">Workspace (installed per workspace)</option>
+              </select>
+            </div>
+            <p className="mt-2 text-[11px] text-white/40">
+              Workspace-scoped MCPs must be installed in the workspace init script.
+            </p>
+          </div>
+
           {isStdio && stdioConfig && (
             <>
               <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-4">
@@ -1182,8 +1221,8 @@ export default function McpsPage() {
     }
   };
 
-  const handleUpdateRuntimeMcp = async (id: string, transport: McpTransport) => {
-    const updated = await updateMcp(id, { transport });
+  const handleUpdateRuntimeMcp = async (id: string, updates: UpdateMcpRequest) => {
+    const updated = await updateMcp(id, updates);
     setRuntimeMcps((prev) => prev.map((m) => (m.id === id ? updated : m)));
     setSelectedRuntimeMcp((prev) => (prev?.id === id ? updated : prev));
   };

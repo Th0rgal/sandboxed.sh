@@ -27,6 +27,7 @@ use crate::workspace;
 use super::control::{
     AgentEvent, AgentTreeNode, ControlStatus, ExecutionProgress, FrontendToolHub,
 };
+use super::library::SharedLibrary;
 
 /// State of a running mission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +207,7 @@ impl MissionRunner {
         root_agent: AgentRef,
         mcp: Arc<McpRegistry>,
         workspaces: workspace::SharedWorkspaceStore,
+        library: SharedLibrary,
         events_tx: broadcast::Sender<AgentEvent>,
         tool_hub: Arc<FrontendToolHub>,
         status: Arc<RwLock<ControlStatus>>,
@@ -256,6 +258,7 @@ impl MissionRunner {
                 root_agent,
                 mcp,
                 workspaces,
+                library,
                 events_tx,
                 tool_hub,
                 status,
@@ -356,6 +359,7 @@ async fn run_mission_turn(
     root_agent: AgentRef,
     mcp: Arc<McpRegistry>,
     workspaces: workspace::SharedWorkspaceStore,
+    library: SharedLibrary,
     events_tx: broadcast::Sender<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
     status: Arc<RwLock<ControlStatus>>,
@@ -432,7 +436,11 @@ async fn run_mission_turn(
     let workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
     let workspace_root = workspace.path.clone();
     let mission_work_dir =
-        match workspace::prepare_mission_workspace_in(&workspace, &mcp, mission_id).await {
+        match {
+            let lib_guard = library.read().await;
+            let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
+            workspace::prepare_mission_workspace_with_skills(&workspace, &mcp, lib_ref, mission_id).await
+        } {
             Ok(dir) => {
                 tracing::info!(
                     "Mission {} workspace directory: {}",

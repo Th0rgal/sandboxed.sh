@@ -22,18 +22,22 @@ test.describe('Overview Page', () => {
     await page.goto('/');
 
     // Should have New Mission link/button
-    const newMissionLink = page.getByRole('link', { name: /New Mission/i });
-    await expect(newMissionLink).toBeVisible();
+    const newMissionButton = page.getByRole('button', { name: /New Mission/i });
+    await expect(newMissionButton).toBeVisible();
   });
 
-  test('should navigate to control page via New Mission', async ({ page }) => {
+  test('should open new mission dialog', async ({ page }) => {
     await page.goto('/');
 
     // Click New Mission
-    await page.getByRole('link', { name: /New Mission/i }).click();
+    await page.getByRole('button', { name: /New Mission/i }).click();
 
-    // Should navigate to /control
-    await expect(page).toHaveURL(/\/control/);
+    // Should show mission dialog
+    await expect(page.getByRole('heading', { name: /Create New Mission/i })).toBeVisible();
+
+    // Close dialog
+    await page.getByRole('button', { name: /Cancel/i }).click();
+    await expect(page.getByRole('heading', { name: /Create New Mission/i })).not.toBeVisible();
   });
 
   test('should show radar visualization', async ({ page }) => {

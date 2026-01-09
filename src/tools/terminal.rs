@@ -162,6 +162,20 @@ fn parse_env(args: &Value) -> HashMap<String, String> {
     envs
 }
 
+fn workspace_env_vars() -> HashMap<String, String> {
+    let mut envs = HashMap::new();
+    let Ok(raw) = env::var("OPEN_AGENT_WORKSPACE_ENV_VARS") else {
+        return envs;
+    };
+    if raw.trim().is_empty() {
+        return envs;
+    }
+    if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&raw) {
+        envs.extend(map);
+    }
+    envs
+}
+
 fn parse_max_output_chars(args: &Value) -> usize {
     let max = args
         .get("max_output_chars")
@@ -358,7 +372,10 @@ async fn run_container_command(
         }
     }
 
-    for (key, value) in &options.env {
+    let mut merged_env = workspace_env_vars();
+    merged_env.extend(options.env.clone());
+
+    for (key, value) in &merged_env {
         args.push(format!("--setenv={}={}", key, value));
     }
 

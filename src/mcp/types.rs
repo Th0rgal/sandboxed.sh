@@ -46,6 +46,20 @@ pub enum McpStatus {
     Disabled,
 }
 
+/// Scope for MCP servers (global or workspace-scoped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpScope {
+    Global,
+    Workspace,
+}
+
+impl Default for McpScope {
+    fn default() -> Self {
+        Self::Global
+    }
+}
+
 // ==================== JSON-RPC 2.0 Types ====================
 
 /// JSON-RPC 2.0 request
@@ -160,6 +174,9 @@ pub struct McpServerConfig {
     pub name: String,
     /// Transport configuration (HTTP or stdio)
     pub transport: McpTransport,
+    /// Scope for this MCP (global or workspace-scoped)
+    #[serde(default)]
+    pub scope: McpScope,
     /// Server endpoint URL (e.g., "http://127.0.0.1:4011") - DEPRECATED, use transport
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub endpoint: String,
@@ -191,6 +208,7 @@ impl McpServerConfig {
                 endpoint: endpoint.clone(),
                 headers: std::collections::HashMap::new(),
             },
+            scope: McpScope::Global,
             endpoint, // Keep for backwards compat
             description: None,
             enabled: true,
@@ -213,6 +231,7 @@ impl McpServerConfig {
             id: Uuid::new_v4(),
             name,
             transport: McpTransport::Stdio { command, args, env },
+            scope: McpScope::Global,
             endpoint: String::new(),
             description: None,
             enabled: true,
@@ -292,6 +311,8 @@ pub struct AddMcpRequest {
     #[serde(default)]
     pub transport: Option<McpTransport>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub scope: Option<McpScope>,
 }
 
 impl AddMcpRequest {
@@ -318,6 +339,7 @@ pub struct UpdateMcpRequest {
     pub transport: Option<McpTransport>,
     pub description: Option<String>,
     pub enabled: Option<bool>,
+    pub scope: Option<McpScope>,
 }
 
 /// MCP tool list response from server.

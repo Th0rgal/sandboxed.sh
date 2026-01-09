@@ -13,7 +13,7 @@ test.describe('Navigation', () => {
 
     await page.goto('/agents');
     await expect(page).toHaveURL(/\/agents/);
-    await expect(page.getByRole('heading', { name: 'Agents' })).toBeVisible();
+    await expect(page.locator('button[title="New Agent"]')).toBeVisible();
 
     await page.goto('/workspaces');
     await expect(page).toHaveURL(/\/workspaces/);
@@ -35,6 +35,7 @@ test.describe('Navigation', () => {
     await expect(page).toHaveURL(/\/control/);
 
     // Navigate to Agents via sidebar
+    await sidebar.getByRole('button', { name: /Config/i }).click();
     await sidebar.getByRole('link', { name: /Agents/i }).click();
     await expect(page).toHaveURL(/\/agents/);
 
@@ -43,20 +44,33 @@ test.describe('Navigation', () => {
     await expect(page).toHaveURL('/');
   });
 
-  test('should expand Library submenu', async ({ page }) => {
+  test('should expand Config submenu', async ({ page }) => {
     await page.goto('/');
 
-    // Click Library button to expand (it's a button, not a link)
-    await page.getByRole('button', { name: /Library/i }).click();
+    // Click Config button to expand (it's a button, not a link)
+    await page.getByRole('button', { name: /Config/i }).click();
 
     // Should show submenu items
-    await expect(page.getByRole('link', { name: /MCP Servers/i })).toBeVisible();
+    await expect(page.getByRole('link', { name: /Agents/i })).toBeVisible();
     await expect(page.getByRole('link', { name: /Skills/i })).toBeVisible();
     await expect(page.getByRole('link', { name: /Commands/i })).toBeVisible();
+    await expect(page.getByRole('link', { name: /Rules/i })).toBeVisible();
 
     // Click on Skills to navigate
     await page.getByRole('link', { name: /Skills/i }).click();
-    await expect(page).toHaveURL(/\/library\/skills/);
+    await expect(page).toHaveURL(/\/config\/skills/);
+  });
+
+  test('should expand Extensions submenu', async ({ page }) => {
+    await page.goto('/');
+
+    // Click Extensions button to expand (it's a button, not a link)
+    await page.getByRole('button', { name: /Extensions/i }).click();
+
+    // Should show submenu items
+    await expect(page.getByRole('link', { name: /MCP Servers/i })).toBeVisible();
+    await expect(page.getByRole('link', { name: /Plugins/i })).toBeVisible();
+    await expect(page.getByRole('link', { name: /Tools/i })).toBeVisible();
   });
 
   test('sidebar should be visible on all pages', async ({ page }) => {
@@ -68,23 +82,23 @@ test.describe('Navigation', () => {
       // Sidebar should contain navigation links
       await expect(page.getByRole('link', { name: /Overview/i })).toBeVisible();
       await expect(page.getByRole('link', { name: 'Mission', exact: true })).toBeVisible();
-      await expect(page.getByRole('link', { name: /Agents/i })).toBeVisible();
+      await expect(page.getByRole('button', { name: /Config/i })).toBeVisible();
     }
   });
 
-  test('should navigate to Library subpages', async ({ page }) => {
+  test('should navigate to Config and Extensions subpages', async ({ page }) => {
     // Navigate to MCP Servers
-    await page.goto('/library/mcps');
+    await page.goto('/extensions/mcps');
     // Wait for page to load (either shows MCP content or "Library unavailable" message)
     await expect(page.getByText(/MCP Servers|Library unavailable|Add MCP/i).first()).toBeVisible();
 
     // Navigate to Skills
-    await page.goto('/library/skills');
+    await page.goto('/config/skills');
     // Wait for page to load (either shows Skills content or "Library unavailable" message)
     await expect(page.getByText(/Skills|Library unavailable|Select a skill/i).first()).toBeVisible();
 
     // Navigate to Commands
-    await page.goto('/library/commands');
+    await page.goto('/config/commands');
     // Wait for page to load (either shows Commands content or "Library unavailable" message)
     await expect(page.getByText(/Commands|Library unavailable|Select a command/i).first()).toBeVisible();
   });

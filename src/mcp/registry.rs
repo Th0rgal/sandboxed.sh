@@ -135,7 +135,7 @@ impl McpRegistry {
             Vec::new(),
             HashMap::new(),
         );
-        let playwright = McpServerConfig::new_stdio(
+        let mut playwright = McpServerConfig::new_stdio(
             "playwright".to_string(),
             "npx".to_string(),
             vec![
@@ -145,6 +145,7 @@ impl McpRegistry {
             ],
             HashMap::new(),
         );
+        playwright.scope = McpScope::Workspace;
 
         vec![host, desktop, playwright]
     }
@@ -181,6 +182,16 @@ impl McpRegistry {
         for config in configs.iter_mut() {
             if config.name != "playwright" {
                 continue;
+            }
+
+            if config.scope != McpScope::Workspace {
+                config.scope = McpScope::Workspace;
+                let id = config.id;
+                let _ = config_store
+                    .update(id, |c| {
+                        c.scope = McpScope::Workspace;
+                    })
+                    .await;
             }
 
             let missing_flags: Vec<&str> = match &config.transport {
@@ -240,6 +251,16 @@ impl McpRegistry {
                         })
                         .await;
                 }
+            }
+
+            if config.scope != McpScope::Global {
+                config.scope = McpScope::Global;
+                let id = config.id;
+                let _ = config_store
+                    .update(id, |c| {
+                        c.scope = McpScope::Global;
+                    })
+                    .await;
             }
         }
 
@@ -478,6 +499,9 @@ impl McpRegistry {
             ),
         };
         config.description = req.description;
+        if let Some(scope) = req.scope {
+            config.scope = scope;
+        }
 
         // Save to persistent store
         let config = self.config_store.add(config).await?;
@@ -594,6 +618,9 @@ impl McpRegistry {
                 }
                 if let Some(enabled) = req.enabled {
                     c.enabled = enabled;
+                }
+                if let Some(scope) = req.scope {
+                    c.scope = scope;
                 }
                 if let Some(transport) = &req.transport {
                     c.transport = transport.clone();

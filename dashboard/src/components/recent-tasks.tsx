@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { cn } from "@/lib/utils";
-import { listMissions, Mission } from "@/lib/api";
+import { isNetworkError, listMissions, Mission } from "@/lib/api";
 import {
   ArrowRight,
   CheckCircle,
@@ -51,6 +51,7 @@ export function RecentTasks() {
           .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
         setMissions(sorted);
       } catch (error) {
+        if (isNetworkError(error)) return;
         console.error("Failed to fetch missions:", error);
       } finally {
         setLoading(false);

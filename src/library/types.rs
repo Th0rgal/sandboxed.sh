@@ -174,6 +174,52 @@ pub struct LibraryTool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Workspace Template Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Workspace template summary for listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceTemplateSummary {
+    /// Template name
+    pub name: String,
+    /// Description from template file
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root (e.g., "workspace-template/basic-ubuntu.json")
+    pub path: String,
+    /// Preferred distro (if set)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distro: Option<String>,
+    /// Skills enabled for this template (optional summary)
+    #[serde(default)]
+    pub skills: Vec<String>,
+}
+
+/// Full workspace template definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceTemplate {
+    /// Template name
+    pub name: String,
+    /// Optional description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root
+    pub path: String,
+    /// Preferred distro (if set)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distro: Option<String>,
+    /// Skills enabled for this workspace template
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Environment variables for the workspace
+    #[serde(default)]
+    pub env_vars: HashMap<String, String>,
+    /// Init script to run on build
+    #[serde(default)]
+    pub init_script: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Skill Types (supports multiple .md files per skill)
 // ─────────────────────────────────────────────────────────────────────────────
 

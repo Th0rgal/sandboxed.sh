@@ -2564,6 +2564,7 @@ async fn control_actor_loop(
                                 Arc::clone(&root_agent),
                                 Arc::clone(&mcp),
                                 Arc::clone(&workspaces),
+                                library.clone(),
                                 events_tx.clone(),
                                 Arc::clone(&tool_hub),
                                 Arc::clone(&status),

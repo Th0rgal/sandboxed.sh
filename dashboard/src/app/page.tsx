@@ -7,7 +7,7 @@ import { StatsCard } from '@/components/stats-card';
 import { ConnectionStatus } from '@/components/connection-status';
 import { RecentTasks } from '@/components/recent-tasks';
 import { ShimmerStat } from '@/components/ui/shimmer';
-import { createMission, getStats, listWorkspaces, type StatsResponse, type Workspace } from '@/lib/api';
+import { createMission, getStats, isNetworkError, listWorkspaces, type StatsResponse, type Workspace } from '@/lib/api';
 import { Activity, CheckCircle, DollarSign, Zap } from 'lucide-react';
 import { formatCents } from '@/lib/utils';
 import { SystemMonitor } from '@/components/system-monitor';
@@ -63,6 +63,7 @@ export default function OverviewPage() {
         setWorkspaces(data);
       })
       .catch((err) => {
+        if (isNetworkError(err)) return;
         console.error('Failed to fetch workspaces:', err);
       });
   }, []);

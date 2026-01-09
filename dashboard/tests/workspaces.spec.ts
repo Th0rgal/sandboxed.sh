@@ -36,8 +36,9 @@ test.describe('Workspaces Page', () => {
     // Check for name input
     await expect(page.getByPlaceholder(/workspace|name/i)).toBeVisible();
 
-    // Check for type selector
-    await expect(page.locator('select')).toBeVisible();
+    // Check for template and type selectors
+    await expect(page.getByText('Template').locator('..').locator('select')).toBeVisible();
+    await expect(page.getByText('Type').locator('..').locator('select')).toBeVisible();
   });
 
   test('should validate workspace creation form', async ({ page }) => {
@@ -64,12 +65,25 @@ test.describe('Workspaces Page', () => {
     await page.getByRole('button', { name: /New Workspace/i }).click();
 
     // Check type selector has options
-    const select = page.locator('select');
+    const select = page.getByText('Type').locator('..').locator('select');
     await expect(select).toBeVisible();
 
     // Should have Host and Chroot options
     const options = await select.locator('option').allTextContents();
     expect(options.some(opt => opt.toLowerCase().includes('host'))).toBeTruthy();
-    expect(options.some(opt => opt.toLowerCase().includes('chroot'))).toBeTruthy();
+    expect(options.some(opt => opt.toLowerCase().includes('isolated'))).toBeTruthy();
+  });
+
+  test('should show template selector options', async ({ page }) => {
+    await page.goto('/workspaces');
+
+    // Open new workspace dialog
+    await page.getByRole('button', { name: /New Workspace/i }).click();
+
+    const templateSelect = page.getByText('Template').locator('..').locator('select');
+    await expect(templateSelect).toBeVisible();
+
+    const options = await templateSelect.locator('option').allTextContents();
+    expect(options.some(opt => opt.includes('No template'))).toBeTruthy();
   });
 });

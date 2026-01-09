@@ -47,6 +47,21 @@ export interface LoginResponse {
   exp: number;
 }
 
+export function isNetworkError(error: unknown): boolean {
+  if (!error) return false;
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase();
+    return (
+      message.includes("failed to fetch") ||
+      message.includes("networkerror") ||
+      message.includes("load failed") ||
+      message.includes("network request failed") ||
+      message.includes("offline")
+    );
+  }
+  return false;
+}
+
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   const headers: Record<string, string> = {
     ...(init?.headers ? (init.headers as Record<string, string>) : {}),
@@ -600,16 +615,37 @@ export async function getProgress(): Promise<ExecutionProgress> {
   return res.json();
 }
 
+export type StreamDiagnosticPhase = "connecting" | "open" | "chunk" | "event" | "closed" | "error";
+
+export type StreamDiagnosticUpdate = {
+  phase: StreamDiagnosticPhase;
+  url: string;
+  status?: number;
+  headers?: Record<string, string>;
+  bytes?: number;
+  error?: string;
+  timestamp: number;
+};
+
 export function streamControl(
-  onEvent: (event: { type: string; data: unknown }) => void
+  onEvent: (event: { type: string; data: unknown }) => void,
+  onDiagnostics?: (update: StreamDiagnosticUpdate) => void
 ): () => void {
   const controller = new AbortController();
   const decoder = new TextDecoder();
   let buffer = "";
+  let bytesRead = 0;
+  const streamUrl = apiUrl("/api/control/stream");
+
+  onDiagnostics?.({
+    phase: "connecting",
+    url: streamUrl,
+    timestamp: Date.now(),
+  });
 
   void (async () => {
     try {
-      const res = await apiFetch("/api/control/stream", {
+      const res = await apiFetch(streamUrl, {
         method: "GET",
         headers: { Accept: "text/event-stream" },
         signal: controller.signal,
@@ -623,6 +659,13 @@ export function streamControl(
             status: res.status,
           },
         });
+        onDiagnostics?.({
+          phase: "error",
+          url: streamUrl,
+          status: res.status,
+          error: `Stream request failed (${res.status})`,
+          timestamp: Date.now(),
+        });
         return;
       }
       if (!res.body) {
@@ -630,14 +673,49 @@ export function streamControl(
           type: "error",
           data: { message: "Stream response had no body" },
         });
+        onDiagnostics?.({
+          phase: "error",
+          url: streamUrl,
+          status: res.status,
+          error: "Stream response had no body",
+          timestamp: Date.now(),
+        });
         return;
       }
+
+      const headers: Record<string, string> = {};
+      res.headers.forEach((value, key) => {
+        headers[key.toLowerCase()] = value;
+      });
+      onDiagnostics?.({
+        phase: "open",
+        url: streamUrl,
+        status: res.status,
+        headers,
+        timestamp: Date.now(),
+      });
 
       const reader = res.body.getReader();
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+        if (value) {
+          bytesRead += value.length;
+        }
+        let chunk = decoder.decode(value, { stream: true });
+        if (buffer.endsWith("\r") && chunk.startsWith("\n")) {
+          buffer = buffer.slice(0, -1);
+        }
+        buffer += chunk;
+        if (buffer.includes("\r")) {
+          buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        }
+        onDiagnostics?.({
+          phase: "chunk",
+          url: streamUrl,
+          bytes: bytesRead,
+          timestamp: Date.now(),
+        });
 
         let idx = buffer.indexOf("\n\n");
         while (idx !== -1) {
@@ -659,6 +737,12 @@ export function streamControl(
           if (!data) continue;
           try {
             onEvent({ type: eventType, data: JSON.parse(data) });
+            onDiagnostics?.({
+              phase: "event",
+              url: streamUrl,
+              bytes: bytesRead,
+              timestamp: Date.now(),
+            });
           } catch {
             // ignore parse errors
           }
@@ -669,6 +753,12 @@ export function streamControl(
       onEvent({
         type: "error",
         data: { message: "Stream ended - server closed connection" },
+      });
+      onDiagnostics?.({
+        phase: "closed",
+        url: streamUrl,
+        bytes: bytesRead,
+        timestamp: Date.now(),
       });
     } catch (err) {
       if (!controller.signal.aborted) {
@@ -681,6 +771,12 @@ export function streamControl(
           type: "error",
           data: { message: errorMessage },
         });
+        onDiagnostics?.({
+          phase: "error",
+          url: streamUrl,
+          error: errorMessage,
+          timestamp: Date.now(),
+        });
       }
     }
   })();
@@ -691,6 +787,7 @@ export function streamControl(
 // ==================== MCP Management ====================
 
 export type McpStatus = "connected" | "connecting" | "disconnected" | "error" | "disabled";
+export type McpScope = "global" | "workspace";
 
 export interface McpTransport {
   http?: { endpoint: string; headers: Record<string, string> };
@@ -702,6 +799,7 @@ export interface McpServerConfig {
   name: string;
   transport: McpTransport;
   endpoint: string;
+  scope: McpScope;
   description: string | null;
   enabled: boolean;
   version: string | null;
@@ -743,6 +841,7 @@ export async function addMcp(data: {
   name: string;
   endpoint: string;
   description?: string;
+  scope?: McpScope;
 }): Promise<McpServerState> {
   const res = await apiFetch("/api/mcp", {
     method: "POST",
@@ -786,6 +885,7 @@ export interface UpdateMcpRequest {
   description?: string;
   enabled?: boolean;
   transport?: McpTransport;
+  scope?: McpScope;
 }
 
 export async function updateMcp(id: string, data: UpdateMcpRequest): Promise<McpServerState> {
@@ -1542,6 +1642,65 @@ export async function deleteLibraryTool(name: string): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Workspace Templates
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface WorkspaceTemplateSummary {
+  name: string;
+  description?: string;
+  path: string;
+  distro?: string;
+  skills?: string[];
+}
+
+export interface WorkspaceTemplate {
+  name: string;
+  description?: string;
+  path: string;
+  distro?: string;
+  skills: string[];
+  env_vars: Record<string, string>;
+  init_script: string;
+}
+
+export async function listWorkspaceTemplates(): Promise<WorkspaceTemplateSummary[]> {
+  const res = await apiFetch("/api/library/workspace-template");
+  await ensureLibraryResponse(res, "Failed to fetch workspace templates");
+  return res.json();
+}
+
+export async function getWorkspaceTemplate(name: string): Promise<WorkspaceTemplate> {
+  const res = await apiFetch(`/api/library/workspace-template/${encodeURIComponent(name)}`);
+  await ensureLibraryResponse(res, "Failed to fetch workspace template");
+  return res.json();
+}
+
+export async function saveWorkspaceTemplate(
+  name: string,
+  data: {
+    description?: string;
+    distro?: string;
+    skills?: string[];
+    env_vars?: Record<string, string>;
+    init_script?: string;
+  }
+): Promise<void> {
+  const res = await apiFetch(`/api/library/workspace-template/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  await ensureLibraryResponse(res, "Failed to save workspace template");
+}
+
+export async function deleteWorkspaceTemplate(name: string): Promise<void> {
+  const res = await apiFetch(`/api/library/workspace-template/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+  await ensureLibraryResponse(res, "Failed to delete workspace template");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Library Migration
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1567,6 +1726,10 @@ export interface Workspace {
   created_at: string;
   skills: string[];
   plugins: string[];
+  template?: string | null;
+  distro?: string | null;
+  env_vars: Record<string, string>;
+  init_script?: string | null;
 }
 
 // List workspaces
@@ -1590,6 +1753,10 @@ export async function createWorkspace(data: {
   path?: string;
   skills?: string[];
   plugins?: string[];
+  template?: string;
+  distro?: string;
+  env_vars?: Record<string, string>;
+  init_script?: string;
 }): Promise<Workspace> {
   const res = await apiFetch("/api/workspaces", {
     method: "POST",
@@ -1607,6 +1774,10 @@ export async function updateWorkspace(
     name?: string;
     skills?: string[];
     plugins?: string[];
+    template?: string | null;
+    distro?: string | null;
+    env_vars?: Record<string, string>;
+    init_script?: string | null;
   }
 ): Promise<Workspace> {
   const res = await apiFetch(`/api/workspaces/${id}`, {
@@ -1650,12 +1821,13 @@ export const CHROOT_DISTROS: { value: ChrootDistro; label: string }[] = [
 // Build a chroot workspace
 export async function buildWorkspace(
   id: string,
-  distro?: ChrootDistro
+  distro?: ChrootDistro,
+  rebuild?: boolean
 ): Promise<Workspace> {
   const res = await apiFetch(`/api/workspaces/${id}/build`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: distro ? JSON.stringify({ distro }) : undefined,
+    body: distro || rebuild ? JSON.stringify({ distro, rebuild }) : undefined,
   });
   if (!res.ok) {
     const text = await res.text();
