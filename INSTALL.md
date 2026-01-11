@@ -123,6 +123,54 @@ curl -fsSL http://127.0.0.1:4096/global/health | jq .
 Note: Open Agent will also keep OpenCode's global config updated (MCP + tool allowlist) in:
 `~/.config/opencode/opencode.json`.
 
+### 3.2.1 Strong workspace skill isolation (recommended)
+
+OpenCode discovers skills from global locations (e.g. `~/.opencode/skill`, `~/.config/opencode/skill`)
+*and* from the project/mission directory `.opencode/skill`. To guarantee **per‑workspace** skill usage,
+run OpenCode with an isolated HOME and keep global skill dirs empty.
+
+1) Create an isolated OpenCode home:
+
+```bash
+mkdir -p /var/lib/opencode
+```
+
+2) Update `opencode.service` to use the isolated home:
+
+```ini
+Environment=HOME=/var/lib/opencode
+Environment=XDG_CONFIG_HOME=/var/lib/opencode/.config
+Environment=XDG_DATA_HOME=/var/lib/opencode/.local/share
+Environment=XDG_CACHE_HOME=/var/lib/opencode/.cache
+```
+
+3) Point Open Agent at the same OpenCode config dir (see section 6):
+
+```
+OPENCODE_CONFIG_DIR=/var/lib/opencode/.config/opencode
+```
+
+4) Move any old global skills out of the way (optional but recommended):
+
+```bash
+mv /root/.opencode/skill /root/.opencode/skill.bak-$(date +%F) 2>/dev/null || true
+mv /root/.config/opencode/skill /root/.config/opencode/skill.bak-$(date +%F) 2>/dev/null || true
+```
+
+5) Reload services:
+
+```bash
+systemctl daemon-reload
+systemctl restart opencode.service
+systemctl restart open_agent.service
+```
+
+Validation (on the server, from the repo root):
+
+```bash
+scripts/validate_skill_isolation.sh
+```
+
 ### 3.3 Install oh-my-opencode (agent pack)
 
 Install the default agent pack as root:
@@ -132,12 +180,33 @@ bunx oh-my-opencode install --no-tui
 ```
 
 This installs the **Sisyphus** default agent (plus other personalities). To preserve plugin defaults:
-- Leave `OPENCODE_AGENT` unset, or
-- Set `OPENCODE_AGENT=Sisyphus` explicitly.
+Leave the Open Agent agent/model overrides unset to use the OpenCode / oh-my-opencode defaults.
 
 Update strategy:
 - Pin a version in your Library `plugins.json` (e.g., `oh-my-opencode@1.2.3`) to lock updates.
-- Otherwise, the plugin can auto-update via OpenCode’s install hook and Open Agent sync.
+- Otherwise, the plugin can auto-update via OpenCode's install hook and Open Agent sync.
+
+### 3.4 Install opencode-gemini-auth (optional, for Google OAuth)
+
+If you want to authenticate with Google accounts (Gemini plans/quotas including free tier) via OAuth instead of API keys:
+
+```bash
+bunx opencode-gemini-auth install
+```
+
+This enables OAuth-based Google authentication, allowing users to leverage their existing Gemini plan directly within OpenCode. Features include:
+- OAuth flow with Google accounts
+- Automatic Cloud project provisioning
+- Support for thinking capabilities (Gemini 2.5/3)
+
+To authenticate via CLI (useful for testing):
+
+```bash
+opencode auth login
+# Select Google provider, then "OAuth with Google (Gemini CLI)"
+```
+
+For dashboard OAuth integration, see the Settings page which handles this flow via the API.
 
 ---
 
@@ -242,9 +311,10 @@ Example (fill in your real values):
 cat > /etc/open_agent/open_agent.env <<'EOF'
 # OpenCode backend (must match opencode.service)
 OPENCODE_BASE_URL=http://127.0.0.1:4096
-# Leave OPENCODE_AGENT unset or set to Sisyphus to keep plugin defaults
-# OPENCODE_AGENT=Sisyphus
 OPENCODE_PERMISSIVE=true
+# Optional: keep Open Agent writing OpenCode global config into the isolated home
+# (recommended if you enabled strong workspace skill isolation in section 3.2.1).
+# OPENCODE_CONFIG_DIR=/var/lib/opencode/.config/opencode
 
 # Server bind
 HOST=0.0.0.0
@@ -261,19 +331,11 @@ DASHBOARD_PASSWORD=change-me
 JWT_SECRET=change-me-to-a-long-random-string
 JWT_TTL_DAYS=30
 
-# Dashboard Console (SSH)
-CONSOLE_SSH_HOST=127.0.0.1
-CONSOLE_SSH_PORT=22
-CONSOLE_SSH_USER=root
-CONSOLE_SSH_PRIVATE_KEY_PATH=/etc/open_agent/ssh/id_ed25519
+# Dashboard Console (local shell)
+# No SSH configuration required.
 
 # Default model (provider/model). If omitted or not in provider/model format,
 # Open Agent won’t force a model and OpenCode will use its own defaults.
-DEFAULT_MODEL=anthropic/claude-opus-4-5-20251101
-
-# Web search (Tavily). If omitted, web search falls back to DuckDuckGo HTML
-# and may be blocked by CAPTCHA.
-TAVILY_API_KEY=tvly-...
 
 # Desktop tools (optional)
 DESKTOP_ENABLED=true

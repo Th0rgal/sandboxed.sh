@@ -1,7 +1,7 @@
 //! Configuration management for Open Agent.
 //!
 //! Open Agent uses OpenCode as its execution backend. Configuration can be set via environment variables:
-//! - `DEFAULT_MODEL` - Optional. Default OpenCode model to request (provider/model, e.g. `anthropic/claude-opus-4-5-20251101`).
+//! - `DEFAULT_MODEL` - Optional. Override OpenCode's default model (provider/model format). If unset, OpenCode uses its own default.
 //! - `WORKING_DIR` - Optional. Default working directory for relative paths. Defaults to `/root` in production, current directory in dev.
 //! - `HOST` - Optional. Server host. Defaults to `127.0.0.1`.
 //! - `PORT` - Optional. Server port. Defaults to `3000`.
@@ -10,21 +10,15 @@
 //! - `OPENCODE_AGENT` - Optional. OpenCode agent name (e.g., `build`, `plan`).
 //! - `OPENCODE_PERMISSIVE` - Optional. If true, auto-allows all permissions for OpenCode sessions (default: true).
 //! - `OPEN_AGENT_USERS` - Optional. JSON array of user accounts for multi-user auth.
-//! - `CONSOLE_SSH_HOST` - Optional. Host for dashboard console/file explorer SSH (default: 127.0.0.1).
-//! - `CONSOLE_SSH_PORT` - Optional. SSH port (default: 22).
-//! - `CONSOLE_SSH_USER` - Optional. SSH user (default: root).
-//! - `CONSOLE_SSH_PRIVATE_KEY_PATH` - Optional. Path to an OpenSSH private key file (recommended).
-//! - `CONSOLE_SSH_PRIVATE_KEY_B64` - Optional. Base64-encoded OpenSSH private key.
-//! - `CONSOLE_SSH_PRIVATE_KEY` - Optional. Raw (multiline) OpenSSH private key (fallback).
-//! - `SUPABASE_URL` - Optional. Supabase project URL for memory storage.
+//! - `SUPABASE_URL` - Optional. Supabase project URL (used by tools for file sharing/screenshots).
 //! - `SUPABASE_SERVICE_ROLE_KEY` - Optional. Service role key for Supabase.
-//! - `MEMORY_EMBED_MODEL` - Optional. Embedding model. Defaults to `openai/text-embedding-3-small`.
-//! - `MEMORY_RERANK_MODEL` - Optional. Reranker model.
+//! - `LIBRARY_GIT_SSH_KEY` - Optional. SSH key path for library git operations. If set to a path, uses that key.
+//!   If set to empty string, ignores ~/.ssh/config (useful when the config specifies a non-existent key).
+//!   If unset, uses default SSH behavior.
 //!
 //! Note: The agent has **full system access**. It can read/write any file, execute any command,
 //! and search anywhere on the machine. The `WORKING_DIR` is just the default for relative paths.
 
-use base64::Engine;
 use serde::Deserialize;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -38,24 +32,6 @@ pub enum ConfigError {
     InvalidValue(String, String),
 }
 
-/// Memory/storage configuration.
-#[derive(Debug, Clone)]
-pub struct MemoryConfig {
-    /// Supabase project URL
-    pub supabase_url: Option<String>,
-
-    /// Supabase service role key (for full access)
-    pub supabase_service_role_key: Option<String>,
-
-    /// Embedding model for vector storage
-    pub embed_model: String,
-
-    /// Reranker model for precision retrieval
-    pub rerank_model: Option<String>,
-
-    /// Embedding dimension (must match model output)
-    pub embed_dimension: usize,
-}
 
 /// Context injection configuration.
 ///
@@ -202,30 +178,11 @@ impl ContextConfig {
     }
 }
 
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            supabase_url: None,
-            supabase_service_role_key: None,
-            embed_model: "openai/text-embedding-3-small".to_string(),
-            rerank_model: None,
-            embed_dimension: 1536,
-        }
-    }
-}
-
-impl MemoryConfig {
-    /// Check if memory is enabled (Supabase configured)
-    pub fn is_enabled(&self) -> bool {
-        self.supabase_url.is_some() && self.supabase_service_role_key.is_some()
-    }
-}
-
 /// Agent configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Default OpenCode model identifier (provider/model format).
-    pub default_model: String,
+    /// Optional model override (provider/model format). If None, OpenCode uses its own default.
+    pub default_model: Option<String>,
 
     /// Default working directory for relative paths (agent has full system access regardless).
     /// In production, this is typically `/root`. The agent can still access any path on the system.
@@ -252,12 +209,6 @@ pub struct Config {
     /// API auth configuration (dashboard login)
     pub auth: AuthConfig,
 
-    /// Remote console/file explorer SSH configuration (optional).
-    pub console_ssh: ConsoleSshConfig,
-
-    /// Memory/storage configuration
-    pub memory: MemoryConfig,
-
     /// Context injection configuration
     pub context: ContextConfig,
 
@@ -281,39 +232,6 @@ pub struct Config {
     /// Git remote URL for the configuration library.
     /// Set via LIBRARY_REMOTE env var. Runtime settings can override this.
     pub library_remote: Option<String>,
-}
-
-/// SSH configuration for the dashboard console + file explorer.
-#[derive(Debug, Clone)]
-pub struct ConsoleSshConfig {
-    /// Host to SSH into (default: 127.0.0.1)
-    pub host: String,
-    /// SSH port (default: 22)
-    pub port: u16,
-    /// SSH username (default: root)
-    pub user: String,
-    /// Private key (OpenSSH) used for auth (prefer *_B64 env)
-    pub private_key: Option<String>,
-}
-
-impl Default for ConsoleSshConfig {
-    fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 22,
-            user: "root".to_string(),
-            private_key: None,
-        }
-    }
-}
-
-impl ConsoleSshConfig {
-    pub fn is_configured(&self) -> bool {
-        self.private_key
-            .as_ref()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
-    }
 }
 
 /// API auth configuration.
@@ -409,8 +327,7 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
-        let default_model = std::env::var("DEFAULT_MODEL")
-            .unwrap_or_else(|_| "claude-opus-4-5-20251101".to_string());
+        let default_model = std::env::var("DEFAULT_MODEL").ok();
 
         // WORKING_DIR: default working directory for relative paths.
         // In production (release build), default to /root. In dev, default to current directory.
@@ -539,39 +456,6 @@ impl Config {
             }
         }
 
-        // Memory configuration (optional)
-        let embed_model = std::env::var("MEMORY_EMBED_MODEL")
-            .unwrap_or_else(|_| "openai/text-embedding-3-small".to_string());
-
-        // Determine embed dimension from env or infer from model
-        let embed_dimension = std::env::var("MEMORY_EMBED_DIMENSION")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| infer_embed_dimension(&embed_model));
-
-        let memory = MemoryConfig {
-            supabase_url: std::env::var("SUPABASE_URL").ok(),
-            supabase_service_role_key: std::env::var("SUPABASE_SERVICE_ROLE_KEY").ok(),
-            embed_model,
-            rerank_model: std::env::var("MEMORY_RERANK_MODEL").ok(),
-            embed_dimension,
-        };
-
-        let console_ssh = ConsoleSshConfig {
-            host: std::env::var("CONSOLE_SSH_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
-            port: std::env::var("CONSOLE_SSH_PORT")
-                .ok()
-                .map(|v| {
-                    v.parse::<u16>().map_err(|e| {
-                        ConfigError::InvalidValue("CONSOLE_SSH_PORT".to_string(), format!("{}", e))
-                    })
-                })
-                .transpose()?
-                .unwrap_or(22),
-            user: std::env::var("CONSOLE_SSH_USER").unwrap_or_else(|_| "root".to_string()),
-            private_key: read_private_key_from_env()?,
-        };
-
         let context = ContextConfig::from_env();
 
         // Library configuration
@@ -591,8 +475,6 @@ impl Config {
             max_parallel_missions,
             dev_mode,
             auth,
-            console_ssh,
-            memory,
             context,
             opencode_base_url,
             opencode_agent,
@@ -604,10 +486,10 @@ impl Config {
     }
 
     /// Create a config with custom values (useful for testing).
-    pub fn new(default_model: String, working_dir: PathBuf) -> Self {
+    pub fn new(working_dir: PathBuf) -> Self {
         let library_path = working_dir.join(".openagent/library");
         Self {
-            default_model,
+            default_model: None,
             working_dir,
             host: "127.0.0.1".to_string(),
             port: 3000,
@@ -616,8 +498,6 @@ impl Config {
             max_parallel_missions: 1,
             dev_mode: true,
             auth: AuthConfig::default(),
-            console_ssh: ConsoleSshConfig::default(),
-            memory: MemoryConfig::default(),
             context: ContextConfig::default(),
             opencode_base_url: "http://127.0.0.1:4096".to_string(),
             opencode_agent: None,
@@ -634,77 +514,5 @@ fn parse_bool(value: &str) -> Result<bool, String> {
         "1" | "true" | "t" | "yes" | "y" | "on" => Ok(true),
         "0" | "false" | "f" | "no" | "n" | "off" => Ok(false),
         other => Err(format!("expected boolean-like value, got: {}", other)),
-    }
-}
-
-/// Infer embedding dimension from model name.
-fn infer_embed_dimension(model: &str) -> usize {
-    let model_lower = model.to_lowercase();
-
-    // Qwen embedding models output 4096 dimensions
-    if model_lower.contains("qwen") && model_lower.contains("embedding") {
-        return 4096;
-    }
-
-    // OpenAI text-embedding-3 models
-    if model_lower.contains("text-embedding-3") {
-        if model_lower.contains("large") {
-            return 3072;
-        }
-        return 1536; // small
-    }
-
-    // OpenAI ada
-    if model_lower.contains("ada") {
-        return 1536;
-    }
-
-    // Cohere embed models
-    if model_lower.contains("embed-english") || model_lower.contains("embed-multilingual") {
-        return 1024;
-    }
-
-    // Default fallback
-    1536
-}
-
-fn read_private_key_from_env() -> Result<Option<String>, ConfigError> {
-    // Recommended: load from file path to avoid large/multiline env values.
-    if let Ok(path) = std::env::var("CONSOLE_SSH_PRIVATE_KEY_PATH") {
-        if path.trim().is_empty() {
-            return Ok(None);
-        }
-        let s = std::fs::read_to_string(path.trim()).map_err(|e| {
-            ConfigError::InvalidValue("CONSOLE_SSH_PRIVATE_KEY_PATH".to_string(), format!("{}", e))
-        })?;
-        if s.trim().is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(s));
-    }
-
-    // Prefer base64 to avoid multiline env complications.
-    if let Ok(b64) = std::env::var("CONSOLE_SSH_PRIVATE_KEY_B64") {
-        if b64.trim().is_empty() {
-            return Ok(None);
-        }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64.trim().as_bytes())
-            .map_err(|e| {
-                ConfigError::InvalidValue(
-                    "CONSOLE_SSH_PRIVATE_KEY_B64".to_string(),
-                    format!("{}", e),
-                )
-            })?;
-        let s = String::from_utf8(bytes).map_err(|e| {
-            ConfigError::InvalidValue("CONSOLE_SSH_PRIVATE_KEY_B64".to_string(), format!("{}", e))
-        })?;
-        return Ok(Some(s));
-    }
-
-    // Fallback: raw private key in env (EnvironmentFile can support multiline).
-    match std::env::var("CONSOLE_SSH_PRIVATE_KEY") {
-        Ok(s) if !s.trim().is_empty() => Ok(Some(s)),
-        _ => Ok(None),
     }
 }

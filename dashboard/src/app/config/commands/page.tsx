@@ -20,6 +20,7 @@ import {
 import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
 import { useLibrary } from '@/contexts/library-context';
+import { ConfigCodeEditor } from '@/components/config-code-editor';
 
 export default function CommandsPage() {
   const {
@@ -330,14 +331,15 @@ Describe what this command does.
                           <Loader className="h-5 w-5 animate-spin text-white/40" />
                         </div>
                       ) : (
-                        <textarea
+                        <ConfigCodeEditor
                           value={commandContent}
-                          onChange={(e) => {
-                            setCommandContent(e.target.value);
+                          onChange={(value) => {
+                            setCommandContent(value);
                             setCommandDirty(true);
                           }}
-                          className="w-full h-full font-mono text-sm bg-[#0d0d0e] border border-white/[0.06] rounded-lg p-4 text-white/90 resize-none focus:outline-none focus:border-indigo-500/50"
-                          spellCheck={false}
+                          language="markdown"
+                          className="h-full"
+                          disabled={commandSaving}
                         />
                       )}
                     </div>

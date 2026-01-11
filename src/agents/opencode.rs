@@ -267,9 +267,12 @@ impl OpenCodeAgent {
                     .and_then(|r| r.as_str())
                     == Some("assistant")
             })
-            .and_then(|m| m.get("parts"))
-            .and_then(|p| p.as_array())
-            .map(|parts| parts.to_vec())
+            .and_then(|m| {
+                m.get("parts")
+                    .or_else(|| m.get("content"))
+                    .and_then(|p| p.as_array())
+                    .map(|parts| parts.to_vec())
+            })
     }
 
     fn emit_tool_events_from_parts(&self, parts: &[serde_json::Value], ctx: &AgentContext) {
@@ -463,8 +466,8 @@ impl Agent for OpenCodeAgent {
             }
         };
 
-        // Use the configured default model
-        let selected_model: Option<String> = Some(ctx.config.default_model.clone());
+        // Use the configured default model (if any)
+        let selected_model: Option<String> = ctx.config.default_model.clone();
         if let Some(ref model) = selected_model {
             task.analysis_mut().selected_model = Some(model.clone());
         }
@@ -511,6 +514,7 @@ impl Agent for OpenCodeAgent {
 
         // Process streaming events with cancellation support and stuck tool detection
         let mut saw_sse_event = false;
+        let mut sse_text_buffer = String::new();
         let response = if let Some(cancel) = ctx.cancel_token.clone() {
             let mut last_event_time = Instant::now();
             let mut last_stuck_check = Instant::now();
@@ -538,6 +542,11 @@ impl Agent for OpenCodeAgent {
 
                                 // Track current tool state
                                 match &oc_event {
+                                    OpenCodeEvent::TextDelta { content } => {
+                                        if !content.trim().is_empty() {
+                                            sse_text_buffer = content.clone();
+                                        }
+                                    }
                                     OpenCodeEvent::ToolCall { name, .. } => {
                                         current_tool = Some(name.clone());
                                     }
@@ -709,6 +718,11 @@ impl Agent for OpenCodeAgent {
                                 saw_sse_event = true;
                                 last_event_time = Instant::now();
                                 stuck_tool_warned = false;
+                                if let OpenCodeEvent::TextDelta { content } = &oc_event {
+                                    if !content.trim().is_empty() {
+                                        sse_text_buffer = content.clone();
+                                    }
+                                }
                                 if let OpenCodeEvent::ToolCall { tool_call_id, name, .. } = &oc_event
                                 {
                                     self.handle_frontend_tool_call(
@@ -906,7 +920,28 @@ impl Agent for OpenCodeAgent {
                 .with_terminal_reason(TerminalReason::LlmError);
         }
 
-        let output = extract_text(&response.parts);
+        let mut output = extract_text(&response.parts);
+        if output.trim().is_empty() && !sse_text_buffer.trim().is_empty() {
+            tracing::info!(
+                session_id = %session.id,
+                output_len = sse_text_buffer.len(),
+                "Using SSE text buffer as final output"
+            );
+            output = sse_text_buffer.clone();
+        }
+        if output.trim().is_empty() {
+            let part_types: Vec<String> = response
+                .parts
+                .iter()
+                .filter_map(|part| part.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .collect();
+            tracing::warn!(
+                session_id = %session.id,
+                part_count = response.parts.len(),
+                part_types = ?part_types,
+                "OpenCode response contained no text output"
+            );
+        }
 
         if let Some(node) = tree.children.iter_mut().find(|n| n.id == "opencode") {
             node.status = "completed".to_string();

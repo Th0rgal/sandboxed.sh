@@ -13,6 +13,42 @@ import { CopyButton } from "@/components/ui/copy-button";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 
+const isTerminalDebugEnabled = () => {
+  if (typeof window === "undefined") return false;
+  return window.localStorage.getItem("openagent.debug.terminal") === "1";
+};
+
+function terminalDebug(...args: unknown[]) {
+  if (!isTerminalDebugEnabled()) return;
+  // eslint-disable-next-line no-console
+  console.debug("[terminal]", ...args);
+}
+
+type WsLogLevel = "debug" | "info" | "warn" | "error";
+
+function wsLog(level: WsLogLevel, message: string, meta?: Record<string, unknown>) {
+  const prefix = "[console:ws]";
+  const args = meta ? [prefix, message, meta] : [prefix, message];
+  switch (level) {
+    case "debug":
+      // eslint-disable-next-line no-console
+      console.debug(...args);
+      break;
+    case "info":
+      // eslint-disable-next-line no-console
+      console.info(...args);
+      break;
+    case "warn":
+      // eslint-disable-next-line no-console
+      console.warn(...args);
+      break;
+    case "error":
+      // eslint-disable-next-line no-console
+      console.error(...args);
+      break;
+  }
+}
+
 type FsEntry = {
   name: string;
   path: string;
@@ -434,13 +470,17 @@ function generateTabId(): string {
 }
 
 // Terminal Tab Component
-function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isActive: boolean; onStatusChange?: (status: "disconnected" | "connecting" | "connected" | "error", reconnect: () => void) => void }) {
+function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isActive: boolean; onStatusChange?: (status: "disconnected" | "connecting" | "connected" | "error", reconnect: () => void, reset: () => void) => void }) {
   const termElRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   // Monotonically increasing counter to ignore stale websocket events.
   const wsSeqRef = useRef(0);
+  const messageCountRef = useRef(0);
+  const retryCountRef = useRef(0);
+  const rafOpenRef = useRef<number | null>(null);
+  const rafFitRef = useRef<number | null>(null);
   const mountedRef = useRef(true);
   const terminalInitializedRef = useRef(false);
   const [wsStatus, setWsStatus] = useState<
@@ -452,10 +492,16 @@ function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isAct
     // Invalidate any in-flight websocket callbacks.
     wsSeqRef.current += 1;
     const seq = wsSeqRef.current;
+    messageCountRef.current = 0;
 
     // Close existing WebSocket if any (and detach handlers so it can't write stale output)
     const prev = wsRef.current;
+    if (prev && !isReconnect && (prev.readyState === WebSocket.CONNECTING || prev.readyState === WebSocket.OPEN)) {
+      terminalDebug("ws already active; skipping connect", { tabId });
+      return prev;
+    }
     if (prev) {
+      terminalDebug("replacing websocket", { tabId, isReconnect });
       try {
         prev.onopen = null;
         prev.onmessage = null;
@@ -482,12 +528,17 @@ function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isAct
 
     let didOpen = false;
     const ws = new WebSocket(u.toString(), proto);
+    wsLog("info", "connect", { tabId, url: u.toString(), hasJwt: Boolean(jwt), isReconnect });
+    terminalDebug("ws connect", { tabId, url: u.toString(), hasJwt: Boolean(jwt), isReconnect });
     wsRef.current = ws;
 
     ws.onopen = () => {
       if (!mountedRef.current || wsSeqRef.current !== seq) return;
       didOpen = true;
+      retryCountRef.current = 0;
       setWsStatus("connected");
+      wsLog("info", "open", { tabId });
+      terminalDebug("ws open", { tabId });
       // Fit and send dimensions immediately after connection
       setTimeout(() => {
         if (!mountedRef.current || wsSeqRef.current !== seq) return;
@@ -496,22 +547,54 @@ function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isAct
           ws.send(JSON.stringify({ t: "r", c: term.cols, r: term.rows }));
         } catch { /* ignore */ }
       }, 50);
+      // If we didn't get any output, nudge the shell to redraw a prompt.
+      setTimeout(() => {
+        if (!mountedRef.current || wsSeqRef.current !== seq) return;
+        if (messageCountRef.current === 0 && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ t: "i", d: "\r" }));
+            terminalDebug("sent prompt nudge", { tabId });
+          } catch { /* ignore */ }
+        }
+      }, 300);
     };
     ws.onmessage = (evt) => {
       if (!mountedRef.current || wsSeqRef.current !== seq) return;
+      messageCountRef.current += 1;
+      if (isTerminalDebugEnabled() && messageCountRef.current <= 3) {
+        wsLog("debug", "message", {
+          tabId,
+          bytes: typeof evt.data === "string" ? evt.data.length : 0,
+        });
+        terminalDebug("ws message", {
+          tabId,
+          bytes: typeof evt.data === "string" ? evt.data.length : 0,
+        });
+      }
       term.write(typeof evt.data === "string" ? evt.data : "");
     };
     ws.onerror = () => {
       if (mountedRef.current && wsSeqRef.current === seq) {
         setWsStatus("error");
+        wsLog("error", "error", { tabId });
+        terminalDebug("ws error", { tabId });
       }
     };
     ws.onclose = (e) => {
       if (mountedRef.current && wsSeqRef.current === seq) {
         setWsStatus("disconnected");
+        wsLog("warn", "close", { tabId, code: e.code, reason: e.reason, wasClean: e.wasClean });
+        terminalDebug("ws close", { tabId, code: e.code, reason: e.reason, wasClean: e.wasClean });
         // Only show error for unexpected closures, not normal disconnects
         if (e.code === 1006 && !didOpen) {
-          term.writeln("\x1b[90mConnection failed. Check that SSH console is configured.\x1b[0m");
+          term.writeln("\x1b[90mConnection failed. Check that the console backend is reachable.\x1b[0m");
+          if (retryCountRef.current < 1) {
+            retryCountRef.current += 1;
+            setTimeout(() => {
+              if (!mountedRef.current || wsSeqRef.current !== seq) return;
+              connectWebSocket(term, fit, true);
+            }, 300);
+          }
         } else if (e.code !== 1000 && e.code !== 1001 && didOpen) {
           term.writeln("\x1b[90mDisconnected.\x1b[0m");
         }
@@ -554,19 +637,24 @@ function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isAct
       fitRef.current = fit;
 
       // Defer opening to next frame to ensure container has dimensions
-      requestAnimationFrame(() => {
+      let cancelled = false;
+      rafOpenRef.current = requestAnimationFrame(() => {
+        if (cancelled || !mountedRef.current) return;
         if (!mountedRef.current) return;
         try {
           term.open(container);
-          requestAnimationFrame(() => {
-            if (!mountedRef.current) return;
+          rafFitRef.current = requestAnimationFrame(() => {
+            if (cancelled || !mountedRef.current) return;
             try {
               fit.fit();
+              terminalDebug("terminal fit", { tabId, cols: term.cols, rows: term.rows });
             } catch { /* Ignore fit errors */ }
             // Connect WebSocket after terminal is ready
             connectWebSocket(term, fit, false);
           });
-        } catch { /* Ignore open errors */ }
+        } catch (err) {
+          terminalDebug("terminal open failed", { tabId, error: String(err) });
+        }
       });
 
       // Resize handler
@@ -593,6 +681,15 @@ function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isAct
       // Cleanup on unmount
       return () => {
         mountedRef.current = false;
+        cancelled = true;
+        if (rafOpenRef.current !== null) {
+          cancelAnimationFrame(rafOpenRef.current);
+          rafOpenRef.current = null;
+        }
+        if (rafFitRef.current !== null) {
+          cancelAnimationFrame(rafFitRef.current);
+          rafFitRef.current = null;
+        }
         // Invalidate websocket callbacks for this terminal instance.
         wsSeqRef.current += 1;
         window.removeEventListener("resize", onResize);
@@ -629,6 +726,22 @@ function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isAct
     connectWebSocket(term, fit, true);
   }, [connectWebSocket]);
 
+  const reset = useCallback(() => {
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ t: "i", d: "reset\n" }));
+        setTimeout(() => {
+          try {
+            ws.send(JSON.stringify({ t: "i", d: "stty sane\n" }));
+          } catch { /* ignore */ }
+        }, 50);
+      } catch { /* ignore */ }
+    } else {
+      reconnect();
+    }
+  }, [reconnect]);
+
   // Fit terminal when tab becomes active
   useEffect(() => {
     if (isActive && fitRef.current) {
@@ -643,9 +756,9 @@ function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isAct
   // Report status changes to parent
   useEffect(() => {
     if (isActive && onStatusChange) {
-      onStatusChange(wsStatus, reconnect);
+      onStatusChange(wsStatus, reconnect, reset);
     }
-  }, [wsStatus, reconnect, isActive, onStatusChange]);
+  }, [wsStatus, reconnect, reset, isActive, onStatusChange]);
 
   return (
     <div
@@ -671,13 +784,17 @@ function WorkspaceShellTab({
   isActive: boolean;
   workspaceId: string;
   workspaceName: string;
-  onStatusChange?: (status: "disconnected" | "connecting" | "connected" | "error", reconnect: () => void) => void;
+  onStatusChange?: (status: "disconnected" | "connecting" | "connected" | "error", reconnect: () => void, reset: () => void) => void;
 }) {
   const termElRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const wsSeqRef = useRef(0);
+  const messageCountRef = useRef(0);
+  const retryCountRef = useRef(0);
+  const rafOpenRef = useRef<number | null>(null);
+  const rafFitRef = useRef<number | null>(null);
   const mountedRef = useRef(true);
   const terminalInitializedRef = useRef(false);
   const [wsStatus, setWsStatus] = useState<
@@ -705,8 +822,13 @@ function WorkspaceShellTab({
   const connectWebSocket = useCallback((term: XTerm, fit: FitAddon, isReconnect = false) => {
     wsSeqRef.current += 1;
     const seq = wsSeqRef.current;
+    messageCountRef.current = 0;
 
     const prev = wsRef.current;
+    if (prev && !isReconnect && (prev.readyState === WebSocket.CONNECTING || prev.readyState === WebSocket.OPEN)) {
+      terminalDebug("workspace ws already active; skipping connect", { tabId, workspaceId });
+      return prev;
+    }
     if (prev) {
       try {
         prev.onopen = null;
@@ -729,12 +851,23 @@ function WorkspaceShellTab({
 
     let didOpen = false;
     const ws = new WebSocket(u.toString(), proto);
+    wsLog("info", "workspace connect", {
+      tabId,
+      workspaceId,
+      url: u.toString(),
+      hasJwt: Boolean(jwt),
+      isReconnect,
+    });
+    terminalDebug("workspace ws connect", { tabId, workspaceId, url: u.toString(), hasJwt: Boolean(jwt), isReconnect });
     wsRef.current = ws;
 
     ws.onopen = () => {
       if (!mountedRef.current || wsSeqRef.current !== seq) return;
       didOpen = true;
+      retryCountRef.current = 0;
       setWsStatus("connected");
+      wsLog("info", "workspace open", { tabId, workspaceId });
+      terminalDebug("workspace ws open", { tabId, workspaceId });
       setTimeout(() => {
         if (!mountedRef.current || wsSeqRef.current !== seq) return;
         try {
@@ -742,25 +875,65 @@ function WorkspaceShellTab({
           ws.send(JSON.stringify({ t: "r", c: term.cols, r: term.rows }));
         } catch { /* ignore */ }
       }, 50);
+      // If no output arrives, nudge to redraw a prompt.
+      setTimeout(() => {
+        if (!mountedRef.current || wsSeqRef.current !== seq) return;
+        if (messageCountRef.current === 0 && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ t: "i", d: "\r" }));
+            terminalDebug("workspace sent prompt nudge", { tabId, workspaceId });
+          } catch { /* ignore */ }
+        }
+      }, 300);
     };
     ws.onmessage = (evt) => {
       if (!mountedRef.current || wsSeqRef.current !== seq) return;
+      messageCountRef.current += 1;
+      if (isTerminalDebugEnabled() && messageCountRef.current <= 3) {
+        wsLog("debug", "workspace message", {
+          tabId,
+          workspaceId,
+          bytes: typeof evt.data === "string" ? evt.data.length : 0,
+        });
+        terminalDebug("workspace ws message", {
+          tabId,
+          workspaceId,
+          bytes: typeof evt.data === "string" ? evt.data.length : 0,
+        });
+      }
       term.write(typeof evt.data === "string" ? evt.data : "");
     };
     ws.onerror = () => {
       if (mountedRef.current && wsSeqRef.current === seq) {
         setWsStatus("error");
+        wsLog("error", "workspace error", { tabId, workspaceId });
+        terminalDebug("workspace ws error", { tabId, workspaceId });
       }
     };
     ws.onclose = (e) => {
       if (mountedRef.current && wsSeqRef.current === seq) {
         setWsStatus("disconnected");
+        wsLog("warn", "workspace close", {
+          tabId,
+          workspaceId,
+          code: e.code,
+          reason: e.reason,
+          wasClean: e.wasClean,
+        });
+        terminalDebug("workspace ws close", { tabId, workspaceId, code: e.code, reason: e.reason, wasClean: e.wasClean });
         if (e.code === 1006 && !didOpen) {
           term.writeln(`\x1b[90mConnection to workspace "${workspaceName}" failed.\x1b[0m`);
           diagnoseApiReachability(API_BASE).then((hint) => {
             if (!mountedRef.current || wsSeqRef.current !== seq || !hint) return;
             term.writeln(`\x1b[90m${hint}\x1b[0m`);
           });
+          if (retryCountRef.current < 1) {
+            retryCountRef.current += 1;
+            setTimeout(() => {
+              if (!mountedRef.current || wsSeqRef.current !== seq) return;
+              connectWebSocket(term, fit, true);
+            }, 300);
+          }
         } else if (e.code !== 1000 && e.code !== 1001 && didOpen) {
           term.writeln("\x1b[90mDisconnected.\x1b[0m");
         }
@@ -838,24 +1011,38 @@ function WorkspaceShellTab({
       window.addEventListener("resize", onResize);
 
       // Defer opening to next frame to ensure container has dimensions
-      requestAnimationFrame(() => {
+      let cancelled = false;
+      rafOpenRef.current = requestAnimationFrame(() => {
+        if (cancelled || !mountedRef.current) return;
         if (!mountedRef.current) return;
         try {
           term.open(container);
-          requestAnimationFrame(() => {
-            if (!mountedRef.current) return;
+          rafFitRef.current = requestAnimationFrame(() => {
+            if (cancelled || !mountedRef.current) return;
             try {
               fit.fit();
+              terminalDebug("workspace terminal fit", { tabId, workspaceId, cols: term.cols, rows: term.rows });
             } catch { /* Ignore fit errors */ }
             term.writeln(`\x1b[90mConnecting to workspace: ${workspaceName}...\x1b[0m`);
             // Connect WebSocket after terminal is ready
             connectWebSocket(term, fit, false);
           });
-        } catch { /* Ignore open errors */ }
+        } catch (err) {
+          terminalDebug("workspace terminal open failed", { tabId, workspaceId, error: String(err) });
+        }
       });
 
       return () => {
         mountedRef.current = false;
+        cancelled = true;
+        if (rafOpenRef.current !== null) {
+          cancelAnimationFrame(rafOpenRef.current);
+          rafOpenRef.current = null;
+        }
+        if (rafFitRef.current !== null) {
+          cancelAnimationFrame(rafFitRef.current);
+          rafFitRef.current = null;
+        }
         wsSeqRef.current += 1;
         window.removeEventListener("resize", onResize);
         try { onDataDisposable.dispose(); } catch { /* ignore */ }
@@ -885,6 +1072,22 @@ function WorkspaceShellTab({
     connectWebSocket(term, fit, true);
   }, [connectWebSocket]);
 
+  const reset = useCallback(() => {
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ t: "i", d: "reset\n" }));
+        setTimeout(() => {
+          try {
+            ws.send(JSON.stringify({ t: "i", d: "stty sane\n" }));
+          } catch { /* ignore */ }
+        }, 50);
+      } catch { /* ignore */ }
+    } else {
+      reconnect();
+    }
+  }, [reconnect]);
+
   useEffect(() => {
     if (isActive && fitRef.current) {
       const timer = setTimeout(() => {
@@ -896,9 +1099,9 @@ function WorkspaceShellTab({
 
   useEffect(() => {
     if (isActive && onStatusChange) {
-      onStatusChange(wsStatus, reconnect);
+      onStatusChange(wsStatus, reconnect, reset);
     }
-  }, [wsStatus, reconnect, isActive, onStatusChange]);
+  }, [wsStatus, reconnect, reset, isActive, onStatusChange]);
 
   return (
     <div
@@ -1482,6 +1685,7 @@ export default function ConsoleClient() {
   const [terminalStatus, setTerminalStatus] = useState<{
     status: "disconnected" | "connecting" | "connected" | "error";
     reconnect: () => void;
+    reset: () => void;
   } | null>(null);
 
   const activeTab = tabs.find(t => t.id === activeTabId);
@@ -1489,9 +1693,10 @@ export default function ConsoleClient() {
 
   const handleTerminalStatusChange = useCallback((
     status: "disconnected" | "connecting" | "connected" | "error",
-    reconnect: () => void
+    reconnect: () => void,
+    reset: () => void
   ) => {
-    setTerminalStatus({ status, reconnect });
+    setTerminalStatus({ status, reconnect, reset });
   }, []);
 
   // Handle workspace URL parameter - create a workspace shell tab
@@ -1674,9 +1879,9 @@ export default function ConsoleClient() {
               </div>
               <button
                 className="rounded px-2 py-1 text-xs text-[var(--foreground-muted)] hover:text-[var(--foreground)] hover:bg-white/[0.05] transition-colors"
-                onClick={terminalStatus.reconnect}
+                onClick={terminalStatus.reset}
               >
-                Reconnect
+                Reset
               </button>
             </div>
           )}

@@ -33,6 +33,7 @@ import {
 import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
 import { useLibrary } from '@/contexts/library-context';
+import { ConfigCodeEditor } from '@/components/config-code-editor';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -880,10 +881,10 @@ Describe what this skill does.
     setIsDirty(true);
   };
 
-  const handleBodyChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setBodyContent(e.target.value);
+  const handleBodyChange = (value: string) => {
+    setBodyContent(value);
     if (selectedFile !== 'SKILL.md') {
-      setFileContent(e.target.value);
+      setFileContent(value);
     }
     setIsDirty(true);
   };
@@ -1127,7 +1128,7 @@ Describe what this skill does.
                 </div>
               </div>
 
-              <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
+              <div className="flex-1 min-h-0 p-3 overflow-hidden flex flex-col gap-3">
                 {loadingFile ? (
                   <div className="flex items-center justify-center h-full">
                     <Loader className="h-5 w-5 animate-spin text-white/40" />
@@ -1141,16 +1142,23 @@ Describe what this skill does.
                         disabled={saving}
                       />
                     )}
-                    <div className="flex-1">
+                    <div className="flex-1 min-h-0 flex flex-col">
                       <label className="block text-xs text-white/40 mb-1.5">
                         {selectedFile === 'SKILL.md' ? 'Body Content' : 'Content'}
                       </label>
-                      <textarea
+                      <ConfigCodeEditor
                         value={bodyContent}
                         onChange={handleBodyChange}
-                        className="w-full h-[calc(100vh-28rem)] font-mono text-sm bg-[#0d0d0e] border border-white/[0.06] rounded-lg p-4 text-white/90 resize-none focus:outline-none focus:border-indigo-500/50"
-                        spellCheck={false}
                         disabled={saving}
+                        language={
+                          selectedFile === 'SKILL.md' ||
+                          selectedFile?.toLowerCase().endsWith('.md') ||
+                          selectedFile?.toLowerCase().endsWith('.mdx') ||
+                          selectedFile?.toLowerCase().endsWith('.markdown')
+                            ? 'markdown'
+                            : 'text'
+                        }
+                        className="flex-1 min-h-0"
                       />
                     </div>
                   </>

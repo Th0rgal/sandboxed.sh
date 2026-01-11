@@ -17,13 +17,13 @@ import {
   ChevronDown,
   Plug,
   FileCode,
-  FileText,
-  Bot,
   Server,
   Puzzle,
   ScrollText,
   Wrench,
   LayoutGrid,
+  Library,
+  Cog,
 } from 'lucide-react';
 
 type NavItem = {
@@ -39,15 +39,15 @@ const navigation: NavItem[] = [
   { name: 'Workspaces', href: '/workspaces', icon: Server },
   { name: 'Console', href: '/console', icon: Terminal },
   {
-    name: 'Config',
+    name: 'Library',
     href: '/config',
-    icon: FileText,
+    icon: Library,
     children: [
-      { name: 'Agents', href: '/agents', icon: Bot },
       { name: 'Commands', href: '/config/commands', icon: Terminal },
       { name: 'Skills', href: '/config/skills', icon: FileCode },
       { name: 'Rules', href: '/config/rules', icon: ScrollText },
       { name: 'Workspaces', href: '/config/workspace-templates', icon: LayoutGrid },
+      { name: 'Configs', href: '/config/settings', icon: Cog },
     ],
   },
   {
@@ -75,8 +75,8 @@ export function Sidebar() {
 
   // Auto-expand sections if we're on their subpages
   useEffect(() => {
-    if (pathname.startsWith('/config') || pathname.startsWith('/agents')) {
-      setExpandedItems((prev) => new Set([...prev, 'Config']));
+    if (pathname.startsWith('/config')) {
+      setExpandedItems((prev) => new Set([...prev, 'Library']));
     }
     if (pathname.startsWith('/extensions')) {
       setExpandedItems((prev) => new Set([...prev, 'Extensions']));

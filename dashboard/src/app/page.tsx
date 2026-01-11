@@ -12,11 +12,9 @@ import { Activity, CheckCircle, DollarSign, Zap } from 'lucide-react';
 import { formatCents } from '@/lib/utils';
 import { SystemMonitor } from '@/components/system-monitor';
 import { NewMissionDialog } from '@/components/new-mission-dialog';
-import { useLibrary } from '@/contexts/library-context';
 
 export default function OverviewPage() {
   const router = useRouter();
-  const { libraryAgents } = useLibrary();
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [isActive, setIsActive] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -114,7 +112,6 @@ export default function OverviewPage() {
           {/* Quick Actions */}
           <NewMissionDialog
             workspaces={workspaces}
-            libraryAgents={libraryAgents}
             disabled={creatingMission}
             onCreate={handleNewMission}
           />

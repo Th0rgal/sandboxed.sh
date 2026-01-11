@@ -6,6 +6,7 @@ import {
   getWorkspaceTemplate,
   saveWorkspaceTemplate,
   deleteWorkspaceTemplate,
+  renameWorkspaceTemplate,
   listLibrarySkills,
   CHROOT_DISTROS,
   type WorkspaceTemplate,
@@ -27,10 +28,14 @@ import {
   FileText,
   Terminal,
   Upload,
+  Pencil,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
 import { useLibrary } from '@/contexts/library-context';
+import Editor from 'react-simple-code-editor';
+import { highlight, languages } from 'prismjs';
+import 'prismjs/components/prism-bash';
 
 type TemplateTab = 'overview' | 'skills' | 'environment' | 'init';
 
@@ -118,6 +123,10 @@ export default function WorkspaceTemplatesPage() {
   const [showCommitDialog, setShowCommitDialog] = useState(false);
   const [commitMessage, setCommitMessage] = useState('');
 
+  const [showRenameDialog, setShowRenameDialog] = useState(false);
+  const [renameTemplateName, setRenameTemplateName] = useState('');
+  const [renaming, setRenaming] = useState(false);
+
   const baselineRef = useRef('');
 
   const snapshot = useMemo(
@@ -139,6 +148,19 @@ export default function WorkspaceTemplatesPage() {
     }
     setDirty(snapshot !== baselineRef.current);
   }, [snapshot, selectedTemplate]);
+
+  // Handle ESC key to close modals
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (showNewDialog) setShowNewDialog(false);
+        if (showCommitDialog) setShowCommitDialog(false);
+        if (showRenameDialog) setShowRenameDialog(false);
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [showNewDialog, showCommitDialog, showRenameDialog]);
 
   const loadTemplates = useCallback(async () => {
     try {
@@ -258,6 +280,23 @@ export default function WorkspaceTemplatesPage() {
       console.error('Failed to delete template:', err);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleRename = async () => {
+    const newName = renameTemplateName.trim();
+    if (!selectedName || !newName || newName === selectedName) return;
+    setRenaming(true);
+    try {
+      await renameWorkspaceTemplate(selectedName, newName);
+      setShowRenameDialog(false);
+      setRenameTemplateName('');
+      await loadTemplates();
+      await loadTemplate(newName);
+    } catch (err) {
+      console.error('Failed to rename template:', err);
+    } finally {
+      setRenaming(false);
     }
   };
 
@@ -475,14 +514,27 @@ export default function WorkspaceTemplatesPage() {
             </div>
             <div className="flex items-center gap-2">
               {selectedName && (
-                <button
-                  onClick={handleDelete}
-                  disabled={saving}
-                  className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] rounded-lg transition-colors disabled:opacity-50"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                  Delete
-                </button>
+                <>
+                  <button
+                    onClick={() => {
+                      setRenameTemplateName(selectedName);
+                      setShowRenameDialog(true);
+                    }}
+                    disabled={saving || renaming}
+                    className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                    Rename
+                  </button>
+                  <button
+                    onClick={handleDelete}
+                    disabled={saving}
+                    className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    Delete
+                  </button>
+                </>
               )}
               <button
                 onClick={handleSave}
@@ -516,7 +568,10 @@ export default function WorkspaceTemplatesPage() {
                 </div>
               </div>
 
-              <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
+              <div className={cn(
+                "flex-1 min-h-0 overflow-y-auto p-5",
+                activeTab === 'init' ? "flex flex-col" : "space-y-4"
+              )}>
                 {activeTab === 'overview' && (
                   <div className="space-y-4">
                     <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] p-4">
@@ -700,20 +755,30 @@ export default function WorkspaceTemplatesPage() {
                 )}
 
                 {activeTab === 'init' && (
-                  <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] overflow-hidden">
-                    <div className="px-4 py-3 border-b border-white/[0.05] flex items-center gap-2">
+                  <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] overflow-hidden flex flex-col flex-1">
+                    <div className="px-4 py-3 border-b border-white/[0.05] flex items-center gap-2 flex-shrink-0">
                       <Terminal className="h-4 w-4 text-indigo-400" />
                       <p className="text-xs text-white/50 font-medium">Init Script</p>
                     </div>
-                    <div className="p-4">
-                      <textarea
-                        value={initScript}
-                        onChange={(e) => setInitScript(e.target.value)}
-                        rows={12}
-                        placeholder="#!/usr/bin/env bash&#10;# Install packages or setup files here"
-                        className="w-full px-3 py-2.5 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white placeholder:text-white/25 font-mono focus:outline-none focus:border-indigo-500/50 resize-none"
-                      />
-                      <p className="text-xs text-white/35 mt-3">
+                    <div className="p-4 flex flex-col flex-1 min-h-0">
+                      <div className="flex-1 min-h-[288px] rounded-lg bg-black/20 border border-white/[0.06] overflow-auto focus-within:border-indigo-500/50 transition-colors">
+                        <Editor
+                          value={initScript}
+                          onValueChange={setInitScript}
+                          highlight={(code) => highlight(code, languages.bash, 'bash')}
+                          placeholder="#!/usr/bin/env bash&#10;# Install packages or setup files here"
+                          padding={12}
+                          style={{
+                            fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+                            fontSize: 12,
+                            lineHeight: 1.6,
+                            minHeight: '100%',
+                          }}
+                          className="init-script-editor"
+                          textareaClassName="focus:outline-none"
+                        />
+                      </div>
+                      <p className="text-xs text-white/35 mt-3 flex-shrink-0">
                         Runs during build for workspaces created from this template.
                       </p>
                     </div>
@@ -826,6 +891,53 @@ export default function WorkspaceTemplatesPage() {
               >
                 {committing ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
                 Commit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Rename Template Dialog */}
+      {showRenameDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md px-4">
+          <div className="w-full max-w-md rounded-2xl bg-[#161618] border border-white/[0.06] shadow-[0_25px_100px_rgba(0,0,0,0.7)] overflow-hidden">
+            <div className="px-5 py-4 border-b border-white/[0.06] flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-white">Rename Template</p>
+                <p className="text-xs text-white/40">Enter a new name for this template.</p>
+              </div>
+              <button
+                onClick={() => setShowRenameDialog(false)}
+                className="p-2 rounded-lg text-white/40 hover:text-white/70 hover:bg-white/[0.06]"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="p-5">
+              <label className="text-xs text-white/40 block mb-2">Template Name</label>
+              <input
+                value={renameTemplateName}
+                onChange={(e) =>
+                  setRenameTemplateName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-'))
+                }
+                placeholder="my-template"
+                className="w-full px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white placeholder:text-white/25 focus:outline-none focus:border-indigo-500/50"
+              />
+            </div>
+            <div className="px-5 pb-5 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setShowRenameDialog(false)}
+                className="px-4 py-2 text-xs text-white/60 hover:text-white/80"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleRename}
+                disabled={!renameTemplateName.trim() || renameTemplateName === selectedName || renaming}
+                className="flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg disabled:opacity-50"
+              >
+                {renaming ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Pencil className="h-3.5 w-3.5" />}
+                Rename
               </button>
             </div>
           </div>

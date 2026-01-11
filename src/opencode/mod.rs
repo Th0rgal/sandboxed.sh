@@ -731,6 +731,11 @@ struct SseState {
     part_buffers: HashMap<String, String>,
     emitted_tool_calls: HashMap<String, ()>,
     emitted_tool_results: HashMap<String, ()>,
+    response_tool_args: HashMap<String, String>,
+    response_tool_names: HashMap<String, String>,
+    /// Track last emitted thinking/text content to deduplicate identical events
+    last_emitted_thinking: Option<String>,
+    last_emitted_text: Option<String>,
 }
 
 fn extract_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
@@ -744,11 +749,9 @@ fn extract_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a st
 
 fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option<&'a str> {
     if part_type == "thinking" {
-        part.get("thinking")
-            .and_then(|v| v.as_str())
-            .or_else(|| part.get("text").and_then(|v| v.as_str()))
+        extract_str(part, &["thinking", "text", "content"])
     } else {
-        part.get("text").and_then(|v| v.as_str())
+        extract_str(part, &["text", "content", "output_text"])
     }
 }
 
@@ -768,7 +771,7 @@ fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option
         return handle_tool_part_update(part, state);
     }
 
-    if !matches!(part_type, "text" | "reasoning" | "thinking") {
+    if !matches!(part_type, "text" | "output_text" | "reasoning" | "thinking") {
         return None;
     }
 
@@ -804,11 +807,20 @@ fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option
         return None;
     };
 
-    if role.is_none() && part_type == "text" && looks_like_user_prompt(&content) {
+    if role.is_none() && matches!(part_type, "text" | "output_text") && looks_like_user_prompt(&content) {
         return None;
     }
 
     if matches!(part_type, "reasoning" | "thinking") {
+        // Skip if content is identical to last emitted thinking
+        if state.last_emitted_thinking.as_ref() == Some(&content) {
+            tracing::debug!(
+                content_len = content.len(),
+                "Skipping duplicate Thinking event"
+            );
+            return None;
+        }
+        state.last_emitted_thinking = Some(content.clone());
         tracing::info!(
             part_type = %part_type,
             content_len = content.len(),
@@ -817,6 +829,15 @@ fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option
         );
         Some(OpenCodeEvent::Thinking { content })
     } else {
+        // Skip if content is identical to last emitted text
+        if state.last_emitted_text.as_ref() == Some(&content) {
+            tracing::debug!(
+                content_len = content.len(),
+                "Skipping duplicate TextDelta event"
+            );
+            return None;
+        }
+        state.last_emitted_text = Some(content.clone());
         tracing::info!(
             part_type = %part_type,
             content_len = content.len(),
@@ -968,7 +989,7 @@ fn parse_sse_event(
     };
 
     let event_type = json.get("type").and_then(|v| v.as_str()).or(event_name)?;
-    let props = json.get("properties").cloned().unwrap_or(json!({}));
+    let props = json.get("properties").cloned().unwrap_or_else(|| json.clone());
 
     // Log all event types for debugging
     tracing::warn!(
@@ -1005,6 +1026,117 @@ fn parse_sse_event(
     }
 
     match event_type {
+        // OpenAI Responses-style streaming
+        "response.output_text.delta" => {
+            let delta = props
+                .get("delta")
+                .or_else(|| props.get("text"))
+                .or_else(|| props.get("output_text_delta"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if delta.is_empty() {
+                return None;
+            }
+
+            let response_id = props
+                .get("response")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str());
+            let key = response_id.unwrap_or("response.output_text").to_string();
+            let buffer = state.part_buffers.entry(key).or_default();
+            buffer.push_str(delta);
+            Some(OpenCodeEvent::TextDelta {
+                content: buffer.clone(),
+            })
+        }
+        "response.completed" | "response.incomplete" => {
+            Some(OpenCodeEvent::MessageComplete {
+                session_id: session_id.to_string(),
+            })
+        }
+        "response.output_item.added" => {
+            if let Some(item) = props.get("item") {
+                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                    let call_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    state.response_tool_names.insert(call_id.clone(), name);
+                    if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
+                        if !args.is_empty() {
+                            state
+                                .response_tool_args
+                                .insert(call_id.clone(), args.to_string());
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "response.function_call_arguments.delta" => {
+            let call_id = props
+                .get("item_id")
+                .or_else(|| props.get("call_id"))
+                .or_else(|| props.get("id"))
+                .and_then(|v| v.as_str());
+            let delta = props.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            if let (Some(call_id), false) = (call_id, delta.is_empty()) {
+                let entry = state
+                    .response_tool_args
+                    .entry(call_id.to_string())
+                    .or_default();
+                entry.push_str(delta);
+            }
+            None
+        }
+        "response.output_item.done" => {
+            if let Some(item) = props.get("item") {
+                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                    let call_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if state.emitted_tool_calls.contains_key(&call_id) {
+                        return None;
+                    }
+
+                    let name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| state.response_tool_names.get(&call_id).cloned())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let args_str = item
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| state.response_tool_args.get(&call_id).cloned())
+                        .unwrap_or_default();
+                    let args = if args_str.trim().is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_str(&args_str)
+                            .unwrap_or_else(|_| json!({ "arguments": args_str }))
+                    };
+                    state.emitted_tool_calls.insert(call_id.clone(), ());
+                    return Some(OpenCodeEvent::ToolCall {
+                        tool_call_id: call_id,
+                        name,
+                        args,
+                    });
+                }
+            }
+            None
+        }
         // Message info updates
         "message.updated" => {
             if let Some(info) = props.get("info") {
@@ -1113,8 +1245,9 @@ impl OpenCodeMessageResponse {
 pub fn extract_text(parts: &[serde_json::Value]) -> String {
     let mut out = Vec::new();
     for part in parts {
-        if part.get("type").and_then(|v| v.as_str()) == Some("text") {
-            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+        let part_type = part.get("type").and_then(|v| v.as_str());
+        if matches!(part_type, Some("text" | "output_text")) {
+            if let Some(text) = extract_str(part, &["text", "content", "output_text"]) {
                 out.push(text.to_string());
             }
         }

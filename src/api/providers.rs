@@ -1,13 +1,16 @@
 //! Provider catalog API.
 //!
 //! Provides endpoints for listing available providers and their models for UI selection.
+//! Only returns providers that are actually configured and authenticated.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 
 use super::routes::AppState;
+use crate::ai_providers::ProviderType;
 
 /// A model available from a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,20 +140,128 @@ fn default_providers_config() -> ProvidersConfig {
                     },
                 ],
             },
+            Provider {
+                id: "google".to_string(),
+                name: "Google AI (OAuth)".to_string(),
+                billing: "subscription".to_string(),
+                description: "Gemini models via Google OAuth".to_string(),
+                models: vec![
+                    ProviderModel {
+                        id: "gemini-2.5-pro-preview-06-05".to_string(),
+                        name: "Gemini 2.5 Pro".to_string(),
+                        description: Some("Most capable Gemini model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "gemini-2.5-flash-preview-05-20".to_string(),
+                        name: "Gemini 2.5 Flash".to_string(),
+                        description: Some("Fast and efficient".to_string()),
+                    },
+                    ProviderModel {
+                        id: "gemini-3-flash-preview".to_string(),
+                        name: "Gemini 3 Flash Preview".to_string(),
+                        description: Some("Latest Gemini 3 preview".to_string()),
+                    },
+                ],
+            },
         ],
     }
+}
+
+/// Check if a JSON value contains valid auth credentials.
+fn has_valid_auth(value: &serde_json::Value) -> bool {
+    // Check for OAuth tokens (various field names used by different providers)
+    let has_oauth = value.get("refresh").is_some()
+        || value.get("refresh_token").is_some()
+        || value.get("access").is_some()
+        || value.get("access_token").is_some();
+    // Check for API key (various field names)
+    let has_api_key = value.get("key").is_some()
+        || value.get("api_key").is_some()
+        || value.get("apiKey").is_some();
+    has_oauth || has_api_key
+}
+
+/// Get the set of configured provider IDs from OpenCode's auth files.
+fn get_configured_provider_ids() -> HashSet<String> {
+    let mut configured = HashSet::new();
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+
+    // 1. Read OpenCode auth.json (~/.local/share/opencode/auth.json)
+    let auth_path = {
+        let data_home = std::env::var("XDG_DATA_HOME").ok();
+        let base = if let Some(data_home) = data_home {
+            std::path::PathBuf::from(data_home).join("opencode")
+        } else {
+            std::path::PathBuf::from(&home).join(".local/share/opencode")
+        };
+        base.join("auth.json")
+    };
+
+    tracing::debug!("Checking OpenCode auth file: {:?}", auth_path);
+    if let Ok(contents) = std::fs::read_to_string(&auth_path) {
+        if let Ok(auth) = serde_json::from_str::<serde_json::Value>(&contents) {
+            if let Some(map) = auth.as_object() {
+                for (key, value) in map {
+                    if has_valid_auth(value) {
+                        tracing::debug!("Found valid auth for provider '{}' in auth.json", key);
+                        configured.insert(key.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check provider-specific auth files (~/.opencode/auth/{provider}.json)
+    // This is where OpenAI stores its auth (separate from the main auth.json)
+    let provider_auth_dir = std::path::PathBuf::from(&home).join(".opencode/auth");
+    tracing::debug!("Checking provider auth dir: {:?}", provider_auth_dir);
+    for provider_type in [
+        ProviderType::Anthropic,
+        ProviderType::OpenAI,
+        ProviderType::Google,
+        ProviderType::GithubCopilot,
+    ] {
+        let auth_file = provider_auth_dir.join(format!("{}.json", provider_type.id()));
+        if let Ok(contents) = std::fs::read_to_string(&auth_file) {
+            tracing::debug!("Found auth file for {}: {:?}", provider_type.id(), auth_file);
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
+                if has_valid_auth(&value) {
+                    tracing::debug!(
+                        "Found valid auth for provider '{}' in {:?}",
+                        provider_type.id(),
+                        auth_file
+                    );
+                    configured.insert(provider_type.id().to_string());
+                }
+            }
+        }
+    }
+
+    tracing::debug!("Configured providers: {:?}", configured);
+    configured
 }
 
 /// List available providers and their models.
 ///
 /// Returns a list of providers with their available models, billing type,
-/// and descriptions. This endpoint is used by the frontend to render
+/// and descriptions. Only includes providers that are actually configured
+/// and authenticated. This endpoint is used by the frontend to render
 /// a grouped model selector.
 pub async fn list_providers(State(state): State<Arc<AppState>>) -> Json<ProvidersResponse> {
     let working_dir = state.config.working_dir.to_string_lossy().to_string();
     let config = load_providers_config(&working_dir);
 
+    // Get the set of configured provider IDs
+    let configured = get_configured_provider_ids();
+
+    // Filter providers to only include those that are configured
+    let filtered_providers: Vec<Provider> = config
+        .providers
+        .into_iter()
+        .filter(|p| configured.contains(&p.id))
+        .collect();
+
     Json(ProvidersResponse {
-        providers: config.providers,
+        providers: filtered_providers,
     })
 }

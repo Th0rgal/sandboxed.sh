@@ -2,14 +2,12 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
-import { listOpenCodeAgents } from '@/lib/api';
+import { getVisibleAgents, getOpenAgentConfig } from '@/lib/api';
 import type { Provider, Workspace } from '@/lib/api';
-import type { LibraryAgentSummary } from '@/contexts/library-context';
 
 interface NewMissionDialogProps {
   workspaces: Workspace[];
-  libraryAgents: LibraryAgentSummary[];
-  providers: Provider[];
+  providers?: Provider[];
   disabled?: boolean;
   onCreate: (options?: {
     workspaceId?: string;
@@ -20,8 +18,7 @@ interface NewMissionDialogProps {
 
 export function NewMissionDialog({
   workspaces,
-  libraryAgents,
-  providers,
+  providers = [],
   disabled = false,
   onCreate,
 }: NewMissionDialogProps) {
@@ -76,11 +73,24 @@ export function NewMissionDialog({
     if (!open) return;
     let cancelled = false;
 
-    const loadAgents = async () => {
+    const loadAgentsAndConfig = async () => {
       try {
-        const payload = await listOpenCodeAgents();
+        // Load visible agents (pre-filtered by OpenAgent config)
+        const payload = await getVisibleAgents();
         if (cancelled) return;
-        setOpencodeAgents(parseAgentNames(payload));
+        const agents = parseAgentNames(payload);
+        setOpencodeAgents(agents);
+
+        // Load OpenAgent config for default agent
+        const config = await getOpenAgentConfig();
+        if (cancelled) return;
+
+        // Set default agent from config, or fallback to Sisyphus if available
+        if (config.default_agent && agents.includes(config.default_agent)) {
+          setNewMissionAgent(config.default_agent);
+        } else if (agents.includes("Sisyphus")) {
+          setNewMissionAgent("Sisyphus");
+        }
       } catch {
         if (!cancelled) {
           setOpencodeAgents([]);
@@ -88,7 +98,7 @@ export function NewMissionDialog({
       }
     };
 
-    void loadAgents();
+    void loadAgentsAndConfig();
     return () => {
       cancelled = true;
     };
@@ -122,9 +132,7 @@ export function NewMissionDialog({
   };
 
   const isBusy = disabled || submitting;
-  const defaultAgentLabel = opencodeAgents.includes('Sisyphus')
-    ? 'Default (Sisyphus)'
-    : 'Default (OpenCode default)';
+  const defaultAgentLabel = 'Default (OpenCode default)';
 
   return (
     <div className="relative" ref={dialogRef}>
@@ -138,7 +146,7 @@ export function NewMissionDialog({
         <span className="hidden sm:inline">New</span> Mission
       </button>
       {open && (
-        <div className="absolute right-0 top-full mt-1 w-96 rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl z-10">
+        <div className="absolute right-0 top-full mt-1 w-96 rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl z-50">
           <h3 className="text-sm font-medium text-white mb-3">Create New Mission</h3>
           <div className="space-y-3">
             {/* Workspace selection */}
@@ -200,14 +208,10 @@ export function NewMissionDialog({
                 <option value="" className="bg-[#1a1a1a]">
                   {defaultAgentLabel}
                 </option>
-                {libraryAgents.length > 0 && (
-                  <optgroup label="Library Agents" className="bg-[#1a1a1a]">
-                    {libraryAgents.map((agent) => (
-                      <option key={agent.name} value={agent.name} className="bg-[#1a1a1a]">
-                        {agent.name}
-                      </option>
-                    ))}
-                  </optgroup>
+                {opencodeAgents.includes("Sisyphus") && (
+                  <option value="Sisyphus" className="bg-[#1a1a1a]">
+                    Sisyphus (recommended)
+                  </option>
                 )}
                 {opencodeAgents.length > 0 && (
                   <optgroup label="OpenCode Agents" className="bg-[#1a1a1a]">
@@ -220,7 +224,7 @@ export function NewMissionDialog({
                 )}
               </select>
               <p className="text-xs text-white/30 mt-1.5">
-                Library agents are editable configs; OpenCode agents come from plugins
+                OpenCode agents are provided by plugins; defaults are recommended
               </p>
             </div>
 

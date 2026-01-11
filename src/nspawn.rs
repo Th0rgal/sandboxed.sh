@@ -297,6 +297,8 @@ pub async fn execute_in_container(
     let mut cmd = tokio::process::Command::new("systemd-nspawn");
     cmd.arg("-D").arg(path);
     cmd.arg("--quiet");
+    // Disable timezone bind-mount (minbase containers lack /usr/share/zoneinfo)
+    cmd.arg("--timezone=off");
 
     match config.network_mode {
         NetworkMode::Host => {}

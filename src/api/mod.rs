@@ -24,12 +24,12 @@ mod fs;
 pub mod library;
 pub mod mcp;
 pub mod mission_runner;
+pub mod mission_store;
 mod monitoring;
 pub mod opencode;
 mod providers;
 mod routes;
 pub mod secrets;
-mod ssh_util;
 pub mod types;
 pub mod workspaces;
 

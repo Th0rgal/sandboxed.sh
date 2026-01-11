@@ -6,8 +6,8 @@ Native iOS dashboard for Open Agent with **Liquid Glass** design language.
 
 - **Control** - Chat interface with the AI agent, real-time streaming
 - **History** - View past missions with filtering (active, interrupted, completed, failed)
-- **Terminal** - SSH console via WebSocket
-- **Files** - Remote file explorer with upload/download
+- **Terminal** - Local shell via WebSocket
+- **Files** - Server file explorer with upload/download
 
 ### Mission Management
 
@@ -93,7 +93,7 @@ ios_dashboard/
 │   ├── Views/
 │   │   ├── Control/            # Chat interface
 │   │   ├── History/            # Mission history
-│   │   ├── Terminal/           # SSH console
+│   │   ├── Terminal/           # Local shell
 │   │   ├── Files/              # File explorer
 │   │   └── Components/         # Reusable UI
 │   │       ├── GlassButton.swift

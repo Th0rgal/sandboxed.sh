@@ -9,6 +9,8 @@
 //! - Rules CRUD
 //! - Library Agents CRUD
 //! - Library Tools CRUD
+//! - OpenCode settings (oh-my-opencode.json)
+//! - OpenAgent config (agent visibility, defaults)
 //! - Migration
 
 use axum::{
@@ -24,10 +26,11 @@ use tokio::sync::RwLock;
 
 use crate::library::{
     Command, CommandSummary, GitAuthor, LibraryAgent, LibraryAgentSummary, LibraryStatus,
-    LibraryStore, LibraryTool, LibraryToolSummary, McpServer, MigrationReport, Plugin, Rule,
-    RuleSummary, Skill, SkillSummary, WorkspaceTemplate, WorkspaceTemplateSummary,
+    LibraryStore, LibraryTool, LibraryToolSummary, McpServer, MigrationReport, OpenAgentConfig,
+    Plugin, Rule, RuleSummary, Skill, SkillSummary, WorkspaceTemplate, WorkspaceTemplateSummary,
 };
 use crate::nspawn::NspawnDistro;
+use crate::workspace::{self, WorkspaceType, DEFAULT_WORKSPACE_ID};
 
 /// Shared library state.
 pub type SharedLibrary = Arc<RwLock<Option<Arc<LibraryStore>>>>;
@@ -65,6 +68,75 @@ fn extract_git_author(headers: &HeaderMap) -> Option<GitAuthor> {
     }
 }
 
+fn is_default_host_workspace(workspace: &workspace::Workspace) -> bool {
+    workspace.id == DEFAULT_WORKSPACE_ID && workspace.workspace_type == WorkspaceType::Host
+}
+
+async fn sync_all_workspaces(state: &super::routes::AppState, library: &LibraryStore) {
+    let workspaces = state.workspaces.list().await;
+    for workspace in workspaces {
+        if is_default_host_workspace(&workspace) || !workspace.skills.is_empty() {
+            if let Err(e) = workspace::sync_workspace_skills(&workspace, library).await {
+                tracing::warn!(
+                    workspace = %workspace.name,
+                    error = %e,
+                    "Failed to sync skills after library update"
+                );
+            }
+        }
+        if is_default_host_workspace(&workspace) || !workspace.tools.is_empty() {
+            if let Err(e) = workspace::sync_workspace_tools(&workspace, library).await {
+                tracing::warn!(
+                    workspace = %workspace.name,
+                    error = %e,
+                    "Failed to sync tools after library update"
+                );
+            }
+        }
+    }
+}
+
+async fn sync_skill_to_workspaces(
+    state: &super::routes::AppState,
+    library: &LibraryStore,
+    skill_name: &str,
+) {
+    let workspaces = state.workspaces.list().await;
+    for workspace in workspaces {
+        if is_default_host_workspace(&workspace) || workspace.skills.iter().any(|s| s == skill_name)
+        {
+            if let Err(e) = workspace::sync_workspace_skills(&workspace, library).await {
+                tracing::warn!(
+                    workspace = %workspace.name,
+                    skill = %skill_name,
+                    error = %e,
+                    "Failed to sync skill to workspace"
+                );
+            }
+        }
+    }
+}
+
+async fn sync_tool_to_workspaces(
+    state: &super::routes::AppState,
+    library: &LibraryStore,
+    tool_name: &str,
+) {
+    let workspaces = state.workspaces.list().await;
+    for workspace in workspaces {
+        if is_default_host_workspace(&workspace) || workspace.tools.iter().any(|t| t == tool_name) {
+            if let Err(e) = workspace::sync_workspace_tools(&workspace, library).await {
+                tracing::warn!(
+                    workspace = %workspace.name,
+                    tool = %tool_name,
+                    error = %e,
+                    "Failed to sync tool to workspace"
+                );
+            }
+        }
+    }
+}
+
 async fn ensure_library(
     state: &super::routes::AppState,
     headers: &HeaderMap,
@@ -97,6 +169,8 @@ async fn ensure_library(
         Ok(store) => {
             let store = Arc::new(store);
             *library_guard = Some(Arc::clone(&store));
+            drop(library_guard);
+            sync_all_workspaces(state, store.as_ref()).await;
             Ok(store)
         }
         Err(e) => Err((
@@ -173,6 +247,13 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         )
         // Migration
         .route("/migrate", post(migrate_library))
+        // OpenCode Settings (oh-my-opencode.json)
+        .route("/opencode/settings", get(get_opencode_settings))
+        .route("/opencode/settings", put(save_opencode_settings))
+        // OpenAgent Config
+        .route("/openagent/config", get(get_openagent_config))
+        .route("/openagent/config", put(save_openagent_config))
+        .route("/openagent/agents", get(get_visible_agents))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -251,6 +332,7 @@ async fn sync_library(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Sync plugins to global OpenCode config
     let plugins = library
         .get_plugins()
         .await
@@ -258,6 +340,19 @@ async fn sync_library(
     crate::opencode_config::sync_global_plugins(&plugins)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Sync OpenCode settings (oh-my-opencode.json) from Library to system
+    if let Err(e) = workspace::sync_opencode_settings(&library).await {
+        tracing::warn!(error = %e, "Failed to sync oh-my-opencode settings during library sync");
+    }
+
+    // Sync OpenAgent config from Library to working directory
+    if let Err(e) = workspace::sync_openagent_config(&library, &state.config.working_dir).await {
+        tracing::warn!(error = %e, "Failed to sync openagent config during library sync");
+    }
+
+    // Sync skills and tools to workspaces
+    sync_all_workspaces(&state, library.as_ref()).await;
 
     Ok((StatusCode::OK, "Synced successfully".to_string()))
 }
@@ -365,8 +460,9 @@ async fn save_skill(
     library
         .save_skill(&name, &req.content)
         .await
-        .map(|_| (StatusCode::OK, "Skill saved successfully".to_string()))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sync_skill_to_workspaces(&state, library.as_ref(), &name).await;
+    Ok((StatusCode::OK, "Skill saved successfully".to_string()))
 }
 
 /// DELETE /api/library/skills/:name - Delete a skill.
@@ -379,8 +475,9 @@ async fn delete_skill(
     library
         .delete_skill(&name)
         .await
-        .map(|_| (StatusCode::OK, "Skill deleted successfully".to_string()))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sync_skill_to_workspaces(&state, library.as_ref(), &name).await;
+    Ok((StatusCode::OK, "Skill deleted successfully".to_string()))
 }
 
 /// GET /api/library/skills/:name/references/*path - Get a reference file.
@@ -414,8 +511,9 @@ async fn save_skill_reference(
     library
         .save_skill_reference(&name, &path, &req.content)
         .await
-        .map(|_| (StatusCode::OK, "Reference saved successfully".to_string()))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sync_skill_to_workspaces(&state, library.as_ref(), &name).await;
+    Ok((StatusCode::OK, "Reference saved successfully".to_string()))
 }
 
 /// DELETE /api/library/skills/:name/references/*path - Delete a reference file.
@@ -428,7 +526,6 @@ async fn delete_skill_reference(
     library
         .delete_skill_reference(&name, &path)
         .await
-        .map(|_| (StatusCode::OK, "Reference deleted successfully".to_string()))
         .map_err(|e| {
             if e.to_string().contains("not found") {
                 (StatusCode::NOT_FOUND, e.to_string())
@@ -437,7 +534,9 @@ async fn delete_skill_reference(
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
-        })
+        })?;
+    sync_skill_to_workspaces(&state, library.as_ref(), &name).await;
+    Ok((StatusCode::OK, "Reference deleted successfully".to_string()))
 }
 
 /// POST /api/library/skills/import - Import a skill from a Git URL.
@@ -466,10 +565,9 @@ async fn import_skill(
         }
     });
 
-    library
+    let skill = library
         .import_skill_from_git(&req.url, req.path.as_deref(), &target_name)
         .await
-        .map(Json)
         .map_err(|e| {
             if e.to_string().contains("already exists") {
                 (StatusCode::CONFLICT, e.to_string())
@@ -478,7 +576,9 @@ async fn import_skill(
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
-        })
+        })?;
+    sync_skill_to_workspaces(&state, library.as_ref(), &target_name).await;
+    Ok(Json(skill))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -755,8 +855,9 @@ async fn save_library_tool(
     library
         .save_library_tool(&name, &req.content)
         .await
-        .map(|_| (StatusCode::OK, "Tool saved successfully".to_string()))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sync_tool_to_workspaces(&state, library.as_ref(), &name).await;
+    Ok((StatusCode::OK, "Tool saved successfully".to_string()))
 }
 
 /// DELETE /api/library/tool/:name - Delete a library tool.
@@ -769,8 +870,9 @@ async fn delete_library_tool(
     library
         .delete_library_tool(&name)
         .await
-        .map(|_| (StatusCode::OK, "Tool deleted successfully".to_string()))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sync_tool_to_workspaces(&state, library.as_ref(), &name).await;
+    Ok((StatusCode::OK, "Tool deleted successfully".to_string()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -887,4 +989,132 @@ async fn migrate_library(
         .await
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenCode Settings (oh-my-opencode.json)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/opencode/settings - Get oh-my-opencode settings from Library.
+async fn get_opencode_settings(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .get_opencode_settings()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// PUT /api/library/opencode/settings - Save oh-my-opencode settings to Library.
+async fn save_opencode_settings(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    Json(settings): Json<serde_json::Value>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+
+    // Validate that the input is a valid JSON object
+    if !settings.is_object() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Settings must be a JSON object".to_string(),
+        ));
+    }
+
+    library
+        .save_opencode_settings(&settings)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Sync to system location
+    if let Err(e) = workspace::sync_opencode_settings(&library).await {
+        tracing::warn!(error = %e, "Failed to sync oh-my-opencode settings to system");
+    }
+
+    Ok((
+        StatusCode::OK,
+        "OpenCode settings saved successfully".to_string(),
+    ))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAgent Config
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/openagent/config - Get OpenAgent config from Library.
+async fn get_openagent_config(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<OpenAgentConfig>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .get_openagent_config()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// PUT /api/library/openagent/config - Save OpenAgent config to Library.
+async fn save_openagent_config(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    Json(config): Json<OpenAgentConfig>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+
+    library
+        .save_openagent_config(&config)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Sync to working directory
+    if let Err(e) = workspace::sync_openagent_config(&library, &state.config.working_dir).await {
+        tracing::warn!(error = %e, "Failed to sync openagent config to working dir");
+    }
+
+    Ok((
+        StatusCode::OK,
+        "OpenAgent config saved successfully".to_string(),
+    ))
+}
+
+/// GET /api/library/openagent/agents - Get filtered list of visible agents.
+/// Fetches agents from OpenCode and filters by hidden_agents config.
+async fn get_visible_agents(
+    State(state): State<Arc<super::routes::AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Read current config from working directory
+    let config = workspace::read_openagent_config(&state.config.working_dir).await;
+
+    // Fetch all agents from OpenCode
+    let all_agents = crate::api::opencode::fetch_opencode_agents(&state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Filter out hidden agents
+    let visible_agents = filter_agents_by_config(all_agents, &config);
+
+    Ok(Json(visible_agents))
+}
+
+/// Filter agents based on OpenAgent config hidden_agents list.
+fn filter_agents_by_config(
+    agents: serde_json::Value,
+    config: &OpenAgentConfig,
+) -> serde_json::Value {
+    // OpenCode returns agents as an object with agent names as keys
+    if let Some(agents_obj) = agents.as_object() {
+        let filtered: serde_json::Map<String, serde_json::Value> = agents_obj
+            .iter()
+            .filter(|(name, _)| !config.hidden_agents.contains(name))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        serde_json::Value::Object(filtered)
+    } else {
+        // If it's an array or other format, return as-is
+        agents
+    }
 }

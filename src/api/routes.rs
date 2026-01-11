@@ -134,6 +134,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     if let Some(library_remote) = config.library_remote.clone() {
         let library_clone = Arc::clone(&library);
         let library_path = config.library_path.clone();
+        let workspaces_clone = Arc::clone(&workspaces);
         tokio::spawn(async move {
             match crate::library::LibraryStore::new(library_path, &library_remote).await {
                 Ok(store) => {
@@ -145,6 +146,36 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                     }
                     tracing::info!("Configuration library initialized from {}", library_remote);
                     *library_clone.write().await = Some(Arc::new(store));
+
+                    let workspaces = workspaces_clone.list().await;
+                    if let Some(library) = library_clone.read().await.as_ref() {
+                        for workspace in workspaces {
+                            let is_default_host = workspace.id == workspace::DEFAULT_WORKSPACE_ID
+                                && workspace.workspace_type == workspace::WorkspaceType::Host;
+                            if is_default_host || !workspace.skills.is_empty() {
+                                if let Err(e) =
+                                    workspace::sync_workspace_skills(&workspace, library).await
+                                {
+                                    tracing::warn!(
+                                        workspace = %workspace.name,
+                                        error = %e,
+                                        "Failed to sync skills after library init"
+                                    );
+                                }
+                            }
+                            if is_default_host || !workspace.tools.is_empty() {
+                                if let Err(e) =
+                                    workspace::sync_workspace_tools(&workspace, library).await
+                                {
+                                    tracing::warn!(
+                                        workspace = %workspace.name,
+                                        error = %e,
+                                        "Failed to sync tools after library init"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to initialize configuration library: {}", e);
@@ -237,6 +268,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(control::get_mission_tree),
         )
         .route(
+            "/api/control/missions/:id/events",
+            get(control::get_mission_events),
+        )
+        .route(
             "/api/control/missions/:id/load",
             post(control::load_mission),
         )
@@ -307,6 +342,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // OpenCode connection endpoints
         .nest("/api/opencode/connections", opencode_api::routes())
         .route("/api/opencode/agents", get(opencode_api::list_agents))
+        // OpenCode settings (oh-my-opencode.json)
+        .route("/api/opencode/settings", get(opencode_api::get_opencode_settings))
+        .route("/api/opencode/settings", axum::routing::put(opencode_api::update_opencode_settings))
+        .route("/api/opencode/restart", post(opencode_api::restart_opencode_service))
         // AI Provider endpoints
         .nest("/api/ai/providers", ai_providers_api::routes())
         // Secrets management endpoints
@@ -527,7 +566,8 @@ async fn create_task(
     let id = Uuid::new_v4();
     let model = req
         .model
-        .unwrap_or_else(|| state.config.default_model.clone());
+        .or(state.config.default_model.clone())
+        .unwrap_or_default();
 
     let task_state = TaskState {
         id,

@@ -6,6 +6,36 @@ use tokio::process::Command;
 
 use super::types::LibraryStatus;
 
+/// Get the GIT_SSH_COMMAND value for git operations.
+///
+/// - If `LIBRARY_GIT_SSH_KEY` is set to a path, uses that key with `-o IdentitiesOnly=yes`
+/// - If `LIBRARY_GIT_SSH_KEY` is set to empty string, uses `ssh` with no config to ignore host-specific settings
+/// - If `LIBRARY_GIT_SSH_KEY` is unset, returns None (use default git/ssh behavior)
+fn get_ssh_command() -> Option<String> {
+    match std::env::var("LIBRARY_GIT_SSH_KEY") {
+        Ok(key) if key.is_empty() => {
+            // Empty string means "use default ssh, ignore any host-specific config"
+            // -F /dev/null ignores the user's ssh config
+            Some("ssh -F /dev/null".to_string())
+        }
+        Ok(key) => {
+            // Use the specified key
+            Some(format!("ssh -i {} -o IdentitiesOnly=yes", key))
+        }
+        Err(_) => {
+            // Not set - use default git behavior (respects ~/.ssh/config)
+            None
+        }
+    }
+}
+
+/// Apply SSH configuration to a git command if needed.
+fn apply_ssh_config(cmd: &mut Command) {
+    if let Some(ssh_cmd) = get_ssh_command() {
+        cmd.env("GIT_SSH_COMMAND", ssh_cmd);
+    }
+}
+
 /// Clone a git repository if it doesn't exist.
 pub async fn clone_if_needed(path: &Path, remote: &str) -> Result<bool> {
     if path.exists() && path.join(".git").exists() {
@@ -20,11 +50,10 @@ pub async fn clone_if_needed(path: &Path, remote: &str) -> Result<bool> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let output = Command::new("git")
-        .args(["clone", remote, &path.to_string_lossy()])
-        .output()
-        .await
-        .context("Failed to execute git clone")?;
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", remote, &path.to_string_lossy()]);
+    apply_ssh_config(&mut cmd);
+    let output = cmd.output().await.context("Failed to execute git clone")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -80,12 +109,10 @@ pub async fn ensure_remote(path: &Path, remote: &str) -> Result<()> {
 
     // Fetch from the new remote
     tracing::info!("Fetching from new remote");
-    let output = Command::new("git")
-        .current_dir(path)
-        .args(["fetch", "origin"])
-        .output()
-        .await
-        .context("Failed to execute git fetch")?;
+    let mut cmd = Command::new("git");
+    cmd.current_dir(path).args(["fetch", "origin"]);
+    apply_ssh_config(&mut cmd);
+    let output = cmd.output().await.context("Failed to execute git fetch")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -174,12 +201,10 @@ pub async fn status(path: &Path) -> Result<LibraryStatus> {
 pub async fn pull(path: &Path) -> Result<()> {
     tracing::info!(path = %path.display(), "Pulling library changes");
 
-    let output = Command::new("git")
-        .current_dir(path)
-        .args(["pull", "--ff-only"])
-        .output()
-        .await
-        .context("Failed to execute git pull")?;
+    let mut cmd = Command::new("git");
+    cmd.current_dir(path).args(["pull", "--ff-only"]);
+    apply_ssh_config(&mut cmd);
+    let output = cmd.output().await.context("Failed to execute git pull")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -224,16 +249,11 @@ pub async fn commit(path: &Path, message: &str, author: Option<&GitAuthor>) -> R
     cmd.current_dir(path);
     cmd.args(["commit", "-m", message]);
 
-    // Add author and committer if both name and email are provided
-    // We set both --author flag and GIT_COMMITTER_* env vars to ensure
-    // git doesn't require global user.name/user.email config
+    // Add author if both name and email are provided
     if let Some(author) = author {
         if let (Some(name), Some(email)) = (&author.name, &author.email) {
             let author_string = format!("{} <{}>", name, email);
             cmd.args(["--author", &author_string]);
-            // Also set committer identity via environment variables
-            cmd.env("GIT_COMMITTER_NAME", name);
-            cmd.env("GIT_COMMITTER_EMAIL", email);
         }
     }
 
@@ -252,12 +272,10 @@ pub async fn commit(path: &Path, message: &str, author: Option<&GitAuthor>) -> R
 pub async fn push(path: &Path) -> Result<()> {
     tracing::info!(path = %path.display(), "Pushing library changes");
 
-    let output = Command::new("git")
-        .current_dir(path)
-        .args(["push"])
-        .output()
-        .await
-        .context("Failed to execute git push")?;
+    let mut cmd = Command::new("git");
+    cmd.current_dir(path).args(["push"]);
+    apply_ssh_config(&mut cmd);
+    let output = cmd.output().await.context("Failed to execute git push")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -276,11 +294,10 @@ pub async fn clone(path: &Path, remote: &str) -> Result<()> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let output = Command::new("git")
-        .args(["clone", "--depth", "1", remote, &path.to_string_lossy()])
-        .output()
-        .await
-        .context("Failed to execute git clone")?;
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", "--depth", "1", remote, &path.to_string_lossy()]);
+    apply_ssh_config(&mut cmd);
+    let output = cmd.output().await.context("Failed to execute git clone")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -353,12 +370,10 @@ pub async fn sparse_clone(path: &Path, remote: &str, subpath: &str) -> Result<()
     tokio::fs::write(&sparse_checkout_path, format!("{}\n", subpath)).await?;
 
     // Fetch and checkout
-    let output = Command::new("git")
-        .current_dir(path)
-        .args(["fetch", "--depth", "1", "origin"])
-        .output()
-        .await
-        .context("Failed to fetch")?;
+    let mut cmd = Command::new("git");
+    cmd.current_dir(path).args(["fetch", "--depth", "1", "origin"]);
+    apply_ssh_config(&mut cmd);
+    let output = cmd.output().await.context("Failed to fetch")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -437,11 +452,10 @@ async fn get_status(path: &Path) -> Result<(bool, Vec<String>)> {
 
 async fn get_ahead_behind(path: &Path) -> Result<(u32, u32)> {
     // First, fetch to update remote tracking branches
-    let _ = Command::new("git")
-        .current_dir(path)
-        .args(["fetch", "--quiet"])
-        .output()
-        .await;
+    let mut cmd = Command::new("git");
+    cmd.current_dir(path).args(["fetch", "--quiet"]);
+    apply_ssh_config(&mut cmd);
+    let _ = cmd.output().await;
 
     // Get ahead/behind counts
     let output = Command::new("git")

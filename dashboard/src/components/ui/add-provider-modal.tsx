@@ -59,6 +59,16 @@ const getProviderAuthMethods = (providerType: AIProviderType): AIProviderAuthMet
       { label: 'Enter API Key', type: 'api', description: 'Use an existing API key' },
     ];
   }
+  if (providerType === 'google') {
+    return [
+      {
+        label: 'OAuth with Google (Gemini CLI)',
+        type: 'oauth',
+        description: 'Use your Gemini plan/quotas (including free tier) via Google OAuth',
+      },
+      { label: 'Enter API Key', type: 'api', description: 'Use an existing Google AI API key' },
+    ];
+  }
   if (providerType === 'github-copilot') {
     return [
       { label: 'GitHub Copilot', type: 'oauth', description: 'Connect your subscription' },

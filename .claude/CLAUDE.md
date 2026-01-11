@@ -50,6 +50,39 @@ bun install
 bun dev
 ```
 
+## Debugging Missions
+
+Missions are persisted in a **SQLite database** with full event logging, enabling detailed post-mortem analysis.
+
+**Database location**: `~/.openagent/missions/missions.db` (or `missions-dev.db` in dev mode)
+
+**Retrieve events via API**:
+```bash
+GET /api/control/missions/{mission_id}/events
+```
+
+**Query parameters**:
+- `types=<type1>,<type2>` – filter by event type
+- `limit=<n>` – max events to return
+- `offset=<n>` – pagination offset
+
+**Event types captured**:
+- `user_message` – user inputs
+- `thinking` – agent reasoning tokens
+- `tool_call` – tool invocations (name + input)
+- `tool_result` – tool outputs
+- `assistant_message` – agent responses
+- `mission_status_changed` – status transitions
+- `error` – execution errors
+
+**Example**: Retrieve tool calls for a mission:
+```bash
+curl "http://localhost:3000/api/control/missions/<mission_id>/events?types=tool_call,tool_result" \
+  -H "Authorization: Bearer <token>"
+```
+
+**Code entry points**: `src/api/mission_store/` handles persistence; `src/api/control.rs` exposes the events endpoint.
+
 ## Notes
 
 - OpenCode config files are generated per workspace; do not keep static `opencode.json` in the repo.

@@ -566,6 +566,23 @@ fn opencode_entry_from_mcp(
             merged_env
                 .entry("OPEN_AGENT_WORKSPACE_TYPE".to_string())
                 .or_insert_with(|| workspace_type.as_str().to_string());
+            if workspace_type == WorkspaceType::Chroot {
+                if let Some(name) = workspace_root.file_name().and_then(|n| n.to_str()) {
+                    if !name.trim().is_empty() {
+                        merged_env
+                            .entry("OPEN_AGENT_WORKSPACE_NAME".to_string())
+                            .or_insert_with(|| name.to_string());
+                    }
+                }
+            }
+            if let Ok(runtime_workspace_file) = std::env::var("OPEN_AGENT_RUNTIME_WORKSPACE_FILE")
+            {
+                if !runtime_workspace_file.trim().is_empty() {
+                    merged_env
+                        .entry("OPEN_AGENT_RUNTIME_WORKSPACE_FILE".to_string())
+                        .or_insert(runtime_workspace_file);
+                }
+            }
 
             let use_nspawn =
                 config.scope == McpScope::Workspace && workspace_type == WorkspaceType::Chroot;
@@ -589,10 +606,26 @@ fn opencode_entry_from_mcp(
                     "-D".to_string(),
                     workspace_root.to_string_lossy().to_string(),
                     "--quiet".to_string(),
+                    "--timezone=off".to_string(),
                     "--console=pipe".to_string(),
                     "--chdir".to_string(),
                     rel_str,
                 ];
+                if let Ok(context_root) = std::env::var("OPEN_AGENT_CONTEXT_ROOT") {
+                    let context_root = context_root.trim();
+                    if !context_root.is_empty() && Path::new(context_root).exists() {
+                        cmd.push(format!("--bind={}:/root/context", context_root));
+                        nspawn_env.insert(
+                            "OPEN_AGENT_CONTEXT_ROOT".to_string(),
+                            "/root/context".to_string(),
+                        );
+                        if let Ok(dir_name) = std::env::var("OPEN_AGENT_CONTEXT_DIR_NAME") {
+                            if !dir_name.trim().is_empty() {
+                                nspawn_env.insert("OPEN_AGENT_CONTEXT_DIR_NAME".to_string(), dir_name);
+                            }
+                        }
+                    }
+                }
                 cmd.extend(nspawn::tailscale_nspawn_extra_args(&merged_env));
                 for (key, value) in &nspawn_env {
                     cmd.push(format!("--setenv={}={}", key, value));
@@ -828,6 +861,29 @@ async fn resolve_workspace_skill_names(
     Ok(Vec::new())
 }
 
+async fn resolve_workspace_tool_names(
+    workspace: &Workspace,
+    library: &LibraryStore,
+) -> anyhow::Result<Vec<String>> {
+    if !workspace.tools.is_empty() {
+        return Ok(workspace.tools.clone());
+    }
+
+    // Default host workspace should expose all library tools when none are explicitly configured.
+    if workspace.id == DEFAULT_WORKSPACE_ID && workspace.workspace_type == WorkspaceType::Host {
+        let tools = library.list_library_tools().await?;
+        let names: Vec<String> = tools.into_iter().map(|tool| tool.name).collect();
+        tracing::debug!(
+            workspace = %workspace.name,
+            count = names.len(),
+            "Using all library tools for default host workspace"
+        );
+        return Ok(names);
+    }
+
+    Ok(Vec::new())
+}
+
 /// Sync skills from library to workspace's `.opencode/skill/` directory.
 /// Called when workspace is created, updated, or before mission execution.
 pub async fn sync_workspace_skills(
@@ -1023,11 +1079,13 @@ pub async fn write_tools_to_workspace(
 
 /// Sync tools from library to workspace's `.opencode/tool/` directory.
 /// Called when workspace is created, updated, or before mission execution.
+/// Default host workspace will include all library tools when none are explicitly configured.
 pub async fn sync_workspace_tools(
     workspace: &Workspace,
     library: &LibraryStore,
 ) -> anyhow::Result<()> {
-    sync_tools_to_dir(&workspace.path, &workspace.tools, &workspace.name, library).await
+    let tool_names = resolve_workspace_tool_names(workspace, library).await?;
+    sync_tools_to_dir(&workspace.path, &tool_names, &workspace.name, library).await
 }
 
 /// Sync tools from library to a specific directory's `.opencode/tool/` folder.
@@ -1197,8 +1255,20 @@ pub async fn prepare_mission_workspace_with_skills(
         }
 
         // Sync tools
-        if !workspace.tools.is_empty() {
-            if let Err(e) = sync_tools_to_dir(&dir, &workspace.tools, &context, lib).await {
+        let tool_names = match resolve_workspace_tool_names(workspace, lib).await {
+            Ok(names) => names,
+            Err(e) => {
+                tracing::warn!(
+                    mission = %mission_id,
+                    workspace = %workspace.name,
+                    error = %e,
+                    "Failed to resolve tools from library"
+                );
+                Vec::new()
+            }
+        };
+        if !tool_names.is_empty() {
+            if let Err(e) = sync_tools_to_dir(&dir, &tool_names, &context, lib).await {
                 tracing::warn!(
                     mission = %mission_id,
                     workspace = %workspace.name,
@@ -1264,9 +1334,33 @@ pub async fn write_runtime_workspace_state(
     workspace: &Workspace,
     working_dir: &Path,
     mission_id: Option<Uuid>,
+    context_dir_name: &str,
 ) -> anyhow::Result<()> {
     let runtime_dir = working_dir_root.join(".openagent").join("runtime");
     tokio::fs::create_dir_all(&runtime_dir).await?;
+    let context_root = working_dir_root.join(context_dir_name);
+    let mission_context = mission_id.map(|id| context_root.join(id.to_string()));
+    let context_link = working_dir.join(context_dir_name);
+    if let Some(target) = mission_context.as_ref() {
+        if !context_link.exists() {
+            #[cfg(unix)]
+            {
+                if let Err(e) = std::os::unix::fs::symlink(target, &context_link) {
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        mission = ?mission_id,
+                        error = %e,
+                        "Failed to create context symlink; falling back to directory"
+                    );
+                    let _ = tokio::fs::create_dir_all(&context_link).await;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::fs::create_dir_all(&context_link).await;
+            }
+        }
+    }
     let payload = json!({
         "workspace_id": workspace.id,
         "workspace_name": workspace.name,
@@ -1274,6 +1368,9 @@ pub async fn write_runtime_workspace_state(
         "workspace_root": workspace.path,
         "working_dir": working_dir,
         "mission_id": mission_id,
+        "context_root": context_root,
+        "mission_context": mission_context,
+        "context_dir_name": context_dir_name,
     });
     let path = runtime_dir.join("current_workspace.json");
     tokio::fs::write(path, serde_json::to_string_pretty(&payload)?).await?;
@@ -1366,6 +1463,9 @@ pub async fn build_chroot_workspace(
     // Update status to building
     workspace.status = WorkspaceStatus::Building;
 
+    // If a previous build failed, always rebuild to clear partial state.
+    let force_rebuild = force_rebuild || workspace.error_message.is_some();
+
     let distro = distro.unwrap_or_default();
 
     // Check if already built with the right distro
@@ -1379,6 +1479,7 @@ pub async fn build_chroot_workspace(
                         distro.as_str()
                     );
                     workspace.status = WorkspaceStatus::Ready;
+                    workspace.error_message = None;
                     return Ok(());
                 }
                 tracing::info!(
@@ -1505,4 +1606,90 @@ pub async fn destroy_chroot_workspace(workspace: &Workspace) -> anyhow::Result<(
     nspawn::destroy_container(&workspace.path).await?;
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Config Sync (Library → System)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve the path to the OpenCode config directory.
+/// Uses OPENCODE_CONFIG_DIR env var or falls back to ~/.config/opencode/
+fn resolve_opencode_config_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    std::path::PathBuf::from(home)
+        .join(".config")
+        .join("opencode")
+}
+
+/// Sync oh-my-opencode.json from Library to ~/.config/opencode/
+/// This makes Library-backed settings take effect for OpenCode.
+pub async fn sync_opencode_settings(library: &crate::library::LibraryStore) -> anyhow::Result<()> {
+    let settings = library.get_opencode_settings().await?;
+
+    // Don't sync empty settings
+    if settings.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        tracing::debug!("No opencode settings in Library to sync");
+        return Ok(());
+    }
+
+    let dest_dir = resolve_opencode_config_dir();
+    let dest_path = dest_dir.join("oh-my-opencode.json");
+
+    // Ensure directory exists
+    tokio::fs::create_dir_all(&dest_dir).await?;
+
+    let content = serde_json::to_string_pretty(&settings)?;
+    tokio::fs::write(&dest_path, content).await?;
+
+    tracing::info!(
+        path = %dest_path.display(),
+        "Synced oh-my-opencode settings from Library"
+    );
+
+    Ok(())
+}
+
+/// Sync openagent/config.json from Library to the working directory.
+/// This makes Library-backed agent visibility settings available.
+pub async fn sync_openagent_config(
+    library: &crate::library::LibraryStore,
+    working_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let config = library.get_openagent_config().await?;
+
+    let dest_dir = working_dir.join(".openagent");
+    let dest_path = dest_dir.join("config.json");
+
+    // Ensure directory exists
+    tokio::fs::create_dir_all(&dest_dir).await?;
+
+    let content = serde_json::to_string_pretty(&config)?;
+    tokio::fs::write(&dest_path, content).await?;
+
+    tracing::info!(
+        path = %dest_path.display(),
+        "Synced openagent config from Library"
+    );
+
+    Ok(())
+}
+
+/// Read the OpenAgent config from the working directory.
+/// Returns default config if the file doesn't exist.
+pub async fn read_openagent_config(
+    working_dir: &std::path::Path,
+) -> crate::library::OpenAgentConfig {
+    let path = working_dir.join(".openagent/config.json");
+
+    if !path.exists() {
+        return crate::library::OpenAgentConfig::default();
+    }
+
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => crate::library::OpenAgentConfig::default(),
+    }
 }

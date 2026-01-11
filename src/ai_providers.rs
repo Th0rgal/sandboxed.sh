@@ -177,7 +177,10 @@ impl ProviderType {
 
     /// Returns whether this provider uses OAuth authentication.
     pub fn uses_oauth(&self) -> bool {
-        matches!(self, Self::Anthropic | Self::GithubCopilot | Self::OpenAI)
+        matches!(
+            self,
+            Self::Anthropic | Self::GithubCopilot | Self::OpenAI | Self::Google
+        )
     }
 
     /// Returns available authentication methods for this provider.
@@ -230,6 +233,21 @@ impl ProviderType {
                 method_type: AuthMethodType::Oauth,
                 description: Some("Connect your GitHub Copilot subscription".to_string()),
             }],
+            Self::Google => vec![
+                AuthMethod {
+                    label: "OAuth with Google (Gemini CLI)".to_string(),
+                    method_type: AuthMethodType::Oauth,
+                    description: Some(
+                        "Use your Gemini plan/quotas (including free tier) via Google OAuth"
+                            .to_string(),
+                    ),
+                },
+                AuthMethod {
+                    label: "Manually enter API Key".to_string(),
+                    method_type: AuthMethodType::Api,
+                    description: Some("Enter an existing Google AI API key".to_string()),
+                },
+            ],
             _ => vec![AuthMethod {
                 label: "API Key".to_string(),
                 method_type: AuthMethodType::Api,

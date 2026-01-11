@@ -36,6 +36,8 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useToast } from '@/components/toast';
+import { ConfigCodeEditor } from '@/components/config-code-editor';
 
 // The nil UUID represents the default "host" workspace which cannot be deleted
 const DEFAULT_WORKSPACE_ID = '00000000-0000-0000-0000-000000000000';
@@ -46,7 +48,7 @@ export default function WorkspacesPage() {
   const [selectedWorkspace, setSelectedWorkspace] = useState<Workspace | null>(null);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { showError } = useToast();
 
   const [showNewWorkspaceDialog, setShowNewWorkspaceDialog] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState('');
@@ -75,11 +77,10 @@ export default function WorkspacesPage() {
   const loadData = async () => {
     try {
       setLoading(true);
-      setError(null);
       const workspacesData = await listWorkspaces();
       setWorkspaces(workspacesData);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load workspaces');
+      showError(err instanceof Error ? err.message : 'Failed to load workspaces');
     } finally {
       setLoading(false);
     }
@@ -177,7 +178,7 @@ export default function WorkspacesPage() {
       const workspace = await getWorkspace(id);
       setSelectedWorkspace(workspace);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load workspace');
+      showError(err instanceof Error ? err.message : 'Failed to load workspace');
     }
   };
 
@@ -195,7 +196,7 @@ export default function WorkspacesPage() {
       setNewWorkspaceName('');
       setNewWorkspaceTemplate('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create workspace');
+      showError(err instanceof Error ? err.message : 'Failed to create workspace');
     } finally {
       setCreating(false);
     }
@@ -208,7 +209,7 @@ export default function WorkspacesPage() {
       setSelectedWorkspace(null);
       await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete workspace');
+      showError(err instanceof Error ? err.message : 'Failed to delete workspace');
     }
   };
 
@@ -216,12 +217,11 @@ export default function WorkspacesPage() {
     if (!selectedWorkspace) return;
     try {
       setBuilding(true);
-      setError(null);
       const updated = await buildWorkspace(selectedWorkspace.id, selectedDistro, rebuild);
       setSelectedWorkspace(updated);
       await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to build workspace');
+      showError(err instanceof Error ? err.message : 'Failed to build workspace');
       // Refresh to get latest status
       await loadData();
       if (selectedWorkspace) {
@@ -246,7 +246,7 @@ export default function WorkspacesPage() {
       setSelectedWorkspace(updated);
       await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save workspace settings');
+      showError(err instanceof Error ? err.message : 'Failed to save workspace settings');
     } finally {
       setSavingWorkspace(false);
     }
@@ -256,7 +256,7 @@ export default function WorkspacesPage() {
     if (!selectedWorkspace) return;
     const trimmedName = templateName.trim();
     if (!trimmedName) {
-      setError('Template name is required');
+      showError('Template name is required');
       return;
     }
     try {
@@ -271,7 +271,7 @@ export default function WorkspacesPage() {
       });
       await loadTemplates();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save workspace template');
+      showError(err instanceof Error ? err.message : 'Failed to save workspace template');
     } finally {
       setSavingTemplate(false);
     }
@@ -290,6 +290,14 @@ export default function WorkspacesPage() {
 
   const formatWorkspaceType = (type: Workspace['workspace_type']) =>
     type === 'host' ? 'host' : 'isolated';
+
+  // Extract the first meaningful line from error messages (ignores build output noise)
+  const extractErrorSummary = (errorMessage: string): string => {
+    // Split on newlines first, then on pipe (build output separator)
+    const firstLine = errorMessage.split('\n')[0].trim();
+    const beforePipe = firstLine.split(' | ')[0].trim();
+    return beforePipe || 'Unknown error';
+  };
 
   const filteredSkills = availableSkills.filter((skill) => {
     if (!skillsFilter.trim()) return true;
@@ -310,16 +318,6 @@ export default function WorkspacesPage() {
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-4">
-      {error && (
-        <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 flex items-center gap-2">
-          <AlertCircle className="h-4 w-4 flex-shrink-0" />
-          {error}
-          <button onClick={() => setError(null)} className="ml-auto">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-      )}
-
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-white">Workspaces</h1>
@@ -397,12 +395,6 @@ export default function WorkspacesPage() {
                   <Clock className="h-3.5 w-3.5" />
                   <span>Created {formatDate(workspace.created_at)}</span>
                 </div>
-
-                {workspace.error_message && (
-                  <div className="text-xs text-red-400 mt-2">
-                    Error: {workspace.error_message}
-                  </div>
-                )}
               </div>
             </div>
           ))
@@ -526,7 +518,7 @@ export default function WorkspacesPage() {
                     <div className="rounded-xl bg-red-500/5 border border-red-500/15 p-4">
                       <div className="flex items-start gap-3">
                         <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
-                        <p className="text-sm text-red-300">{selectedWorkspace.error_message}</p>
+                        <p className="text-sm text-red-300">{extractErrorSummary(selectedWorkspace.error_message)}</p>
                       </div>
                     </div>
                   )}
@@ -778,12 +770,13 @@ export default function WorkspacesPage() {
                       <p className="text-xs text-white/50 font-medium">Init Script</p>
                     </div>
                     <div className="p-4">
-                      <textarea
+                      <ConfigCodeEditor
                         value={initScript}
-                        onChange={(e) => setInitScript(e.target.value)}
-                        rows={10}
+                        onChange={setInitScript}
+                        language="bash"
                         placeholder="#!/usr/bin/env bash&#10;# Install packages or setup files here"
-                        className="w-full px-3 py-2.5 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white placeholder:text-white/25 font-mono focus:outline-none focus:border-indigo-500/50 resize-none"
+                        className="min-h-[220px]"
+                        minHeight={220}
                       />
                       <p className="text-xs text-white/35 mt-3">
                         Runs during build. Changes require rebuild to take effect.

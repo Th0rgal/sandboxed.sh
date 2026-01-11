@@ -7,6 +7,8 @@ import { MarkdownContent } from "@/components/markdown-content";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { cn } from "@/lib/utils";
+import { getRuntimeApiBase } from "@/lib/settings";
+import { authHeader } from "@/lib/auth";
 import {
   cancelControl,
   postControlMessage,
@@ -39,7 +41,6 @@ import {
   type Provider,
   type Workspace,
 } from "@/lib/api";
-import { useLibrary } from "@/contexts/library-context";
 import {
   Send,
   Square,
@@ -118,6 +119,31 @@ function formatDiagAge(ts?: number) {
   const remMins = mins % 60;
   return `${hrs}h ${remMins}m ago`;
 }
+
+type StreamLogLevel = "debug" | "info" | "warn" | "error";
+
+function streamLog(level: StreamLogLevel, message: string, meta?: Record<string, unknown>) {
+  const prefix = "[control:sse]";
+  const args = meta ? [prefix, message, meta] : [prefix, message];
+  switch (level) {
+    case "debug":
+      // eslint-disable-next-line no-console
+      console.debug(...args);
+      break;
+    case "info":
+      // eslint-disable-next-line no-console
+      console.info(...args);
+      break;
+    case "warn":
+      // eslint-disable-next-line no-console
+      console.warn(...args);
+      break;
+    case "error":
+      // eslint-disable-next-line no-console
+      console.error(...args);
+      break;
+  }
+}
 import {
   OptionList,
   OptionListErrorBoundary,
@@ -133,6 +159,7 @@ import { useLocalStorage } from "@/hooks/use-local-storage";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { DesktopStream } from "@/components/desktop-stream";
 import { NewMissionDialog } from "@/components/new-mission-dialog";
+import { MissionSwitcher } from "@/components/mission-switcher";
 
 import type { SharedFile } from "@/lib/api";
 
@@ -633,42 +660,53 @@ function PhaseItem({ item }: { item: Extract<ChatItem, { kind: "phase" }> }) {
   );
 }
 
-// Thinking item component with collapsible UI and auto-collapse
-function ThinkingItem({
-  item,
+// Thinking group component - displays multiple thinking items merged with separators
+function ThinkingGroupItem({
+  items,
 }: {
-  item: Extract<ChatItem, { kind: "thinking" }>;
+  items: Extract<ChatItem, { kind: "thinking" }>[];
 }) {
-  const [expanded, setExpanded] = useState(!item.done); // Auto-expand while thinking
+  // Filter out empty items for display
+  const nonEmptyItems = useMemo(() =>
+    items.filter(item => item.content.trim()),
+    [items]
+  );
+
+  const hasActiveItem = items.some(item => !item.done);
+  const [expanded, setExpanded] = useState(hasActiveItem);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const hasAutoCollapsedRef = useRef(false);
 
-  // Update elapsed time while thinking is active
+  // Get the earliest start time and latest end time
+  const startTime = Math.min(...items.map(item => item.startTime));
+  const endTime = items.every(item => item.done && item.endTime)
+    ? Math.max(...items.map(item => item.endTime || item.startTime))
+    : undefined;
+
+  // Update elapsed time while any thinking is active
   useEffect(() => {
-    if (item.done) return;
+    if (!hasActiveItem) return;
     const interval = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - item.startTime) / 1000));
+      setElapsedSeconds(Math.floor((Date.now() - startTime) / 1000));
     }, 1000);
     return () => clearInterval(interval);
-  }, [item.done, item.startTime]);
+  }, [hasActiveItem, startTime]);
 
-  // Auto-collapse when thinking is done (with delay)
-  // Longer delay for extended thinking sessions to let user see the summary
+  // Auto-collapse when all thinking is done
   useEffect(() => {
-    if (item.done && expanded && !hasAutoCollapsedRef.current) {
-      const duration = Math.floor((Date.now() - item.startTime) / 1000);
-      // Don't auto-collapse if thinking was > 30 seconds (user may want to review)
+    if (!hasActiveItem && expanded && !hasAutoCollapsedRef.current) {
+      const duration = Math.floor((Date.now() - startTime) / 1000);
       if (duration > 30) {
-        hasAutoCollapsedRef.current = true; // Mark as handled but don't collapse
+        hasAutoCollapsedRef.current = true;
         return;
       }
       const timer = setTimeout(() => {
         setExpanded(false);
         hasAutoCollapsedRef.current = true;
-      }, 1500); // Longer delay
+      }, 1500);
       return () => clearTimeout(timer);
     }
-  }, [item.done, expanded, item.startTime]);
+  }, [hasActiveItem, expanded, startTime]);
 
   const formatDuration = (seconds: number) => {
     if (seconds < 60) return `${seconds}s`;
@@ -677,10 +715,16 @@ function ThinkingItem({
     return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
   };
 
-  // Use endTime for completed thinking, otherwise use elapsed time for active thinking
-  const duration = item.done && item.endTime
-    ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
+  const duration = !hasActiveItem && endTime
+    ? formatDuration(Math.floor((endTime - startTime) / 1000))
     : formatDuration(elapsedSeconds);
+
+  // If no non-empty items, don't render anything
+  if (nonEmptyItems.length === 0) {
+    return null;
+  }
+
+  const label = nonEmptyItems.length === 1 ? "Thought" : "Thoughts";
 
   return (
     <div className="my-2">
@@ -697,12 +741,15 @@ function ThinkingItem({
         <Brain
           className={cn(
             "h-3 w-3",
-            !item.done && "animate-pulse text-indigo-400"
+            hasActiveItem && "animate-pulse text-indigo-400"
           )}
         />
         <span className="text-xs">
-          {item.done ? `Thought for ${duration}` : `Thinking for ${duration}`}
+          {hasActiveItem ? `Thinking for ${duration}` : `${label} for ${duration}`}
         </span>
+        {nonEmptyItems.length > 1 && (
+          <span className="text-xs text-white/30">({nonEmptyItems.length})</span>
+        )}
         <ChevronDown
           className={cn(
             "h-3 w-3 transition-transform duration-200",
@@ -719,8 +766,21 @@ function ThinkingItem({
         )}
       >
         <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
-          <div className="text-xs text-white/50 whitespace-pre-wrap overflow-y-auto max-h-[45vh] leading-relaxed">
-            {item.content || <span className="italic text-white/30">Processing...</span>}
+          <div className="overflow-y-auto max-h-[45vh] leading-relaxed space-y-2">
+            {nonEmptyItems.map((item, idx) => (
+              <div key={item.id}>
+                {idx > 0 && (
+                  <div className="border-t border-white/[0.06] my-2" />
+                )}
+                <MarkdownContent
+                  content={item.content}
+                  className="text-xs text-white/60 [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
+                />
+              </div>
+            ))}
+            {hasActiveItem && nonEmptyItems.length === 0 && (
+              <span className="italic text-white/30">Processing...</span>
+            )}
           </div>
         </div>
       </div>
@@ -779,11 +839,16 @@ function ThinkingPanelItem({
         </span>
       </div>
       <div className={cn(
-        "text-xs leading-relaxed whitespace-pre-wrap",
+        "text-xs leading-relaxed",
         isActive ? "text-white/70" : "text-white/40",
         "max-h-[50vh] overflow-y-auto"
       )}>
-        {item.content || (
+        {item.content ? (
+          <MarkdownContent
+            content={item.content}
+            className="text-xs [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
+          />
+        ) : (
           <span className="italic text-white/30">Processing...</span>
         )}
       </div>
@@ -802,7 +867,21 @@ function ThinkingPanel({
   className?: string;
 }) {
   const activeItem = items.find(t => !t.done);
-  const completedItems = items.filter(t => t.done); // Oldest first (chronological order)
+
+  // Deduplicate completed items by content - keep first occurrence
+  const completedItems = useMemo(() => {
+    const seen = new Set<string>();
+    return items.filter(t => {
+      if (!t.done) return false;
+      // Skip empty/whitespace-only content
+      const trimmed = t.content.trim();
+      if (!trimmed) return false;
+      if (seen.has(trimmed)) return false;
+      seen.add(trimmed);
+      return true;
+    });
+  }, [items]);
+
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll to bottom when active thought content changes
@@ -835,8 +914,8 @@ function ThinkingPanel({
           <span className="text-sm font-medium text-white">
             {activeItem ? "Thinking" : "Thoughts"}
           </span>
-          {items.length > 0 && (
-            <span className="text-xs text-white/30">({items.length})</span>
+          {(completedItems.length > 0 || activeItem) && (
+            <span className="text-xs text-white/30">({completedItems.length + (activeItem ? 1 : 0)})</span>
           )}
         </div>
         <button
@@ -928,6 +1007,395 @@ function truncateText(text: string, maxLength: number = 100): string {
   return text.slice(0, maxLength) + "...";
 }
 
+// Check if a tool is a subagent/background task tool
+function isSubagentTool(toolName: string): boolean {
+  const name = toolName.toLowerCase();
+  return (
+    name === "background_task" ||
+    name === "task" ||
+    name.includes("subagent") ||
+    name.includes("spawn_agent") ||
+    name.includes("delegate")
+  );
+}
+
+// Extract subagent info from tool args
+function extractSubagentInfo(args: unknown): {
+  agentName: string | null;
+  description: string | null;
+  prompt: string | null;
+} {
+  if (!args || typeof args !== "object") {
+    return { agentName: null, description: null, prompt: null };
+  }
+  const argsObj = args as Record<string, unknown>;
+  return {
+    agentName: typeof argsObj.agent === "string" ? argsObj.agent :
+               typeof argsObj.subagent_type === "string" ? argsObj.subagent_type :
+               typeof argsObj.name === "string" ? argsObj.name : null,
+    description: typeof argsObj.description === "string" ? argsObj.description : null,
+    prompt: typeof argsObj.prompt === "string" ? argsObj.prompt : null,
+  };
+}
+
+// Parse subagent result for summary stats
+function parseSubagentResult(result: unknown): {
+  success: boolean;
+  summary: string | null;
+} {
+  if (!result) return { success: false, summary: null };
+
+  // Handle string results
+  if (typeof result === "string") {
+    // Strip out <task_metadata>...</task_metadata> blocks entirely
+    const cleanedResult = result.replace(/<task_metadata>[\s\S]*?<\/task_metadata>/gi, "").trim();
+    // Check for explicit error indicators at the start, not just keyword presence
+    const trimmedLower = cleanedResult.toLowerCase();
+    const isError = trimmedLower.startsWith("error:") ||
+                    trimmedLower.startsWith("error -") ||
+                    trimmedLower.startsWith("failed:") ||
+                    trimmedLower.startsWith("exception:");
+    // Try to extract a meaningful summary from the result
+    const lines = cleanedResult.split("\n").filter(l => l.trim());
+    const summary = lines.length > 0 ? truncateText(lines[0], 100) : null;
+    return { success: !isError, summary };
+  }
+
+  // Handle object results
+  if (typeof result === "object") {
+    const resultObj = result as Record<string, unknown>;
+    const statusLower = typeof resultObj.status === "string" ? resultObj.status.toLowerCase() : "";
+    const isError = resultObj.error !== undefined ||
+                    resultObj.is_error === true ||
+                    resultObj.success === false ||
+                    statusLower === "error" || statusLower === "failed";
+    const summary = typeof resultObj.summary === "string" ? resultObj.summary :
+                    typeof resultObj.message === "string" ? resultObj.message :
+                    typeof resultObj.result === "string" ? truncateText(resultObj.result, 100) : null;
+    return { success: !isError, summary };
+  }
+
+  return { success: true, summary: null };
+}
+
+// Subagent/Background Task tool item with enhanced UX
+function SubagentToolItem({
+  item,
+}: {
+  item: Extract<ChatItem, { kind: "tool" }>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const isDone = item.result !== undefined;
+
+  const { agentName, description, prompt } = extractSubagentInfo(item.args);
+  const { success, summary } = isDone ? parseSubagentResult(item.result) : { success: false, summary: null };
+
+  // Update elapsed time while tool is running
+  useEffect(() => {
+    if (isDone) return;
+    const interval = setInterval(() => {
+      setElapsedSeconds(Math.floor((Date.now() - item.startTime) / 1000));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [isDone, item.startTime]);
+
+  const formatDuration = (seconds: number) => {
+    // Handle negative or zero durations
+    if (seconds <= 0) return "<1s";
+    if (seconds < 60) return `${seconds}s`;
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
+  };
+
+  const duration = isDone && item.endTime
+    ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
+    : formatDuration(elapsedSeconds);
+
+  const resultStr = item.result !== undefined ? formatToolArgs(item.result) : null;
+
+  return (
+    <div className="my-3">
+      {/* Main card */}
+      <div
+        className={cn(
+          "rounded-lg border overflow-hidden",
+          "bg-white/[0.02]",
+          !isDone && "border-purple-500/30",
+          isDone && success && "border-emerald-500/20",
+          isDone && !success && "border-red-500/20"
+        )}
+      >
+        {/* Header */}
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className={cn(
+            "w-full flex items-center gap-3 px-3 py-2",
+            "hover:bg-white/[0.02] transition-colors"
+          )}
+        >
+          {/* Icon */}
+          <div className={cn(
+            "flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center",
+            !isDone && "bg-purple-500/20",
+            isDone && success && "bg-emerald-500/20",
+            isDone && !success && "bg-red-500/20"
+          )}>
+            {!isDone ? (
+              <Cpu className="h-4 w-4 text-purple-400 animate-pulse" />
+            ) : success ? (
+              <CheckCircle className="h-4 w-4 text-emerald-400" />
+            ) : (
+              <XCircle className="h-4 w-4 text-red-400" />
+            )}
+          </div>
+
+          {/* Info */}
+          <div className="flex-1 text-left min-w-0">
+            <div className="flex items-center gap-2">
+              <span className={cn(
+                "text-sm font-medium",
+                !isDone && "text-purple-300",
+                isDone && success && "text-emerald-300",
+                isDone && !success && "text-red-300"
+              )}>
+                {agentName || "Subagent"}
+              </span>
+              {description && (
+                <span className="text-xs text-white/40 truncate">
+                  {truncateText(description, 40)}
+                </span>
+              )}
+            </div>
+
+            {/* Status line */}
+            <div className="flex items-center gap-2 mt-0.5">
+              {!isDone ? (
+                <>
+                  <span className="text-xs text-white/50">Running for {duration}</span>
+                  <Loader className="h-3 w-3 animate-spin text-purple-400" />
+                </>
+              ) : (
+                <>
+                  <span className="text-xs text-white/50">Completed in {duration}</span>
+                  {summary && (
+                    <span className="text-xs text-white/40 truncate max-w-[200px]">
+                      — {summary}
+                    </span>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Peek toggle */}
+          <div className="flex items-center gap-1 flex-shrink-0">
+            <span className={cn(
+              "text-[10px] uppercase tracking-wider transition-colors",
+              expanded ? "text-white/50" : "text-white/30"
+            )}>
+              {expanded ? "Hide" : "Peek"}
+            </span>
+            <ChevronDown
+              className={cn(
+                "h-4 w-4 text-white/30 transition-transform duration-200",
+                expanded ? "rotate-0" : "-rotate-90"
+              )}
+            />
+          </div>
+        </button>
+
+        {/* Progress bar (only when running) */}
+        {!isDone && (
+          <div className="h-1 bg-purple-500/10">
+            <div
+              className="h-full bg-purple-500/50 animate-pulse"
+              style={{
+                width: "100%",
+                background: "linear-gradient(90deg, transparent, rgba(168, 85, 247, 0.5), transparent)",
+                animation: "shimmer 2s infinite"
+              }}
+            />
+          </div>
+        )}
+
+        {/* Expandable content */}
+        <div
+          className={cn(
+            "overflow-hidden transition-all duration-200 ease-out",
+            expanded ? "max-h-[600px] opacity-100" : "max-h-0 opacity-0"
+          )}
+        >
+          <div className="px-3 py-3 space-y-3 border-t border-white/[0.06]">
+            {/* Prompt preview */}
+            {prompt && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-white/30 mb-1">
+                  Task
+                </div>
+                <div className="text-xs text-white/60 bg-black/20 rounded p-2 max-h-24 overflow-y-auto">
+                  {truncateText(prompt, 300)}
+                </div>
+              </div>
+            )}
+
+            {/* Result */}
+            {resultStr !== null && (
+              <div>
+                <div className={cn(
+                  "text-[10px] uppercase tracking-wider mb-1",
+                  !success ? "text-red-400/70" : "text-emerald-400/70"
+                )}>
+                  {!success ? "Error" : "Result"}
+                </div>
+                <div className={cn(
+                  "max-h-60 overflow-y-auto rounded",
+                  !success && "[&_pre]:!bg-red-500/10"
+                )}>
+                  <SyntaxHighlighter
+                    language="json"
+                    style={oneDark}
+                    customStyle={{
+                      margin: 0,
+                      padding: "0.5rem",
+                      fontSize: "0.75rem",
+                      borderRadius: "0.25rem",
+                      background: !success ? "rgba(239, 68, 68, 0.1)" : "rgba(0, 0, 0, 0.2)",
+                    }}
+                    codeTagProps={{
+                      style: {
+                        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+                        color: !success ? "rgb(248, 113, 113)" : undefined,
+                      },
+                    }}
+                  >
+                    {resultStr}
+                  </SyntaxHighlighter>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Extract image file paths from tool result strings
+// Matches patterns like "/path/to/image.png" or "screenshots/file.jpg"
+function extractImagePaths(text: string): string[] {
+  const paths: string[] = [];
+  // Match absolute paths or relative paths that look like image files
+  // Pattern: word characters, slashes, dots, hyphens, underscores ending in image extension
+  const pathPattern = /(?:\/[\w\-._/]+|[\w\-._]+\/[\w\-._/]+)\.(?:png|jpg|jpeg|gif|webp|bmp|svg)\b/gi;
+  const matches = text.match(pathPattern);
+  if (matches) {
+    for (const match of matches) {
+      // Normalize and dedupe
+      const normalized = match.trim();
+      if (!paths.includes(normalized)) {
+        paths.push(normalized);
+      }
+    }
+  }
+  return paths;
+}
+
+// Component to display an image preview with click-to-open functionality
+function ImagePreview({ path }: { path: string }) {
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadImage = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const API_BASE = getRuntimeApiBase();
+        const res = await fetch(
+          `${API_BASE}/api/fs/download?path=${encodeURIComponent(path)}`,
+          { headers: { ...authHeader() } }
+        );
+        if (!res.ok) {
+          throw new Error(`Failed to load image: ${res.status}`);
+        }
+        const blob = await res.blob();
+        if (cancelled) return;
+        const url = URL.createObjectURL(blob);
+        setImageUrl(url);
+      } catch (e) {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : 'Failed to load image');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    loadImage();
+    return () => {
+      cancelled = true;
+      if (imageUrl) URL.revokeObjectURL(imageUrl);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path]);
+
+  const openInNewTab = () => {
+    if (imageUrl) {
+      window.open(imageUrl, '_blank');
+    }
+  };
+
+  const fileName = path.split('/').pop() || path;
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-white/40 py-2">
+        <Loader className="h-3 w-3 animate-spin" />
+        <span>Loading {fileName}...</span>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-red-400/70 py-2">
+        <AlertTriangle className="h-3 w-3" />
+        <span>{error}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-2">
+      <div className="text-[10px] uppercase tracking-wider text-white/30 mb-1 flex items-center gap-2">
+        <Image className="h-3 w-3" />
+        Screenshot Preview
+      </div>
+      <div
+        className="relative group cursor-pointer rounded-lg overflow-hidden border border-white/10 hover:border-white/20 transition-colors"
+        onClick={openInNewTab}
+        title="Click to open in new tab"
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={imageUrl || ''}
+          alt={fileName}
+          className="max-w-full max-h-60 object-contain bg-black/20"
+        />
+        <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-colors flex items-center justify-center opacity-0 group-hover:opacity-100">
+          <div className="flex items-center gap-2 text-white text-sm bg-black/60 px-3 py-1.5 rounded-full">
+            <ExternalLink className="h-4 w-4" />
+            Open in new tab
+          </div>
+        </div>
+      </div>
+      <div className="text-[10px] text-white/30 mt-1 truncate">{path}</div>
+    </div>
+  );
+}
+
 // Tool call item component with collapsible UI
 function ToolCallItem({
   item,
@@ -963,12 +1431,25 @@ function ToolCallItem({
   const argsStr = formatToolArgs(item.args);
   const resultStr = item.result !== undefined ? formatToolArgs(item.result) : null;
   
-  // Determine result status
-  const isError = resultStr !== null && (
-    resultStr.toLowerCase().includes("error") ||
-    resultStr.toLowerCase().includes("failed") ||
-    resultStr.toLowerCase().includes("exception")
-  );
+  // Determine result status - check for explicit error indicators, not just keyword presence
+  const isError = (() => {
+    if (resultStr === null) return false;
+
+    // Check if the result is an object with explicit error fields
+    if (typeof item.result === "object" && item.result !== null) {
+      const resultObj = item.result as Record<string, unknown>;
+      if (resultObj.error !== undefined || resultObj.is_error === true || resultObj.success === false) {
+        return true;
+      }
+    }
+
+    // Check if the string result starts with error indicators (more specific than keyword search)
+    const trimmedLower = resultStr.trim().toLowerCase();
+    return trimmedLower.startsWith("error:") ||
+           trimmedLower.startsWith("error -") ||
+           trimmedLower.startsWith("failed:") ||
+           trimmedLower.startsWith("exception:");
+  })();
 
   // Get a preview of the args for the collapsed state
   const argsPreview = truncateText(
@@ -1091,6 +1572,18 @@ function ToolCallItem({
                   {resultStr}
                 </SyntaxHighlighter>
               </div>
+              {/* Image previews for screenshot results */}
+              {(() => {
+                const imagePaths = extractImagePaths(resultStr);
+                if (imagePaths.length === 0) return null;
+                return (
+                  <div className="space-y-2">
+                    {imagePaths.map((path) => (
+                      <ImagePreview key={path} path={path} />
+                    ))}
+                  </div>
+                );
+              })()}
             </div>
           )}
 
@@ -1120,6 +1613,14 @@ function CollapsedToolGroup({
   const hiddenCount = tools.length - 1;
   const lastTool = tools[tools.length - 1];
 
+  // Helper to render appropriate tool component
+  const renderTool = (tool: Extract<ChatItem, { kind: "tool" }>) => {
+    if (isSubagentTool(tool.name)) {
+      return <SubagentToolItem key={tool.id} item={tool} />;
+    }
+    return <ToolCallItem key={tool.id} item={tool} />;
+  };
+
   if (isExpanded) {
     // Show all tools with a collapse button at the top
     return (
@@ -1136,9 +1637,7 @@ function CollapsedToolGroup({
           <ChevronUp className="h-3 w-3" />
           <span>Hide {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}</span>
         </button>
-        {tools.map((tool) => (
-          <ToolCallItem key={tool.id} item={tool} />
-        ))}
+        {tools.map((tool) => renderTool(tool))}
       </div>
     );
   }
@@ -1158,7 +1657,7 @@ function CollapsedToolGroup({
         <ChevronDown className="h-3 w-3" />
         <span>Show {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}</span>
       </button>
-      <ToolCallItem item={lastTool} />
+      {renderTool(lastTool)}
     </div>
   );
 }
@@ -1243,7 +1742,6 @@ export default function ControlClient() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
 
   // Library context for agents
-  const { libraryAgents } = useLibrary();
 
   useEffect(() => {
     const interval = setInterval(() => setDiagTick((prev) => prev + 1), 1000);
@@ -1254,7 +1752,7 @@ export default function ControlClient() {
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
     []
   );
-  const [showParallelPanel, setShowParallelPanel] = useState(false);
+  const [showMissionSwitcher, setShowMissionSwitcher] = useState(false);
 
   // Track which mission's events we're viewing (for parallel missions)
   // This can differ from currentMission when viewing a parallel mission
@@ -1302,6 +1800,21 @@ export default function ControlClient() {
     [items]
   );
 
+  // Deduplicated count for display (same logic as ThinkingPanel)
+  const thinkingItemsCount = useMemo(() => {
+    const activeItem = thinkingItems.find(t => !t.done);
+    const seen = new Set<string>();
+    let completedCount = 0;
+    for (const t of thinkingItems) {
+      if (!t.done) continue;
+      const trimmed = t.content.trim();
+      if (!trimmed || seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      completedCount++;
+    }
+    return completedCount + (activeItem ? 1 : 0);
+  }, [thinkingItems]);
+
   // Check if there's active thinking happening
   const hasActiveThinking = useMemo(() =>
     thinkingItems.some(t => !t.done),
@@ -1318,26 +1831,30 @@ export default function ControlClient() {
     prevHasActiveThinking.current = hasActiveThinking;
   }, [hasActiveThinking]);
 
-  // Group consecutive tool items for collapsed display
-  // Returns array of: original items OR { kind: "tool_group", tools: [...], groupId: string }
+  // Group consecutive tool items and thinking items for collapsed display
+  // Returns array of: original items OR { kind: "tool_group", tools: [...] } OR { kind: "thinking_group", thoughts: [...] }
   type ToolGroup = {
     kind: "tool_group";
     groupId: string;
     tools: Extract<ChatItem, { kind: "tool" }>[];
   };
-  type GroupedItem = ChatItem | ToolGroup;
+  type ThinkingGroup = {
+    kind: "thinking_group";
+    groupId: string;
+    thoughts: Extract<ChatItem, { kind: "thinking" }>[];
+  };
+  type GroupedItem = ChatItem | ToolGroup | ThinkingGroup;
 
   const groupedItems = useMemo((): GroupedItem[] => {
     const result: GroupedItem[] = [];
     let currentToolGroup: Extract<ChatItem, { kind: "tool" }>[] = [];
+    let currentThinkingGroup: Extract<ChatItem, { kind: "thinking" }>[] = [];
 
     const flushToolGroup = () => {
       if (currentToolGroup.length === 0) return;
       if (currentToolGroup.length === 1) {
-        // Single tool - no grouping needed
         result.push(currentToolGroup[0]);
       } else {
-        // Multiple consecutive tools - create a group
         result.push({
           kind: "tool_group",
           groupId: currentToolGroup[0].id,
@@ -1347,21 +1864,46 @@ export default function ControlClient() {
       currentToolGroup = [];
     };
 
+    const flushThinkingGroup = () => {
+      if (currentThinkingGroup.length === 0) return;
+      // Always create a group for thinking items (even for single items)
+      // This ensures consistent rendering through ThinkingGroupItem
+      result.push({
+        kind: "thinking_group",
+        groupId: currentThinkingGroup[0].id,
+        thoughts: currentThinkingGroup,
+      });
+      currentThinkingGroup = [];
+    };
+
     for (const item of items) {
       if (item.kind === "tool" && !item.isUiTool) {
-        // Non-UI tool - add to current group
+        // Non-UI tool - flush thinking first, then add to tool group
+        flushThinkingGroup();
         currentToolGroup.push(item);
+      } else if (item.kind === "thinking") {
+        if (showThinkingPanel) {
+          // When thinking panel is open, skip all thinking items entirely
+          // (they're shown in the side panel)
+          flushThinkingGroup();
+        } else {
+          // Add to thinking group
+          flushToolGroup();
+          currentThinkingGroup.push(item);
+        }
       } else {
-        // Non-tool item - flush any pending tool group first
+        // Other item - flush any pending groups first
         flushToolGroup();
+        flushThinkingGroup();
         result.push(item);
       }
     }
-    // Flush any remaining tools
+    // Flush any remaining groups
     flushToolGroup();
+    flushThinkingGroup();
 
     return result;
-  }, [items]);
+  }, [items, showThinkingPanel]);
 
   // Check if the mission we're viewing is actually running (not just any mission)
   const viewingMissionIsRunning = useMemo(() => {
@@ -1407,7 +1949,6 @@ export default function ControlClient() {
   const isBusy = viewingMissionIsRunning;
 
   const streamCleanupRef = useRef<null | (() => void)>(null);
-  const missionsMenuRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const viewingMissionIdRef = useRef<string | null>(null);
@@ -1469,20 +2010,6 @@ export default function ControlClient() {
   useEffect(() => {
     adjustTextareaHeight();
   }, [input, adjustTextareaHeight]);
-
-  // Close status menu when clicking outside
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (
-        missionsMenuRef.current &&
-        !missionsMenuRef.current.contains(event.target as Node)
-      ) {
-        setShowParallelPanel(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, []);
 
   const compressImageFile = useCallback(async (file: File) => {
     if (!file.type.startsWith("image/")) return file;
@@ -1554,9 +2081,8 @@ export default function ControlClient() {
 
     try {
       // Upload to mission-specific context folder if we have a mission
-      const contextPath = currentMission?.id 
-        ? `/root/context/${currentMission.id}/`
-        : "/root/context/";
+      // Upload into the workspace-local ./context (symlinked to mission context inside the container).
+      const contextPath = "./context/";
       
       // Use chunked upload for files > 10MB, regular for smaller
       const useChunked = fileToUpload.size > 10 * 1024 * 1024;
@@ -1591,9 +2117,7 @@ export default function ControlClient() {
     
     setUrlDownloading(true);
     try {
-      const contextPath = currentMission?.id 
-        ? `/root/context/${currentMission.id}/`
-        : "/root/context/";
+      const contextPath = "./context/";
       
       const result = await downloadFromUrl(urlInput.trim(), contextPath);
       toast.success(`Downloaded ${result.name}`);
@@ -1762,14 +2286,22 @@ export default function ControlClient() {
 
   useEffect(() => {
     let cancelled = false;
-    const missionId = searchParams.get("mission");
+      const missionId = searchParams.get("mission");
 
-    const loadFromQuery = async (id: string) => {
-      // Skip loading if we already have this mission in state (e.g., after handleNewMission)
-      if (viewingMissionRef.current?.id === id) {
-        setViewingMissionId(id);
-        return;
-      }
+      const loadFromQuery = async (id: string) => {
+        const pendingId = pendingMissionNavRef.current;
+        if (pendingId && id !== pendingId) {
+          // Ignore stale query params while we navigate to a newly-created mission.
+          return;
+        }
+        if (pendingId && id === pendingId) {
+          pendingMissionNavRef.current = null;
+        }
+        // Skip loading if we already have this mission in state (e.g., after handleNewMission)
+        if (viewingMissionRef.current?.id === id) {
+          setViewingMissionId(id);
+          return;
+        }
       const previousViewingMission = viewingMissionRef.current;
       setMissionLoading(true);
       setViewingMissionId(id); // Set viewing ID immediately to prevent "Agent is working..." flash
@@ -1846,7 +2378,6 @@ export default function ControlClient() {
     missionHistoryToItems,
     applyDesktopSessionState,
     authRetryTrigger,
-    lastMissionId,
   ]);
 
   useEffect(() => {
@@ -1861,10 +2392,6 @@ export default function ControlClient() {
       try {
         const running = await getRunningMissions();
         setRunningMissions(running);
-        // Auto-show panel if there are parallel missions
-        if (running.length > 1) {
-          setShowParallelPanel(true);
-        }
       } catch {
         // Ignore errors
       }
@@ -1887,6 +2414,35 @@ export default function ControlClient() {
   }, []);
 
   const handleStreamDiagnostics = useCallback((update: StreamDiagnosticUpdate) => {
+    switch (update.phase) {
+      case "connecting":
+        streamLog("info", "connecting", { url: update.url });
+        break;
+      case "open":
+        streamLog("info", "open", {
+          url: update.url,
+          status: update.status,
+          headers: update.headers,
+        });
+        break;
+      case "chunk":
+        streamLog("debug", "chunk", { url: update.url, bytes: update.bytes });
+        break;
+      case "event":
+        streamLog("debug", "event", { url: update.url, bytes: update.bytes });
+        break;
+      case "closed":
+        streamLog("warn", "closed", { url: update.url, bytes: update.bytes });
+        break;
+      case "error":
+        streamLog("error", "error", {
+          url: update.url,
+          status: update.status,
+          error: update.error,
+        });
+        break;
+    }
+
     setStreamDiagnostics((prev) => {
       const next: StreamDiagnosticsState = { ...prev };
       if (update.url) next.url = update.url;
@@ -1950,6 +2506,18 @@ export default function ControlClient() {
     return () => clearInterval(interval);
   }, [refreshRecentMissions]);
 
+  // Global keyboard shortcut for mission switcher (Cmd+K / Ctrl+K)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setShowMissionSwitcher(true);
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
   // Fetch available providers and models for mission creation (retry on auth success)
   useEffect(() => {
     listProviders()
@@ -2004,6 +2572,7 @@ export default function ControlClient() {
 
   // Track the mission ID being fetched to prevent race conditions
   const fetchingMissionIdRef = useRef<string | null>(null);
+  const pendingMissionNavRef = useRef<string | null>(null);
 
   // Handle switching which mission we're viewing
   const handleViewMission = useCallback(
@@ -2097,17 +2666,17 @@ export default function ControlClient() {
         agent: options?.agent,
         modelOverride: options?.modelOverride,
       });
+      pendingMissionNavRef.current = mission.id;
+      router.replace(`/control?mission=${mission.id}`, { scroll: false });
       setCurrentMission(mission);
       setViewingMission(mission);
       setViewingMissionId(mission.id); // Also update viewing to the new mission
       setItems([]);
       setHasDesktopSession(false);
-      setShowParallelPanel(false); // Keep the mission switcher closed after creating a mission
       // Refresh running missions to get accurate state
       const running = await getRunningMissions();
       setRunningMissions(running);
       refreshRecentMissions();
-      router.replace(`/control?mission=${mission.id}`, { scroll: false });
       toast.success("New mission created");
     } catch (err) {
       console.error("Failed to create mission:", err);
@@ -2197,15 +2766,22 @@ export default function ControlClient() {
           ? String(data["mission_id"])
           : null;
       const currentMissionId = currentMissionRef.current?.id;
+      streamLog("debug", "received", {
+        type: event.type,
+        eventMissionId,
+        viewingId,
+        currentMissionId,
+      });
 
       // If we're viewing a specific mission, filter events strictly
       if (viewingId) {
+        let filterReason: string | null = null;
         // Event has a mission_id - must match viewing mission
         if (eventMissionId) {
           if (eventMissionId !== viewingId) {
             // Event is from a different mission - only allow status events
             if (event.type !== "status") {
-              return;
+              filterReason = "event from different mission";
             }
           }
         } else {
@@ -2215,9 +2791,19 @@ export default function ControlClient() {
           if (currentMissionId && viewingId !== currentMissionId) {
             // We're viewing a parallel mission, skip main session events
             if (event.type !== "status") {
-              return;
+              filterReason = "event has no mission_id for parallel mission";
             }
           }
+        }
+        if (filterReason) {
+          streamLog("debug", "filtered", {
+            type: event.type,
+            eventMissionId,
+            viewingId,
+            currentMissionId,
+            reason: filterReason,
+          });
+          return;
         }
       }
 
@@ -2576,6 +3162,11 @@ export default function ControlClient() {
         const missionId = isRecord(data) && typeof data["mission_id"] === "string"
           ? data["mission_id"]
           : undefined;
+        streamLog("error", "error event", {
+          message: msg,
+          missionId,
+          resumable,
+        });
 
         if (
           msg.includes("Stream connection failed") ||
@@ -2609,6 +3200,10 @@ export default function ControlClient() {
         maxReconnectDelay
       );
       reconnectAttempts++;
+      streamLog("warn", "reconnect scheduled", {
+        attempt: reconnectAttempts,
+        delayMs: delay,
+      });
       // Update connection state to show reconnecting indicator
       setConnectionState("reconnecting");
       setReconnectAttempt(reconnectAttempts);
@@ -2619,6 +3214,7 @@ export default function ControlClient() {
 
     const connect = () => {
       cleanup?.();
+      streamLog("info", "connecting stream");
       cleanup = streamControl(handleEvent, handleStreamDiagnostics);
     };
 
@@ -2778,257 +3374,61 @@ export default function ControlClient() {
         className="hidden"
       />
 
+      {/* Mission Switcher Command Palette */}
+      <MissionSwitcher
+        open={showMissionSwitcher}
+        onClose={() => setShowMissionSwitcher(false)}
+        missions={recentMissions}
+        runningMissions={runningMissions}
+        currentMissionId={currentMission?.id}
+        viewingMissionId={viewingMissionId}
+        onSelectMission={(missionId) => {
+          handleViewMission(missionId);
+        }}
+        onCancelMission={handleCancelMission}
+        onRefresh={refreshRecentMissions}
+      />
+
       {/* Header */}
       <div className="mb-6 flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
           {/* Unified Mission Selector */}
-          <div className="relative" ref={missionsMenuRef}>
+          <div className="relative">
             <button
-              onClick={() => setShowParallelPanel(!showParallelPanel)}
+              onClick={() => setShowMissionSwitcher(true)}
               className={cn(
                 "flex h-9 items-center gap-2 px-3 rounded-lg transition-colors",
-                showParallelPanel ? "bg-indigo-500/30" : "bg-indigo-500/20 hover:bg-indigo-500/30"
+                "bg-indigo-500/20 hover:bg-indigo-500/30"
               )}
+              title="Switch mission (⌘K)"
             >
-              <Layers className="h-4 w-4 text-indigo-400" />
               {activeMission ? (
                 <>
-                  <span className="text-sm font-medium text-white/70 tabular-nums">
-                    {activeMission.id.slice(0, 8)}
-                  </span>
-                  <span className="text-xs text-white/30">·</span>
-                  <span className={cn(
-                    "text-xs font-medium",
-                    missionStatus?.className?.includes("text-")
-                      ? missionStatus.className.split(" ").find(c => c.startsWith("text-"))
-                      : "text-white/60"
-                  )}>
-                    {missionStatus?.label || "Unknown"}
+                  <div
+                    className={cn(
+                      "h-2 w-2 rounded-full shrink-0",
+                      missionStatusDotClass(activeMission.status)
+                    )}
+                    title={missionStatus?.label}
+                  />
+                  <span className="text-sm font-medium text-white/70">
+                    {activeMission.workspace_name || activeMission.id.slice(0, 8)}
                   </span>
                 </>
               ) : (
-                <span className="text-sm font-medium text-white/50">No mission</span>
+                <>
+                  <Layers className="h-4 w-4 text-indigo-400" />
+                  <span className="text-sm font-medium text-white/50">No mission</span>
+                </>
               )}
               <ChevronDown className="h-3 w-3 text-white/40" />
             </button>
-            {showParallelPanel && (
-              <div className="absolute left-0 top-full mt-1 w-72 rounded-lg border border-white/[0.06] bg-[#1a1a1a] py-1 shadow-xl z-10">
-                {/* Mission selection section */}
-                <div className="flex items-center justify-between px-3 py-2 border-b border-white/[0.06]">
-                  <span className="text-xs font-medium text-white/40">Switch Mission</span>
-                  <button
-                    onClick={async (e) => {
-                      e.stopPropagation();
-                      const running = await getRunningMissions();
-                      setRunningMissions(running);
-                      refreshRecentMissions();
-                    }}
-                    className="p-0.5 rounded hover:bg-white/[0.04] hover:text-white/70 transition-colors text-white/40"
-                    title="Refresh"
-                  >
-                    <RefreshCw className="h-3 w-3" />
-                  </button>
-                </div>
-                {/* Current mission if not in running missions */}
-                {currentMission && !runningMissions.some((m) => m.mission_id === currentMission.id) && (
-                  <button
-                    onClick={() => {
-                      handleViewMission(currentMission.id);
-                      setShowParallelPanel(false);
-                    }}
-                    className={cn(
-                      "flex w-full items-center gap-2 px-3 py-2 text-sm transition-colors",
-                      viewingMissionId === currentMission.id
-                        ? "bg-indigo-500/10 text-white"
-                        : "text-white/70 hover:bg-white/[0.04]"
-                    )}
-                  >
-                    <div className="h-1.5 w-1.5 rounded-full shrink-0 bg-emerald-400" />
-                    <span className="text-[10px] text-white/40 tabular-nums">{currentMission.id.slice(0, 8)}</span>
-                    <span className="text-xs text-white/30">·</span>
-                    <span className="text-xs">{missionStatusLabel(currentMission.status).label}</span>
-                    <span className="flex-1" />
-                    {viewingMissionId === currentMission.id && <Check className="h-3 w-3 text-indigo-400" />}
-                  </button>
-                )}
-                {/* Running missions */}
-                {runningMissions.map((mission) => {
-                  const isViewingMission = viewingMissionId === mission.mission_id;
-                  const isStalled = mission.state === "running" && mission.seconds_since_activity > 60;
-                  const isSeverlyStalled = mission.state === "running" && mission.seconds_since_activity > 120;
-                  return (
-                    <div
-                      key={mission.mission_id}
-                      className={cn(
-                        "flex w-full items-center gap-2 px-3 py-2 text-sm transition-colors cursor-pointer",
-                        isViewingMission
-                          ? "bg-indigo-500/10 text-white"
-                          : isSeverlyStalled
-                          ? "bg-red-500/10 text-white/70"
-                          : isStalled
-                          ? "bg-amber-500/10 text-white/70"
-                          : "text-white/70 hover:bg-white/[0.04]"
-                      )}
-                      onClick={() => {
-                        handleViewMission(mission.mission_id);
-                        setShowParallelPanel(false);
-                      }}
-                    >
-                      <div
-                        className={cn(
-                          "h-1.5 w-1.5 rounded-full shrink-0",
-                          isSeverlyStalled
-                            ? "bg-red-400"
-                            : isStalled
-                            ? "bg-amber-400 animate-pulse"
-                            : mission.state === "running"
-                            ? "bg-emerald-400 animate-pulse"
-                            : "bg-amber-400"
-                        )}
-                      />
-                      <span className="text-[10px] text-white/40 tabular-nums">{mission.mission_id.slice(0, 8)}</span>
-                      <span className="text-xs text-white/30">·</span>
-                      <span className="text-xs capitalize">{mission.state}</span>
-                      {isStalled && (
-                        <span className="text-[10px] text-amber-400 tabular-nums">⚠️ {Math.floor(mission.seconds_since_activity)}s</span>
-                      )}
-                      <span className="flex-1" />
-                      {isViewingMission && <Check className="h-3 w-3 text-indigo-400" />}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleCancelMission(mission.mission_id);
-                        }}
-                        className="p-0.5 rounded hover:bg-white/[0.08] text-white/30 hover:text-red-400 transition-colors"
-                        title="Cancel mission"
-                      >
-                        <XCircle className="h-3 w-3" />
-                      </button>
-                    </div>
-                  );
-                })}
-                {recentMissionList.length > 0 && (
-                  <>
-                    <div className="border-t border-white/[0.06] mt-1 pt-2 px-3">
-                      <span className="text-xs font-medium text-white/40">Recent Missions</span>
-                    </div>
-                    {recentMissionList.map((mission) => {
-                      const isViewingMission = viewingMissionId === mission.id;
-                      const status = missionStatusLabel(mission.status);
-                      return (
-                        <button
-                          key={mission.id}
-                          onClick={() => {
-                            handleViewMission(mission.id);
-                            setShowParallelPanel(false);
-                          }}
-                          className={cn(
-                            "flex w-full items-center gap-2 px-3 py-2 text-sm transition-colors",
-                            isViewingMission
-                              ? "bg-indigo-500/10 text-white"
-                              : "text-white/70 hover:bg-white/[0.04]"
-                          )}
-                        >
-                          <div
-                            className={cn(
-                              "h-1.5 w-1.5 rounded-full shrink-0",
-                              missionStatusDotClass(mission.status)
-                            )}
-                          />
-                          <span className="text-[10px] text-white/40 tabular-nums">
-                            {mission.id.slice(0, 8)}
-                          </span>
-                          <span className="text-xs text-white/30">·</span>
-                          <span className="text-xs">{status.label}</span>
-                          <span className="flex-1" />
-                          {isViewingMission && <Check className="h-3 w-3 text-indigo-400" />}
-                        </button>
-                      );
-                    })}
-                  </>
-                )}
-                {runningMissions.length === 0 && !currentMission && recentMissionList.length === 0 && (
-                  <div className="px-3 py-2 text-sm text-white/40">No missions</div>
-                )}
-
-                {/* Status actions section */}
-                {activeMission && (
-                  <>
-                    <div className="border-t border-white/[0.06] mt-1 pt-1">
-                      <div className="px-3 py-2">
-                        <span className="text-xs font-medium text-white/40">Change Status</span>
-                      </div>
-                      <button
-                        onClick={() => {
-                          handleSetStatus("completed");
-                          setShowParallelPanel(false);
-                        }}
-                        className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
-                      >
-                        <CheckCircle className="h-4 w-4 text-emerald-400" />
-                        Mark Complete
-                      </button>
-                      <button
-                        onClick={() => {
-                          handleSetStatus("failed");
-                          setShowParallelPanel(false);
-                        }}
-                        className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
-                      >
-                        <XCircle className="h-4 w-4 text-red-400" />
-                        Mark Failed
-                      </button>
-                      {(activeMission?.status === "interrupted" || activeMission?.status === "blocked") && (
-                        <>
-                          <button
-                            onClick={() => {
-                              handleResumeMission(false);
-                              setShowParallelPanel(false);
-                            }}
-                            disabled={missionLoading}
-                            className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
-                          >
-                            <PlayCircle className="h-4 w-4 text-emerald-400" />
-                            {activeMission?.status === "blocked" ? "Continue" : "Resume"}
-                          </button>
-                          <button
-                            onClick={() => {
-                              handleResumeMission(true);
-                              setShowParallelPanel(false);
-                            }}
-                            disabled={missionLoading}
-                            className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
-                            title="Delete work folder and start fresh"
-                          >
-                            <Trash2 className="h-4 w-4 text-orange-400" />
-                            Clean & {activeMission?.status === "blocked" ? "Continue" : "Resume"}
-                          </button>
-                        </>
-                      )}
-                      {activeMission?.status !== "active" && activeMission?.status !== "interrupted" && activeMission?.status !== "blocked" && (
-                        <button
-                          onClick={() => {
-                            handleSetStatus("active");
-                            setShowParallelPanel(false);
-                          }}
-                          className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
-                        >
-                          <Clock className="h-4 w-4 text-indigo-400" />
-                          Reactivate
-                        </button>
-                      )}
-                    </div>
-                  </>
-                )}
-              </div>
-            )}
           </div>
         </div>
 
         <div className="flex items-center gap-3 shrink-0">
           <NewMissionDialog
             workspaces={workspaces}
-            libraryAgents={libraryAgents}
             providers={providers}
             disabled={missionLoading}
             onCreate={handleNewMission}
@@ -3048,8 +3448,8 @@ export default function ControlClient() {
           >
             <Brain className={cn("h-4 w-4", hasActiveThinking && "animate-pulse")} />
             <span className="hidden sm:inline">Thinking</span>
-            {thinkingItems.length > 0 && (
-              <span className="text-xs opacity-60">({thinkingItems.length})</span>
+            {thinkingItemsCount > 0 && (
+              <span className="text-xs opacity-60">({thinkingItemsCount})</span>
             )}
           </button>
 
@@ -3571,28 +3971,14 @@ export default function ControlClient() {
                   return <PhaseItem key={item.id} item={item} />;
                 }
 
+                if (item.kind === "thinking_group") {
+                  // Render grouped thinking items as a single merged block
+                  return <ThinkingGroupItem key={item.groupId} items={item.thoughts} />;
+                }
+
                 if (item.kind === "thinking") {
-                  // When thinking panel is open, show a compact inline indicator instead
-                  if (showThinkingPanel) {
-                    return (
-                      <div key={item.id} className="my-2">
-                        <button
-                          onClick={() => setShowThinkingPanel(true)}
-                          className={cn(
-                            "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
-                            "bg-indigo-500/10 border border-indigo-500/20",
-                            "text-indigo-400/70 hover:text-indigo-400 hover:bg-indigo-500/15",
-                            "transition-all duration-200 text-xs"
-                          )}
-                        >
-                          <Brain className={cn("h-3 w-3", !item.done && "animate-pulse")} />
-                          <span>{item.done ? "Thought" : "Thinking..."}</span>
-                          <ChevronRight className="h-3 w-3" />
-                        </button>
-                      </div>
-                    );
-                  }
-                  return <ThinkingItem key={item.id} item={item} />;
+                  // Fallback for individual thinking items (should be rare with grouping)
+                  return <ThinkingGroupItem key={item.id} items={[item]} />;
                 }
 
                 if (item.kind === "tool") {
@@ -3747,6 +4133,11 @@ export default function ControlClient() {
 
                     // Unknown UI tool - still show with ToolCallItem
                     return <ToolCallItem key={item.id} item={item} />;
+                  }
+
+                  // Subagent/background task tools get enhanced rendering
+                  if (isSubagentTool(item.name)) {
+                    return <SubagentToolItem key={item.id} item={item} />;
                   }
 
                   // Non-UI tools use the collapsible ToolCallItem component
@@ -4016,67 +4407,94 @@ export default function ControlClient() {
             </div>
           )}
 
-          <form
-            onSubmit={handleSubmit}
-            className="mx-auto flex max-w-3xl gap-3 items-end"
-          >
-            <div className="flex gap-1">
+          {/* Show resume buttons for interrupted/blocked missions, otherwise show normal input */}
+          {activeMission && (activeMission.status === 'interrupted' || activeMission.status === 'blocked') ? (
+            <div className="mx-auto flex max-w-3xl gap-3 items-center justify-center py-2">
+              <div className="flex items-center gap-2 text-sm text-white/50 mr-4">
+                <AlertTriangle className="h-4 w-4 text-amber-400" />
+                <span>Mission {activeMission.status === 'blocked' ? 'blocked' : 'interrupted'}</span>
+              </div>
               <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
-                title="Attach files"
+                onClick={() => handleResumeMission(false)}
+                disabled={missionLoading}
+                className="flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50"
               >
-                <Paperclip className="h-5 w-5" />
+                <PlayCircle className="h-4 w-4" />
+                {activeMission.status === 'blocked' ? 'Continue' : 'Resume'}
               </button>
               <button
-                type="button"
-                onClick={() => setShowUrlInput(!showUrlInput)}
-                className={`p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0 ${showUrlInput ? 'text-indigo-400 border-indigo-500/30' : ''}`}
-                title="Download from URL"
+                onClick={() => handleResumeMission(true)}
+                disabled={missionLoading}
+                className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] px-5 py-3 text-sm font-medium text-white/70 transition-colors disabled:opacity-50"
+                title="Delete work folder and start fresh"
               >
-                <Link2 className="h-5 w-5" />
+                <Trash2 className="h-4 w-4 text-orange-400" />
+                Clean & {activeMission.status === 'blocked' ? 'Continue' : 'Resume'}
               </button>
             </div>
+          ) : (
+            <form
+              onSubmit={handleSubmit}
+              className="mx-auto flex max-w-3xl gap-3 items-end"
+            >
+              <div className="flex gap-1">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
+                  title="Attach files"
+                >
+                  <Paperclip className="h-5 w-5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowUrlInput(!showUrlInput)}
+                  className={`p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0 ${showUrlInput ? 'text-indigo-400 border-indigo-500/30' : ''}`}
+                  title="Download from URL"
+                >
+                  <Link2 className="h-5 w-5" />
+                </button>
+              </div>
 
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  if (input.trim()) {
-                    handleSubmit(e);
+              <textarea
+                ref={textareaRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    if (input.trim()) {
+                      handleSubmit(e);
+                    }
                   }
-                }
-              }}
-              placeholder="Message the root agent… (paste files to upload)"
-              rows={1}
-              className="flex-1 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-[border-color,height] duration-150 ease-out resize-none overflow-y-auto leading-5"
-              style={{ minHeight: "46px" }}
-            />
+                }}
+                placeholder="Message the root agent… (paste files to upload)"
+                rows={1}
+                className="flex-1 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-[border-color,height] duration-150 ease-out resize-none overflow-y-auto leading-5"
+                style={{ minHeight: "46px" }}
+              />
 
-            {isBusy ? (
-              <button
-                type="button"
-                onClick={handleStop}
-                className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
-              >
-                <Square className="h-4 w-4" />
-                Stop
-              </button>
-            ) : (
-              <button
-                type="submit"
-                disabled={!input.trim()}
-                className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
-              >
-                <Send className="h-4 w-4" />
-                Send
-              </button>
-            )}
-          </form>
+              {isBusy ? (
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
+                >
+                  <Square className="h-4 w-4" />
+                  Stop
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={!input.trim()}
+                  className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                >
+                  <Send className="h-4 w-4" />
+                  Send
+                </button>
+              )}
+            </form>
+          )}
         </div>
       </div>
 

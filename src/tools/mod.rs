@@ -28,7 +28,7 @@ pub use directory::{ListDirectory, SearchFiles};
 pub use file_ops::{DeleteFile, ReadFile, WriteFile};
 pub use search::GrepSearch;
 pub use terminal::RunCommand;
-pub use web::{FetchUrl, WebSearch};
+pub use web::FetchUrl;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -207,8 +207,7 @@ impl ToolRegistry {
         // Search
         tools.insert("grep_search".to_string(), Arc::new(search::GrepSearch));
 
-        // Web
-        tools.insert("web_search".to_string(), Arc::new(web::WebSearch));
+        // Web (fetch only; web search removed in favor of OMO/Exa)
         tools.insert("fetch_url".to_string(), Arc::new(web::FetchUrl));
 
         // Frontend Tool UI (schemas for rich rendering in the dashboard)

@@ -344,6 +344,8 @@ export interface Mission {
   id: string;
   status: MissionStatus;
   title: string | null;
+  workspace_id?: string;
+  workspace_name?: string;
   history: MissionHistoryEntry[];
   desktop_sessions?: DesktopSessionInfo[];
   created_at: string;
@@ -963,7 +965,7 @@ export interface UploadProgress {
 // Upload a file to the remote filesystem with progress tracking
 export function uploadFile(
   file: File,
-  remotePath: string = "/root/context/",
+  remotePath: string = "./context/",
   onProgress?: (progress: UploadProgress) => void
 ): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
@@ -1025,7 +1027,7 @@ export interface ChunkedUploadProgress extends UploadProgress {
 
 export async function uploadFileChunked(
   file: File,
-  remotePath: string = "/root/context/",
+  remotePath: string = "./context/",
   onProgress?: (progress: ChunkedUploadProgress) => void
 ): Promise<UploadResult> {
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
@@ -1133,7 +1135,7 @@ async function finalizeChunkedUpload(
 // Download file from URL to server filesystem
 export async function downloadFromUrl(
   url: string,
-  remotePath: string = "/root/context/",
+  remotePath: string = "./context/",
   fileName?: string
 ): Promise<UploadResult> {
   const res = await apiFetch("/api/fs/download-url", {
@@ -1722,6 +1724,21 @@ export async function deleteWorkspaceTemplate(name: string): Promise<void> {
   await ensureLibraryResponse(res, "Failed to delete workspace template");
 }
 
+export async function renameWorkspaceTemplate(oldName: string, newName: string): Promise<void> {
+  // Get the existing template
+  const template = await getWorkspaceTemplate(oldName);
+  // Save with new name
+  await saveWorkspaceTemplate(newName, {
+    description: template.description,
+    distro: template.distro,
+    skills: template.skills,
+    env_vars: template.env_vars,
+    init_script: template.init_script,
+  });
+  // Delete old template
+  await deleteWorkspaceTemplate(oldName);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Library Migration
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1947,7 +1964,90 @@ export async function testOpenCodeConnection(id: string): Promise<TestConnection
 // Set default connection
 export async function setDefaultOpenCodeConnection(id: string): Promise<OpenCodeConnection> {
   const res = await apiFetch(`/api/opencode/connections/${id}/default`, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to set default OpenCode connection");
+  if (!res.ok) throw new Error("Failed to set default OpenCodeconnection");
+  return res.json();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenCode Settings API (oh-my-opencode.json)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Get OpenCode settings (oh-my-opencode.json)
+export async function getOpenCodeSettings(): Promise<Record<string, unknown>> {
+  const res = await apiFetch("/api/opencode/settings");
+  if (!res.ok) throw new Error("Failed to get OpenCode settings");
+  return res.json();
+}
+
+// Update OpenCode settings (oh-my-opencode.json)
+export async function updateOpenCodeSettings(settings: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await apiFetch("/api/opencode/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+  if (!res.ok) throw new Error("Failed to update OpenCode settings");
+  return res.json();
+}
+
+// Restart OpenCode service (to apply settings changes)
+export async function restartOpenCodeService(): Promise<{ success: boolean; message: string }> {
+  const res = await apiFetch("/api/opencode/restart", { method: "POST" });
+  if (!res.ok) throw new Error("Failed to restart OpenCode service");
+  return res.json();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Library-backed OpenCode Settings API
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Get OpenCode settings from Library (oh-my-opencode.json)
+export async function getLibraryOpenCodeSettings(): Promise<Record<string, unknown>> {
+  const res = await apiFetch("/api/library/opencode/settings");
+  if (!res.ok) throw new Error("Failed to get Library OpenCode settings");
+  return res.json();
+}
+
+// Save OpenCode settings to Library and sync to system
+export async function saveLibraryOpenCodeSettings(settings: Record<string, unknown>): Promise<void> {
+  const res = await apiFetch("/api/library/opencode/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+  if (!res.ok) throw new Error("Failed to save Library OpenCode settings");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAgent Config API
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface OpenAgentConfig {
+  hidden_agents: string[];
+  default_agent: string | null;
+}
+
+// Get OpenAgent config from Library
+export async function getOpenAgentConfig(): Promise<OpenAgentConfig> {
+  const res = await apiFetch("/api/library/openagent/config");
+  if (!res.ok) throw new Error("Failed to get OpenAgent config");
+  return res.json();
+}
+
+// Save OpenAgent config to Library
+export async function saveOpenAgentConfig(config: OpenAgentConfig): Promise<void> {
+  const res = await apiFetch("/api/library/openagent/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) throw new Error("Failed to save OpenAgent config");
+}
+
+// Get visible agents (filtered by OpenAgent config)
+export async function getVisibleAgents(): Promise<unknown> {
+  const res = await apiFetch("/api/library/openagent/agents");
+  if (!res.ok) throw new Error("Failed to get visible agents");
   return res.json();
 }
 

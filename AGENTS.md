@@ -41,6 +41,8 @@ Skills and tools are synced to workspace `.opencode/skill/` and `.opencode/tool/
 
 Testing of the backend cannot be done locally as it requires Linux-specific tools (desktop MCP). Deploy as root on `95.216.112.253` (use local SSH key `cursor`). Always prefer debug builds for speed.
 
+Frontend workflow: the Next.js dashboard is run locally (no remote deploy). Point the local dashboard at the remote backend in Settings.
+
 Fast deploy loop (sync source only, build on host):
 
 ```bash
@@ -61,6 +63,39 @@ cargo build --bin open_agent
 Notes to avoid common deploy pitfalls:
 - Always include the SSH key in rsync: `-e "ssh -i ~/.ssh/cursor"` (otherwise auth will fail in non-interactive shells).
 - The host uses rustup; build with `source /root/.cargo/env` so the newer toolchain is on PATH.
+
+## Debugging Missions
+
+Missions are persisted in a **SQLite database** with full event logging, enabling detailed post-mortem analysis.
+
+**Database location**: `~/.openagent/missions/missions.db` (or `missions-dev.db` in dev mode)
+
+**Retrieve events via API**:
+```bash
+GET /api/control/missions/{mission_id}/events
+```
+
+**Query parameters**:
+- `types=<type1>,<type2>` – filter by event type
+- `limit=<n>` – max events to return
+- `offset=<n>` – pagination offset
+
+**Event types captured**:
+- `user_message` – user inputs
+- `thinking` – agent reasoning tokens
+- `tool_call` – tool invocations (name + input)
+- `tool_result` – tool outputs
+- `assistant_message` – agent responses
+- `mission_status_changed` – status transitions
+- `error` – execution errors
+
+**Example**: Retrieve tool calls for a mission:
+```bash
+curl "http://localhost:3000/api/control/missions/<mission_id>/events?types=tool_call,tool_result" \
+  -H "Authorization: Bearer <token>"
+```
+
+**Code entry points**: `src/api/mission_store/` handles persistence; `src/api/control.rs` exposes the events endpoint.
 
 ## Notes
 

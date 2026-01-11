@@ -8,6 +8,8 @@
 //! - Rules (`rule/*.md`)
 //! - Library agents (`agent/*.md`)
 //! - Library tools (`tool/*.ts`)
+//! - OpenCode settings (`opencode/oh-my-opencode.json`)
+//! - OpenAgent config (`openagent/config.json`)
 
 mod git;
 pub mod types;
@@ -45,6 +47,8 @@ const TOOL_DIR: &str = "tool";
 const RULE_DIR: &str = "rule";
 const PLUGINS_FILE: &str = "plugins.json";
 const WORKSPACE_TEMPLATE_DIR: &str = "workspace-template";
+const OPENCODE_DIR: &str = "opencode";
+const OPENAGENT_DIR: &str = "openagent";
 
 /// Store for managing the configuration library.
 pub struct LibraryStore {
@@ -1228,6 +1232,104 @@ impl LibraryStore {
                 .await
                 .context("Failed to delete workspace template file")?;
         }
+
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // OpenCode Settings (opencode/oh-my-opencode.json)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Get oh-my-opencode settings from the Library.
+    /// If the Library file doesn't exist, attempts to read from the system location
+    /// (~/.config/opencode/oh-my-opencode.json) and returns that.
+    /// Returns an empty object if neither file exists.
+    pub async fn get_opencode_settings(&self) -> Result<serde_json::Value> {
+        let path = self.path.join(OPENCODE_DIR).join("oh-my-opencode.json");
+
+        if path.exists() {
+            let content = fs::read_to_string(&path)
+                .await
+                .context("Failed to read opencode/oh-my-opencode.json")?;
+            return serde_json::from_str(&content).context("Failed to parse oh-my-opencode.json");
+        }
+
+        // Library file doesn't exist - try to read from system location
+        let system_path = Self::resolve_system_opencode_path();
+        if system_path.exists() {
+            let content = fs::read_to_string(&system_path)
+                .await
+                .context("Failed to read system oh-my-opencode.json")?;
+            return serde_json::from_str(&content)
+                .context("Failed to parse system oh-my-opencode.json");
+        }
+
+        // Neither file exists
+        Ok(serde_json::json!({}))
+    }
+
+    /// Resolve the system path to oh-my-opencode.json.
+    fn resolve_system_opencode_path() -> std::path::PathBuf {
+        if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
+            if !dir.trim().is_empty() {
+                return std::path::PathBuf::from(dir).join("oh-my-opencode.json");
+            }
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        std::path::PathBuf::from(home)
+            .join(".config")
+            .join("opencode")
+            .join("oh-my-opencode.json")
+    }
+
+    /// Save oh-my-opencode settings to the Library.
+    pub async fn save_opencode_settings(&self, settings: &serde_json::Value) -> Result<()> {
+        let opencode_dir = self.path.join(OPENCODE_DIR);
+        let path = opencode_dir.join("oh-my-opencode.json");
+
+        // Ensure directory exists
+        fs::create_dir_all(&opencode_dir).await?;
+
+        let content = serde_json::to_string_pretty(settings)?;
+        fs::write(&path, content)
+            .await
+            .context("Failed to write opencode/oh-my-opencode.json")?;
+
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // OpenAgent Config (openagent/config.json)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Get OpenAgent configuration from the Library.
+    /// Returns default config if the file doesn't exist.
+    pub async fn get_openagent_config(&self) -> Result<OpenAgentConfig> {
+        let path = self.path.join(OPENAGENT_DIR).join("config.json");
+
+        if !path.exists() {
+            return Ok(OpenAgentConfig::default());
+        }
+
+        let content = fs::read_to_string(&path)
+            .await
+            .context("Failed to read openagent/config.json")?;
+
+        serde_json::from_str(&content).context("Failed to parse openagent/config.json")
+    }
+
+    /// Save OpenAgent configuration to the Library.
+    pub async fn save_openagent_config(&self, config: &OpenAgentConfig) -> Result<()> {
+        let openagent_dir = self.path.join(OPENAGENT_DIR);
+        let path = openagent_dir.join("config.json");
+
+        // Ensure directory exists
+        fs::create_dir_all(&openagent_dir).await?;
+
+        let content = serde_json::to_string_pretty(config)?;
+        fs::write(&path, content)
+            .await
+            .context("Failed to write openagent/config.json")?;
 
         Ok(())
     }

@@ -54,6 +54,11 @@ struct RuntimeWorkspace {
     workspace_root: Option<String>,
     workspace_type: Option<String>,
     working_dir: Option<String>,
+    workspace_name: Option<String>,
+    mission_id: Option<String>,
+    context_root: Option<String>,
+    mission_context: Option<String>,
+    context_dir_name: Option<String>,
 }
 
 impl JsonRpcResponse {
@@ -225,12 +230,32 @@ fn apply_runtime_workspace(working_dir: &Arc<RwLock<PathBuf>>) {
         }
     }
 
+    if let Some(name) = state.workspace_name.as_ref() {
+        std::env::set_var("OPEN_AGENT_WORKSPACE_NAME", name);
+    }
+
     if let Some(root) = state.workspace_root.as_ref() {
         std::env::set_var("OPEN_AGENT_WORKSPACE_ROOT", root);
     }
 
     if let Some(kind) = state.workspace_type.as_ref() {
         std::env::set_var("OPEN_AGENT_WORKSPACE_TYPE", kind);
+    }
+
+    if let Some(context_root) = state.context_root.as_ref() {
+        std::env::set_var("OPEN_AGENT_CONTEXT_ROOT", context_root);
+    }
+
+    if let Some(mission_id) = state.mission_id.as_ref() {
+        std::env::set_var("OPEN_AGENT_MISSION_ID", mission_id);
+    }
+
+    if let Some(mission_context) = state.mission_context.as_ref() {
+        std::env::set_var("OPEN_AGENT_MISSION_CONTEXT", mission_context);
+    }
+
+    if let Some(context_dir_name) = state.context_dir_name.as_ref() {
+        std::env::set_var("OPEN_AGENT_CONTEXT_DIR_NAME", context_dir_name);
     }
 }
 
@@ -290,7 +315,6 @@ fn tool_set() -> HashMap<String, Arc<dyn Tool>> {
             delegate: tools::RunCommand,
         }),
     );
-    tools.insert("web_search".to_string(), Arc::new(tools::WebSearch));
     tools.insert("fetch_url".to_string(), Arc::new(tools::FetchUrl));
 
     tools

@@ -35,6 +35,117 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/:id/default", post(set_default))
 }
 
+/// Resolve the path to oh-my-opencode.json configuration file.
+fn resolve_oh_my_opencode_path() -> std::path::PathBuf {
+    // Check OPENCODE_CONFIG_DIR first
+    if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
+        if !dir.trim().is_empty() {
+            return std::path::PathBuf::from(dir).join("oh-my-opencode.json");
+        }
+    }
+    // Fall back to ~/.config/opencode/oh-my-opencode.json
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    std::path::PathBuf::from(home)
+        .join(".config")
+        .join("opencode")
+        .join("oh-my-opencode.json")
+}
+
+/// GET /api/opencode/settings - Read oh-my-opencode settings.
+pub async fn get_opencode_settings() -> Result<Json<Value>, (StatusCode, String)> {
+    let config_path = resolve_oh_my_opencode_path();
+
+    if !config_path.exists() {
+        // Return empty object if file doesn't exist
+        return Ok(Json(serde_json::json!({})));
+    }
+
+    let contents = tokio::fs::read_to_string(&config_path)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read oh-my-opencode.json: {}", e),
+            )
+        })?;
+
+    let config: Value = serde_json::from_str(&contents).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Invalid JSON in oh-my-opencode.json: {}", e),
+        )
+    })?;
+
+    Ok(Json(config))
+}
+
+/// PUT /api/opencode/settings - Write oh-my-opencode settings.
+pub async fn update_opencode_settings(
+    Json(config): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let config_path = resolve_oh_my_opencode_path();
+
+    // Ensure parent directory exists
+    if let Some(parent) = config_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create config directory: {}", e),
+            )
+        })?;
+    }
+
+    // Write the config
+    let contents = serde_json::to_string_pretty(&config).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid JSON: {}", e),
+        )
+    })?;
+
+    tokio::fs::write(&config_path, contents).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write oh-my-opencode.json: {}", e),
+        )
+    })?;
+
+    tracing::info!(path = %config_path.display(), "Updated oh-my-opencode settings");
+
+    Ok(Json(config))
+}
+
+/// POST /api/opencode/restart - Restart the OpenCode service.
+pub async fn restart_opencode_service() -> Result<Json<Value>, (StatusCode, String)> {
+    tracing::info!("Restarting OpenCode service...");
+
+    let output = tokio::process::Command::new("systemctl")
+        .args(["restart", "opencode.service"])
+        .output()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to execute systemctl: {}", e),
+            )
+        })?;
+
+    if output.status.success() {
+        tracing::info!("OpenCode service restarted successfully");
+        Ok(Json(serde_json::json!({
+            "success": true,
+            "message": "OpenCode service restarted successfully"
+        })))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("Failed to restart OpenCode service: {}", stderr);
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to restart OpenCode service: {}", stderr),
+        ))
+    }
+}
+
 const AGENTS_CACHE_TTL: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Default)]
@@ -106,6 +217,48 @@ pub struct TestConnectionResponse {
     pub success: bool,
     pub message: String,
     pub version: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fetch agents from OpenCode (internal helper for library.rs).
+/// Returns the raw agent payload from OpenCode.
+pub async fn fetch_opencode_agents(
+    state: &super::routes::AppState,
+) -> Result<Value, String> {
+    let base_url = if let Some(connection) = state.opencode_connections.get_default().await {
+        connection.base_url
+    } else {
+        state.config.opencode_base_url.clone()
+    };
+    let base_url = base_url.trim_end_matches('/').to_string();
+    if base_url.is_empty() {
+        return Err("OpenCode base URL is not configured".to_string());
+    }
+
+    let url = format!("{}/agent", base_url);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("OpenCode request failed: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("OpenCode /agent failed: {} - {}", status, text));
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| format!("Invalid agent payload: {}", e))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

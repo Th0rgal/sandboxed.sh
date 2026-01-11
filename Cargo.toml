@@ -43,6 +43,7 @@ async-recursion = "1"
 
 # For memory/storage
 chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # For desktop tools (process management on Unix)
 libc = "0.2"

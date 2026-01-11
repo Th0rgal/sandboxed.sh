@@ -334,6 +334,43 @@ pub struct MigrationReport {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OpenAgent Config Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// OpenAgent configuration stored in the Library.
+/// Controls agent visibility and defaults in the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAgentConfig {
+    /// Agents to hide from the mission dialog selector.
+    /// These are typically internal/system agents that users shouldn't select directly.
+    #[serde(default)]
+    pub hidden_agents: Vec<String>,
+    /// Default agent to pre-select in the mission dialog.
+    #[serde(default)]
+    pub default_agent: Option<String>,
+}
+
+impl Default for OpenAgentConfig {
+    fn default() -> Self {
+        Self {
+            hidden_agents: vec![
+                "build".to_string(),
+                "plan".to_string(),
+                "general".to_string(),
+                "explore".to_string(),
+                "compaction".to_string(),
+                "title".to_string(),
+                "summary".to_string(),
+                "Metis (Plan Consultant)".to_string(),
+                "Momus (Plan Reviewer)".to_string(),
+                "orchestrator-sisyphus".to_string(),
+            ],
+            default_agent: Some("Sisyphus".to_string()),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helper Functions
 // ─────────────────────────────────────────────────────────────────────────────
 

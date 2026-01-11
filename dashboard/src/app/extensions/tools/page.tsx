@@ -1,9 +1,10 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { AlertCircle, Loader, Wrench, X } from 'lucide-react';
+import { Loader, Wrench } from 'lucide-react';
 import { listTools, type ToolInfo } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { useToast } from '@/components/toast';
 
 function formatToolSource(source: ToolInfo['source']): string {
   if (source === 'builtin') return 'Built-in';
@@ -21,23 +22,22 @@ function formatToolSource(source: ToolInfo['source']): string {
 export default function ToolsPage() {
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { showError } = useToast();
 
   useEffect(() => {
     const loadTools = async () => {
       try {
         setLoading(true);
-        setError(null);
         const data = await listTools();
         setTools(data);
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load tools');
+        showError(err instanceof Error ? err.message : 'Failed to load tools');
       } finally {
         setLoading(false);
       }
     };
     loadTools();
-  }, []);
+  }, [showError]);
 
   const sortedTools = useMemo(() => {
     return [...tools].sort((a, b) => a.name.localeCompare(b.name));
@@ -53,16 +53,6 @@ export default function ToolsPage() {
 
   return (
     <div className="min-h-screen flex flex-col p-6 max-w-6xl mx-auto space-y-4">
-      {error && (
-        <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 flex items-center gap-2">
-          <AlertCircle className="h-4 w-4 flex-shrink-0" />
-          {error}
-          <button onClick={() => setError(null)} className="ml-auto">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-      )}
-
       <div>
         <h1 className="text-2xl font-semibold text-white">Tools</h1>
         <p className="text-sm text-white/60 mt-1">

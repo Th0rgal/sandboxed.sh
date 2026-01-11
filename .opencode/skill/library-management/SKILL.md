@@ -1,89 +1,75 @@
 ---
 name: library-management
-description: Manage Open Agent library - create, update, delete skills, agents, commands, tools, rules, and MCPs via the Library API
+description: >
+  Manage the Open Agent library (skills, agents, commands, tools, rules, MCPs) via Library API tools.
+  Trigger terms: library, skill, agent, command, tool, rule, MCP, save skill, create skill.
 ---
 
 # Open Agent Library Management
 
-The Open Agent Library is a Git-backed configuration repository that stores reusable components for your agent system. Use the `library_*` tools to manage these components.
+The Open Agent Library is a Git-backed configuration repo that stores reusable skills, agents,
+commands, tools, rules, MCP servers, and workspace templates. Use the `library-*` tools to
+read and update that repo.
 
-## Available Tools
+## When to Use
+- Creating or updating skills, agents, commands, tools, rules, or MCPs
+- Syncing library git state (status/sync/commit/push)
+- Updating workspace templates or plugins in the library
 
-Use these tools to manage the library. Tool names follow the pattern `<filename>_<export>`:
+## When NOT to Use
+- Local file operations unrelated to the library
+- Running missions or managing workspace lifecycle
 
-### Skills (library-skills.ts)
-- `library-skills_list_skills` - List all skills with their descriptions
-- `library-skills_get_skill` - Get full skill content by name
-- `library-skills_save_skill` - Create or update a skill
-- `library-skills_delete_skill` - Delete a skill
+## Tool Map (file name + export)
+Tool names follow the pattern `<filename>_<export>`.
 
-### Agents (library-agents.ts)
-- `library-agents_list_agents` - List all library agents
-- `library-agents_get_agent` - Get full agent configuration by name
-- `library-agents_save_agent` - Create or update an agent
-- `library-agents_delete_agent` - Delete an agent
+### Skills (`library-skills.ts`)
+- `library-skills_list_skills`
+- `library-skills_get_skill`
+- `library-skills_save_skill`
+- `library-skills_delete_skill`
 
-### Commands (library-commands.ts)
-- `library-commands_list_commands` - List all commands
-- `library-commands_get_command` - Get full command content by name
-- `library-commands_save_command` - Create or update a command
-- `library-commands_delete_command` - Delete a command
+### Agents (`library-agents.ts`)
+- `library-agents_list_agents`
+- `library-agents_get_agent`
+- `library-agents_save_agent`
+- `library-agents_delete_agent`
 
-### Tools (library-commands.ts)
-- `library-commands_list_tools` - List all custom tools
-- `library-commands_get_tool` - Get full tool code by name
-- `library-commands_save_tool` - Create or update a tool
-- `library-commands_delete_tool` - Delete a tool
+### Commands / Tools / Rules (`library-commands.ts`)
+- Commands: `library-commands_list_commands`, `library-commands_get_command`, `library-commands_save_command`, `library-commands_delete_command`
+- Tools: `library-commands_list_tools`, `library-commands_get_tool`, `library-commands_save_tool`, `library-commands_delete_tool`
+- Rules: `library-commands_list_rules`, `library-commands_get_rule`, `library-commands_save_rule`, `library-commands_delete_rule`
 
-### Rules (library-commands.ts)
-- `library-commands_list_rules` - List all rules
-- `library-commands_get_rule` - Get full rule content by name
-- `library-commands_save_rule` - Create or update a rule
-- `library-commands_delete_rule` - Delete a rule
+### MCPs + Git (`library-git.ts`)
+- MCPs: `library-git_get_mcps`, `library-git_save_mcps`
+- Git: `library-git_status`, `library-git_sync`, `library-git_commit`, `library-git_push`
 
-### MCPs (library-git.ts)
-- `library-git_get_mcps` - Get all MCP server configurations
-- `library-git_save_mcps` - Save MCP server configurations
-
-### Git Operations (library-git.ts)
-- `library-git_status` - Get git status (branch, modified files, sync state)
-- `library-git_sync` - Pull latest changes from remote
-- `library-git_commit` - Commit all changes with a message
-- `library-git_push` - Push commits to remote
-
----
+## Procedure
+1. **List** existing items
+2. **Get** current content before editing
+3. **Save** the full updated content (frontmatter + body)
+4. **Commit** with a clear message
+5. **Push** to sync the library remote
 
 ## File Formats
 
-### Skills (`skill/<name>/SKILL.md`)
-
+### Skill (`skill/<name>/SKILL.md`)
 ```yaml
 ---
 name: skill-name
-description: What this skill does (required, 1-1024 chars)
-license: MIT (optional)
-compatibility: opencode (optional)
-metadata:
-  key: value (optional)
+description: What this skill does
 ---
-
-Skill instructions in markdown...
+Instructions for using this skill...
 ```
 
-Name requirements:
-- 1-64 characters
-- Lowercase alphanumeric with single hyphen separators
-- No leading/trailing hyphens, no consecutive hyphens
-
-### Agents (`agent/<name>.md`)
-
+### Agent (`agent/<name>.md`)
 ```yaml
 ---
-description: Agent description (required)
+description: Agent description
 mode: primary | subagent
-model: provider/model-id (e.g., anthropic/claude-sonnet-4-20250514)
+model: provider/model-id
 hidden: true | false
-color: "#44BA81" (optional hex color)
+color: "#44BA81"
 tools:
   "*": false
   "read": true
@@ -92,59 +78,45 @@ permission:
   edit: ask | allow | deny
   bash:
     "*": ask
-    "git status": allow
 rules:
-  - rule-name-to-include
+  - rule-name
 ---
-
-Agent system prompt in markdown...
+Agent system prompt...
 ```
 
-### Commands (`command/<name>.md`)
-
+### Command (`command/<name>.md`)
 ```yaml
 ---
 description: Command description
-model: provider/model-id (optional, overrides default)
-subtask: true | false (run as background task)
-agent: agent-name (optional, use specific agent)
+model: provider/model-id
+subtask: true | false
+agent: agent-name
 ---
-
-Command prompt template...
-
-Use $ARGUMENTS for user-provided arguments.
+Command prompt template. Use $ARGUMENTS for user input.
 ```
 
-### Tools (`tool/<name>.ts`)
-
+### Tool (`tool/<name>.ts`)
 ```typescript
 import { tool } from "@opencode-ai/plugin"
 
-export default tool({
-  description: "Tool description",
-  args: {
-    param: tool.schema.string().describe("Parameter description"),
-  },
-  async execute(args, context) {
-    // Tool implementation
+export const my_tool = tool({
+  description: "What it does",
+  args: { param: tool.schema.string().describe("Param description") },
+  async execute(args) {
     return "result"
   },
 })
 ```
 
-### Rules (`rule/<name>.md`)
-
+### Rule (`rule/<name>.md`)
 ```yaml
 ---
 description: Rule description
 ---
-
-Rule instructions in markdown...
-Applied to agents that reference this rule.
+Rule instructions applied to agents referencing this rule.
 ```
 
 ### MCPs (`mcp/servers.json`)
-
 ```json
 {
   "server-name": {
@@ -162,21 +134,8 @@ Applied to agents that reference this rule.
 }
 ```
 
----
-
-## Workflow Example
-
-1. **List existing items**: Use `library_list_*` to see what exists
-2. **Get current content**: Use `library_get_*` to read before modifying
-3. **Make changes**: Use `library_save_*` with the full content
-4. **Commit changes**: Use `library_commit` with a descriptive message
-5. **Push to remote**: Use `library_push` to sync with the git remote
-
----
-
-## Tips
-
-- Always read existing content before updating to avoid overwriting changes
-- Use descriptive commit messages explaining what changed and why
-- Check `library_status` to see uncommitted changes before pushing
-- Skills sync automatically to workspaces after saving
+## Guardrails
+- Always read before updating to avoid overwrites
+- Keep names lowercase (hyphens allowed) and within 1-64 chars
+- Use descriptive commit messages
+- Check `library-git_status` before pushing

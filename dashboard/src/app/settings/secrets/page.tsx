@@ -23,18 +23,18 @@ import {
   Eye,
   EyeOff,
   Loader,
-  AlertCircle,
   Shield,
   Copy,
   Check,
   X,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useToast } from '@/components/toast';
 
 export default function SecretsPage() {
   const [status, setStatus] = useState<SecretsStatus | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { showError } = useToast();
 
   // Unlock dialog
   const [showUnlockDialog, setShowUnlockDialog] = useState(false);
@@ -77,6 +77,19 @@ export default function SecretsPage() {
     }
   }, [selectedRegistry, status?.can_decrypt]);
 
+  // Handle ESC key to close modals
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (showInitDialog) setShowInitDialog(false);
+        if (showUnlockDialog) setShowUnlockDialog(false);
+        if (showAddDialog) setShowAddDialog(false);
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [showInitDialog, showUnlockDialog, showAddDialog]);
+
   const loadStatus = async () => {
     try {
       setLoading(true);
@@ -86,7 +99,7 @@ export default function SecretsPage() {
         setSelectedRegistry(s.registries[0].name);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load secrets status');
+      showError(err instanceof Error ? err.message : 'Failed to load secrets status');
     } finally {
       setLoading(false);
     }
@@ -115,7 +128,7 @@ export default function SecretsPage() {
       // Show message about setting passphrase
       alert(result.message);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to initialize');
+      showError(err instanceof Error ? err.message : 'Failed to initialize');
     } finally {
       setInitializing(false);
     }
@@ -124,13 +137,12 @@ export default function SecretsPage() {
   const handleUnlock = async () => {
     try {
       setUnlocking(true);
-      setError(null);
       await unlockSecrets(passphrase);
       setShowUnlockDialog(false);
       setPassphrase('');
       await loadStatus();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Invalid passphrase');
+      showError(err instanceof Error ? err.message : 'Invalid passphrase');
     } finally {
       setUnlocking(false);
     }
@@ -142,7 +154,7 @@ export default function SecretsPage() {
       setRevealedSecrets({});
       await loadStatus();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to lock');
+      showError(err instanceof Error ? err.message : 'Failed to lock');
     }
   };
 
@@ -165,7 +177,7 @@ export default function SecretsPage() {
         setSelectedRegistry(newSecretRegistry);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to add secret');
+      showError(err instanceof Error ? err.message : 'Failed to add secret');
     } finally {
       setAddingSecret(false);
     }
@@ -180,7 +192,7 @@ export default function SecretsPage() {
         await loadSecrets(registry);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete secret');
+      showError(err instanceof Error ? err.message : 'Failed to delete secret');
     }
   };
 
@@ -201,7 +213,7 @@ export default function SecretsPage() {
       const value = await revealSecret(registry, key);
       setRevealedSecrets((prev) => ({ ...prev, [fullKey]: value }));
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to reveal secret');
+      showError(err instanceof Error ? err.message : 'Failed to reveal secret');
     } finally {
       setRevealingSecret(null);
     }
@@ -218,7 +230,7 @@ export default function SecretsPage() {
       setCopiedKey(fullKey);
       setTimeout(() => setCopiedKey(null), 2000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to copy');
+      showError(err instanceof Error ? err.message : 'Failed to copy');
     }
   };
 
@@ -279,16 +291,6 @@ export default function SecretsPage() {
           )}
         </div>
       </div>
-
-      {error && (
-        <div className="mb-6 p-4 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 flex items-center gap-2">
-          <AlertCircle className="h-4 w-4 flex-shrink-0" />
-          {error}
-          <button onClick={() => setError(null)} className="ml-auto">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-      )}
 
       {!status?.initialized ? (
         // Not initialized - show setup

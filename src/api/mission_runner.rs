@@ -239,6 +239,14 @@ impl MissionRunner {
         let agent_override = self.agent_override.clone();
         let user_message = msg.content.clone();
         let msg_id = msg.id;
+        tracing::info!(
+            mission_id = %mission_id,
+            workspace_id = %workspace_id,
+            agent_override = ?agent_override,
+            message_id = %msg_id,
+            message_len = user_message.len(),
+            "Mission runner starting"
+        );
 
         // Create mission control for complete_mission tool
         let mission_ctrl = crate::tools::mission::MissionControl {
@@ -380,6 +388,14 @@ async fn run_mission_turn(
     if let Some(agent) = agent_override {
         config.opencode_agent = Some(agent);
     }
+    tracing::info!(
+        mission_id = %mission_id,
+        workspace_id = ?workspace_id,
+        opencode_agent = ?config.opencode_agent,
+        history_len = history.len(),
+        user_message_len = user_message.len(),
+        "Mission turn started"
+    );
 
     // Build context with history
     let max_history_chars = config.context.max_history_total_chars;
@@ -475,7 +491,16 @@ async fn run_mission_turn(
     ctx.mission_id = Some(mission_id);
     ctx.mcp = Some(mcp);
 
-    root_agent.execute(&mut task, &ctx).await
+    let result = root_agent.execute(&mut task, &ctx).await;
+    tracing::info!(
+        mission_id = %mission_id,
+        success = result.success,
+        cost_cents = result.cost_cents,
+        model = ?result.model_used,
+        terminal_reason = ?result.terminal_reason,
+        "Mission turn finished"
+    );
+    result
 }
 
 /// Compact info about a running mission (for API responses).

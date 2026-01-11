@@ -1,9 +1,7 @@
-//! Remote file explorer endpoints (list/upload/download) via SSH + SFTP (OpenSSH).
-//!
-//! Note: uploads/downloads use `sftp` for transfer performance; directory listing uses `ssh` to run a small
-//! Python snippet that returns JSON (easier/safer than parsing `sftp ls` output).
+//! Local file explorer endpoints (list/upload/download) via server filesystem access.
 
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -18,11 +16,64 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use super::routes::AppState;
-use super::ssh_util::{materialize_private_key, sftp_batch, ssh_exec, ssh_exec_with_stdin};
 
-/// Check if the SSH target is localhost (optimization to skip SFTP)
-fn is_localhost(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+#[derive(Debug, Deserialize)]
+struct RuntimeWorkspace {
+    working_dir: Option<String>,
+    mission_context: Option<String>,
+    context_root: Option<String>,
+    context_dir_name: Option<String>,
+}
+
+fn runtime_workspace_path() -> PathBuf {
+    if let Ok(path) = std::env::var("OPEN_AGENT_RUNTIME_WORKSPACE_FILE") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home)
+        .join(".openagent")
+        .join("runtime")
+        .join("current_workspace.json")
+}
+
+fn load_runtime_workspace() -> Option<RuntimeWorkspace> {
+    let path = runtime_workspace_path();
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<RuntimeWorkspace>(&contents).ok()
+}
+
+fn resolve_upload_base(path: &str) -> Result<PathBuf, (StatusCode, String)> {
+    // Absolute path
+    if Path::new(path).is_absolute() {
+        // Remap /root/context to mission-specific context if available
+        if path.starts_with("/root/context") {
+            if let Some(state) = load_runtime_workspace() {
+                if let Some(ctx) = state.mission_context {
+                    let suffix = path.trim_start_matches("/root/context");
+                    return Ok(PathBuf::from(ctx).join(suffix.trim_start_matches('/')));
+                }
+                if let Some(root) = state.context_root {
+                    let suffix = path.trim_start_matches("/root/context");
+                    return Ok(PathBuf::from(root).join(suffix.trim_start_matches('/')));
+                }
+            }
+        }
+        return Ok(PathBuf::from(path));
+    }
+
+    // Relative path -> resolve against current workspace working dir if known
+    if let Some(state) = load_runtime_workspace() {
+        if let Some(wd) = state.working_dir {
+            return Ok(PathBuf::from(wd).join(path));
+        }
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        "Relative upload path requires an active workspace".to_string(),
+    ))
 }
 
 /// Sanitize a path component to prevent path traversal attacks.
@@ -156,94 +207,14 @@ pub struct FsEntry {
     pub mtime: i64,
 }
 
-const LIST_SCRIPT: &str = r#"
-import os, sys, json, stat
-
-path = sys.argv[1]
-out = []
-try:
-  with os.scandir(path) as it:
-    for e in it:
-      try:
-        st = e.stat(follow_symlinks=False)
-        mode = st.st_mode
-        if stat.S_ISDIR(mode):
-          kind = "dir"
-        elif stat.S_ISREG(mode):
-          kind = "file"
-        elif stat.S_ISLNK(mode):
-          kind = "link"
-        else:
-          kind = "other"
-        out.append({
-          "name": e.name,
-          "path": os.path.join(path, e.name),
-          "kind": kind,
-          "size": int(st.st_size),
-          "mtime": int(st.st_mtime),
-        })
-      except Exception:
-        continue
-except FileNotFoundError:
-  out = []
-
-print(json.dumps(out))
-"#;
-
-async fn get_key_and_cfg(
-    state: &Arc<AppState>,
-) -> Result<
-    (
-        crate::config::ConsoleSshConfig,
-        super::ssh_util::TempKeyFile,
-    ),
-    (StatusCode, String),
-> {
-    let cfg = state.config.console_ssh.clone();
-    let key = cfg.private_key.as_deref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Console SSH not configured".to_string(),
-        )
-    })?;
-    let key_file = materialize_private_key(key)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok((cfg, key_file))
-}
-
 pub async fn list(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Query(q): Query<PathQuery>,
 ) -> Result<Json<Vec<FsEntry>>, (StatusCode, String)> {
-    let (cfg, key_file) = get_key_and_cfg(&state).await?;
-
-    // Optimization: if SSH target is localhost, read directory directly
-    if is_localhost(&cfg.host) {
-        let entries = list_directory_local(&q.path)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        return Ok(Json(entries));
-    }
-
-    // Remote listing via SSH + Python
-    let out = ssh_exec_with_stdin(
-        &cfg,
-        key_file.path(),
-        "python3",
-        &vec!["-".into(), q.path.clone()],
-        LIST_SCRIPT,
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let parsed = serde_json::from_str::<Vec<FsEntry>>(&out).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("parse error: {}", e),
-        )
-    })?;
-    Ok(Json(parsed))
+    let entries = list_directory_local(&q.path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(entries))
 }
 
 /// List directory contents locally (for localhost optimization)
@@ -284,65 +255,37 @@ async fn list_directory_local(path: &str) -> anyhow::Result<Vec<FsEntry>> {
 }
 
 pub async fn mkdir(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Json(req): Json<MkdirRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (cfg, key_file) = get_key_and_cfg(&state).await?;
-
-    // Optimization: if SSH target is localhost, create directory directly
-    if is_localhost(&cfg.host) {
-        tokio::fs::create_dir_all(&req.path)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        return Ok(Json(serde_json::json!({ "ok": true })));
-    }
-
-    ssh_exec(&cfg, key_file.path(), "mkdir", &vec!["-p".into(), req.path])
+    tokio::fs::create_dir_all(&req.path)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn rm(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Json(req): Json<RmRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (cfg, key_file) = get_key_and_cfg(&state).await?;
     let recursive = req.recursive.unwrap_or(false);
 
-    // Optimization: if SSH target is localhost, delete directly
-    if is_localhost(&cfg.host) {
-        if recursive {
-            tokio::fs::remove_dir_all(&req.path)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        } else {
-            tokio::fs::remove_file(&req.path)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        }
-        return Ok(Json(serde_json::json!({ "ok": true })));
-    }
-
-    let mut args = vec![];
     if recursive {
-        args.push("-rf".to_string());
+        tokio::fs::remove_dir_all(&req.path)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     } else {
-        args.push("-f".to_string());
+        tokio::fs::remove_file(&req.path)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
-    args.push(req.path);
-    ssh_exec(&cfg, key_file.path(), "rm", &args)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn download(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Query(q): Query<PathQuery>,
 ) -> Result<Response, (StatusCode, String)> {
-    let (cfg, key_file) = get_key_and_cfg(&state).await?;
-
     let filename = q.path.split('/').last().unwrap_or("download");
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -356,45 +299,21 @@ pub async fn download(
         "application/octet-stream".parse().unwrap(),
     );
 
-    // Optimization: if SSH target is localhost, read file directly
-    if is_localhost(&cfg.host) {
-        let file = tokio::fs::File::open(&q.path)
-            .await
-            .map_err(|e| (StatusCode::NOT_FOUND, format!("File not found: {}", e)))?;
-        let stream = ReaderStream::new(file);
-        let body = Body::from_stream(stream);
-        return Ok((headers, body).into_response());
-    }
-
-    // Remote download via SFTP
-    let tmp = std::env::temp_dir().join(format!("open_agent_dl_{}", uuid::Uuid::new_v4()));
-    let batch = format!("get -p \"{}\" \"{}\"\n", q.path, tmp.to_string_lossy());
-    sftp_batch(&cfg, key_file.path(), &batch)
+    let file = tokio::fs::File::open(&q.path)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let file = tokio::fs::File::open(&tmp)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("File not found: {}", e)))?;
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
-
-    // Best-effort cleanup (delete after a short delay).
-    let tmp_cleanup = tmp.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        let _ = tokio::fs::remove_file(tmp_cleanup).await;
-    });
 
     Ok((headers, body).into_response())
 }
 
 pub async fn upload(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Query(q): Query<PathQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (cfg, key_file) = get_key_and_cfg(&state).await?;
+    let base = resolve_upload_base(&q.path)?;
 
     // Expect one file field.
     if let Some(field) = multipart
@@ -427,59 +346,37 @@ pub async fn upload(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let remote_path = if q.path.ends_with('/') {
-            format!("{}{}", q.path, file_name)
+            base.join(&file_name)
         } else {
-            format!("{}/{}", q.path, file_name)
+            base.join(&file_name)
         };
 
         // Ensure the target directory exists
-        let target_dir = if q.path.ends_with('/') {
-            q.path.trim_end_matches('/').to_string()
-        } else {
-            q.path.clone()
-        };
+        let target_dir = remote_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| base.clone());
 
-        // Optimization: if SSH target is localhost, skip SFTP and use direct file operations
-        if is_localhost(&cfg.host) {
-            // Direct local file operations (much faster than SFTP to self)
-            tokio::fs::create_dir_all(&target_dir).await.map_err(|e| {
+        tokio::fs::create_dir_all(&target_dir).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create directory: {}", e),
+            )
+        })?;
+
+        // Try rename first (fast), fall back to copy+delete if across filesystems
+        if tokio::fs::rename(&tmp, &remote_path).await.is_err() {
+            tokio::fs::copy(&tmp, &remote_path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create directory: {}", e),
+                    format!("Failed to copy file: {}", e),
                 )
             })?;
-
-            // Try rename first (fast), fall back to copy+delete if across filesystems
-            if tokio::fs::rename(&tmp, &remote_path).await.is_err() {
-                tokio::fs::copy(&tmp, &remote_path).await.map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to copy file: {}", e),
-                    )
-                })?;
-                let _ = tokio::fs::remove_file(&tmp).await;
-            }
-        } else {
-            // Remote upload via SFTP
-            ssh_exec(&cfg, key_file.path(), "mkdir", &["-p".into(), target_dir])
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to create directory: {}", e),
-                    )
-                })?;
-
-            let batch = format!("put -p \"{}\" \"{}\"\n", tmp.to_string_lossy(), remote_path);
-            sftp_batch(&cfg, key_file.path(), &batch)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            let _ = tokio::fs::remove_file(tmp).await;
+            let _ = tokio::fs::remove_file(&tmp).await;
         }
 
-        return Ok(Json(
-            serde_json::json!({ "ok": true, "path": q.path, "name": file_name }),
-        ));
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "path": remote_path,
+            "name": file_name
+        })));
     }
 
     Err((StatusCode::BAD_REQUEST, "missing file".to_string()))
@@ -562,10 +459,10 @@ pub struct FinalizeUploadRequest {
 
 // Finalize chunked upload by assembling chunks
 pub async fn upload_finalize(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Json(req): Json<FinalizeUploadRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (cfg, key_file) = get_key_and_cfg(&state).await?;
+    let base = resolve_upload_base(&req.path)?;
 
     // Sanitize upload_id and file_name to prevent path traversal attacks
     let safe_upload_id = sanitize_path_component(&req.upload_id);
@@ -613,58 +510,31 @@ pub async fn upload_finalize(
     drop(assembled);
 
     // Move assembled file to destination (using sanitized file_name)
-    let remote_path = if req.path.ends_with('/') {
-        format!("{}{}", req.path, safe_file_name)
-    } else {
-        format!("{}/{}", req.path, safe_file_name)
-    };
+    let remote_path = base.join(&safe_file_name);
+    let target_dir = remote_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| base.clone());
 
-    let target_dir = if req.path.ends_with('/') {
-        req.path.trim_end_matches('/').to_string()
-    } else {
-        req.path.clone()
-    };
+    tokio::fs::create_dir_all(&target_dir).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create directory: {}", e),
+        )
+    })?;
 
-    if is_localhost(&cfg.host) {
-        tokio::fs::create_dir_all(&target_dir).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create directory: {}", e),
-            )
-        })?;
-
-        if tokio::fs::rename(&assembled_path, &remote_path)
-            .await
-            .is_err()
-        {
-            tokio::fs::copy(&assembled_path, &remote_path)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to copy file: {}", e),
-                    )
-                })?;
-            let _ = tokio::fs::remove_file(&assembled_path).await;
-        }
-    } else {
-        ssh_exec(&cfg, key_file.path(), "mkdir", &["-p".into(), target_dir])
+    if tokio::fs::rename(&assembled_path, &remote_path)
+        .await
+        .is_err()
+    {
+        tokio::fs::copy(&assembled_path, &remote_path)
             .await
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create directory: {}", e),
+                    format!("Failed to copy file: {}", e),
                 )
             })?;
-
-        let batch = format!(
-            "put -p \"{}\" \"{}\"\n",
-            assembled_path.to_string_lossy(),
-            remote_path
-        );
-        sftp_batch(&cfg, key_file.path(), &batch)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let _ = tokio::fs::remove_file(&assembled_path).await;
     }
 
@@ -685,11 +555,9 @@ pub struct DownloadUrlRequest {
 
 // Download file from URL to server filesystem
 pub async fn download_from_url(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Json(req): Json<DownloadUrlRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (cfg, key_file) = get_key_and_cfg(&state).await?;
-
     // Validate URL to prevent SSRF attacks
     validate_url_for_ssrf(&req.url).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
@@ -802,53 +670,31 @@ pub async fn download_from_url(
     drop(f);
 
     // Move to destination
-    let remote_path = if req.path.ends_with('/') {
-        format!("{}{}", req.path, file_name)
-    } else {
-        format!("{}/{}", req.path, file_name)
-    };
+    let base = resolve_upload_base(&req.path)?;
+    let remote_path = base.join(&file_name);
+    let target_dir = remote_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| base.clone());
 
-    let target_dir = if req.path.ends_with('/') {
-        req.path.trim_end_matches('/').to_string()
-    } else {
-        req.path.clone()
-    };
+    tokio::fs::create_dir_all(&target_dir).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create directory: {}", e),
+        )
+    })?;
 
-    if is_localhost(&cfg.host) {
-        tokio::fs::create_dir_all(&target_dir).await.map_err(|e| {
+    if tokio::fs::rename(&tmp, &remote_path).await.is_err() {
+        tokio::fs::copy(&tmp, &remote_path).await.map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create directory: {}", e),
+                format!("Failed to copy file: {}", e),
             )
         })?;
-
-        if tokio::fs::rename(&tmp, &remote_path).await.is_err() {
-            tokio::fs::copy(&tmp, &remote_path).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to copy file: {}", e),
-                )
-            })?;
-            let _ = tokio::fs::remove_file(&tmp).await;
-        }
-    } else {
-        ssh_exec(&cfg, key_file.path(), "mkdir", &["-p".into(), target_dir])
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create directory: {}", e),
-                )
-            })?;
-
-        let batch = format!("put -p \"{}\" \"{}\"\n", tmp.to_string_lossy(), remote_path);
-        sftp_batch(&cfg, key_file.path(), &batch)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let _ = tokio::fs::remove_file(&tmp).await;
     }
 
     Ok(Json(
-        serde_json::json!({ "ok": true, "path": req.path, "name": file_name }),
+        serde_json::json!({ "ok": true, "path": remote_path, "name": file_name }),
     ))
 }

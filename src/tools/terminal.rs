@@ -85,21 +85,76 @@ const DANGEROUS_PATTERNS: &[(&str, &str)] = &[
 /// Returns Ok(()) if safe, Err with suggestion if blocked.
 fn validate_command(cmd: &str) -> Result<(), String> {
     let cmd_trimmed = cmd.trim();
+    let prefixes = ["sudo ", "time ", "nice ", "nohup "];
+
+    let is_safe_root_find = {
+        let mut safe = false;
+        if cmd_trimmed.starts_with("find /root") {
+            safe = true;
+        } else {
+            for prefix in prefixes {
+                if cmd_trimmed.starts_with(prefix) {
+                    let after_prefix = cmd_trimmed[prefix.len()..].trim_start();
+                    if after_prefix.starts_with("find /root") {
+                        safe = true;
+                        break;
+                    }
+                }
+            }
+        }
+        safe
+    };
+
+    let is_safe_root_grep = {
+        let mut safe = false;
+        let grep_prefixes = ["grep -r /root", "grep -rn /root", "grep -R /root"];
+        if grep_prefixes.iter().any(|p| cmd_trimmed.starts_with(p)) {
+            safe = true;
+        } else {
+            for prefix in prefixes {
+                if cmd_trimmed.starts_with(prefix) {
+                    let after_prefix = cmd_trimmed[prefix.len()..].trim_start();
+                    if grep_prefixes.iter().any(|p| after_prefix.starts_with(p)) {
+                        safe = true;
+                        break;
+                    }
+                }
+            }
+        }
+        safe
+    };
 
     for (pattern, suggestion) in DANGEROUS_PATTERNS {
         // Check if command starts with the dangerous pattern
         if cmd_trimmed.starts_with(pattern) {
+            if (pattern == &"find /" || pattern == &"find / ") && is_safe_root_find {
+                continue;
+            }
+            if (pattern == &"grep -r /" || pattern == &"grep -rn /" || pattern == &"grep -R /")
+                && is_safe_root_grep
+            {
+                continue;
+            }
             return Err(format!(
                 "Blocked dangerous command pattern '{}'. {}",
                 pattern, suggestion
             ));
         }
         // Also check for the pattern after common prefixes (sudo, time, etc.)
-        let prefixes = ["sudo ", "time ", "nice ", "nohup "];
         for prefix in prefixes {
             if cmd_trimmed.starts_with(prefix) {
                 let after_prefix = &cmd_trimmed[prefix.len()..];
                 if after_prefix.starts_with(pattern) {
+                    if (pattern == &"find /" || pattern == &"find / ") && is_safe_root_find {
+                        continue;
+                    }
+                    if (pattern == &"grep -r /"
+                        || pattern == &"grep -rn /"
+                        || pattern == &"grep -R /")
+                        && is_safe_root_grep
+                    {
+                        continue;
+                    }
                     return Err(format!(
                         "Blocked dangerous command pattern '{}'. {}",
                         pattern, suggestion
@@ -372,13 +427,44 @@ async fn run_container_command(
         format!("/{}", rel.to_string_lossy())
     };
 
+    // If a container is already running (e.g., MCP server), run commands via nsenter.
+    if let Ok(machine_name) = env::var("OPEN_AGENT_WORKSPACE_NAME") {
+        let machine_name = machine_name.trim();
+        if !machine_name.is_empty() {
+            if let Some(leader) = running_container_leader(machine_name, options).await {
+                if let Ok(output) = run_nsenter_command(&leader, &rel_str, command, options).await {
+                    return Ok(output);
+                }
+            }
+        }
+    }
+
     let mut args = vec![
         "-D".to_string(),
         root.to_string_lossy().to_string(),
         "--quiet".to_string(),
+        "--timezone=off".to_string(),
         "--chdir".to_string(),
         rel_str,
     ];
+
+    // Bind mission context into containers so uploaded files are accessible.
+    if let Ok(context_root) = env::var("OPEN_AGENT_CONTEXT_ROOT") {
+        let context_root = context_root.trim();
+        if !context_root.is_empty() && Path::new(context_root).exists() {
+            args.push(format!("--bind={}:/root/context", context_root));
+            args.push("--setenv=OPEN_AGENT_CONTEXT_ROOT=/root/context".to_string());
+            if let Ok(mission_id) = env::var("OPEN_AGENT_MISSION_ID") {
+                let mission_id = mission_id.trim();
+                if !mission_id.is_empty() {
+                    args.push(format!(
+                        "--setenv=OPEN_AGENT_MISSION_CONTEXT=/root/context/{}",
+                        mission_id
+                    ));
+                }
+            }
+        }
+    }
 
     if let Some(display) = read_runtime_display() {
         if Path::new("/tmp/.X11-unix").exists() {
@@ -403,7 +489,119 @@ async fn run_container_command(
     args.push("-c".to_string());
     args.push(command.to_string());
 
-    run_shell_command("systemd-nspawn", &args, None, options).await
+    let mut output = run_shell_command("systemd-nspawn", &args, None, options).await?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let is_busy = stderr.contains("Directory tree") && stderr.contains("busy");
+    if is_busy {
+        // If the container is already running without an active desktop, terminate it and retry.
+        if read_runtime_display().is_none() {
+            if let Ok(machine_name) = env::var("OPEN_AGENT_WORKSPACE_NAME") {
+                let machine_name = machine_name.trim();
+                if !machine_name.is_empty() {
+                    let terminate_args = vec!["terminate".to_string(), machine_name.to_string()];
+                    let machinectl = if Path::new("/usr/bin/machinectl").exists() {
+                        "/usr/bin/machinectl"
+                    } else {
+                        "machinectl"
+                    };
+                    let _ = run_shell_command(machinectl, &terminate_args, None, options).await;
+                }
+            }
+        }
+
+        // Retry a few times in case another nspawn process is holding the root.
+        for attempt in 1..=3 {
+            tokio::time::sleep(Duration::from_millis(200 * attempt)).await;
+            output = run_shell_command("systemd-nspawn", &args, None, options).await?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !(stderr.contains("Directory tree") && stderr.contains("busy")) {
+                break;
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+async fn running_container_leader(
+    machine_name: &str,
+    options: &CommandOptions,
+) -> Option<String> {
+    let machinectl = if Path::new("/usr/bin/machinectl").exists() {
+        "/usr/bin/machinectl"
+    } else {
+        "machinectl"
+    };
+    let args = vec![
+        "show".to_string(),
+        machine_name.to_string(),
+        "-p".to_string(),
+        "Leader".to_string(),
+        "--value".to_string(),
+    ];
+    let output = run_shell_command(machinectl, &args, None, options).await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let leader = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if leader.is_empty() {
+        None
+    } else {
+        Some(leader)
+    }
+}
+
+fn nsenter_command(rel_str: &str, command: &str) -> String {
+    let mut exports = Vec::new();
+    exports.push("export OPEN_AGENT_CONTEXT_ROOT=/root/context".to_string());
+    if let Ok(context_dir) = env::var("OPEN_AGENT_CONTEXT_DIR_NAME") {
+        if !context_dir.trim().is_empty() {
+            exports.push(format!("export OPEN_AGENT_CONTEXT_DIR_NAME={}", context_dir.trim()));
+        }
+    }
+    if let Ok(mission_id) = env::var("OPEN_AGENT_MISSION_ID") {
+        let mission_id = mission_id.trim();
+        if !mission_id.is_empty() {
+            exports.push(format!("export OPEN_AGENT_MISSION_ID={}", mission_id));
+            exports.push(format!(
+                "export OPEN_AGENT_MISSION_CONTEXT=/root/context/{}",
+                mission_id
+            ));
+        }
+    }
+    let prelude = if exports.is_empty() {
+        String::new()
+    } else {
+        format!("{}; ", exports.join("; "))
+    };
+    format!("{}cd {} && {}", prelude, rel_str, command)
+}
+
+async fn run_nsenter_command(
+    leader_pid: &str,
+    rel_str: &str,
+    command: &str,
+    options: &CommandOptions,
+) -> anyhow::Result<Output> {
+    let nsenter = if Path::new("/usr/bin/nsenter").exists() {
+        "/usr/bin/nsenter"
+    } else {
+        "nsenter"
+    };
+    let args = vec![
+        "--target".to_string(),
+        leader_pid.to_string(),
+        "--mount".to_string(),
+        "--uts".to_string(),
+        "--ipc".to_string(),
+        "--net".to_string(),
+        "--pid".to_string(),
+        "/bin/sh".to_string(),
+        "-lc".to_string(),
+        nsenter_command(rel_str, command),
+    ];
+    run_shell_command(nsenter, &args, None, options).await
 }
 
 /// Run a shell command.

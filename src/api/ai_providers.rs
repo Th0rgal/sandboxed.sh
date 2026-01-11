@@ -10,6 +10,7 @@
 //! - Set default provider
 
 use std::collections::{BTreeSet, HashMap};
+use std::env;
 use std::path::{Path, PathBuf};
 
 use axum::{
@@ -36,6 +37,21 @@ const OPENAI_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const OPENAI_SCOPE: &str = "openid profile email offline_access";
+
+/// Google/Gemini OAuth constants (from opencode-gemini-auth plugin)
+const GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_REDIRECT_URI: &str = "http://localhost:8085/oauth2callback";
+const GOOGLE_SCOPES: &str =
+    "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
+
+fn google_client_id() -> String {
+    env::var("GOOGLE_CLIENT_ID").unwrap_or_else(|_| "missing-google-client-id".to_string())
+}
+
+fn google_client_secret() -> String {
+    env::var("GOOGLE_CLIENT_SECRET").unwrap_or_else(|_| "missing-google-client-secret".to_string())
+}
 
 fn anthropic_client_id() -> String {
     ANTHROPIC_CLIENT_ID
@@ -67,6 +83,25 @@ fn openai_authorize_url(challenge: &str, state: &str) -> Result<String, String> 
         .append_pair("id_token_add_organizations", "true")
         .append_pair("codex_cli_simplified_flow", "true")
         .append_pair("originator", "codex_cli_rs");
+
+    Ok(url.to_string())
+}
+
+fn google_authorize_url(challenge: &str, state: &str) -> Result<String, String> {
+    let mut url =
+        url::Url::parse(GOOGLE_AUTHORIZE_URL).map_err(|e| format!("Failed to parse URL: {}", e))?;
+    let client_id = google_client_id();
+
+    url.query_pairs_mut()
+        .append_pair("client_id", &client_id)
+        .append_pair("response_type", "code")
+        .append_pair("redirect_uri", GOOGLE_REDIRECT_URI)
+        .append_pair("scope", GOOGLE_SCOPES)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent");
 
     Ok(url.to_string())
 }
@@ -666,9 +701,10 @@ fn set_provider_config_entry(
         }
     }
 
-    if let Some(enabled) = enabled {
-        entry_obj.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
-    }
+    // OpenCode's config schema doesn't accept "enabled" under provider entries.
+    // We treat providers as enabled when present and avoid writing this field.
+    let _ = enabled;
+    entry_obj.remove("enabled");
 }
 
 fn remove_provider_config_entry(config: &mut serde_json::Value, provider: ProviderType) {
@@ -894,7 +930,7 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
         ProviderTypeInfo {
             id: "google".to_string(),
             name: "Google AI".to_string(),
-            uses_oauth: false,
+            uses_oauth: true,
             env_var: Some("GOOGLE_API_KEY".to_string()),
         },
         ProviderTypeInfo {
@@ -1414,6 +1450,34 @@ async fn oauth_authorize(
                 method: "code".to_string(),
             }))
         }
+        ProviderType::Google => {
+            let (verifier, challenge) = generate_pkce();
+            let state_value = generate_state();
+
+            let url = google_authorize_url(&challenge, &state_value)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            {
+                let mut pending = state.pending_oauth.write().await;
+                pending.insert(
+                    provider_type,
+                    PendingOAuth {
+                        verifier,
+                        mode: "google".to_string(),
+                        state: Some(state_value),
+                        created_at: std::time::Instant::now(),
+                    },
+                );
+            }
+
+            Ok(Json(OAuthAuthorizeResponse {
+                url,
+                instructions:
+                    "Complete OAuth in your browser, then paste the full redirected URL (e.g., http://localhost:8085/oauth2callback?code=...&state=...) or just the authorization code."
+                        .to_string(),
+                method: "code".to_string(),
+            }))
+        }
         _ => Err((
             StatusCode::BAD_REQUEST,
             "OAuth not supported for this provider".to_string(),
@@ -1721,6 +1785,108 @@ async fn oauth_callback_inner(
                 Some(AuthKind::OAuth),
                 default_provider,
             );
+
+            Ok(Json(response))
+        }
+        ProviderType::Google => {
+            // Parse the callback input (URL or code)
+            let (code_opt, state_opt) = parse_openai_authorization_input(&req.code);
+            let Some(code) = code_opt else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Authorization code not found. Paste the full redirect URL or code."
+                        .to_string(),
+                ));
+            };
+
+            // Validate state if present
+            if let (Some(expected), Some(actual)) = (pending.state.as_ref(), state_opt.as_ref()) {
+                if expected != actual {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "OAuth state mismatch. Please start the OAuth flow again.".to_string(),
+                    ));
+                }
+            }
+
+            // Exchange code for tokens
+            let client = reqwest::Client::new();
+            let client_id = google_client_id();
+            let client_secret = google_client_secret();
+            let token_body = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("client_id", &client_id)
+                .append_pair("client_secret", &client_secret)
+                .append_pair("code", &code)
+                .append_pair("grant_type", "authorization_code")
+                .append_pair("redirect_uri", GOOGLE_REDIRECT_URI)
+                .append_pair("code_verifier", &pending.verifier)
+                .finish();
+
+            let token_response = client
+                .post(GOOGLE_TOKEN_URL)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(token_body)
+                .send()
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to exchange code: {}", e),
+                    )
+                })?;
+
+            if !token_response.status().is_success() {
+                let error_text = token_response.text().await.unwrap_or_default();
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("OAuth token exchange failed: {}", error_text),
+                ));
+            }
+
+            let token_data: serde_json::Value = token_response.json().await.map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to parse token response: {}", e),
+                )
+            })?;
+
+            let access_token = token_data["access_token"].as_str().ok_or_else(|| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "No access token in response".to_string(),
+                )
+            })?;
+
+            let refresh_token = token_data["refresh_token"].as_str().ok_or_else(|| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "No refresh token in response".to_string(),
+                )
+            })?;
+
+            let expires_in = token_data["expires_in"].as_i64().unwrap_or(3600);
+            let expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
+
+            // Sync to OpenCode's auth.json
+            if let Err(e) =
+                sync_to_opencode_auth(provider_type, refresh_token, access_token, expires_at)
+            {
+                tracing::error!("Failed to sync Google credentials to OpenCode: {}", e);
+            }
+
+            let config_path = get_opencode_config_path(&state.config.working_dir);
+            let opencode_config = read_opencode_config(&config_path)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let default_provider = get_default_provider(&opencode_config);
+            let config_entry = get_provider_config_entry(&opencode_config, provider_type);
+            let response = build_provider_response(
+                provider_type,
+                config_entry,
+                Some(AuthKind::OAuth),
+                default_provider,
+            );
+
+            tracing::info!("Google OAuth credentials saved for provider: {}", id);
 
             Ok(Json(response))
         }
