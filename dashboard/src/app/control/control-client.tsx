@@ -663,8 +663,10 @@ function PhaseItem({ item }: { item: Extract<ChatItem, { kind: "phase" }> }) {
 // Thinking group component - displays multiple thinking items merged with separators
 function ThinkingGroupItem({
   items,
+  basePath,
 }: {
   items: Extract<ChatItem, { kind: "thinking" }>[];
+  basePath?: string;
 }) {
   // Filter out empty items for display
   const nonEmptyItems = useMemo(() =>
@@ -775,6 +777,7 @@ function ThinkingGroupItem({
                 <MarkdownContent
                   content={item.content}
                   className="text-xs text-white/60 [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
+                  basePath={basePath}
                 />
               </div>
             ))}
@@ -792,9 +795,11 @@ function ThinkingGroupItem({
 function ThinkingPanelItem({
   item,
   isActive,
+  basePath,
 }: {
   item: Extract<ChatItem, { kind: "thinking" }>;
   isActive: boolean;
+  basePath?: string;
 }) {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
@@ -847,6 +852,7 @@ function ThinkingPanelItem({
           <MarkdownContent
             content={item.content}
             className="text-xs [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
+            basePath={basePath}
           />
         ) : (
           <span className="italic text-white/30">Processing...</span>
@@ -861,10 +867,12 @@ function ThinkingPanel({
   items,
   onClose,
   className,
+  basePath,
 }: {
   items: Extract<ChatItem, { kind: "thinking" }>[];
   onClose: () => void;
   className?: string;
+  basePath?: string;
 }) {
   const activeItem = items.find(t => !t.done);
 
@@ -945,7 +953,7 @@ function ThinkingPanel({
             {completedItems.length > 0 && (
               <>
                 {completedItems.map((item) => (
-                  <ThinkingPanelItem key={item.id} item={item} isActive={false} />
+                  <ThinkingPanelItem key={item.id} item={item} isActive={false} basePath={basePath} />
                 ))}
                 {activeItem && (
                   <div className="text-[10px] uppercase tracking-wider text-white/30 px-1">
@@ -957,7 +965,7 @@ function ThinkingPanel({
 
             {/* Active thinking at the bottom (sticky) */}
             {activeItem && (
-              <ThinkingPanelItem item={activeItem} isActive={true} />
+              <ThinkingPanelItem item={activeItem} isActive={true} basePath={basePath} />
             )}
           </>
         )}
@@ -1572,8 +1580,13 @@ function ToolCallItem({
                   {resultStr}
                 </SyntaxHighlighter>
               </div>
-              {/* Image previews for screenshot results */}
+              {/* Image previews for screenshot results - only from tools that produce images */}
               {(() => {
+                // Only extract images from tools that actually produce screenshots
+                const IMAGE_PRODUCING_TOOLS = ['capture', 'screenshot', 'desktop_screenshot', 'mccli', 'browser_take_screenshot'];
+                const toolName = item.name.toLowerCase();
+                if (!IMAGE_PRODUCING_TOOLS.some(t => toolName.includes(t))) return null;
+
                 const imagePaths = extractImagePaths(resultStr);
                 if (imagePaths.length === 0) return null;
                 return (
@@ -2244,6 +2257,25 @@ export default function ControlClient() {
     },
     [getActiveDesktopSession, missionHasDesktopSession]
   );
+
+  // Derive working directory from mission's desktop sessions for file path resolution
+  const missionWorkingDirectory = useMemo(() => {
+    const mission = viewingMission ?? currentMission;
+    if (!mission?.desktop_sessions?.length) return undefined;
+
+    // Try to find screenshots_dir from any session (prefer active/latest)
+    for (let i = mission.desktop_sessions.length - 1; i >= 0; i--) {
+      const session = mission.desktop_sessions[i];
+      if (session?.screenshots_dir) {
+        // screenshots_dir is like /path/to/workspaces/mission-xxx/screenshots/
+        // We want the parent: /path/to/workspaces/mission-xxx/
+        const dir = session.screenshots_dir.replace(/\/?$/, ''); // remove trailing slash
+        const parent = dir.substring(0, dir.lastIndexOf('/'));
+        if (parent) return parent;
+      }
+    }
+    return undefined;
+  }, [viewingMission, currentMission]);
 
   const missionHistoryToItems = useCallback((mission: Mission): ChatItem[] => {
     // Estimate timestamps based on mission creation time
@@ -3929,7 +3961,7 @@ export default function ControlClient() {
                             {formatTime(item.timestamp)}
                           </span>
                         </div>
-                        <MarkdownContent content={item.content} />
+                        <MarkdownContent content={item.content} basePath={missionWorkingDirectory} />
                         {/* Render shared files */}
                         {item.sharedFiles && item.sharedFiles.length > 0 && (
                           <div className="mt-2">
@@ -3973,12 +4005,12 @@ export default function ControlClient() {
 
                 if (item.kind === "thinking_group") {
                   // Render grouped thinking items as a single merged block
-                  return <ThinkingGroupItem key={item.groupId} items={item.thoughts} />;
+                  return <ThinkingGroupItem key={item.groupId} items={item.thoughts} basePath={missionWorkingDirectory} />;
                 }
 
                 if (item.kind === "thinking") {
                   // Fallback for individual thinking items (should be rare with grouping)
-                  return <ThinkingGroupItem key={item.id} items={[item]} />;
+                  return <ThinkingGroupItem key={item.id} items={[item]} basePath={missionWorkingDirectory} />;
                 }
 
                 if (item.kind === "tool") {
@@ -4510,6 +4542,7 @@ export default function ControlClient() {
                 items={thinkingItems}
                 onClose={() => setShowThinkingPanel(false)}
                 className={showDesktopStream ? "flex-shrink-0 max-h-[40%]" : "flex-1"}
+                basePath={missionWorkingDirectory}
               />
             )}
 

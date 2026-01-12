@@ -752,7 +752,8 @@ pub struct SkillContent {
     pub name: String,
     /// Primary SKILL.md content
     pub content: String,
-    /// Additional markdown files (name, content)
+    /// Additional markdown files (relative path, content)
+    /// Path preserves subdirectory structure (e.g., "references/guide.md")
     pub files: Vec<(String, String)>,
 }
 
@@ -820,9 +821,13 @@ pub async fn write_skills_to_workspace(
         let skill_md_path = skill_dir.join("SKILL.md");
         tokio::fs::write(&skill_md_path, &content_with_name).await?;
 
-        // Write additional files
-        for (file_name, file_content) in &skill.files {
-            let file_path = skill_dir.join(file_name);
+        // Write additional files (preserving subdirectory structure)
+        for (relative_path, file_content) in &skill.files {
+            let file_path = skill_dir.join(relative_path);
+            // Create parent directories if needed (e.g., "references/guide.md")
+            if let Some(parent) = file_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
             tokio::fs::write(&file_path, file_content).await?;
         }
 
@@ -922,10 +927,11 @@ pub async fn sync_skills_to_dir(
                 skills_to_write.push(SkillContent {
                     name: skill.name,
                     content: skill.content,
+                    // Use f.path to preserve subdirectory structure (e.g., "references/guide.md")
                     files: skill
                         .files
                         .into_iter()
-                        .map(|f| (f.name, f.content))
+                        .map(|f| (f.path, f.content))
                         .collect(),
                 });
             }

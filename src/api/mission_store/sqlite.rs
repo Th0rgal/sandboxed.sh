@@ -409,75 +409,23 @@ impl MissionStore for SqliteMissionStore {
     async fn update_mission_history(
         &self,
         id: Uuid,
-        history: &[MissionHistoryEntry],
+        _history: &[MissionHistoryEntry],
     ) -> Result<(), String> {
-        // For SQLite store, history is derived from events.
-        // This method updates the mission's updated_at timestamp and logs any new entries.
+        // For SQLite store, history is derived from events logged via log_event().
+        // This method only updates the mission's updated_at timestamp.
+        // Events are NOT inserted here to avoid race condition duplicates with the
+        // event logger task that also inserts via log_event().
         let conn = self.conn.clone();
-        let content_dir = self.content_dir.clone();
         let now = now_string();
-        let history = history.to_vec();
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
 
-            // Update timestamp
             conn.execute(
                 "UPDATE missions SET updated_at = ?1 WHERE id = ?2",
                 params![&now, id.to_string()],
             )
             .map_err(|e| e.to_string())?;
-
-            // Get current event count
-            let current_count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM mission_events WHERE mission_id = ?1 AND event_type IN ('user_message', 'assistant_message')",
-                    params![id.to_string()],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-
-            // Insert any new history entries
-            for (idx, entry) in history.iter().enumerate() {
-                if idx as i64 >= current_count {
-                    let sequence: i64 = conn
-                        .query_row(
-                            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM mission_events WHERE mission_id = ?1",
-                            params![id.to_string()],
-                            |row| row.get(0),
-                        )
-                        .unwrap_or(1);
-
-                    let event_type = if entry.role == "user" {
-                        "user_message"
-                    } else {
-                        "assistant_message"
-                    };
-
-                    let (content_inline, content_file) = SqliteMissionStore::store_content(
-                        &content_dir,
-                        id,
-                        sequence,
-                        event_type,
-                        &entry.content,
-                    );
-
-                    conn.execute(
-                        "INSERT INTO mission_events (mission_id, sequence, event_type, timestamp, content, content_file, metadata)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![
-                            id.to_string(),
-                            sequence,
-                            event_type,
-                            &now,
-                            content_inline,
-                            content_file,
-                            "{}",
-                        ],
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-            }
 
             Ok(())
         })

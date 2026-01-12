@@ -215,13 +215,29 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
     // Wait for Xvfb to be ready
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // Start i3 window manager - cleanup Xvfb on failure
-    let i3 = match std::process::Command::new("i3")
+    // Start i3 window manager with explicit config path - cleanup Xvfb on failure
+    // Try multiple config locations in order of preference
+    let config_paths = [
+        "/var/lib/opencode/.config/i3/config",
+        "/root/.config/i3/config",
+    ];
+    let config_path = config_paths
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|s| s.to_string());
+
+    let mut i3_cmd = std::process::Command::new("i3");
+    i3_cmd
         .env("DISPLAY", &display_id)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+
+    // Use explicit config path if found to avoid first-run wizard
+    if let Some(ref cfg) = config_path {
+        i3_cmd.args(["-c", cfg]);
+    }
+
+    let i3 = match i3_cmd.spawn() {
         Ok(i3) => i3,
         Err(e) => {
             kill_process(xvfb_pid);
@@ -256,11 +272,32 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
 
         let chromium = match std::process::Command::new("chromium")
             .args([
+                // Security/sandbox (required for running as root)
                 "--no-sandbox",
+                "--disable-setuid-sandbox",
+                // GPU/rendering
                 "--disable-gpu",
                 "--disable-software-rasterizer",
                 "--disable-dev-shm-usage",
+                // Accessibility for automation
                 "--force-renderer-accessibility",
+                // Suppress dialogs and prompts for LLM automation
+                "--disable-infobars",              // "Restore pages?" bar
+                "--disable-session-crashed-bubble", // Crash recovery dialog
+                "--disable-restore-session-state", // Don't restore previous session
+                "--no-first-run",                  // Skip first-run wizard
+                "--disable-translate",             // No translate prompts
+                "--disable-default-apps",          // No app suggestions
+                "--disable-popup-blocking",        // Allow popups for automation
+                "--disable-prompt-on-repost",      // No repost warnings
+                "--disable-hang-monitor",          // No unresponsive page dialogs
+                "--disable-client-side-phishing-detection",
+                // Clean profile behavior
+                "--disable-background-networking", // No background requests
+                "--disable-sync",                  // No sync prompts
+                "--disable-extensions",            // No extension prompts
+                // Window behavior
+                "--start-maximized",               // Fill the screen
                 url,
             ])
             .env("DISPLAY", &display_id)
