@@ -712,34 +712,32 @@ async fn build_workspace(
     workspace.status = WorkspaceStatus::Building;
     state.workspaces.update(workspace.clone()).await;
 
-    // Build the container
-    match crate::workspace::build_chroot_workspace(
-        &mut workspace,
-        distro,
-        force_rebuild,
-        &state.config.working_dir,
-    )
-    .await
-    {
-        Ok(()) => {
-            // Update in store
-            state.workspaces.update(workspace.clone()).await;
-            Ok(Json(workspace.into()))
-        }
-        Err(e) => {
-            // Update status to error and save
-            workspace.status = WorkspaceStatus::Error;
-            if workspace.error_message.is_none() {
-                workspace.error_message = Some(e.to_string());
-            }
-            state.workspaces.update(workspace.clone()).await;
+    // Run the container build in the background so long builds aren't tied to the HTTP request
+    let workspaces_store = Arc::clone(&state.workspaces);
+    let working_dir = state.config.working_dir.clone();
+    let mut workspace_for_build = workspace.clone();
 
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to build container: {}", e),
-            ))
+    tokio::spawn(async move {
+        let result = crate::workspace::build_chroot_workspace(
+            &mut workspace_for_build,
+            distro,
+            force_rebuild,
+            &working_dir,
+        )
+        .await;
+
+        if let Err(e) = result {
+            tracing::error!(
+                workspace = %workspace_for_build.name,
+                error = %e,
+                "Failed to build container workspace"
+            );
         }
-    }
+
+        workspaces_store.update(workspace_for_build).await;
+    });
+
+    Ok(Json(workspace.into()))
 }
 
 #[cfg(test)]

@@ -282,22 +282,22 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
                 // Accessibility for automation
                 "--force-renderer-accessibility",
                 // Suppress dialogs and prompts for LLM automation
-                "--disable-infobars",              // "Restore pages?" bar
+                "--disable-infobars",               // "Restore pages?" bar
                 "--disable-session-crashed-bubble", // Crash recovery dialog
-                "--disable-restore-session-state", // Don't restore previous session
-                "--no-first-run",                  // Skip first-run wizard
-                "--disable-translate",             // No translate prompts
-                "--disable-default-apps",          // No app suggestions
-                "--disable-popup-blocking",        // Allow popups for automation
-                "--disable-prompt-on-repost",      // No repost warnings
-                "--disable-hang-monitor",          // No unresponsive page dialogs
+                "--disable-restore-session-state",  // Don't restore previous session
+                "--no-first-run",                   // Skip first-run wizard
+                "--disable-translate",              // No translate prompts
+                "--disable-default-apps",           // No app suggestions
+                "--disable-popup-blocking",         // Allow popups for automation
+                "--disable-prompt-on-repost",       // No repost warnings
+                "--disable-hang-monitor",           // No unresponsive page dialogs
                 "--disable-client-side-phishing-detection",
                 // Clean profile behavior
                 "--disable-background-networking", // No background requests
                 "--disable-sync",                  // No sync prompts
                 "--disable-extensions",            // No extension prompts
                 // Window behavior
-                "--start-maximized",               // Fill the screen
+                "--start-maximized", // Fill the screen
                 url,
             ])
             .env("DISPLAY", &display_id)
