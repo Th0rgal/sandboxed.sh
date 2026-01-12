@@ -1167,3 +1167,73 @@ fn filter_agents_by_config(
         agents
     }
 }
+
+/// Validate that an agent name exists in the visible agents list.
+/// Returns Ok(()) if the agent exists, or Err with a descriptive message if not.
+pub async fn validate_agent_exists(
+    state: &super::routes::AppState,
+    agent_name: &str,
+) -> Result<(), String> {
+    // Fetch all agents from OpenCode
+    let all_agents = match crate::api::opencode::fetch_opencode_agents(state).await {
+        Ok(agents) => agents,
+        Err(e) => {
+            // If we can't fetch agents, log warning but allow the request
+            // (OpenCode will validate at runtime)
+            tracing::warn!("Could not validate agent '{}': {}", agent_name, e);
+            return Ok(());
+        }
+    };
+
+    // Read config to get hidden agents list
+    let config = crate::workspace::read_openagent_config(&state.config.working_dir).await;
+    let visible_agents = filter_agents_by_config(all_agents, &config);
+
+    // Extract agent names from the visible agents list
+    let agent_names = extract_agent_names(&visible_agents);
+
+    // Case-insensitive match for better UX
+    let exists = agent_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(agent_name));
+
+    if exists {
+        Ok(())
+    } else {
+        let suggestions = agent_names.join(", ");
+        Err(format!(
+            "Agent '{}' not found. Available agents: {}",
+            agent_name, suggestions
+        ))
+    }
+}
+
+/// Extract agent names from the visible agents payload.
+fn extract_agent_names(agents: &serde_json::Value) -> Vec<String> {
+    fn get_name(entry: &serde_json::Value) -> Option<String> {
+        if let Some(s) = entry.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(obj) = entry.as_object() {
+            if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+                return Some(name.to_string());
+            }
+            if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+        None
+    }
+
+    if let Some(agents_obj) = agents.as_object() {
+        if let Some(agents_arr) = agents_obj.get("agents").and_then(|v| v.as_array()) {
+            return agents_arr.iter().filter_map(get_name).collect();
+        }
+        // Object with agent names as keys
+        return agents_obj.keys().cloned().collect();
+    }
+    if let Some(agents_arr) = agents.as_array() {
+        return agents_arr.iter().filter_map(get_name).collect();
+    }
+    Vec::new()
+}

@@ -33,6 +33,10 @@ import {
   listProviders,
   listWorkspaces,
   getHealth,
+  listDesktopSessions,
+  closeDesktopSession,
+  keepAliveDesktopSession,
+  cleanupOrphanedDesktopSessions,
   type StreamDiagnosticUpdate,
   type ControlRunState,
   type Mission,
@@ -41,6 +45,8 @@ import {
   type UploadProgress,
   type Provider,
   type Workspace,
+  type DesktopSessionDetail,
+  type DesktopSessionStatus,
 } from "@/lib/api";
 import {
   Send,
@@ -1801,6 +1807,8 @@ export default function ControlClient() {
   const [desktopDisplayId, setDesktopDisplayId] = useState(":101");
   const [showDisplaySelector, setShowDisplaySelector] = useState(false);
   const [hasDesktopSession, setHasDesktopSession] = useState(false);
+  const [desktopSessions, setDesktopSessions] = useState<DesktopSessionDetail[]>([]);
+  const [isClosingDesktop, setIsClosingDesktop] = useState<string | null>(null);
 
   // Thinking panel state
   const [showThinkingPanel, setShowThinkingPanel] = useState(false);
@@ -2538,6 +2546,64 @@ export default function ControlClient() {
     const interval = setInterval(refreshRecentMissions, 10000);
     return () => clearInterval(interval);
   }, [refreshRecentMissions]);
+
+  // Fetch desktop sessions periodically for the enhanced dropdown
+  const refreshDesktopSessions = useCallback(async () => {
+    try {
+      const sessions = await listDesktopSessions();
+      setDesktopSessions(sessions);
+      // Update hasDesktopSession based on whether there are any running sessions
+      const hasRunning = sessions.some(s => s.process_running && s.status !== 'stopped');
+      if (hasRunning && !hasDesktopSession) {
+        setHasDesktopSession(true);
+      }
+    } catch (err) {
+      if (isNetworkError(err)) return;
+      // Silently fail - desktop sessions are optional
+    }
+  }, [hasDesktopSession]);
+
+  useEffect(() => {
+    refreshDesktopSessions();
+    const interval = setInterval(refreshDesktopSessions, 10000);
+    return () => clearInterval(interval);
+  }, [refreshDesktopSessions]);
+
+  // Handle closing a desktop session
+  const handleCloseDesktopSession = useCallback(async (display: string) => {
+    setIsClosingDesktop(display);
+    try {
+      await closeDesktopSession(display);
+      toast.success(`Desktop session ${display} closed`);
+      // Refresh sessions
+      await refreshDesktopSessions();
+      // If we closed the currently viewed display, switch to another or hide
+      if (desktopDisplayId === display) {
+        const remaining = desktopSessions.filter(s => s.display !== display && s.process_running);
+        if (remaining.length > 0) {
+          setDesktopDisplayId(remaining[0].display);
+        } else {
+          setShowDesktopStream(false);
+          setHasDesktopSession(false);
+        }
+      }
+    } catch (err) {
+      toast.error(`Failed to close session: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      setIsClosingDesktop(null);
+    }
+  }, [desktopDisplayId, desktopSessions, refreshDesktopSessions]);
+
+  // Handle extending keep-alive
+  const handleKeepAliveDesktopSession = useCallback(async (display: string) => {
+    try {
+      await keepAliveDesktopSession(display, 7200); // 2 hours
+      toast.success(`Keep-alive extended for ${display}`);
+      await refreshDesktopSessions();
+    } catch (err) {
+      toast.error(`Failed to extend keep-alive: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+  }, [refreshDesktopSessions]);
 
   // Global keyboard shortcut for mission switcher (Cmd+K / Ctrl+K)
   useEffect(() => {
@@ -3589,27 +3655,152 @@ export default function ControlClient() {
                   <ChevronDown className="h-3.5 w-3.5" />
                 </button>
                 {showDisplaySelector && (
-                  <div className="absolute right-0 top-full mt-1 z-50 min-w-[120px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
-                    {[":99", ":100", ":101", ":102"].map((display) => (
-                      <button
-                        key={display}
-                        onClick={() => {
-                          setDesktopDisplayId(display);
-                          setShowDisplaySelector(false);
-                        }}
-                        className={cn(
-                          "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
-                          desktopDisplayId === display
-                            ? "text-emerald-400"
-                            : "text-white/70"
+                  <div className="absolute right-0 top-full mt-1 z-50 min-w-[280px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
+                    {/* Show sessions from API if available, otherwise show hardcoded list */}
+                    {desktopSessions.length > 0 ? (
+                      <>
+                        {desktopSessions.filter(s => s.process_running).map((session) => (
+                          <div
+                            key={session.display}
+                            className={cn(
+                              "flex w-full items-center gap-2 px-3 py-2 text-sm transition-colors hover:bg-white/[0.04]",
+                              desktopDisplayId === session.display
+                                ? "bg-white/[0.02]"
+                                : ""
+                            )}
+                          >
+                            <button
+                              onClick={() => {
+                                setDesktopDisplayId(session.display);
+                                setShowDisplaySelector(false);
+                              }}
+                              className="flex flex-1 items-center gap-2 text-left"
+                            >
+                              {/* Status indicator */}
+                              <span className={cn(
+                                "h-2 w-2 rounded-full",
+                                session.status === 'active' ? "bg-emerald-500" :
+                                session.status === 'orphaned' ? "bg-amber-500" :
+                                "bg-gray-500"
+                              )} title={session.status} />
+
+                              {/* Display ID */}
+                              <span className={cn(
+                                "font-mono",
+                                desktopDisplayId === session.display
+                                  ? "text-emerald-400"
+                                  : "text-white/70"
+                              )}>
+                                {session.display}
+                              </span>
+
+                              {/* Status label */}
+                              <span className={cn(
+                                "text-xs",
+                                session.status === 'active' ? "text-emerald-500/70" :
+                                session.status === 'orphaned' ? "text-amber-500/70" :
+                                "text-white/40"
+                              )}>
+                                {session.status === 'active' ? 'Active' :
+                                 session.status === 'orphaned' ? 'Orphaned' :
+                                 session.status}
+                              </span>
+
+                              {/* Auto-close countdown for orphaned sessions */}
+                              {session.status === 'orphaned' && session.auto_close_in_secs != null && session.auto_close_in_secs > 0 && (
+                                <span className="text-xs text-amber-500/50">
+                                  {Math.floor(session.auto_close_in_secs / 60)}m left
+                                </span>
+                              )}
+
+                              {desktopDisplayId === session.display && (
+                                <CheckCircle className="ml-auto h-3.5 w-3.5 text-emerald-400" />
+                              )}
+                            </button>
+
+                            {/* Keep alive button for orphaned sessions */}
+                            {session.status === 'orphaned' && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleKeepAliveDesktopSession(session.display);
+                                }}
+                                className="p-1 text-white/40 hover:text-amber-400 transition-colors"
+                                title="Extend keep-alive (+2h)"
+                              >
+                                <Clock className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+
+                            {/* Close button */}
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleCloseDesktopSession(session.display);
+                              }}
+                              disabled={isClosingDesktop === session.display}
+                              className={cn(
+                                "p-1 transition-colors",
+                                isClosingDesktop === session.display
+                                  ? "text-white/20"
+                                  : "text-white/40 hover:text-red-400"
+                              )}
+                              title="Close session"
+                            >
+                              {isClosingDesktop === session.display ? (
+                                <Loader className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <X className="h-3.5 w-3.5" />
+                              )}
+                            </button>
+                          </div>
+                        ))}
+
+                        {/* Separator and cleanup action if there are orphaned sessions */}
+                        {desktopSessions.some(s => s.status === 'orphaned' && s.process_running) && (
+                          <>
+                            <div className="my-1 h-px bg-white/[0.06]" />
+                            <button
+                              onClick={async () => {
+                                try {
+                                  await cleanupOrphanedDesktopSessions();
+                                  toast.success('Orphaned sessions cleaned up');
+                                  await refreshDesktopSessions();
+                                } catch (err) {
+                                  toast.error('Failed to cleanup sessions');
+                                }
+                              }}
+                              className="flex w-full items-center gap-2 px-3 py-2 text-xs text-amber-500/70 hover:bg-white/[0.04] transition-colors"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                              Close all orphaned
+                            </button>
+                          </>
                         )}
-                      >
-                        {display}
-                        {desktopDisplayId === display && (
-                          <CheckCircle className="ml-auto h-3.5 w-3.5" />
-                        )}
-                      </button>
-                    ))}
+                      </>
+                    ) : (
+                      /* Fallback to hardcoded list if no sessions from API */
+                      [":99", ":100", ":101", ":102"].map((display) => (
+                        <button
+                          key={display}
+                          onClick={() => {
+                            setDesktopDisplayId(display);
+                            setShowDisplaySelector(false);
+                          }}
+                          className={cn(
+                            "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
+                            desktopDisplayId === display
+                              ? "text-emerald-400"
+                              : "text-white/70"
+                          )}
+                        >
+                          {display}
+                          {desktopDisplayId === display && (
+                            <CheckCircle className="ml-auto h-3.5 w-3.5" />
+                          )}
+                        </button>
+                      ))
+                    )}
                   </div>
                 )}
               </div>

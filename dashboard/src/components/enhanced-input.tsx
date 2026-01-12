@@ -71,7 +71,9 @@ export function EnhancedInput({
         const agentNames = parseAgentNames(agentsData);
         setAgents(agentNames);
       } catch {
-        setAgents(['Sisyphus', 'oracle', 'explore', 'librarian', 'plan']);
+        // Use empty array on failure - backend validates agents anyway
+        // This prevents suggesting non-existent agents from stale fallbacks
+        setAgents([]);
       }
     }
     loadData();

@@ -337,6 +337,48 @@ pub struct MigrationReport {
 // OpenAgent Config Types
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Desktop session lifecycle configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopConfig {
+    /// Grace period in seconds before auto-closing orphaned desktop sessions.
+    /// Orphaned sessions are those where the owning mission has completed.
+    /// Set to 0 to disable auto-close. Default: 7200 (2 hours).
+    #[serde(default = "default_auto_close_grace_period")]
+    pub auto_close_grace_period_secs: u64,
+
+    /// Interval in seconds for the background cleanup sweep.
+    /// Default: 900 (15 minutes).
+    #[serde(default = "default_cleanup_interval")]
+    pub cleanup_interval_secs: u64,
+
+    /// Number of seconds before auto-close to show a warning notification.
+    /// Set to 0 to disable warnings. Default: 300 (5 minutes).
+    #[serde(default = "default_warning_before_close")]
+    pub warning_before_close_secs: u64,
+}
+
+fn default_auto_close_grace_period() -> u64 {
+    7200 // 2 hours
+}
+
+fn default_cleanup_interval() -> u64 {
+    900 // 15 minutes
+}
+
+fn default_warning_before_close() -> u64 {
+    300 // 5 minutes
+}
+
+impl Default for DesktopConfig {
+    fn default() -> Self {
+        Self {
+            auto_close_grace_period_secs: default_auto_close_grace_period(),
+            cleanup_interval_secs: default_cleanup_interval(),
+            warning_before_close_secs: default_warning_before_close(),
+        }
+    }
+}
+
 /// OpenAgent configuration stored in the Library.
 /// Controls agent visibility and defaults in the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +390,9 @@ pub struct OpenAgentConfig {
     /// Default agent to pre-select in the mission dialog.
     #[serde(default)]
     pub default_agent: Option<String>,
+    /// Desktop session lifecycle configuration.
+    #[serde(default)]
+    pub desktop: DesktopConfig,
 }
 
 impl Default for OpenAgentConfig {
@@ -366,6 +411,7 @@ impl Default for OpenAgentConfig {
                 "orchestrator-sisyphus".to_string(),
             ],
             default_agent: Some("Sisyphus".to_string()),
+            desktop: DesktopConfig::default(),
         }
     }
 }

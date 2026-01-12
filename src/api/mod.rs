@@ -19,6 +19,7 @@ pub mod ai_providers;
 mod auth;
 mod console;
 pub mod control;
+pub mod desktop;
 mod desktop_stream;
 mod fs;
 pub mod library;

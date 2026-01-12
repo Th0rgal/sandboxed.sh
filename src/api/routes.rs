@@ -30,6 +30,7 @@ use super::ai_providers as ai_providers_api;
 use super::auth::{self, AuthUser};
 use super::console;
 use super::control;
+use super::desktop;
 use super::desktop_stream;
 use super::fs;
 use super::library as library_api;
@@ -211,6 +212,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         console_pool,
     });
 
+    // Start background desktop session cleanup task
+    {
+        let state_clone = Arc::clone(&state);
+        tokio::spawn(async move {
+            desktop::start_cleanup_task(state_clone).await;
+        });
+    }
+
     let public_routes = Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/login", post(auth::login))
@@ -359,6 +368,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/ai/providers", ai_providers_api::routes())
         // Secrets management endpoints
         .nest("/api/secrets", secrets_api::routes())
+        // Desktop session management endpoints
+        .nest("/api/desktop", desktop::routes())
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_auth,

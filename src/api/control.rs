@@ -500,6 +500,13 @@ pub struct DesktopSessionInfo {
     pub browser: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The mission that owns this desktop session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<uuid::Uuid>,
+    /// Timestamp until which the session should be kept alive (ISO 8601).
+    /// User can extend this to prevent auto-close.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_alive_until: Option<String>,
 }
 
 /// Request to set mission status.
@@ -560,7 +567,7 @@ pub struct ControlState {
     /// Max parallel missions allowed
     pub max_parallel: usize,
     /// Mission persistence (in-memory or Supabase-backed)
-    mission_store: Arc<dyn MissionStore>,
+    pub mission_store: Arc<dyn MissionStore>,
 }
 
 /// Control session manager for per-user sessions.
@@ -634,6 +641,33 @@ impl ControlHub {
 
     pub async fn all_sessions(&self) -> Vec<ControlState> {
         self.sessions.read().await.values().cloned().collect()
+    }
+
+    /// Get a mission store for desktop management.
+    /// Uses the default user's store if available, or creates a temporary one.
+    pub async fn get_mission_store(&self) -> Arc<dyn MissionStore> {
+        // Try to get from the first existing session
+        if let Some(session) = self.sessions.read().await.values().next() {
+            return Arc::clone(&session.mission_store);
+        }
+
+        // No existing sessions, create a temporary store
+        let store_type = std::env::var("MISSION_STORE_TYPE")
+            .map(|s| MissionStoreType::from_str(&s))
+            .unwrap_or(MissionStoreType::Sqlite);
+
+        let base_dir = self.config.working_dir.join(".openagent").join("missions");
+
+        match create_mission_store(store_type, base_dir, "default").await {
+            Ok(store) => Arc::from(store),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to create mission store for desktop management: {}",
+                    err
+                );
+                Arc::new(mission_store::InMemoryMissionStore::new())
+            }
+        }
     }
 }
 
@@ -851,6 +885,13 @@ pub async fn create_mission(
             )
         })
         .unwrap_or((None, None, None, None));
+
+    // Validate agent exists before creating mission (fail fast with clear error)
+    if let Some(ref agent_name) = agent {
+        super::library::validate_agent_exists(&state, agent_name)
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
 
     let control = control_for_user(&state, &user).await;
     control
@@ -3018,6 +3059,8 @@ async fn control_actor_loop(
                                     screenshots_dir,
                                     browser,
                                     url,
+                                    mission_id: Some(*mid),
+                                    keep_alive_until: None,
                                 });
                             }
                         } else {

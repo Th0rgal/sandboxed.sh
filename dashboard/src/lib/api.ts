@@ -2372,3 +2372,80 @@ export async function deleteSecretRegistry(registryName: string): Promise<void> 
   });
   if (!res.ok) throw new Error('Failed to delete registry');
 }
+
+// ============================================================
+// Desktop Session Management
+// ============================================================
+
+export type DesktopSessionStatus = 'active' | 'orphaned' | 'stopped' | 'unknown';
+
+export interface DesktopSessionDetail {
+  display: string;
+  status: DesktopSessionStatus;
+  mission_id?: string;
+  mission_title?: string;
+  mission_status?: string;
+  started_at: string;
+  stopped_at?: string;
+  keep_alive_until?: string;
+  auto_close_in_secs?: number;
+  process_running: boolean;
+}
+
+export interface ListSessionsResponse {
+  sessions: DesktopSessionDetail[];
+}
+
+export interface OperationResponse {
+  success: boolean;
+  message?: string;
+}
+
+// List all desktop sessions
+export async function listDesktopSessions(): Promise<DesktopSessionDetail[]> {
+  const res = await apiFetch('/api/desktop/sessions');
+  if (!res.ok) throw new Error('Failed to list desktop sessions');
+  const data: ListSessionsResponse = await res.json();
+  return data.sessions;
+}
+
+// Close a desktop session
+export async function closeDesktopSession(display: string): Promise<OperationResponse> {
+  // Remove leading colon for URL path
+  const displayNum = display.replace(/^:/, '');
+  const res = await apiFetch(`/api/desktop/sessions/:${displayNum}/close`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || 'Failed to close desktop session');
+  }
+  return res.json();
+}
+
+// Extend keep-alive for a desktop session
+export async function keepAliveDesktopSession(
+  display: string,
+  extensionSecs: number = 7200
+): Promise<OperationResponse> {
+  const displayNum = display.replace(/^:/, '');
+  const res = await apiFetch(`/api/desktop/sessions/:${displayNum}/keep-alive`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ extension_secs: extensionSecs }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || 'Failed to extend keep-alive');
+  }
+  return res.json();
+}
+
+// Close all orphaned desktop sessions
+export async function cleanupOrphanedDesktopSessions(): Promise<OperationResponse> {
+  const res = await apiFetch('/api/desktop/sessions/cleanup', {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error('Failed to cleanup orphaned sessions');
+  return res.json();
+}
