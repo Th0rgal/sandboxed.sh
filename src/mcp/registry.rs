@@ -88,6 +88,9 @@ pub struct McpRegistry {
     request_id: AtomicU64,
 }
 
+const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+const MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl McpRegistry {
     /// Create a new MCP registry.
     pub async fn new(working_dir: &Path) -> Self {
@@ -101,10 +104,10 @@ impl McpRegistry {
             states.insert(config.id, McpServerState::from_config(config));
         }
 
-        // Use very short timeouts to avoid blocking for too long
+        // Use generous timeouts for long-running MCP tools (e.g., Minecraft launches)
         let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_millis(5000))
+            .timeout(MCP_REQUEST_TIMEOUT)
+            .connect_timeout(MCP_CONNECT_TIMEOUT)
             .build()
             .unwrap_or_default();
 
@@ -380,7 +383,7 @@ impl McpRegistry {
 
         // Read with timeout
         let read_result =
-            tokio::time::timeout(Duration::from_secs(30), stdout.read_line(&mut line)).await;
+            tokio::time::timeout(MCP_REQUEST_TIMEOUT, stdout.read_line(&mut line)).await;
 
         match read_result {
             Ok(Ok(0)) => anyhow::bail!("MCP process closed stdout"),
