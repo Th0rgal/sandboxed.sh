@@ -2064,8 +2064,25 @@ export default function ControlClient() {
     [items]
   );
 
-  const isViewingMissionStalled = viewingMissionStallSeconds >= 60;
-  const isViewingMissionSeverelyStalled = viewingMissionStallSeconds >= 120;
+  // Check if there are any pending tool calls (tools without results)
+  // These may be long-running operations like desktop automation or subagents
+  // When tools are running, we should be less aggressive about stall warnings
+  const hasPendingToolCalls = useMemo(
+    () =>
+      items.some(
+        (item) =>
+          item.kind === "tool" &&
+          item.name !== "question" &&
+          item.result === undefined
+      ),
+    [items]
+  );
+
+  // Use higher threshold when tools are actively running (they may not emit events during execution)
+  const stallThreshold = hasPendingToolCalls ? 180 : 60;
+  const severeStallThreshold = hasPendingToolCalls ? 300 : 120;
+  const isViewingMissionStalled = viewingMissionStallSeconds >= stallThreshold;
+  const isViewingMissionSeverelyStalled = viewingMissionStallSeconds >= severeStallThreshold;
 
   const recentMissionList = useMemo(() => {
     if (recentMissions.length === 0) return [];
@@ -2482,11 +2499,29 @@ export default function ControlClient() {
           // Finalize any pending thinking before assistant message
           finalizePendingThinking(timestamp);
           const meta = event.metadata || {};
+          const isFailure = meta.success === false;
+
+          // When mission fails, mark all pending tool calls as failed
+          // This ensures subagent headers don't stay stuck showing "Running for X"
+          if (isFailure) {
+            const errorMessage = event.content || "Mission failed";
+            for (let i = 0; i < items.length; i++) {
+              const it = items[i];
+              if (it.kind === "tool" && it.result === undefined) {
+                items[i] = {
+                  ...it,
+                  result: { error: errorMessage, status: "failed" },
+                  endTime: timestamp,
+                };
+              }
+            }
+          }
+
           items.push({
             kind: "assistant" as const,
             id: `event-${event.id}`,
             content: event.content,
-            success: meta.success !== false,
+            success: !isFailure,
             costCents: typeof meta.cost_cents === "number" ? meta.cost_cents : 0,
             model: typeof meta.model === "string" ? meta.model : null,
             timestamp,
@@ -3375,20 +3410,42 @@ export default function ControlClient() {
         }
 
         const resumable = data["resumable"] === true;
-        setItems((prev) => [
-          ...prev.filter((it) => it.kind !== "thinking" || it.done),
-          {
-            kind: "assistant",
-            id: String(data["id"] ?? Date.now()),
-            content: String(data["content"] ?? ""),
-            success: Boolean(data["success"]),
-            costCents: Number(data["cost_cents"] ?? 0),
-            model: data["model"] ? String(data["model"]) : null,
-            timestamp: Date.now(),
-            sharedFiles,
-            resumable,
-          },
-        ]);
+        const isFailure = !Boolean(data["success"]);
+        setItems((prev) => {
+          // Filter out incomplete thinking
+          let filtered = prev.filter((it) => it.kind !== "thinking" || it.done);
+
+          // When mission fails, mark all pending tool calls as failed
+          // This ensures subagent headers don't stay stuck showing "Running for X"
+          if (isFailure) {
+            const errorMessage = String(data["content"] ?? "Mission failed");
+            filtered = filtered.map((it) => {
+              if (it.kind === "tool" && it.result === undefined) {
+                return {
+                  ...it,
+                  result: { error: errorMessage, status: "failed" },
+                  endTime: Date.now(),
+                };
+              }
+              return it;
+            });
+          }
+
+          return [
+            ...filtered,
+            {
+              kind: "assistant",
+              id: String(data["id"] ?? Date.now()),
+              content: String(data["content"] ?? ""),
+              success: !isFailure,
+              costCents: Number(data["cost_cents"] ?? 0),
+              model: data["model"] ? String(data["model"]) : null,
+              timestamp: Date.now(),
+              sharedFiles,
+              resumable,
+            },
+          ];
+        });
         return;
       }
 
