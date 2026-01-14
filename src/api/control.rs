@@ -451,6 +451,8 @@ pub enum ControlCommand {
         agent: Option<String>,
         /// Target mission ID - if provided and differs from running mission, start in parallel
         target_mission_id: Option<Uuid>,
+        /// Respond with whether the message was queued (true = waiting to be processed)
+        respond: oneshot::Sender<bool>,
     },
     ToolResult {
         tool_call_id: String,
@@ -786,15 +788,11 @@ pub async fn post_message(
     let agent = req.agent;
     let target_mission_id = req.mission_id;
     let control = control_for_user(&state, &user).await;
-    let queued = {
-        let status = control.status.read().await;
-        status.state != ControlRunState::Idle
-    };
+    let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
         user_id = %user.id,
         username = %user.username,
         message_id = %id,
-        queued,
         content_len = content.len(),
         agent = ?agent,
         target_mission_id = ?target_mission_id,
@@ -802,7 +800,13 @@ pub async fn post_message(
     );
     control
         .cmd_tx
-        .send(ControlCommand::UserMessage { id, content, agent, target_mission_id })
+        .send(ControlCommand::UserMessage {
+            id,
+            content,
+            agent,
+            target_mission_id,
+            respond: queued_tx,
+        })
         .await
         .map_err(|_| {
             (
@@ -810,7 +814,13 @@ pub async fn post_message(
                 "control session unavailable".to_string(),
             )
         })?;
-
+    let queued = match queued_rx.await {
+        Ok(value) => value,
+        Err(_) => {
+            let status = control.status.read().await;
+            status.state != ControlRunState::Idle
+        }
+    };
     Ok(Json(ControlMessageResponse { id, queued }))
 }
 
@@ -2116,11 +2126,17 @@ async fn control_actor_loop(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id } => {
+                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, respond } => {
                         // Smart routing: decide where to send this message based on target_mission_id
                         // and what's currently running.
 
-                        let main_mission_id = current_mission.read().await.clone();
+                        let current_mission_id = current_mission.read().await.clone();
+                        let running_mid = running_mission_id;
+                        let main_mission_id = if running_mid.is_some() {
+                            running_mid
+                        } else {
+                            current_mission_id
+                        };
                         let main_is_running = running.is_some();
 
                         // Determine if target is already running somewhere
@@ -2135,11 +2151,12 @@ async fn control_actor_loop(
                         if let Some(tid) = target_mission_id {
                             if target_in_parallel {
                                 if let Some(runner) = parallel_runners.get_mut(&tid) {
+                                    let was_running = runner.is_running();
                                     runner.queue_message(id, content.clone(), msg_agent);
                                     let _ = events_tx.send(AgentEvent::UserMessage {
                                         id,
                                         content: content.clone(),
-                                        queued: runner.is_running(),
+                                        queued: was_running,
                                         mission_id: Some(tid),
                                     });
                                     // Try to start if not already running
@@ -2157,6 +2174,7 @@ async fn control_actor_loop(
                                             Arc::new(RwLock::new(Some(tid))),
                                         );
                                     }
+                                    let _ = respond.send(was_running);
                                     continue;
                                 }
                             }
@@ -2213,6 +2231,7 @@ async fn control_actor_loop(
                                             );
                                             tracing::info!("Auto-started mission {} in parallel", tid);
                                             parallel_runners.insert(tid, runner);
+                                            let _ = respond.send(false);
                                             continue;
                                         }
                                         Err(e) => {
@@ -2374,6 +2393,7 @@ async fn control_actor_loop(
                                 set_and_emit_status(&status, &events_tx, ControlRunState::Idle, 0, None).await;
                             }
                         }
+                        let _ = respond.send(was_running);
                     }
                     ControlCommand::ToolResult { tool_call_id, name, result } => {
                         // Deliver to the tool hub. The executor emits ToolResult events when it receives it.
