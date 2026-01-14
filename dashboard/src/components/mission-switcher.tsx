@@ -52,7 +52,11 @@ function missionStatusLabel(status: MissionStatus): string {
 }
 
 function getMissionDisplayName(mission: Mission): string {
-  return mission.workspace_name || mission.id.slice(0, 8);
+  const parts: string[] = [];
+  if (mission.workspace_name) parts.push(mission.workspace_name);
+  if (mission.agent) parts.push(mission.agent);
+  parts.push(mission.id.slice(0, 8));
+  return parts.join(' · ');
 }
 
 function getMissionDescription(mission: Mission): string {

@@ -1488,9 +1488,40 @@ pub async fn write_runtime_workspace_state(
         "mission_context": effective_mission_context,
         "context_dir_name": context_dir_name,
     });
-    let path = runtime_dir.join("current_workspace.json");
-    tokio::fs::write(path, serde_json::to_string_pretty(&payload)?).await?;
+
+    // Use per-mission workspace file to avoid race conditions with parallel missions
+    let filename = match mission_id {
+        Some(id) => format!("workspace-{}.json", id),
+        None => "current_workspace.json".to_string(),
+    };
+    let path = runtime_dir.join(&filename);
+    tokio::fs::write(&path, serde_json::to_string_pretty(&payload)?).await?;
+
+    // Also write to the working directory itself so MCPs can find it
+    // This allows MCPs to discover workspace context from cwd without racing on a shared file
+    let context_file = working_dir.join(".openagent_context.json");
+    if let Err(e) = tokio::fs::write(&context_file, serde_json::to_string_pretty(&payload)?).await {
+        tracing::warn!(
+            workspace = %workspace.name,
+            path = %context_file.display(),
+            error = %e,
+            "Failed to write workspace context to working directory"
+        );
+    }
+
     Ok(())
+}
+
+/// Get the path to the runtime workspace file for a mission.
+///
+/// Per-mission files are used to avoid race conditions when running parallel missions.
+pub fn runtime_workspace_file_path(working_dir_root: &Path, mission_id: Option<Uuid>) -> PathBuf {
+    let runtime_dir = working_dir_root.join(".openagent").join("runtime");
+    let filename = match mission_id {
+        Some(id) => format!("workspace-{}.json", id),
+        None => "current_workspace.json".to_string(),
+    };
+    runtime_dir.join(filename)
 }
 
 /// Regenerate `opencode.json` for all workspace directories.

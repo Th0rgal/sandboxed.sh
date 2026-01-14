@@ -6,8 +6,6 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 
 use crate::agents::{Agent, AgentContext, AgentId, AgentResult, AgentType, TerminalReason};
 use crate::api::control::{AgentEvent, AgentTreeNode};
@@ -15,29 +13,10 @@ use crate::config::Config;
 use crate::opencode::{extract_reasoning, extract_text, OpenCodeClient, OpenCodeEvent};
 use crate::task::Task;
 
-/// How long to wait without events before checking if a tool is stuck.
-const TOOL_STUCK_CHECK_INTERVAL: Duration = Duration::from_secs(120);
-
-/// Maximum time a tool can be "running" without any output before we consider it stuck.
-const TOOL_STUCK_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Message to send to the agent when a tool appears stuck, asking it to self-diagnose.
-const STUCK_TOOL_RECOVERY_PROMPT: &str = r#"IMPORTANT: The previous operation appears to have stalled - there has been no activity for over 2 minutes.
-
-Please check:
-1. Is the bash command or tool still running? Use `ps aux | grep` to check
-2. If the process has exited or crashed, acknowledge what happened
-3. If the command is still running but taking a long time, explain what it's doing
-4. If something went wrong, try an alternative approach
-
-Do NOT just retry the same command blindly - first investigate what happened."#;
-
 pub struct OpenCodeAgent {
     id: AgentId,
     client: OpenCodeClient,
     default_agent: Option<String>,
-    /// Timeout in seconds after which to auto-abort stuck tools (0 = disabled).
-    tool_stuck_abort_timeout_secs: u64,
 }
 
 impl OpenCodeAgent {
@@ -51,7 +30,6 @@ impl OpenCodeAgent {
             id: AgentId::new(),
             client,
             default_agent: config.opencode_agent,
-            tool_stuck_abort_timeout_secs: config.tool_stuck_abort_timeout_secs,
         }
     }
 
@@ -72,99 +50,6 @@ impl OpenCodeAgent {
         );
 
         root
-    }
-
-    /// Send a recovery message to the agent asking it to investigate a stuck tool.
-    /// This aborts the current operation and sends a new message.
-    async fn send_recovery_message(
-        &self,
-        session_id: &str,
-        directory: &str,
-        stuck_tools: &str,
-        model: Option<&str>,
-        agent: Option<&str>,
-        ctx: &AgentContext,
-    ) -> anyhow::Result<(
-        mpsc::Receiver<OpenCodeEvent>,
-        tokio::task::JoinHandle<anyhow::Result<crate::opencode::OpenCodeMessageResponse>>,
-    )> {
-        // First, abort the current session to free it up
-        tracing::info!(
-            session_id = %session_id,
-            stuck_tools = %stuck_tools,
-            "Aborting stuck session and sending recovery message"
-        );
-
-        if let Err(e) = self.client.abort_session(session_id, directory).await {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "Failed to abort session (may already be complete)"
-            );
-        }
-
-        // Small delay to let OpenCode process the abort
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Send a recovery message asking the agent to investigate
-        let recovery_message = format!(
-            "{}\n\nThe tool(s) that appear stuck: {}",
-            STUCK_TOOL_RECOVERY_PROMPT, stuck_tools
-        );
-
-        // Emit an event so the frontend knows we're trying to recover
-        if let Some(events_tx) = &ctx.control_events {
-            let _ = events_tx.send(AgentEvent::Thinking {
-                content: format!("Asking agent to investigate stuck tool: {}", stuck_tools),
-                done: false,
-                mission_id: ctx.mission_id,
-            });
-        }
-
-        self.client
-            .send_message_streaming(session_id, directory, &recovery_message, model, agent)
-            .await
-    }
-
-    /// Check if a tool appears to be stuck by querying OpenCode session status.
-    /// Returns the name of the stuck tool if found.
-    async fn check_for_stuck_tool(&self, session_id: &str) -> Option<String> {
-        match self.client.get_session_status(session_id).await {
-            Ok(status) => {
-                if !status.running_tools.is_empty() {
-                    let tool_names: Vec<_> = status
-                        .running_tools
-                        .iter()
-                        .map(|t| t.name.clone())
-                        .collect();
-                    let non_question: Vec<_> = tool_names
-                        .iter()
-                        .filter(|name| name.as_str() != "question")
-                        .cloned()
-                        .collect();
-                    tracing::warn!(
-                        session_id = %session_id,
-                        running_tools = ?tool_names,
-                        "Found tools marked as 'running' in OpenCode session"
-                    );
-                    if non_question.is_empty() {
-                        None
-                    } else {
-                        Some(non_question.join(", "))
-                    }
-                } else {
-                    None
-                }
-            }
-            Err(e) => {
-                tracing::debug!(
-                    session_id = %session_id,
-                    error = %e,
-                    "Failed to check OpenCode session status"
-                );
-                None
-            }
-        }
     }
 
     /// Forward an OpenCode event to the control broadcast channel.
@@ -512,17 +397,12 @@ impl Agent for OpenCodeAgent {
             }
         };
 
-        // Process streaming events with cancellation support and stuck tool detection
+        // Process streaming events with cancellation support
         let mut saw_sse_event = false;
         let mut sse_text_buffer = String::new();
         let mut message_handle = message_handle;
         let mut response_result = None;
         let response = if let Some(cancel) = ctx.cancel_token.clone() {
-            let mut last_event_time = Instant::now();
-            let mut last_stuck_check = Instant::now();
-            let mut stuck_tool_warned = false;
-            let mut current_tool: Option<String> = None;
-
             loop {
                 tokio::select! {
                     biased;
@@ -543,23 +423,11 @@ impl Agent for OpenCodeAgent {
                                     event_type = ?std::mem::discriminant(&oc_event),
                                     "Received event from OpenCode SSE channel"
                                 );
-                                last_event_time = Instant::now();
-                                stuck_tool_warned = false; // Reset warning on new event
 
-                                // Track current tool state
-                                match &oc_event {
-                                    OpenCodeEvent::TextDelta { content } => {
-                                        if !content.trim().is_empty() {
-                                            sse_text_buffer = content.clone();
-                                        }
+                                if let OpenCodeEvent::TextDelta { content } = &oc_event {
+                                    if !content.trim().is_empty() {
+                                        sse_text_buffer = content.clone();
                                     }
-                                    OpenCodeEvent::ToolCall { name, .. } => {
-                                        current_tool = Some(name.clone());
-                                    }
-                                    OpenCodeEvent::ToolResult { .. } => {
-                                        current_tool = None;
-                                    }
-                                    _ => {}
                                 }
 
                                 if let OpenCodeEvent::ToolCall { tool_call_id, name, .. } = &oc_event
@@ -578,111 +446,6 @@ impl Agent for OpenCodeAgent {
                                 }
                             }
                             None => break, // Channel closed
-                        }
-                    }
-                    _ = tokio::time::sleep(TOOL_STUCK_CHECK_INTERVAL) => {
-                        let elapsed = last_event_time.elapsed();
-                        let since_last_check = last_stuck_check.elapsed();
-
-                        // Only check periodically to avoid hammering OpenCode
-                        if since_last_check >= TOOL_STUCK_CHECK_INTERVAL {
-                            last_stuck_check = Instant::now();
-
-                            tracing::info!(
-                                session_id = %session.id,
-                                elapsed_secs = elapsed.as_secs(),
-                                current_tool = ?current_tool,
-                                "No OpenCode events received, checking for stuck tools"
-                            );
-
-                            // Check if there's a stuck tool in OpenCode
-                            if let Some(stuck_tools) = self.check_for_stuck_tool(&session.id).await {
-                                if elapsed >= TOOL_STUCK_TIMEOUT && !stuck_tool_warned {
-                                    stuck_tool_warned = true;
-
-                                    tracing::warn!(
-                                        session_id = %session.id,
-                                        stuck_tools = %stuck_tools,
-                                        elapsed_secs = elapsed.as_secs(),
-                                        "Tool appears stuck - sending recovery message to agent"
-                                    );
-
-                                    // Send recovery message asking agent to investigate
-                                    match self.send_recovery_message(
-                                        &session.id,
-                                        &directory,
-                                        &stuck_tools,
-                                        selected_model.as_deref(),
-                                        agent_name,
-                                        ctx,
-                                    ).await {
-                                        Ok((new_rx, new_handle)) => {
-                                            // Switch to the new event stream
-                                            message_handle.abort();
-                                            event_rx = new_rx;
-                                            // We can't reassign message_handle in this scope,
-                                            // so we'll process the new stream inline
-                                            drop(new_handle); // Let it run, we'll use the events
-
-                                            // Reset timers for the new message
-                                            last_event_time = Instant::now();
-                                            last_stuck_check = Instant::now();
-                                            stuck_tool_warned = false;
-                                            current_tool = None;
-
-                                            tracing::info!(
-                                                session_id = %session.id,
-                                                "Switched to recovery message event stream"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                session_id = %session.id,
-                                                error = %e,
-                                                "Failed to send recovery message"
-                                            );
-
-                                            // Fall back to emitting a warning
-                                            if let Some(events_tx) = &ctx.control_events {
-                                                let _ = events_tx.send(AgentEvent::Error {
-                                                    message: format!(
-                                                        "Tool '{}' may be stuck - no activity for {} seconds. Recovery failed: {}",
-                                                        stuck_tools,
-                                                        elapsed.as_secs(),
-                                                        e
-                                                    ),
-                                                    mission_id: ctx.mission_id,
-                                                    resumable: ctx.mission_id.is_some(),
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Auto-abort if configured and timeout exceeded (as final fallback)
-                                if self.tool_stuck_abort_timeout_secs > 0
-                                    && elapsed.as_secs() >= self.tool_stuck_abort_timeout_secs
-                                {
-                                    tracing::warn!(
-                                        session_id = %session.id,
-                                        stuck_tools = %stuck_tools,
-                                        timeout_secs = self.tool_stuck_abort_timeout_secs,
-                                        "Auto-aborting stuck session due to TOOL_STUCK_ABORT_TIMEOUT_SECS"
-                                    );
-
-                                    let _ = self.client.abort_session(&session.id, &directory).await;
-                                    message_handle.abort();
-                                    tree.status = "failed".to_string();
-                                    if let Some(node) = tree.children.iter_mut().find(|n| n.id == "opencode") {
-                                        node.status = "failed".to_string();
-                                    }
-                                    ctx.emit_tree(tree);
-                                    return AgentResult::failure(
-                                        format!("Tool '{}' timed out after {} seconds with no progress", stuck_tools, elapsed.as_secs()),
-                                        0
-                                    ).with_terminal_reason(TerminalReason::Stalled);
-                                }
-                            }
                         }
                     }
                 }
@@ -714,11 +477,7 @@ impl Agent for OpenCodeAgent {
                 }
             }
         } else {
-            // No cancel token - process events with stuck detection
-            let mut last_event_time = Instant::now();
-            let mut last_stuck_check = Instant::now();
-            let mut stuck_tool_warned = false;
-
+            // No cancel token - just process events
             loop {
                 tokio::select! {
                     res = &mut message_handle => {
@@ -729,8 +488,6 @@ impl Agent for OpenCodeAgent {
                         match event {
                             Some(oc_event) => {
                                 saw_sse_event = true;
-                                last_event_time = Instant::now();
-                                stuck_tool_warned = false;
                                 if let OpenCodeEvent::TextDelta { content } = &oc_event {
                                     if !content.trim().is_empty() {
                                         sse_text_buffer = content.clone();
@@ -752,96 +509,6 @@ impl Agent for OpenCodeAgent {
                                 }
                             }
                             None => break, // Channel closed
-                        }
-                    }
-                    _ = tokio::time::sleep(TOOL_STUCK_CHECK_INTERVAL) => {
-                        let elapsed = last_event_time.elapsed();
-                        let since_last_check = last_stuck_check.elapsed();
-
-                        if since_last_check >= TOOL_STUCK_CHECK_INTERVAL {
-                            last_stuck_check = Instant::now();
-
-                            if let Some(stuck_tools) = self.check_for_stuck_tool(&session.id).await {
-                                if elapsed >= TOOL_STUCK_TIMEOUT && !stuck_tool_warned {
-                                    stuck_tool_warned = true;
-
-                                    tracing::warn!(
-                                        session_id = %session.id,
-                                        stuck_tools = %stuck_tools,
-                                        elapsed_secs = elapsed.as_secs(),
-                                        "Tool appears stuck - sending recovery message to agent"
-                                    );
-
-                                    // Send recovery message asking agent to investigate
-                                    match self.send_recovery_message(
-                                        &session.id,
-                                        &directory,
-                                        &stuck_tools,
-                                        selected_model.as_deref(),
-                                        agent_name,
-                                        ctx,
-                                    ).await {
-                                        Ok((new_rx, new_handle)) => {
-                                            message_handle.abort();
-                                            event_rx = new_rx;
-                                            drop(new_handle);
-
-                                            last_event_time = Instant::now();
-                                            last_stuck_check = Instant::now();
-                                            stuck_tool_warned = false;
-
-                                            tracing::info!(
-                                                session_id = %session.id,
-                                                "Switched to recovery message event stream"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                session_id = %session.id,
-                                                error = %e,
-                                                "Failed to send recovery message"
-                                            );
-
-                                            if let Some(events_tx) = &ctx.control_events {
-                                                let _ = events_tx.send(AgentEvent::Error {
-                                                    message: format!(
-                                                        "Tool '{}' may be stuck - no activity for {} seconds. Recovery failed: {}",
-                                                        stuck_tools,
-                                                        elapsed.as_secs(),
-                                                        e
-                                                    ),
-                                                    mission_id: ctx.mission_id,
-                                                    resumable: ctx.mission_id.is_some(),
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Auto-abort if configured and timeout exceeded (as final fallback)
-                                if self.tool_stuck_abort_timeout_secs > 0
-                                    && elapsed.as_secs() >= self.tool_stuck_abort_timeout_secs
-                                {
-                                    tracing::warn!(
-                                        session_id = %session.id,
-                                        stuck_tools = %stuck_tools,
-                                        timeout_secs = self.tool_stuck_abort_timeout_secs,
-                                        "Auto-aborting stuck session due to TOOL_STUCK_ABORT_TIMEOUT_SECS"
-                                    );
-
-                                    let _ = self.client.abort_session(&session.id, &directory).await;
-                                    message_handle.abort();
-                                    tree.status = "failed".to_string();
-                                    if let Some(node) = tree.children.iter_mut().find(|n| n.id == "opencode") {
-                                        node.status = "failed".to_string();
-                                    }
-                                    ctx.emit_tree(tree);
-                                    return AgentResult::failure(
-                                        format!("Tool '{}' timed out after {} seconds with no progress", stuck_tools, elapsed.as_secs()),
-                                        0
-                                    ).with_terminal_reason(TerminalReason::Stalled);
-                                }
-                            }
                         }
                     }
                 }

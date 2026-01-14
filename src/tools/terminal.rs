@@ -469,6 +469,12 @@ async fn run_container_command(
         rel_str,
     ];
 
+    // Explicitly set HOME=/root inside the container.
+    // The host process may have a different HOME (e.g., /var/lib/opencode for isolated OpenCode),
+    // and nspawn inherits environment variables by default. Tools like `shard` use $HOME/.shard
+    // for their configuration, so we must ensure HOME points to the container's root user home.
+    args.push("--setenv=HOME=/root".to_string());
+
     // Bind mission context into containers so uploaded files are accessible.
     if let Ok(context_root) = env::var("OPEN_AGENT_CONTEXT_ROOT") {
         let context_root = context_root.trim();

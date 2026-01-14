@@ -720,6 +720,7 @@ function ThinkingGroupItem({
   }, [hasActiveItem, expanded, startTime]);
 
   const formatDuration = (seconds: number) => {
+    if (seconds <= 0) return "<1s";
     if (seconds < 60) return `${seconds}s`;
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
@@ -821,6 +822,7 @@ function ThinkingPanelItem({
   }, [item.done, item.startTime]);
 
   const formatDuration = (seconds: number) => {
+    if (seconds <= 0) return "<1s";
     if (seconds < 60) return `${seconds}s`;
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
@@ -1058,9 +1060,10 @@ function extractSubagentInfo(args: unknown): {
 // Parse subagent result for summary stats
 function parseSubagentResult(result: unknown): {
   success: boolean;
+  cancelled: boolean;
   summary: string | null;
 } {
-  if (!result) return { success: false, summary: null };
+  if (!result) return { success: false, cancelled: false, summary: null };
 
   // Handle string results
   if (typeof result === "string") {
@@ -1075,24 +1078,27 @@ function parseSubagentResult(result: unknown): {
     // Try to extract a meaningful summary from the result
     const lines = cleanedResult.split("\n").filter(l => l.trim());
     const summary = lines.length > 0 ? truncateText(lines[0], 100) : null;
-    return { success: !isError, summary };
+    return { success: !isError, cancelled: false, summary };
   }
 
   // Handle object results
   if (typeof result === "object") {
     const resultObj = result as Record<string, unknown>;
     const statusLower = typeof resultObj.status === "string" ? resultObj.status.toLowerCase() : "";
-    const isError = resultObj.error !== undefined ||
+    const isCancelled = statusLower === "cancelled";
+    const isError = !isCancelled && (
+                    resultObj.error !== undefined ||
                     resultObj.is_error === true ||
                     resultObj.success === false ||
-                    statusLower === "error" || statusLower === "failed";
+                    statusLower === "error" || statusLower === "failed");
     const summary = typeof resultObj.summary === "string" ? resultObj.summary :
                     typeof resultObj.message === "string" ? resultObj.message :
+                    typeof resultObj.reason === "string" ? resultObj.reason :
                     typeof resultObj.result === "string" ? truncateText(resultObj.result, 100) : null;
-    return { success: !isError, summary };
+    return { success: !isError && !isCancelled, cancelled: isCancelled, summary };
   }
 
-  return { success: true, summary: null };
+  return { success: true, cancelled: false, summary: null };
 }
 
 // Subagent/Background Task tool item with enhanced UX
@@ -1113,8 +1119,8 @@ const SubagentToolItem = memo(function SubagentToolItem({
   );
 
   // Memoize result parsing
-  const { success, summary } = useMemo(
-    () => (isDone ? parseSubagentResult(item.result) : { success: false, summary: null }),
+  const { success, cancelled, summary } = useMemo(
+    () => (isDone ? parseSubagentResult(item.result) : { success: false, cancelled: false, summary: null }),
     [isDone, item.result]
   );
 
@@ -1154,8 +1160,9 @@ const SubagentToolItem = memo(function SubagentToolItem({
           "rounded-lg border overflow-hidden",
           "bg-white/[0.02]",
           !isDone && "border-purple-500/30",
-          isDone && success && "border-emerald-500/20",
-          isDone && !success && "border-red-500/20"
+          isDone && cancelled && "border-amber-500/20",
+          isDone && success && !cancelled && "border-emerald-500/20",
+          isDone && !success && !cancelled && "border-red-500/20"
         )}
       >
         {/* Header */}
@@ -1170,11 +1177,14 @@ const SubagentToolItem = memo(function SubagentToolItem({
           <div className={cn(
             "flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center",
             !isDone && "bg-purple-500/20",
-            isDone && success && "bg-emerald-500/20",
-            isDone && !success && "bg-red-500/20"
+            isDone && cancelled && "bg-amber-500/20",
+            isDone && success && !cancelled && "bg-emerald-500/20",
+            isDone && !success && !cancelled && "bg-red-500/20"
           )}>
             {!isDone ? (
               <Cpu className="h-4 w-4 text-purple-400 animate-pulse" />
+            ) : cancelled ? (
+              <XCircle className="h-4 w-4 text-amber-400" />
             ) : success ? (
               <CheckCircle className="h-4 w-4 text-emerald-400" />
             ) : (
@@ -1188,8 +1198,9 @@ const SubagentToolItem = memo(function SubagentToolItem({
               <span className={cn(
                 "text-sm font-medium",
                 !isDone && "text-purple-300",
-                isDone && success && "text-emerald-300",
-                isDone && !success && "text-red-300"
+                isDone && cancelled && "text-amber-300",
+                isDone && success && !cancelled && "text-emerald-300",
+                isDone && !success && !cancelled && "text-red-300"
               )}>
                 {agentName || "Subagent"}
               </span>
@@ -1206,6 +1217,15 @@ const SubagentToolItem = memo(function SubagentToolItem({
                 <>
                   <span className="text-xs text-white/50">Running for {duration}</span>
                   <Loader className="h-3 w-3 animate-spin text-purple-400" />
+                </>
+              ) : cancelled ? (
+                <>
+                  <span className="text-xs text-amber-400">Cancelled</span>
+                  {summary && (
+                    <span className="text-xs text-white/40 truncate max-w-[200px]">
+                      — {summary}
+                    </span>
+                  )}
                 </>
               ) : (
                 <>
@@ -1449,6 +1469,7 @@ const ToolCallItem = memo(function ToolCallItem({
   }, [isDone, item.startTime]);
 
   const formatDuration = (seconds: number) => {
+    if (seconds <= 0) return "<1s";
     if (seconds < 60) return `${seconds}s`;
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
@@ -1469,9 +1490,18 @@ const ToolCallItem = memo(function ToolCallItem({
     [item.result]
   );
 
+  // Memoize cancelled detection - check if tool was cancelled due to mission ending
+  const isCancelled = useMemo(() => {
+    if (typeof item.result === "object" && item.result !== null) {
+      const resultObj = item.result as Record<string, unknown>;
+      return resultObj.status === "cancelled";
+    }
+    return false;
+  }, [item.result]);
+
   // Memoize error detection - only recompute when result changes
   const isError = useMemo(() => {
-    if (resultStr === null) return false;
+    if (resultStr === null || isCancelled) return false;
 
     // Check if the result is an object with explicit error fields
     if (typeof item.result === "object" && item.result !== null) {
@@ -1487,7 +1517,7 @@ const ToolCallItem = memo(function ToolCallItem({
            trimmedLower.startsWith("error -") ||
            trimmedLower.startsWith("failed:") ||
            trimmedLower.startsWith("exception:");
-  }, [item.result, resultStr]);
+  }, [item.result, resultStr, isCancelled]);
 
   // Memoize args preview - only recompute when item.args changes
   const argsPreview = useMemo(
@@ -1511,7 +1541,8 @@ const ToolCallItem = memo(function ToolCallItem({
           "text-white/40 hover:text-white/60 hover:bg-white/[0.06]",
           "transition-all duration-200",
           !isDone && "border-amber-500/20",
-          isDone && !isError && "border-emerald-500/20",
+          isDone && isCancelled && "border-amber-500/20",
+          isDone && !isError && !isCancelled && "border-emerald-500/20",
           isDone && isError && "border-red-500/20"
         )}
       >
@@ -1519,7 +1550,8 @@ const ToolCallItem = memo(function ToolCallItem({
           className={cn(
             "h-3 w-3",
             !isDone && "animate-pulse text-amber-400",
-            isDone && !isError && "text-emerald-400",
+            isDone && isCancelled && "text-amber-400",
+            isDone && !isError && !isCancelled && "text-emerald-400",
             isDone && isError && "text-red-400"
           )}
         />
@@ -1530,9 +1562,10 @@ const ToolCallItem = memo(function ToolCallItem({
           </span>
         )}
         <span className="text-xs text-white/30 ml-1">
-          {isDone ? `${duration}` : `${duration}...`}
+          {isDone ? (isCancelled ? "cancelled" : duration) : `${duration}...`}
         </span>
-        {isDone && !isError && <CheckCircle className="h-3 w-3 text-emerald-400" />}
+        {isDone && !isError && !isCancelled && <CheckCircle className="h-3 w-3 text-emerald-400" />}
+        {isDone && isCancelled && <XCircle className="h-3 w-3 text-amber-400" />}
         {isDone && isError && <XCircle className="h-3 w-3 text-red-400" />}
         {!isDone && <Loader className="h-3 w-3 animate-spin text-amber-400" />}
         <ChevronDown
@@ -1754,6 +1787,9 @@ export default function ControlClient() {
   );
 
   const [runState, setRunState] = useState<ControlRunState>("idle");
+  const [runStateMissionId, setRunStateMissionId] = useState<string | null>(
+    null
+  );
   const [queueLen, setQueueLen] = useState(0);
 
   // Connection state for SSE stream - starts as disconnected until first event received
@@ -1770,13 +1806,18 @@ export default function ControlClient() {
   });
   const [diagTick, setDiagTick] = useState(0);
 
-  // Progress state (for "Subtask X of Y" indicator)
-  const [progress, setProgress] = useState<{
-    total: number;
-    completed: number;
-    current: string | null;
-    depth: number;
-  } | null>(null);
+  // Progress state (for "Subtask X of Y" indicator), tracked per mission
+  const [progressByMission, setProgressByMission] = useState<
+    Record<
+      string,
+      {
+        total: number;
+        completed: number;
+        current: string | null;
+        depth: number;
+      }
+    >
+  >({});
 
   // Mission state
   const [currentMission, setCurrentMission] = useState<Mission | null>(null);
@@ -1953,30 +1994,64 @@ export default function ControlClient() {
     return result;
   }, [items, showThinkingPanel]);
 
-  // Check if the mission we're viewing is actually running (not just any mission)
-  const viewingMissionIsRunning = useMemo(() => {
-    if (!viewingMissionId) return runState !== "idle";
-    const mission = runningMissions.find((m) => m.mission_id === viewingMissionId);
-    if (mission) {
-      // Check the actual state from the backend
-      return mission.state === "running" || mission.state === "waiting_for_tool";
+  const runningMissionById = useMemo(() => {
+    return new Map(runningMissions.map((m) => [m.mission_id, m]));
+  }, [runningMissions]);
+
+  const viewingRunningInfo = useMemo(() => {
+    if (!viewingMissionId) return null;
+    return runningMissionById.get(viewingMissionId) ?? null;
+  }, [runningMissionById, viewingMissionId]);
+
+  const viewingRunState = useMemo<ControlRunState>(() => {
+    if (!viewingMissionId) return "idle";
+    if (viewingRunningInfo) {
+      if (viewingRunningInfo.state === "waiting_for_tool") return "waiting_for_tool";
+      if (viewingRunningInfo.state === "queued" || viewingRunningInfo.state === "running") {
+        return "running";
+      }
+      return "idle";
     }
-    // Fallback: if viewing the current/main mission and it's not in runningMissions,
-    // check runState to handle cases where the backend is running but not reporting properly
-    if (viewingMissionId === currentMission?.id) {
+    if (runStateMissionId === viewingMissionId) {
+      return runState;
+    }
+    return "idle";
+  }, [viewingMissionId, viewingRunningInfo, runStateMissionId, runState]);
+
+  const viewingQueueLen = useMemo(() => {
+    if (!viewingMissionId) return 0;
+    if (viewingRunningInfo) return viewingRunningInfo.queue_len;
+    if (runStateMissionId === viewingMissionId) return queueLen;
+    return 0;
+  }, [viewingMissionId, viewingRunningInfo, runStateMissionId, queueLen]);
+
+  const viewingMissionIsRunning = useMemo(() => {
+    if (!viewingMissionId) return false;
+    if (viewingRunningInfo) {
+      return (
+        viewingRunningInfo.state === "running" ||
+        viewingRunningInfo.state === "waiting_for_tool" ||
+        viewingRunningInfo.state === "queued"
+      );
+    }
+    if (runStateMissionId === viewingMissionId) {
       return runState !== "idle";
     }
     return false;
-  }, [viewingMissionId, runningMissions, runState, currentMission?.id]);
+  }, [viewingMissionId, viewingRunningInfo, runStateMissionId, runState]);
+
+  const viewingProgress = useMemo(() => {
+    if (!viewingMissionId) return null;
+    return progressByMission[viewingMissionId] ?? null;
+  }, [progressByMission, viewingMissionId]);
 
   // Check if the mission we're viewing appears stalled (no activity for 60+ seconds)
   const viewingMissionStallSeconds = useMemo(() => {
     if (!viewingMissionId) return 0;
-    const mission = runningMissions.find((m) => m.mission_id === viewingMissionId);
-    if (!mission) return 0;
-    if (mission.state !== "running") return 0;
-    return mission.seconds_since_activity;
-  }, [viewingMissionId, runningMissions]);
+    if (!viewingRunningInfo) return 0;
+    if (viewingRunningInfo.state !== "running") return 0;
+    return viewingRunningInfo.seconds_since_activity;
+  }, [viewingMissionId, viewingRunningInfo]);
 
   const hasPendingQuestion = useMemo(
     () =>
@@ -2007,14 +2082,20 @@ export default function ControlClient() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const viewingMissionIdRef = useRef<string | null>(null);
+  const runStateMissionIdRef = useRef<string | null>(null);
   const runningMissionsRef = useRef<RunningMissionInfo[]>([]);
   const currentMissionRef = useRef<Mission | null>(null);
   const viewingMissionRef = useRef<Mission | null>(null);
+  const submittingRef = useRef(false); // Guard against double-submission
 
   // Keep refs in sync with state
   useEffect(() => {
     viewingMissionIdRef.current = viewingMissionId;
   }, [viewingMissionId]);
+
+  useEffect(() => {
+    runStateMissionIdRef.current = runStateMissionId;
+  }, [runStateMissionId]);
 
   useEffect(() => {
     runningMissionsRef.current = runningMissions;
@@ -3071,12 +3152,18 @@ export default function ControlClient() {
     getProgress()
       .then((p) => {
         if (mounted && p.total_subtasks > 0) {
-          setProgress({
-            total: p.total_subtasks,
-            completed: p.completed_subtasks,
-            current: p.current_subtask,
-            depth: p.current_depth,
-          });
+          const currentId = currentMissionRef.current?.id;
+          if (currentId) {
+            setProgressByMission((prev) => ({
+              ...prev,
+              [currentId]: {
+                total: p.total_subtasks,
+                completed: p.completed_subtasks,
+                current: p.current_subtask,
+                depth: p.current_depth,
+              },
+            }));
+          }
         }
       })
       .catch(() => {}); // Ignore errors
@@ -3167,48 +3254,51 @@ export default function ControlClient() {
           typeof st === "string" ? (st as ControlRunState) : "idle";
         const q = data["queue_len"];
 
-        // Status filtering: only apply status if it matches the mission we're viewing
-        const statusMissionId = typeof data["mission_id"] === "string" ? data["mission_id"] : null;
+        // Status filtering: only apply UI side-effects if it matches the mission we're viewing
+        const statusMissionId =
+          typeof data["mission_id"] === "string" ? data["mission_id"] : null;
+        const effectiveMissionId =
+          statusMissionId ?? runStateMissionIdRef.current ?? null;
         let shouldApplyStatus = true;
 
-        if (statusMissionId) {
-          // Status for a specific mission - only apply if viewing that mission
-          shouldApplyStatus = statusMissionId === viewingId;
+        if (effectiveMissionId) {
+          shouldApplyStatus = effectiveMissionId === viewingId;
         } else {
-          // Status for main session - only apply if viewing main mission, no specific mission,
-          // or currentMissionId hasn't loaded yet (to match event filter logic and avoid
-          // desktop stream staying open when status=idle comes during loading)
+          // No mission id available - only apply if viewing main mission or none selected
           shouldApplyStatus = !viewingId || viewingId === currentMissionId || !currentMissionId;
         }
 
-        if (shouldApplyStatus) {
-          setQueueLen(typeof q === "number" ? q : 0);
+        setQueueLen(typeof q === "number" ? q : 0);
+        setRunStateMissionId(effectiveMissionId);
 
-          // Clear progress and auto-close desktop stream when idle
-          if (newState === "idle") {
-            setProgress(null);
+        // Clear progress and auto-close desktop stream when idle for the active mission
+        if (newState === "idle" && effectiveMissionId) {
+          setProgressByMission((prev) => {
+            if (!prev[effectiveMissionId]) return prev;
+            const { [effectiveMissionId]: _removed, ...rest } = prev;
+            return rest;
+          });
+          if (shouldApplyStatus) {
             // Auto-close desktop stream when agent finishes
             setShowDesktopStream(false);
           }
-
-          // If we reconnected and agent is already running, add a visual indicator
-          setRunState((prevState) => {
-            // Only show reconnect notice if we weren't already tracking this as running
-            // and there's no active thinking/phase item (means we missed some events)
-            if (newState === "running" && prevState === "idle") {
-              setItems((prevItems) => {
-                const hasActiveThinking = prevItems.some(
-                  (it) =>
-                    (it.kind === "thinking" && !it.done) || it.kind === "phase"
-                );
-                // If there's no active streaming item, the user is seeing stale state
-                // The "Agent is working..." indicator will show via the render logic
-                return prevItems;
-              });
-            }
-            return newState;
-          });
         }
+
+        // If we reconnected and agent is already running, add a visual indicator
+        setRunState((prevState) => {
+          if (shouldApplyStatus && newState === "running" && prevState === "idle") {
+            setItems((prevItems) => {
+              const hasActiveThinking = prevItems.some(
+                (it) =>
+                  (it.kind === "thinking" && !it.done) || it.kind === "phase"
+              );
+              // If there's no active streaming item, the user is seeing stale state
+              // The "Agent is working..." indicator will show via the render logic
+              return prevItems;
+            });
+          }
+          return newState;
+        });
         return;
       }
 
@@ -3517,14 +3607,60 @@ export default function ControlClient() {
         }
       }
 
+      // Handle mission status changes - mark pending tools as cancelled when mission ends
+      if (event.type === "mission_status_changed" && isRecord(data)) {
+        const newStatus = String(data["status"] ?? "");
+        const missionId = typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+
+        // When mission is no longer active, mark all pending tool calls as cancelled
+        if (newStatus !== "active") {
+          const now = Date.now();
+          setItems((prev) =>
+            prev.map((item) => {
+              if (item.kind === "tool" && item.result === undefined) {
+                return {
+                  ...item,
+                  result: { status: "cancelled", reason: `Mission ${newStatus}` },
+                  endTime: now,
+                };
+              }
+              return item;
+            })
+          );
+
+          // Also update the mission in our local state if it matches
+          if (missionId) {
+            setMissions((prev) =>
+              prev.map((m) =>
+                m.id === missionId ? { ...m, status: newStatus as MissionStatus } : m
+              )
+            );
+            if (currentMissionRef.current?.id === missionId) {
+              setCurrentMission((prev) =>
+                prev ? { ...prev, status: newStatus as MissionStatus } : prev
+              );
+            }
+          }
+        }
+      }
+
       // Handle progress updates
       if (event.type === "progress" && isRecord(data)) {
-        setProgress({
-          total: Number(data["total_subtasks"] ?? 0),
-          completed: Number(data["completed_subtasks"] ?? 0),
-          current: data["current_subtask"] as string | null,
-          depth: Number(data["depth"] ?? 0),
-        });
+        const progressMissionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : currentMissionRef.current?.id ?? null;
+        if (progressMissionId) {
+          setProgressByMission((prev) => ({
+            ...prev,
+            [progressMissionId]: {
+              total: Number(data["total_subtasks"] ?? 0),
+              completed: Number(data["completed_subtasks"] ?? 0),
+              current: data["current_subtask"] as string | null,
+              depth: Number(data["depth"] ?? 0),
+            },
+          }));
+        }
       }
     };
 
@@ -3564,7 +3700,7 @@ export default function ControlClient() {
     };
   }, []);
 
-  const status = useMemo(() => statusLabel(runState), [runState]);
+  const status = useMemo(() => statusLabel(viewingRunState), [viewingRunState]);
   const StatusIcon = status.Icon;
 
   const streamHints = useMemo(() => {
@@ -3665,7 +3801,7 @@ export default function ControlClient() {
     // Message is queued only if agent is currently busy AND there are existing user messages
     // The first message in a conversation should never be shown as queued
     const hasExistingUserMessages = items.some((item) => item.kind === "user");
-    const willBeQueued = runState !== "idle" && hasExistingUserMessages;
+    const willBeQueued = viewingMissionIsRunning && hasExistingUserMessages;
 
     setItems((prev) => [
       ...prev,
@@ -3705,18 +3841,22 @@ export default function ControlClient() {
     const { content, agent } = payload;
     if (!content.trim()) return;
 
+    // Guard against double-submission (e.g., double-click, React StrictMode)
+    if (submittingRef.current) {
+      console.debug("[control] ignoring duplicate submission");
+      return;
+    }
+    submittingRef.current = true;
+
     const targetMissionId = viewingMissionIdRef.current;
 
-    // Always sync with backend before sending to prevent mission routing bugs.
-    // The backend's current_mission can get out of sync (e.g., from another tab or auto-creation).
+    // Sync mission state before sending (for UI consistency)
     if (targetMissionId) {
       try {
-        console.debug("[control] syncing mission before send", { targetMissionId });
         const mission = await loadMission(targetMissionId);
         setCurrentMission(mission);
         setViewingMission(mission);
         setViewingMissionId(mission.id);
-        // Only update items if history changed (avoid flicker for in-progress conversations)
         const currentIds = items.filter(i => i.kind === "user" || i.kind === "assistant").map(i => i.id).join(",");
         const newItems = missionHistoryToItems(mission);
         const newIds = newItems.filter(i => i.kind === "user" || i.kind === "assistant").map(i => i.id).join(",");
@@ -3727,6 +3867,7 @@ export default function ControlClient() {
       } catch (err) {
         console.error("Failed to sync mission before sending:", err);
         toast.error("Failed to sync mission before sending");
+        submittingRef.current = false;
         return;
       }
     }
@@ -3737,9 +3878,7 @@ export default function ControlClient() {
     const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const timestamp = Date.now();
     const hasExistingUserMessages = items.some((item) => item.kind === "user");
-    const willBeQueued = runState !== "idle" && hasExistingUserMessages;
-
-    // Display the original content with agent mention for UI
+    const willBeQueued = viewingMissionIsRunning && hasExistingUserMessages;
     const displayContent = agent ? `@${agent} ${content}` : content;
 
     setItems((prev) => [
@@ -3754,8 +3893,11 @@ export default function ControlClient() {
     ]);
 
     try {
-      // Send content to API, with agent as separate parameter
-      const { id, queued } = await postControlMessage(content, agent ? { agent } : undefined);
+      // Send message with mission_id - backend handles routing (main vs parallel)
+      const { id, queued } = await postControlMessage(content, {
+        agent: agent || undefined,
+        mission_id: targetMissionId || undefined,
+      });
       setItems((prev) => {
         const otherUserMessages = prev.filter((item) => item.kind === "user" && item.id !== tempId);
         const isFirstMessage = otherUserMessages.length === 0;
@@ -3768,10 +3910,17 @@ export default function ControlClient() {
       console.error(err);
       setItems((prev) => prev.filter((item) => item.id !== tempId));
       toast.error("Failed to send message");
+    } finally {
+      submittingRef.current = false;
     }
-  }, [items, runState, applyDesktopSessionState, missionHistoryToItems]);
+  }, [items, viewingMissionIsRunning, applyDesktopSessionState, missionHistoryToItems]);
 
   const handleStop = async () => {
+    const targetId = viewingMissionIdRef.current;
+    if (targetId) {
+      await handleCancelMission(targetId);
+      return;
+    }
     try {
       await cancelControl();
       toast.success("Cancelled");
@@ -3834,8 +3983,16 @@ export default function ControlClient() {
                     )}
                     title={missionStatus?.label}
                   />
+                  {activeMission.workspace_name && (
+                    <>
+                      <span className="text-sm font-medium text-white/50">
+                        {activeMission.workspace_name}
+                      </span>
+                      <div className="h-4 w-px bg-white/20" />
+                    </>
+                  )}
                   <span className="text-sm font-medium text-white/70">
-                    {activeMission.workspace_name || activeMission.id.slice(0, 8)}
+                    {[activeMission.agent, activeMission.id.slice(0, 8)].filter(Boolean).join(' · ')}
                   </span>
                 </>
               ) : (
@@ -3916,9 +4073,9 @@ export default function ControlClient() {
                     {/* Show sessions from API if available, otherwise show hardcoded list */}
                     {desktopSessions.length > 0 ? (
                       <>
-                        {desktopSessions.filter(s => s.process_running).map((session) => (
+                        {desktopSessions.filter(s => s.process_running).map((session, index) => (
                           <div
-                            key={session.display}
+                            key={`${session.display}-${session.mission_id || index}`}
                             className={cn(
                               "flex w-full items-center gap-2 px-3 py-2 text-sm transition-colors hover:bg-white/[0.04]",
                               desktopDisplayId === session.display
@@ -4104,7 +4261,7 @@ export default function ControlClient() {
                 <StatusIcon
                   className={cn(
                     "h-3.5 w-3.5",
-                    runState !== "idle" && "animate-spin"
+                    viewingRunState !== "idle" && "animate-spin"
                   )}
                 />
                 <span className="text-sm font-medium">{status.label}</span>
@@ -4125,6 +4282,12 @@ export default function ControlClient() {
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-white/40">Workspace</span>
                           <span className="font-mono text-white/80">{(viewingMission ?? currentMission)?.workspace_name}</span>
+                        </div>
+                      )}
+                      {(viewingMission ?? currentMission)?.agent && (
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-white/40">Agent</span>
+                          <span className="font-mono text-white/80">{(viewingMission ?? currentMission)?.agent}</span>
                         </div>
                       )}
                     </div>
@@ -4183,23 +4346,23 @@ export default function ControlClient() {
             <div className="h-4 w-px bg-white/[0.08]" />
             <div
               className="flex items-center gap-1.5"
-              title={queueLen > 0 ? `${queueLen} message${queueLen > 1 ? 's' : ''} waiting to be processed` : 'No messages queued'}
+              title={viewingQueueLen > 0 ? `${viewingQueueLen} message${viewingQueueLen > 1 ? 's' : ''} waiting to be processed` : 'No messages queued'}
             >
               <span className="text-[10px] uppercase tracking-wider text-white/40">
                 Queue
               </span>
               <span className={cn(
                 "text-sm font-medium tabular-nums",
-                queueLen === 0 && "text-white/70",
-                queueLen > 0 && queueLen < 3 && "text-amber-400",
-                queueLen >= 3 && "text-orange-400"
+                viewingQueueLen === 0 && "text-white/70",
+                viewingQueueLen > 0 && viewingQueueLen < 3 && "text-amber-400",
+                viewingQueueLen >= 3 && "text-orange-400"
               )}>
-                {queueLen}
+                {viewingQueueLen}
               </span>
             </div>
 
             {/* Progress indicator */}
-            {progress && progress.total > 0 && (
+            {viewingProgress && viewingProgress.total > 0 && (
               <>
                 <div className="h-4 w-px bg-white/[0.08]" />
                 <div className="flex items-center gap-1.5">
@@ -4207,7 +4370,7 @@ export default function ControlClient() {
                     Subtask
                   </span>
                   <span className="text-sm font-medium text-emerald-400 tabular-nums">
-                    {progress.completed + 1}/{progress.total}
+                    {viewingProgress.completed + 1}/{viewingProgress.total}
                   </span>
                 </div>
               </>

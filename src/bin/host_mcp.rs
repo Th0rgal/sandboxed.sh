@@ -241,12 +241,41 @@ fn runtime_workspace_path() -> PathBuf {
 }
 
 fn load_runtime_workspace() -> Option<RuntimeWorkspace> {
-    let path = runtime_workspace_path();
-    let contents = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    // First, try to load from the global runtime file to get workspace_root
+    let global_path = runtime_workspace_path();
+    let global_state: Option<RuntimeWorkspace> = std::fs::read_to_string(&global_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok());
+
+    // Check for a local context file in the workspace root
+    // This is more specific and avoids race conditions with parallel missions
+    // We use workspace_root (host path) instead of working_dir (which may be container-relative)
+    if let Some(ref state) = global_state {
+        if let Some(ref workspace_root) = state.workspace_root {
+            let local_context = PathBuf::from(workspace_root).join(".openagent_context.json");
+            if local_context.exists() {
+                if let Ok(contents) = std::fs::read_to_string(&local_context) {
+                    if let Ok(local_state) = serde_json::from_str::<RuntimeWorkspace>(&contents) {
+                        // Use the local context which is specific to this workspace
+                        return Some(local_state);
+                    }
+                }
+            }
+        }
+    }
+
+    global_state
 }
 
 fn apply_runtime_workspace(working_dir: &Arc<RwLock<PathBuf>>) {
+    // CRITICAL: Do NOT overwrite OPEN_AGENT_WORKSPACE_ROOT and OPEN_AGENT_WORKSPACE_TYPE
+    // These are set correctly at MCP spawn time from opencode.json and determine which
+    // container commands run in. Overwriting them from a shared file causes race conditions
+    // when multiple missions run in parallel.
+    //
+    // We only load from the file to get auxiliary context (mission_id, context paths) that
+    // may be useful for some tools, but we preserve the core workspace identity.
+
     let Some(state) = load_runtime_workspace() else {
         debug_log("runtime_workspace", &json!({"status": "missing"}));
         return;
@@ -254,62 +283,60 @@ fn apply_runtime_workspace(working_dir: &Arc<RwLock<PathBuf>>) {
 
     // Check if we're running inside a container and need to translate paths
     let inside_container = is_inside_container();
-    let workspace_root = state.workspace_root.as_deref();
+
+    // Use workspace_root from spawn env, NOT from the (potentially stale) file
+    let workspace_root = std::env::var("OPEN_AGENT_WORKSPACE_ROOT").ok();
+    let workspace_root_ref = workspace_root.as_deref();
 
     debug_log(
         "runtime_workspace",
         &json!({
             "working_dir": state.working_dir,
-            "workspace_root": state.workspace_root,
+            "workspace_root_from_env": workspace_root,
+            "workspace_root_from_file": state.workspace_root,
             "workspace_type": state.workspace_type,
             "inside_container": inside_container,
         }),
     );
 
-    if let Some(dir) = state.working_dir.as_ref() {
-        // Translate path if running inside container
-        let effective_dir = if inside_container {
-            translate_host_path_for_container(dir, workspace_root)
-        } else {
-            dir.clone()
-        };
-        debug_log(
-            "path_translation",
-            &json!({
-                "original": dir,
-                "effective": &effective_dir,
-                "translated": inside_container,
-            }),
-        );
-        std::env::set_var("OPEN_AGENT_WORKSPACE", &effective_dir);
-        if let Ok(mut guard) = working_dir.write() {
-            *guard = PathBuf::from(&effective_dir);
+    // Only update working_dir if not already set from spawn env
+    if std::env::var("OPEN_AGENT_WORKSPACE").is_err() {
+        if let Some(dir) = state.working_dir.as_ref() {
+            let effective_dir = if inside_container {
+                translate_host_path_for_container(dir, workspace_root_ref)
+            } else {
+                dir.clone()
+            };
+            std::env::set_var("OPEN_AGENT_WORKSPACE", &effective_dir);
+            if let Ok(mut guard) = working_dir.write() {
+                *guard = PathBuf::from(&effective_dir);
+            }
         }
     }
 
-    if let Some(name) = state.workspace_name.as_ref() {
-        std::env::set_var("OPEN_AGENT_WORKSPACE_NAME", name);
+    // Only update workspace name if not already set
+    if std::env::var("OPEN_AGENT_WORKSPACE_NAME").is_err() {
+        if let Some(name) = state.workspace_name.as_ref() {
+            std::env::set_var("OPEN_AGENT_WORKSPACE_NAME", name);
+        }
     }
 
+    // IMPORTANT: Do NOT modify OPEN_AGENT_WORKSPACE_ROOT or OPEN_AGENT_WORKSPACE_TYPE here!
+    // These are set at spawn time and must remain stable for the lifetime of the MCP process.
+    // The code below handles the special case of running INSIDE a container.
     if inside_container {
         // When running inside a container, clear these variables so RunCommand
         // executes directly (we're already in the container, no need to nspawn again)
         std::env::remove_var("OPEN_AGENT_WORKSPACE_ROOT");
         std::env::set_var("OPEN_AGENT_WORKSPACE_TYPE", "host");
-    } else {
-        if let Some(root) = state.workspace_root.as_ref() {
-            std::env::set_var("OPEN_AGENT_WORKSPACE_ROOT", root);
-        }
-
-        if let Some(kind) = state.workspace_type.as_ref() {
-            std::env::set_var("OPEN_AGENT_WORKSPACE_TYPE", kind);
-        }
     }
+    // NOTE: We intentionally do NOT set OPEN_AGENT_WORKSPACE_ROOT or OPEN_AGENT_WORKSPACE_TYPE
+    // from the file when not inside a container. These must come from spawn env only.
 
     if let Some(context_root) = state.context_root.as_ref() {
         // Also translate context_root for container environments
         let effective_context = if inside_container {
-            translate_host_path_for_container(context_root, workspace_root)
+            translate_host_path_for_container(context_root, workspace_root_ref)
         } else {
             context_root.clone()
         };
@@ -323,7 +350,7 @@ fn apply_runtime_workspace(working_dir: &Arc<RwLock<PathBuf>>) {
     if let Some(mission_context) = state.mission_context.as_ref() {
         // Also translate mission_context for container environments
         let effective_mission_context = if inside_container {
-            translate_host_path_for_container(mission_context, workspace_root)
+            translate_host_path_for_container(mission_context, workspace_root_ref)
         } else {
             mission_context.clone()
         };

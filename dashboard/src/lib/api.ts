@@ -346,6 +346,7 @@ export interface Mission {
   title: string | null;
   workspace_id?: string;
   workspace_name?: string;
+  agent?: string;
   history: MissionHistoryEntry[];
   desktop_sessions?: DesktopSessionInfo[];
   created_at: string;
@@ -598,11 +599,14 @@ export type ControlAgentEvent =
 
 export async function postControlMessage(
   content: string,
-  options?: { agent?: string }
+  options?: { agent?: string; mission_id?: string }
 ): Promise<{ id: string; queued: boolean }> {
-  const body: { content: string; agent?: string } = { content };
+  const body: { content: string; agent?: string; mission_id?: string } = { content };
   if (options?.agent) {
     body.agent = options.agent;
+  }
+  if (options?.mission_id) {
+    body.mission_id = options.mission_id;
   }
   const res = await apiFetch("/api/control/message", {
     method: "POST",
