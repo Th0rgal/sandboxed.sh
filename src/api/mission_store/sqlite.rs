@@ -830,7 +830,7 @@ impl MissionStore for SqliteMissionStore {
         let mid = mission_id.to_string();
         let types: Option<Vec<String>> =
             event_types.map(|t| t.iter().map(|s| s.to_string()).collect());
-        let limit = limit.unwrap_or(1000) as i64;
+        let limit = limit.unwrap_or(50000) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
         tokio::task::spawn_blocking(move || {

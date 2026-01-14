@@ -376,6 +376,113 @@ impl Tool for BashTool {
     }
 }
 
+/// Tool for updating skill content in the library.
+///
+/// Updates the skill file directly in the library directory and triggers
+/// workspace syncing via the backend API.
+struct UpdateSkillTool;
+
+#[async_trait]
+impl Tool for UpdateSkillTool {
+    fn name(&self) -> &str {
+        "update_skill"
+    }
+
+    fn description(&self) -> &str {
+        "Update skill content in the library. Writes to SKILL.md or additional reference files. \
+         Changes are synced to all workspaces that use this skill. Use this to keep skill \
+         data (like reference materials, examples, or instructions) up to date."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "skill_name": {
+                    "type": "string",
+                    "description": "Name of the skill to update (folder name in library/skill/)"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The new content for SKILL.md (the main skill file)"
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Optional: path to a reference file within the skill (e.g., 'references/examples.md'). If provided, updates this file instead of SKILL.md"
+                }
+            },
+            "required": ["skill_name", "content"]
+        })
+    }
+
+    async fn execute(&self, args: Value, _working_dir: &Path) -> anyhow::Result<String> {
+        let skill_name = args["skill_name"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'skill_name' argument"))?;
+
+        let content = args["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'content' argument"))?;
+
+        let file_path = args["file_path"].as_str();
+
+        // Validate skill name (prevent path traversal)
+        if skill_name.contains("..") || skill_name.contains('/') || skill_name.contains('\\') {
+            return Err(anyhow::anyhow!("Invalid skill name: contains path separators or '..'"));
+        }
+
+        // Get backend API URL (defaults to localhost in dev)
+        let api_base = std::env::var("OPEN_AGENT_API_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+
+        // Get auth token if set
+        let auth_token = std::env::var("OPEN_AGENT_API_TOKEN").ok();
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+
+        // Build the request URL
+        let url = if let Some(ref_path) = file_path {
+            // Validate reference path
+            if ref_path.contains("..") {
+                return Err(anyhow::anyhow!("Invalid file_path: contains '..'"));
+            }
+            format!("{}/api/library/skill/{}/files/{}", api_base, skill_name, ref_path)
+        } else {
+            format!("{}/api/library/skill/{}", api_base, skill_name)
+        };
+
+        // Build request with optional auth
+        let mut request = client
+            .put(&url)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "content": content }));
+
+        if let Some(token) = auth_token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+
+        if status.is_success() {
+            let target = file_path.unwrap_or("SKILL.md");
+            Ok(format!(
+                "Successfully updated skill '{}' (file: {}). Changes will sync to workspaces.",
+                skill_name, target
+            ))
+        } else {
+            let error_text = response.text().await.unwrap_or_default();
+            Err(anyhow::anyhow!(
+                "Failed to update skill: {} - {}",
+                status,
+                error_text
+            ))
+        }
+    }
+}
+
 fn tool_set() -> HashMap<String, Arc<dyn Tool>> {
     let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
 
@@ -392,6 +499,7 @@ fn tool_set() -> HashMap<String, Arc<dyn Tool>> {
         }),
     );
     tools.insert("fetch_url".to_string(), Arc::new(tools::FetchUrl));
+    tools.insert("update_skill".to_string(), Arc::new(UpdateSkillTool));
 
     tools
 }
