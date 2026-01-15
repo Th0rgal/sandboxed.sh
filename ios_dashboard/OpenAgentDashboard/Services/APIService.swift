@@ -282,34 +282,20 @@ final class APIService {
         return uploadResponse.path
     }
     
-    // MARK: - Workspaces
+    // MARK: - Agents (Deprecated - agents are now managed via library)
 
-    // MARK: - Agents
-
+    /// List agents - returns empty as agents are now library-managed.
+    /// This is a stub for backward compatibility with unused UI code.
     func listAgents(completion: @escaping (Result<[AgentConfig], Error>) -> Void) {
-        Task {
-            do {
-                let agents: [AgentConfig] = try await get("/api/agents")
-                completion(.success(agents))
-            } catch {
-                completion(.failure(error))
-            }
-        }
+        // Agents endpoint no longer exists - return empty list
+        completion(.success([]))
     }
 
+    /// Create agent - no-op as agents are now library-managed.
+    /// This is a stub for backward compatibility with unused UI code.
     func createAgent(name: String, modelId: String, completion: @escaping (Result<AgentConfig, Error>) -> Void) {
-        Task {
-            do {
-                struct CreateAgentRequest: Encodable {
-                    let name: String
-                    let model_id: String
-                }
-                let agent: AgentConfig = try await post("/api/agents", body: CreateAgentRequest(name: name, model_id: modelId))
-                completion(.success(agent))
-            } catch {
-                completion(.failure(error))
-            }
-        }
+        // Agents endpoint no longer exists
+        completion(.failure(APIError.httpError(404, "Agents are now managed through the library configuration")))
     }
 
     // MARK: - Workspaces
