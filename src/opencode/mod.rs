@@ -228,12 +228,31 @@ impl OpenCodeClient {
             loop {
                 line.clear();
 
-                // Apply inactivity timeout to prevent infinite hangs when OpenCode stops responding
-                let read_result = tokio::time::timeout(
-                    SSE_INACTIVITY_TIMEOUT,
-                    reader.read_line(&mut line),
-                )
-                .await;
+                // Apply inactivity timeout based on meaningful SSE activity (not just bytes).
+                let idle = last_activity.elapsed();
+                if idle >= SSE_INACTIVITY_TIMEOUT {
+                    let idle_secs = idle.as_secs();
+                    tracing::error!(
+                        session_id = %session_id_clone,
+                        idle_secs = idle_secs,
+                        event_count = event_count,
+                        "SSE inactivity timeout - OpenCode stopped sending meaningful events"
+                    );
+                    let _ = event_tx
+                        .send(OpenCodeEvent::Error {
+                            message: format!(
+                                "OpenCode SSE stream inactive for {} seconds - possible internal timeout or crash",
+                                idle_secs
+                            ),
+                        })
+                        .await;
+                    let _ = child.kill().await;
+                    return;
+                }
+
+                let remaining = SSE_INACTIVITY_TIMEOUT.saturating_sub(idle);
+                let read_result =
+                    tokio::time::timeout(remaining, reader.read_line(&mut line)).await;
 
                 match read_result {
                     Err(_timeout) => {
@@ -261,7 +280,9 @@ impl OpenCodeClient {
                         break;
                     }
                     Ok(Ok(_)) => {
-                        last_activity = std::time::Instant::now();
+                        // Note: We only update last_activity when we emit a meaningful event,
+                        // not on every line read. This prevents heartbeat events from
+                        // resetting the inactivity timeout.
                         let trimmed = line.trim_end();
 
                         if trimmed.is_empty() {
@@ -275,18 +296,27 @@ impl OpenCodeClient {
                                     "SSE event block received"
                                 );
 
-                                if let Some(event) = parse_sse_event(
+                                let parsed = parse_sse_event(
                                     &data,
                                     event_name,
                                     &session_id_clone,
                                     &mut sse_state,
-                                ) {
+                                );
+
+                                if parsed.activity {
+                                    last_activity = std::time::Instant::now();
+                                }
+
+                                if let Some(event) = parsed.event {
                                     event_count += 1;
                                     let is_complete =
                                         matches!(event, OpenCodeEvent::MessageComplete { .. });
 
                                     if event_tx.send(event).await.is_err() {
-                                        tracing::debug!(session_id = %session_id_clone, "SSE receiver dropped");
+                                        tracing::debug!(
+                                            session_id = %session_id_clone,
+                                            "SSE receiver dropped"
+                                        );
                                         let _ = child.kill().await;
                                         return;
                                     }
@@ -1072,13 +1102,18 @@ fn handle_tool_part_update(
     }
 }
 
+struct ParsedSseEvent {
+    event: Option<OpenCodeEvent>,
+    activity: bool,
+}
+
 /// Parse an SSE event line into an OpenCodeEvent.
 fn parse_sse_event(
     data_str: &str,
     event_name: Option<&str>,
     session_id: &str,
     state: &mut SseState,
-) -> Option<OpenCodeEvent> {
+) -> ParsedSseEvent {
     let json: serde_json::Value = match serde_json::from_str(data_str) {
         Ok(value) => value,
         Err(err) => {
@@ -1093,7 +1128,10 @@ fn parse_sse_event(
                             data_preview = %data_str.chars().take(200).collect::<String>(),
                             "Failed to parse OpenCode SSE JSON payload"
                         );
-                        return None;
+                        return ParsedSseEvent {
+                            event: None,
+                            activity: false,
+                        };
                     }
                 }
             } else {
@@ -1102,12 +1140,23 @@ fn parse_sse_event(
                     data_preview = %data_str.chars().take(200).collect::<String>(),
                     "Failed to parse OpenCode SSE JSON payload"
                 );
-                return None;
+                return ParsedSseEvent {
+                    event: None,
+                    activity: false,
+                };
             }
         }
     };
 
-    let event_type = json.get("type").and_then(|v| v.as_str()).or(event_name)?;
+    let event_type = match json.get("type").and_then(|v| v.as_str()).or(event_name) {
+        Some(event_type) => event_type,
+        None => {
+            return ParsedSseEvent {
+                event: None,
+                activity: false,
+            }
+        }
+    };
     let props = json
         .get("properties")
         .cloned()
@@ -1143,11 +1192,16 @@ fn parse_sse_event(
                 event_type = %event_type,
                 "SKIPPING event - session ID mismatch"
             );
-            return None;
+            return ParsedSseEvent {
+                event: None,
+                activity: false,
+            };
         }
     }
 
-    match event_type {
+    let activity = event_type != "server.heartbeat";
+
+    let event = match event_type {
         // OpenAI Responses-style streaming
         "response.output_text.delta" => {
             let delta = props
@@ -1157,19 +1211,19 @@ fn parse_sse_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if delta.is_empty() {
-                return None;
+                None
+            } else {
+                let response_id = props
+                    .get("response")
+                    .and_then(|v| v.get("id"))
+                    .and_then(|v| v.as_str());
+                let key = response_id.unwrap_or("response.output_text").to_string();
+                let buffer = state.part_buffers.entry(key).or_default();
+                buffer.push_str(delta);
+                Some(OpenCodeEvent::TextDelta {
+                    content: buffer.clone(),
+                })
             }
-
-            let response_id = props
-                .get("response")
-                .and_then(|v| v.get("id"))
-                .and_then(|v| v.as_str());
-            let key = response_id.unwrap_or("response.output_text").to_string();
-            let buffer = state.part_buffers.entry(key).or_default();
-            buffer.push_str(delta);
-            Some(OpenCodeEvent::TextDelta {
-                content: buffer.clone(),
-            })
         }
         "response.completed" | "response.incomplete" => Some(OpenCodeEvent::MessageComplete {
             session_id: session_id.to_string(),
@@ -1226,36 +1280,39 @@ fn parse_sse_event(
                         .unwrap_or("unknown")
                         .to_string();
                     if state.emitted_tool_calls.contains_key(&call_id) {
-                        return None;
-                    }
-
-                    let name = item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| state.response_tool_names.get(&call_id).cloned())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let args_str = item
-                        .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| state.response_tool_args.get(&call_id).cloned())
-                        .unwrap_or_default();
-                    let args = if args_str.trim().is_empty() {
-                        json!({})
+                        None
                     } else {
-                        serde_json::from_str(&args_str)
-                            .unwrap_or_else(|_| json!({ "arguments": args_str }))
-                    };
-                    state.emitted_tool_calls.insert(call_id.clone(), ());
-                    return Some(OpenCodeEvent::ToolCall {
-                        tool_call_id: call_id,
-                        name,
-                        args,
-                    });
+                        let name = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| state.response_tool_names.get(&call_id).cloned())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let args_str = item
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| state.response_tool_args.get(&call_id).cloned())
+                            .unwrap_or_default();
+                        let args = if args_str.trim().is_empty() {
+                            json!({})
+                        } else {
+                            serde_json::from_str(&args_str)
+                                .unwrap_or_else(|_| json!({ "arguments": args_str }))
+                        };
+                        state.emitted_tool_calls.insert(call_id.clone(), ());
+                        Some(OpenCodeEvent::ToolCall {
+                            tool_call_id: call_id,
+                            name,
+                            args,
+                        })
+                    }
+                } else {
+                    None
                 }
+            } else {
+                None
             }
-            None
         }
         // Message info updates
         "message.updated" => {
@@ -1317,7 +1374,9 @@ fn parse_sse_event(
             );
             None
         }
-    }
+    };
+
+    ParsedSseEvent { event, activity }
 }
 
 #[derive(Debug, Deserialize)]

@@ -3,6 +3,7 @@
 //! Provides endpoints for listing, closing, and managing desktop sessions.
 //! Also includes background cleanup of orphaned sessions.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -252,7 +253,7 @@ async fn cleanup_orphaned_sessions(State(state): State<Arc<AppState>>) -> Json<O
 
 /// Collect all desktop sessions from all missions with status information.
 async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDetail> {
-    let mut sessions = Vec::new();
+    let mut sessions_by_display: HashMap<String, DesktopSessionDetail> = HashMap::new();
 
     // Get desktop config for grace period
     let grace_period_secs = get_desktop_config(&state.library)
@@ -265,7 +266,7 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("Failed to list missions for desktop sessions: {}", e);
-            return sessions;
+            return Vec::new();
         }
     };
 
@@ -315,7 +316,7 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
                 None
             };
 
-            sessions.push(DesktopSessionDetail {
+            let detail = DesktopSessionDetail {
                 display: session.display.clone(),
                 status,
                 mission_id: session.mission_id.or(Some(mission.id)),
@@ -326,7 +327,18 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
                 keep_alive_until: session.keep_alive_until.clone(),
                 auto_close_in_secs,
                 process_running,
-            });
+            };
+
+            match sessions_by_display.get(&detail.display) {
+                Some(existing) => {
+                    if session_rank(&detail) > session_rank(existing) {
+                        sessions_by_display.insert(detail.display.clone(), detail);
+                    }
+                }
+                None => {
+                    sessions_by_display.insert(detail.display.clone(), detail);
+                }
+            }
         }
     }
 
@@ -334,23 +346,37 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
     let running_displays = get_running_xvfb_displays().await;
     for display in running_displays {
         // Check if this display is already in our list
-        if !sessions.iter().any(|s| s.display == display) {
-            sessions.push(DesktopSessionDetail {
-                display: display.clone(),
-                status: DesktopSessionStatus::Unknown,
-                mission_id: None,
-                mission_title: None,
-                mission_status: None,
-                started_at: "unknown".to_string(),
-                stopped_at: None,
-                keep_alive_until: None,
-                auto_close_in_secs: None,
-                process_running: true,
-            });
-        }
+        sessions_by_display.entry(display.clone()).or_insert_with(|| DesktopSessionDetail {
+            display: display.clone(),
+            status: DesktopSessionStatus::Unknown,
+            mission_id: None,
+            mission_title: None,
+            mission_status: None,
+            started_at: "unknown".to_string(),
+            stopped_at: None,
+            keep_alive_until: None,
+            auto_close_in_secs: None,
+            process_running: true,
+        });
     }
 
+    let mut sessions: Vec<DesktopSessionDetail> = sessions_by_display.into_values().collect();
+    sessions.sort_by(|a, b| a.display.cmp(&b.display));
     sessions
+}
+
+fn session_rank(detail: &DesktopSessionDetail) -> (u8, u8, i64) {
+    let running_rank = if detail.process_running { 1 } else { 0 };
+    let status_rank = match detail.status {
+        DesktopSessionStatus::Active => 3,
+        DesktopSessionStatus::Orphaned => 2,
+        DesktopSessionStatus::Stopped => 1,
+        DesktopSessionStatus::Unknown => 0,
+    };
+    let started_rank = DateTime::parse_from_rfc3339(&detail.started_at)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0);
+    (running_rank, status_rank, started_rank)
 }
 
 /// Calculate seconds until auto-close based on mission completion time.

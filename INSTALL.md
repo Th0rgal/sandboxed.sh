@@ -9,6 +9,7 @@ Open Agent is the orchestrator/UI backend. **It does not run model inference**; 
 > 2. **Domain name** pointing to that IP (e.g., `agent.example.com`)
 > 3. **SSH access** credentials or key path for the server
 > 4. **Library git repo URL** (or confirm using the template)
+> 5. **Dashboard password** to set for authentication (or offer to generate one)
 >
 > Verify you have SSH access before proceeding: `ssh root@<server-ip> "hostname"`
 

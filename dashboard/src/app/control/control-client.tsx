@@ -78,6 +78,7 @@ import {
   RotateCcw,
   PlayCircle,
   Link2,
+  ListPlus,
   X,
   Wrench,
   Terminal,
@@ -5243,23 +5244,33 @@ export default function ControlClient() {
                 />
 
                 {isBusy ? (
-                  <button
-                    type="button"
-                    onClick={handleStop}
-                    className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
-                  >
-                    <Square className="h-4 w-4" />
-                    Stop
-                  </button>
+                  <>
+                    <button
+                      type="submit"
+                      disabled={!input.trim()}
+                      className="flex items-center gap-2 rounded-xl bg-indigo-500/80 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                    >
+                      <ListPlus className="h-4 w-4" />
+                      Queue
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleStop}
+                      className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
+                    >
+                      <Square className="h-4 w-4" />
+                      Stop
+                    </button>
+                  </>
                 ) : (
                   <button
-                  type="submit"
-                  disabled={!input.trim()}
-                  className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
-                >
-                  <Send className="h-4 w-4" />
-                  Send
-                </button>
+                    type="submit"
+                    disabled={!input.trim()}
+                    className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                  >
+                    <Send className="h-4 w-4" />
+                    Send
+                  </button>
               )}
               </form>
             </div>
