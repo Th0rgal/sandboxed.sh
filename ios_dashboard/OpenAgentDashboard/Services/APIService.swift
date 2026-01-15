@@ -16,8 +16,13 @@ final class APIService {
     
     // Configuration
     var baseURL: String {
-        get { UserDefaults.standard.string(forKey: "api_base_url") ?? "https://agent-backend.thomas.md" }
+        get { UserDefaults.standard.string(forKey: "api_base_url") ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: "api_base_url") }
+    }
+
+    /// Whether the server URL has been configured
+    var isConfigured: Bool {
+        !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
     
     private var jwtToken: String? {

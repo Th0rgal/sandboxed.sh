@@ -11,9 +11,10 @@ struct ContentView: View {
     @State private var isAuthenticated = false
     @State private var isCheckingAuth = true
     @State private var authRequired = false
-    
+    @State private var showSetupSheet = false
+
     private let api = APIService.shared
-    
+
     var body: some View {
         Group {
             if isCheckingAuth {
@@ -28,11 +29,30 @@ struct ContentView: View {
         .task {
             await checkAuth()
         }
+        .sheet(isPresented: $showSetupSheet) {
+            SetupSheet(onComplete: {
+                showSetupSheet = false
+                Task { await checkAuth() }
+            })
+        }
+        .onChange(of: api.isConfigured) { _, isConfigured in
+            // Re-check auth when server URL is configured
+            if isConfigured {
+                Task { await checkAuth() }
+            }
+        }
     }
-    
+
     private func checkAuth() async {
         isCheckingAuth = true
-        
+
+        // If not configured, show setup sheet
+        guard api.isConfigured else {
+            isCheckingAuth = false
+            showSetupSheet = true
+            return
+        }
+
         do {
             let _ = try await api.checkHealth()
             authRequired = api.authRequired
@@ -42,8 +62,148 @@ struct ContentView: View {
             authRequired = true
             isAuthenticated = api.isAuthenticated
         }
-        
+
         isCheckingAuth = false
+    }
+}
+
+// MARK: - Setup Sheet (First Launch)
+
+struct SetupSheet: View {
+    let onComplete: () -> Void
+
+    @State private var serverURL = ""
+    @State private var isTestingConnection = false
+    @State private var connectionSuccess = false
+    @State private var errorMessage: String?
+
+    private let api = APIService.shared
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Theme.backgroundPrimary.ignoresSafeArea()
+
+                VStack(spacing: 32) {
+                    Spacer()
+
+                    // Welcome icon
+                    VStack(spacing: 16) {
+                        Image(systemName: "server.rack")
+                            .font(.system(size: 64, weight: .light))
+                            .foregroundStyle(Theme.accent)
+
+                        VStack(spacing: 8) {
+                            Text("Welcome to Open Agent")
+                                .font(.title2.bold())
+                                .foregroundStyle(Theme.textPrimary)
+
+                            Text("Enter your server URL to get started")
+                                .font(.subheadline)
+                                .foregroundStyle(Theme.textSecondary)
+                        }
+                    }
+
+                    // Server URL input
+                    GlassCard(padding: 24, cornerRadius: 24) {
+                        VStack(spacing: 20) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Server URL")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(Theme.textSecondary)
+
+                                TextField("https://your-server.com", text: $serverURL)
+                                    .textFieldStyle(.plain)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    .keyboardType(.URL)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 14)
+                                    .background(Color.white.opacity(0.05))
+                                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                            .stroke(Theme.border, lineWidth: 1)
+                                    )
+                            }
+
+                            if let error = errorMessage {
+                                HStack {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(Theme.error)
+                                    Text(error)
+                                        .font(.caption)
+                                        .foregroundStyle(Theme.error)
+                                    Spacer()
+                                }
+                            }
+
+                            if connectionSuccess {
+                                HStack {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(Theme.success)
+                                    Text("Connection successful!")
+                                        .font(.caption)
+                                        .foregroundStyle(Theme.success)
+                                    Spacer()
+                                }
+                            }
+
+                            Button {
+                                Task { await connectToServer() }
+                            } label: {
+                                HStack {
+                                    if isTestingConnection {
+                                        ProgressView()
+                                            .progressViewStyle(.circular)
+                                            .tint(.white)
+                                            .scaleEffect(0.8)
+                                    }
+                                    Text(isTestingConnection ? "Connecting..." : "Connect")
+                                        .fontWeight(.semibold)
+                                }
+                                .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(GlassProminentButtonStyle())
+                            .disabled(serverURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isTestingConnection)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+
+                    Spacer()
+                }
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .interactiveDismissDisabled()
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.hidden)
+    }
+
+    private func connectToServer() async {
+        let trimmedURL = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURL.isEmpty else { return }
+
+        isTestingConnection = true
+        errorMessage = nil
+        connectionSuccess = false
+
+        api.baseURL = trimmedURL
+
+        do {
+            _ = try await api.checkHealth()
+            connectionSuccess = true
+            HapticService.success()
+
+            // Brief delay to show success state
+            try? await Task.sleep(for: .milliseconds(500))
+            onComplete()
+        } catch {
+            errorMessage = "Could not connect. Please check the URL."
+            HapticService.error()
+        }
+
+        isTestingConnection = false
     }
 }
 
