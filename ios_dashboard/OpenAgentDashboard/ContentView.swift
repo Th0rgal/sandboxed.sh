@@ -188,6 +188,8 @@ struct SetupSheet: View {
         errorMessage = nil
         connectionSuccess = false
 
+        // Save original URL to restore on failure
+        let originalURL = api.baseURL
         api.baseURL = trimmedURL
 
         do {
@@ -199,6 +201,8 @@ struct SetupSheet: View {
             try? await Task.sleep(for: .milliseconds(500))
             onComplete()
         } catch {
+            // Restore original URL on failure
+            api.baseURL = originalURL
             errorMessage = "Could not connect. Please check the URL."
             HapticService.error()
         }
