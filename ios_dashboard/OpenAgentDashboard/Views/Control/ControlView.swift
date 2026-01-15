@@ -536,7 +536,7 @@ struct ControlView: View {
     private var emptyStateView: some View {
         VStack(spacing: 32) {
             Spacer()
-            
+
             // Animated brain icon
             Image(systemName: "brain")
                 .font(.system(size: 56, weight: .light))
@@ -548,23 +548,34 @@ struct ControlView: View {
                     )
                 )
                 .symbolEffect(.pulse, options: .repeating.speed(0.5))
-            
+
             VStack(spacing: 12) {
                 Text("Ready to Help")
                     .font(.title2.bold())
                     .foregroundStyle(Theme.textPrimary)
-                
-                Text("Send a message to start working\nwith the AI agent")
+
+                Text(emptyStateSubtitle)
                     .font(.subheadline)
                     .foregroundStyle(Theme.textSecondary)
                     .multilineTextAlignment(.center)
                     .lineSpacing(4)
             }
-            
+
             Spacer()
             Spacer()
         }
         .padding(.horizontal, 32)
+    }
+
+    private var emptyStateSubtitle: String {
+        if let workspace = workspaceState.selectedWorkspace {
+            if workspace.isDefault {
+                return "Send a message to start working\non the host environment"
+            } else {
+                return "Send a message to start working\nin \(workspace.name)"
+            }
+        }
+        return "Send a message to start working\nwith the AI agent"
     }
     
     private func suggestionChip(_ text: String) -> some View {
@@ -591,7 +602,7 @@ struct ControlView: View {
     private var inputView: some View {
         VStack(spacing: 0) {
             // ChatGPT-style input: clean outline, no fill, integrated send button
-            HStack(alignment: .bottom, spacing: 0) {
+            HStack(alignment: .center, spacing: 0) {
                 // Text input - minimal style with just a border
                 TextField("Message the agent...", text: $inputText, axis: .vertical)
                     .textFieldStyle(.plain)
@@ -639,10 +650,8 @@ struct ControlView: View {
                 .disabled(runState == .idle && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .animation(.easeInOut(duration: 0.15), value: runState)
                 .animation(.easeInOut(duration: 0.15), value: inputText.isEmpty)
-                .padding(.trailing, 6)
-                .padding(.bottom, 6)
+                .padding(.trailing, 8)
             }
-            .background(Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
@@ -651,7 +660,6 @@ struct ControlView: View {
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, 16)
-            .background(Theme.backgroundPrimary)
         }
     }
     
