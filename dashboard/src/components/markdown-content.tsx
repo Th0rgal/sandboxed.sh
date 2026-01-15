@@ -27,8 +27,34 @@ const FILE_EXTENSIONS = [
 const CODE_EXTENSIONS = [".sh", ".py", ".js", ".ts", ".rs", ".go", ".html", ".css", ".json", ".yaml", ".yml", ".xml"];
 const ARCHIVE_EXTENSIONS = [".zip", ".tar", ".gz"];
 
-// Global cache for fetched image URLs
+// Global cache for fetched image URLs with automatic cleanup
+// Uses a simple LRU-style eviction: when cache exceeds limit, oldest entries are revoked
+const IMAGE_CACHE_LIMIT = 50;
 const imageUrlCache = new Map<string, string>();
+
+function cacheImageUrl(path: string, url: string): void {
+  // If already cached, just update access order
+  if (imageUrlCache.has(path)) {
+    const existingUrl = imageUrlCache.get(path)!;
+    imageUrlCache.delete(path);
+    imageUrlCache.set(path, existingUrl);
+    return;
+  }
+
+  // Evict oldest entries if at limit
+  while (imageUrlCache.size >= IMAGE_CACHE_LIMIT) {
+    const oldestKey = imageUrlCache.keys().next().value;
+    if (oldestKey) {
+      const oldUrl = imageUrlCache.get(oldestKey);
+      if (oldUrl) {
+        URL.revokeObjectURL(oldUrl);
+      }
+      imageUrlCache.delete(oldestKey);
+    }
+  }
+
+  imageUrlCache.set(path, url);
+}
 
 function isFilePath(str: string): boolean {
   const hasExtension = FILE_EXTENSIONS.some(ext => str.toLowerCase().endsWith(ext));
@@ -138,7 +164,7 @@ function FilePreviewModalContent({ path, resolvedPath, onClose }: FilePreviewMod
         const blob = await res.blob();
         if (!cancelled) setFileSize(blob.size);
         const url = URL.createObjectURL(blob);
-        imageUrlCache.set(resolvedPath, url);
+        cacheImageUrl(resolvedPath, url);
         if (!cancelled) setImageUrl(url);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load");

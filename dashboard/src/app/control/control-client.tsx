@@ -3410,7 +3410,9 @@ export default function ControlClient() {
         }
 
         const resumable = data["resumable"] === true;
-        const isFailure = !Boolean(data["success"]);
+        // Use strict equality to match eventsToItems behavior:
+        // undefined means no explicit status, only false means actual failure
+        const isFailure = data["success"] === false;
         setItems((prev) => {
           // Filter out incomplete thinking
           let filtered = prev.filter((it) => it.kind !== "thinking" || it.done);

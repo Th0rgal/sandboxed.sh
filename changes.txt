@@ -1,6 +1,0 @@
-Changes made
-- Started a local Open Agent backend on port 3010 with a writable WORKING_DIR and LIBRARY_PATH.
-- Created a local Git-backed library at `.openagent/library-remote` with `workspace-template/ubuntu-github.json` and `skill/github/SKILL.md`, then set LIBRARY_REMOTE to enable templates.
-- Created and later deleted test workspaces and their directories (`host-webapp`, `dgx-spark`, `ubuntu-github`, `ubuntu-github-template`).
-- Generated mission artifacts (web app files, attempts.txt, AddZero.lean) in isolated mission workspaces, then removed those directories during cleanup.
-- Updated report.txt with iteration 2 findings.
