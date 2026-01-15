@@ -11,6 +11,7 @@
 //! - OpenCode settings (`opencode/oh-my-opencode.json`)
 //! - OpenAgent config (`openagent/config.json`)
 
+pub mod env_crypto;
 mod git;
 pub mod types;
 
@@ -1161,6 +1162,7 @@ impl LibraryStore {
     }
 
     /// Get a workspace template by name with full content.
+    /// Env vars are decrypted if a PRIVATE_KEY is configured; plaintext values pass through.
     pub async fn get_workspace_template(&self, name: &str) -> Result<WorkspaceTemplate> {
         Self::validate_name(name)?;
         let template_path = self
@@ -1179,18 +1181,36 @@ impl LibraryStore {
         let config: WorkspaceTemplateConfig =
             serde_json::from_str(&content).context("Failed to parse workspace template file")?;
 
+        // Decrypt env vars if we have a key configured
+        let env_vars = match env_crypto::load_private_key_from_env()? {
+            Some(key) => env_crypto::decrypt_env_vars(&key, &config.env_vars)
+                .context("Failed to decrypt template env vars")?,
+            None => {
+                // No key configured - check if any values are encrypted
+                let has_encrypted = config.env_vars.values().any(|v| env_crypto::is_encrypted(v));
+                if has_encrypted {
+                    tracing::warn!(
+                        "Template '{}' has encrypted env vars but PRIVATE_KEY is not configured",
+                        name
+                    );
+                }
+                config.env_vars
+            }
+        };
+
         Ok(WorkspaceTemplate {
             name: config.name.unwrap_or_else(|| name.to_string()),
             description: config.description,
             path: format!("{}/{}.json", WORKSPACE_TEMPLATE_DIR, name),
             distro: config.distro,
             skills: config.skills,
-            env_vars: config.env_vars,
+            env_vars,
             init_script: config.init_script,
         })
     }
 
     /// Save a workspace template.
+    /// Env vars are encrypted if a PRIVATE_KEY is configured.
     pub async fn save_workspace_template(
         &self,
         name: &str,
@@ -1202,12 +1222,27 @@ impl LibraryStore {
 
         fs::create_dir_all(&templates_dir).await?;
 
+        // Encrypt env vars if we have a key configured
+        let env_vars = match env_crypto::load_private_key_from_env()? {
+            Some(key) => env_crypto::encrypt_env_vars(&key, &template.env_vars)
+                .context("Failed to encrypt template env vars")?,
+            None => {
+                if !template.env_vars.is_empty() {
+                    tracing::warn!(
+                        "Saving template '{}' with plaintext env vars (PRIVATE_KEY not configured)",
+                        name
+                    );
+                }
+                template.env_vars.clone()
+            }
+        };
+
         let config = WorkspaceTemplateConfig {
             name: Some(name.to_string()),
             description: template.description.clone(),
             distro: template.distro.clone(),
             skills: template.skills.clone(),
-            env_vars: template.env_vars.clone(),
+            env_vars,
             init_script: template.init_script.clone(),
         };
 
