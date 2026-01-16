@@ -1199,9 +1199,42 @@ fn parse_sse_event(
         }
     }
 
+    // Treat most events as meaningful activity EXCEPT server heartbeats.
+    // tool.running events indicate a long-running tool is still executing - these
+    // ARE meaningful activity and should reset the inactivity timeout.
     let activity = event_type != "server.heartbeat";
 
     let event = match event_type {
+        // Tool progress events - sent by OpenCode while a tool is still running.
+        // These reset the inactivity timeout to prevent premature disconnection.
+        "tool.running" | "tool.progress" => {
+            let tool_call_id = props
+                .get("callID")
+                .or_else(|| props.get("tool_call_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let tool_name = props
+                .get("tool")
+                .or_else(|| props.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let elapsed = props
+                .get("elapsed_seconds")
+                .or_else(|| props.get("elapsed"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            tracing::debug!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                elapsed_seconds = elapsed,
+                "Tool still running - heartbeat received"
+            );
+
+            // Don't emit an event to the UI, just acknowledge the activity
+            // (activity = true above already resets the timeout)
+            None
+        }
         // OpenAI Responses-style streaming
         "response.output_text.delta" => {
             let delta = props
