@@ -226,6 +226,8 @@ impl OpenCodeClient {
             let mut last_activity = std::time::Instant::now();
             // Track running tool call IDs to extend timeout while tools execute
             let mut running_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Track last time we logged about running tools to avoid spam
+            let mut last_tool_log: Option<std::time::Instant> = None;
 
             loop {
                 line.clear();
@@ -262,16 +264,20 @@ impl OpenCodeClient {
                     return;
                 }
 
-                // Log periodically when tools are running but SSE is quiet
+                // Log every 30 seconds when tools are running but SSE is quiet
                 if !running_tools.is_empty() && idle >= TOOL_STATUS_CHECK_INTERVAL {
-                    let idle_secs = idle.as_secs();
-                    if idle_secs % 30 == 0 {
+                    let should_log = match last_tool_log {
+                        None => true,
+                        Some(last) => last.elapsed() >= Duration::from_secs(30),
+                    };
+                    if should_log {
                         tracing::info!(
                             session_id = %session_id_clone,
-                            idle_secs = idle_secs,
+                            idle_secs = idle.as_secs(),
                             running_tools = ?running_tools,
                             "SSE quiet but tools still running - extending timeout"
                         );
+                        last_tool_log = Some(std::time::Instant::now());
                     }
                 }
 
@@ -281,17 +287,19 @@ impl OpenCodeClient {
 
                 match read_result {
                     Err(_timeout) => {
-                        let idle_secs = last_activity.elapsed().as_secs();
-                        // Double-check: if tools are running, don't timeout yet
+                        // Double-check: if tools are running, reset activity and continue waiting
                         if !running_tools.is_empty() {
                             tracing::warn!(
                                 session_id = %session_id_clone,
-                                idle_secs = idle_secs,
+                                idle_secs = last_activity.elapsed().as_secs(),
                                 running_tools = ?running_tools,
-                                "Read timeout but tools still running - continuing to wait"
+                                "Read timeout but tools still running - resetting activity timer"
                             );
+                            // Reset activity so we don't immediately timeout on next iteration
+                            last_activity = std::time::Instant::now();
                             continue;
                         }
+                        let idle_secs = last_activity.elapsed().as_secs();
                         tracing::error!(
                             session_id = %session_id_clone,
                             idle_secs = idle_secs,

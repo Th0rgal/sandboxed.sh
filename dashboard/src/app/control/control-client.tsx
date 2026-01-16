@@ -3891,6 +3891,13 @@ export default function ControlClient() {
       // This allows SSE handler to correctly deduplicate
       // The first message should never be shown as queued
       setItems((prev) => {
+        // Check if SSE already added this message (race condition where SSE arrives before API response)
+        // If so, just remove the temp message to avoid duplicates
+        const sseAlreadyAdded = prev.some((item) => item.id === id);
+        if (sseAlreadyAdded) {
+          return prev.filter((item) => item.id !== tempId);
+        }
+
         const otherUserMessages = prev.filter((item) => item.kind === "user" && item.id !== tempId);
         const isFirstMessage = otherUserMessages.length === 0;
         const effectiveQueued = isFirstMessage ? false : queued;
@@ -3949,14 +3956,16 @@ export default function ControlClient() {
     const timestamp = Date.now();
     const hasExistingUserMessages = items.some((item) => item.kind === "user");
     const willBeQueued = viewingMissionIsRunning && hasExistingUserMessages;
-    const displayContent = agent ? `@${agent} ${content}` : content;
 
+    // Use raw content for optimistic message (not prefixed with agent)
+    // This ensures content matches what SSE echoes back, preventing duplicate messages
+    // when SSE arrives before API response and needs to dedupe by content
     setItems((prev) => [
       ...prev,
       {
         kind: "user" as const,
         id: tempId,
-        content: displayContent,
+        content,
         timestamp,
         queued: willBeQueued,
       },
@@ -3969,6 +3978,13 @@ export default function ControlClient() {
         mission_id: targetMissionId || undefined,
       });
       setItems((prev) => {
+        // Check if SSE already added this message (race condition where SSE arrives before API response)
+        // If so, just remove the temp message to avoid duplicates
+        const sseAlreadyAdded = prev.some((item) => item.id === id);
+        if (sseAlreadyAdded) {
+          return prev.filter((item) => item.id !== tempId);
+        }
+
         const otherUserMessages = prev.filter((item) => item.kind === "user" && item.id !== tempId);
         const isFirstMessage = otherUserMessages.length === 0;
         const effectiveQueued = isFirstMessage ? false : queued;
@@ -4951,12 +4967,14 @@ export default function ControlClient() {
                 );
               })}
 
-              {/* Show streaming indicator when running but no active thinking/phase */}
+              {/* Show streaming indicator when running but no active thinking/phase visible inline */}
               {viewingMissionIsRunning &&
                 items.length > 0 &&
                 !items.some(
                   (it) =>
-                    (it.kind === "thinking" && !it.done) || it.kind === "phase"
+                    // Only block for undone thinking if it's visible inline (panel closed)
+                    (it.kind === "thinking" && !it.done && !showThinkingPanel) ||
+                    it.kind === "phase"
                 ) &&
                 // Hide if the last item is an assistant message (response complete, waiting for state change)
                 items[items.length - 1]?.kind !== "assistant" && (
@@ -5249,9 +5267,8 @@ export default function ControlClient() {
                   <>
                     <button
                       type="button"
-                      disabled={!input.trim()}
                       onClick={() => enhancedInputRef.current?.submit()}
-                      className="flex items-center gap-2 rounded-xl bg-indigo-500/80 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                      className="flex items-center gap-2 rounded-xl bg-indigo-500/80 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
                     >
                       <ListPlus className="h-4 w-4" />
                       Queue
@@ -5268,9 +5285,8 @@ export default function ControlClient() {
                 ) : (
                   <button
                     type="button"
-                    disabled={!input.trim()}
                     onClick={() => enhancedInputRef.current?.submit()}
-                    className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                    className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
                   >
                     <Send className="h-4 w-4" />
                     Send
