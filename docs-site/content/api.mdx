@@ -1,0 +1,363 @@
+---
+title: API Reference
+description: Complete API documentation for Open Agent
+---
+
+# API Reference
+
+All endpoints require authentication via `Authorization: Bearer <token>` header.
+
+Get a token by logging in:
+
+```bash
+curl -X POST "https://agent.yourdomain.com/api/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"password": "your-password"}'
+```
+
+---
+
+## Missions
+
+Missions are agent tasks with conversation history.
+
+### Create Mission
+
+```http
+POST /api/control/missions
+```
+
+```json
+{
+  "title": "My Mission",
+  "workspace_id": "uuid",
+  "agent": "code-reviewer",
+  "model_override": "anthropic/claude-sonnet-4-20250514"
+}
+```
+
+All fields optional. Returns `Mission` object.
+
+### Load Mission
+
+```http
+POST /api/control/missions/:id/load
+```
+
+Loads a mission into the active control session. Required before sending messages.
+
+### Send Message
+
+```http
+POST /api/control/message
+```
+
+```json
+{
+  "content": "Your message here",
+  "agent": "optional-agent-override"
+}
+```
+
+Returns `{"id": "uuid", "queued": false}`. If `queued: true`, another message is processing.
+
+### Cancel
+
+```http
+POST /api/control/cancel           # Current mission
+POST /api/control/missions/:id/cancel   # Specific mission
+```
+
+### Set Status
+
+```http
+POST /api/control/missions/:id/status
+```
+
+```json
+{"status": "completed"}
+```
+
+Statuses: `pending`, `active`, `completed`, `failed`, `interrupted`
+
+### Get Events
+
+```http
+GET /api/control/missions/:id/events?types=user_message,assistant_message&limit=100&offset=0
+```
+
+Returns stored events for replay/debugging.
+
+### Stream Events (SSE)
+
+```http
+GET /api/control/stream
+```
+
+Server-Sent Events for real-time updates:
+
+| Event | Description |
+|-------|-------------|
+| `status` | Control state changed |
+| `user_message` | User message received |
+| `assistant_message` | Agent response complete |
+| `thinking` | Agent reasoning |
+| `tool_call` | Tool invocation |
+| `tool_result` | Tool output |
+| `error` | Error occurred |
+
+### Other Mission Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/control/missions` | GET | List all missions |
+| `/api/control/missions/:id` | GET | Get mission details |
+| `/api/control/missions/:id` | DELETE | Delete mission |
+| `/api/control/missions/:id/resume` | POST | Resume interrupted mission |
+| `/api/control/tree` | GET | Live agent tree |
+
+### Mission Object
+
+```json
+{
+  "id": "uuid",
+  "status": "active",
+  "title": "My Mission",
+  "workspace_id": "uuid",
+  "workspace_name": "my-workspace",
+  "agent": "code-reviewer",
+  "model_override": null,
+  "created_at": "2025-01-13T10:00:00Z",
+  "updated_at": "2025-01-13T10:05:00Z"
+}
+```
+
+---
+
+## Workspaces
+
+Workspaces are isolated environments for agent execution.
+
+### List Workspaces
+
+```http
+GET /api/workspaces
+```
+
+### Create Workspace
+
+```http
+POST /api/workspaces
+```
+
+```json
+{
+  "name": "my-workspace",
+  "workspace_type": "host",
+  "path": "/path/to/workspace",
+  "skills": ["skill-name"],
+  "tools": ["tool-name"],
+  "template": "template-name",
+  "distro": "ubuntu-noble",
+  "env_vars": {"KEY": "VALUE"},
+  "init_script": "#!/bin/bash\napt install -y nodejs"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Human-readable name |
+| `workspace_type` | No | `host` or `chroot` (default: `host`) |
+| `template` | No | Template name (forces `chroot`) |
+| `distro` | No | `ubuntu-noble`, `ubuntu-jammy`, `debian-bookworm`, `arch-linux` |
+| `skills` | No | Library skill names |
+| `init_script` | No | Script to run on container build |
+
+### Update Workspace
+
+```http
+PUT /api/workspaces/:id
+```
+
+### Delete Workspace
+
+```http
+DELETE /api/workspaces/:id
+```
+
+### Build Container
+
+```http
+POST /api/workspaces/:id/build
+```
+
+```json
+{"distro": "ubuntu-noble", "rebuild": true}
+```
+
+Build runs in background. Poll status to check completion.
+
+### Execute Command
+
+```http
+POST /api/workspaces/:id/exec
+```
+
+```json
+{
+  "command": "ls -la",
+  "cwd": "subdirectory",
+  "timeout_secs": 60,
+  "env": {"MY_VAR": "value"}
+}
+```
+
+Response:
+
+```json
+{
+  "exit_code": 0,
+  "stdout": "...",
+  "stderr": "",
+  "timed_out": false
+}
+```
+
+### Sync Skills
+
+```http
+POST /api/workspaces/:id/sync
+```
+
+Syncs skills/tools from Library to `.opencode/` directory.
+
+### Debug Endpoints
+
+For troubleshooting container builds:
+
+```http
+GET /api/workspaces/:id/debug      # Container state info
+GET /api/workspaces/:id/init-log   # Init script output
+POST /api/workspaces/:id/rerun-init # Re-run init without rebuild
+```
+
+### Workspace Object
+
+```json
+{
+  "id": "uuid",
+  "name": "my-workspace",
+  "workspace_type": "chroot",
+  "path": "/path/to/workspace",
+  "status": "ready",
+  "error_message": null,
+  "skills": ["skill-1"],
+  "distro": "ubuntu-noble",
+  "created_at": "2025-01-13T10:00:00Z"
+}
+```
+
+Status: `pending`, `building`, `ready`, `error`
+
+---
+
+## Library
+
+Manage skills, commands, rules, agents, and templates.
+
+### List Items
+
+```http
+GET /api/library/skill
+GET /api/library/command
+GET /api/library/rule
+GET /api/library/agent
+GET /api/library/mcp
+GET /api/library/workspace-template
+```
+
+### Get Item
+
+```http
+GET /api/library/{type}/{name}
+```
+
+### Save Item
+
+```http
+PUT /api/library/{type}/{name}
+```
+
+### Delete Item
+
+```http
+DELETE /api/library/{type}/{name}
+```
+
+### Sync Library
+
+```http
+POST /api/library/sync
+```
+
+Pulls latest from git and updates workspaces.
+
+---
+
+## System
+
+### Health Check
+
+```http
+GET /api/health
+```
+
+### System Stats
+
+```http
+GET /api/stats
+```
+
+Returns CPU, memory, disk, network usage.
+
+### AI Providers
+
+```http
+GET /api/providers              # List configured providers
+POST /api/providers/:id/auth    # Start OAuth flow
+DELETE /api/providers/:id/auth  # Remove auth
+```
+
+---
+
+## Authentication
+
+### Login
+
+```http
+POST /api/auth/login
+```
+
+```json
+{"password": "your-password"}
+```
+
+Returns: `{"token": "jwt-token", "expires_at": "..."}`
+
+### Multi-user Login
+
+```http
+POST /api/auth/login
+```
+
+```json
+{"username": "alice", "password": "alice-password"}
+```
+
+### Verify Token
+
+```http
+GET /api/auth/verify
+```
+
+Returns `200` if valid, `401` if expired/invalid.

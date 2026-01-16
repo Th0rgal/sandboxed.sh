@@ -1,0 +1,481 @@
+@import "tailwindcss";
+
+/*
+ * Open Agent Documentation
+ * Design System: Warm dark palette with blue accent
+ */
+
+/* =============================================================================
+   FONTS - Geist (matching desktop app)
+   ============================================================================= */
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/Geist-VariableFont_wght.ttf") format("truetype-variations");
+  font-weight: 300 700;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/GeistMono-VariableFont_wght.ttf") format("truetype-variations");
+  font-weight: 300 700;
+  font-display: swap;
+}
+
+/* =============================================================================
+   DESIGN TOKENS
+   ============================================================================= */
+:root {
+  /* Typography */
+  --font-sans: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Premium easing curves */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Light mode backgrounds */
+  --background: 255 255 255; /* #ffffff */
+  --background-elevated: 249 250 251; /* #f9fafb */
+  --background-tertiary: 243 244 246; /* #f3f4f6 */
+
+  /* Text hierarchy - light mode */
+  --foreground: 17 24 39; /* #111827 */
+  --foreground-secondary: 75 85 99; /* #4b5563 */
+  --foreground-tertiary: 107 114 128; /* #6b7280 */
+  --foreground-muted: 156 163 175; /* #9ca3af */
+
+  /* Borders - light mode */
+  --border: 0 0 0 / 0.06;
+  --border-elevated: 0 0 0 / 0.1;
+  --border-strong: 0 0 0 / 0.15;
+
+  /* Blue accent - matching dashboard */
+  --accent: 59 130 246; /* #3B82F6 - blue-500 */
+  --accent-hover: 37 99 235; /* #2563EB - blue-600 */
+  --accent-light: 96 165 250; /* #60A5FA - blue-400 */
+  --accent-foreground: 255 255 255;
+
+  /* Semantic colors */
+  --success: 34 197 94;
+  --warning: 234 179 8;
+  --error: 239 68 68;
+  --info: 59 130 246;
+
+  /* Glow colors - blue */
+  --glow-primary: rgba(59, 130, 246, 0.15);
+  --glow-secondary: rgba(96, 165, 250, 0.12);
+
+  /* Premium shadows (layered for depth) - lighter for light mode */
+  --shadow-sm:
+    0 1px 2px rgba(0, 0, 0, 0.05),
+    0 2px 4px rgba(0, 0, 0, 0.05);
+  --shadow-md:
+    0 2px 4px rgba(0, 0, 0, 0.04),
+    0 4px 12px rgba(0, 0, 0, 0.06),
+    0 8px 24px rgba(0, 0, 0, 0.06);
+  --shadow-lg:
+    0 4px 8px rgba(0, 0, 0, 0.04),
+    0 8px 24px rgba(0, 0, 0, 0.08),
+    0 24px 48px rgba(0, 0, 0, 0.1);
+  --shadow-xl:
+    0 8px 16px rgba(0, 0, 0, 0.06),
+    0 16px 32px rgba(0, 0, 0, 0.1),
+    0 32px 64px rgba(0, 0, 0, 0.12);
+
+  /* Button shadows */
+  --shadow-button:
+    0 1px 2px rgba(0, 0, 0, 0.1),
+    0 2px 4px rgba(0, 0, 0, 0.08);
+  --shadow-button-hover:
+    0 2px 4px rgba(0, 0, 0, 0.1),
+    0 4px 8px rgba(0, 0, 0, 0.08);
+
+  /* Ring for focus states */
+  --ring: 59 130 246 / 0.4;
+}
+
+/* Dark mode tokens */
+.dark {
+  /* Warm dark backgrounds */
+  --background: 12 11 10; /* #0c0b0a */
+  --background-elevated: 24 23 22; /* #181716 */
+  --background-tertiary: 30 29 27; /* #1e1d1b */
+
+  /* Text hierarchy - warm whites */
+  --foreground: 245 240 235;
+  --foreground-secondary: 176 168 159;
+  --foreground-tertiary: 122 116 110;
+  --foreground-muted: 90 85 80;
+
+  /* Borders - subtle, warm */
+  --border: 255 248 240 / 0.06;
+  --border-elevated: 255 248 240 / 0.1;
+  --border-strong: 255 248 240 / 0.15;
+
+  /* Blue accent - slightly lighter for dark mode */
+  --accent-hover: 96 165 250; /* #60A5FA - blue-400 */
+  --accent-light: 147 197 253; /* #93C5FD - blue-300 */
+
+  /* Premium shadows (layered for depth) - darker for dark mode */
+  --shadow-sm:
+    0 1px 2px rgba(0, 0, 0, 0.2),
+    0 2px 4px rgba(0, 0, 0, 0.2);
+  --shadow-md:
+    0 2px 4px rgba(0, 0, 0, 0.15),
+    0 4px 12px rgba(0, 0, 0, 0.2),
+    0 8px 24px rgba(0, 0, 0, 0.2);
+  --shadow-lg:
+    0 4px 8px rgba(0, 0, 0, 0.15),
+    0 8px 24px rgba(0, 0, 0, 0.25),
+    0 24px 48px rgba(0, 0, 0, 0.3);
+  --shadow-xl:
+    0 8px 16px rgba(0, 0, 0, 0.2),
+    0 16px 32px rgba(0, 0, 0, 0.25),
+    0 32px 64px rgba(0, 0, 0, 0.3);
+
+  /* Button shadows */
+  --shadow-button:
+    0 1px 2px rgba(0, 0, 0, 0.3),
+    0 2px 4px rgba(0, 0, 0, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --shadow-button-hover:
+    0 2px 4px rgba(0, 0, 0, 0.3),
+    0 4px 8px rgba(0, 0, 0, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+/* =============================================================================
+   BASE STYLES
+   ============================================================================= */
+html {
+  color-scheme: light;
+  background: rgb(var(--background));
+  overflow-x: hidden;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: rgb(var(--background));
+  color: rgb(var(--foreground));
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  min-height: 100dvh;
+}
+
+/* Safari/iOS overscroll background fix */
+html::before {
+  content: '';
+  position: fixed;
+  top: -100vh;
+  left: 0;
+  right: 0;
+  height: 300vh;
+  background: rgb(var(--background));
+  z-index: -9999;
+  pointer-events: none;
+}
+
+/* =============================================================================
+   PREMIUM SCROLLBAR
+   ============================================================================= */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.08);
+  border-radius: 100px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.15);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: rgba(59, 130, 246, 0.25);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Dark mode scrollbar */
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* =============================================================================
+   GLASS EFFECTS
+   ============================================================================= */
+.glass {
+  background: rgb(var(--background-elevated) / 0.7);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+}
+
+.glass-subtle {
+  background: rgb(var(--background-elevated) / 0.5);
+  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+}
+
+/* Glass with ambient tint - blue */
+.glass-tinted {
+  background: rgb(var(--background-elevated) / 0.7);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  position: relative;
+}
+
+.glass-tinted::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    rgba(59, 130, 246, 0.02) 0%,
+    transparent 50%,
+    rgba(96, 165, 250, 0.015) 100%
+  );
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+/* =============================================================================
+   ELEVATION SURFACES
+   ============================================================================= */
+.surface-0 {
+  background: rgb(var(--background));
+}
+
+.surface-1 {
+  background: rgb(var(--background-elevated));
+}
+
+.surface-2 {
+  background: rgb(var(--background-tertiary));
+}
+
+/* =============================================================================
+   FOCUS STYLES
+   ============================================================================= */
+*:focus {
+  outline: none;
+}
+
+*:focus-visible {
+  outline: none;
+}
+
+button:focus-visible,
+a:focus-visible,
+[role="button"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgb(var(--accent) / 0.4);
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+  border-color: rgba(59, 130, 246, 0.5) !important;
+  box-shadow: 0 0 0 2px rgb(var(--accent) / 0.2);
+}
+
+/* =============================================================================
+   TYPOGRAPHY UTILITIES
+   ============================================================================= */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+/* =============================================================================
+   SELECTION
+   ============================================================================= */
+::selection {
+  background: rgb(var(--accent) / 0.3);
+}
+
+/* =============================================================================
+   ANIMATIONS
+   ============================================================================= */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes text-rotate {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+    filter: blur(4px);
+  }
+  15% {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+  85% {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-8px);
+    filter: blur(4px);
+  }
+}
+
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 150ms var(--ease-out-quart);
+}
+
+.animate-text-rotate {
+  animation: text-rotate 3s ease-in-out forwards;
+}
+
+.animate-slide-up {
+  animation: slide-up 200ms var(--ease-out-expo);
+}
+
+.animate-scale-in {
+  animation: scale-in 200ms var(--ease-spring);
+}
+
+/* =============================================================================
+   BACKGROUND MESH GRADIENT - blue
+   ============================================================================= */
+.bg-mesh-subtle {
+  background:
+    radial-gradient(ellipse at 20% 0%, rgba(59, 130, 246, 0.03) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 100%, rgba(96, 165, 250, 0.02) 0%, transparent 50%),
+    rgb(var(--background));
+}
+
+/* =============================================================================
+   CARD UTILITIES
+   ============================================================================= */
+.card {
+  background: rgb(var(--background-elevated));
+  border: 1px solid rgb(var(--border));
+  border-radius: 12px;
+  transition: all 200ms var(--ease-out-quart);
+}
+
+.card:hover {
+  border-color: rgb(var(--border-elevated));
+  box-shadow: var(--shadow-md);
+}
+
+/* Card with top edge highlight */
+.card-highlight {
+  position: relative;
+  overflow: hidden;
+}
+
+.card-highlight::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 5%,
+    rgba(255, 255, 255, 0.08) 50%,
+    transparent 95%
+  );
+  pointer-events: none;
+}
+
+/* =============================================================================
+   BUTTON UTILITIES
+   ============================================================================= */
+.btn-primary {
+  background: rgb(var(--accent));
+  color: white;
+  box-shadow: var(--shadow-button);
+  transition: all 150ms var(--ease-out-quart);
+}
+
+.btn-primary:hover {
+  background: rgb(var(--accent-hover));
+  box-shadow: var(--shadow-button-hover);
+  transform: translateY(-1px);
+}
+
+.btn-primary:active {
+  transform: scale(0.98) translateY(0);
+  box-shadow: var(--shadow-sm);
+}
+
+.btn-secondary {
+  background: rgb(var(--background-elevated));
+  border: 1px solid rgb(var(--border));
+  color: rgb(var(--foreground-secondary));
+  box-shadow: var(--shadow-sm);
+  transition: all 150ms var(--ease-out-quart);
+}
+
+.btn-secondary:hover {
+  border-color: rgb(var(--border-elevated));
+  color: rgb(var(--foreground));
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+.btn-secondary:active {
+  transform: scale(0.98) translateY(0);
+  box-shadow: none;
+}

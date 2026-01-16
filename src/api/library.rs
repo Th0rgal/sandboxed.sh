@@ -25,6 +25,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::library::{
+    rename::{ItemType, RenameResult},
     Command, CommandSummary, GitAuthor, LibraryAgent, LibraryAgentSummary, LibraryStatus,
     LibraryStore, LibraryTool, LibraryToolSummary, McpServer, MigrationReport, OpenAgentConfig,
     Plugin, Rule, RuleSummary, Skill, SkillSummary, WorkspaceTemplate, WorkspaceTemplateSummary,
@@ -250,6 +251,8 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         )
         // Migration
         .route("/migrate", post(migrate_library))
+        // Rename (works for all item types)
+        .route("/rename/:item_type/:name", post(rename_item))
         // OpenCode Settings (oh-my-opencode.json)
         .route("/opencode/settings", get(get_opencode_settings))
         .route("/opencode/settings", put(save_opencode_settings))
@@ -291,6 +294,15 @@ pub struct SaveWorkspaceTemplateRequest {
     pub env_vars: Option<HashMap<String, String>>,
     pub encrypted_keys: Option<Vec<String>>,
     pub init_script: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameRequest {
+    /// The new name for the item.
+    pub new_name: String,
+    /// If true, return what would be changed without actually changing anything.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 fn sanitize_skill_list(skills: Vec<String>) -> Vec<String> {
@@ -1238,4 +1250,165 @@ fn extract_agent_names(agents: &serde_json::Value) -> Vec<String> {
         return agents_arr.iter().filter_map(get_name).collect();
     }
     Vec::new()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rename
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// POST /api/library/rename/:item_type/:name - Rename a library item.
+/// Supports dry_run mode to preview changes before applying them.
+async fn rename_item(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path((item_type_str, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(req): Json<RenameRequest>,
+) -> Result<Json<RenameResult>, (StatusCode, String)> {
+    // Parse item type
+    let item_type = match item_type_str.as_str() {
+        "skill" => ItemType::Skill,
+        "command" => ItemType::Command,
+        "rule" => ItemType::Rule,
+        "agent" => ItemType::Agent,
+        "tool" => ItemType::Tool,
+        "workspace-template" => ItemType::WorkspaceTemplate,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid item type '{}'. Valid types: skill, command, rule, agent, tool, workspace-template",
+                    item_type_str
+                ),
+            ))
+        }
+    };
+
+    let library = ensure_library(&state, &headers).await?;
+
+    // Perform rename (or dry run)
+    let result = library
+        .rename_item(item_type, &name, &req.new_name, req.dry_run)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // If not dry run and successful, update workspace references
+    if !req.dry_run && result.success {
+        match item_type {
+            ItemType::Skill => {
+                // Update workspace skill lists
+                update_workspace_skill_references(&state, &name, &req.new_name).await;
+                // Sync skills to workspaces
+                sync_skill_to_workspaces(&state, library.as_ref(), &req.new_name).await;
+            }
+            ItemType::Tool => {
+                // Update workspace tool lists
+                update_workspace_tool_references(&state, &name, &req.new_name).await;
+                // Sync tools to workspaces
+                sync_tool_to_workspaces(&state, library.as_ref(), &req.new_name).await;
+            }
+            ItemType::WorkspaceTemplate => {
+                // Update workspace template references
+                update_workspace_template_references(&state, &name, &req.new_name).await;
+            }
+            _ => {}
+        }
+    }
+
+    if !result.success {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            result.error.clone().unwrap_or_else(|| "Rename failed".to_string()),
+        ));
+    }
+
+    Ok(Json(result))
+}
+
+/// Update workspace skill references when a skill is renamed.
+async fn update_workspace_skill_references(
+    state: &super::routes::AppState,
+    old_name: &str,
+    new_name: &str,
+) {
+    let workspaces = state.workspaces.list().await;
+    for workspace in workspaces {
+        if workspace.skills.contains(&old_name.to_string()) {
+            let mut updated_workspace = workspace.clone();
+            updated_workspace.skills = updated_workspace
+                .skills
+                .iter()
+                .map(|s| {
+                    if s == old_name {
+                        new_name.to_string()
+                    } else {
+                        s.clone()
+                    }
+                })
+                .collect();
+
+            let workspace_name = workspace.name.clone();
+            if !state.workspaces.update(updated_workspace).await {
+                tracing::warn!(
+                    workspace = %workspace_name,
+                    "Failed to update workspace skill reference"
+                );
+            }
+        }
+    }
+}
+
+/// Update workspace tool references when a tool is renamed.
+async fn update_workspace_tool_references(
+    state: &super::routes::AppState,
+    old_name: &str,
+    new_name: &str,
+) {
+    let workspaces = state.workspaces.list().await;
+    for workspace in workspaces {
+        if workspace.tools.contains(&old_name.to_string()) {
+            let mut updated_workspace = workspace.clone();
+            updated_workspace.tools = updated_workspace
+                .tools
+                .iter()
+                .map(|t| {
+                    if t == old_name {
+                        new_name.to_string()
+                    } else {
+                        t.clone()
+                    }
+                })
+                .collect();
+
+            let workspace_name = workspace.name.clone();
+            if !state.workspaces.update(updated_workspace).await {
+                tracing::warn!(
+                    workspace = %workspace_name,
+                    "Failed to update workspace tool reference"
+                );
+            }
+        }
+    }
+}
+
+/// Update workspace template references when a template is renamed.
+async fn update_workspace_template_references(
+    state: &super::routes::AppState,
+    old_name: &str,
+    new_name: &str,
+) {
+    let workspaces = state.workspaces.list().await;
+    for workspace in workspaces {
+        if workspace.template.as_deref() == Some(old_name) {
+            let mut updated_workspace = workspace.clone();
+            updated_workspace.template = Some(new_name.to_string());
+
+            let workspace_name = workspace.name.clone();
+            if !state.workspaces.update(updated_workspace).await {
+                tracing::warn!(
+                    workspace = %workspace_name,
+                    "Failed to update workspace template reference"
+                );
+            }
+        }
+    }
 }

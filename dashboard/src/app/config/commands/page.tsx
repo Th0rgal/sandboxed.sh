@@ -16,11 +16,13 @@ import {
   Save,
   Trash2,
   FileText,
+  Pencil,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
 import { useLibrary } from '@/contexts/library-context';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
+import { RenameDialog } from '@/components/rename-dialog';
 
 export default function CommandsPage() {
   const {
@@ -46,6 +48,7 @@ export default function CommandsPage() {
   const [commandSaving, setCommandSaving] = useState(false);
   const [loadingCommand, setLoadingCommand] = useState(false);
   const [showNewCommandDialog, setShowNewCommandDialog] = useState(false);
+  const [showRenameDialog, setShowRenameDialog] = useState(false);
   const [newCommandName, setNewCommandName] = useState('');
   const [commitMessage, setCommitMessage] = useState('');
   const [showCommitDialog, setShowCommitDialog] = useState(false);
@@ -157,6 +160,12 @@ Describe what this command does.
     } catch (err) {
       console.error('Failed to delete command:', err);
     }
+  };
+
+  const handleRenameSuccess = async () => {
+    await refresh();
+    setSelectedCommand(null);
+    setCommandContent('');
   };
 
   if (loading) {
@@ -305,8 +314,16 @@ Describe what this command does.
                       <div className="flex items-center gap-2">
                         {commandDirty && <span className="text-xs text-amber-400">Unsaved</span>}
                         <button
+                          onClick={() => setShowRenameDialog(true)}
+                          className="p-1.5 rounded-lg text-white/60 hover:text-white hover:bg-white/[0.06] transition-colors"
+                          title="Rename Command"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                        <button
                           onClick={handleCommandDelete}
                           className="p-1.5 rounded-lg text-red-400 hover:bg-red-500/10 transition-colors"
+                          title="Delete Command"
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
@@ -415,6 +432,17 @@ Describe what this command does.
             </div>
           </div>
         </div>
+      )}
+
+      {/* Rename Dialog */}
+      {selectedCommand && (
+        <RenameDialog
+          open={showRenameDialog}
+          onOpenChange={setShowRenameDialog}
+          itemType="command"
+          currentName={selectedCommand.name}
+          onSuccess={handleRenameSuccess}
+        />
       )}
     </div>
   );

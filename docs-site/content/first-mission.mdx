@@ -1,0 +1,111 @@
+---
+title: First Mission
+description: Run your first agent task and learn the basics
+---
+
+# Your First Mission
+
+You've got Open Agent running. Now let's use it.
+
+## Start a Mission
+
+1. Open your dashboard at `https://agent.yourdomain.com`
+2. Log in with your password
+3. Click **New Mission** (or press `N`)
+4. Type a simple task:
+
+```
+List the files in /root and tell me what you see.
+```
+
+5. Press Enter and watch
+
+## What You'll See
+
+The mission view shows:
+
+- **Message stream**: Your messages and the agent's responses
+- **Tool calls**: Every command the agent runs (with expandable output)
+- **Thinking**: The agent's reasoning (if the model supports it)
+- **Cost**: Running total of API usage
+
+The agent will execute `ls -la /root`, read the output, and explain what it found.
+
+## Try Something More Interesting
+
+Here are good first tasks to understand capabilities:
+
+**Code exploration:**
+```
+Clone https://github.com/Th0rgal/open-agent and summarize
+what the main components do. Focus on src/api/.
+```
+
+**System administration:**
+```
+Check disk usage, memory, and running services on this server.
+Highlight anything that looks unusual.
+```
+
+**File operations:**
+```
+Create a Python script in /tmp that fetches weather for Paris
+and prints it. Use the wttr.in API. Then run it.
+```
+
+## Understanding the Output
+
+### Tool Calls
+
+Every action the agent takes appears as a tool call:
+
+```
+[Tool: bash]
+Input: ls -la /root
+Output: total 48
+drwx------ 8 root root 4096 Jan 15 10:30 .
+...
+```
+
+Click to expand and see full input/output.
+
+### Mission Status
+
+Missions have these states:
+
+| Status | Meaning |
+|--------|---------|
+| `active` | Agent is working |
+| `completed` | Agent finished successfully |
+| `failed` | Something went wrong |
+| `interrupted` | You cancelled it |
+
+## Canceling a Mission
+
+If the agent goes off track or you want to stop it:
+
+1. Click **Cancel** in the top right
+2. Or press `Esc`
+
+The agent will stop after its current tool call completes.
+
+## Workspaces
+
+By default, missions run in the **host workspace**, directly on your server with full access.
+
+For isolation, create a **container workspace**:
+
+1. Go to **Workspaces** in the sidebar
+2. Click **New Workspace**
+3. Choose a template or configure manually
+4. Select the workspace when starting a new mission
+
+Container workspaces run in isolated Linux environments (systemd-nspawn). The agent can't affect your host system.
+
+→ Learn more in [Workspaces](/workspaces)
+
+## Next Steps
+
+- **[Library](/library)**: Customize agent behavior with skills and rules
+- **[Workspaces](/workspaces)**: Create isolated environments for different projects
+- **[API Reference](/api)**: Integrate Open Agent into your own tools

@@ -1808,6 +1808,59 @@ export async function renameWorkspaceTemplate(oldName: string, newName: string):
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Library Rename
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type LibraryItemType =
+  | "skill"
+  | "command"
+  | "rule"
+  | "agent"
+  | "tool"
+  | "workspace-template";
+
+export interface RenameChange {
+  type: "rename_file" | "update_reference" | "update_workspace";
+  from?: string;
+  to?: string;
+  file?: string;
+  field?: string;
+  old_value?: string;
+  new_value?: string;
+  workspace_id?: string;
+  workspace_name?: string;
+}
+
+export interface RenameResult {
+  success: boolean;
+  changes: RenameChange[];
+  warnings: string[];
+  error?: string;
+}
+
+/**
+ * Rename a library item and update all references.
+ * Supports dry_run mode to preview changes before applying them.
+ */
+export async function renameLibraryItem(
+  itemType: LibraryItemType,
+  oldName: string,
+  newName: string,
+  dryRun: boolean = false
+): Promise<RenameResult> {
+  const res = await apiFetch(
+    `/api/library/rename/${itemType}/${encodeURIComponent(oldName)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_name: newName, dry_run: dryRun }),
+    }
+  );
+  await ensureLibraryResponse(res, "Failed to rename item");
+  return res.json();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Library Migration
 // ─────────────────────────────────────────────────────────────────────────────
 

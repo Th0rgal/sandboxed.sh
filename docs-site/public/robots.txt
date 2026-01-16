@@ -1,0 +1,9 @@
+# Open Agent Documentation
+# https://openagent.thomas.md
+
+User-agent: *
+Allow: /
+
+# AI agent documentation index
+# See /llms.txt for structured documentation access
+Sitemap: https://openagent.thomas.md/sitemap.xml

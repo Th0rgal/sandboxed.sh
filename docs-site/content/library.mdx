@@ -1,0 +1,204 @@
+---
+title: Library
+description: Git-backed configuration for agent behavior
+---
+
+# Library
+
+The Library is a git repository containing your agent's configuration. Everything that defines how your agent behaves lives here.
+
+## Structure
+
+```
+library/
+├── skill/              # Reusable capabilities
+│   └── python-dev.md
+├── command/            # Slash commands (/deploy, /test)
+│   └── deploy.md
+├── rule/               # Behavior constraints
+│   └── no-production.md
+├── agent/              # Agent personalities
+│   └── code-reviewer.md
+├── mcp/                # MCP server configs
+│   └── playwright.json
+└── workspace-template/ # Container blueprints
+    └── nodejs.json
+```
+
+## Why Git-Backed?
+
+- **Version control**: Track changes to agent behavior like code
+- **Review workflow**: PRs for configuration changes
+- **Rollback**: Revert to working configs when something breaks
+- **Sharing**: Fork and customize other people's setups
+
+## Getting Started
+
+Fork the [template library](https://github.com/Th0rgal/openagent-library-template) and customize it:
+
+```bash
+git clone https://github.com/Th0rgal/openagent-library-template my-library
+cd my-library
+git remote set-url origin git@github.com:you/your-library.git
+git push -u origin main
+```
+
+Then set `LIBRARY_REMOTE` in your Open Agent config to point to your repo.
+
+## Skills
+
+Skills are markdown files that give the agent specialized knowledge and instructions for specific domains.
+
+**Example: `skill/python-dev.md`**
+
+```markdown
+# Python Development
+
+When working with Python code:
+
+- Use type hints for all function signatures
+- Prefer f-strings over .format() or %
+- Use pathlib instead of os.path
+- Run `ruff check` before committing
+- Use pytest for testing, not unittest
+
+Standard project structure:
+├── src/
+│   └── package_name/
+├── tests/
+├── pyproject.toml
+└── README.md
+```
+
+Skills are synced to workspaces based on configuration. A workspace can have multiple skills.
+
+## Commands
+
+Commands are slash-triggered actions (like `/deploy` or `/test`).
+
+**Example: `command/deploy.md`**
+
+```markdown
+# /deploy
+
+Deploy the current project to production.
+
+Steps:
+1. Run tests: `pytest`
+2. If tests pass, run: `./scripts/deploy.sh`
+3. Verify deployment at the production URL
+4. Report success or failure
+```
+
+Commands appear in the dashboard's command palette.
+
+## Rules
+
+Rules constrain agent behavior. They define things the agent should always or never do.
+
+**Example: `rule/no-production.md`**
+
+```markdown
+# No Production Changes
+
+NEVER:
+- Modify files in /var/www/production
+- Run commands with `--production` flag
+- Access the production database directly
+
+ALWAYS:
+- Use staging/dev environments for testing
+- Ask for confirmation before any production-adjacent operation
+```
+
+Rules are global and apply to all missions.
+
+## Agents
+
+Agents are personalities with specific behaviors and defaults.
+
+**Example: `agent/code-reviewer.md`**
+
+```markdown
+# Code Reviewer
+
+You are a senior code reviewer focused on:
+- Security vulnerabilities
+- Performance issues
+- Code clarity and maintainability
+- Test coverage
+
+For each file, provide:
+1. Summary of changes
+2. Issues found (if any)
+3. Suggestions for improvement
+
+Be constructive. Praise good patterns. Flag serious issues clearly.
+```
+
+Select an agent when starting a mission.
+
+## MCP Servers
+
+MCP (Model Context Protocol) servers provide tools and resources to agents.
+
+**Example: `mcp/playwright.json`**
+
+```json
+{
+  "name": "playwright",
+  "description": "Browser automation",
+  "command": "bunx",
+  "args": ["@anthropic/mcp-playwright"],
+  "env": {}
+}
+```
+
+MCP servers run on the host and are available to all missions.
+
+## Workspace Templates
+
+Templates define pre-configured container environments.
+
+**Example: `workspace-template/nodejs.json`**
+
+```json
+{
+  "name": "nodejs",
+  "description": "Node.js development environment",
+  "distro": "ubuntu-noble",
+  "skills": ["typescript-dev"],
+  "env_vars": {
+    "NODE_ENV": "development"
+  },
+  "init_script": "#!/bin/bash\napt update\napt install -y nodejs npm\nnpm install -g typescript"
+}
+```
+
+Create workspaces from templates for consistent, reproducible environments.
+
+## Scoping
+
+| Type | Scope | Applied To |
+|------|-------|------------|
+| Skills | Per-workspace | Synced to `.opencode/skill/` |
+| Commands | Global | Available everywhere |
+| Rules | Global | All missions |
+| Agents | Global | Selectable per-mission |
+| MCPs | Global | Run on host |
+| Templates | Per-workspace | Container creation |
+
+## Syncing
+
+Open Agent automatically syncs your Library:
+
+1. Pulls latest changes from `LIBRARY_REMOTE`
+2. Copies relevant files to workspace `.opencode/` directories
+3. Updates OpenCode's global config
+
+Force a sync via the dashboard: **Library → Sync**
+
+## Next Steps
+
+- **[Workspaces](/workspaces)**: Create isolated environments that use your skills
+- **[API Reference](/api)**: Programmatic access to Library management

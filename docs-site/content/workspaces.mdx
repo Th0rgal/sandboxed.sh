@@ -1,0 +1,217 @@
+---
+title: Workspaces
+description: Isolated environments for agent tasks
+---
+
+# Workspaces
+
+Workspaces are isolated environments where agents execute tasks. Each workspace has its own file system, installed software, and configuration.
+
+## Types
+
+### Host Workspace
+
+The default workspace. Runs directly on your server.
+
+- Full access to the host file system
+- Uses globally installed tools
+- No isolation (agent can affect system state)
+- Zero setup required
+
+Good for: trusted tasks, system administration, quick experiments.
+
+### Container Workspace
+
+Isolated Linux environment using systemd-nspawn.
+
+- Separate file system (can't see host files)
+- Own installed packages
+- Destroyed and recreated cleanly
+- Template-based setup
+
+Good for: untrusted code, experiments, reproducible environments.
+
+## Creating Workspaces
+
+### Via Dashboard
+
+1. Go to **Workspaces** in sidebar
+2. Click **New Workspace**
+3. Choose:
+   - **Host**: Direct execution on server
+   - **Container**: Isolated environment
+4. If container:
+   - Select a **template** or configure manually
+   - Choose **distro** (Ubuntu Noble, Jammy, Debian, Arch)
+   - Add **skills** and **tools** from your Library
+5. Click **Create**
+
+For containers, click **Build** to create the environment (takes 1-3 minutes).
+
+### Via API
+
+```bash
+curl -X POST "https://agent.yourdomain.com/api/workspaces" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "python-project",
+    "workspace_type": "chroot",
+    "distro": "ubuntu-noble",
+    "skills": ["python-dev"],
+    "init_script": "#!/bin/bash\napt install -y python3 python3-pip"
+  }'
+```
+
+## Container Lifecycle
+
+```
+pending → building → ready → (in use) → (destroyed)
+           ↑                    ↓
+           └── rebuild ←───────┘
+```
+
+| Status | Meaning |
+|--------|---------|
+| `pending` | Created but not built |
+| `building` | debootstrap + init script running |
+| `ready` | Available for missions |
+| `error` | Build failed (check logs) |
+
+## Configuration
+
+### Skills and Tools
+
+Workspaces can have skills and tools from your Library:
+
+```json
+{
+  "skills": ["python-dev", "docker"],
+  "tools": ["custom-linter"]
+}
+```
+
+These are synced to `.opencode/skill/` and `.opencode/tool/` inside the workspace.
+
+### Environment Variables
+
+Set environment variables available to all commands:
+
+```json
+{
+  "env_vars": {
+    "NODE_ENV": "development",
+    "DATABASE_URL": "postgres://localhost/dev"
+  }
+}
+```
+
+### Init Script
+
+For containers, the init script runs during build:
+
+```bash
+#!/bin/bash
+apt update
+apt install -y nodejs npm python3 python3-pip
+pip3 install poetry
+npm install -g typescript
+```
+
+## Templates
+
+Templates are reusable workspace configurations stored in your Library.
+
+**Create a template:**
+
+```json
+// library/workspace-template/fullstack.json
+{
+  "name": "fullstack",
+  "description": "Node + Python development",
+  "distro": "ubuntu-noble",
+  "skills": ["typescript-dev", "python-dev"],
+  "env_vars": {
+    "NODE_ENV": "development"
+  },
+  "init_script": "#!/bin/bash\napt install -y nodejs npm python3 python3-pip"
+}
+```
+
+**Use a template:**
+
+```bash
+curl -X POST "https://agent.yourdomain.com/api/workspaces" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"name": "my-project", "template": "fullstack"}'
+```
+
+## Executing Commands
+
+Run commands in a workspace:
+
+```bash
+curl -X POST "https://agent.yourdomain.com/api/workspaces/$ID/exec" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"command": "python3 --version"}'
+```
+
+Response:
+
+```json
+{
+  "exit_code": 0,
+  "stdout": "Python 3.12.0\n",
+  "stderr": "",
+  "timed_out": false
+}
+```
+
+## Debugging Container Builds
+
+If a container build fails:
+
+1. **Check status**:
+   ```bash
+   GET /api/workspaces/$ID
+   # Look at error_message field
+   ```
+
+2. **View init log**:
+   ```bash
+   GET /api/workspaces/$ID/init-log
+   # Returns stdout/stderr from init script
+   ```
+
+3. **Get debug info**:
+   ```bash
+   GET /api/workspaces/$ID/debug
+   # Container state, directory structure, etc.
+   ```
+
+4. **Re-run init** (without full rebuild):
+   ```bash
+   POST /api/workspaces/$ID/rerun-init
+   # Faster iteration on init script fixes
+   ```
+
+## Distros
+
+| Distro | ID | Notes |
+|--------|-----|-------|
+| Ubuntu 24.04 | `ubuntu-noble` | Recommended |
+| Ubuntu 22.04 | `ubuntu-jammy` | LTS |
+| Debian 12 | `debian-bookworm` | Stable |
+| Arch Linux | `arch-linux` | Rolling release |
+
+## Best Practices
+
+1. **Use containers for untrusted code.** Never run unknown code in host workspace.
+2. **Create templates for repeated setups.** Don't rebuild the same environment.
+3. **Keep init scripts idempotent.** Should work on re-run.
+4. **Version your templates.** They're in your Library git repo.
+
+## Next Steps
+
+- **[API Reference](/api)**: Full workspace API documentation
+- **[Desktop Automation](/desktop)**: Run browsers in workspaces

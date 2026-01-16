@@ -1,0 +1,175 @@
+---
+title: Setup
+description: Get Open Agent running on your server
+---
+
+# Setup
+
+Choose your path based on comfort level. All paths end up with the same result.
+
+## Quick Path: AI-Assisted (5 min)
+
+Have an AI agent deploy for you. Open Claude, Cursor, or any coding assistant with terminal access and say:
+
+```
+Deploy Open Agent on my server.
+- Server IP: YOUR_IP
+- Domain: agent.yourdomain.com
+- I have SSH access as root
+
+Read INSTALL.md from the Open Agent repo for the full guide.
+```
+
+The AI will handle systemd services, nginx/Caddy, SSL certificates, and everything else.
+
+**Requirements:**
+- A dedicated server ([~$30/month from Hetzner](https://www.hetzner.com/), DigitalOcean, Vultr, etc.)
+- Ubuntu 24.04 LTS
+- A domain pointed to your server IP
+- SSH key access to the server
+
+## Standard Path: Manual (20 min)
+
+If you prefer doing it yourself, here's the condensed version.
+
+### 1. Install dependencies
+
+```bash
+apt update && apt install -y \
+  ca-certificates curl git jq unzip tar \
+  build-essential pkg-config libssl-dev \
+  systemd-container debootstrap
+
+# Install Bun (for OpenCode plugins)
+curl -fsSL https://bun.sh/install | bash
+install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun
+
+# Install Rust
+curl -fsSL https://sh.rustup.rs | sh -s -- -y
+source /root/.cargo/env
+```
+
+### 2. Install OpenCode
+
+```bash
+curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
+install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode
+```
+
+### 3. Clone and build Open Agent
+
+```bash
+mkdir -p /opt/open_agent
+cd /opt/open_agent
+git clone https://github.com/Th0rgal/open-agent vaduz-v1
+cd vaduz-v1
+
+cargo build --bin open_agent --bin host-mcp --bin desktop-mcp
+install -m 0755 target/debug/open_agent /usr/local/bin/open_agent
+install -m 0755 target/debug/host-mcp /usr/local/bin/host-mcp
+install -m 0755 target/debug/desktop-mcp /usr/local/bin/desktop-mcp
+```
+
+### 4. Configure
+
+Create `/etc/open_agent/open_agent.env`:
+
+```bash
+mkdir -p /etc/open_agent
+cat > /etc/open_agent/open_agent.env << 'EOF'
+OPENCODE_BASE_URL=http://127.0.0.1:4096
+OPENCODE_PERMISSIVE=true
+HOST=0.0.0.0
+PORT=3000
+WORKING_DIR=/root
+DEV_MODE=false
+DASHBOARD_PASSWORD=change-me-to-something-strong
+JWT_SECRET=change-me-to-a-long-random-string
+EOF
+```
+
+### 5. Create systemd services
+
+**OpenCode** (`/etc/systemd/system/opencode.service`):
+
+```ini
+[Unit]
+Description=OpenCode Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/opencode serve --port 4096 --hostname 127.0.0.1
+WorkingDirectory=/root
+Restart=always
+Environment=HOME=/root
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Open Agent** (`/etc/systemd/system/open_agent.service`):
+
+```ini
+[Unit]
+Description=Open Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/open_agent/open_agent.env
+ExecStart=/usr/local/bin/open_agent
+WorkingDirectory=/root
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 6. Start services
+
+```bash
+systemctl daemon-reload
+systemctl enable --now opencode.service
+systemctl enable --now open_agent.service
+```
+
+### 7. Set up reverse proxy (Caddy)
+
+```bash
+apt install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+apt update && apt install caddy
+
+echo 'agent.yourdomain.com {
+    reverse_proxy localhost:3000
+}' > /etc/caddy/Caddyfile
+
+systemctl enable --now caddy
+```
+
+### 8. Test
+
+Open `https://agent.yourdomain.com` in your browser. Log in with your dashboard password.
+
+## Accessing the Dashboard
+
+This guide installs the **backend** on your server. The dashboard (frontend) is separate:
+
+| Option | How | Best For |
+|--------|-----|----------|
+| **Vercel** | Deploy `dashboard/` folder to Vercel, set `NEXT_PUBLIC_API_URL` to your backend | Production, always accessible |
+| **Local** | Run `bun dev` in `dashboard/` folder | Development, quick testing |
+| **iOS App** | Enter your backend URL in the app settings | Mobile access |
+
+The backend URL is your server domain (e.g., `https://agent.yourdomain.com`). All dashboard options connect to the same backend.
+
+## Full Documentation
+
+For advanced options (container workspaces, desktop automation, Tailscale exit nodes, multi-user auth), see the complete [INSTALL.md](https://github.com/Th0rgal/open-agent/blob/master/INSTALL.md) in the repository.
+
+## Next: Your First Mission
+
+Once you're logged into the dashboard, head to [First Mission](/first-mission) to run your first agent task.

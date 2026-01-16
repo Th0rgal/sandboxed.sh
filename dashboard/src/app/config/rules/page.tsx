@@ -14,11 +14,13 @@ import {
   Trash2,
   X,
   FileText,
+  Pencil,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
 import { useLibrary } from '@/contexts/library-context';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
+import { RenameDialog } from '@/components/rename-dialog';
 
 export default function RulesPage() {
   const {
@@ -44,6 +46,7 @@ export default function RulesPage() {
   const [ruleSaving, setRuleSaving] = useState(false);
   const [loadingRule, setLoadingRule] = useState(false);
   const [showNewRuleDialog, setShowNewRuleDialog] = useState(false);
+  const [showRenameDialog, setShowRenameDialog] = useState(false);
   const [newRuleName, setNewRuleName] = useState('');
   const [commitMessage, setCommitMessage] = useState('');
   const [showCommitDialog, setShowCommitDialog] = useState(false);
@@ -176,6 +179,12 @@ Describe what this rule does.
     } catch (err) {
       console.error('Failed to delete rule:', err);
     }
+  };
+
+  const handleRenameSuccess = async () => {
+    await refresh();
+    setSelectedRule(null);
+    setRuleContent('');
   };
 
   if (loading) {
@@ -325,6 +334,13 @@ Describe what this rule does.
                       <div className="flex items-center gap-2">
                         {ruleDirty && <span className="text-xs text-amber-400">Unsaved</span>}
                         <button
+                          onClick={() => setShowRenameDialog(true)}
+                          className="p-1.5 rounded-lg text-white/60 hover:text-white hover:bg-white/[0.06] transition-colors"
+                          title="Rename Rule"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                        <button
                           onClick={handleRuleDelete}
                           className="p-1.5 rounded-lg text-red-400 hover:bg-red-500/10 transition-colors"
                           title="Delete Rule"
@@ -449,6 +465,17 @@ Your rule content here..."
             </div>
           </div>
         </div>
+      )}
+
+      {/* Rename Dialog */}
+      {selectedRule && (
+        <RenameDialog
+          open={showRenameDialog}
+          onOpenChange={setShowRenameDialog}
+          itemType="rule"
+          currentName={selectedRule.name}
+          onSuccess={handleRenameSuccess}
+        />
       )}
     </div>
   );

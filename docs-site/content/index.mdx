@@ -1,0 +1,100 @@
+---
+title: Open Agent
+description: Self-hosted control plane for autonomous AI agents
+---
+
+import { Callout } from 'nextra/components'
+
+<Callout type="info">
+**Are you an AI?** Check [/llms.txt](/llms.txt) or add `.md` to any page URL to get raw markdown and save tokens.
+</Callout>
+
+# Open Agent
+
+Run AI coding agents on your own server. Start a task, close your laptop, check back tomorrow.
+
+## The Problem
+
+You're using Claude Code or Cursor. It's good. But:
+
+- **Sessions time out.** That 4-hour refactor? Dead at 80%.
+- **Your code goes somewhere.** Fine for side projects. Not fine for work.
+- **You can't customize it.** Same generic behavior for every project.
+
+Open Agent fixes all three.
+
+## What It Actually Does
+
+Open Agent is a control plane that runs on your server. You connect to it from a web dashboard, iOS app, or CLI. You tell an agent what to do. It works until it's done, whether that takes 10 minutes or 10 hours.
+
+Your code stays on your machine. You define how the agent behaves through a git repo of skills, commands, and rules. Each project gets its own isolated container.
+
+Under the hood, it runs [OpenCode](https://opencode.ai) for the actual agent work. Open Agent handles everything around it: starting tasks, streaming progress, managing environments, syncing configuration.
+
+## When To Use This
+
+**You have a task that takes hours.**
+Point an agent at a GitHub issue before bed. Wake up to a PR. Review the diff, not the process.
+
+**Your code can't leave your machines.**
+Healthcare, finance, defense, or just "my company said no." Run local inference or route API calls through your own infrastructure.
+
+**You want agents that know your codebase.**
+Write skills that encode your team's patterns. "When touching the payments module, always run the fraud detection tests." The agent follows them.
+
+**You run multiple projects with different needs.**
+Container workspaces isolate everything. Your Node project doesn't see your Python project. Different tools, different rules, no cross-contamination.
+
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     Your Devices                         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐  │
+│  │ Web Dashboard│  │  iOS App   │  │ Claude Code CLI │  │
+│  └──────┬──────┘  └──────┬──────┘  └────────┬────────┘  │
+└─────────┼────────────────┼──────────────────┼───────────┘
+          │                │                  │
+          └────────────────┼──────────────────┘
+                           │ HTTPS
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│                   Your Server (~$30/mo)                  │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │              Open Agent                          │    │
+│  │  • Starts and monitors agent tasks               │    │
+│  │  • Manages isolated container workspaces         │    │
+│  │  • Syncs skills and rules from your git repo     │    │
+│  └──────────────────────┬──────────────────────────┘    │
+│                         │                                │
+│  ┌──────────────────────▼──────────────────────────┐    │
+│  │              OpenCode                            │    │
+│  │  • Runs the actual agent logic                   │    │
+│  │  • Executes tools, writes code                   │    │
+│  │  • Talks to Claude/GPT/local models              │    │
+│  └─────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────┘
+```
+
+Open Agent doesn't do AI. It manages the infrastructure around AI. OpenCode does the thinking. Open Agent makes sure it has somewhere to run, something to work on, and a way for you to watch.
+
+**Note**: The setup guide installs the **backend** on your server. For the dashboard, you have options:
+- **Vercel**: Host the Next.js dashboard for free
+- **Local**: Run `bun dev` in the dashboard folder on your machine
+- **iOS**: Download the app and enter your server URL
+
+## Setup Takes 5 Minutes
+
+If you have a server and a domain, tell Claude or Cursor:
+
+> "Deploy Open Agent on my server at `1.2.3.4` with domain `agent.example.com`. Read INSTALL.md for the full guide."
+
+It handles systemd, nginx, SSL, everything. Or [do it manually](/setup) if you prefer.
+
+Don't have a server? Get one from [Hetzner](https://www.hetzner.com/) or DigitalOcean for ~$30/month.
+
+## Next
+
+1. **[Setup](/setup)** to get Open Agent running on your server
+2. **[First Mission](/first-mission)** to run your first agent task
+3. **[Library](/library)** to customize how your agents behave

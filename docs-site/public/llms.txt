@@ -1,0 +1,87 @@
+# Open Agent Documentation
+# For AI Agents and LLMs
+# https://openagent.thomas.md
+
+> Open Agent is a self-hosted control plane for autonomous AI agents.
+> Isolated Linux workspaces, git-backed configuration, remote mission control.
+
+## How to Access Documentation
+
+All docs are available as raw markdown:
+
+1. **Automatic**: If your User-Agent is a known LLM (ChatGPT, GPTBot, PerplexityBot, ClaudeBot, etc.), you automatically get raw markdown
+2. **Add .md extension**: `/setup.md` returns raw markdown
+3. **Accept header**: `Accept: text/markdown`
+4. **Query param**: `/setup?format=md`
+5. **API directly**: `/api/docs/setup`
+
+Known LLM User-Agents that get markdown automatically:
+ChatGPT-User, GPTBot, Claude-Web, ClaudeBot, PerplexityBot, Applebot, cohere-ai, anthropic-ai, Google-Extended, CCBot
+
+## Documentation Index
+
+### Getting Started
+- /index.md - Overview: what Open Agent is and why
+- /setup.md - Installation guide (AI-assisted and manual)
+- /first-mission.md - Your first 10 minutes after setup
+
+### Core Concepts
+- /library.md - Git-backed config: skills, commands, rules, MCPs
+- /workspaces.md - Isolated environments (host and containers)
+
+### Reference
+- /api.md - Complete API reference (missions, workspaces, library)
+- /desktop.md - Headless browser and GUI automation (optional)
+
+### Special Endpoints
+- /api/docs/_index - JSON index of all documents
+- /api/docs/_all - All documentation concatenated (for full context loading)
+
+## Quick Reference
+
+### Architecture
+```
+Your Devices (Dashboard, iOS, CLI)
+        │
+        ▼ HTTPS
+┌───────────────────────────┐
+│      Your Server          │
+│  ┌─────────────────────┐  │
+│  │    Open Agent       │  │  ← Orchestration, workspaces, library
+│  └──────────┬──────────┘  │
+│             ▼             │
+│  ┌─────────────────────┐  │
+│  │     OpenCode        │  │  ← Model inference, tool execution
+│  └─────────────────────┘  │
+└───────────────────────────┘
+```
+
+### Scoping Model
+| Scope | Components |
+|-------|------------|
+| Global | Auth, providers, MCPs, agents, commands, rules |
+| Per-Workspace | Skills, tools, plugins, installed software |
+| Per-Mission | Agent selection, workspace, conversation |
+
+### Key API Endpoints
+```
+POST /api/control/missions        # Create mission
+POST /api/control/missions/:id/load  # Load mission
+POST /api/control/message         # Send message to agent
+GET  /api/control/stream          # SSE event stream
+POST /api/workspaces              # Create workspace
+POST /api/workspaces/:id/exec     # Execute command
+```
+
+## For AI Agents Deploying Open Agent
+
+1. Ask user for: server IP, domain, SSH access
+2. Read `/api/docs/_all` for complete installation context
+3. Or read `/setup.md` for condensed instructions
+4. Full manual: INSTALL.md in the repository
+
+## Source
+
+- Repository: https://github.com/Th0rgal/open-agent
+- Library Template: https://github.com/Th0rgal/openagent-library-template
+- Docs: https://openagent.thomas.md

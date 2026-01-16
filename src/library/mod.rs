@@ -13,6 +13,7 @@
 
 pub mod env_crypto;
 mod git;
+pub mod rename;
 pub mod types;
 
 use anyhow::{Context, Result};

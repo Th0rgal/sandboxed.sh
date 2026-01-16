@@ -29,11 +29,13 @@ import {
   Download,
   FileText,
   ExternalLink,
+  Pencil,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
 import { useLibrary } from '@/contexts/library-context';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
+import { RenameDialog } from '@/components/rename-dialog';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -640,6 +642,7 @@ export default function SkillsPage() {
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [showNewFileDialog, setShowNewFileDialog] = useState(false);
   const [showCommitDialog, setShowCommitDialog] = useState(false);
+  const [showRenameDialog, setShowRenameDialog] = useState(false);
   const [newSkillName, setNewSkillName] = useState('');
   const [newSkillError, setNewSkillError] = useState<string | null>(null);
   const [commitMessage, setCommitMessage] = useState('');
@@ -921,6 +924,17 @@ Describe what this skill does.
     await loadSkill(skill.name);
   };
 
+  const handleRenameSuccess = async () => {
+    await refresh();
+    // The skill was renamed, so we need to clear selection
+    // since the old name no longer exists
+    setSelectedSkill(null);
+    setSelectedFile(null);
+    setFileContent('');
+    setFrontmatter({});
+    setBodyContent('');
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
@@ -1104,13 +1118,22 @@ Describe what this skill does.
                 <div className="flex items-center gap-2">
                   {isDirty && <span className="text-xs text-amber-400">Unsaved</span>}
                   {selectedFile === 'SKILL.md' && (
-                    <button
-                      onClick={handleDeleteSkill}
-                      className="p-1.5 rounded-lg text-red-400 hover:bg-red-500/10 transition-colors"
-                      title="Delete Skill"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
+                    <>
+                      <button
+                        onClick={() => setShowRenameDialog(true)}
+                        className="p-1.5 rounded-lg text-white/60 hover:text-white hover:bg-white/[0.06] transition-colors"
+                        title="Rename Skill"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        onClick={handleDeleteSkill}
+                        className="p-1.5 rounded-lg text-red-400 hover:bg-red-500/10 transition-colors"
+                        title="Delete Skill"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </>
                   )}
                   <button
                     onClick={handleSave}
@@ -1273,6 +1296,17 @@ Describe what this skill does.
           onClose={() => setShowNewFileDialog(false)}
           onCreate={handleCreateFile}
           skillName={selectedSkill.name}
+        />
+      )}
+
+      {/* Rename Dialog */}
+      {selectedSkill && (
+        <RenameDialog
+          open={showRenameDialog}
+          onOpenChange={setShowRenameDialog}
+          itemType="skill"
+          currentName={selectedSkill.name}
+          onSuccess={handleRenameSuccess}
         />
       )}
     </div>

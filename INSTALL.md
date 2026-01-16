@@ -767,20 +767,40 @@ Note: Multi-user mode provides separate login credentials but does **not** provi
 
 ## 12) Dashboard Configuration
 
-### 12.1 Web Dashboard
+This guide installs the **backend** on your server. The dashboard (frontend) is separate and you have several options:
 
-The web dashboard auto-detects the backend URL. For production, set the environment variable:
+| Option | Best For | Setup |
+|--------|----------|-------|
+| **Vercel** | Production, always accessible | Deploy `dashboard/` to Vercel |
+| **Local** | Development, quick testing | Run `bun dev` in dashboard folder |
+| **iOS App** | Mobile access | Enter backend URL in app |
+
+### 12.1 Web Dashboard (Vercel)
+
+Deploy the `dashboard/` folder to [Vercel](https://vercel.com):
+
+1. Connect your repo to Vercel
+2. Set the root directory to `dashboard`
+3. Add environment variable: `NEXT_PUBLIC_API_URL=https://agent.yourdomain.com`
+4. Deploy
+
+The dashboard will connect to your backend server.
+
+### 12.2 Web Dashboard (Local)
+
+Run the dashboard locally on your machine:
 
 ```bash
-# When building/running the Next.js dashboard
-NEXT_PUBLIC_API_URL=https://agent.yourdomain.com
+cd dashboard
+bun install
+NEXT_PUBLIC_API_URL=https://agent.yourdomain.com bun dev
 ```
 
-Or configure it at runtime via the Settings page.
+Then open `http://localhost:3000`.
 
-### 12.2 iOS App
+### 12.3 iOS App
 
-On first launch, the iOS app prompts for the server URL. Enter your production URL (e.g., `https://agent.yourdomain.com`).
+On first launch, the iOS app prompts for the server URL. Enter your backend URL (e.g., `https://agent.yourdomain.com`).
 
 To change later: **Menu (⋮) → Settings**
 

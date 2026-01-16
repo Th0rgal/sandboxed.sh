@@ -201,6 +201,8 @@ export default function SettingsPage() {
     try {
       setRestarting(true);
       setError(null);
+      // Sync config before restarting
+      await sync();
       await restartOpenCodeService();
       setRestartSuccess(true);
       setNeedsRestart(false);
@@ -328,47 +330,6 @@ export default function SettingsPage() {
         </div>
       )}
 
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-semibold text-white">Configs</h1>
-          <p className="text-sm text-white/50 mt-1">
-            Configure OpenCode and OpenAgent settings
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={loadSettings}
-            disabled={loading}
-            className="flex items-center gap-2 px-3 py-1.5 text-sm text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] rounded-lg transition-colors disabled:opacity-50"
-          >
-            <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
-            Reload
-          </button>
-          <button
-            onClick={handleRestart}
-            disabled={restarting}
-            className={cn(
-              'flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors',
-              needsRestart
-                ? 'text-white bg-amber-500 hover:bg-amber-600'
-                : restartSuccess
-                  ? 'text-emerald-400 bg-emerald-500/10'
-                  : 'text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08]'
-            )}
-          >
-            {restarting ? (
-              <Loader className="h-4 w-4 animate-spin" />
-            ) : restartSuccess ? (
-              <Check className="h-4 w-4" />
-            ) : (
-              <RotateCcw className="h-4 w-4" />
-            )}
-            {restarting ? 'Restarting...' : restartSuccess ? 'Restarted!' : 'Restart OpenCode'}
-          </button>
-        </div>
-      </div>
-
       {/* Error Display */}
       {error && (
         <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/20 flex items-start gap-3">
@@ -481,6 +442,37 @@ export default function SettingsPage() {
               )}
               {saving ? 'Saving...' : saveSuccess ? 'Saved!' : 'Save'}
             </button>
+            <button
+              onClick={loadSettings}
+              disabled={loading}
+              title="Reloads the source from disk"
+              className="flex items-center gap-2 px-3 py-1.5 text-sm text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] rounded-lg transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
+              Reload
+            </button>
+            <button
+              onClick={handleRestart}
+              disabled={restarting}
+              title="Syncs config, and restarts OpenCode"
+              className={cn(
+                'flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors',
+                needsRestart
+                  ? 'text-white bg-amber-500 hover:bg-amber-600'
+                  : restartSuccess
+                    ? 'text-emerald-400 bg-emerald-500/10'
+                    : 'text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08]'
+              )}
+            >
+              {restarting ? (
+                <Loader className="h-4 w-4 animate-spin" />
+              ) : restartSuccess ? (
+                <Check className="h-4 w-4" />
+              ) : (
+                <RotateCcw className="h-4 w-4" />
+              )}
+              {restarting ? 'Restarting...' : restartSuccess ? 'Restarted!' : 'Restart'}
+            </button>
           </div>
         </div>
 
@@ -520,25 +512,58 @@ export default function SettingsPage() {
             <h2 className="text-lg font-medium text-white">OpenAgent Settings</h2>
             <p className="text-sm text-white/50">Configure agent visibility in mission dialog</p>
           </div>
-          <button
-            onClick={handleSaveOpenAgent}
-            disabled={savingOpenAgent || !isOpenAgentDirty}
-            className={cn(
-              'flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors',
-              isOpenAgentDirty
-                ? 'text-white bg-indigo-500 hover:bg-indigo-600'
-                : 'text-white/40 bg-white/[0.04] cursor-not-allowed'
-            )}
-          >
-            {savingOpenAgent ? (
-              <Loader className="h-4 w-4 animate-spin" />
-            ) : openAgentSaveSuccess ? (
-              <Check className="h-4 w-4 text-emerald-400" />
-            ) : (
-              <Save className="h-4 w-4" />
-            )}
-            {savingOpenAgent ? 'Saving...' : openAgentSaveSuccess ? 'Saved!' : 'Save'}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleSaveOpenAgent}
+              disabled={savingOpenAgent || !isOpenAgentDirty}
+              className={cn(
+                'flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors',
+                isOpenAgentDirty
+                  ? 'text-white bg-indigo-500 hover:bg-indigo-600'
+                  : 'text-white/40 bg-white/[0.04] cursor-not-allowed'
+              )}
+            >
+              {savingOpenAgent ? (
+                <Loader className="h-4 w-4 animate-spin" />
+              ) : openAgentSaveSuccess ? (
+                <Check className="h-4 w-4 text-emerald-400" />
+              ) : (
+                <Save className="h-4 w-4" />
+              )}
+              {savingOpenAgent ? 'Saving...' : openAgentSaveSuccess ? 'Saved!' : 'Save'}
+            </button>
+            <button
+              onClick={loadSettings}
+              disabled={loading}
+              title="Reloads the source from disk"
+              className="flex items-center gap-2 px-3 py-1.5 text-sm text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] rounded-lg transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
+              Reload
+            </button>
+            <button
+              onClick={handleRestart}
+              disabled={restarting}
+              title="Syncs config, and restarts OpenCode"
+              className={cn(
+                'flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors',
+                needsRestart
+                  ? 'text-white bg-amber-500 hover:bg-amber-600'
+                  : restartSuccess
+                    ? 'text-emerald-400 bg-emerald-500/10'
+                    : 'text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08]'
+              )}
+            >
+              {restarting ? (
+                <Loader className="h-4 w-4 animate-spin" />
+              ) : restartSuccess ? (
+                <Check className="h-4 w-4" />
+              ) : (
+                <RotateCcw className="h-4 w-4" />
+              )}
+              {restarting ? 'Restarting...' : restartSuccess ? 'Restarted!' : 'Restart'}
+            </button>
+          </div>
         </div>
 
         {/* Agent Visibility */}

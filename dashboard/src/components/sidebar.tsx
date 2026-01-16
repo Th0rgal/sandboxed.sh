@@ -139,8 +139,8 @@ export function Sidebar() {
         </div>
       </div>
 
-      {/* Navigation */}
-      <nav className="flex flex-1 flex-col gap-1 p-3">
+      {/* Navigation - scrollable when content overflows */}
+      <nav className="flex-1 overflow-y-auto p-3 space-y-1">
         {navigation.map((item) => {
           const isCurrentPath = pathname === item.href;
           const isChildActive = item.children?.some((child) => pathname === child.href);
