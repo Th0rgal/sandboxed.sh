@@ -14,12 +14,12 @@ use tokio::sync::mpsc;
 /// Reduced from 10 minutes since we now have SSE inactivity detection.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Interval for logging heartbeat while waiting for SSE events (30 seconds).
-const HEARTBEAT_LOG_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Maximum time to wait for SSE activity before considering the connection stale.
-/// This prevents infinite hangs when OpenCode stops sending events mid-stream.
+/// Maximum time to wait for SSE activity before checking tool status.
+/// If tools are still running, we extend the timeout; otherwise we disconnect.
 const SSE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(180); // 3 minutes
+
+/// How often to check if tools are still running when SSE is inactive.
+const TOOL_STATUS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Number of retries for transient network failures.
 const NETWORK_RETRY_COUNT: u32 = 3;
@@ -224,18 +224,30 @@ impl OpenCodeClient {
             tracing::warn!(session_id = %session_id_clone, "SSE curl process started, reading lines");
 
             let mut last_activity = std::time::Instant::now();
+            // Track running tool call IDs to extend timeout while tools execute
+            let mut running_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             loop {
                 line.clear();
 
                 // Apply inactivity timeout based on meaningful SSE activity (not just bytes).
+                // If tools are currently running, we use a longer effective timeout.
                 let idle = last_activity.elapsed();
-                if idle >= SSE_INACTIVITY_TIMEOUT {
+                let effective_timeout = if running_tools.is_empty() {
+                    SSE_INACTIVITY_TIMEOUT
+                } else {
+                    // When tools are running, extend timeout significantly (10 minutes)
+                    // Long-running tools like vision analysis can take several minutes
+                    Duration::from_secs(600)
+                };
+
+                if idle >= effective_timeout {
                     let idle_secs = idle.as_secs();
                     tracing::error!(
                         session_id = %session_id_clone,
                         idle_secs = idle_secs,
                         event_count = event_count,
+                        running_tools = running_tools.len(),
                         "SSE inactivity timeout - OpenCode stopped sending meaningful events"
                     );
                     let _ = event_tx
@@ -250,13 +262,36 @@ impl OpenCodeClient {
                     return;
                 }
 
-                let remaining = SSE_INACTIVITY_TIMEOUT.saturating_sub(idle);
+                // Log periodically when tools are running but SSE is quiet
+                if !running_tools.is_empty() && idle >= TOOL_STATUS_CHECK_INTERVAL {
+                    let idle_secs = idle.as_secs();
+                    if idle_secs % 30 == 0 {
+                        tracing::info!(
+                            session_id = %session_id_clone,
+                            idle_secs = idle_secs,
+                            running_tools = ?running_tools,
+                            "SSE quiet but tools still running - extending timeout"
+                        );
+                    }
+                }
+
+                let remaining = effective_timeout.saturating_sub(idle);
                 let read_result =
                     tokio::time::timeout(remaining, reader.read_line(&mut line)).await;
 
                 match read_result {
                     Err(_timeout) => {
                         let idle_secs = last_activity.elapsed().as_secs();
+                        // Double-check: if tools are running, don't timeout yet
+                        if !running_tools.is_empty() {
+                            tracing::warn!(
+                                session_id = %session_id_clone,
+                                idle_secs = idle_secs,
+                                running_tools = ?running_tools,
+                                "Read timeout but tools still running - continuing to wait"
+                            );
+                            continue;
+                        }
                         tracing::error!(
                             session_id = %session_id_clone,
                             idle_secs = idle_secs,
@@ -307,12 +342,33 @@ impl OpenCodeClient {
                                     last_activity = std::time::Instant::now();
                                 }
 
-                                if let Some(event) = parsed.event {
+                                if let Some(ref event) = parsed.event {
+                                    // Track running tools to extend timeout while they execute
+                                    match event {
+                                        OpenCodeEvent::ToolCall { tool_call_id, name, .. } => {
+                                            tracing::debug!(
+                                                tool_call_id = %tool_call_id,
+                                                tool_name = %name,
+                                                "Tool started - tracking for timeout extension"
+                                            );
+                                            running_tools.insert(tool_call_id.clone());
+                                        }
+                                        OpenCodeEvent::ToolResult { tool_call_id, name, .. } => {
+                                            tracing::debug!(
+                                                tool_call_id = %tool_call_id,
+                                                tool_name = %name,
+                                                "Tool completed - removing from tracking"
+                                            );
+                                            running_tools.remove(tool_call_id);
+                                        }
+                                        _ => {}
+                                    }
+
                                     event_count += 1;
                                     let is_complete =
                                         matches!(event, OpenCodeEvent::MessageComplete { .. });
 
-                                    if event_tx.send(event).await.is_err() {
+                                    if event_tx.send(event.clone()).await.is_err() {
                                         tracing::debug!(
                                             session_id = %session_id_clone,
                                             "SSE receiver dropped"
