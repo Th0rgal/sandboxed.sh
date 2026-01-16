@@ -505,6 +505,20 @@ fn stream_open_agent_update() -> impl Stream<Item = Result<Event, std::convert::
             progress: Some(15),
         }).unwrap()));
 
+        // Reset any local changes before checkout to prevent conflicts
+        let _ = Command::new("git")
+            .args(["reset", "--hard", "HEAD"])
+            .current_dir(OPEN_AGENT_REPO_PATH)
+            .output()
+            .await;
+
+        // Clean untracked files that might interfere
+        let _ = Command::new("git")
+            .args(["clean", "-fd"])
+            .current_dir(OPEN_AGENT_REPO_PATH)
+            .output()
+            .await;
+
         // Checkout the tag/branch
         let checkout_result = Command::new("git")
             .args(["checkout", &latest_tag])
@@ -647,6 +661,9 @@ fn stream_open_agent_update() -> impl Stream<Item = Result<Event, std::convert::
             message: format!("Binaries installed, restarting service to complete update to {}...", latest_tag),
             progress: Some(100),
         }).unwrap()));
+
+        // Small delay to ensure the SSE event is flushed before we restart
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Restart the service - this will terminate our process, so no code after this
         // will execute. The client should poll /api/health to confirm the new version.
