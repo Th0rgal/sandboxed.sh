@@ -437,5 +437,34 @@ pub async fn sync_global_plugins(plugins: &HashMap<String, Plugin>) -> anyhow::R
     Ok(())
 }
 
+/// Get the list of installed plugins from OpenCode's global config.
+/// Returns a list of plugin specs (e.g., "opencode-gemini-auth@latest", "oh-my-opencode").
+pub async fn get_installed_plugins() -> Vec<String> {
+    let config_path = resolve_opencode_config_path();
+    if !config_path.exists() {
+        return Vec::new();
+    }
+
+    let contents = match tokio::fs::read_to_string(&config_path).await {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let root: Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    root.get("plugin")
+        .or_else(|| root.get("plugins"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|value| value.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Shared store type.
 pub type SharedOpenCodeStore = Arc<OpenCodeStore>;

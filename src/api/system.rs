@@ -59,6 +59,27 @@ pub struct UpdateProgressEvent {
     pub progress: Option<u8>, // 0-100
 }
 
+/// Information about an installed OpenCode plugin.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstalledPluginInfo {
+    /// Plugin package name (e.g., "opencode-gemini-auth")
+    pub package: String,
+    /// Full spec from config (e.g., "opencode-gemini-auth@latest")
+    pub spec: String,
+    /// Currently installed version (if detectable)
+    pub installed_version: Option<String>,
+    /// Latest version available on npm
+    pub latest_version: Option<String>,
+    /// Whether an update is available
+    pub update_available: bool,
+}
+
+/// Response for installed plugins endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstalledPluginsResponse {
+    pub plugins: Vec<InstalledPluginInfo>,
+}
+
 // Type alias for the boxed stream to avoid opaque type mismatch
 type UpdateStream = Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send>>;
 
@@ -67,6 +88,8 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/components", get(get_components))
         .route("/components/:name/update", post(update_component))
+        .route("/plugins/installed", get(get_installed_plugins))
+        .route("/plugins/:package/update", post(update_plugin))
 }
 
 /// Get information about all system components.
@@ -860,6 +883,215 @@ fn stream_oh_my_opencode_update() -> impl Stream<Item = Result<Event, std::conve
                 yield Ok(Event::default().data(serde_json::to_string(&UpdateProgressEvent {
                     event_type: "error".to_string(),
                     message: format!("Failed to run update: {}", e),
+                    progress: None,
+                }).unwrap()));
+            }
+        }
+    }
+}
+
+/// Get all installed OpenCode plugins with version information.
+async fn get_installed_plugins() -> Json<InstalledPluginsResponse> {
+    let plugin_specs = crate::opencode_config::get_installed_plugins().await;
+
+    let mut plugins = Vec::new();
+
+    for spec in plugin_specs {
+        let (package, _pinned_version) = split_package_spec(&spec);
+
+        // Get installed version from bun cache
+        let installed_version = get_plugin_installed_version(&package).await;
+
+        // Get latest version from npm
+        let latest_version = get_plugin_latest_version(&package).await;
+
+        // Determine if update is available
+        let update_available = match (&installed_version, &latest_version) {
+            (Some(installed), Some(latest)) => {
+                installed != latest && version_is_newer(latest, installed)
+            }
+            (None, Some(_)) => true, // Not installed locally but available
+            _ => false,
+        };
+
+        plugins.push(InstalledPluginInfo {
+            package: package.clone(),
+            spec: spec.clone(),
+            installed_version,
+            latest_version,
+            update_available,
+        });
+    }
+
+    Json(InstalledPluginsResponse { plugins })
+}
+
+/// Split a package spec into (name, version).
+/// E.g., "opencode-gemini-auth@1.2.3" -> ("opencode-gemini-auth", Some("1.2.3"))
+fn split_package_spec(spec: &str) -> (String, Option<String>) {
+    // Handle scoped packages like @scope/name@version
+    if spec.starts_with('@') {
+        if let Some(slash_idx) = spec.find('/') {
+            let after_scope = &spec[slash_idx + 1..];
+            if let Some(at_idx) = after_scope.find('@') {
+                let name = format!("{}/{}", &spec[..slash_idx], &after_scope[..at_idx]);
+                let version = &after_scope[at_idx + 1..];
+                if !version.is_empty() && version != "latest" {
+                    return (name, Some(version.to_string()));
+                }
+                return (name, None);
+            }
+        }
+        return (spec.to_string(), None);
+    }
+
+    // Non-scoped package
+    if let Some(at_idx) = spec.find('@') {
+        let name = &spec[..at_idx];
+        let version = &spec[at_idx + 1..];
+        if !version.is_empty() && version != "latest" {
+            return (name.to_string(), Some(version.to_string()));
+        }
+        return (name.to_string(), None);
+    }
+
+    (spec.to_string(), None)
+}
+
+/// Get the installed version of a plugin from bun cache.
+async fn get_plugin_installed_version(package: &str) -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+
+    // Search bun cache for the package
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                "find {}/.bun/install/cache -maxdepth 1 -name '{}@*' 2>/dev/null | sort -V | tail -1",
+                home,
+                package.replace('/', "-") // Handle scoped packages in filesystem
+            ),
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+
+    // Extract version from directory name (e.g., "opencode-gemini-auth@1.3.7@@@1" -> "1.3.7")
+    let dirname = std::path::Path::new(&path).file_name()?.to_str()?;
+
+    // Find the version part between first @ and second @
+    let after_name = dirname.strip_prefix(&format!("{}@", package.replace('/', "-")))?;
+    let version = after_name.split('@').next()?;
+
+    Some(version.to_string())
+}
+
+/// Get the latest version of a plugin from npm registry.
+async fn get_plugin_latest_version(package: &str) -> Option<String> {
+    let client = reqwest::Client::new();
+    let url = format!("https://registry.npmjs.org/{}/latest", package);
+
+    let resp = client.get(&url).send().await.ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let json: serde_json::Value = resp.json().await.ok()?;
+    json.get("version")?.as_str().map(|s| s.to_string())
+}
+
+/// Update a plugin to the latest version.
+async fn update_plugin(
+    Path(package): Path<String>,
+) -> Result<Sse<UpdateStream>, (StatusCode, String)> {
+    Ok(Sse::new(Box::pin(stream_plugin_update(package))))
+}
+
+/// Stream the plugin update process.
+fn stream_plugin_update(package: String) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    async_stream::stream! {
+        yield Ok(Event::default().data(serde_json::to_string(&UpdateProgressEvent {
+            event_type: "log".to_string(),
+            message: format!("Starting {} update...", package),
+            progress: Some(0),
+        }).unwrap()));
+
+        // Clear bun cache for this package
+        yield Ok(Event::default().data(serde_json::to_string(&UpdateProgressEvent {
+            event_type: "log".to_string(),
+            message: "Clearing package cache...".to_string(),
+            progress: Some(10),
+        }).unwrap()));
+
+        let _ = Command::new("bun")
+            .args(["pm", "cache", "rm"])
+            .output()
+            .await;
+
+        // Update the plugin by reinstalling with @latest
+        yield Ok(Event::default().data(serde_json::to_string(&UpdateProgressEvent {
+            event_type: "log".to_string(),
+            message: format!("Installing {}@latest...", package),
+            progress: Some(30),
+        }).unwrap()));
+
+        // Use bunx to trigger the plugin install (which will cache the latest version)
+        let install_result = Command::new("bunx")
+            .args([&format!("{}@latest", package), "--help"])
+            .output()
+            .await;
+
+        match install_result {
+            Ok(_) => {
+                yield Ok(Event::default().data(serde_json::to_string(&UpdateProgressEvent {
+                    event_type: "log".to_string(),
+                    message: "Package downloaded, updating config...".to_string(),
+                    progress: Some(70),
+                }).unwrap()));
+
+                // Update the opencode config to use @latest
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                let config_path = format!("{}/.config/opencode/opencode.json", home);
+
+                if let Ok(contents) = tokio::fs::read_to_string(&config_path).await {
+                    if let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&contents) {
+                        if let Some(plugins) = root.get_mut("plugin").and_then(|v| v.as_array_mut()) {
+                            // Update the plugin spec to @latest
+                            for p in plugins.iter_mut() {
+                                if let Some(s) = p.as_str() {
+                                    if s.starts_with(&package) {
+                                        *p = serde_json::json!(format!("{}@latest", package));
+                                    }
+                                }
+                            }
+
+                            if let Ok(payload) = serde_json::to_string_pretty(&root) {
+                                let _ = tokio::fs::write(&config_path, payload).await;
+                            }
+                        }
+                    }
+                }
+
+                yield Ok(Event::default().data(serde_json::to_string(&UpdateProgressEvent {
+                    event_type: "complete".to_string(),
+                    message: format!("{} updated successfully!", package),
+                    progress: Some(100),
+                }).unwrap()));
+            }
+            Err(e) => {
+                yield Ok(Event::default().data(serde_json::to_string(&UpdateProgressEvent {
+                    event_type: "error".to_string(),
+                    message: format!("Failed to update {}: {}", package, e),
                     progress: None,
                 }).unwrap()));
             }
