@@ -294,6 +294,9 @@ pub struct SaveWorkspaceTemplateRequest {
     pub env_vars: Option<HashMap<String, String>>,
     pub encrypted_keys: Option<Vec<String>>,
     pub init_script: Option<String>,
+    /// Whether to share the host network (default: true).
+    /// Set to false for isolated networking (e.g., Tailscale).
+    pub shared_network: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -958,6 +961,7 @@ async fn save_workspace_template(
         env_vars: req.env_vars.unwrap_or_default(),
         encrypted_keys: req.encrypted_keys.unwrap_or_default(),
         init_script: req.init_script.unwrap_or_default(),
+        shared_network: req.shared_network,
     };
 
     library

@@ -1812,6 +1812,7 @@ export interface WorkspaceTemplate {
   env_vars: Record<string, string>;
   encrypted_keys: string[];
   init_script: string;
+  shared_network?: boolean | null;
 }
 
 export async function listWorkspaceTemplates(): Promise<WorkspaceTemplateSummary[]> {
@@ -1835,6 +1836,7 @@ export async function saveWorkspaceTemplate(
     env_vars?: Record<string, string>;
     encrypted_keys?: string[];
     init_script?: string;
+    shared_network?: boolean | null;
   }
 ): Promise<void> {
   const res = await apiFetch(`/api/library/workspace-template/${encodeURIComponent(name)}`, {
@@ -1863,6 +1865,7 @@ export async function renameWorkspaceTemplate(oldName: string, newName: string):
     env_vars: template.env_vars,
     encrypted_keys: template.encrypted_keys,
     init_script: template.init_script,
+    shared_network: template.shared_network,
   });
   // Delete old template
   await deleteWorkspaceTemplate(oldName);
@@ -1951,6 +1954,7 @@ export interface Workspace {
   distro?: string | null;
   env_vars: Record<string, string>;
   init_script?: string | null;
+  shared_network?: boolean | null;
 }
 
 // List workspaces
@@ -1978,6 +1982,7 @@ export async function createWorkspace(data: {
   distro?: string;
   env_vars?: Record<string, string>;
   init_script?: string;
+  shared_network?: boolean | null;
 }): Promise<Workspace> {
   const res = await apiFetch("/api/workspaces", {
     method: "POST",
@@ -1999,6 +2004,7 @@ export async function updateWorkspace(
     distro?: string | null;
     env_vars?: Record<string, string>;
     init_script?: string | null;
+    shared_network?: boolean | null;
   }
 ): Promise<Workspace> {
   const res = await apiFetch(`/api/workspaces/${id}`, {

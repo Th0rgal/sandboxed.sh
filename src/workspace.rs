@@ -119,6 +119,11 @@ pub struct Workspace {
     /// Plugin identifiers for hooks
     #[serde(default)]
     pub plugins: Vec<String>,
+    /// Whether to share the host network (default: true).
+    /// When true, bind-mounts /etc/resolv.conf for DNS.
+    /// Set to false for isolated networking (e.g., Tailscale).
+    #[serde(default)]
+    pub shared_network: Option<bool>,
 }
 
 impl Workspace {
@@ -140,6 +145,7 @@ impl Workspace {
             skills: Vec::new(),
             tools: Vec::new(),
             plugins: Vec::new(),
+            shared_network: None,
         }
     }
 
@@ -161,6 +167,7 @@ impl Workspace {
             skills: Vec::new(),
             tools: Vec::new(),
             plugins: Vec::new(),
+            shared_network: None,
         }
     }
 }
@@ -348,6 +355,7 @@ impl WorkspaceStore {
                     skills: Vec::new(),
                     tools: Vec::new(),
                     plugins: Vec::new(),
+                    shared_network: None, // Default to shared network
                 };
 
                 orphaned.push(workspace);
@@ -509,6 +517,7 @@ fn opencode_entry_from_mcp(
     workspace_root: &Path,
     workspace_type: WorkspaceType,
     workspace_env: &HashMap<String, String>,
+    shared_network: Option<bool>,
 ) -> serde_json::Value {
     fn resolve_command_path(cmd: &str) -> String {
         let cmd_path = Path::new(cmd);
@@ -638,7 +647,18 @@ fn opencode_entry_from_mcp(
                         context_dir_name,
                     );
                 }
-                cmd.extend(nspawn::tailscale_nspawn_extra_args(&merged_env));
+
+                // Network configuration based on shared_network setting:
+                // - shared_network=true (default): Share host network, bind-mount /etc/resolv.conf for DNS
+                // - shared_network=false: Isolated network (--network-veth), used with Tailscale
+                let use_shared_network = shared_network.unwrap_or(true);
+                if use_shared_network {
+                    // Bind-mount host's resolv.conf for DNS resolution in shared network mode
+                    cmd.push("--bind-ro=/etc/resolv.conf".to_string());
+                } else {
+                    // Isolated network mode - use Tailscale network configuration
+                    cmd.extend(nspawn::tailscale_nspawn_extra_args(&merged_env));
+                }
                 for (key, value) in &nspawn_env {
                     cmd.push(format!("--setenv={}={}", key, value));
                 }
@@ -666,6 +686,7 @@ async fn write_opencode_config(
     workspace_type: WorkspaceType,
     workspace_env: &HashMap<String, String>,
     skill_allowlist: Option<&[String]>,
+    shared_network: Option<bool>,
 ) -> anyhow::Result<()> {
     let mut mcp_map = serde_json::Map::new();
     let mut used = std::collections::HashSet::new();
@@ -688,6 +709,7 @@ async fn write_opencode_config(
                 workspace_root,
                 workspace_type,
                 workspace_env,
+                shared_network,
             ),
         );
     }
@@ -1243,6 +1265,7 @@ pub async fn prepare_custom_workspace(
         WorkspaceType::Host,
         &workspace_env,
         None,
+        None, // shared_network: not relevant for host workspaces
     )
     .await?;
     Ok(workspace_dir)
@@ -1279,6 +1302,7 @@ pub async fn prepare_mission_workspace_in(
         workspace.workspace_type,
         &workspace.env_vars,
         skill_allowlist,
+        workspace.shared_network,
     )
     .await?;
     Ok(dir)
@@ -1307,6 +1331,7 @@ pub async fn prepare_mission_workspace_with_skills(
         workspace.workspace_type,
         &workspace.env_vars,
         skill_allowlist,
+        workspace.shared_network,
     )
     .await?;
 
@@ -1407,6 +1432,7 @@ pub async fn prepare_task_workspace(
         WorkspaceType::Host,
         &workspace_env,
         None,
+        None, // shared_network: not relevant for host workspaces
     )
     .await?;
     Ok(dir)
@@ -1571,6 +1597,7 @@ pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::
             WorkspaceType::Host,
             &workspace_env,
             None,
+            None, // shared_network: not relevant for host workspaces
         )
         .await
         .is_ok()

@@ -69,6 +69,9 @@ pub struct CreateWorkspaceRequest {
     pub env_vars: Option<HashMap<String, String>>,
     /// Init script to run when the workspace is built/rebuilt
     pub init_script: Option<String>,
+    /// Whether to share the host network (default: true).
+    /// Set to false for isolated networking (e.g., Tailscale).
+    pub shared_network: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +92,9 @@ pub struct UpdateWorkspaceRequest {
     pub env_vars: Option<HashMap<String, String>>,
     /// Init script to run when the workspace is built/rebuilt
     pub init_script: Option<String>,
+    /// Whether to share the host network (default: true).
+    /// Set to false for isolated networking (e.g., Tailscale).
+    pub shared_network: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +113,7 @@ pub struct WorkspaceResponse {
     pub distro: Option<String>,
     pub env_vars: HashMap<String, String>,
     pub init_script: Option<String>,
+    pub shared_network: Option<bool>,
 }
 
 impl From<Workspace> for WorkspaceResponse {
@@ -126,6 +133,7 @@ impl From<Workspace> for WorkspaceResponse {
             distro: w.distro,
             env_vars: w.env_vars,
             init_script: w.init_script,
+            shared_network: w.shared_network,
         }
     }
 }
@@ -326,6 +334,11 @@ async fn create_workspace(
         None => None,
     };
 
+    // shared_network: request overrides template, default to true (None means true)
+    let shared_network = req
+        .shared_network
+        .or_else(|| template_data.as_ref().and_then(|t| t.shared_network));
+
     let mut workspace = match workspace_type {
         WorkspaceType::Host => Workspace {
             id: Uuid::new_v4(),
@@ -343,6 +356,7 @@ async fn create_workspace(
             skills,
             tools: req.tools,
             plugins: req.plugins,
+            shared_network,
         },
         WorkspaceType::Chroot => {
             let mut ws = Workspace::new_chroot(req.name, path);
@@ -353,6 +367,7 @@ async fn create_workspace(
             ws.distro = distro;
             ws.env_vars = env_vars;
             ws.init_script = init_script;
+            ws.shared_network = shared_network;
             ws
         }
     };
@@ -518,6 +533,10 @@ async fn update_workspace(
 
     if let Some(init_script) = req.init_script {
         workspace.init_script = normalize_init_script(Some(init_script));
+    }
+
+    if let Some(shared_network) = req.shared_network {
+        workspace.shared_network = Some(shared_network);
     }
 
     // Save the updated workspace

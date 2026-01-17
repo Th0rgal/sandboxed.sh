@@ -52,6 +52,7 @@ const buildSnapshot = (data: {
   skills: string[];
   envRows: EnvRow[];
   initScript: string;
+  sharedNetwork: boolean | null;
 }) =>
   JSON.stringify({
     description: data.description,
@@ -59,6 +60,7 @@ const buildSnapshot = (data: {
     skills: data.skills,
     env: data.envRows.map((row) => ({ key: row.key, value: row.value, encrypted: row.encrypted })),
     initScript: data.initScript,
+    sharedNetwork: data.sharedNetwork,
   });
 
 export default function WorkspaceTemplatesPage() {
@@ -94,6 +96,7 @@ export default function WorkspaceTemplatesPage() {
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [envRows, setEnvRows] = useState<EnvRow[]>([]);
   const [initScript, setInitScript] = useState('');
+  const [sharedNetwork, setSharedNetwork] = useState<boolean | null>(null);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
 
@@ -118,8 +121,9 @@ export default function WorkspaceTemplatesPage() {
         skills: selectedSkills,
         envRows,
         initScript,
+        sharedNetwork,
       }),
-    [description, distro, selectedSkills, envRows, initScript]
+    [description, distro, selectedSkills, envRows, initScript, sharedNetwork]
   );
 
   useEffect(() => {
@@ -186,12 +190,14 @@ export default function WorkspaceTemplatesPage() {
       const rows = toEnvRows(template.env_vars || {}, template.encrypted_keys);
       setEnvRows(rows);
       setInitScript(template.init_script || '');
+      setSharedNetwork(template.shared_network ?? null);
       baselineRef.current = buildSnapshot({
         description: template.description || '',
         distro: template.distro || '',
         skills: template.skills || [],
         envRows: rows,
         initScript: template.init_script || '',
+        sharedNetwork: template.shared_network ?? null,
       });
       setDirty(false);
     } catch (err) {
@@ -210,6 +216,7 @@ export default function WorkspaceTemplatesPage() {
         env_vars: envRowsToMap(envRows),
         encrypted_keys: getEncryptedKeys(envRows),
         init_script: initScript,
+        shared_network: sharedNetwork,
       });
       baselineRef.current = snapshot;
       setDirty(false);
@@ -257,6 +264,7 @@ export default function WorkspaceTemplatesPage() {
       setSelectedSkills([]);
       setEnvRows([]);
       setInitScript('');
+      setSharedNetwork(null);
       setDirty(false);
       await loadTemplates();
     } catch (err) {
@@ -591,6 +599,51 @@ export default function WorkspaceTemplatesPage() {
                           </option>
                         ))}
                       </select>
+                    </div>
+
+                    <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] p-4">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <label className="text-xs text-white/40 block mb-1">Shared Network</label>
+                          <p className="text-[10px] text-white/25">
+                            Share host network and DNS. Disable for isolated networking (e.g., Tailscale).
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => {
+                            // Toggle: null (default=true) -> false -> true -> null
+                            if (sharedNetwork === null) setSharedNetwork(false);
+                            else if (sharedNetwork === false) setSharedNetwork(true);
+                            else setSharedNetwork(null);
+                          }}
+                          className={cn(
+                            "relative w-11 h-6 rounded-full transition-colors",
+                            sharedNetwork === null
+                              ? "bg-white/10" // default (true)
+                              : sharedNetwork
+                                ? "bg-emerald-500/50"
+                                : "bg-red-500/30"
+                          )}
+                        >
+                          <span
+                            className={cn(
+                              "absolute top-1 w-4 h-4 rounded-full bg-white transition-all",
+                              sharedNetwork === null
+                                ? "left-6" // default position (on)
+                                : sharedNetwork
+                                  ? "left-6"
+                                  : "left-1"
+                            )}
+                          />
+                        </button>
+                      </div>
+                      <p className="text-[10px] text-white/30 mt-2">
+                        {sharedNetwork === null
+                          ? "Default (enabled)"
+                          : sharedNetwork
+                            ? "Enabled"
+                            : "Disabled (isolated)"}
+                      </p>
                     </div>
                   </div>
                 )}

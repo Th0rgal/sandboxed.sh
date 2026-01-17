@@ -43,12 +43,12 @@ nav.nextra-nav-container {
   background: rgba(249, 250, 251, 0.5);
   backdrop-filter: blur(12px) saturate(150%);
   -webkit-backdrop-filter: blur(12px) saturate(150%);
-  border-right: 1px solid rgba(0, 0, 0, 0.06);
+  border-right: 1px solid rgba(0, 0, 0, 0.1);
 }
 
 .dark .nextra-sidebar-container {
   background: rgba(24, 23, 22, 0.5);
-  border-right: 1px solid rgba(255, 248, 240, 0.06);
+  border-right: 1px solid rgba(255, 248, 240, 0.1);
 }
 
 /* Sidebar ambient tint - blue */
@@ -861,36 +861,74 @@ aside a:hover,
 }
 
 /* ============================================
-   SIDEBAR BOTTOM-LEFT CORNER FIX
+   SIDEBAR FOOTER SEPARATOR
    ============================================ */
 
-/* Fix the rounded corner artifact in the bottom-left of the sidebar */
+/* Add top border to sidebar footer section (theme toggle, collapse button area) */
+.nextra-sidebar-container > div:last-child,
+aside.nextra-sidebar-container > div:last-child {
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  margin-top: auto;
+  padding-top: 0.75rem;
+}
+
+.dark .nextra-sidebar-container > div:last-child,
+.dark aside.nextra-sidebar-container > div:last-child {
+  border-top: 1px solid rgba(255, 248, 240, 0.06);
+}
+
+/* ============================================
+   SIDEBAR COLLAPSED STATE & CORNER FIXES
+   ============================================ */
+
+/* Remove all rounded corners from sidebar in any state */
 .nextra-sidebar-container,
 aside.nextra-sidebar-container,
 [class*="sidebar-container"],
-aside[class*="nextra"] {
-  border-radius: 0 !important;
-}
-
-/* Target the theme switcher container at the bottom of the sidebar */
-.nextra-sidebar-container > div:last-child,
-aside > div:last-child,
-aside > div:last-of-type {
-  border-radius: 0 !important;
-}
-
-/* Ensure the sidebar footer area has no rounded corners */
-[class*="sidebar"] [class*="footer"],
-[class*="sidebar"] > :last-child,
-aside [class*="theme"],
-aside [class*="toggle"] {
-  border-radius: 0 !important;
-}
-
-/* Target any nested containers that might have rounded corners */
+aside[class*="nextra"],
 .nextra-sidebar-container *,
 aside.nextra-sidebar-container * {
-  border-bottom-left-radius: 0 !important;
+  border-radius: 0 !important;
+}
+
+/* Fix collapsed sidebar - extend to full height, remove floating box effect */
+.nextra-sidebar-container[data-collapsed="true"],
+aside[data-collapsed="true"],
+.nextra-sidebar-container:has(> div:only-child),
+[class*="sidebar"][class*="collapsed"] {
+  background: rgba(249, 250, 251, 0.5) !important;
+  backdrop-filter: blur(12px) saturate(150%) !important;
+  -webkit-backdrop-filter: blur(12px) saturate(150%) !important;
+  border-right: 1px solid rgba(0, 0, 0, 0.1) !important;
+  height: 100% !important;
+  border-radius: 0 !important;
+}
+
+.dark .nextra-sidebar-container[data-collapsed="true"],
+.dark aside[data-collapsed="true"],
+.dark .nextra-sidebar-container:has(> div:only-child),
+.dark [class*="sidebar"][class*="collapsed"] {
+  background: rgba(24, 23, 22, 0.5) !important;
+  border-right: 1px solid rgba(255, 248, 240, 0.1) !important;
+}
+
+/* Remove background/border from inner containers in collapsed state to prevent floating box */
+.nextra-sidebar-container > div,
+aside.nextra-sidebar-container > div {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+/* Keep the footer separator visible */
+.nextra-sidebar-container > div:last-child,
+aside.nextra-sidebar-container > div:last-child {
+  border-top: 1px solid rgba(0, 0, 0, 0.06) !important;
+}
+
+.dark .nextra-sidebar-container > div:last-child,
+.dark aside.nextra-sidebar-container > div:last-child {
+  border-top: 1px solid rgba(255, 248, 240, 0.06) !important;
 }
 
 /* Specifically remove the bottom-left radius from the sidebar wrapper */

@@ -84,6 +84,7 @@ export default function WorkspacesPage() {
   // Workspace settings state
   const [envRows, setEnvRows] = useState<EnvRow[]>([]);
   const [initScript, setInitScript] = useState('');
+  const [sharedNetwork, setSharedNetwork] = useState<boolean | null>(null);
   const [savingWorkspace, setSavingWorkspace] = useState(false);
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [templateName, setTemplateName] = useState('');
@@ -162,6 +163,7 @@ export default function WorkspacesPage() {
       }
       setEnvRows(toEnvRows(selectedWorkspace.env_vars ?? {}));
       setInitScript(selectedWorkspace.init_script ?? '');
+      setSharedNetwork(selectedWorkspace.shared_network ?? null);
       setSelectedSkills(selectedWorkspace.skills ?? []);
       setTemplateName(`${selectedWorkspace.name}-template`);
       setTemplateDescription('');
@@ -341,6 +343,7 @@ export default function WorkspacesPage() {
         env_vars,
         init_script: initScript,
         skills: selectedSkills,
+        shared_network: sharedNetwork,
       });
       setSelectedWorkspace(updated);
       await mutateWorkspaces();
@@ -598,6 +601,51 @@ export default function WorkspacesPage() {
                         <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
                         <p className="text-sm text-red-300">{extractErrorSummary(selectedWorkspace.error_message)}</p>
                       </div>
+                    </div>
+                  )}
+
+                  {/* Network settings for chroot workspaces */}
+                  {selectedWorkspace.workspace_type === 'chroot' && (
+                    <div className="rounded-lg bg-white/[0.02] border border-white/[0.05] p-3">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-xs text-white/60 font-medium">Shared Network</p>
+                          <p className="text-[10px] text-white/30 mt-0.5">
+                            Share host network and DNS. Disable for isolated networking.
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => {
+                            if (sharedNetwork === null) setSharedNetwork(false);
+                            else if (sharedNetwork === false) setSharedNetwork(true);
+                            else setSharedNetwork(null);
+                          }}
+                          className={cn(
+                            "relative w-10 h-5 rounded-full transition-colors",
+                            sharedNetwork === null
+                              ? "bg-white/10"
+                              : sharedNetwork
+                                ? "bg-emerald-500/50"
+                                : "bg-red-500/30"
+                          )}
+                        >
+                          <span
+                            className={cn(
+                              "absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all",
+                              sharedNetwork === null || sharedNetwork
+                                ? "left-5"
+                                : "left-0.5"
+                            )}
+                          />
+                        </button>
+                      </div>
+                      <p className="text-[10px] text-white/25 mt-1.5">
+                        {sharedNetwork === null
+                          ? "Default (enabled)"
+                          : sharedNetwork
+                            ? "Enabled"
+                            : "Disabled (isolated)"}
+                      </p>
                     </div>
                   )}
 

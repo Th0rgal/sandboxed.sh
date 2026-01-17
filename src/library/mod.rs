@@ -42,6 +42,9 @@ struct WorkspaceTemplateConfig {
     encrypted_keys: Vec<String>,
     #[serde(default)]
     init_script: String,
+    /// Whether to share the host network (default: true).
+    #[serde(default)]
+    shared_network: Option<bool>,
 }
 
 // Directory constants (OpenCode-aligned structure)
@@ -1275,6 +1278,7 @@ impl LibraryStore {
             env_vars,
             encrypted_keys,
             init_script: config.init_script,
+            shared_network: config.shared_network,
         })
     }
 
@@ -1329,6 +1333,7 @@ impl LibraryStore {
             env_vars,
             encrypted_keys: template.encrypted_keys.clone(),
             init_script: template.init_script.clone(),
+            shared_network: template.shared_network,
         };
 
         let content = serde_json::to_string_pretty(&config)?;

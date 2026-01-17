@@ -220,6 +220,11 @@ pub struct WorkspaceTemplate {
     /// Init script to run on build
     #[serde(default)]
     pub init_script: String,
+    /// Whether to share the host network (default: true).
+    /// When true, bind-mounts /etc/resolv.conf for DNS.
+    /// Set to false for isolated networking (e.g., Tailscale).
+    #[serde(default)]
+    pub shared_network: Option<bool>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
