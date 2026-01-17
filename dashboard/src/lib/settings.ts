@@ -1,6 +1,5 @@
 export type SavedSettings = Partial<{
   apiUrl: string;
-  libraryRepo: string;
 }>;
 
 const STORAGE_KEY = 'settings';
@@ -13,7 +12,6 @@ export function readSavedSettings(): SavedSettings {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     const out: SavedSettings = {};
     if (typeof parsed.apiUrl === 'string') out.apiUrl = parsed.apiUrl;
-    if (typeof parsed.libraryRepo === 'string') out.libraryRepo = parsed.libraryRepo;
     return out;
   } catch {
     return {};
@@ -42,15 +40,3 @@ export function getRuntimeApiBase(): string {
   const { protocol, hostname } = window.location;
   return normalizeBaseUrl(`${protocol}//${hostname}:3000`);
 }
-
-export function getRuntimeLibraryRemote(): string | undefined {
-  if (typeof window === 'undefined') return undefined;
-  const saved = readSavedSettings().libraryRepo;
-  const trimmed = saved?.trim();
-  return trimmed ? trimmed : undefined;
-}
-
-
-
-
-

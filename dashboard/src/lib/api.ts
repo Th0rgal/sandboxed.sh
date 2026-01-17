@@ -1,5 +1,5 @@
 import { authHeader, clearJwt, signalAuthRequired } from "./auth";
-import { getRuntimeApiBase, getRuntimeLibraryRemote } from "./settings";
+import { getRuntimeApiBase } from "./settings";
 
 function apiUrl(pathOrUrl: string): string {
   if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
@@ -40,6 +40,8 @@ export interface HealthResponse {
   auth_required: boolean;
   auth_mode: "disabled" | "single_tenant" | "multi_user";
   max_iterations: number;
+  /** Configured library remote URL from server (LIBRARY_REMOTE env var) */
+  library_remote?: string;
 }
 
 export interface LoginResponse {
@@ -67,10 +69,6 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
     ...(init?.headers ? (init.headers as Record<string, string>) : {}),
     ...authHeader(),
   };
-  const libraryRemote = getRuntimeLibraryRemote();
-  if (libraryRemote) {
-    headers["x-openagent-library-remote"] = libraryRemote;
-  }
 
   const res = await fetch(apiUrl(path), { ...init, headers });
   if (res.status === 401) {
@@ -1672,7 +1670,7 @@ export function updatePlugin(
     onEvent({
       event_type: "error",
       message: "Connection error: failed to connect to server",
-      progress: null,
+      progress: undefined,
     });
   };
 

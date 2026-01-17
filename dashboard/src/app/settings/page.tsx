@@ -72,19 +72,14 @@ export default function SettingsPage() {
   const [apiUrl, setApiUrl] = useState(
     () => readSavedSettings().apiUrl ?? 'http://127.0.0.1:3000'
   );
-  const [libraryRepo, setLibraryRepo] = useState(
-    () => readSavedSettings().libraryRepo ?? ''
-  );
 
   // Track original values for unsaved changes
   const [originalValues, setOriginalValues] = useState({
     apiUrl: readSavedSettings().apiUrl ?? 'http://127.0.0.1:3000',
-    libraryRepo: readSavedSettings().libraryRepo ?? '',
   });
 
   // Validation state
   const [urlError, setUrlError] = useState<string | null>(null);
-  const [repoError, setRepoError] = useState<string | null>(null);
 
   // Modal/edit state
   const [showAddModal, setShowAddModal] = useState(false);
@@ -119,9 +114,7 @@ export default function SettingsPage() {
   );
 
   // Check if there are unsaved changes
-  const hasUnsavedChanges =
-    apiUrl !== originalValues.apiUrl ||
-    libraryRepo !== originalValues.libraryRepo;
+  const hasUnsavedChanges = apiUrl !== originalValues.apiUrl;
 
   // Validate URL
   const validateUrl = useCallback((url: string) => {
@@ -137,20 +130,6 @@ export default function SettingsPage() {
       setUrlError('Invalid URL format');
       return false;
     }
-  }, []);
-
-  const validateRepo = useCallback((repo: string) => {
-    const trimmed = repo.trim();
-    if (!trimmed) {
-      setRepoError(null);
-      return true;
-    }
-    if (/\s/.test(trimmed)) {
-      setRepoError('Repository URL cannot contain spaces');
-      return false;
-    }
-    setRepoError(null);
-    return true;
   }, []);
 
 
@@ -178,19 +157,16 @@ export default function SettingsPage() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [apiUrl, libraryRepo]);
+  }, [apiUrl]);
 
   const handleSave = () => {
-    const urlValid = validateUrl(apiUrl);
-    const repoValid = validateRepo(libraryRepo);
-
-    if (!urlValid || !repoValid) {
+    if (!validateUrl(apiUrl)) {
       toast.error('Please fix validation errors before saving');
       return;
     }
 
-    writeSavedSettings({ apiUrl, libraryRepo });
-    setOriginalValues({ apiUrl, libraryRepo });
+    writeSavedSettings({ apiUrl });
+    setOriginalValues({ apiUrl });
     toast.success('Settings saved!');
   };
 
@@ -331,10 +307,10 @@ export default function SettingsPage() {
             )}
             <button
               onClick={handleSave}
-              disabled={!!urlError || !!repoError}
+              disabled={!!urlError}
               className={cn(
                 'flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium text-white transition-colors cursor-pointer',
-                urlError || repoError
+                urlError
                   ? 'bg-white/10 cursor-not-allowed opacity-50'
                   : 'bg-indigo-500 hover:bg-indigo-600'
               )}
@@ -530,46 +506,41 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          {/* Git Settings */}
+          {/* Library Settings */}
           <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
             <div className="flex items-center gap-3 mb-4">
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10">
                 <GitBranch className="h-5 w-5 text-indigo-400" />
               </div>
               <div>
-                <h2 className="text-sm font-medium text-white">Git</h2>
+                <h2 className="text-sm font-medium text-white">Library</h2>
                 <p className="text-xs text-white/40">
-                  Configuration library settings
+                  Configuration library (server-managed)
                 </p>
               </div>
             </div>
 
             <div>
               <label className="block text-xs font-medium text-white/60 mb-1.5">
-                Library Repo (optional)
+                Library Remote
               </label>
-              <input
-                type="text"
-                value={libraryRepo}
-                onChange={(e) => {
-                  setLibraryRepo(e.target.value);
-                  validateRepo(e.target.value);
-                }}
-                placeholder="git@github.com:your/library.git"
-                className={cn(
-                  'w-full rounded-lg border bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:outline-none transition-colors',
-                  repoError
-                    ? 'border-red-500/50 focus:border-red-500/50'
-                    : 'border-white/[0.06] focus:border-indigo-500/50'
-                )}
-              />
-              {repoError ? (
-                <p className="mt-1.5 text-xs text-red-400">{repoError}</p>
+              {healthLoading ? (
+                <div className="flex items-center gap-2 py-2.5">
+                  <Loader className="h-4 w-4 animate-spin text-white/40" />
+                  <span className="text-sm text-white/40">Loading...</span>
+                </div>
+              ) : health?.library_remote ? (
+                <div className="w-full rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-2.5 text-sm text-white/70 font-mono">
+                  {health.library_remote}
+                </div>
               ) : (
-                <p className="mt-1.5 text-xs text-white/30">
-                  Leave blank to disable library features.
-                </p>
+                <div className="w-full rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2.5 text-sm text-amber-400/80">
+                  Not configured
+                </div>
               )}
+              <p className="mt-1.5 text-xs text-white/30">
+                Set via <code className="text-white/50">LIBRARY_REMOTE</code> environment variable on the server.
+              </p>
             </div>
           </div>
 

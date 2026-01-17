@@ -31,7 +31,7 @@ test.describe("AI Providers", () => {
       localStorage.clear();
       localStorage.setItem(
         "settings",
-        JSON.stringify({ apiUrl: "http://127.0.0.1:3000", libraryRepo: "" })
+        JSON.stringify({ apiUrl: "http://127.0.0.1:3000" })
       );
     });
     // Reload to pick up new settings
