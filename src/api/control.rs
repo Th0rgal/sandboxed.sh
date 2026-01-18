@@ -1083,10 +1083,14 @@ pub async fn create_mission(
     }
 
     // Validate agent exists before creating mission (fail fast with clear error)
+    // Skip validation for Claude Code - it has its own built-in agents
     if let Some(ref agent_name) = agent {
-        super::library::validate_agent_exists(&state, agent_name)
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        let is_claudecode = backend.as_deref() == Some("claudecode");
+        if !is_claudecode {
+            super::library::validate_agent_exists(&state, agent_name)
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        }
     }
 
     if let Some(ref backend_id) = backend {

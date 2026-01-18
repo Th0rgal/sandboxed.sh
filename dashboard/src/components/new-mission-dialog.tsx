@@ -169,8 +169,35 @@ export function NewMissionDialog({
     return backend && agent ? { backend, agent } : null;
   };
 
+  // Get the currently selected backend
+  const selectedBackend = useMemo(() => {
+    const parsed = parseSelectedValue(selectedAgentValue);
+    return parsed?.backend || null;
+  }, [selectedAgentValue]);
+
+  // Filter providers based on selected backend
+  // Claude Code only supports Anthropic models
+  const filteredProviders = useMemo(() => {
+    if (selectedBackend === 'claudecode') {
+      // Only show Anthropic (Claude) models for Claude Code
+      return providers.filter(p => p.id === 'anthropic');
+    }
+    // Show all providers for OpenCode or when no backend is selected
+    return providers;
+  }, [providers, selectedBackend]);
+
   const formatWorkspaceType = (type: Workspace['workspace_type']) =>
     type === 'host' ? 'host' : 'isolated';
+
+  // Reset model override when switching to Claude Code if current model isn't Anthropic
+  useEffect(() => {
+    if (selectedBackend === 'claudecode' && newMissionModelOverride) {
+      // Check if current model is from Anthropic
+      if (!newMissionModelOverride.startsWith('anthropic/')) {
+        setNewMissionModelOverride('');
+      }
+    }
+  }, [selectedBackend, newMissionModelOverride]);
 
   // Click outside handler
   useEffect(() => {
@@ -362,7 +389,7 @@ export function NewMissionDialog({
                 <option value="" className="bg-[#1a1a1a]">
                   Default (agent or global)
                 </option>
-                {providers.map((provider) => (
+                {filteredProviders.map((provider) => (
                   <optgroup key={provider.id} label={provider.name} className="bg-[#1a1a1a]">
                     {provider.models.map((model) => (
                       <option
