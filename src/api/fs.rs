@@ -162,10 +162,12 @@ fn content_type_for_path(path: &Path) -> &'static str {
 }
 
 /// Resolve a path relative to a specific workspace.
+/// If mission_id is provided and path is a context path, resolves to mission-specific context.
 async fn resolve_path_for_workspace(
     state: &Arc<AppState>,
     workspace_id: uuid::Uuid,
     path: &str,
+    mission_id: Option<uuid::Uuid>,
 ) -> Result<PathBuf, (StatusCode, String)> {
     let workspace = state
         .workspaces
@@ -191,12 +193,23 @@ async fn resolve_path_for_workspace(
     let resolved = if input.is_absolute() {
         input.to_path_buf()
     } else if path.starts_with("./context") || path.starts_with("context") {
-        // For "context" paths, use the workspace's context directory
+        // For "context" paths, use the mission-specific context directory if mission_id provided
         let suffix = path
             .trim_start_matches("./")
             .trim_start_matches("context/")
             .trim_start_matches("context");
-        let context_path = workspace_root.join("context");
+
+        // If mission_id is provided, use mission-specific context directory
+        // This ensures uploaded files go to the right place for the agent to find them
+        let context_path = if let Some(mid) = mission_id {
+            // Mission context is at /root/context/{mission_id} (or workspace equivalent)
+            // For host workspaces, the global context root is typically at working_dir/context
+            let context_root = state.config.working_dir.join("context");
+            context_root.join(mid.to_string())
+        } else {
+            workspace_root.join("context")
+        };
+
         if suffix.is_empty() {
             context_path
         } else {
@@ -244,14 +257,18 @@ async fn resolve_path_for_workspace(
         }
     };
 
-    // Validate that the resolved path is within the workspace
-    if !canonical.starts_with(&workspace_root) {
+    // Validate that the resolved path is within an allowed location
+    // This can be either the workspace root or the global context directory for missions
+    let context_root = state.config.working_dir.join("context");
+    let in_workspace = canonical.starts_with(&workspace_root);
+    let in_context = mission_id.is_some() && canonical.starts_with(&context_root);
+
+    if !in_workspace && !in_context {
         return Err((
             StatusCode::FORBIDDEN,
             format!(
-                "Path traversal attempt: {} is outside workspace {}",
+                "Path traversal attempt: {} is outside allowed directories",
                 canonical.display(),
-                workspace_root.display()
             ),
         ));
     }
@@ -421,6 +438,8 @@ pub struct PathQuery {
     pub path: String,
     /// Optional workspace ID to resolve relative paths against
     pub workspace_id: Option<uuid::Uuid>,
+    /// Optional mission ID for mission-specific context directories
+    pub mission_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -556,8 +575,9 @@ pub async fn upload(
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // If workspace_id is provided, resolve path relative to that workspace
+    // If mission_id is also provided, context paths resolve to mission-specific directory
     let base = if let Some(workspace_id) = q.workspace_id {
-        resolve_path_for_workspace(&state, workspace_id, &q.path).await?
+        resolve_path_for_workspace(&state, workspace_id, &q.path, q.mission_id).await?
     } else {
         resolve_upload_base(&q.path)?
     };
@@ -709,6 +729,8 @@ pub struct FinalizeUploadRequest {
     pub total_chunks: u32,
     /// Optional workspace ID to resolve relative paths against
     pub workspace_id: Option<uuid::Uuid>,
+    /// Optional mission ID for mission-specific context directories
+    pub mission_id: Option<uuid::Uuid>,
 }
 
 // Finalize chunked upload by assembling chunks
@@ -717,8 +739,9 @@ pub async fn upload_finalize(
     Json(req): Json<FinalizeUploadRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // If workspace_id is provided, resolve path relative to that workspace
+    // If mission_id is also provided, context paths resolve to mission-specific directory
     let base = if let Some(workspace_id) = req.workspace_id {
-        resolve_path_for_workspace(&state, workspace_id, &req.path).await?
+        resolve_path_for_workspace(&state, workspace_id, &req.path, req.mission_id).await?
     } else {
         resolve_upload_base(&req.path)?
     };
@@ -812,6 +835,8 @@ pub struct DownloadUrlRequest {
     pub file_name: Option<String>,
     /// Optional workspace ID to resolve relative paths against
     pub workspace_id: Option<uuid::Uuid>,
+    /// Optional mission ID for mission-specific context directories
+    pub mission_id: Option<uuid::Uuid>,
 }
 
 // Download file from URL to server filesystem
@@ -931,8 +956,9 @@ pub async fn download_from_url(
     drop(f);
 
     // Move to destination
+    // If mission_id is provided, context paths resolve to mission-specific directory
     let base = if let Some(workspace_id) = req.workspace_id {
-        resolve_path_for_workspace(&state, workspace_id, &req.path).await?
+        resolve_path_for_workspace(&state, workspace_id, &req.path, req.mission_id).await?
     } else {
         resolve_upload_base(&req.path)?
     };

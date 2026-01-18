@@ -2243,9 +2243,10 @@ export default function ControlClient() {
       // Upload into the workspace-local ./context (symlinked to mission context inside the container).
       const contextPath = "./context/";
 
-      // Get workspace_id from current or viewing mission
+      // Get workspace_id and mission_id from current or viewing mission
       const mission = viewingMission ?? currentMission;
       const workspaceId = mission?.workspace_id;
+      const missionId = mission?.id;
 
       // Use chunked upload for files > 10MB, regular for smaller
       const useChunked = fileToUpload.size > 10 * 1024 * 1024;
@@ -2253,10 +2254,10 @@ export default function ControlClient() {
       const result = useChunked
         ? await uploadFileChunked(fileToUpload, contextPath, (progress) => {
             setUploadProgress({ fileName: displayName, progress });
-          }, workspaceId)
+          }, workspaceId, missionId)
         : await uploadFile(fileToUpload, contextPath, (progress) => {
             setUploadProgress({ fileName: displayName, progress });
-          }, workspaceId);
+          }, workspaceId, missionId);
 
       toast.success(`Uploaded ${result.name}`);
 
@@ -2282,11 +2283,12 @@ export default function ControlClient() {
     try {
       const contextPath = "./context/";
 
-      // Get workspace_id from current or viewing mission
+      // Get workspace_id and mission_id from current or viewing mission
       const mission = viewingMission ?? currentMission;
       const workspaceId = mission?.workspace_id;
+      const missionId = mission?.id;
 
-      const result = await downloadFromUrl(urlInput.trim(), contextPath, undefined, workspaceId);
+      const result = await downloadFromUrl(urlInput.trim(), contextPath, undefined, workspaceId, missionId);
       toast.success(`Downloaded ${result.name}`);
 
       // Add a message about the download at the beginning (consistent with uploads)

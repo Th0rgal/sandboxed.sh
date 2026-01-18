@@ -1036,13 +1036,17 @@ export function uploadFile(
   file: File,
   remotePath: string = "./context/",
   onProgress?: (progress: UploadProgress) => void,
-  workspaceId?: string
+  workspaceId?: string,
+  missionId?: string
 ): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const params = new URLSearchParams({ path: remotePath });
     if (workspaceId) {
       params.append("workspace_id", workspaceId);
+    }
+    if (missionId) {
+      params.append("mission_id", missionId);
     }
     const url = apiUrl(`/api/fs/upload?${params}`);
     
@@ -1103,7 +1107,8 @@ export async function uploadFileChunked(
   file: File,
   remotePath: string = "./context/",
   onProgress?: (progress: ChunkedUploadProgress) => void,
-  workspaceId?: string
+  workspaceId?: string,
+  missionId?: string
 ): Promise<UploadResult> {
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   const uploadId = `${file.name}-${file.size}-${Date.now()}`;
@@ -1114,7 +1119,7 @@ export async function uploadFileChunked(
       ...p,
       chunkIndex: 0,
       totalChunks: 1,
-    }) : undefined, workspaceId);
+    }) : undefined, workspaceId, missionId);
   }
 
   let uploadedBytes = 0;
@@ -1152,7 +1157,7 @@ export async function uploadFileChunked(
   }
 
   // Finalize the upload
-  return finalizeChunkedUpload(remotePath, uploadId, file.name, totalChunks, workspaceId);
+  return finalizeChunkedUpload(remotePath, uploadId, file.name, totalChunks, workspaceId, missionId);
 }
 
 async function uploadChunk(
@@ -1192,7 +1197,8 @@ async function finalizeChunkedUpload(
   uploadId: string,
   fileName: string,
   totalChunks: number,
-  workspaceId?: string
+  workspaceId?: string,
+  missionId?: string
 ): Promise<UploadResult> {
   const body: Record<string, unknown> = {
     path: remotePath,
@@ -1202,6 +1208,9 @@ async function finalizeChunkedUpload(
   };
   if (workspaceId) {
     body.workspace_id = workspaceId;
+  }
+  if (missionId) {
+    body.mission_id = missionId;
   }
 
   const res = await apiFetch("/api/fs/upload-finalize", {
@@ -1222,7 +1231,8 @@ export async function downloadFromUrl(
   url: string,
   remotePath: string = "./context/",
   fileName?: string,
-  workspaceId?: string
+  workspaceId?: string,
+  missionId?: string
 ): Promise<UploadResult> {
   const body: Record<string, unknown> = {
     url,
@@ -1231,6 +1241,9 @@ export async function downloadFromUrl(
   };
   if (workspaceId) {
     body.workspace_id = workspaceId;
+  }
+  if (missionId) {
+    body.mission_id = missionId;
   }
 
   const res = await apiFetch("/api/fs/download-url", {
