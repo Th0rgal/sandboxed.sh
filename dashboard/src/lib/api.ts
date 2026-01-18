@@ -1035,11 +1035,16 @@ export interface UploadProgress {
 export function uploadFile(
   file: File,
   remotePath: string = "./context/",
-  onProgress?: (progress: UploadProgress) => void
+  onProgress?: (progress: UploadProgress) => void,
+  workspaceId?: string
 ): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    const url = apiUrl(`/api/fs/upload?path=${encodeURIComponent(remotePath)}`);
+    const params = new URLSearchParams({ path: remotePath });
+    if (workspaceId) {
+      params.append("workspace_id", workspaceId);
+    }
+    const url = apiUrl(`/api/fs/upload?${params}`);
     
     // Track upload progress
     xhr.upload.addEventListener("progress", (event) => {
@@ -1097,36 +1102,37 @@ export interface ChunkedUploadProgress extends UploadProgress {
 export async function uploadFileChunked(
   file: File,
   remotePath: string = "./context/",
-  onProgress?: (progress: ChunkedUploadProgress) => void
+  onProgress?: (progress: ChunkedUploadProgress) => void,
+  workspaceId?: string
 ): Promise<UploadResult> {
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   const uploadId = `${file.name}-${file.size}-${Date.now()}`;
-  
+
   // For small files, use regular upload
   if (totalChunks <= 1) {
     return uploadFile(file, remotePath, onProgress ? (p) => onProgress({
       ...p,
       chunkIndex: 0,
       totalChunks: 1,
-    }) : undefined);
+    }) : undefined, workspaceId);
   }
-  
+
   let uploadedBytes = 0;
-  
+
   for (let i = 0; i < totalChunks; i++) {
     const start = i * CHUNK_SIZE;
     const end = Math.min(start + CHUNK_SIZE, file.size);
     const chunk = file.slice(start, end);
-    
+
     const chunkFile = new File([chunk], file.name, { type: file.type });
-    
+
     // Upload chunk with retry
     let retries = 3;
     while (retries > 0) {
       try {
-        await uploadChunk(chunkFile, remotePath, uploadId, i, totalChunks);
+        await uploadChunk(chunkFile, remotePath, uploadId, i, totalChunks, workspaceId);
         uploadedBytes += chunk.size;
-        
+
         if (onProgress) {
           onProgress({
             loaded: uploadedBytes,
@@ -1144,9 +1150,9 @@ export async function uploadFileChunked(
       }
     }
   }
-  
+
   // Finalize the upload
-  return finalizeChunkedUpload(remotePath, uploadId, file.name, totalChunks);
+  return finalizeChunkedUpload(remotePath, uploadId, file.name, totalChunks, workspaceId);
 }
 
 async function uploadChunk(
@@ -1154,24 +1160,28 @@ async function uploadChunk(
   remotePath: string,
   uploadId: string,
   chunkIndex: number,
-  totalChunks: number
+  totalChunks: number,
+  workspaceId?: string
 ): Promise<void> {
   const formData = new FormData();
   formData.append("file", chunk);
-  
+
   const params = new URLSearchParams({
     path: remotePath,
     upload_id: uploadId,
     chunk_index: String(chunkIndex),
     total_chunks: String(totalChunks),
   });
-  
+  if (workspaceId) {
+    params.append("workspace_id", workspaceId);
+  }
+
   const res = await fetch(apiUrl(`/api/fs/upload-chunk?${params}`), {
     method: "POST",
     headers: authHeader(),
     body: formData,
   });
-  
+
   if (!res.ok) {
     throw new Error(`Chunk upload failed: ${await res.text()}`);
   }
@@ -1181,23 +1191,29 @@ async function finalizeChunkedUpload(
   remotePath: string,
   uploadId: string,
   fileName: string,
-  totalChunks: number
+  totalChunks: number,
+  workspaceId?: string
 ): Promise<UploadResult> {
+  const body: Record<string, unknown> = {
+    path: remotePath,
+    upload_id: uploadId,
+    file_name: fileName,
+    total_chunks: totalChunks,
+  };
+  if (workspaceId) {
+    body.workspace_id = workspaceId;
+  }
+
   const res = await apiFetch("/api/fs/upload-finalize", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      path: remotePath,
-      upload_id: uploadId,
-      file_name: fileName,
-      total_chunks: totalChunks,
-    }),
+    body: JSON.stringify(body),
   });
-  
+
   if (!res.ok) {
     throw new Error(`Failed to finalize upload: ${await res.text()}`);
   }
-  
+
   return res.json();
 }
 
@@ -1205,22 +1221,28 @@ async function finalizeChunkedUpload(
 export async function downloadFromUrl(
   url: string,
   remotePath: string = "./context/",
-  fileName?: string
+  fileName?: string,
+  workspaceId?: string
 ): Promise<UploadResult> {
+  const body: Record<string, unknown> = {
+    url,
+    path: remotePath,
+    file_name: fileName,
+  };
+  if (workspaceId) {
+    body.workspace_id = workspaceId;
+  }
+
   const res = await apiFetch("/api/fs/download-url", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      url,
-      path: remotePath,
-      file_name: fileName,
-    }),
+    body: JSON.stringify(body),
   });
-  
+
   if (!res.ok) {
     throw new Error(`Failed to download from URL: ${await res.text()}`);
   }
-  
+
   return res.json();
 }
 

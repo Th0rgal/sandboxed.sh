@@ -2242,18 +2242,22 @@ export default function ControlClient() {
       // Upload to mission-specific context folder if we have a mission
       // Upload into the workspace-local ./context (symlinked to mission context inside the container).
       const contextPath = "./context/";
-      
+
+      // Get workspace_id from current or viewing mission
+      const mission = viewingMission ?? currentMission;
+      const workspaceId = mission?.workspace_id;
+
       // Use chunked upload for files > 10MB, regular for smaller
       const useChunked = fileToUpload.size > 10 * 1024 * 1024;
-      
-      const result = useChunked 
+
+      const result = useChunked
         ? await uploadFileChunked(fileToUpload, contextPath, (progress) => {
             setUploadProgress({ fileName: displayName, progress });
-          })
+          }, workspaceId)
         : await uploadFile(fileToUpload, contextPath, (progress) => {
             setUploadProgress({ fileName: displayName, progress });
-          });
-      
+          }, workspaceId);
+
       toast.success(`Uploaded ${result.name}`);
 
       // Add a message about the upload at the beginning
@@ -2268,25 +2272,29 @@ export default function ControlClient() {
       setUploadQueue((prev) => prev.filter((name) => name !== displayName));
       setUploadProgress(null);
     }
-  }, [compressImageFile, currentMission?.id]);
+  }, [compressImageFile, currentMission, viewingMission]);
 
   // Handle URL download
   const handleUrlDownload = useCallback(async () => {
     if (!urlInput.trim()) return;
-    
+
     setUrlDownloading(true);
     try {
       const contextPath = "./context/";
-      
-      const result = await downloadFromUrl(urlInput.trim(), contextPath);
+
+      // Get workspace_id from current or viewing mission
+      const mission = viewingMission ?? currentMission;
+      const workspaceId = mission?.workspace_id;
+
+      const result = await downloadFromUrl(urlInput.trim(), contextPath, undefined, workspaceId);
       toast.success(`Downloaded ${result.name}`);
-      
+
       // Add a message about the download at the beginning (consistent with uploads)
       setInput((prev) => {
         const downloadNote = `[Downloaded: ${result.name}]`;
         return prev ? `${downloadNote}\n${prev}` : downloadNote;
       });
-      
+
       setUrlInput("");
       setShowUrlInput(false);
     } catch (error) {
@@ -2295,7 +2303,7 @@ export default function ControlClient() {
     } finally {
       setUrlDownloading(false);
     }
-  }, [urlInput, currentMission?.id]);
+  }, [urlInput, currentMission, viewingMission]);
 
   // Handle paste to upload files
   useEffect(() => {

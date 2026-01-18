@@ -161,6 +161,48 @@ fn content_type_for_path(path: &Path) -> &'static str {
     }
 }
 
+/// Resolve a path relative to a specific workspace.
+async fn resolve_path_for_workspace(
+    state: &Arc<AppState>,
+    workspace_id: uuid::Uuid,
+    path: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let workspace = state
+        .workspaces
+        .get(workspace_id)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Workspace {} not found", workspace_id),
+            )
+        })?;
+
+    let input = Path::new(path);
+
+    // If the path is absolute, use it directly (but validate it's within workspace)
+    if input.is_absolute() {
+        return Ok(input.to_path_buf());
+    }
+
+    // Resolve relative path against workspace path
+    // For "context" paths, use the workspace's context directory
+    if path.starts_with("./context") || path.starts_with("context") {
+        let suffix = path
+            .trim_start_matches("./")
+            .trim_start_matches("context/")
+            .trim_start_matches("context");
+        let context_path = workspace.path.join("context");
+        if suffix.is_empty() {
+            return Ok(context_path);
+        }
+        return Ok(context_path.join(suffix));
+    }
+
+    // Default: resolve relative to workspace path
+    Ok(workspace.path.join(path))
+}
+
 fn resolve_upload_base(path: &str) -> Result<PathBuf, (StatusCode, String)> {
     // Absolute path
     if Path::new(path).is_absolute() {
@@ -321,6 +363,8 @@ fn is_internal_ip(ip: &IpAddr) -> bool {
 #[derive(Debug, Deserialize)]
 pub struct PathQuery {
     pub path: String,
+    /// Optional workspace ID to resolve relative paths against
+    pub workspace_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -451,11 +495,16 @@ pub async fn download(
 }
 
 pub async fn upload(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Query(q): Query<PathQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let base = resolve_upload_base(&q.path)?;
+    // If workspace_id is provided, resolve path relative to that workspace
+    let base = if let Some(workspace_id) = q.workspace_id {
+        resolve_path_for_workspace(&state, workspace_id, &q.path).await?
+    } else {
+        resolve_upload_base(&q.path)?
+    };
 
     // Expect one file field.
     if let Some(field) = multipart
@@ -534,6 +583,8 @@ pub struct ChunkUploadQuery {
     pub upload_id: String,
     pub chunk_index: u32,
     pub total_chunks: u32,
+    /// Optional workspace ID to resolve relative paths against
+    pub workspace_id: Option<uuid::Uuid>,
 }
 
 // Handle chunked file upload
@@ -600,14 +651,21 @@ pub struct FinalizeUploadRequest {
     pub upload_id: String,
     pub file_name: String,
     pub total_chunks: u32,
+    /// Optional workspace ID to resolve relative paths against
+    pub workspace_id: Option<uuid::Uuid>,
 }
 
 // Finalize chunked upload by assembling chunks
 pub async fn upload_finalize(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<FinalizeUploadRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let base = resolve_upload_base(&req.path)?;
+    // If workspace_id is provided, resolve path relative to that workspace
+    let base = if let Some(workspace_id) = req.workspace_id {
+        resolve_path_for_workspace(&state, workspace_id, &req.path).await?
+    } else {
+        resolve_upload_base(&req.path)?
+    };
 
     // Sanitize upload_id and file_name to prevent path traversal attacks
     let safe_upload_id = sanitize_path_component(&req.upload_id);
@@ -696,11 +754,13 @@ pub struct DownloadUrlRequest {
     pub url: String,
     pub path: String,
     pub file_name: Option<String>,
+    /// Optional workspace ID to resolve relative paths against
+    pub workspace_id: Option<uuid::Uuid>,
 }
 
 // Download file from URL to server filesystem
 pub async fn download_from_url(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<DownloadUrlRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Validate URL to prevent SSRF attacks
@@ -815,7 +875,11 @@ pub async fn download_from_url(
     drop(f);
 
     // Move to destination
-    let base = resolve_upload_base(&req.path)?;
+    let base = if let Some(workspace_id) = req.workspace_id {
+        resolve_path_for_workspace(&state, workspace_id, &req.path).await?
+    } else {
+        resolve_upload_base(&req.path)?
+    };
     let remote_path = base.join(&file_name);
     let target_dir = remote_path
         .parent()
