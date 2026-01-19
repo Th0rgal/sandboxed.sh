@@ -3479,6 +3479,13 @@ export default function ControlClient() {
             },
           ];
         });
+
+        // Reset stream phase to idle when agent finishes responding
+        // (Agent has completed processing and is now waiting for user input)
+        setStreamDiagnostics((prev) => ({
+          ...prev,
+          phase: "idle",
+        }));
         return;
       }
 
@@ -3724,6 +3731,13 @@ export default function ControlClient() {
               prev ? { ...prev, status: newStatus as MissionStatus } : prev
             );
           }
+
+          // Reset stream phase to idle when mission completes
+          // (The SSE connection stays open for the control session, but the mission is done)
+          setStreamDiagnostics((prev) => ({
+            ...prev,
+            phase: "idle",
+          }));
         }
       }
 
@@ -4641,7 +4655,10 @@ export default function ControlClient() {
                 }
 
                 if (item.kind === "user") {
-                  const isQueued = item.queued === true;
+                  // Skip queued messages here - they render after "Agent is working..."
+                  if (item.queued === true) {
+                    return null;
+                  }
                   return (
                     <div key={item.id} className="flex justify-end gap-3 group">
                       <CopyButton
@@ -4649,34 +4666,19 @@ export default function ControlClient() {
                         className="self-start mt-2"
                       />
                       <div className="max-w-[80%]">
-                        <div
-                          className={cn(
-                            "rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light",
-                            isQueued
-                              ? "border-2 border-dashed border-indigo-500/60 bg-indigo-500/20"
-                              : "bg-indigo-500"
-                          )}
-                        >
+                        <div className="rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light bg-indigo-500">
                           <p className="whitespace-pre-wrap text-sm">
                             {item.content}
                           </p>
                         </div>
                         <div className="mt-1 text-right flex items-center justify-end gap-2">
-                          {isQueued && (
-                            <span className="text-[10px] text-white/30">
-                              Queued
-                            </span>
-                          )}
                           <span className="text-[10px] text-white/30">
                             {formatTime(item.timestamp)}
                           </span>
                         </div>
                       </div>
-                      <div className={cn(
-                        "flex h-8 w-8 shrink-0 items-center justify-center rounded-full",
-                        isQueued ? "bg-white/[0.04]" : "bg-white/[0.08]"
-                      )}>
-                        <User className={cn("h-4 w-4", isQueued ? "text-white/40" : "text-white/60")} />
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.08]">
+                        <User className="h-4 w-4 text-white/60" />
                       </div>
                     </div>
                   );
@@ -5005,6 +5007,36 @@ export default function ControlClient() {
                     </div>
                   </div>
                 )}
+
+              {/* Queued messages - rendered after "Agent is working..." since they'll be sent after */}
+              {items
+                .filter((item): item is Extract<ChatItem, { kind: "user" }> => item.kind === "user" && item.queued === true)
+                .map(item => (
+                  <div key={item.id} className="flex justify-end gap-3 group">
+                    <CopyButton
+                      text={item.content}
+                      className="self-start mt-2"
+                    />
+                    <div className="max-w-[80%]">
+                      <div className="rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light border-2 border-dashed border-indigo-500/60 bg-indigo-500/20">
+                        <p className="whitespace-pre-wrap text-sm">
+                          {item.content}
+                        </p>
+                      </div>
+                      <div className="mt-1 text-right flex items-center justify-end gap-2">
+                        <span className="text-[10px] text-white/30">
+                          Queued
+                        </span>
+                        <span className="text-[10px] text-white/30">
+                          {formatTime(item.timestamp)}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.04]">
+                      <User className="h-4 w-4 text-white/40" />
+                    </div>
+                  </div>
+                ))}
 
               {/* Waiting banner for question tool */}
               {hasPendingQuestion && (
