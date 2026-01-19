@@ -830,14 +830,18 @@ async fn write_opencode_config(
             tools.insert("browser_*".to_string(), json!(true));
         }
         WorkspaceType::Host => {
-            // Disable all bash for host workspaces (security)
-            tools.insert("Bash".to_string(), json!(false));
-            tools.insert("bash".to_string(), json!(false));
+            // For host workspaces, enable both built-in Bash and workspace MCP tools.
+            // The user explicitly chose a host workspace, so they want to run commands on the host.
+            // The workspace MCP bash runs on host anyway, so disabling built-in Bash
+            // only causes confusion without providing security benefits.
+            tools.insert("Bash".to_string(), json!(true));
+            tools.insert("bash".to_string(), json!(true));
+            tools.insert("workspace_*".to_string(), json!(true));
+            // Desktop/browser tools are disabled for host workspaces
+            // as they require container isolation for display handling
             tools.insert("desktop_*".to_string(), json!(false));
             tools.insert("playwright_*".to_string(), json!(false));
             tools.insert("browser_*".to_string(), json!(false));
-            // Only allow workspace MCP tools (files, etc)
-            tools.insert("workspace_*".to_string(), json!(true));
         }
     }
     config_json.insert("tools".to_string(), serde_json::Value::Object(tools));
@@ -946,15 +950,7 @@ async fn write_claudecode_config(
                 WorkspaceType::Host => {
                     claude_md.push_str("## Host Workspace\n\n");
                     claude_md.push_str(
-                        "**IMPORTANT**: For ALL shell commands, you MUST use `mcp__workspace__bash` instead of the built-in `Bash` tool. \
-                        The built-in Bash tool is disabled - use the workspace MCP tool instead.\n\n\
-                        Example:\n\
-                        ```\n\
-                        // WRONG - will not work:\n\
-                        Bash: git clone https://github.com/example/repo\n\n\
-                        // CORRECT:\n\
-                        mcp__workspace__bash: git clone https://github.com/example/repo\n\
-                        ```\n\n",
+                        "This is a host workspace. You can use the built-in `Bash` tool to run shell commands directly.\n\n",
                     );
                 }
             }
