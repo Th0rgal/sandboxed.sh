@@ -599,17 +599,10 @@ pub async fn run_claudecode_turn(
     app_working_dir: &std::path::Path,
 ) -> AgentResult {
     use super::ai_providers::{
-        ensure_anthropic_oauth_token_valid, get_anthropic_api_key_for_claudecode,
+        get_anthropic_api_key_for_claudecode,
     };
     use std::collections::HashMap;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    // Ensure OAuth token is valid before starting (refresh if expired)
-    if let Err(e) = ensure_anthropic_oauth_token_valid().await {
-        tracing::warn!("Failed to refresh OAuth token: {}. Will attempt to continue with existing credentials.", e);
-    }
-
-    // Try to get API key from Anthropic provider configured for Claude Code backend
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};    // Try to get API key from Anthropic provider configured for Claude Code backend
     let api_key = if let Some(key) = get_anthropic_api_key_for_claudecode(app_working_dir) {
         tracing::info!("Using Anthropic API key from provider for Claude Code");
         Some(key)

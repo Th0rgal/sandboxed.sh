@@ -3641,7 +3641,7 @@ async fn run_single_control_turn(
                 tracing::warn!("Failed to prepare mission workspace: {}", e);
                 ws.path.clone()
             }
-        };
+            };
         (dir, Some(ws))
     } else {
         (
@@ -3709,8 +3709,11 @@ async fn run_single_control_turn(
             let mid = match mission_id {
                 Some(id) => id,
                 None => {
-                    // Don't send Error event - the failure will be emitted as an AssistantMessage
-                    // with success=false after this function returns, avoiding duplicate messages.
+                    let _ = events_tx.send(AgentEvent::Error {
+                        message: "Claude Code backend requires a mission ID".to_string(),
+                        mission_id: None,
+                        resumable: false,
+                    });
                     return crate::agents::AgentResult::failure(
                         "Claude Code backend requires a mission ID".to_string(),
                         0,
@@ -3733,8 +3736,11 @@ async fn run_single_control_turn(
             .await
         }
         Some(backend) if backend != "opencode" => {
-            // Don't send Error event - the failure will be emitted as an AssistantMessage
-            // with success=false after this function returns, avoiding duplicate messages.
+            let _ = events_tx.send(AgentEvent::Error {
+                message: format!("Unsupported backend: {}", backend),
+                mission_id,
+                resumable: mission_id.is_some(),
+            });
             crate::agents::AgentResult::failure(format!("Unsupported backend: {}", backend), 0)
                 .with_terminal_reason(TerminalReason::LlmError)
         }
