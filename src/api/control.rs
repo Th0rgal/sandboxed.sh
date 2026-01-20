@@ -3700,6 +3700,9 @@ async fn run_single_control_turn(
     ctx.mission_id = mission_id;
     ctx.mcp = Some(mcp);
 
+    let fallback_workspace = workspace::Workspace::default_host(config.working_dir.clone());
+    let exec_workspace = runtime_workspace.as_ref().unwrap_or(&fallback_workspace);
+
     // Execute based on backend
     let result = match backend_id.as_deref() {
         Some("claudecode") => {
@@ -3716,6 +3719,7 @@ async fn run_single_control_turn(
                 }
             };
             super::mission_runner::run_claudecode_turn(
+                exec_workspace,
                 &ctx.working_dir,
                 &user_message,
                 config.default_model.as_deref(),

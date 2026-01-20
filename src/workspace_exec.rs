@@ -40,6 +40,9 @@ impl WorkspaceExec {
         let mut merged = self.workspace.env_vars.clone();
         merged.extend(extra_env);
         merged
+            .entry("OPEN_AGENT_WORKSPACE_TYPE".to_string())
+            .or_insert_with(|| self.workspace.workspace_type.as_str().to_string());
+        merged
     }
 
     fn build_command(
@@ -65,6 +68,10 @@ impl WorkspaceExec {
             WorkspaceType::Chroot => {
                 // For chroot workspaces we execute via systemd-nspawn.
                 // Note: this requires systemd-nspawn on the host at runtime.
+                let mut env = env;
+                if !env.contains_key("HOME") {
+                    env.insert("HOME".to_string(), "/root".to_string());
+                }
                 let root = self.workspace.path.clone();
                 let rel_cwd = self.rel_path_in_container(cwd);
 

@@ -1623,6 +1623,63 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     )
     .await?;
 
+    // Sync oh-my-opencode settings into the mission directory when using OpenCode.
+    if backend_id == "opencode" {
+        if let Some(lib) = library {
+            match lib.get_opencode_settings().await {
+                Ok(settings) => {
+                    if !settings.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                        let opencode_dir = dir.join(".opencode");
+                        if let Err(e) = tokio::fs::create_dir_all(&opencode_dir).await {
+                            tracing::warn!(
+                                mission = %mission_id,
+                                workspace = %workspace.name,
+                                error = %e,
+                                "Failed to create .opencode directory for OpenCode settings"
+                            );
+                        } else {
+                            let dest_path = opencode_dir.join("oh-my-opencode.json");
+                            match serde_json::to_string_pretty(&settings) {
+                                Ok(content) => {
+                                    if let Err(e) = tokio::fs::write(&dest_path, content).await {
+                                        tracing::warn!(
+                                            mission = %mission_id,
+                                            workspace = %workspace.name,
+                                            error = %e,
+                                            "Failed to write oh-my-opencode settings"
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            mission = %mission_id,
+                                            path = %dest_path.display(),
+                                            "Synced oh-my-opencode settings to mission directory"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        mission = %mission_id,
+                                        workspace = %workspace.name,
+                                        error = %e,
+                                        "Failed to serialize oh-my-opencode settings"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        mission = %mission_id,
+                        workspace = %workspace.name,
+                        error = %e,
+                        "Failed to load oh-my-opencode settings from library"
+                    );
+                }
+            }
+        }
+    }
+
     // Sync skills and tools from workspace to mission directory
     if let Some(lib) = library {
         let context = format!("mission-{}", mission_id);

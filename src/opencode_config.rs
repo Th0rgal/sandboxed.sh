@@ -347,11 +347,11 @@ pub async fn ensure_global_config(mcp: &McpRegistry) -> anyhow::Result<()> {
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .expect("tools object");
-    tools_obj.insert("bash".to_string(), json!(false));
+    tools_obj.insert("bash".to_string(), json!(true));
     tools_obj.insert("desktop_*".to_string(), json!(true));
     tools_obj.insert("playwright_*".to_string(), json!(true));
     tools_obj.insert("browser_*".to_string(), json!(true));
-    tools_obj.insert("workspace_*".to_string(), json!(true));
+    tools_obj.insert("workspace_*".to_string(), json!(false));
 
     let payload = serde_json::to_string_pretty(&root)?;
     tokio::fs::write(&config_path, payload).await?;

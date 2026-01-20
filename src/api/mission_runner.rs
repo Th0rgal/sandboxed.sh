@@ -10,7 +10,7 @@
 //! - Health monitoring
 //! - Working directory (isolated per mission)
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::agents::{AgentContext, AgentRef, AgentResult, TerminalReason};
+use crate::agents::{AgentRef, AgentResult, TerminalReason};
 use crate::backend::claudecode::client::{ClaudeEvent, ContentBlock, StreamEvent};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
@@ -385,19 +385,19 @@ fn build_history_context(history: &[(String, String)], max_chars: usize) -> Stri
 /// Execute a single turn for a mission.
 async fn run_mission_turn(
     config: Config,
-    root_agent: AgentRef,
+    _root_agent: AgentRef,
     mcp: Arc<McpRegistry>,
     workspaces: workspace::SharedWorkspaceStore,
     library: SharedLibrary,
     events_tx: broadcast::Sender<AgentEvent>,
-    tool_hub: Arc<FrontendToolHub>,
-    status: Arc<RwLock<ControlStatus>>,
+    _tool_hub: Arc<FrontendToolHub>,
+    _status: Arc<RwLock<ControlStatus>>,
     cancel: CancellationToken,
     history: Vec<(String, String)>,
     user_message: String,
-    mission_control: Option<crate::tools::mission::MissionControl>,
-    tree_snapshot: Arc<RwLock<Option<AgentTreeNode>>>,
-    progress_snapshot: Arc<RwLock<ExecutionProgress>>,
+    _mission_control: Option<crate::tools::mission::MissionControl>,
+    _tree_snapshot: Arc<RwLock<Option<AgentTreeNode>>>,
+    _progress_snapshot: Arc<RwLock<ExecutionProgress>>,
     mission_id: Uuid,
     workspace_id: Option<Uuid>,
     backend_id: String,
@@ -471,13 +471,6 @@ async fn run_mission_turn(
     convo.push_str(multi_step_instructions);
     convo.push_str("\n");
 
-    let mut task = match crate::task::Task::new(convo, Some(1000)) {
-        Ok(t) => t,
-        Err(e) => {
-            return AgentResult::failure(format!("Failed to create task: {}", e), 0);
-        }
-    };
-
     // Ensure mission workspace exists and is configured for OpenCode.
     let workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
     let workspace_root = workspace.path.clone();
@@ -525,17 +518,20 @@ async fn run_mission_turn(
             .await
         }
         "opencode" => {
-            let mut ctx = AgentContext::new(config.clone(), mission_work_dir);
-            ctx.mission_control = mission_control;
-            ctx.control_events = Some(events_tx.clone());
-            ctx.frontend_tool_hub = Some(tool_hub);
-            ctx.control_status = Some(status);
-            ctx.cancel_token = Some(cancel);
-            ctx.tree_snapshot = Some(tree_snapshot);
-            ctx.progress_snapshot = Some(progress_snapshot);
-            ctx.mission_id = Some(mission_id);
-            ctx.mcp = Some(mcp);
-            root_agent.execute(&mut task, &ctx).await
+            // Use per-workspace CLI execution for all workspace types to ensure
+            // native bash + correct filesystem scope.
+            run_opencode_turn(
+                &workspace,
+                &mission_work_dir,
+                &convo,
+                config.default_model.as_deref(),
+                effective_agent.as_deref(),
+                mission_id,
+                events_tx.clone(),
+                cancel,
+                &config.working_dir,
+            )
+            .await
         }
         _ => {
             // Don't send Error event - the failure will be emitted as an AssistantMessage
@@ -945,6 +941,410 @@ pub async fn run_claudecode_turn(
             .with_terminal_reason(TerminalReason::LlmError)
     } else {
         AgentResult::success(final_result, cost_cents)
+    }
+}
+
+/// Read CLI path for opencode from backend config file if available.
+fn get_opencode_cli_path_from_config(_app_working_dir: &std::path::Path) -> Option<String> {
+    // Backend configs are stored in ~/.openagent/data/backend_configs.json
+    let home = std::env::var("HOME").ok()?;
+    let config_path = std::path::PathBuf::from(&home)
+        .join(".openagent")
+        .join("data")
+        .join("backend_configs.json");
+
+    let contents = std::fs::read_to_string(&config_path).ok()?;
+    let configs: Vec<serde_json::Value> = serde_json::from_str(&contents).ok()?;
+
+    for config in configs {
+        if config.get("id")?.as_str()? == "opencode" {
+            if let Some(settings) = config.get("settings") {
+                if let Some(cli_path) = settings.get("cli_path").and_then(|v| v.as_str()) {
+                    if !cli_path.is_empty() {
+                        tracing::info!("Using OpenCode CLI path from backend config: {}", cli_path);
+                        return Some(cli_path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn workspace_path_for_env(
+    workspace: &Workspace,
+    host_path: &std::path::Path,
+) -> std::path::PathBuf {
+    if workspace.workspace_type == workspace::WorkspaceType::Chroot {
+        if let Ok(rel) = host_path.strip_prefix(&workspace.path) {
+            return std::path::PathBuf::from("/").join(rel);
+        }
+    }
+    host_path.to_path_buf()
+}
+
+fn strip_ansi_codes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip ANSI escape sequences like "\x1b[31m"
+            if let Some('[') = chars.peek() {
+                let _ = chars.next();
+                while let Some(c) = chars.next() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
+async fn command_available(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    program: &str,
+) -> bool {
+    if program.contains('/') {
+        let output = workspace_exec
+            .output(cwd, program, &["--version".to_string()], HashMap::new())
+            .await;
+        return matches!(output, Ok(out) if out.status.success());
+    }
+
+    let mut args = Vec::new();
+    args.push("-lc".to_string());
+    args.push(format!("command -v {}", program));
+    let output = workspace_exec
+        .output(cwd, "/bin/sh", &args, HashMap::new())
+        .await;
+    matches!(output, Ok(out) if out.status.success())
+}
+
+/// Execute a turn using OpenCode CLI backend.
+///
+/// For Host workspaces: spawns the CLI directly on the host.
+/// For Chroot workspaces: spawns the CLI inside the container using systemd-nspawn.
+///
+/// This uses the `oh-my-opencode run` CLI which creates an embedded OpenCode server,
+/// enabling per-workspace isolation without network issues.
+pub async fn run_opencode_turn(
+    workspace: &Workspace,
+    work_dir: &std::path::Path,
+    message: &str,
+    model: Option<&str>,
+    agent: Option<&str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    _app_working_dir: &std::path::Path,
+) -> AgentResult {
+    use std::collections::HashMap;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Determine CLI runner: prefer backend config, then env var, then try bunx/npx
+    // We use 'bunx oh-my-opencode run' or 'npx oh-my-opencode run' for per-workspace execution.
+    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let configured_runner = get_opencode_cli_path_from_config(_app_working_dir)
+        .or_else(|| std::env::var("OPENCODE_CLI_PATH").ok());
+
+    let cli_runner = if let Some(path) = configured_runner {
+        if command_available(&workspace_exec, work_dir, &path).await {
+            path
+        } else {
+            let err_msg = format!(
+                "OpenCode CLI runner '{}' not found in workspace. Install it or update OPENCODE_CLI_PATH.",
+                path
+            );
+            tracing::error!("{}", err_msg);
+            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+        }
+    } else if command_available(&workspace_exec, work_dir, "bunx").await {
+        "bunx".to_string()
+    } else if command_available(&workspace_exec, work_dir, "npx").await {
+        "npx".to_string()
+    } else {
+        let err_msg =
+            "No OpenCode CLI runner found in workspace (expected bunx or npx).".to_string();
+        tracing::error!("{}", err_msg);
+        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+    };
+
+    tracing::info!(
+        mission_id = %mission_id,
+        work_dir = %work_dir.display(),
+        workspace_type = ?workspace.workspace_type,
+        model = ?model,
+        agent = ?agent,
+        cli_runner = %cli_runner,
+        "Starting OpenCode execution via WorkspaceExec (per-workspace CLI mode)"
+    );
+
+    let work_dir_env = workspace_path_for_env(workspace, work_dir);
+    let work_dir_arg = work_dir_env.to_string_lossy().to_string();
+
+    // Build CLI arguments for oh-my-opencode run
+    // The 'run' command takes a prompt and executes it with completion detection
+    // Arguments: bunx oh-my-opencode run [--agent <agent>] [--directory <path>] [--timeout <ms>] <message>
+    let mut args = vec!["oh-my-opencode".to_string(), "run".to_string()];
+
+    if let Some(a) = agent {
+        args.push("--agent".to_string());
+        args.push(a.to_string());
+    }
+
+    args.push("--directory".to_string());
+    args.push(work_dir_arg.clone());
+
+    // Add timeout (0 = no timeout, let the agent complete)
+    args.push("--timeout".to_string());
+    args.push("0".to_string());
+
+    // The message is passed as the final argument
+    args.push(message.to_string());
+
+    // Build environment variables
+    let mut env: HashMap<String, String> = HashMap::new();
+
+    // Pass the model if specified
+    if let Some(m) = model {
+        // Parse provider/model format
+        if let Some((provider, model_id)) = m.split_once('/') {
+            env.insert("OPENCODE_PROVIDER".to_string(), provider.to_string());
+            env.insert("OPENCODE_MODEL".to_string(), model_id.to_string());
+        } else {
+            env.insert("OPENCODE_MODEL".to_string(), m.to_string());
+        }
+    }
+
+    // Ensure OpenCode uses workspace-local config
+    let opencode_config_dir = workspace_path_for_env(workspace, &work_dir.join(".opencode"));
+    let opencode_config_path = workspace_path_for_env(workspace, &work_dir.join("opencode.json"));
+    env.insert(
+        "OPENCODE_CONFIG_DIR".to_string(),
+        opencode_config_dir.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "OPENCODE_CONFIG".to_string(),
+        opencode_config_path.to_string_lossy().to_string(),
+    );
+
+    // Disable ANSI color codes for easier parsing
+    env.insert("NO_COLOR".to_string(), "1".to_string());
+    env.insert("FORCE_COLOR".to_string(), "0".to_string());
+
+    // Set non-interactive mode
+    env.insert("OPENCODE_NON_INTERACTIVE".to_string(), "true".to_string());
+    env.insert("OPENCODE_RUN".to_string(), "true".to_string());
+    env.entry("OPEN_AGENT_WORKSPACE_TYPE".to_string())
+        .or_insert_with(|| workspace.workspace_type.as_str().to_string());
+
+    // Use WorkspaceExec to spawn the CLI in the correct workspace context
+    let mut child = match workspace_exec
+        .spawn_streaming(work_dir, &cli_runner, &args, env)
+        .await
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let err_msg = format!("Failed to start OpenCode CLI: {}", e);
+            tracing::error!("{}", err_msg);
+            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+
+    // Get stdout and stderr for reading output
+    // oh-my-opencode run writes:
+    // - stdout: assistant text output (the actual response)
+    // - stderr: event logs (tool calls, results, session status)
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let err_msg = "Failed to capture OpenCode stdout";
+            tracing::error!("{}", err_msg);
+            return AgentResult::failure(err_msg.to_string(), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+
+    let stderr = child.stderr.take();
+
+    let mut final_result = String::new();
+    let mut had_error = false;
+
+    // Create buffered readers
+    let stdout_reader = BufReader::new(stdout);
+    let mut stdout_lines = stdout_reader.lines();
+
+    // Spawn a task to read stderr events if available
+    let events_tx_clone = events_tx.clone();
+    let mission_id_clone = mission_id;
+    let stderr_handle = if let Some(stderr) = stderr {
+        Some(tokio::spawn(async move {
+            let stderr_reader = BufReader::new(stderr);
+            let mut stderr_lines = stderr_reader.lines();
+            let mut last_tool_id: Option<String> = None;
+            let mut last_tool_name: Option<String> = None;
+
+            while let Ok(Some(line)) = stderr_lines.next_line().await {
+                let clean = strip_ansi_codes(&line);
+                let clean = clean.trim().to_string();
+                if clean.is_empty() {
+                    continue;
+                }
+
+                tracing::debug!(mission_id = %mission_id_clone, line = %clean, "OpenCode CLI stderr");
+
+                // Parse stderr for tool execution events
+                // Format: "[MAIN] ⚡ TOOL.EXECUTE: <tool>" or "✓ TOOL.RESULT: \"...\""
+                if clean.contains("TOOL.EXECUTE:") {
+                    // Extract tool name from the line
+                    if let Some(name_start) = clean.find("TOOL.EXECUTE:") {
+                        let name_part = &clean[name_start + 14..];
+                        let tool_name = name_part.trim().trim_matches('"');
+                        let tool_id = format!("opencode-{}", uuid::Uuid::new_v4());
+                        last_tool_id = Some(tool_id.clone());
+                        last_tool_name = Some(tool_name.to_string());
+                        let _ = events_tx_clone.send(AgentEvent::ToolCall {
+                            tool_call_id: tool_id,
+                            name: tool_name.to_string(),
+                            args: serde_json::json!({}),
+                            mission_id: Some(mission_id_clone),
+                        });
+                    }
+                } else if clean.contains("TOOL.RESULT:") {
+                    // Emit tool result using the most recent tool call if available
+                    let tool_id = last_tool_id
+                        .clone()
+                        .unwrap_or_else(|| format!("opencode-{}", uuid::Uuid::new_v4()));
+                    let tool_name = last_tool_name
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let _ = events_tx_clone.send(AgentEvent::ToolResult {
+                        tool_call_id: tool_id,
+                        name: tool_name,
+                        result: serde_json::json!({ "output": clean }),
+                        mission_id: Some(mission_id_clone),
+                    });
+                } else if clean.contains("SESSION.ERROR:")
+                    || clean.contains("Error:")
+                    || clean.contains("error:")
+                {
+                    // Emit error event
+                    let _ = events_tx_clone.send(AgentEvent::Error {
+                        message: clean.clone(),
+                        mission_id: Some(mission_id_clone),
+                        resumable: true,
+                    });
+                }
+
+                // Also forward as thinking for UI visibility
+                let _ = events_tx_clone.send(AgentEvent::Thinking {
+                    content: clean,
+                    done: false,
+                    mission_id: Some(mission_id_clone),
+                });
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Process stdout until completion or cancellation
+    // stdout contains the actual assistant response text
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!(mission_id = %mission_id, "OpenCode execution cancelled, killing process");
+                let _ = child.kill().await;
+                if let Some(handle) = stderr_handle {
+                    handle.abort();
+                }
+                return AgentResult::failure("Cancelled".to_string(), 0)
+                    .with_terminal_reason(TerminalReason::Cancelled);
+            }
+            line_result = stdout_lines.next_line() => {
+                match line_result {
+                    Ok(Some(line)) => {
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        // Log the output for debugging
+                        tracing::debug!(mission_id = %mission_id, line = %line, "OpenCode CLI stdout");
+
+                        // Accumulate output as the final result (this is the assistant's text)
+                        let delta = if final_result.is_empty() {
+                            line.clone()
+                        } else {
+                            format!("\n{}", line)
+                        };
+                        final_result.push_str(&delta);
+
+                        // Check for error indicators in stdout too
+                        if line.contains("Error:") || line.contains("error:") {
+                            had_error = true;
+                        }
+
+                        // Emit text delta for the UI
+                        let _ = events_tx.send(AgentEvent::Thinking {
+                            content: delta,
+                            done: false,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    Ok(None) => {
+                        // EOF - process finished
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!("Error reading from OpenCode CLI stdout: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Wait for stderr task to complete
+    if let Some(handle) = stderr_handle {
+        let _ = handle.await;
+    }
+
+    // Wait for child process to finish and clean up
+    let exit_status = child.wait().await;
+
+    // Check exit status
+    if let Ok(status) = exit_status {
+        if !status.success() {
+            had_error = true;
+            if final_result.is_empty() {
+                final_result = format!("OpenCode CLI exited with status: {}", status);
+            }
+        }
+    }
+
+    // Emit final thinking done marker
+    let _ = events_tx.send(AgentEvent::Thinking {
+        content: String::new(),
+        done: true,
+        mission_id: Some(mission_id),
+    });
+
+    tracing::info!(
+        mission_id = %mission_id,
+        had_error = had_error,
+        result_len = final_result.len(),
+        "OpenCode CLI execution completed"
+    );
+
+    if had_error {
+        AgentResult::failure(final_result, 0).with_terminal_reason(TerminalReason::LlmError)
+    } else {
+        AgentResult::success(final_result, 0)
     }
 }
 
