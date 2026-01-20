@@ -21,7 +21,11 @@ fn default_enabled() -> bool {
 }
 
 impl BackendConfigEntry {
-    pub fn new(id: impl Into<String>, name: impl Into<String>, settings: serde_json::Value) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        settings: serde_json::Value,
+    ) -> Self {
         Self {
             id: id.into(),
             name: name.into(),

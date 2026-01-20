@@ -113,11 +113,12 @@ pub async fn get_backend_config(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Backend {} not found", id)))?;
     drop(registry);
 
-    let config_entry = state
-        .backend_configs
-        .get(&id)
-        .await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Backend {} not configured", id)))?;
+    let config_entry = state.backend_configs.get(&id).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Backend {} not configured", id),
+        )
+    })?;
 
     let mut settings = config_entry.settings.clone();
 
@@ -169,10 +170,12 @@ pub async fn update_backend_config(
 
     let updated_settings = match id.as_str() {
         "opencode" => {
-            let settings = req
-                .settings
-                .as_object()
-                .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid settings payload".to_string()))?;
+            let settings = req.settings.as_object().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid settings payload".to_string(),
+                )
+            })?;
             let base_url = settings
                 .get("base_url")
                 .and_then(|v| v.as_str())
@@ -197,15 +200,12 @@ pub async fn update_backend_config(
         "claudecode" => {
             let mut settings = req.settings.clone();
             if let Some(api_key) = settings.get("api_key").and_then(|v| v.as_str()) {
-                let store = state
-                    .secrets
-                    .as_ref()
-                    .ok_or_else(|| {
-                        (
-                            StatusCode::BAD_REQUEST,
-                            "Secrets store not available".to_string(),
-                        )
-                    })?;
+                let store = state.secrets.as_ref().ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "Secrets store not available".to_string(),
+                    )
+                })?;
                 store
                     .set_secret("claudecode", "api_key", api_key, None)
                     .await

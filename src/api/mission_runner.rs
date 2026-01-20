@@ -19,12 +19,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agents::{AgentContext, AgentRef, AgentResult, TerminalReason};
-use crate::backend::claudecode::client::{ClaudeCodeClient, ClaudeCodeConfig, ClaudeEvent, ContentBlock, StreamEvent};
+use crate::backend::claudecode::client::{ClaudeEvent, ContentBlock, StreamEvent};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
 use crate::secrets::SecretsStore;
 use crate::task::{extract_deliverables, DeliverableSet};
-use crate::workspace;
+use crate::workspace::{self, Workspace};
+use crate::workspace_exec::WorkspaceExec;
 
 use super::control::{
     AgentEvent, AgentTreeNode, ControlStatus, ExecutionProgress, FrontendToolHub,
@@ -510,6 +511,7 @@ async fn run_mission_turn(
     let result = match backend_id.as_str() {
         "claudecode" => {
             run_claudecode_turn(
+                &workspace,
                 &mission_work_dir,
                 &user_message,
                 config.default_model.as_deref(),
@@ -571,7 +573,10 @@ fn get_claudecode_cli_path_from_config(_app_working_dir: &std::path::Path) -> Op
             if let Some(settings) = config.get("settings") {
                 if let Some(cli_path) = settings.get("cli_path").and_then(|v| v.as_str()) {
                     if !cli_path.is_empty() {
-                        tracing::info!("Using Claude Code CLI path from backend config: {}", cli_path);
+                        tracing::info!(
+                            "Using Claude Code CLI path from backend config: {}",
+                            cli_path
+                        );
                         return Some(cli_path.to_string());
                     }
                 }
@@ -582,7 +587,11 @@ fn get_claudecode_cli_path_from_config(_app_working_dir: &std::path::Path) -> Op
 }
 
 /// Execute a turn using Claude Code CLI backend.
+///
+/// For Host workspaces: spawns the CLI directly on the host.
+/// For Chroot workspaces: spawns the CLI inside the container using systemd-nspawn.
 pub async fn run_claudecode_turn(
+    workspace: &Workspace,
     work_dir: &std::path::Path,
     message: &str,
     model: Option<&str>,
@@ -593,8 +602,11 @@ pub async fn run_claudecode_turn(
     secrets: Option<Arc<SecretsStore>>,
     app_working_dir: &std::path::Path,
 ) -> AgentResult {
+    use super::ai_providers::{
+        ensure_anthropic_oauth_token_valid, get_anthropic_api_key_for_claudecode,
+    };
     use std::collections::HashMap;
-    use super::ai_providers::{get_anthropic_api_key_for_claudecode, ensure_anthropic_oauth_token_valid};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     // Ensure OAuth token is valid before starting (refresh if expired)
     if let Err(e) = ensure_anthropic_oauth_token_valid().await {
@@ -629,42 +641,85 @@ pub async fn run_claudecode_turn(
         .or_else(|| std::env::var("CLAUDE_CLI_PATH").ok())
         .unwrap_or_else(|| "claude".to_string());
 
-    let config = ClaudeCodeConfig {
-        cli_path,
-        api_key,
-        default_model: model.map(|s| s.to_string()),
-    };
-
-    let client = ClaudeCodeClient::with_config(config);
-    let session_id = client.create_session_id();
+    let session_id = Uuid::new_v4().to_string();
 
     tracing::info!(
         mission_id = %mission_id,
         session_id = %session_id,
         work_dir = %work_dir.display(),
+        workspace_type = ?workspace.workspace_type,
         model = ?model,
         agent = ?agent,
-        "Starting Claude Code execution"
+        "Starting Claude Code execution via WorkspaceExec"
     );
 
-    // Execute the message
-    let (mut event_rx, process_handle) = match client
-        .execute_message(
-            work_dir.to_str().unwrap_or("."),
-            message,
-            model,
-            Some(&session_id),
-            agent,
-        )
+    // Build CLI arguments
+    let mut args = vec![
+        "--print".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--include-partial-messages".to_string(),
+    ];
+
+    if let Some(m) = model {
+        args.push("--model".to_string());
+        args.push(m.to_string());
+    }
+
+    args.push("--session-id".to_string());
+    args.push(session_id.clone());
+
+    if let Some(a) = agent {
+        args.push("--agent".to_string());
+        args.push(a.to_string());
+    }
+
+    // Build environment variables
+    let mut env: HashMap<String, String> = HashMap::new();
+    if let Some(ref key) = api_key {
+        if key.starts_with("sk-ant-oat") {
+            env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), key.clone());
+            tracing::debug!("Using OAuth token for Claude CLI authentication");
+        } else {
+            env.insert("ANTHROPIC_API_KEY".to_string(), key.clone());
+            tracing::debug!("Using API key for Claude CLI authentication");
+        }
+    }
+
+    // Use WorkspaceExec to spawn the CLI in the correct workspace context
+    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let mut child = match workspace_exec
+        .spawn_streaming(work_dir, &cli_path, &args, env)
         .await
     {
-        Ok(r) => r,
+        Ok(child) => child,
         Err(e) => {
             let err_msg = format!("Failed to start Claude CLI: {}", e);
             tracing::error!("{}", err_msg);
-            // Don't send Error event - the failure will be emitted as an AssistantMessage
-            // with success=false by the caller (control.rs), avoiding duplicate messages.
-            return AgentResult::failure(err_msg, 0)
+            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+
+    // Write message to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        let msg = message.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = stdin.write_all(msg.as_bytes()).await {
+                tracing::error!("Failed to write to Claude stdin: {}", e);
+            }
+            // Close stdin to signal end of input
+            drop(stdin);
+        });
+    }
+
+    // Get stdout for reading events
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let err_msg = "Failed to capture Claude stdout";
+            tracing::error!("{}", err_msg);
+            return AgentResult::failure(err_msg.to_string(), 0)
                 .with_terminal_reason(TerminalReason::LlmError);
         }
     };
@@ -682,19 +737,43 @@ pub async fn run_claudecode_turn(
     let mut text_buffer: HashMap<u32, String> = HashMap::new();
     let mut last_thinking_len: usize = 0; // Track last emitted length to avoid re-sending same content
 
+    // Create a buffered reader for stdout
+    let reader = BufReader::new(stdout);
+    let mut lines = reader.lines();
+
     // Process events until completion or cancellation
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!(mission_id = %mission_id, "Claude Code execution cancelled, killing process");
                 // Kill the process to stop consuming API resources
-                process_handle.kill().await;
+                let _ = child.kill().await;
                 return AgentResult::failure("Cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
             }
-            event = event_rx.recv() => {
-                match event {
-                    Some(claude_event) => {
+            line_result = lines.next_line() => {
+                match line_result {
+                    Ok(Some(line)) => {
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        let claude_event: ClaudeEvent = match serde_json::from_str(&line) {
+                            Ok(event) => event,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to parse Claude event: {} - line: {}",
+                                    e,
+                                    if line.len() > 200 {
+                                        format!("{}...", &line[..200])
+                                    } else {
+                                        line.clone()
+                                    }
+                                );
+                                continue;
+                            }
+                        };
+
                         match claude_event {
                             ClaudeEvent::System(sys) => {
                                 tracing::debug!(
@@ -842,8 +921,12 @@ pub async fn run_claudecode_turn(
                             }
                         }
                     }
-                    None => {
-                        // Channel closed - process finished
+                    Ok(None) => {
+                        // EOF - process finished
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!("Error reading from Claude CLI: {}", e);
                         break;
                     }
                 }
@@ -851,7 +934,8 @@ pub async fn run_claudecode_turn(
         }
     }
 
-    // Process handle is dropped here, which will clean up the child process
+    // Wait for child process to finish and clean up
+    let _ = child.wait().await;
 
     // Convert cost from USD to cents
     let cost_cents = (total_cost_usd * 100.0) as u64;

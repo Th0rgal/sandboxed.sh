@@ -1,120 +1,109 @@
-/ralph-loop --max-iterations 50 --completion-promise "<promise>SHADER_FIX_COMPLETE</promise>"
+Refactor Plan: Per-Workspace Claude Code + OpenCode (No Host MCP Proxy)
+======================================================================
 
-# Meta Ralph Loop: Oraxen Shader Fix via OpenAgent Orchestration
+Goal
+----
+Replace the host workspace bash tool + MCP proxy system with per-workspace installs
+of Claude Code and OpenCode. Each agent runs inside the workspace so native bash
+works and file effects are scoped to the correct workspace. Keep event streaming
+visible in the UI.
 
-## Role
-You are Claude Opus orchestrating a Claude Code mission through the OpenAgent dashboard via Chrome browser automation. Your job is to:
-1. Control the Claude Code agent to fix Oraxen text shaders for Minecraft 1.21.4
-2. Fix any OpenAgent frontend/backend bugs you encounter along the way
-3. Monitor mission progress and intervene when the agent gets stuck
+Why this change
+---------------
+- Native bash is reliable only when the agent runs inside the target workspace.
+- The current proxy system introduces ambiguity and bugs (cwd/path/state drift).
+- Per-workspace installs allow strict isolation and predictable behavior.
 
-## CRITICAL: Completion Signal
-When ALL success criteria below are met, output exactly:
-<promise>SHADER_FIX_COMPLETE</promise>
+Summary of required changes
+---------------------------
+Backend
+- Add a workspace execution layer (host/chroot/ssh) that can spawn streaming
+  processes inside the workspace (used by both Claude Code and OpenCode).
+- Claude Code: spawn the CLI inside the workspace (not on host).
+- OpenCode: run per-workspace server or run curl inside the workspace for /session
+  and SSE /event streaming; avoid host HTTP into container networks.
+- Track per-workspace runtime state: PID, port, status, last_event_at.
 
-Do NOT output this until ALL criteria are verified. This will end the loop.
+Workspace + Config
+- Stop syncing workspace-mcp/desktop-mcp binaries into containers.
+- Enable built-in bash in per-workspace configs; remove instructions that force
+  mcp__workspace__bash.
+- Copy per-workspace config into each workspace:
+  - opencode.json
+  - oh-my-opencode.json
+  - provider auth / tokens (if needed)
+- Add per-workspace overrides (CLI path, OpenCode port, plugin list, env vars).
 
-## Success Criteria (ALL must be true to complete)
-1. grep confirms no remaining "#version 150" in Oraxen codebase (verified via SSH)
-2. Test server started successfully with shard
-3. Minecraft client connected via mc-cli
-4. Text shaders render correctly (screenshot evidence from agent)
-5. No new OpenAgent bugs in last 2 monitoring cycles
+UI
+- Add per-workspace backend settings panel.
+- Show per-workspace status: installed / running / version / last event.
+- Fetch agents per workspace (not global).
 
-## Plan
+Networking / Tailscale
+- For isolated workspaces with private networking, host HTTP will fail.
+- Fix: run OpenCode client requests inside the workspace (nspawn/ssh).
 
-### Phase 1: Mission Setup
-1. Navigate to OpenAgent dashboard at localhost:3001/control
-2. Create new Claude Code mission in "minecraft" workspace (create from template if needed)
-3. Ensure workspace has access to: oraxen repo, shard, mc-cli
+Test Instructions
+=================
 
-### Phase 2: Send Initial Prompt to Claude Code Agent
-Send this exact prompt to the mission:
+Pre-checks
+- Create two workspaces:
+  1) Isolated workspace (chroot)
+  2) Host workspace
+- Ensure per-workspace installs are present for both Claude Code and OpenCode
+  in each workspace (the new flow should do this automatically).
 
----
-Your task is to fix Oraxen shader compatibility with Minecraft 1.21.4.
+Test 1: Claude Code in isolated workspace
+----------------------------------------
+Steps
+1) In the UI, create a new mission with backend = Claude Code and workspace = isolated.
+2) Send a prompt like: "Create a file named WORKSPACE_TEST_CLAUDE.txt with the content 'hello' in the current directory. Then list files."
+3) Observe streaming events in UI.
+4) Verify in the isolated workspace filesystem that the file exists.
 
-IMPORTANT: The issue is likely with TEXT SHADERS, not just armor shaders.
+Pass criteria
+- Terminal/tool outputs stream in UI.
+- File appears inside the isolated workspace directory.
+- File does NOT appear in host workspace directory.
 
-Step 1 - Find ALL shader code:
-- Search for text/font/glyph shader generation
-- grep -r "#version" in the entire codebase
-- Focus on rendertype_text shaders
+Test 2: OpenCode in isolated workspace
+--------------------------------------
+Steps
+1) Create a mission with backend = OpenCode and workspace = isolated.
+2) Send: "Create a file named WORKSPACE_TEST_OPENCODE.txt with the content 'hello' in the current directory. Then list files."
+3) Observe streaming events.
+4) Verify the file exists in the isolated workspace filesystem.
 
-Step 2 - Fix shader versions:
-- Change ALL "#version 150" to "#version 330 core"
-- Update deprecated GLSL: texture2D to texture, gl_FragColor to out variable
-- Fix varying to in/out keywords
+Pass criteria
+- Tool calls and results stream in UI.
+- File exists in isolated workspace.
+- File does NOT appear in host workspace.
 
-Step 3 - Set up testing:
-- Clone https://github.com/th0rgal/shard (server launcher)
-- Clone https://github.com/Th0rgal/mc-cli (client controller)
-- Create Fabric 1.21.4 profile for mc-cli if needed
-- Build Oraxen: ./gradlew build
+Test 3: Claude Code in host workspace
+-------------------------------------
+Steps
+1) Create a mission with backend = Claude Code and workspace = host.
+2) Send: "Create a file named HOST_TEST_CLAUDE.txt with the content 'hello' in the current directory. Then list files."
+3) Verify file exists in host workspace directory.
 
-Step 4 - Test:
-- Start test server with shard
-- Launch client with mc-cli
-- Connect and verify text shaders render correctly
-- Take screenshots as proof
+Pass criteria
+- File is created in host workspace.
+- No file appears in isolated workspace.
 
-Full permission granted. Stop asking for permission and proceed autonomously.
----
+Test 4: OpenCode in host workspace
+----------------------------------
+Steps
+1) Create a mission with backend = OpenCode and workspace = host.
+2) Send: "Create a file named HOST_TEST_OPENCODE.txt with the content 'hello' in the current directory. Then list files."
+3) Verify file exists in host workspace directory.
 
-### Phase 3: Monitor Mission (every 3-5 minutes)
-1. Take screenshot of mission status
-2. If agent idle >2 minutes: send "Continue working on the shader fix."
-3. If agent asks permission: send "Yes, full permission granted. Proceed."
-4. If agent off-track: redirect to TEXT shaders specifically
+Pass criteria
+- File is created in host workspace.
+- No file appears in isolated workspace.
 
-### Phase 4: Fix OpenAgent Bugs As Discovered
-When encountering platform bugs:
-1. Document the bug
-2. Fix in dashboard/ or src/
-3. Test the fix
-4. Continue monitoring
-
-### Phase 5: Verification
-Once agent reports completion:
-1. SSH verify: ssh root@95.216.112.253 "grep -r '#version 150' /root/workspaces/*/oraxen/"
-2. Should return empty
-3. Confirm agent has screenshot evidence of working shaders
-4. If verification fails, send correction and repeat
-
-### Phase 6: Complete
-When ALL success criteria verified:
-1. Ensure all OpenAgent fixes saved
-2. Output: <promise>SHADER_FIX_COMPLETE</promise>
-
-## Intervention Messages
-- Idle agent: "Continue working on the shader fix."
-- Permission request: "Yes, full permission granted. Proceed."
-- Wrong focus: "Focus on TEXT shaders. Search for rendertype_text."
-- mc-cli issues: "Create a new Fabric 1.21.4 profile. Modify mc-cli source if needed."
-- No testing: "You must verify with actual test server using shard and mc-cli."
-
-## Error Recovery
-- Browser disconnected: call tabs_context_mcp to reconnect
-- Typing fails: use JavaScript nativeInputValueSetter injection
-- Mission crash: check logs via SSH, fix backend bug if needed, restart
-
-## Technical Context
-- Dashboard: localhost:3001
-- Backend: 95.216.112.253
-- Oraxen location: /root/workspaces/mission-*/oraxen/
-- GLSL requirement: version 330 core (not 150)
-- Text shaders: rendertype_text.vsh and rendertype_text.fsh
-
-## Progress Checklist
-- [ ] Mission created in minecraft workspace
-- [ ] Initial prompt sent
-- [ ] Agent found text shader code
-- [ ] Agent applied shader fixes
-- [ ] Agent set up shard
-- [ ] Agent set up mc-cli
-- [ ] Oraxen built successfully
-- [ ] Test server running
-- [ ] Client connected
-- [ ] Shaders verified working
-- [ ] No #version 150 remaining (SSH verified)
-- [ ] Output <promise>SHADER_FIX_COMPLETE</promise>
+Notes
+-----
+- If any file shows up in the wrong workspace, it means the agent or tool
+  execution still runs on the host or is using the wrong cwd.
+- If events do not stream, the in-workspace process spawning or SSE proxy is
+  broken.

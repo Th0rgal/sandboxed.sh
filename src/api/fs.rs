@@ -169,16 +169,12 @@ async fn resolve_path_for_workspace(
     path: &str,
     mission_id: Option<uuid::Uuid>,
 ) -> Result<PathBuf, (StatusCode, String)> {
-    let workspace = state
-        .workspaces
-        .get(workspace_id)
-        .await
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Workspace {} not found", workspace_id),
-            )
-        })?;
+    let workspace = state.workspaces.get(workspace_id).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Workspace {} not found", workspace_id),
+        )
+    })?;
 
     let workspace_root = workspace.path.canonicalize().map_err(|e| {
         (

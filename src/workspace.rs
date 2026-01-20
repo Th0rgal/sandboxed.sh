@@ -739,7 +739,10 @@ fn claude_entry_from_mcp(
             entry.insert("command".to_string(), json!(command));
             entry.insert("args".to_string(), json!(args));
 
-            if let Some(env) = opencode_entry.get("environment").and_then(|v| v.as_object()) {
+            if let Some(env) = opencode_entry
+                .get("environment")
+                .and_then(|v| v.as_object())
+            {
                 entry.insert("env".to_string(), serde_json::Value::Object(env.clone()));
             }
 
@@ -809,36 +812,27 @@ async fn write_opencode_config(
         }
     }
 
-    // Disable OpenCode's builtin bash tools so agents must use the workspace MCP's bash.
-    //
-    // The "workspace MCP" is the MCP provided by Open Agent that runs in the workspace's
-    // execution context. For container (nspawn) workspaces, this MCP runs INSIDE the
-    // container via systemd-nspawn wrapping (see lines 590-640), so its bash tool executes
-    // commands inside the container with container networking (Tailscale, etc).
-    // For host workspaces, disable bash entirely (security: no host shell access).
+    // Tool policy:
+    // - We want shell/file effects scoped to the workspace by running the agent process
+    //   inside the workspace execution context (host/chroot/ssh).
+    // - Therefore, OpenCode built-in bash MUST be enabled for all workspace types.
+    // - The legacy workspace-mcp/desktop-mcp proxy tools are no longer required for core flows.
     let mut tools = serde_json::Map::new();
     match workspace_type {
         WorkspaceType::Chroot => {
-            // Disable OpenCode built-in bash - agents must use workspace MCP's bash
-            // which runs inside the container with container networking
-            tools.insert("Bash".to_string(), json!(false)); // Claude Code built-in
-            tools.insert("bash".to_string(), json!(false)); // lowercase variant
-                                                            // Enable MCP-provided tools (workspace MCP runs inside container via nspawn)
-            tools.insert("workspace_*".to_string(), json!(true));
-            tools.insert("desktop_*".to_string(), json!(true));
+            // Container workspace: OpenCode runs inside the container, so built-in bash is safe.
+            tools.insert("Bash".to_string(), json!(true));
+            tools.insert("bash".to_string(), json!(true));
+            // Disable legacy MCP tool namespaces by default.
+            tools.insert("workspace_*".to_string(), json!(false));
+            tools.insert("desktop_*".to_string(), json!(false));
             tools.insert("playwright_*".to_string(), json!(true));
             tools.insert("browser_*".to_string(), json!(true));
         }
         WorkspaceType::Host => {
-            // For host workspaces, enable both built-in Bash and workspace MCP tools.
-            // The user explicitly chose a host workspace, so they want to run commands on the host.
-            // The workspace MCP bash runs on host anyway, so disabling built-in Bash
-            // only causes confusion without providing security benefits.
             tools.insert("Bash".to_string(), json!(true));
             tools.insert("bash".to_string(), json!(true));
-            tools.insert("workspace_*".to_string(), json!(true));
-            // Desktop/browser tools are disabled for host workspaces
-            // as they require container isolation for display handling
+            tools.insert("workspace_*".to_string(), json!(false));
             tools.insert("desktop_*".to_string(), json!(false));
             tools.insert("playwright_*".to_string(), json!(false));
             tools.insert("browser_*".to_string(), json!(false));
@@ -906,13 +900,12 @@ async fn write_claudecode_config(
     // - "Bash(*)" does NOT work as a wildcard - it's a literal pattern
     // - "mcp__*" works for MCP tools as a wildcard
     //
-    // For container workspaces: Do NOT include Bash permission - agents must use
-    // mcp__workspace__bash which runs inside the container. The CLAUDE.md file
-    // also instructs agents to use mcp__workspace__bash.
-    //
-    // For host workspaces: Include Bash permission since commands run on host anyway.
+    // Tool policy:
+    // - Claude Code CLI is executed inside the workspace execution context.
+    // - Therefore, built-in Bash is safe to allow for both host + container workspaces.
+    // - Legacy MCP tools are still allowed as a wildcard for compatibility.
     let permissions: Vec<&str> = match workspace_type {
-        WorkspaceType::Chroot => vec!["Edit", "Write", "Read", "mcp__*"],
+        WorkspaceType::Chroot => vec!["Bash", "Edit", "Write", "Read", "mcp__*"],
         WorkspaceType::Host => vec!["Bash", "Edit", "Write", "Read", "mcp__*"],
     };
     let settings = json!({
@@ -942,16 +935,8 @@ async fn write_claudecode_config(
                 WorkspaceType::Chroot => {
                     claude_md.push_str("## Container Workspace\n\n");
                     claude_md.push_str(
-                        "**IMPORTANT**: This is an isolated container workspace. \
-                        For ALL shell commands, you MUST use `mcp__workspace__bash` instead of the built-in `Bash` tool. \
-                        The built-in Bash tool is disabled for security - it would run on the host instead of inside the container.\n\n\
-                        Example:\n\
-                        ```\n\
-                        // WRONG - will not work:\n\
-                        Bash: git clone https://github.com/example/repo\n\n\
-                        // CORRECT - runs inside container:\n\
-                        mcp__workspace__bash: git clone https://github.com/example/repo\n\
-                        ```\n\n",
+                        "This is an isolated container workspace. Shell commands execute inside the container workspace context.\n\n\
+                        Use the built-in `Bash` tool for shell commands.\n\n",
                     );
                 }
                 WorkspaceType::Host => {
@@ -1592,14 +1577,8 @@ pub async fn prepare_mission_workspace_with_skills(
     library: Option<&LibraryStore>,
     mission_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
-    prepare_mission_workspace_with_skills_backend(
-        workspace,
-        mcp,
-        library,
-        mission_id,
-        "opencode",
-    )
-    .await
+    prepare_mission_workspace_with_skills_backend(workspace, mcp, library, mission_id, "opencode")
+        .await
 }
 
 /// Prepare a workspace directory for a mission with skill and tool syncing for a specific backend.
@@ -1623,8 +1602,9 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     if backend_id == "claudecode" {
         if let Some(lib) = library {
             let context = format!("mission-{}", mission_id);
-            let skill_names =
-                resolve_workspace_skill_names(workspace, lib).await.unwrap_or_default();
+            let skill_names = resolve_workspace_skill_names(workspace, lib)
+                .await
+                .unwrap_or_default();
             let skills = collect_skill_contents(&skill_names, &context, lib).await;
             skill_contents = Some(skills);
         }
@@ -2018,12 +1998,12 @@ async fn copy_binary_into_container(
 }
 
 async fn sync_workspace_mcp_binaries(
-    working_dir: &Path,
-    container_root: &Path,
+    _working_dir: &Path,
+    _container_root: &Path,
 ) -> anyhow::Result<()> {
-    for binary in ["workspace-mcp", "desktop-mcp"] {
-        copy_binary_into_container(working_dir, container_root, binary).await?;
-    }
+    // Legacy behavior: copy host workspace-mcp/desktop-mcp binaries into container.
+    // New behavior: no-op. With per-workspace agent execution, shell/tools execute
+    // inside the workspace and we no longer depend on these proxy MCP binaries.
     Ok(())
 }
 

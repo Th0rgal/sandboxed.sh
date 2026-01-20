@@ -148,9 +148,7 @@ pub enum ContentBlock {
         is_error: bool,
     },
     #[serde(rename = "thinking")]
-    Thinking {
-        thinking: String,
-    },
+    Thinking { thinking: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -208,8 +206,7 @@ pub struct ClaudeCodeConfig {
 impl Default for ClaudeCodeConfig {
     fn default() -> Self {
         Self {
-            cli_path: std::env::var("CLAUDE_CLI_PATH")
-                .unwrap_or_else(|_| "claude".to_string()),
+            cli_path: std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string()),
             api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             default_model: None,
         }
@@ -299,7 +296,11 @@ impl ClaudeCodeClient {
 
         let mut child = cmd.spawn().map_err(|e| {
             error!("Failed to spawn Claude CLI: {}", e);
-            anyhow!("Failed to spawn Claude CLI: {}. Is it installed at '{}'?", e, self.config.cli_path)
+            anyhow!(
+                "Failed to spawn Claude CLI: {}. Is it installed at '{}'?",
+                e,
+                self.config.cli_path
+            )
         })?;
 
         // Write message to stdin

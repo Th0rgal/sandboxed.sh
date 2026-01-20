@@ -3641,7 +3641,7 @@ async fn run_single_control_turn(
                 tracing::warn!("Failed to prepare mission workspace: {}", e);
                 ws.path.clone()
             }
-            };
+        };
         (dir, Some(ws))
     } else {
         (

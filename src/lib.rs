@@ -49,6 +49,7 @@ pub mod settings;
 pub mod task;
 pub mod tools;
 pub mod workspace;
+pub mod workspace_exec;
 
 pub use ai_providers::{AIProvider, AIProviderStore, ProviderType};
 pub use config::Config;

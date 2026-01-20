@@ -1,0 +1,31 @@
+{
+  "iterations": [
+    {
+      "iteration": 1,
+      "startedAt": "2026-01-20T06:49:43.051Z",
+      "endedAt": "2026-01-20T06:56:05.690Z",
+      "durationMs": 380764,
+      "toolsUsed": {
+        "Todo": 5,
+        "task": 4,
+        "Glob": 2,
+        "Read": 26,
+        "Grep": 4,
+        "Edit": 5
+      },
+      "filesModified": [
+        "oh-my-opencode",
+        "src/api/mission_runner.rs"
+      ],
+      "exitCode": 0,
+      "completionDetected": false,
+      "errors": []
+    }
+  ],
+  "totalDurationMs": 380764,
+  "struggleIndicators": {
+    "repeatedErrors": {},
+    "noProgressIterations": 0,
+    "shortIterations": 0
+  }
+}

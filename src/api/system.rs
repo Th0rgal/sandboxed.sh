@@ -249,11 +249,7 @@ async fn get_claude_code_info() -> ComponentInfo {
 async fn which_claude_code() -> Option<String> {
     let output = Command::new("which").arg("claude").output().await.ok()?;
     if output.status.success() {
-        Some(
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_string(),
-        )
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         None
     }
@@ -686,7 +682,7 @@ fn stream_open_agent_update() -> impl Stream<Item = Result<Event, std::convert::
 
         // Source cargo env and build
         let build_result = Command::new("bash")
-            .args(["-c", "source /root/.cargo/env && cargo build --bin open_agent --bin workspace-mcp --bin desktop-mcp"])
+            .args(["-c", "source /root/.cargo/env && cargo build --bin open_agent"])
             .current_dir(OPEN_AGENT_REPO_PATH)
             .output()
             .await;
@@ -728,11 +724,7 @@ fn stream_open_agent_update() -> impl Stream<Item = Result<Event, std::convert::
             progress: Some(75),
         }).unwrap()));
 
-        let binaries = [
-            ("open_agent", "/usr/local/bin/open_agent"),
-            ("workspace-mcp", "/usr/local/bin/workspace-mcp"),
-            ("desktop-mcp", "/usr/local/bin/desktop-mcp"),
-        ];
+        let binaries = [("open_agent", "/usr/local/bin/open_agent")];
 
         for (name, dest) in binaries {
             let src = format!("{}/target/debug/{}", OPEN_AGENT_REPO_PATH, name);

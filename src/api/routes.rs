@@ -156,9 +156,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     ];
     let backend_configs = Arc::new(
         crate::backend_config::BackendConfigStore::new(
-            config
-                .working_dir
-                .join(".openagent/backend_config.json"),
+            config.working_dir.join(".openagent/backend_config.json"),
             backend_defaults,
         )
         .await,

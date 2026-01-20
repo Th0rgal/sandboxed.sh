@@ -562,7 +562,11 @@ fn parse_simple_frontmatter(yaml_str: &str) -> Option<serde_yaml::Value> {
                 let value_part = line[colon_pos + 1..].trim();
 
                 // Check for multiline indicators
-                if value_part == ">" || value_part == "|" || value_part == ">-" || value_part == "|-" {
+                if value_part == ">"
+                    || value_part == "|"
+                    || value_part == ">-"
+                    || value_part == "|-"
+                {
                     in_multiline = true;
                     current_value.clear();
                 } else {

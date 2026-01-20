@@ -181,13 +181,11 @@ fn get_anthropic_key_from_opencode_auth() -> Option<String> {
     // Check for API key first
     let auth_type = anthropic_auth.get("type").and_then(|v| v.as_str());
     match auth_type {
-        Some("api_key") | Some("api") => {
-            anthropic_auth
-                .get("key")
-                .or_else(|| anthropic_auth.get("api_key"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        }
+        Some("api_key") | Some("api") => anthropic_auth
+            .get("key")
+            .or_else(|| anthropic_auth.get("api_key"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         Some("oauth") => {
             // Return OAuth access token - Claude CLI can use this
             anthropic_auth
@@ -1065,7 +1063,9 @@ fn clear_default_provider_state(working_dir: &Path) -> Result<(), String> {
 /// This stores which backends each provider is used for (e.g., opencode, claudecode).
 /// This is stored separately from the OpenCode config because OpenCode doesn't recognize this field.
 fn provider_backends_state_path(working_dir: &Path) -> PathBuf {
-    working_dir.join(".openagent").join("provider_backends.json")
+    working_dir
+        .join(".openagent")
+        .join("provider_backends.json")
 }
 
 /// Read provider backends state from the separate state file.
@@ -1673,9 +1673,11 @@ async fn update_provider(
 
     // Save backends to separate state file if provided
     if let Some(ref backends) = req.use_for_backends {
-        if let Err(e) =
-            update_provider_backends(&state.config.working_dir, provider_type.id(), backends.clone())
-        {
+        if let Err(e) = update_provider_backends(
+            &state.config.working_dir,
+            provider_type.id(),
+            backends.clone(),
+        ) {
             tracing::error!("Failed to save provider backends: {}", e);
         }
     }
@@ -2112,25 +2114,28 @@ async fn oauth_callback_inner(
             // 2. The old format: code#state
             // 3. Just the code
             let input = req.code.trim();
-            let (code_string, state_string): (String, Option<String>) = if let Ok(url) = url::Url::parse(input) {
-                // Parse as URL
-                let code = url.query_pairs()
-                    .find(|(k, _)| k == "code")
-                    .map(|(_, v)| v.to_string());
-                let state = url.query_pairs()
-                    .find(|(k, _)| k == "state")
-                    .map(|(_, v)| v.to_string());
-                (code.unwrap_or_default(), state)
-            } else if input.contains('#') {
-                // Old format: code#state
-                let mut parts = input.splitn(2, '#');
-                let code = parts.next().unwrap_or(input).to_string();
-                let state = parts.next().map(|s| s.to_string());
-                (code, state)
-            } else {
-                // Just the code
-                (input.to_string(), None)
-            };
+            let (code_string, state_string): (String, Option<String>) =
+                if let Ok(url) = url::Url::parse(input) {
+                    // Parse as URL
+                    let code = url
+                        .query_pairs()
+                        .find(|(k, _)| k == "code")
+                        .map(|(_, v)| v.to_string());
+                    let state = url
+                        .query_pairs()
+                        .find(|(k, _)| k == "state")
+                        .map(|(_, v)| v.to_string());
+                    (code.unwrap_or_default(), state)
+                } else if input.contains('#') {
+                    // Old format: code#state
+                    let mut parts = input.splitn(2, '#');
+                    let code = parts.next().unwrap_or(input).to_string();
+                    let state = parts.next().map(|s| s.to_string());
+                    (code, state)
+                } else {
+                    // Just the code
+                    (input.to_string(), None)
+                };
 
             if code_string.is_empty() {
                 return Err((

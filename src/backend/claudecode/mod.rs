@@ -265,9 +265,7 @@ fn convert_claude_event(
         ClaudeEvent::Result(res) => {
             if res.is_error || res.subtype == "error" {
                 results.push(ExecutionEvent::Error {
-                    message: res
-                        .result
-                        .unwrap_or_else(|| "Unknown error".to_string()),
+                    message: res.result.unwrap_or_else(|| "Unknown error".to_string()),
                 });
             } else {
                 debug!(
