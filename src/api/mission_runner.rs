@@ -1467,6 +1467,178 @@ async fn ensure_oh_my_opencode_config(
     }
 }
 
+fn split_package_spec(spec: &str) -> (&str, Option<&str>) {
+    if spec.starts_with('@') {
+        if let Some((base, version)) = spec.rsplit_once('@') {
+            if base.contains('/') {
+                return (base, Some(version));
+            }
+        }
+        return (spec, None);
+    }
+    spec.rsplit_once('@').map(|(base, version)| (base, Some(version))).unwrap_or((spec, None))
+}
+
+fn package_base(spec: &str) -> &str {
+    split_package_spec(spec).0
+}
+
+fn plugin_module_path(node_modules_dir: &std::path::Path, base: &str) -> std::path::PathBuf {
+    if let Some(stripped) = base.strip_prefix('@') {
+        if let Some((scope, name)) = stripped.split_once('/') {
+            return node_modules_dir
+                .join(format!("@{}", scope))
+                .join(name);
+        }
+    }
+    node_modules_dir.join(base)
+}
+
+fn ensure_opencode_plugin_specs(
+    opencode_config_dir: &std::path::Path,
+    plugin_specs: &[&str],
+) {
+    if plugin_specs.is_empty() {
+        return;
+    }
+
+    let opencode_path = opencode_config_dir.join("opencode.json");
+    let mut root = if opencode_path.exists() {
+        match std::fs::read_to_string(&opencode_path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        {
+            Some(value) => value,
+            None => serde_json::json!({}),
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let mut updated = false;
+    let plugins = root
+        .as_object_mut()
+        .and_then(|obj| {
+            obj.entry("plugin".to_string())
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                .as_array_mut()
+        });
+
+    let Some(plugins) = plugins else {
+        return;
+    };
+
+    for spec in plugin_specs {
+        let base = package_base(spec);
+        let mut found_idx = None;
+        for (idx, entry) in plugins.iter().enumerate() {
+            if let Some(existing) = entry.as_str() {
+                if package_base(existing) == base {
+                    found_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        match found_idx {
+            Some(idx) => {
+                if plugins[idx].as_str() != Some(*spec) {
+                    plugins[idx] = serde_json::Value::String(spec.to_string());
+                    updated = true;
+                }
+            }
+            None => {
+                plugins.push(serde_json::Value::String(spec.to_string()));
+                updated = true;
+            }
+        }
+    }
+
+    if updated {
+        if let Err(err) = std::fs::write(
+            &opencode_path,
+            serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string()),
+        ) {
+            tracing::warn!(
+                "Failed to update OpenCode plugin config at {}: {}",
+                opencode_path.display(),
+                err
+            );
+        }
+    }
+}
+
+async fn ensure_opencode_plugin_installed(
+    workspace_exec: &WorkspaceExec,
+    work_dir: &std::path::Path,
+    opencode_config_dir_host: &std::path::Path,
+    opencode_config_dir_env: &std::path::Path,
+    plugin_spec: &str,
+) {
+    let base = package_base(plugin_spec);
+    let node_modules_dir = opencode_config_dir_host.join("node_modules");
+    let module_path = plugin_module_path(&node_modules_dir, base);
+    if module_path.exists() {
+        return;
+    }
+
+    let installer = if command_available(workspace_exec, work_dir, "bun").await {
+        Some("bun")
+    } else if command_available(workspace_exec, work_dir, "npm").await {
+        Some("npm")
+    } else {
+        None
+    };
+
+    let Some(installer) = installer else {
+        tracing::warn!(
+            "No bun/npm available to install OpenCode plugin {}",
+            plugin_spec
+        );
+        return;
+    };
+
+    let install_cmd = match installer {
+        "bun" => format!(
+            "cd {} && bun add {}",
+            opencode_config_dir_env.to_string_lossy(),
+            plugin_spec
+        ),
+        _ => format!(
+            "cd {} && npm install {}",
+            opencode_config_dir_env.to_string_lossy(),
+            plugin_spec
+        ),
+    };
+
+    let mut args = Vec::new();
+    args.push("-lc".to_string());
+    args.push(install_cmd);
+
+    match workspace_exec
+        .output(work_dir, "/bin/sh", &args, std::collections::HashMap::new())
+        .await
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                tracing::warn!(
+                    "Failed to install OpenCode plugin {}: {} {}",
+                    plugin_spec,
+                    stderr.trim(),
+                    stdout.trim()
+                );
+            } else {
+                tracing::info!("Installed OpenCode plugin {}", plugin_spec);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to install OpenCode plugin {}: {}", plugin_spec, e);
+        }
+    }
+}
+
 fn sync_opencode_agent_config(
     opencode_config_dir: &std::path::Path,
     default_model: Option<&str>,
@@ -2558,6 +2730,19 @@ pub async fn run_opencode_turn(
     )
     .await;
     sync_opencode_agent_config(&opencode_config_dir_host, resolved_model.as_deref());
+    let (_has_openai, _has_anthropic, has_google) = detect_opencode_provider_auth();
+    if has_google {
+        let gemini_plugin = "opencode-gemini-auth@latest";
+        ensure_opencode_plugin_specs(&opencode_config_dir_host, &[gemini_plugin]);
+        ensure_opencode_plugin_installed(
+            &workspace_exec,
+            work_dir,
+            &opencode_config_dir_host,
+            &opencode_config_dir_env,
+            gemini_plugin,
+        )
+        .await;
+    }
     let port_override_supported = patch_oh_my_opencode_port_override(workspace);
 
     // Build CLI arguments for oh-my-opencode run
