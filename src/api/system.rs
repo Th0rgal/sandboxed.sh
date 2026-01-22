@@ -129,41 +129,9 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
 }
 
 /// Get OpenCode version and status.
-async fn get_opencode_info(config: &crate::config::Config) -> ComponentInfo {
-    // Try to get version from the health endpoint
-    let client = reqwest::Client::new();
-    let health_url = format!("{}/global/health", config.opencode_base_url);
-
-    match client.get(&health_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                let version = json
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                // Check for updates by querying the latest release
-                let update_available = check_opencode_update(version.as_deref()).await;
-                let status = if update_available.is_some() {
-                    ComponentStatus::UpdateAvailable
-                } else {
-                    ComponentStatus::Ok
-                };
-
-                return ComponentInfo {
-                    name: "opencode".to_string(),
-                    version,
-                    installed: true,
-                    update_available,
-                    path: Some("/usr/local/bin/opencode".to_string()),
-                    status,
-                };
-            }
-        }
-        _ => {}
-    }
-
-    // Fallback: try to run opencode --version
+/// Note: No central server check - missions use per-workspace CLI execution.
+async fn get_opencode_info(_config: &crate::config::Config) -> ComponentInfo {
+    // Check CLI availability (per-workspace execution doesn't need a central server)
     match Command::new("opencode").arg("--version").output().await {
         Ok(output) if output.status.success() => {
             let mut version_str = String::from_utf8_lossy(&output.stdout).to_string();

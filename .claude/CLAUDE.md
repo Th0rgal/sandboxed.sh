@@ -1,12 +1,14 @@
 # Open Agent – Project Guide
 
-Open Agent is a managed control plane for OpenCode-based agents. The backend **does not** run model inference or autonomous logic; it delegates execution to an OpenCode server and focuses on orchestration, telemetry, and workspace/library management.
+Open Agent is a managed control plane for AI coding agents (OpenCode and Claude Code). The backend **does not** run model inference or autonomous logic; it spawns per-mission CLI processes and focuses on orchestration, telemetry, and workspace/library management.
 
 ## Architecture Summary
 
 - **Backend (Rust/Axum)**: mission orchestration, workspace/container management, MCP registry, Library sync.
-- **OpenCode Client**: `src/opencode/` and `src/agents/opencode.rs` (thin wrapper).
+- **Per-Mission Execution**: Each mission spawns its own CLI process (oh-my-opencode or claude) inside the workspace.
 - **Dashboards**: `dashboard/` (Next.js) and `ios_dashboard/` (SwiftUI).
+
+**No central server required**: Agents are read from the Library's `oh-my-opencode.json`, and missions execute via per-workspace CLI processes.
 
 ## Core Concepts
 
@@ -22,20 +24,34 @@ Open Agent is a managed control plane for OpenCode-based agents. The backend **d
 
 MCPs can be global because and run as child processes on the host or workspace (run inside the container). It depends on the kind of MCP.
 
-## Container Execution Model (Important!)
+## Per-Mission CLI Execution (Important!)
 
-When a **mission runs in a container workspace**, bash commands execute **inside the container**, not on the host. Here's why:
+Open Agent uses **per-mission CLI execution** for both OpenCode and Claude Code:
 
-1. OpenCode's built-in Bash tool is **disabled** for container workspaces
-2. Agents use `workspace_bash` from the "workspace MCP" instead
-3. The "workspace MCP" command is **wrapped in systemd-nspawn** at startup
-4. Therefore all `workspace_bash` commands run inside the container with container networking
+```
+Mission Start
+    ↓
+WorkspaceExec.spawn_streaming()
+    ↓
+┌─────────────────────────────────────────────┐
+│  Container Workspace:                        │
+│  systemd-nspawn → bunx oh-my-opencode run   │
+│                                              │
+│  Host Workspace:                             │
+│  bunx oh-my-opencode run (directly)         │
+└─────────────────────────────────────────────┘
+    ↓
+CLI process streams JSON events back
+```
 
-The "workspace MCP" is named this way because it runs in the **workspace's execution context** - for container workspaces, that means inside the container.
+**Key points:**
+- Each mission spawns its own CLI process inside the workspace
+- For containers: CLI runs via `systemd-nspawn` inside the container filesystem
+- For host: CLI runs directly on the host
+- Built-in Bash executes inside the workspace (no MCP needed)
+- Settings sync from Library → per-workspace config files
 
-See `src/workspace.rs` lines 590-640 (nspawn wrapping) and 714-720 (tool configuration).
-
-**Contrast with workspace exec API**: The `/api/workspaces/:id/exec` endpoint also runs commands inside containers (via nspawn), but is subject to HTTP timeouts. The mission system uses SSE streaming with no timeout.
+See `src/workspace_exec.rs` for the execution layer and `src/api/mission_runner.rs` for mission execution.
 
 ## Design Guardrails
 
@@ -72,7 +88,7 @@ The backend must be deployed on a remote linux server and ran in debug mode (rel
 
 ```bash
 # Backend (url is https://agent-backend.thomas.md but remote is 95.216.112.253)
-export OPENCODE_BASE_URL="http://127.0.0.1:4096"
+# No OPENCODE_BASE_URL needed - per-mission CLI execution
 cargo run --debug
 
 # Dashboard
@@ -178,7 +194,7 @@ mutate(missions.filter(m => m.id !== deletedId), false); // Update cache without
 For deploying Open Agent on a VPS or dedicated server, see **[INSTALL.md](../INSTALL.md)**.
 
 This covers:
-- systemd services for OpenCode and Open Agent
+- systemd service for Open Agent (no separate OpenCode service needed)
 - nginx/Caddy reverse proxy with SSL (Let's Encrypt)
 - DNS setup and domain configuration
 - Authentication configuration

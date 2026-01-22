@@ -199,13 +199,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let backend_registry = Arc::new(RwLock::new(backend_registry));
     tracing::info!("Backend registry initialized with {} backends", 2);
 
-    // Start background OpenCode session cleanup task
-    {
-        let opencode_base_url_clone = opencode_base_url.clone();
-        tokio::spawn(async move {
-            opencode_session_cleanup_task(&opencode_base_url_clone).await;
-        });
-    }
+    // Note: No central OpenCode server cleanup needed - missions use per-workspace CLI execution
 
     // Initialize configuration library (optional - can also be configured at runtime)
     // Must be created before ControlHub so it can be passed to control sessions
@@ -1017,48 +1011,4 @@ async fn search_memory(Query(params): Query<SearchMemoryQuery>) -> Json<serde_js
     }))
 }
 
-/// Background task that periodically cleans up old OpenCode sessions.
-/// This prevents session accumulation from causing memory pressure on the OpenCode server.
-async fn opencode_session_cleanup_task(base_url: &str) {
-    use crate::opencode::OpenCodeClient;
-    use std::time::Duration;
-
-    // Cleanup interval: every 30 minutes
-    const CLEANUP_INTERVAL: Duration = Duration::from_secs(30 * 60);
-    // Max session age: 1 hour
-    const MAX_SESSION_AGE: Duration = Duration::from_secs(60 * 60);
-
-    let client = OpenCodeClient::new(base_url, None, false);
-
-    tracing::info!(
-        base_url = %base_url,
-        interval_mins = CLEANUP_INTERVAL.as_secs() / 60,
-        max_age_mins = MAX_SESSION_AGE.as_secs() / 60,
-        "Starting OpenCode session cleanup background task"
-    );
-
-    // Initial delay to let server fully start
-    tokio::time::sleep(Duration::from_secs(60)).await;
-
-    loop {
-        // Run cleanup
-        match client.cleanup_old_sessions(MAX_SESSION_AGE).await {
-            Ok(deleted) => {
-                if deleted > 0 {
-                    tracing::info!(deleted = deleted, "OpenCode session cleanup completed");
-                } else {
-                    tracing::debug!("OpenCode session cleanup: no old sessions to delete");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "OpenCode session cleanup failed"
-                );
-            }
-        }
-
-        // Sleep until next cleanup
-        tokio::time::sleep(CLEANUP_INTERVAL).await;
-    }
-}
+// Note: opencode_session_cleanup_task removed - per-workspace CLI execution doesn't need central session cleanup

@@ -97,7 +97,8 @@ This preserves the UI experience while keeping execution isolated per workspace.
 
 ## Operational notes
 
-- Central OpenCode servers are **optional** for mission execution.
+- **No central OpenCode server needed**: Missions spawn per-workspace CLI processes.
+- Agents are loaded from the Library's `oh-my-opencode.json` (no HTTP call).
 - Per-workspace execution eliminates host-to-container network issues.
 - For remote workspaces, SSH execution keeps bash/tooling on the remote host.
 

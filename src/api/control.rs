@@ -1343,80 +1343,20 @@ pub struct OpenCodeDiagnostics {
     pub error: Option<String>,
 }
 
-/// Get OpenCode session diagnostics for debugging stuck operations.
+/// Get OpenCode diagnostics.
+/// Note: With per-mission CLI execution, there's no central server to diagnose.
+/// This endpoint now returns information about the execution mode.
 pub async fn get_opencode_diagnostics(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Extension(_user): Extension<AuthUser>,
 ) -> Result<Json<OpenCodeDiagnostics>, (StatusCode, String)> {
-    let opencode_url = state.config.opencode_base_url.clone();
-
-    // Create a client to query OpenCode
-    let client = crate::opencode::OpenCodeClient::new(&opencode_url, None, false);
-
-    // Try to get the list of sessions from OpenCode
-    let sessions_url = format!("{}/session", opencode_url);
-    let sessions_result = reqwest::Client::new()
-        .get(&sessions_url)
-        .header("Accept", "application/json")
-        .send()
-        .await;
-
-    match sessions_result {
-        Ok(resp) if resp.status().is_success() => {
-            let sessions: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
-
-            // Find the most recent session
-            let most_recent = sessions.iter().max_by_key(|s| {
-                s.get("time")
-                    .and_then(|t| t.get("updated"))
-                    .and_then(|u| u.as_u64())
-                    .unwrap_or(0)
-            });
-
-            if let Some(session) = most_recent {
-                let session_id = session
-                    .get("id")
-                    .and_then(|id| id.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                // Get detailed status for this session
-                match client.get_session_status(&session_id).await {
-                    Ok(status) => Ok(Json(OpenCodeDiagnostics {
-                        base_url: opencode_url,
-                        session_id: Some(session_id),
-                        session_status: Some(status),
-                        error: None,
-                    })),
-                    Err(e) => Ok(Json(OpenCodeDiagnostics {
-                        base_url: opencode_url,
-                        session_id: Some(session_id),
-                        session_status: None,
-                        error: Some(format!("Failed to get session status: {}", e)),
-                    })),
-                }
-            } else {
-                Ok(Json(OpenCodeDiagnostics {
-                    base_url: opencode_url,
-                    session_id: None,
-                    session_status: None,
-                    error: Some("No sessions found".to_string()),
-                }))
-            }
-        }
-        Ok(resp) => Ok(Json(OpenCodeDiagnostics {
-            base_url: opencode_url,
-            session_id: None,
-            session_status: None,
-            error: Some(format!("OpenCode returned status {}", resp.status())),
-        })),
-        Err(e) => Ok(Json(OpenCodeDiagnostics {
-            base_url: opencode_url,
-            session_id: None,
-            session_status: None,
-            error: Some(format!("Failed to connect to OpenCode: {}", e)),
-        })),
-    }
+    // Per-mission CLI execution doesn't use a central server
+    Ok(Json(OpenCodeDiagnostics {
+        base_url: "per-mission-cli-mode".to_string(),
+        session_id: None,
+        session_status: None,
+        error: Some("Per-mission CLI mode: No central server. Each mission spawns its own CLI process.".to_string()),
+    }))
 }
 
 // ==================== Parallel Mission Endpoints ====================

@@ -220,68 +220,51 @@ pub struct TestConnectionResponse {
 // Public Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Fetch agents from OpenCode (internal helper for library.rs).
-/// Returns the raw agent payload from OpenCode.
+/// Fetch agents from Library configuration (no central server needed).
+/// Reads agents from Library's oh-my-opencode.json, falling back to defaults.
 pub async fn fetch_opencode_agents(state: &super::routes::AppState) -> Result<Value, String> {
-    let base_url = if let Some(connection) = state.opencode_connections.get_default().await {
-        connection.base_url
+    // Try to read agents from Library's oh-my-opencode.json
+    let library_guard = state.library.read().await;
+    if let Some(lib) = library_guard.as_ref() {
+        match lib.get_opencode_settings().await {
+            Ok(settings) => {
+                // Extract agents from the settings
+                if let Some(agents) = settings.get("agents") {
+                    if agents.is_object() && !agents.as_object().unwrap().is_empty() {
+                        // Return agent names as array
+                        let agent_names: Vec<Value> = agents
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .map(|k| Value::String(k.clone()))
+                            .collect();
+                        tracing::debug!("Loaded {} agents from Library", agent_names.len());
+                        return Ok(Value::Array(agent_names));
+                    }
+                }
+                tracing::debug!("No agents in Library oh-my-opencode.json, using defaults");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to read Library opencode settings: {}. Using defaults.", e);
+            }
+        }
     } else {
-        state.config.opencode_base_url.clone()
-    };
-    let base_url = base_url.trim_end_matches('/').to_string();
-    if base_url.is_empty() {
-        tracing::warn!("OpenCode base URL not configured. Returning default agents.");
-        return Ok(opencode_agents::default_agent_payload());
+        tracing::debug!("Library not configured, using default agents");
     }
 
-    let url = format!("{}/agent", base_url);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let resp = match client.get(&url).send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!(
-                "OpenCode /agent request failed ({}). Returning default agents.",
-                e
-            );
-            return Ok(opencode_agents::default_agent_payload());
-        }
-    };
-
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        tracing::warn!(
-            "OpenCode /agent returned {} ({}). Returning default agents.",
-            status,
-            text
-        );
-        return Ok(opencode_agents::default_agent_payload());
-    }
-
-    match resp.json().await {
-        Ok(payload) => Ok(payload),
-        Err(e) => {
-            tracing::warn!(
-                "Invalid OpenCode agent payload ({}). Returning default agents.",
-                e
-            );
-            Ok(opencode_agents::default_agent_payload())
-        }
-    }
+    // Fall back to hardcoded defaults
+    Ok(opencode_agents::default_agent_payload())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// GET /api/opencode/agents - Proxy OpenCode agent list.
+/// GET /api/opencode/agents - Return OpenCode agent list from Library.
 pub async fn list_agents(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    // Check cache first
     let now = Instant::now();
     if let Some(payload) = {
         let cache = state.opencode_agents_cache.read().await;
@@ -298,56 +281,12 @@ pub async fn list_agents(
         return Ok(Json(payload));
     }
 
-    let base_url = if let Some(connection) = state.opencode_connections.get_default().await {
-        connection.base_url
-    } else {
-        state.config.opencode_base_url.clone()
-    };
-    let base_url = base_url.trim_end_matches('/').to_string();
-    if base_url.is_empty() {
-        tracing::warn!("OpenCode base URL not configured. Returning default agents.");
-        return Ok(Json(opencode_agents::default_agent_payload()));
-    }
+    // Fetch from Library (no HTTP call needed)
+    let payload = fetch_opencode_agents(&state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let url = format!("{}/agent", base_url);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let resp = match client.get(&url).send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!(
-                "OpenCode /agent request failed ({}). Returning default agents.",
-                e
-            );
-            return Ok(Json(opencode_agents::default_agent_payload()));
-        }
-    };
-
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        tracing::warn!(
-            "OpenCode /agent returned {} ({}). Returning default agents.",
-            status,
-            text
-        );
-        return Ok(Json(opencode_agents::default_agent_payload()));
-    }
-
-    let payload: Value = match resp.json().await {
-        Ok(payload) => payload,
-        Err(e) => {
-            tracing::warn!(
-                "Invalid OpenCode agent payload ({}). Returning default agents.",
-                e
-            );
-            return Ok(Json(opencode_agents::default_agent_payload()));
-        }
-    };
-
+    // Update cache
     {
         let mut cache = state.opencode_agents_cache.write().await;
         cache.payload = Some(payload.clone());

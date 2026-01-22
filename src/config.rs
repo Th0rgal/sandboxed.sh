@@ -1,13 +1,14 @@
 //! Configuration management for Open Agent.
 //!
-//! Open Agent uses OpenCode as its execution backend. Configuration can be set via environment variables:
-//! - `DEFAULT_MODEL` - Optional. Override OpenCode's default model (provider/model format). If unset, OpenCode uses its own default.
+//! Open Agent uses per-mission CLI execution for both OpenCode and Claude Code.
+//! Configuration can be set via environment variables:
+//! - `DEFAULT_MODEL` - Optional. Override default model (provider/model format). If unset, uses backend default.
 //! - `WORKING_DIR` - Optional. Default working directory for relative paths. Defaults to `/root` in production, current directory in dev.
 //! - `HOST` - Optional. Server host. Defaults to `127.0.0.1`.
 //! - `PORT` - Optional. Server port. Defaults to `3000`.
 //! - `MAX_ITERATIONS` - Optional. Maximum agent loop iterations. Defaults to `50`.
-//! - `OPENCODE_BASE_URL` - Optional. Base URL for OpenCode server. Defaults to `http://127.0.0.1:4096`.
-//! - `OPENCODE_AGENT` - Optional. OpenCode agent name (e.g., `build`, `plan`).
+//! - `OPENCODE_BASE_URL` - DEPRECATED. No longer used for mission execution (per-mission CLI mode).
+//! - `OPENCODE_AGENT` - Optional. Default OpenCode agent name (e.g., `Sisyphus`, `oracle`).
 //! - `OPENCODE_PERMISSIVE` - Optional. If true, auto-allows all permissions for OpenCode sessions (default: true).
 //! - `OPEN_AGENT_USERS` - Optional. JSON array of user accounts for multi-user auth.
 //! - `LIBRARY_GIT_SSH_KEY` - Optional. SSH key path for library git operations. If set to a path, uses that key.
@@ -211,10 +212,10 @@ pub struct Config {
     /// Context injection configuration
     pub context: ContextConfig,
 
-    /// OpenCode server base URL
+    /// DEPRECATED: OpenCode server base URL (no longer used for mission execution)
     pub opencode_base_url: String,
 
-    /// Default OpenCode agent name (e.g., "build", "plan")
+    /// Default OpenCode agent name (e.g., "Sisyphus", "oracle")
     pub opencode_agent: Option<String>,
 
     /// Whether to auto-allow all OpenCode permissions for created sessions
