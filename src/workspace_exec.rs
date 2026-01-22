@@ -26,6 +26,26 @@ impl WorkspaceExec {
         Self { workspace }
     }
 
+    /// Translate a host path to a container-relative path.
+    ///
+    /// For container workspaces using nspawn/nsenter, paths must be relative to the container
+    /// filesystem root, not the host. This translates paths like:
+    ///   /root/.openagent/containers/minecraft/workspaces/mission-xxx/.claude/settings.json
+    /// to:
+    ///   /workspaces/mission-xxx/.claude/settings.json
+    ///
+    /// For host workspaces or fallback mode, returns the original path unchanged.
+    pub fn translate_path_for_container(&self, path: &Path) -> String {
+        if self.workspace.workspace_type != WorkspaceType::Container {
+            return path.to_string_lossy().to_string();
+        }
+        if !use_nspawn_for_workspace(&self.workspace) {
+            return path.to_string_lossy().to_string();
+        }
+        // Translate to container-relative path
+        self.rel_path_in_container(path)
+    }
+
     fn rel_path_in_container(&self, cwd: &Path) -> String {
         let root = &self.workspace.path;
         let rel = cwd.strip_prefix(root).unwrap_or_else(|_| Path::new(""));
@@ -260,6 +280,14 @@ impl WorkspaceExec {
                         "--setenv=OPEN_AGENT_CONTEXT_DIR_NAME={}",
                         context_dir_name
                     ));
+                }
+
+                // Bind X11 socket for GUI applications (e.g., Minecraft) when available.
+                // The desktop MCP creates Xvfb displays on the host; containers need
+                // access to /tmp/.X11-unix to connect to these displays.
+                let x11_socket_path = Path::new("/tmp/.X11-unix");
+                if x11_socket_path.exists() {
+                    cmd.arg("--bind=/tmp/.X11-unix");
                 }
 
                 // Network configuration.
