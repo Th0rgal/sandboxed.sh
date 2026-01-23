@@ -1264,6 +1264,26 @@ pub async fn run_claudecode_turn(
         "Starting Claude Code execution via WorkspaceExec"
     );
 
+    // Check for Claude Code builtin slash commands that need special handling
+    let trimmed_message = message.trim();
+    let (effective_message, permission_mode) = if trimmed_message == "/plan"
+        || trimmed_message.starts_with("/plan ")
+    {
+        // /plan triggers plan mode via --permission-mode plan
+        let rest = trimmed_message
+            .strip_prefix("/plan")
+            .unwrap_or("")
+            .trim();
+        let msg = if rest.is_empty() {
+            "Please analyze the codebase and create a plan for the task.".to_string()
+        } else {
+            rest.to_string()
+        };
+        (msg, Some("plan"))
+    } else {
+        (message.to_string(), None)
+    };
+
     // Build CLI arguments
     let mut args = vec![
         "--print".to_string(),
@@ -1272,6 +1292,12 @@ pub async fn run_claudecode_turn(
         "--verbose".to_string(),
         "--include-partial-messages".to_string(),
     ];
+
+    // Add permission mode if a slash command triggered a special mode
+    if let Some(mode) = permission_mode {
+        args.push("--permission-mode".to_string());
+        args.push(mode.to_string());
+    }
 
     // NOTE: --dangerously-skip-permissions cannot be used when running as root.
     // The container runs as root, so we rely on the permissions in settings.local.json instead.
@@ -1348,9 +1374,9 @@ pub async fn run_claudecode_turn(
         }
     };
 
-    // Write message to stdin
+    // Write message to stdin (use effective_message which may have been transformed from slash commands)
     if let Some(mut stdin) = child.stdin.take() {
-        let msg = message.to_string();
+        let msg = effective_message.clone();
         tokio::spawn(async move {
             if let Err(e) = stdin.write_all(msg.as_bytes()).await {
                 tracing::error!("Failed to write to Claude stdin: {}", e);
