@@ -47,7 +47,8 @@ in the correct workspace without a host-proxy tool.
 - Runs **per workspace** using the Claude CLI.
 - Configuration is written to each workspace:
   - `.claude/settings.local.json` (MCP servers + permissions)
-  - `CLAUDE.md` (generated from Library skills)
+  - `.claude/skills/<name>/SKILL.md` (native skills with YAML frontmatter)
+  - `CLAUDE.md` (general workspace context)
 - Built-in `Bash` is **enabled** in the permissions allowlist.
 
 ## Tool policy
@@ -82,7 +83,8 @@ Files written per mission workspace:
 - `opencode.json` and `.opencode/opencode.json`
 - `.opencode/oh-my-opencode.json` (for OpenCode agents)
 - `.claude/settings.local.json` (for Claude Code)
-- `CLAUDE.md` (skill-based context)
+- `.claude/skills/<name>/SKILL.md` (native Claude Code skills)
+- `CLAUDE.md` (general workspace context)
 
 ## Observability
 

@@ -18,11 +18,11 @@ export const viewport: Viewport = {
 export const metadata: Metadata = {
   metadataBase: new URL("https://openagent.thomas.md"),
   title: {
-    default: "Open Agent | Managed Control Plane for AI Agents",
+    default: "Open Agent | Cloud Orchestrator for AI Coding Agents",
     template: "%s | Open Agent",
   },
   description:
-    "Open-source managed control plane for OpenCode-based agents. Mission orchestration, workspace management, and library sync.",
+    "Self-hosted cloud orchestrator for AI coding agents (Claude Code & OpenCode). Mission orchestration, workspace management, and library sync.",
   applicationName: "Open Agent",
   generator: "Next.js",
   keywords: [
@@ -46,7 +46,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Open Agent",
     description:
-      "Open-source managed control plane for OpenCode-based agents. Mission orchestration, workspace management, and library sync.",
+      "Self-hosted cloud orchestrator for AI coding agents (Claude Code & OpenCode). Mission orchestration, workspace management, and library sync.",
     creator: "@music_music_yo",
     images: ["/og-image.png"],
   },
@@ -57,13 +57,13 @@ export const metadata: Metadata = {
     siteName: "Open Agent",
     title: "Open Agent",
     description:
-      "Open-source managed control plane for OpenCode-based agents. Mission orchestration, workspace management, and library sync.",
+      "Self-hosted cloud orchestrator for AI coding agents (Claude Code & OpenCode). Mission orchestration, workspace management, and library sync.",
     images: [
       {
         url: "/og-image.png",
         width: 1200,
         height: 630,
-        alt: "Open Agent - Managed Control Plane for AI Agents",
+        alt: "Open Agent - Cloud Orchestrator for AI Coding Agents",
       },
     ],
   },

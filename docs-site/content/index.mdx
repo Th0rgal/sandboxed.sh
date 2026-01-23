@@ -1,6 +1,6 @@
 ---
 title: Open Agent
-description: Self-hosted control plane for autonomous AI agents
+description: Self-hosted cloud orchestrator for AI coding agents
 ---
 
 import { Callout } from 'nextra/components'
@@ -25,11 +25,11 @@ Open Agent fixes all three.
 
 ## What It Actually Does
 
-Open Agent is a control plane that runs on your server. You connect to it from a web dashboard, iOS app, or CLI. You tell an agent what to do. It works until it's done, whether that takes 10 minutes or 10 hours.
+Open Agent is a cloud orchestrator that runs on your server. You connect to it from a web dashboard, iOS app, or CLI. You tell an agent what to do. It works until it's done, whether that takes 10 minutes or 10 hours.
 
 Your code stays on your machine. You define how the agent behaves through a git repo of skills, commands, and rules. Each project gets its own isolated container.
 
-Under the hood, it runs [OpenCode](https://opencode.ai) for the actual agent work. Open Agent handles everything around it: starting tasks, streaming progress, managing environments, syncing configuration.
+Under the hood, it runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) for the actual agent work. Open Agent handles everything around it: starting tasks, streaming progress, managing environments, syncing configuration.
 
 ## When To Use This
 
@@ -51,7 +51,7 @@ Container workspaces isolate everything. Your Node project doesn't see your Pyth
 ┌─────────────────────────────────────────────────────────┐
 │                     Your Devices                         │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐  │
-│  │ Web Dashboard│  │  iOS App   │  │ Claude Code CLI │  │
+│  │ Web Dashboard│  │  iOS App   │  │       CLI       │  │
 │  └──────┬──────┘  └──────┬──────┘  └────────┬────────┘  │
 └─────────┼────────────────┼──────────────────┼───────────┘
           │                │                  │
@@ -68,7 +68,7 @@ Container workspaces isolate everything. Your Node project doesn't see your Pyth
 │  └──────────────────────┬──────────────────────────┘    │
 │                         │                                │
 │  ┌──────────────────────▼──────────────────────────┐    │
-│  │              OpenCode                            │    │
+│  │          Claude Code / OpenCode                  │    │
 │  │  • Runs the actual agent logic                   │    │
 │  │  • Executes tools, writes code                   │    │
 │  │  • Talks to Claude/GPT/local models              │    │
@@ -76,7 +76,7 @@ Container workspaces isolate everything. Your Node project doesn't see your Pyth
 └─────────────────────────────────────────────────────────┘
 ```
 
-Open Agent doesn't do AI. It manages the infrastructure around AI. OpenCode does the thinking. Open Agent makes sure it has somewhere to run, something to work on, and a way for you to watch.
+Open Agent doesn't do AI. It manages the infrastructure around AI. The runtime (Claude Code or OpenCode) does the thinking. Open Agent makes sure it has somewhere to run, something to work on, and a way for you to watch.
 
 **Note**: The setup guide installs the **backend** on your server. For the dashboard, you have options:
 - **Vercel**: Host the Next.js dashboard for free

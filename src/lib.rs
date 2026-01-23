@@ -1,6 +1,6 @@
 //! # Open Agent Panel
 //!
-//! Managed control plane for OpenCode-based agents.
+//! Cloud orchestrator for AI coding agents (Claude Code & OpenCode).
 //!
 //! This library provides:
 //! - HTTP APIs for missions, workspaces, MCP tooling, and library sync

@@ -5,8 +5,8 @@
 <h1 align="center">Open Agent</h1>
 
 <p align="center">
-  <strong>Self-hosted control plane for AI autonomous agents</strong><br/>
-  Isolated Linux workspaces and git-backed Library configuration
+  <strong>Self-hosted cloud orchestrator for AI coding agents</strong><br/>
+  Isolated Linux workspaces with Claude Code & OpenCode runtimes
 </p>
 
 <p align="center">
@@ -43,6 +43,7 @@ What if you could:
 
 ## Features
 
+- **Dual Runtime Support**: Run Claude Code or OpenCode agents in the same infrastructure
 - **Mission Control**: Start, stop, and monitor agents remotely with real-time streaming
 - **Isolated Workspaces**: Containerized Linux environments (systemd-nspawn) with per-mission directories
 - **Git-backed Library**: Skills, tools, rules, agents, and MCPs versioned in a single repo
@@ -53,9 +54,12 @@ What if you could:
 
 ## Ecosystem
 
-Open Agent is a control plane for [**OpenCode**](https://github.com/anomalyco/opencode) and Claude Code. It executes harnesses inside each workspace so native bash and file effects are scoped correctly, while Open Agent handles orchestration, workspace isolation, and configuration management.
+Open Agent orchestrates multiple AI coding agent runtimes:
 
-Works great with [**oh-my-opencode**](https://github.com/code-yeongyu/oh-my-opencode) for enhanced agent capabilities and prebuilt skill packs.
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**: Anthropic's official coding agent with native skills support (`.claude/skills/`)
+- **[OpenCode](https://github.com/anomalyco/opencode)**: Open-source alternative via [oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode)
+
+Each runtime executes inside isolated workspaces, so bash commands and file operations are scoped correctly. Open Agent handles orchestration, workspace isolation, and Library-based configuration management.
 
 ---
 

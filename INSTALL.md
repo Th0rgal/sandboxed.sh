@@ -481,7 +481,7 @@ Create `/etc/systemd/system/open_agent.service`:
 
 ```ini
 [Unit]
-Description=OpenAgent (managed control plane)
+Description=OpenAgent (cloud orchestrator)
 After=network-online.target
 Wants=network-online.target
 

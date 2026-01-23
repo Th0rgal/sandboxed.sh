@@ -1,6 +1,6 @@
 # Open Agent – Project Guide
 
-Open Agent is a managed control plane for AI coding agents (OpenCode and Claude Code). The backend **does not** run model inference or autonomous logic; it spawns per-mission CLI processes and focuses on orchestration, telemetry, and workspace/library management.
+Open Agent is a cloud orchestrator for AI coding agents, supporting both **Claude Code** and **OpenCode** runtimes. The backend **does not** run model inference or autonomous logic; it spawns per-mission CLI processes and focuses on orchestration, telemetry, and workspace/library management.
 
 ## Architecture Summary
 
@@ -13,8 +13,8 @@ Open Agent is a managed control plane for AI coding agents (OpenCode and Claude 
 ## Core Concepts
 
 - **Library**: Git-backed config repo (skills, commands, agents, tools, rules, MCPs). `src/library/`. The default template is at [github.com/Th0rgal/openagent-library-template](https://github.com/Th0rgal/openagent-library-template).
-- **Workspaces**: Host or container environments with their own skills, tools, and plugins. `src/workspace.rs` manages workspace lifecycle and syncs skills/tools to `.opencode/`.
-- **Missions**: Agent selection + workspace + conversation. Execution is delegated to OpenCode and streamed to the UI.
+- **Workspaces**: Host or container environments with their own skills, tools, and plugins. `src/workspace.rs` manages workspace lifecycle and syncs skills/tools to runtime-specific locations (`.opencode/` for OpenCode, `.claude/skills/` for Claude Code).
+- **Missions**: Agent selection + workspace + conversation. Execution is delegated to the chosen runtime (Claude Code or OpenCode) and streamed to the UI.
 
 ## Scoping Model
 
@@ -34,11 +34,14 @@ Mission Start
 WorkspaceExec.spawn_streaming()
     ↓
 ┌─────────────────────────────────────────────┐
-│  Container Workspace:                        │
-│  systemd-nspawn → bunx oh-my-opencode run   │
+│  Claude Code Runtime:                        │
+│  claude --dangerously-skip-permissions ...  │
 │                                              │
-│  Host Workspace:                             │
-│  bunx oh-my-opencode run (directly)         │
+│  OpenCode Runtime:                           │
+│  bunx oh-my-opencode run ...                │
+│                                              │
+│  Container: via systemd-nspawn              │
+│  Host: direct execution                      │
 └─────────────────────────────────────────────┘
     ↓
 CLI process streams JSON events back
@@ -55,31 +58,31 @@ See `src/workspace_exec.rs` for the execution layer and `src/api/mission_runner.
 
 ## Design Guardrails
 
-- Do **not** reintroduce autonomous agent logic (budgeting, task splitting, verification, model selection). OpenCode handles execution.
+- Do **not** reintroduce autonomous agent logic (budgeting, task splitting, verification, model selection). The runtime (Claude Code or OpenCode) handles execution.
 - Keep the backend a thin orchestrator: **Start Mission → Stream Events → Store Logs**.
-- Avoid embedding provider-specific logic in the backend. Provider auth is managed via OpenCode config + dashboard flows.
+- Avoid embedding provider-specific logic in the backend. Provider auth is managed via runtime config + dashboard flows.
 
 ## Timeout Philosophy
 
-Open Agent is a **pure pass-through frontend** to OpenCode. We intentionally do NOT impose any timeouts on the SSE event stream from OpenCode. All timeout handling is delegated to OpenCode, which manages tool execution timeouts internally.
+Open Agent is a **pure pass-through frontend** to the runtime (Claude Code or OpenCode). We intentionally do NOT impose any timeouts on the event stream. All timeout handling is delegated to the runtime, which manages tool execution timeouts internally.
 
 **Why no timeouts in Open Agent?**
 - Long-running tools (vision analysis, large file operations, web scraping) should complete naturally
 - Users can abort missions manually via the dashboard if needed
-- Avoids artificial timeout mismatches between Open Agent and OpenCode
-- OpenCode remains the single source of truth for execution limits
+- Avoids artificial timeout mismatches between Open Agent and the runtime
+- The runtime remains the single source of truth for execution limits
 
 **What this means:**
-- The SSE stream in `src/opencode/mod.rs` runs indefinitely until OpenCode sends a `MessageComplete` event or closes the connection
-- The only timeout applied is for initial HTTP connection establishment (`DEFAULT_REQUEST_TIMEOUT`)
-- If a mission appears stuck, check OpenCode logs first—any timeout errors originate from OpenCode or downstream clients (like Conductor), not Open Agent
+- The event stream runs indefinitely until the runtime sends completion events or closes the connection
+- The only timeout applied is for initial connection establishment
+- If a mission appears stuck, check runtime logs first—any timeout errors originate from the runtime or downstream clients, not Open Agent
 
 ## Common Entry Points
 
 - `src/api/routes.rs` – API routing and server startup.
 - `src/api/control.rs` – mission control session, SSE streaming.
-- `src/api/mission_runner.rs` – per-mission execution loop.
-- `src/workspace.rs` – workspace lifecycle + OpenCode config generation.
+- `src/api/mission_runner.rs` – per-mission execution loop (handles both Claude Code and OpenCode).
+- `src/workspace.rs` – workspace lifecycle + runtime config generation (skills synced to `.claude/skills/` or `.opencode/`).
 - `src/opencode/` – OpenCode HTTP + SSE client.
 
 ## Local Dev

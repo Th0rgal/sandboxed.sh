@@ -2,7 +2,7 @@
 # For AI Agents and LLMs
 # https://openagent.thomas.md
 
-> Open Agent is a self-hosted control plane for autonomous AI agents.
+> Open Agent is a self-hosted cloud orchestrator for AI coding agents (Claude Code & OpenCode).
 > Isolated Linux workspaces, git-backed configuration, remote mission control.
 
 ## How to Access Documentation
@@ -51,7 +51,7 @@ Your Devices (Dashboard, iOS, CLI)
 │  └──────────┬──────────┘  │
 │             ▼             │
 │  ┌─────────────────────┐  │
-│  │     OpenCode        │  │  ← Model inference, tool execution
+│  │ Claude Code/OpenCode│  │  ← Model inference, tool execution
 │  └─────────────────────┘  │
 └───────────────────────────┘
 ```

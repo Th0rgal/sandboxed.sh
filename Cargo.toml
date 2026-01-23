@@ -2,7 +2,7 @@
 name = "open_agent"
 version = "0.2.0"
 edition = "2021"
-description = "Managed control plane for OpenCode-based agents"
+description = "Cloud orchestrator for AI coding agents (Claude Code & OpenCode)"
 authors = ["Open Agent Contributors"]
 
 [dependencies]
