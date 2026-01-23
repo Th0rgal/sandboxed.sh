@@ -1797,6 +1797,11 @@ export default function ControlClient() {
   );
   const [queueLen, setQueueLen] = useState(0);
 
+  // Performance optimization: limit rendered items for large conversations
+  const INITIAL_VISIBLE_ITEMS = 30;
+  const LOAD_MORE_INCREMENT = 30;
+  const [visibleItemsLimit, setVisibleItemsLimit] = useState(INITIAL_VISIBLE_ITEMS);
+
   // Connection state for SSE stream - starts as disconnected until first event received
   const [connectionState, setConnectionState] = useState<
     "connected" | "disconnected" | "reconnecting"
@@ -2796,6 +2801,7 @@ export default function ControlClient() {
           setViewingMissionId(null);
           setViewingMission(null);
           setItems([]);
+          setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
           setHasDesktopSession(false);
         }
       } finally {
@@ -3195,6 +3201,7 @@ export default function ControlClient() {
           setViewingMissionId(null);
           setViewingMission(null);
           setItems([]);
+          setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
           setHasDesktopSession(false);
           router.replace(`/control`, { scroll: false });
         }
@@ -4743,7 +4750,20 @@ export default function ControlClient() {
             </div>
           ) : (
             <div className="mx-auto max-w-3xl space-y-6">
-              {groupedItems.map((item) => {
+              {/* Performance: only render recent items, with option to load more */}
+              {groupedItems.length > visibleItemsLimit && (
+                <button
+                  onClick={() => setVisibleItemsLimit(prev => prev + LOAD_MORE_INCREMENT)}
+                  className="w-full py-2 px-4 text-sm text-white/50 hover:text-white/80 hover:bg-white/5 rounded-lg transition-colors flex items-center justify-center gap-2"
+                >
+                  <ChevronUp className="w-4 h-4" />
+                  Load {Math.min(LOAD_MORE_INCREMENT, groupedItems.length - visibleItemsLimit)} older messages
+                  <span className="text-white/30">
+                    ({groupedItems.length - visibleItemsLimit} hidden)
+                  </span>
+                </button>
+              )}
+              {groupedItems.slice(-visibleItemsLimit).map((item) => {
                 // Handle tool groups (multiple consecutive tools collapsed)
                 if (item.kind === "tool_group") {
                   const isExpanded = expandedToolGroups.has(item.groupId);
