@@ -942,6 +942,8 @@ async fn run_mission_turn(
     };
 
     // Execute based on backend
+    // For Claude Code, check if this is a continuation turn (has prior history)
+    let is_continuation = !history.is_empty();
     let result = match backend_id.as_str() {
         "claudecode" => {
             run_claudecode_turn(
@@ -956,6 +958,7 @@ async fn run_mission_turn(
                 secrets,
                 &config.working_dir,
                 session_id.as_deref(),
+                is_continuation,
             )
             .await
         }
@@ -1056,6 +1059,7 @@ pub async fn run_claudecode_turn(
     secrets: Option<Arc<SecretsStore>>,
     app_working_dir: &std::path::Path,
     session_id: Option<&str>,
+    is_continuation: bool,
 ) -> AgentResult {
     use super::ai_providers::{
         get_anthropic_auth_from_workspace, get_anthropic_auth_from_host_with_expiry,
@@ -1331,8 +1335,25 @@ pub async fn run_claudecode_turn(
         args.push(m.to_string());
     }
 
-    args.push("--session-id".to_string());
-    args.push(session_id.clone());
+    // For continuation turns, use --resume to resume existing session
+    // For first turn, use --session-id to create new session with that ID
+    if is_continuation {
+        args.push("--resume".to_string());
+        args.push(session_id.clone());
+        tracing::debug!(
+            mission_id = %mission_id,
+            session_id = %session_id,
+            "Resuming existing Claude Code session"
+        );
+    } else {
+        args.push("--session-id".to_string());
+        args.push(session_id.clone());
+        tracing::debug!(
+            mission_id = %mission_id,
+            session_id = %session_id,
+            "Starting new Claude Code session"
+        );
+    }
 
     if let Some(a) = agent {
         args.push("--agent".to_string());

@@ -3707,6 +3707,8 @@ async fn run_single_control_turn(
                     .with_terminal_reason(TerminalReason::LlmError);
                 }
             };
+            // Check if this is a continuation turn (has prior history)
+            let is_continuation = !history.is_empty();
             super::mission_runner::run_claudecode_turn(
                 exec_workspace,
                 &ctx.working_dir,
@@ -3719,6 +3721,7 @@ async fn run_single_control_turn(
                 None, // secrets - not available in control context
                 &config.working_dir,
                 session_id.as_deref(),
+                is_continuation,
             )
             .await
         }
