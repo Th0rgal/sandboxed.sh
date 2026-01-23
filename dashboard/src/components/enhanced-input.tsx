@@ -63,6 +63,7 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [autocompleteType, setAutocompleteType] = useState<'command' | 'agent' | null>(null);
   const [triggerPosition, setTriggerPosition] = useState(0);
+  const [ghostText, setGhostText] = useState<string>('');
 
   // Track locked agent badge separately for cleaner UX
   const [lockedAgent, setLockedAgent] = useState<string | null>(null);
@@ -212,6 +213,27 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
       setTriggerPosition(cursorPos - commandMatch[1].length);
       setShowAutocomplete(filtered.length > 0);
       setSelectedIndex(0);
+
+      // Compute ghost text for the best matching command
+      if (filtered.length > 0 && searchTerm.length > 0) {
+        // Find commands that start with the search term (prefix match)
+        const prefixMatches = filtered.filter(cmd =>
+          cmd.name.toLowerCase().startsWith(searchTerm)
+        );
+        if (prefixMatches.length > 0) {
+          const bestMatch = prefixMatches[0];
+          const remaining = bestMatch.name.substring(searchTerm.length);
+          // Show remaining command name + short hint from description
+          const hint = bestMatch.description
+            ? ` — ${bestMatch.description.split('.')[0].substring(0, 40)}${bestMatch.description.length > 40 ? '…' : ''}`
+            : '';
+          setGhostText(remaining + hint);
+        } else {
+          setGhostText('');
+        }
+      } else {
+        setGhostText('');
+      }
       return;
     }
 
@@ -232,12 +254,31 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
         setTriggerPosition(0);
         setShowAutocomplete(filtered.length > 0);
         setSelectedIndex(0);
+
+        // Compute ghost text for the best matching agent
+        if (filtered.length > 0 && searchTerm.length > 0) {
+          const prefixMatches = filtered.filter(agent =>
+            agent.toLowerCase().startsWith(searchTerm)
+          );
+          if (prefixMatches.length > 0) {
+            const bestMatch = prefixMatches[0];
+            const remaining = bestMatch.substring(searchTerm.length);
+            const desc = getAgentDescription(bestMatch);
+            const hint = desc ? ` — ${desc.substring(0, 30)}${desc.length > 30 ? '…' : ''}` : '';
+            setGhostText(remaining + hint);
+          } else {
+            setGhostText('');
+          }
+        } else {
+          setGhostText('');
+        }
         return;
       }
     }
 
     setShowAutocomplete(false);
     setAutocompleteType(null);
+    setGhostText('');
   }, [displayValue, commands, agents, lockedAgent]);
 
   const getAgentDescription = (name: string): string => {
@@ -311,6 +352,7 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
       onChange(''); // Clear the @partial text, agent is now in badge
     }
     setShowAutocomplete(false);
+    setGhostText('');
     textareaRef.current?.focus();
   };
 
@@ -430,21 +472,39 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
           </button>
         )}
 
-        {/* Textarea - shows full value when no locked badge, or just the rest when locked */}
-        <textarea
-          ref={textareaRef}
-          value={lockedAgent ? displayValue : value}
-          onChange={handleChange}
-          onKeyDown={handleKeyDown}
-          placeholder={lockedAgent ? "Type your message..." : placeholder}
-          disabled={disabled}
-          rows={1}
-          className="flex-1 bg-transparent text-sm text-white placeholder-white/30 focus:outline-none resize-none overflow-y-auto leading-5"
-          style={{
-            minHeight: "20px",
-            maxHeight: "200px",
-          }}
-        />
+        {/* Textarea with ghost text overlay */}
+        <div className="relative flex-1">
+          <textarea
+            ref={textareaRef}
+            value={lockedAgent ? displayValue : value}
+            onChange={handleChange}
+            onKeyDown={handleKeyDown}
+            placeholder={lockedAgent ? "Type your message..." : placeholder}
+            disabled={disabled}
+            rows={1}
+            className="w-full bg-transparent text-sm text-white placeholder-white/30 focus:outline-none resize-none overflow-y-auto leading-5"
+            style={{
+              minHeight: "20px",
+              maxHeight: "200px",
+            }}
+          />
+          {/* Ghost text overlay - positioned to appear after input text */}
+          {ghostText && (
+            <div
+              className="absolute top-0 left-0 pointer-events-none text-sm leading-5 whitespace-pre-wrap overflow-hidden"
+              style={{
+                minHeight: "20px",
+                maxHeight: "200px",
+              }}
+              aria-hidden="true"
+            >
+              {/* Invisible text matching the input to position ghost text correctly */}
+              <span className="invisible">{lockedAgent ? displayValue : value}</span>
+              {/* Visible ghost text with reduced opacity */}
+              <span className="text-white/30">{ghostText}</span>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Autocomplete dropdown */}
