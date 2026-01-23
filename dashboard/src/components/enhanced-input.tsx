@@ -1,47 +1,20 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback, useMemo, forwardRef, useImperativeHandle } from 'react';
-import { listLibraryCommands, getVisibleAgents, type CommandSummary, type CommandParam } from '@/lib/api';
+import { listLibraryCommands, getBuiltinCommands as fetchBuiltinCommands, getVisibleAgents, type CommandSummary, type CommandParam, type BuiltinCommandsResponse } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
-// Built-in oh-my-opencode commands
-const OPENCODE_BUILTIN_COMMANDS: CommandSummary[] = [
+// Fallback builtin commands (used if API fails)
+const FALLBACK_OPENCODE_COMMANDS: CommandSummary[] = [
   { name: 'ralph-loop', description: 'Start self-referential development loop until completion', path: 'builtin' },
   { name: 'cancel-ralph', description: 'Cancel active Ralph Loop', path: 'builtin' },
-  { name: 'start-work', description: 'Start Sisyphus work session from Prometheus plan', path: 'builtin' },
-  { name: 'refactor', description: 'Intelligent refactoring with LSP, AST-grep, and TDD verification', path: 'builtin' },
-  { name: 'init-deep', description: 'Initialize hierarchical AGENTS.md knowledge base', path: 'builtin' },
 ];
 
-// Built-in Claude Code commands
-const CLAUDECODE_BUILTIN_COMMANDS: CommandSummary[] = [
+const FALLBACK_CLAUDECODE_COMMANDS: CommandSummary[] = [
   { name: 'plan', description: 'Enter plan mode to design an implementation approach', path: 'builtin-claude' },
   { name: 'compact', description: 'Compact conversation history to save context', path: 'builtin-claude' },
   { name: 'clear', description: 'Clear conversation history and start fresh', path: 'builtin-claude' },
-  { name: 'config', description: 'Show or modify configuration settings', path: 'builtin-claude' },
-  { name: 'cost', description: 'Show token usage and API costs', path: 'builtin-claude' },
-  { name: 'doctor', description: 'Check installation and diagnose issues', path: 'builtin-claude' },
-  { name: 'help', description: 'Show available commands and usage', path: 'builtin-claude' },
-  { name: 'memory', description: 'Manage persistent memories across sessions', path: 'builtin-claude' },
-  { name: 'mcp', description: 'Manage Model Context Protocol servers', path: 'builtin-claude' },
-  { name: 'review', description: 'Request a code review of recent changes', path: 'builtin-claude' },
-  { name: 'bug', description: 'Report a bug with diagnostic info', path: 'builtin-claude' },
-  { name: 'login', description: 'Log in to your Anthropic account', path: 'builtin-claude' },
-  { name: 'logout', description: 'Log out of your Anthropic account', path: 'builtin-claude' },
-  { name: 'resume', description: 'Resume a previous conversation', path: 'builtin-claude' },
 ];
-
-// Get builtin commands based on backend type
-function getBuiltinCommands(backend?: string): CommandSummary[] {
-  if (backend === 'claudecode') {
-    return CLAUDECODE_BUILTIN_COMMANDS;
-  }
-  if (backend === 'opencode') {
-    return OPENCODE_BUILTIN_COMMANDS;
-  }
-  // If no backend specified, show both
-  return [...OPENCODE_BUILTIN_COMMANDS, ...CLAUDECODE_BUILTIN_COMMANDS];
-}
 
 export interface SubmitPayload {
   content: string;
@@ -100,7 +73,31 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
   // Load commands and agents on mount or when backend changes
   useEffect(() => {
     async function loadData() {
-      const builtinCommands = getBuiltinCommands(backend);
+      // Fetch builtin commands from backend API
+      let builtinCommands: CommandSummary[] = [];
+      try {
+        const builtinResponse = await fetchBuiltinCommands();
+        // Select commands based on backend type
+        if (backend === 'claudecode') {
+          builtinCommands = builtinResponse.claudecode;
+        } else if (backend === 'opencode') {
+          builtinCommands = builtinResponse.opencode;
+        } else {
+          // No backend specified, show both
+          builtinCommands = [...builtinResponse.opencode, ...builtinResponse.claudecode];
+        }
+      } catch {
+        // Use fallback commands if API fails
+        if (backend === 'claudecode') {
+          builtinCommands = FALLBACK_CLAUDECODE_COMMANDS;
+        } else if (backend === 'opencode') {
+          builtinCommands = FALLBACK_OPENCODE_COMMANDS;
+        } else {
+          builtinCommands = [...FALLBACK_OPENCODE_COMMANDS, ...FALLBACK_CLAUDECODE_COMMANDS];
+        }
+      }
+
+      // Fetch library commands
       try {
         const libraryCommands = await listLibraryCommands();
         setCommands([...builtinCommands, ...libraryCommands]);
@@ -108,6 +105,7 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
         setCommands(builtinCommands);
       }
 
+      // Fetch agents
       try {
         const agentsData = await getVisibleAgents();
         const agentNames = parseAgentNames(agentsData);

@@ -1614,6 +1614,22 @@ export async function listLibraryCommands(): Promise<CommandSummary[]> {
   return res.json();
 }
 
+// Builtin commands response
+export interface BuiltinCommandsResponse {
+  opencode: CommandSummary[];
+  claudecode: CommandSummary[];
+}
+
+// Get builtin slash commands for each backend
+export async function getBuiltinCommands(): Promise<BuiltinCommandsResponse> {
+  const res = await apiFetch("/api/library/builtin-commands");
+  if (!res.ok) {
+    // Fallback to empty if endpoint not available
+    return { opencode: [], claudecode: [] };
+  }
+  return res.json();
+}
+
 // Get command
 export async function getLibraryCommand(name: string): Promise<Command> {
   const res = await apiFetch(`/api/library/commands/${encodeURIComponent(name)}`);

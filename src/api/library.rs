@@ -229,6 +229,8 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/commands/:name", get(get_command))
         .route("/commands/:name", put(save_command))
         .route("/commands/:name", delete(delete_command))
+        // Builtin commands (runtime-specific slash commands)
+        .route("/builtin-commands", get(get_builtin_commands))
         // Plugins
         .route("/plugins", get(get_plugins))
         .route("/plugins", put(save_plugins))
@@ -669,6 +671,148 @@ async fn delete_command(
         .await
         .map(|_| (StatusCode::OK, "Command deleted successfully".to_string()))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// Response for builtin commands endpoint.
+#[derive(Debug, serde::Serialize)]
+struct BuiltinCommandsResponse {
+    /// Commands for OpenCode (oh-my-opencode)
+    opencode: Vec<CommandSummary>,
+    /// Commands for Claude Code
+    claudecode: Vec<CommandSummary>,
+}
+
+/// GET /api/library/builtin-commands - Get builtin slash commands for each backend.
+///
+/// Returns the native slash commands available for OpenCode and Claude Code.
+/// These are runtime-specific commands that don't come from the Library.
+async fn get_builtin_commands() -> Json<BuiltinCommandsResponse> {
+    // OpenCode builtin commands (oh-my-opencode)
+    let opencode_commands = vec![
+        CommandSummary {
+            name: "ralph-loop".to_string(),
+            description: Some("Start self-referential development loop until completion".to_string()),
+            path: "builtin".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "cancel-ralph".to_string(),
+            description: Some("Cancel active Ralph Loop".to_string()),
+            path: "builtin".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "start-work".to_string(),
+            description: Some("Start Sisyphus work session from Prometheus plan".to_string()),
+            path: "builtin".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "refactor".to_string(),
+            description: Some("Intelligent refactoring with LSP, AST-grep, and TDD verification".to_string()),
+            path: "builtin".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "init-deep".to_string(),
+            description: Some("Initialize hierarchical AGENTS.md knowledge base".to_string()),
+            path: "builtin".to_string(),
+            params: vec![],
+        },
+    ];
+
+    // Claude Code builtin commands
+    let claudecode_commands = vec![
+        CommandSummary {
+            name: "plan".to_string(),
+            description: Some("Enter plan mode to design an implementation approach".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "compact".to_string(),
+            description: Some("Compact conversation history to save context".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "clear".to_string(),
+            description: Some("Clear conversation history and start fresh".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "config".to_string(),
+            description: Some("Show or modify configuration settings".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "cost".to_string(),
+            description: Some("Show token usage and API costs".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "doctor".to_string(),
+            description: Some("Check installation and diagnose issues".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "help".to_string(),
+            description: Some("Show available commands and usage".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "memory".to_string(),
+            description: Some("Manage persistent memories across sessions".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "mcp".to_string(),
+            description: Some("Manage Model Context Protocol servers".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "review".to_string(),
+            description: Some("Request a code review of recent changes".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "bug".to_string(),
+            description: Some("Report a bug with diagnostic info".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "login".to_string(),
+            description: Some("Log in to your Anthropic account".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "logout".to_string(),
+            description: Some("Log out of your Anthropic account".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+        CommandSummary {
+            name: "resume".to_string(),
+            description: Some("Resume a previous conversation".to_string()),
+            path: "builtin-claude".to_string(),
+            params: vec![],
+        },
+    ];
+
+    Json(BuiltinCommandsResponse {
+        opencode: opencode_commands,
+        claudecode: claudecode_commands,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
