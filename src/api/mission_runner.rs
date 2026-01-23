@@ -1644,6 +1644,17 @@ pub async fn run_claudecode_turn(
     // Convert cost from USD to cents
     let cost_cents = (total_cost_usd * 100.0) as u64;
 
+    // If no final result from Assistant or Result events, use accumulated text buffer
+    // This handles plan mode and other cases where text is streamed incrementally
+    if final_result.trim().is_empty() && !text_buffer.is_empty() {
+        final_result = text_buffer.values().cloned().collect::<Vec<_>>().join("");
+        tracing::debug!(
+            mission_id = %mission_id,
+            "Using accumulated text buffer as final result ({} chars)",
+            final_result.len()
+        );
+    }
+
     if final_result.trim().is_empty() && !had_error {
         had_error = true;
         final_result =
