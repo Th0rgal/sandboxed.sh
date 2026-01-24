@@ -90,8 +90,20 @@ OpenCode agents are defined in `oh-my-opencode.json`:
 Claude Code is executed **per workspace** using the CLI:
 
 - `.claude/settings.local.json` defines MCP servers and tool permissions.
-- `CLAUDE.md` provides per-workspace context (generated from Library skills).
+- `.claude/skills/<name>/SKILL.md` provides native skill support.
+- `CLAUDE.md` provides per-workspace context.
 - Built-in `Bash` is enabled in the permissions allowlist.
+
+### OAuth credentials for long-running missions
+
+For container workspaces using OAuth authentication, Open Agent writes Claude Code's
+credentials file to enable automatic token refresh during long-running missions:
+
+- **Container workspaces**: `/root/.claude/.credentials.json` inside the container
+- **Host workspaces**: `$HOME/.claude/.credentials.json` on the host
+
+This allows Claude Code to refresh expired access tokens automatically instead of
+failing mid-mission. The credentials file includes the refresh token and expiry time.
 
 ### Harness bootstrap (auto-install)
 

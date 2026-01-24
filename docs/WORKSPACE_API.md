@@ -120,13 +120,15 @@ Build runs in background. Poll workspace status to check completion.
 POST /api/workspaces/:id/sync
 ```
 
-Manually syncs the workspace's skills and tools from the library to the `.opencode/` directory.
+Manually syncs the workspace's skills and tools from the library.
 
 **Response**: `Workspace` object.
 
-Note: Mission workspaces also generate backend-specific config on execution:
-- OpenCode: `.opencode/opencode.json` (and `opencode.json` in the workspace root)
-- Claude Code: `.claude/settings.local.json` + `CLAUDE.md`
+Note: Mission workspaces generate backend-specific config on execution:
+- **OpenCode**: `opencode.json`, `.opencode/opencode.json`, `.opencode/oh-my-opencode.json`
+- **Claude Code**: `.claude/settings.local.json`, `.claude/skills/<name>/SKILL.md`, `CLAUDE.md`
+
+Skills are written to `.opencode/skill/` for OpenCode and `.claude/skills/` for Claude Code.
 
 ## Execute Command
 

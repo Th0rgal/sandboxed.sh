@@ -49,6 +49,8 @@ in the correct workspace without a host-proxy tool.
   - `.claude/settings.local.json` (MCP servers + permissions)
   - `.claude/skills/<name>/SKILL.md` (native skills with YAML frontmatter)
   - `CLAUDE.md` (general workspace context)
+- For OAuth auth, credentials are written to `$HOME/.claude/.credentials.json`
+  (or `/root/.claude/.credentials.json` in containers) to enable token refresh.
 - Built-in `Bash` is **enabled** in the permissions allowlist.
 
 ## Tool policy
