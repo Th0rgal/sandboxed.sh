@@ -255,9 +255,9 @@ struct NewMissionSheet: View {
             }
             .padding(.leading, 4)
             
-            // Agents
+            // Agents (use agent.id for CLI value, not display name)
             ForEach(agents) { agent in
-                let value = "\(backend.id):\(agent.name)"
+                let value = "\(backend.id):\(agent.id)"
                 agentRow(agent: agent, backend: backend, value: value)
             }
         }

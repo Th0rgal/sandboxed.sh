@@ -177,9 +177,9 @@ export function NewMissionDialog({
         const allClaudeAgents = claudecodeAgents?.map(a => a.name) || [];
         agentNames = allClaudeAgents.filter(name => !claudeCodeHiddenAgents.includes(name));
       } else if (backend.id === 'amp') {
-        // Amp has built-in modes: smart and rush
-        const backendAgentList = ampAgents?.map(a => a.name) || [];
-        agentNames = backendAgentList.length > 0 ? backendAgentList : ['Smart Mode', 'Rush Mode'];
+        // Amp has built-in modes: smart and rush (use id for CLI, not display name)
+        const backendAgentList = ampAgents?.map(a => a.id) || [];
+        agentNames = backendAgentList.length > 0 ? backendAgentList : ['smart', 'rush'];
       }
 
       for (const agent of agentNames) {
