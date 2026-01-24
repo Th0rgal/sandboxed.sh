@@ -4311,6 +4311,15 @@ export default function ControlClient() {
     ? missionStatusLabel(activeMission.status)
     : null;
 
+  // Determine if we should show the resume UI for interrupted/blocked missions
+  // Don't show resume UI if: mission is running, or the last turn completed (assistant message at end)
+  const lastItem = items[items.length - 1];
+  const lastTurnCompleted = lastItem?.kind === 'assistant';
+  const showResumeUI = activeMission &&
+    !viewingMissionIsRunning &&
+    !lastTurnCompleted &&
+    (activeMission.status === 'interrupted' || activeMission.status === 'blocked');
+
   return (
     <div className="flex h-screen flex-col p-6">
       {/* Hidden file input */}
@@ -5487,8 +5496,8 @@ export default function ControlClient() {
           )}
 
           {/* Show resume buttons for interrupted/blocked missions, otherwise show normal input */}
-          {/* Note: Also check viewingMissionIsRunning to handle case where status is stale but mission is actively running */}
-          {activeMission && !viewingMissionIsRunning && (activeMission.status === 'interrupted' || activeMission.status === 'blocked') ? (
+          {/* Note: showResumeUI checks viewingMissionIsRunning and if the last turn completed */}
+          {showResumeUI ? (
             <div className="mx-auto flex max-w-3xl gap-3 items-center justify-center py-2">
               <div className="flex items-center gap-2 text-sm text-white/50 mr-4">
                 <AlertTriangle className="h-4 w-4 text-amber-400" />
