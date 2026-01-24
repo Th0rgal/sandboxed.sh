@@ -3916,10 +3916,24 @@ export default function ControlClient() {
         }
       }
 
-      // Handle mission status changes - mark pending tools as cancelled when mission ends
+      // Handle mission status changes
       if (event.type === "mission_status_changed" && isRecord(data)) {
         const newStatus = String(data["status"] ?? "");
         const missionId = typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+
+        // Always update mission status in state when it changes
+        if (missionId) {
+          if (currentMissionRef.current?.id === missionId) {
+            setCurrentMission((prev) =>
+              prev ? { ...prev, status: newStatus as MissionStatus } : prev
+            );
+          }
+          if (viewingMissionRef.current?.id === missionId) {
+            setViewingMission((prev) =>
+              prev ? { ...prev, status: newStatus as MissionStatus } : prev
+            );
+          }
+        }
 
         // When mission is no longer active, mark all pending tool calls as cancelled
         if (newStatus !== "active") {
@@ -3936,13 +3950,6 @@ export default function ControlClient() {
               return item;
             })
           );
-
-          // Also update the current mission if it matches
-          if (missionId && currentMissionRef.current?.id === missionId) {
-            setCurrentMission((prev) =>
-              prev ? { ...prev, status: newStatus as MissionStatus } : prev
-            );
-          }
 
           // Reset stream phase to idle when mission completes
           // (The SSE connection stays open for the control session, but the mission is done)
@@ -5480,7 +5487,8 @@ export default function ControlClient() {
           )}
 
           {/* Show resume buttons for interrupted/blocked missions, otherwise show normal input */}
-          {activeMission && (activeMission.status === 'interrupted' || activeMission.status === 'blocked') ? (
+          {/* Note: Also check viewingMissionIsRunning to handle case where status is stale but mission is actively running */}
+          {activeMission && !viewingMissionIsRunning && (activeMission.status === 'interrupted' || activeMission.status === 'blocked') ? (
             <div className="mx-auto flex max-w-3xl gap-3 items-center justify-center py-2">
               <div className="flex items-center gap-2 text-sm text-white/50 mr-4">
                 <AlertTriangle className="h-4 w-4 text-amber-400" />
