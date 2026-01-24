@@ -979,4 +979,28 @@ impl MissionStore for SqliteMissionStore {
         .await
         .map_err(|e| e.to_string())?
     }
+
+    async fn get_total_cost_cents(&self) -> Result<u64, String> {
+        let conn = self.conn.lock().await;
+        
+        // Use SQLite JSON1 extension to extract cost_cents from metadata
+        // and sum across all assistant_message events
+        let query = r#"
+            SELECT COALESCE(
+                SUM(
+                    CAST(
+                        COALESCE(json_extract(metadata, '$.cost_cents'), 0) AS INTEGER
+                    )
+                ),
+                0
+            ) as total_cost
+            FROM mission_events
+            WHERE event_type = 'assistant_message'
+        "#;
+        
+        let total: i64 = conn.query_row(query, [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        
+        Ok(total as u64)
+    }
 }

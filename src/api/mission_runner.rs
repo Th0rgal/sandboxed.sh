@@ -981,6 +981,7 @@ async fn run_mission_turn(
             .await
         }
         "amp" => {
+            let api_key = get_amp_api_key_from_config();
             run_amp_turn(
                 &workspace,
                 &mission_work_dir,
@@ -992,6 +993,7 @@ async fn run_mission_turn(
                 &config.working_dir,
                 session_id.as_deref(),
                 is_continuation,
+                api_key.as_deref(),
             )
             .await
         }
@@ -1016,15 +1018,33 @@ async fn run_mission_turn(
 
 fn read_backend_configs() -> Option<Vec<serde_json::Value>> {
     let home = std::env::var("HOME").ok()?;
-    let candidates = [
+    
+    // Check WORKING_DIR first (for custom deployment paths), then HOME
+    let working_dir = std::env::var("WORKING_DIR").ok();
+    
+    let mut candidates = vec![];
+    
+    // Add WORKING_DIR paths if set
+    if let Some(ref wd) = working_dir {
+        candidates.push(
+            std::path::PathBuf::from(wd)
+                .join(".openagent")
+                .join("backend_config.json"),
+        );
+    }
+    
+    // Add HOME paths
+    candidates.push(
         std::path::PathBuf::from(&home)
             .join(".openagent")
             .join("backend_config.json"),
+    );
+    candidates.push(
         std::path::PathBuf::from(&home)
             .join(".openagent")
             .join("data")
             .join("backend_configs.json"),
-    ];
+    );
 
     for path in candidates {
         let contents = match std::fs::read_to_string(&path) {
@@ -1052,6 +1072,25 @@ fn get_claudecode_cli_path_from_config(_app_working_dir: &std::path::Path) -> Op
                             cli_path
                         );
                         return Some(cli_path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read API key from Amp backend config file if available.
+pub fn get_amp_api_key_from_config() -> Option<String> {
+    let configs = read_backend_configs()?;
+
+    for config in configs {
+        if config.get("id")?.as_str()? == "amp" {
+            if let Some(settings) = config.get("settings") {
+                if let Some(api_key) = settings.get("api_key").and_then(|v| v.as_str()) {
+                    if !api_key.is_empty() {
+                        tracing::debug!("Using Amp API key from backend config");
+                        return Some(api_key.to_string());
                     }
                 }
             }
@@ -2314,14 +2353,14 @@ async fn ensure_oh_my_opencode_config(
     // No config found; run oh-my-opencode install in non-interactive mode to generate defaults.
     let mut args: Vec<String> = Vec::new();
     let claude_flag = if has_anthropic { "yes" } else { "no" };
-    let chatgpt_flag = if has_openai { "yes" } else { "no" };
+    let openai_flag = if has_openai { "yes" } else { "no" };
     let gemini_flag = if has_google { "yes" } else { "no" };
     if runner_is_direct {
         args.extend([
             "install".to_string(),
             "--no-tui".to_string(),
             format!("--claude={}", claude_flag),
-            format!("--chatgpt={}", chatgpt_flag),
+            format!("--openai={}", openai_flag),
             format!("--gemini={}", gemini_flag),
             "--skip-auth".to_string(),
         ]);
@@ -2331,7 +2370,7 @@ async fn ensure_oh_my_opencode_config(
             "install".to_string(),
             "--no-tui".to_string(),
             format!("--claude={}", claude_flag),
-            format!("--chatgpt={}", chatgpt_flag),
+            format!("--openai={}", openai_flag),
             format!("--gemini={}", gemini_flag),
             "--skip-auth".to_string(),
         ]);
@@ -4707,6 +4746,7 @@ pub async fn run_amp_turn(
     app_working_dir: &std::path::Path,
     session_id: Option<&str>,
     is_continuation: bool,
+    api_key: Option<&str>,
 ) -> AgentResult {
     use crate::backend::amp::client::{AmpEvent, ContentBlock, StreamEvent};
     use std::collections::HashMap;
@@ -4718,8 +4758,35 @@ pub async fn run_amp_turn(
     if !command_available(&workspace_exec, work_dir, "amp").await {
         let auto_install = env_var_bool("OPEN_AGENT_AUTO_INSTALL_AMP", true);
         if auto_install {
-            // Try to install via npm
-            if command_available(&workspace_exec, work_dir, "npm").await {
+            // Try to install via bun first (preferred for container templates), then npm
+            let has_bun = command_available(&workspace_exec, work_dir, "bun").await;
+            let has_npm = command_available(&workspace_exec, work_dir, "npm").await;
+            
+            if has_bun {
+                tracing::info!(mission_id = %mission_id, "Auto-installing Amp CLI via bun");
+                let install_result = workspace_exec
+                    .output(
+                        work_dir,
+                        "/bin/sh",
+                        &["-lc".to_string(), "bun install -g @sourcegraph/amp 2>&1".to_string()],
+                        HashMap::new(),
+                    )
+                    .await;
+                match &install_result {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        if output.status.success() {
+                            tracing::info!(mission_id = %mission_id, stdout = %stdout, "Amp CLI installed via bun");
+                        } else {
+                            tracing::warn!(mission_id = %mission_id, stdout = %stdout, stderr = %stderr, exit_code = ?output.status.code(), "bun install for Amp CLI failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(mission_id = %mission_id, error = %e, "Failed to run bun install for Amp CLI");
+                    }
+                }
+            } else if has_npm {
                 tracing::info!(mission_id = %mission_id, "Auto-installing Amp CLI via npm");
                 let install_result = workspace_exec
                     .output(
@@ -4729,19 +4796,29 @@ pub async fn run_amp_turn(
                         HashMap::new(),
                     )
                     .await;
-                if let Err(e) = install_result {
-                    tracing::warn!(mission_id = %mission_id, error = %e, "Failed to auto-install Amp CLI");
+                if let Err(e) = &install_result {
+                    tracing::warn!(mission_id = %mission_id, error = %e, "Failed to auto-install Amp CLI via npm");
                 }
+            } else {
+                tracing::warn!(mission_id = %mission_id, "Neither bun nor npm available for Amp CLI auto-install");
             }
         }
 
-        if !command_available(&workspace_exec, work_dir, "amp").await {
-            let err_msg = "Amp CLI not found. Install it with: npm install -g @sourcegraph/amp";
-            tracing::error!(mission_id = %mission_id, "{}", err_msg);
-            return AgentResult::failure(err_msg.to_string(), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
-        }
     }
+
+    // Find the amp binary - check standard PATH first, then bun's global bin paths
+    let amp_binary = if command_available(&workspace_exec, work_dir, "amp").await {
+        "amp".to_string()
+    } else if command_available(&workspace_exec, work_dir, "/root/.bun/bin/amp").await {
+        "/root/.bun/bin/amp".to_string()
+    } else if command_available(&workspace_exec, work_dir, "/root/.cache/.bun/bin/amp").await {
+        "/root/.cache/.bun/bin/amp".to_string()
+    } else {
+        let err_msg = "Amp CLI not found. Install it with: bun install -g @sourcegraph/amp (or npm install -g @sourcegraph/amp)";
+        tracing::error!(mission_id = %mission_id, "{}", err_msg);
+        return AgentResult::failure(err_msg.to_string(), 0)
+            .with_terminal_reason(TerminalReason::LlmError);
+    };
 
     tracing::info!(
         mission_id = %mission_id,
@@ -4749,13 +4826,16 @@ pub async fn run_amp_turn(
         workspace_type = ?workspace.workspace_type,
         mode = ?mode,
         is_continuation = is_continuation,
+        amp_binary = %amp_binary,
         "Starting Amp execution via WorkspaceExec"
     );
 
     // Build CLI arguments
+    // Amp CLI format: amp [subcommand] --execute "message" [flags]
+    // For continuation: amp threads continue <session_id> --execute "message" [flags]
     let mut args = vec![];
 
-    // For continuation, use threads continue
+    // For continuation, use threads continue subcommand
     if is_continuation {
         if let Some(sid) = session_id {
             args.push("threads".to_string());
@@ -4764,8 +4844,11 @@ pub async fn run_amp_turn(
         }
     }
 
-    // Core flags
+    // --execute with message as its argument (must come before other flags)
     args.push("--execute".to_string());
+    args.push(message.to_string());
+
+    // Remaining flags
     args.push("--stream-json".to_string());
     args.push("--dangerously-allow-all".to_string());
 
@@ -4775,15 +4858,14 @@ pub async fn run_amp_turn(
         args.push(m.to_string());
     }
 
-    // Message as final argument
-    args.push(message.to_string());
-
     // Build environment
     let mut env = HashMap::new();
     
-    // Pass through AMP_API_KEY if available
-    if let Ok(api_key) = std::env::var("AMP_API_KEY") {
-        env.insert("AMP_API_KEY".to_string(), api_key);
+    // Use API key from config, or fall back to environment variable
+    if let Some(key) = api_key {
+        env.insert("AMP_API_KEY".to_string(), key.to_string());
+    } else if let Ok(key) = std::env::var("AMP_API_KEY") {
+        env.insert("AMP_API_KEY".to_string(), key);
     }
     
     // Pass through AMP_URL for CLIProxyAPI integration
@@ -4802,7 +4884,7 @@ pub async fn run_amp_turn(
 
     // Use WorkspaceExec to spawn the CLI
     let mut child = match workspace_exec
-        .spawn_streaming(work_dir, "amp", &args, env)
+        .spawn_streaming(work_dir, &amp_binary, &args, env)
         .await
     {
         Ok(child) => child,
@@ -4854,6 +4936,12 @@ pub async fn run_amp_turn(
     let mut final_result = String::new();
     let mut had_error = false;
     let mut model_used: Option<String> = None;
+    
+    // Track token usage for cost calculation
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+    let mut total_cache_creation_tokens: u64 = 0;
+    let mut total_cache_read_tokens: u64 = 0;
 
     // Track content blocks for streaming
     let mut block_types: HashMap<u32, String> = HashMap::new();
@@ -4958,6 +5046,19 @@ pub async fn run_amp_turn(
                                 }
                             }
                             AmpEvent::Assistant(evt) => {
+                                // Track model from assistant message
+                                if evt.message.model.is_some() {
+                                    model_used = evt.message.model.clone();
+                                }
+                                
+                                // Accumulate token usage for cost calculation
+                                if let Some(usage) = &evt.message.usage {
+                                    total_input_tokens += usage.input_tokens.unwrap_or(0);
+                                    total_output_tokens += usage.output_tokens.unwrap_or(0);
+                                    total_cache_creation_tokens += usage.cache_creation_input_tokens.unwrap_or(0);
+                                    total_cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0);
+                                }
+                                
                                 for block in evt.message.content {
                                     match block {
                                         ContentBlock::Text { text } => {
@@ -5075,12 +5176,35 @@ pub async fn run_amp_turn(
         }
     };
 
+    // Compute cost from accumulated token usage
+    let usage = crate::cost::TokenUsage {
+        input_tokens: total_input_tokens,
+        output_tokens: total_output_tokens,
+        cache_creation_input_tokens: if total_cache_creation_tokens > 0 { Some(total_cache_creation_tokens) } else { None },
+        cache_read_input_tokens: if total_cache_read_tokens > 0 { Some(total_cache_read_tokens) } else { None },
+    };
+    let cost_cents = model_used
+        .as_deref()
+        .map(|m| crate::cost::cost_cents_from_usage(m, &usage))
+        .unwrap_or(0);
+    
+    tracing::debug!(
+        mission_id = %mission_id,
+        model = ?model_used,
+        input_tokens = total_input_tokens,
+        output_tokens = total_output_tokens,
+        cache_creation_tokens = total_cache_creation_tokens,
+        cache_read_tokens = total_cache_read_tokens,
+        cost_cents = cost_cents,
+        "Amp cost computed from token usage"
+    );
+
     // Emit assistant message
     let _ = events_tx.send(AgentEvent::AssistantMessage {
         id: Uuid::new_v4(),
         content: final_result.clone(),
         success,
-        cost_cents: 0, // Amp doesn't report cost in stream-json
+        cost_cents,
         model: model_used.clone(),
         mission_id: Some(mission_id),
         shared_files: None,
@@ -5088,9 +5212,9 @@ pub async fn run_amp_turn(
     });
 
     let mut result = if success {
-        AgentResult::success(final_result, 0)
+        AgentResult::success(final_result, cost_cents)
     } else {
-        AgentResult::failure(final_result, 0)
+        AgentResult::failure(final_result, cost_cents)
             .with_terminal_reason(TerminalReason::LlmError)
     };
 

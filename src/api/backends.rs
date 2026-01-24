@@ -140,6 +140,28 @@ pub async fn get_backend_config(
         settings = serde_json::Value::Object(obj);
     }
 
+    // For amp backend, mask the api_key but indicate if configured
+    if id == "amp" {
+        let mut obj = settings.as_object().cloned().unwrap_or_default();
+        let has_api_key = obj
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty() && !s.starts_with("[REDACTED"))
+            .unwrap_or(false);
+        obj.insert(
+            "api_key_configured".to_string(),
+            serde_json::Value::Bool(has_api_key),
+        );
+        // Mask the actual api_key value if present
+        if has_api_key {
+            obj.insert(
+                "api_key".to_string(),
+                serde_json::Value::String("********".to_string()),
+            );
+        }
+        settings = serde_json::Value::Object(obj);
+    }
+
     Ok(Json(BackendConfig {
         id: backend.id().to_string(),
         name: backend.name().to_string(),
@@ -220,6 +242,56 @@ pub async fn update_backend_config(
                 obj.remove("api_key");
             }
             settings
+        }
+        "amp" => {
+            let settings = req.settings.as_object().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid settings payload".to_string(),
+                )
+            })?;
+
+            // Get current config to preserve api_key if not being updated
+            let current_config = state.backend_configs.get(&id).await;
+            let current_api_key = current_config
+                .as_ref()
+                .and_then(|c| c.settings.get("api_key"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty() && !s.starts_with("[REDACTED") && *s != "********")
+                .map(|s| s.to_string());
+
+            // Get the new api_key if provided and valid (not masked/redacted)
+            let new_api_key = settings
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty() && !s.starts_with("[REDACTED") && *s != "********")
+                .map(|s| s.to_string());
+
+            // Use new key if provided, otherwise keep existing
+            let api_key = new_api_key.or(current_api_key);
+
+            let cli_path = settings
+                .get("cli_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let default_mode = settings
+                .get("default_mode")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "smart".to_string());
+            let permissive = settings
+                .get("permissive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            serde_json::json!({
+                "api_key": api_key,
+                "cli_path": cli_path,
+                "default_mode": default_mode,
+                "permissive": permissive,
+            })
         }
         _ => req.settings.clone(),
     };

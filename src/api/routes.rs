@@ -153,6 +153,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             }),
         ),
         BackendConfigEntry::new("claudecode", "Claude Code", serde_json::json!({})),
+        BackendConfigEntry::new("amp", "Amp", serde_json::json!({})),
     ];
     let backend_configs = Arc::new(
         crate::backend_config::BackendConfigStore::new(
@@ -625,8 +626,13 @@ async fn get_stats(
         })
         .unwrap_or(0);
 
-    // Total cost not tracked without memory system
-    let total_cost_cents = 0;
+    // Get total cost from mission store (aggregates from all assistant_message events)
+    let control_state = state.control.get_or_spawn(&user).await;
+    let total_cost_cents = control_state
+        .mission_store
+        .get_total_cost_cents()
+        .await
+        .unwrap_or(0);
 
     let finished = completed_tasks + failed_tasks;
     let success_rate = if finished > 0 {

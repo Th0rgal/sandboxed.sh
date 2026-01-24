@@ -127,6 +127,7 @@ export default function SettingsPage() {
     default_mode: 'smart',
     permissive: true,
     enabled: true,
+    api_key: '',
   });
 
   // SWR: fetch health status
@@ -265,6 +266,7 @@ export default function SettingsPage() {
       default_mode: typeof settings.default_mode === 'string' ? settings.default_mode : 'smart',
       permissive: settings.permissive !== false,
       enabled: ampBackendConfig.enabled,
+      api_key: typeof settings.api_key === 'string' ? settings.api_key : '',
     });
   }, [ampBackendConfig]);
 
@@ -407,6 +409,7 @@ export default function SettingsPage() {
         cli_path: ampForm.cli_path || null,
         default_mode: ampForm.default_mode || 'smart',
         permissive: ampForm.permissive,
+        api_key: ampForm.api_key || null,
       };
 
       const result = await updateBackendConfig('amp', settings, {
@@ -948,28 +951,34 @@ export default function SettingsPage() {
                   />
                   Enabled
                 </label>
-                {/* Anthropic Provider Status for Amp */}
-                <div className="flex items-center justify-between py-2 px-3 rounded-lg border border-white/[0.06] bg-white/[0.02]">
-                  <div className="flex items-center gap-2">
-                    <span className="text-base">🧠</span>
-                    <span className="text-sm text-white/70">Anthropic (required for Amp)</span>
-                  </div>
-                  {claudecodeProvider?.configured && claudecodeProvider.has_credentials ? (
-                    <span className="flex items-center gap-1.5 text-xs text-emerald-400">
-                      <Check className="h-3.5 w-3.5" />
-                      Connected
+                {/* Amp API Key */}
+                <div>
+                  <label className="block text-xs text-white/60 mb-1.5">
+                    <span className="flex items-center gap-1.5">
+                      <Key className="h-3.5 w-3.5" />
+                      Amp API Key
                     </span>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        document.getElementById('ai-providers')?.scrollIntoView({ behavior: 'smooth' });
-                      }}
-                      className="text-xs text-amber-400 hover:text-amber-300 transition-colors"
+                  </label>
+                  <input
+                    type="password"
+                    value={ampForm.api_key || ''}
+                    onChange={(e) =>
+                      setAmpForm((prev) => ({ ...prev, api_key: e.target.value }))
+                    }
+                    placeholder="Enter your Amp API key from ampcode.com"
+                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-indigo-500/50"
+                  />
+                  <p className="mt-1.5 text-xs text-white/30">
+                    Get your API key from{' '}
+                    <a
+                      href="https://ampcode.com/settings/tokens"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-indigo-400 hover:text-indigo-300"
                     >
-                      Configure in AI Providers ↑
-                    </button>
-                  )}
+                      ampcode.com/settings/tokens
+                    </a>
+                  </p>
                 </div>
                 <div>
                   <label className="block text-xs text-white/60 mb-1.5">CLI Path</label>

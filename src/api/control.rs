@@ -1118,10 +1118,11 @@ pub async fn create_mission(
     }
 
     // Validate agent exists before creating mission (fail fast with clear error)
-    // Skip validation for Claude Code - it has its own built-in agents
+    // Skip validation for Claude Code and Amp - they have their own built-in agents
     if let Some(ref agent_name) = agent {
-        let is_claudecode = backend.as_deref() == Some("claudecode");
-        if !is_claudecode {
+        let backend_id = backend.as_deref();
+        let skip_validation = backend_id == Some("claudecode") || backend_id == Some("amp");
+        if !skip_validation {
             super::library::validate_agent_exists(&state, agent_name)
                 .await
                 .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -3802,6 +3803,7 @@ async fn run_single_control_turn(
                 }
             };
             let is_continuation = history.iter().any(|(role, _)| role == "assistant");
+            let api_key = super::mission_runner::get_amp_api_key_from_config();
             super::mission_runner::run_amp_turn(
                 exec_workspace,
                 &ctx.working_dir,
@@ -3813,6 +3815,7 @@ async fn run_single_control_turn(
                 &config.working_dir,
                 session_id.as_deref(),
                 is_continuation,
+                api_key.as_deref(),
             )
             .await
         }

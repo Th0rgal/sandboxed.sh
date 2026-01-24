@@ -256,6 +256,8 @@ pub struct AmpConfig {
     pub default_model: Option<String>,
     /// Default mode (smart, rush)
     pub default_mode: Option<String>,
+    /// Amp API key for authentication
+    pub api_key: Option<String>,
 }
 
 /// Client for interacting with the Amp CLI.

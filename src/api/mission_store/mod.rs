@@ -201,6 +201,12 @@ pub trait MissionStore: Send + Sync {
         let _ = (mission_id, event_types, limit, offset);
         Ok(vec![])
     }
+
+    /// Get total cost in cents across all missions.
+    /// Aggregates cost_cents from all assistant_message events.
+    async fn get_total_cost_cents(&self) -> Result<u64, String> {
+        Ok(0)
+    }
 }
 
 /// Mission store type selection.

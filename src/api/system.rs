@@ -1160,7 +1160,7 @@ fn stream_oh_my_opencode_update() -> impl Stream<Item = Result<Event, std::conve
                 "install",
                 "--no-tui",
                 "--claude=yes",
-                "--chatgpt=yes",
+                "--openai=yes",
                 "--gemini=yes",
             ])
             .output()
