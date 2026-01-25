@@ -151,58 +151,53 @@ export function NewMissionDialog({
     const claudeCodeHiddenAgents = claudeCodeLibConfig?.hidden_agents || [];
 
     for (const backend of enabledBackends) {
-      let agentNames: string[] = [];
+      // Use consistent {id, name} format for all backends
+      let agents: { id: string; name: string }[] = [];
 
       if (backend.id === 'opencode') {
-        // Filter out hidden OpenCode agents
-        const backendAgents = opencodeAgents?.map(a => a.name) || [];
-        const visibleBackendAgents = backendAgents.filter(name => !openCodeHiddenAgents.includes(name));
-        if (visibleBackendAgents.length > 0) {
-          agentNames = visibleBackendAgents;
+        // Filter out hidden OpenCode agents by name
+        const backendAgents = opencodeAgents || [];
+        const visibleAgents = backendAgents.filter(a => !openCodeHiddenAgents.includes(a.name));
+        if (visibleAgents.length > 0) {
+          agents = visibleAgents;
         } else if (backendAgents.length > 0) {
           // If all OpenCode agents are hidden, fall back to the raw list so the backend remains usable.
-          agentNames = backendAgents;
+          agents = backendAgents;
         } else {
-          const fallbackAgents = parseAgentNames(agentsPayload);
-          agentNames = fallbackAgents.filter(name => !openCodeHiddenAgents.includes(name));
+          // Fallback to parsing agent names from raw payload
+          const fallbackNames = parseAgentNames(agentsPayload).filter(
+            name => !openCodeHiddenAgents.includes(name)
+          );
+          agents = fallbackNames.map(name => ({ id: name, name }));
         }
 
-        if (agentNames.length === 0) {
+        if (agents.length === 0) {
           const visibleDefaults = DEFAULT_OPENCODE_AGENTS.filter(
             name => !openCodeHiddenAgents.includes(name),
           );
-          agentNames = visibleDefaults.length > 0 ? visibleDefaults : [...DEFAULT_OPENCODE_AGENTS];
+          const defaultNames = visibleDefaults.length > 0 ? visibleDefaults : [...DEFAULT_OPENCODE_AGENTS];
+          agents = defaultNames.map(name => ({ id: name, name }));
         }
       } else if (backend.id === 'claudecode') {
-        // Filter out hidden Claude Code agents
-        const allClaudeAgents = claudecodeAgents?.map(a => a.name) || [];
-        agentNames = allClaudeAgents.filter(name => !claudeCodeHiddenAgents.includes(name));
+        // Filter out hidden Claude Code agents by name
+        const allClaudeAgents = claudecodeAgents || [];
+        agents = allClaudeAgents.filter(a => !claudeCodeHiddenAgents.includes(a.name));
       } else if (backend.id === 'amp') {
         // Amp has built-in modes: smart and rush
-        // Use id for CLI value but name for display
-        const ampAgentsList = ampAgents || [
+        agents = ampAgents || [
           { id: 'smart', name: 'Smart Mode' },
           { id: 'rush', name: 'Rush Mode' },
         ];
-        for (const agent of ampAgentsList) {
-          result.push({
-            backend: backend.id,
-            backendName: backend.name,
-            agent: agent.id,
-            displayName: agent.name,
-            value: `${backend.id}:${agent.id}`,
-          });
-        }
-        continue; // Skip the generic loop below
       }
 
-      for (const agent of agentNames) {
+      // Use agent.id for CLI value, agent.name for display (consistent across all backends)
+      for (const agent of agents) {
         result.push({
           backend: backend.id,
           backendName: backend.name,
-          agent,
-          displayName: agent, // For non-Amp backends, agent name is the display name
-          value: `${backend.id}:${agent}`,
+          agent: agent.id,
+          displayName: agent.name,
+          value: `${backend.id}:${agent.id}`,
         });
       }
     }
