@@ -189,6 +189,7 @@ pub fn get_anthropic_auth_for_claudecode(working_dir: &Path) -> Option<ClaudeCod
         tracing::debug!("Claude Code not in Anthropic backends, trying fallback auth sources");
         if let Some(auth) = get_anthropic_auth_from_opencode_auth()
             .or_else(|| get_anthropic_auth_from_ai_providers(working_dir))
+            .or_else(get_anthropic_auth_from_claude_cli_credentials)
         {
             tracing::warn!(
                 "Anthropic credentials found but not marked for Claude Code; using them anyway"
@@ -207,9 +208,15 @@ pub fn get_anthropic_auth_for_claudecode(working_dir: &Path) -> Option<ClaudeCod
     tracing::debug!("No Anthropic credentials in OpenCode auth.json, trying ai_providers.json");
 
     // Fall back to ai_providers.json
-    let result = get_anthropic_auth_from_ai_providers(working_dir);
+    if let Some(auth) = get_anthropic_auth_from_ai_providers(working_dir) {
+        return Some(auth);
+    }
+    tracing::debug!("No Anthropic credentials found in ai_providers.json, trying Claude CLI credentials");
+
+    // Fall back to Claude CLI's own credentials file
+    let result = get_anthropic_auth_from_claude_cli_credentials();
     if result.is_none() {
-        tracing::debug!("No Anthropic credentials found in ai_providers.json either");
+        tracing::debug!("No Anthropic credentials found in Claude CLI credentials either");
     }
     result
 }
@@ -549,6 +556,83 @@ fn get_anthropic_auth_from_ai_providers(working_dir: &Path) -> Option<ClaudeCode
         if let Some(oauth) = provider.get("oauth") {
             if let Some(access_token) = oauth.get("access_token").and_then(|v| v.as_str()) {
                 if !access_token.is_empty() {
+                    return Some(ClaudeCodeAuth::OAuthToken(access_token.to_string()));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Get Anthropic auth from Claude CLI's own credentials file.
+///
+/// The Claude CLI stores OAuth credentials in `~/.claude/.credentials.json` with format:
+/// ```json
+/// {
+///   "claudeAiOauth": {
+///     "accessToken": "sk-ant-oat01-...",
+///     "expiresAt": 1769395897294,
+///     "refreshToken": "sk-ant-ort01-...",
+///     "scopes": ["user:inference", "user:profile"]
+///   }
+/// }
+/// ```
+///
+/// This function checks multiple possible locations:
+/// - /var/lib/opencode/.claude/.credentials.json (isolated OpenCode home)
+/// - /root/.claude/.credentials.json (standard root home)
+/// - $HOME/.claude/.credentials.json (current user's home)
+fn get_anthropic_auth_from_claude_cli_credentials() -> Option<ClaudeCodeAuth> {
+    let locations = [
+        // OpenCode isolated home (used when OPENCODE_CONFIG_DIR is set)
+        std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
+        // Standard root home
+        std::path::PathBuf::from("/root/.claude/.credentials.json"),
+    ];
+
+    // Also try HOME env var
+    let home_path = std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join(".claude/.credentials.json"));
+
+    for path in locations.iter().chain(home_path.iter()) {
+        if !path.exists() {
+            continue;
+        }
+
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to read Claude CLI credentials file"
+                );
+                continue;
+            }
+        };
+
+        let creds: serde_json::Value = match serde_json::from_str(&contents) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to parse Claude CLI credentials file"
+                );
+                continue;
+            }
+        };
+
+        // Look for claudeAiOauth.accessToken
+        if let Some(oauth) = creds.get("claudeAiOauth") {
+            if let Some(access_token) = oauth.get("accessToken").and_then(|v| v.as_str()) {
+                if !access_token.is_empty() {
+                    tracing::info!(
+                        path = %path.display(),
+                        "Found Anthropic OAuth token in Claude CLI credentials file"
+                    );
                     return Some(ClaudeCodeAuth::OAuthToken(access_token.to_string()));
                 }
             }
