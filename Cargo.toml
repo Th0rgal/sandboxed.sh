@@ -1,6 +1,6 @@
 [package]
 name = "open_agent"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Cloud orchestrator for AI coding agents (Claude Code & OpenCode)"
 authors = ["Open Agent Contributors"]
@@ -67,6 +67,9 @@ bytes = "1"
 portable-pty = "0.9"
 md5 = "0.7"
 tokio-util = { version = "0.7", features = ["io"] }
+
+# Backup/restore
+zip = "2"
 # Keep MSRV-compatible idna_adapter for the production builder (rustc 1.75).
 idna_adapter = "=1.1.0"
 
