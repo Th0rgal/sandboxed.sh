@@ -135,13 +135,50 @@ function parseFrontmatter(content: string): { frontmatter: Frontmatter; body: st
   return { frontmatter, body };
 }
 
+// YAML special characters that require quoting
+const YAML_SPECIAL_CHARS = [':', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', "'", '"', '%', '@', '`'];
+
+/**
+ * Format a YAML value, quoting if it contains special characters.
+ * This prevents YAML parsing errors when descriptions contain colons (e.g., "Triggers: foo, bar").
+ */
+function formatYamlValue(value: string): string {
+  // Check if value needs quoting
+  const needsQuoting = YAML_SPECIAL_CHARS.some(char => value.includes(char));
+  
+  if (needsQuoting) {
+    // Escape backslashes and double quotes, then wrap in quotes
+    const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    return `"${escaped}"`;
+  }
+  
+  return value;
+}
+
+/**
+ * Check if a frontmatter value contains YAML special characters that need quoting.
+ * Returns an array of field names that have problematic values.
+ */
+function checkFrontmatterForYamlIssues(frontmatter: Frontmatter): string[] {
+  const problematicFields: string[] = [];
+  
+  for (const [key, value] of Object.entries(frontmatter)) {
+    if (value && YAML_SPECIAL_CHARS.some(char => value.includes(char))) {
+      problematicFields.push(key);
+    }
+  }
+  
+  return problematicFields;
+}
+
 function buildContent(frontmatter: Frontmatter, body: string): string {
   const entries = Object.entries(frontmatter).filter(([_, v]) => v !== undefined && v !== '');
   if (entries.length === 0) {
     return body;
   }
 
-  const yaml = entries.map(([k, v]) => `${k}: ${v}`).join('\n');
+  // Quote values that contain YAML special characters
+  const yaml = entries.map(([k, v]) => `${k}: ${formatYamlValue(v!)}`).join('\n');
   return `---\n${yaml}\n---\n\n${body}`;
 }
 
@@ -256,6 +293,10 @@ function FrontmatterEditor({ frontmatter, onChange, disabled }: FrontmatterEdito
     onChange({ ...frontmatter, [key]: value || undefined });
   };
 
+  // Check if description contains special YAML characters
+  const descriptionHasSpecialChars = frontmatter.description && 
+    YAML_SPECIAL_CHARS.some(char => frontmatter.description?.includes(char));
+
   return (
     <div className="space-y-3 p-3 rounded-lg bg-white/[0.02] border border-white/[0.06]">
       <div className="text-xs font-medium text-white/60 uppercase tracking-wide">Frontmatter</div>
@@ -271,6 +312,12 @@ function FrontmatterEditor({ frontmatter, onChange, disabled }: FrontmatterEdito
             className="w-full px-3 py-1.5 text-xs rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50"
             disabled={disabled}
           />
+          {descriptionHasSpecialChars && (
+            <p className="text-xs text-blue-400/80 mt-1 flex items-center gap-1">
+              <Check className="h-3 w-3" />
+              Contains special characters — will be auto-quoted for valid YAML
+            </p>
+          )}
         </div>
 
         <div className="grid grid-cols-2 gap-2">
