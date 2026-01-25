@@ -253,6 +253,8 @@ pub async fn update_backend_config(
                     "Invalid settings payload".to_string(),
                 )
             })?;
+            
+            tracing::debug!("Amp config update - received settings: {:?}", req.settings);
 
             // Get current config to preserve api_key if not being updated
             let current_config = state.backend_configs.get(&id).await;
@@ -272,6 +274,12 @@ pub async fn update_backend_config(
 
             // Use new key if provided, otherwise keep existing
             let api_key = new_api_key.or(current_api_key);
+            
+            tracing::debug!(
+                "Amp config update - api_key present: {}, api_key_len: {:?}",
+                api_key.is_some(),
+                api_key.as_ref().map(|k| k.len())
+            );
 
             let cli_path = settings
                 .get("cli_path")
@@ -316,6 +324,6 @@ pub async fn update_backend_config(
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "message": "Backend configuration updated. Restart Open Agent to apply runtime changes."
+        "message": "Backend configuration updated."
     })))
 }
