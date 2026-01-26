@@ -29,7 +29,8 @@ use crate::workspace::{self, Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
 
 use super::control::{
-    AgentEvent, AgentTreeNode, ControlStatus, ExecutionProgress, FrontendToolHub,
+    safe_truncate_index, AgentEvent, AgentTreeNode, ControlStatus, ExecutionProgress,
+    FrontendToolHub,
 };
 use super::library::SharedLibrary;
 
@@ -479,6 +480,14 @@ pub struct QueuedMessage {
 }
 
 /// Isolated runner for a single mission.
+/// Info about a tracked subtask (from delegate_task/Task tool calls).
+#[derive(Debug, Clone)]
+pub struct SubtaskInfo {
+    pub tool_call_id: String,
+    pub description: String,
+    pub completed: bool,
+}
+
 pub struct MissionRunner {
     /// Mission ID
     pub mission_id: Uuid,
@@ -524,6 +533,12 @@ pub struct MissionRunner {
 
     /// Whether complete_mission was explicitly called
     pub explicitly_completed: bool,
+
+    /// Current activity label (derived from latest tool call)
+    pub current_activity: Option<String>,
+
+    /// Tracked subtasks (from delegate_task/Task tool calls)
+    pub subtasks: Vec<SubtaskInfo>,
 }
 
 impl MissionRunner {
@@ -551,6 +566,8 @@ impl MissionRunner {
             deliverables: DeliverableSet::default(),
             last_activity: Instant::now(),
             explicitly_completed: false,
+            current_activity: None,
+            subtasks: Vec::new(),
         }
     }
 
@@ -875,7 +892,7 @@ async fn run_mission_turn(
     workspaces: workspace::SharedWorkspaceStore,
     library: SharedLibrary,
     events_tx: broadcast::Sender<AgentEvent>,
-    _tool_hub: Arc<FrontendToolHub>,
+    tool_hub: Arc<FrontendToolHub>,
     _status: Arc<RwLock<ControlStatus>>,
     cancel: CancellationToken,
     history: Vec<(String, String)>,
@@ -1014,6 +1031,7 @@ async fn run_mission_turn(
                 &config.working_dir,
                 session_id.as_deref(),
                 is_continuation,
+                Some(Arc::clone(&tool_hub)),
             )
             .await
         }
@@ -1193,20 +1211,22 @@ fn get_amp_url_from_settings() -> Option<String> {
 ///
 /// For Host workspaces: spawns the CLI directly on the host.
 /// For Container workspaces: spawns the CLI inside the container using systemd-nspawn.
-pub async fn run_claudecode_turn(
-    workspace: &Workspace,
-    work_dir: &std::path::Path,
-    message: &str,
-    model: Option<&str>,
-    agent: Option<&str>,
+pub fn run_claudecode_turn<'a>(
+    workspace: &'a Workspace,
+    work_dir: &'a std::path::Path,
+    message: &'a str,
+    model: Option<&'a str>,
+    agent: Option<&'a str>,
     mission_id: Uuid,
     events_tx: broadcast::Sender<AgentEvent>,
     cancel: CancellationToken,
     secrets: Option<Arc<SecretsStore>>,
-    app_working_dir: &std::path::Path,
-    session_id: Option<&str>,
+    app_working_dir: &'a std::path::Path,
+    session_id: Option<&'a str>,
     is_continuation: bool,
-) -> AgentResult {
+    tool_hub: Option<Arc<FrontendToolHub>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
+    Box::pin(async move {
     use super::ai_providers::{
         get_anthropic_auth_from_workspace, get_anthropic_auth_from_host_with_expiry,
         get_workspace_auth_path, ClaudeCodeAuth, ensure_anthropic_oauth_token_valid,
@@ -1504,9 +1524,9 @@ pub async fn run_claudecode_turn(
         args.push(mode.to_string());
     }
 
-    // NOTE: --dangerously-skip-permissions cannot be used when running as root.
-    // The container runs as root, so we rely on the permissions in settings.local.json instead.
-    // The "mcp__*" permission pattern should allow all MCP tools.
+    // Skip all permission checks. IS_SANDBOX=1 is set in env vars below
+    // to allow --dangerously-skip-permissions even when running as root.
+    args.push("--dangerously-skip-permissions".to_string());
 
     // Ensure per-workspace MCP config is loaded (Claude CLI may not auto-load .claude in --print mode).
     // For container workspaces, we must translate the path to be relative to the container filesystem.
@@ -1550,6 +1570,8 @@ pub async fn run_claudecode_turn(
 
     // Build environment variables
     let mut env: HashMap<String, String> = HashMap::new();
+    // Allow --dangerously-skip-permissions when running as root inside containers.
+    env.insert("IS_SANDBOX".to_string(), "1".to_string());
     if let Some(ref auth) = api_auth {
         match auth {
             ClaudeCodeAuth::OAuthToken(token) => {
@@ -1624,7 +1646,7 @@ pub async fn run_claudecode_turn(
     let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
     let stderr_capture_clone = stderr_capture.clone();
     let mission_id_for_stderr = mission_id;
-    let stderr_handle = if let Some(stderr) = stderr {
+    let mut stderr_handle = if let Some(stderr) = stderr {
         Some(tokio::spawn(async move {
             let stderr_reader = BufReader::new(stderr);
             let mut stderr_lines = stderr_reader.lines();
@@ -1673,7 +1695,7 @@ pub async fn run_claudecode_turn(
                 tracing::info!(mission_id = %mission_id, "Claude Code execution cancelled, killing process");
                 // Kill the process to stop consuming API resources
                 let _ = child.kill().await;
-                if let Some(handle) = stderr_handle {
+                if let Some(handle) = stderr_handle.take() {
                     handle.abort();
                 }
                 return AgentResult::failure("Cancelled".to_string(), 0)
@@ -1683,7 +1705,7 @@ pub async fn run_claudecode_turn(
                 let err_msg = "Claude Code produced no output. No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
                 tracing::warn!(mission_id = %mission_id, "{}", err_msg);
                 let _ = child.kill().await;
-                if let Some(handle) = stderr_handle {
+                if let Some(handle) = stderr_handle.take() {
                     handle.abort();
                 }
                 return AgentResult::failure(err_msg.to_string(), 0)
@@ -1703,7 +1725,8 @@ pub async fn run_claudecode_turn(
                                     "Failed to parse Claude event: {} - line: {}",
                                     e,
                                     if line.len() > 200 {
-                                        format!("{}...", &line[..200])
+                                        let end = safe_truncate_index(&line, 200);
+                                        format!("{}...", &line[..end])
                                     } else {
                                         line.clone()
                                     }
@@ -1790,9 +1813,73 @@ pub async fn run_claudecode_turn(
                                             let _ = events_tx.send(AgentEvent::ToolCall {
                                                 tool_call_id: id.clone(),
                                                 name: name.clone(),
-                                                args: input,
+                                                args: input.clone(),
                                                 mission_id: Some(mission_id),
                                             });
+
+                                            if name == "question" || name.starts_with("ui_") {
+                                                if let Some(ref hub) = tool_hub {
+                                                    tracing::info!(
+                                                        mission_id = %mission_id,
+                                                        tool_call_id = %id,
+                                                        tool_name = %name,
+                                                        "Frontend tool detected, pausing for user input"
+                                                    );
+                                                    let hub = Arc::clone(hub);
+                                                    let rx = hub.register(id.clone()).await;
+
+                                                    let _ = child.kill().await;
+                                                    if let Some(handle) = stderr_handle.take() {
+                                                        handle.abort();
+                                                    }
+
+                                                    let answer = tokio::select! {
+                                                        _ = cancel.cancelled() => {
+                                                            return AgentResult::failure("Cancelled".to_string(), 0)
+                                                                .with_terminal_reason(TerminalReason::Cancelled);
+                                                        }
+                                                        res = rx => {
+                                                            match res {
+                                                                Ok(v) => v,
+                                                                Err(_) => {
+                                                                    return AgentResult::failure(
+                                                                        "Frontend tool result channel closed".to_string(), 0
+                                                                    ).with_terminal_reason(TerminalReason::LlmError);
+                                                                }
+                                                            }
+                                                        }
+                                                    };
+
+                                                    let _ = events_tx.send(AgentEvent::ToolResult {
+                                                        tool_call_id: id.clone(),
+                                                        name: name.clone(),
+                                                        result: answer.clone(),
+                                                        mission_id: Some(mission_id),
+                                                    });
+
+                                                    let answer_text = if let Some(answers) = answer.get("answers") {
+                                                        answers.to_string()
+                                                    } else {
+                                                        answer.to_string()
+                                                    };
+
+                                                    return run_claudecode_turn(
+                                                        workspace,
+                                                        work_dir,
+                                                        &answer_text,
+                                                        model,
+                                                        agent,
+                                                        mission_id,
+                                                        events_tx,
+                                                        cancel,
+                                                        secrets,
+                                                        app_working_dir,
+                                                        Some(&session_id),
+                                                        true,
+                                                        tool_hub,
+                                                    ).await;
+                                                }
+                                            }
                                         }
                                         ContentBlock::Thinking { thinking } => {
                                             // Only send if this is new content not already streamed
@@ -1935,6 +2022,7 @@ pub async fn run_claudecode_turn(
     } else {
         AgentResult::success(final_result, cost_cents)
     }
+    }) // end Box::pin(async move { ... })
 }
 
 /// Read CLI path for opencode from backend config file if available.
@@ -5092,7 +5180,7 @@ pub async fn run_amp_turn(
                                 tracing::warn!(
                                     mission_id = %mission_id,
                                     error = %e,
-                                    line = %if line.len() > 200 { format!("{}...", &line[..200]) } else { line.clone() },
+                                    line = %if line.len() > 200 { let end = safe_truncate_index(&line, 200); format!("{}...", &line[..end]) } else { line.clone() },
                                     "Failed to parse Amp event"
                                 );
                                 continue;
@@ -5362,6 +5450,13 @@ pub struct RunningMissionInfo {
     pub history_len: usize,
     pub seconds_since_activity: u64,
     pub expected_deliverables: usize,
+    /// Current activity label (e.g., "Reading: main.rs")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_activity: Option<String>,
+    /// Total tracked subtasks
+    pub subtask_total: usize,
+    /// Completed subtasks
+    pub subtask_completed: usize,
 }
 
 impl From<&MissionRunner> for RunningMissionInfo {
@@ -5378,6 +5473,9 @@ impl From<&MissionRunner> for RunningMissionInfo {
             history_len: runner.history.len(),
             seconds_since_activity: runner.last_activity.elapsed().as_secs(),
             expected_deliverables: runner.deliverables.deliverables.len(),
+            current_activity: runner.current_activity.clone(),
+            subtask_total: runner.subtasks.len(),
+            subtask_completed: runner.subtasks.iter().filter(|s| s.completed).count(),
         }
     }
 }

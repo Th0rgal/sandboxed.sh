@@ -39,7 +39,7 @@ use super::mission_store::{
 use super::routes::AppState;
 
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
-fn safe_truncate_index(s: &str, max: usize) -> usize {
+pub(super) fn safe_truncate_index(s: &str, max: usize) -> usize {
     if s.len() <= max {
         return s.len();
     }
@@ -49,6 +49,120 @@ fn safe_truncate_index(s: &str, max: usize) -> usize {
         idx -= 1;
     }
     idx
+}
+
+/// Derive a human-readable activity label from a tool call.
+fn activity_label_from_tool_call(tool_name: &str, args: &serde_json::Value) -> String {
+    fn extract_str<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+        for key in keys {
+            if let Some(v) = args.get(*key).and_then(|v| v.as_str()) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn basename(path: &str) -> &str {
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(path)
+    }
+
+    fn truncate(s: &str, max: usize) -> String {
+        if s.len() <= max {
+            s.to_string()
+        } else {
+            let end = safe_truncate_index(s, max);
+            format!("{}…", &s[..end])
+        }
+    }
+
+    match tool_name {
+        "Bash" | "bash" => {
+            let cmd = extract_str(args, &["command"]).unwrap_or("…");
+            let first_line = cmd.lines().next().unwrap_or(cmd);
+            format!("Running: {}", truncate(first_line, 60))
+        }
+        "Read" | "read_file" => {
+            let path = extract_str(args, &["file_path", "path"]).unwrap_or("…");
+            format!("Reading: {}", basename(path))
+        }
+        "Edit" | "edit_file" => {
+            let path = extract_str(args, &["file_path", "path"]).unwrap_or("…");
+            format!("Editing: {}", basename(path))
+        }
+        "Write" | "write_file" => {
+            let path = extract_str(args, &["file_path", "path"]).unwrap_or("…");
+            format!("Writing: {}", basename(path))
+        }
+        "Grep" | "grep" | "search" => {
+            let pattern = extract_str(args, &["pattern"]).unwrap_or("…");
+            format!("Searching: {}", truncate(pattern, 40))
+        }
+        "Glob" | "glob" => {
+            let pattern = extract_str(args, &["pattern"]).unwrap_or("…");
+            format!("Finding: {}", truncate(pattern, 50))
+        }
+        "WebSearch" | "web_search" => {
+            let query = extract_str(args, &["query"]).unwrap_or("…");
+            format!("Searching web: {}", truncate(query, 40))
+        }
+        "WebFetch" | "web_fetch" => "Fetching web page".to_string(),
+        "Task" | "delegate_task" => {
+            let desc = extract_str(args, &["description", "prompt", "subject"]).unwrap_or("…");
+            format!("Subtask: {}", truncate(desc, 80))
+        }
+        "TaskCreate" => {
+            let desc = extract_str(args, &["subject", "description"]).unwrap_or("…");
+            format!("Creating task: {}", truncate(desc, 80))
+        }
+        "Skill" => {
+            let skill = extract_str(args, &["skill"]).unwrap_or("…");
+            format!("Running skill: {}", skill)
+        }
+        "AskUserQuestion" => "Waiting for input".to_string(),
+        "NotebookEdit" => {
+            let path = extract_str(args, &["notebook_path"]).unwrap_or("…");
+            format!("Editing notebook: {}", basename(path))
+        }
+        name if name.starts_with("mcp__") => {
+            let parts: Vec<&str> = name.splitn(3, "__").collect();
+            if parts.len() == 3 {
+                format!("{}: {}", parts[1], parts[2])
+            } else {
+                format!("Tool: {}", name)
+            }
+        }
+        other => format!("Tool: {}", other),
+    }
+}
+
+/// Extract a concise title from the assistant's first response.
+/// Returns the first substantive line, cleaned of markdown formatting.
+fn extract_title_from_assistant(content: &str) -> Option<String> {
+    // Find the first non-trivial line that isn't a code fence
+    let first_line = content
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| l.len() > 5 && !l.starts_with("```"))?;
+
+    // Strip markdown prefixes
+    let cleaned = first_line
+        .trim_start_matches(|c: char| c == '#' || c == '*' || c == '-' || c == ' ')
+        .trim();
+
+    if cleaned.len() < 5 {
+        return None;
+    }
+
+    let max_len = cleaned.len().min(100);
+    let safe_end = safe_truncate_index(cleaned, max_len);
+    if safe_end < cleaned.len() {
+        Some(format!("{}...", &cleaned[..safe_end]))
+    } else {
+        Some(cleaned.to_string())
+    }
 }
 
 /// Build a simple history context from conversation history.
@@ -388,6 +502,16 @@ pub enum AgentEvent {
         /// Mission this session ID belongs to
         mission_id: Uuid,
     },
+    /// Live activity label derived from the current tool call
+    MissionActivity {
+        /// Human-readable activity label (e.g., "Reading: main.rs")
+        label: String,
+        /// Tool name that generated this activity
+        tool_name: String,
+        /// Mission this activity belongs to
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mission_id: Option<Uuid>,
+    },
 }
 
 /// A node in the agent tree (for visualization)
@@ -467,6 +591,7 @@ impl AgentEvent {
             AgentEvent::AgentTree { .. } => "agent_tree",
             AgentEvent::Progress { .. } => "progress",
             AgentEvent::SessionIdUpdate { .. } => "session_id_update",
+            AgentEvent::MissionActivity { .. } => "mission_activity",
         }
     }
 
@@ -485,6 +610,7 @@ impl AgentEvent {
             AgentEvent::AgentTree { mission_id, .. } => *mission_id,
             AgentEvent::Progress { mission_id, .. } => *mission_id,
             AgentEvent::SessionIdUpdate { mission_id, .. } => Some(*mission_id),
+            AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
         }
     }
 }
@@ -637,33 +763,65 @@ pub struct SetMissionStatusRequest {
 // MissionStore trait and implementations are in mission_store module
 
 /// Shared tool hub used to await frontend tool results.
+///
+/// Supports both orderings:
+/// - register-then-resolve (normal flow)
+/// - resolve-then-register (frontend submits answer before backend registers)
 #[derive(Debug)]
 pub struct FrontendToolHub {
     pending: Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>,
+    early_results: Mutex<HashMap<String, serde_json::Value>>,
 }
 
 impl FrontendToolHub {
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
+            early_results: Mutex::new(HashMap::new()),
         }
     }
 
     /// Register a tool call that expects a frontend-provided result.
+    /// If the result was already submitted (resolve-before-register), it is
+    /// delivered immediately.
     pub async fn register(&self, tool_call_id: String) -> oneshot::Receiver<serde_json::Value> {
         let (tx, rx) = oneshot::channel();
+
+        {
+            let mut early = self.early_results.lock().await;
+            if let Some(result) = early.remove(&tool_call_id) {
+                let _ = tx.send(result);
+                return rx;
+            }
+        }
+
         let mut pending = self.pending.lock().await;
         pending.insert(tool_call_id, tx);
         rx
     }
 
     /// Resolve a pending tool call by id.
+    /// If no one has registered yet, the result is cached for later pickup.
     pub async fn resolve(&self, tool_call_id: &str, result: serde_json::Value) -> Result<(), ()> {
         let mut pending = self.pending.lock().await;
-        let Some(tx) = pending.remove(tool_call_id) else {
-            return Err(());
-        };
-        let _ = tx.send(result);
+        if let Some(tx) = pending.remove(tool_call_id) {
+            let _ = tx.send(result);
+            return Ok(());
+        }
+        drop(pending);
+
+        let mut early = self.early_results.lock().await;
+        const MAX_EARLY_RESULTS: usize = 256;
+        if early.len() >= MAX_EARLY_RESULTS {
+            tracing::warn!(
+                "FrontendToolHub: early_results cache full ({} entries), dropping oldest",
+                early.len()
+            );
+            if let Some(key) = early.keys().next().cloned() {
+                early.remove(&key);
+            }
+        }
+        early.insert(tool_call_id.to_string(), result);
         Ok(())
     }
 }
@@ -1984,6 +2142,10 @@ async fn control_actor_loop(
     let mut running_mission_id: Option<Uuid> = None;
     // Track last activity for the main runner (for stall detection)
     let mut main_runner_last_activity: std::time::Instant = std::time::Instant::now();
+    // Track current activity label for the main runner
+    let mut main_runner_activity: Option<String> = None;
+    // Track subtasks for the main runner
+    let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
 
     // Parallel mission runners - each runs independently
     let mut parallel_runners: std::collections::HashMap<
@@ -2029,29 +2191,35 @@ async fn control_actor_loop(
                 tracing::warn!("Failed to persist mission history: {}", e);
             }
 
-            // Update title from first user message if not set
-            if history.len() == 2 {
-                if let Some((role, content)) = history.first() {
-                    if role == "user" {
-                        let should_update = mission_store
-                            .get_mission(mid)
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|m| m.title)
-                            .map(|t| t.trim().is_empty())
-                            .unwrap_or(true);
-                        if should_update {
-                            let title = if content.len() > 100 {
-                                let safe_end = safe_truncate_index(content, 100);
-                                format!("{}...", &content[..safe_end])
+            // Auto-generate title from conversation if not set
+            if history.len() >= 2 {
+                let should_update = mission_store
+                    .get_mission(mid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.title)
+                    .map(|t| t.trim().is_empty())
+                    .unwrap_or(true);
+                if should_update {
+                    // Prefer assistant's opening line (often a summary of intent)
+                    let title = history
+                        .iter()
+                        .rev()
+                        .find(|(role, _)| role == "assistant")
+                        .and_then(|(_, content)| extract_title_from_assistant(content))
+                        .unwrap_or_else(|| {
+                            // Fall back to user's first message
+                            let user_content = &history[0].1;
+                            if user_content.len() > 100 {
+                                let safe_end = safe_truncate_index(user_content, 100);
+                                format!("{}...", &user_content[..safe_end])
                             } else {
-                                content.clone()
-                            };
-                            if let Err(e) = mission_store.update_mission_title(mid, &title).await {
-                                tracing::warn!("Failed to update mission title: {}", e);
+                                user_content.clone()
                             }
-                        }
+                        });
+                    if let Err(e) = mission_store.update_mission_title(mid, &title).await {
+                        tracing::warn!("Failed to update mission title: {}", e);
                     }
                 }
             }
@@ -2180,7 +2348,8 @@ async fn control_actor_loop(
                 mission.history.iter().rev().find(|h| h.role == "assistant")
             {
                 let truncated = if last_assistant.content.len() > 2000 {
-                    format!("{}...", &last_assistant.content[..2000])
+                    let end = safe_truncate_index(&last_assistant.content, 2000);
+                    format!("{}...", &last_assistant.content[..end])
                 } else {
                     last_assistant.content.clone()
                 };
@@ -2428,19 +2597,35 @@ async fn control_actor_loop(
                                     tracing::info!("Auto-created mission: {}", new_mission.id);
                                 }
                             } else if let Some(tid) = effective_target {
-                                // Switch main session to target mission if nothing running
-                                if !main_is_running && mission_id != Some(tid) {
-                                    // Persist current history before switching
-                                    persist_mission_history(&mission_store, &current_mission, &history).await;
-                                    // Load new mission's history
-                                    if let Ok(mission) = load_mission_record(&mission_store, tid).await {
-                                        history.clear();
-                                        for entry in &mission.history {
-                                            history.push((entry.role.clone(), entry.content.clone()));
+                                if !main_is_running {
+                                    if mission_id != Some(tid) {
+                                        // Switch main session to target mission
+                                        persist_mission_history(&mission_store, &current_mission, &history).await;
+                                        if let Ok(mission) = load_mission_record(&mission_store, tid).await {
+                                            history.clear();
+                                            for entry in &mission.history {
+                                                history.push((entry.role.clone(), entry.content.clone()));
+                                            }
+                                        }
+                                        *current_mission.write().await = Some(tid);
+                                        tracing::info!("Switched main session to mission: {}", tid);
+                                    } else if !history.iter().any(|(role, _)| role == "assistant") {
+                                        // Same mission but no assistant history in memory
+                                        // (e.g., after server restart). Reload from database
+                                        // so Claude Code continuation detection works correctly.
+                                        if let Ok(mission) = load_mission_record(&mission_store, tid).await {
+                                            if !mission.history.is_empty() {
+                                                history.clear();
+                                                for entry in &mission.history {
+                                                    history.push((entry.role.clone(), entry.content.clone()));
+                                                }
+                                                tracing::info!(
+                                                    "Reloaded {} history entries for mission {} (session continuity)",
+                                                    mission.history.len(), tid
+                                                );
+                                            }
                                         }
                                     }
-                                    *current_mission.write().await = Some(tid);
-                                    tracing::info!("Switched main session to mission: {}", tid);
                                 }
                             }
                         }
@@ -2552,8 +2737,10 @@ async fn control_actor_loop(
                                 let agent_override = per_msg_agent.or(mission_agent);
                                 running_cancel = Some(cancel.clone());
                                 running_mission_id = mission_id;
-                                // Reset activity timer when new task starts to avoid false stall warnings
+                                // Reset activity tracking when new task starts
                                 main_runner_last_activity = std::time::Instant::now();
+                                main_runner_activity = None;
+                                main_runner_subtasks.clear();
                                 running = Some(tokio::spawn(async move {
                                     let result = run_single_control_turn(
                                         cfg,
@@ -2587,10 +2774,10 @@ async fn control_actor_loop(
                         let _ = respond.send(was_running);
                     }
                     ControlCommand::ToolResult { tool_call_id, name, result } => {
-                        // Deliver to the tool hub. The executor emits ToolResult events when it receives it.
-                        if tool_hub.resolve(&tool_call_id, result).await.is_err() {
-                            let _ = events_tx.send(AgentEvent::Error { message: format!("Unknown tool_call_id '{}' for tool '{}'", tool_call_id, name), mission_id: None, resumable: false });
-                        }
+                        // Deliver to the tool hub. resolve() caches the result if
+                        // no one has registered yet (resolve-before-register).
+                        let _ = tool_hub.resolve(&tool_call_id, result).await;
+                        tracing::debug!(tool_call_id = %tool_call_id, name = %name, "ToolResult delivered to hub");
                     }
                     ControlCommand::Cancel => {
                         if let Some(token) = &running_cancel {
@@ -2849,6 +3036,9 @@ async fn control_actor_loop(
                                     history_len: history.len(),
                                     seconds_since_activity: main_runner_last_activity.elapsed().as_secs(),
                                     expected_deliverables: 0,
+                                    current_activity: main_runner_activity.clone(),
+                                    subtask_total: main_runner_subtasks.len(),
+                                    subtask_completed: main_runner_subtasks.iter().filter(|s| s.completed).count(),
                                 });
                             }
                         }
@@ -2933,6 +3123,8 @@ async fn control_actor_loop(
                                         running_cancel = Some(cancel.clone());
                                         // Capture which mission this task is working on (the resumed mission)
                                         running_mission_id = Some(mission_id);
+                                        main_runner_activity = None;
+                                        main_runner_subtasks.clear();
                                         running = Some(tokio::spawn(async move {
                                             let result = run_single_control_turn(
                                                 cfg,
@@ -3171,6 +3363,7 @@ async fn control_actor_loop(
                     running = None;
                     running_cancel = None;
                     running_mission_id = None;
+                    main_runner_activity = None;
                     match res {
                         Ok((_mid, user_msg, agent_result)) => {
                             // Only append assistant to local history if this mission is still the current mission.
@@ -3208,16 +3401,22 @@ async fn control_actor_loop(
                                             .as_ref()
                                             .map(|s| s.trim().is_empty())
                                             .unwrap_or(true);
-                                        if title_empty && entries.len() == 2 && entries[0].role == "user"
-                                        {
-                                            // Use safe_truncate_index for UTF-8 safe truncation
-                                            let title = if user_msg.len() > 100 {
-                                                let safe_end =
-                                                    safe_truncate_index(&user_msg, 100);
-                                                format!("{}...", &user_msg[..safe_end])
-                                            } else {
-                                                user_msg.clone()
-                                            };
+                                        if title_empty && entries.len() >= 2 {
+                                            // Prefer assistant's opening line, fall back to user message
+                                            let title = entries
+                                                .iter()
+                                                .rev()
+                                                .find(|e| e.role == "assistant")
+                                                .and_then(|e| extract_title_from_assistant(&e.content))
+                                                .unwrap_or_else(|| {
+                                                    if user_msg.len() > 100 {
+                                                        let safe_end =
+                                                            safe_truncate_index(&user_msg, 100);
+                                                        format!("{}...", &user_msg[..safe_end])
+                                                    } else {
+                                                        user_msg.clone()
+                                                    }
+                                                });
                                             if let Err(e) =
                                                 mission_store.update_mission_title(mid, &title).await
                                             {
@@ -3416,8 +3615,10 @@ async fn control_actor_loop(
                     // Per-message agent overrides mission agent
                     let agent_override = per_msg_agent.or(mission_agent);
                     running_mission_id = mission_id;
-                    // Reset activity timer when new task starts to avoid false stall warnings
+                    // Reset activity tracking when new task starts
                     main_runner_last_activity = std::time::Instant::now();
+                    main_runner_activity = None;
+                    main_runner_subtasks.clear();
                     running = Some(tokio::spawn(async move {
                         let result = run_single_control_turn(
                             cfg,
@@ -3529,6 +3730,189 @@ async fn control_actor_loop(
                             // Update parallel runner activity
                             runner.touch();
                         }
+                    }
+
+                    // --- Activity tracking & subtask detection ---
+                    match &event {
+                        AgentEvent::ToolCall { name, args, tool_call_id, mission_id } => {
+                            if let Some(mid) = mission_id {
+                                let label = activity_label_from_tool_call(name, args);
+
+                                // Update activity on runner
+                                if running_mission_id == Some(*mid) {
+                                    main_runner_activity = Some(label.clone());
+                                } else if let Some(runner) = parallel_runners.get_mut(mid) {
+                                    runner.current_activity = Some(label.clone());
+                                }
+
+                                // Emit activity event for real-time SSE
+                                let _ = events_tx.send(AgentEvent::MissionActivity {
+                                    label,
+                                    tool_name: name.clone(),
+                                    mission_id: Some(*mid),
+                                });
+
+                                // Subtask detection
+                                let is_subtask = matches!(name.as_str(),
+                                    "Task" | "delegate_task" | "TaskCreate" | "Skill"
+                                );
+                                if is_subtask {
+                                    let desc: String = args.get("description")
+                                        .or_else(|| args.get("subject"))
+                                        .or_else(|| args.get("prompt"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("Subtask")
+                                        .chars().take(120).collect();
+                                    let info = super::mission_runner::SubtaskInfo {
+                                        tool_call_id: tool_call_id.clone(),
+                                        description: desc,
+                                        completed: false,
+                                    };
+                                    let (total, completed) = if running_mission_id == Some(*mid) {
+                                        main_runner_subtasks.push(info);
+                                        (main_runner_subtasks.len(), main_runner_subtasks.iter().filter(|s| s.completed).count())
+                                    } else if let Some(runner) = parallel_runners.get_mut(mid) {
+                                        runner.subtasks.push(info);
+                                        (runner.subtasks.len(), runner.subtasks.iter().filter(|s| s.completed).count())
+                                    } else {
+                                        (0, 0)
+                                    };
+                                    if total > 0 {
+                                        let _ = events_tx.send(AgentEvent::Progress {
+                                            total_subtasks: total,
+                                            completed_subtasks: completed,
+                                            current_subtask: None,
+                                            depth: 0,
+                                            mission_id: Some(*mid),
+                                        });
+                                    }
+                                }
+
+                                // Desktop session detection from ToolCall.
+                                // Claude Code and Amp don't emit ToolResult for MCP tools,
+                                // so we detect the session start from the ToolCall and
+                                // spawn a background task to attribute Xvfb processes.
+                                let is_desktop_start = matches!(
+                                    name.as_str(),
+                                    "desktop_start_session"
+                                        | "desktop_desktop_start_session"
+                                        | "mcp__desktop__desktop_start_session"
+                                );
+                                if is_desktop_start {
+                                    let store = mission_store.clone();
+                                    let mid = *mid;
+                                    tokio::spawn(async move {
+                                        // Wait for Xvfb to start
+                                        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+                                        // Scan for running Xvfb displays
+                                        let displays =
+                                            super::desktop::get_running_xvfb_displays().await;
+                                        if displays.is_empty() {
+                                            tracing::debug!(
+                                                "No Xvfb displays found for desktop attribution"
+                                            );
+                                            return;
+                                        }
+
+                                        // Load current mission sessions
+                                        let Ok(Some(mission)) = store.get_mission(mid).await
+                                        else {
+                                            return;
+                                        };
+                                        let mut sessions = mission.desktop_sessions.clone();
+                                        let tracked: std::collections::HashSet<String> =
+                                            sessions.iter().map(|s| s.display.clone()).collect();
+
+                                        let mut changed = false;
+                                        for disp in displays {
+                                            if !tracked.contains(&disp) {
+                                                sessions.push(DesktopSessionInfo {
+                                                    display: disp.clone(),
+                                                    resolution: None,
+                                                    started_at: now_string(),
+                                                    stopped_at: None,
+                                                    screenshots_dir: None,
+                                                    browser: None,
+                                                    url: None,
+                                                    mission_id: Some(mid),
+                                                    keep_alive_until: None,
+                                                });
+                                                changed = true;
+                                                tracing::info!(
+                                                    display_id = %disp,
+                                                    mission_id = %mid,
+                                                    "Desktop session attributed from ToolCall"
+                                                );
+                                            }
+                                        }
+
+                                        if changed {
+                                            if let Err(err) = store
+                                                .update_mission_desktop_sessions(mid, &sessions)
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    "Failed to persist desktop session from ToolCall for mission {}: {}",
+                                                    mid,
+                                                    err
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        AgentEvent::ToolResult { tool_call_id, mission_id, .. } => {
+                            if let Some(mid) = mission_id {
+                                // Clear activity label (tool finished)
+                                if running_mission_id == Some(*mid) {
+                                    main_runner_activity = None;
+                                } else if let Some(runner) = parallel_runners.get_mut(mid) {
+                                    runner.current_activity = None;
+                                }
+
+                                // Mark subtask complete if applicable
+                                let subtasks: Option<&mut Vec<super::mission_runner::SubtaskInfo>> =
+                                    if running_mission_id == Some(*mid) {
+                                        Some(&mut main_runner_subtasks)
+                                    } else {
+                                        parallel_runners.get_mut(mid).map(|r| &mut r.subtasks)
+                                    };
+                                if let Some(subtasks) = subtasks {
+                                    let mut changed = false;
+                                    for s in subtasks.iter_mut() {
+                                        if s.tool_call_id == *tool_call_id && !s.completed {
+                                            s.completed = true;
+                                            changed = true;
+                                            break;
+                                        }
+                                    }
+                                    if changed {
+                                        let total = subtasks.len();
+                                        let completed = subtasks.iter().filter(|s| s.completed).count();
+                                        let _ = events_tx.send(AgentEvent::Progress {
+                                            total_subtasks: total,
+                                            completed_subtasks: completed,
+                                            current_subtask: None,
+                                            depth: 0,
+                                            mission_id: Some(*mid),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        AgentEvent::Thinking { done, mission_id, .. } => {
+                            if let Some(mid) = mission_id {
+                                let label = if *done { None } else { Some("Thinking…".to_string()) };
+                                if running_mission_id == Some(*mid) {
+                                    main_runner_activity = label;
+                                } else if let Some(runner) = parallel_runners.get_mut(mid) {
+                                    runner.current_activity = label;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
 
                     // Track desktop sessions for mission reconnect/resume.
@@ -3769,7 +4153,7 @@ async fn run_single_control_turn(
     let mut ctx = AgentContext::new(config.clone(), working_dir_path);
     ctx.mission_control = mission_control;
     ctx.control_events = Some(events_tx.clone());
-    ctx.frontend_tool_hub = Some(tool_hub);
+    ctx.frontend_tool_hub = Some(tool_hub.clone());
     ctx.control_status = Some(status);
     ctx.cancel_token = Some(cancel.clone());
     ctx.tree_snapshot = Some(tree_snapshot);
@@ -3815,6 +4199,7 @@ async fn run_single_control_turn(
                 &config.working_dir,
                 session_id.as_deref(),
                 is_continuation,
+                Some(tool_hub.clone()),
             )
             .await
         }

@@ -862,7 +862,8 @@ impl MissionStore for SqliteMissionStore {
             | AgentEvent::AgentTree { .. }
             | AgentEvent::Progress { .. }
             | AgentEvent::SessionIdUpdate { .. }
-            | AgentEvent::TextDelta { .. } => return Ok(()),
+            | AgentEvent::TextDelta { .. }
+            | AgentEvent::MissionActivity { .. } => return Ok(()),
         };
 
         let event_type = event_type.to_string();
@@ -870,6 +871,29 @@ impl MissionStore for SqliteMissionStore {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
+
+            // If this event has an event_id that already exists for this mission,
+            // update the existing row's metadata instead of inserting a duplicate.
+            // This happens when a queued UserMessage is re-emitted with queued: false.
+            if let Some(ref eid) = event_id {
+                let existing: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM mission_events WHERE mission_id = ?1 AND event_id = ?2",
+                        params![&mid, eid],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .unwrap_or(None);
+
+                if let Some(row_id) = existing {
+                    conn.execute(
+                        "UPDATE mission_events SET metadata = ?1, timestamp = ?2 WHERE id = ?3",
+                        params![metadata_str, now, row_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+            }
 
             // Get next sequence
             let sequence: i64 = conn
