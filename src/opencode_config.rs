@@ -243,12 +243,28 @@ fn resolve_command_path(cmd: &str) -> String {
         return cmd.to_string();
     }
 
-    let candidates = [
+    // Build candidates list with user-local paths first
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let user_candidates = [
+        PathBuf::from(&home).join(".opencode/bin").join(cmd),
+        PathBuf::from(&home).join(".local/bin").join(cmd),
+        PathBuf::from(&home).join(".bun/bin").join(cmd),
+    ];
+    
+    let system_candidates = [
         Path::new("/usr/local/bin").join(cmd),
         Path::new("/usr/bin").join(cmd),
     ];
 
-    for candidate in candidates.iter() {
+    // Check user-local paths first
+    for candidate in user_candidates.iter() {
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+    
+    // Fall back to system paths
+    for candidate in system_candidates.iter() {
         if candidate.exists() {
             return candidate.to_string_lossy().to_string();
         }
