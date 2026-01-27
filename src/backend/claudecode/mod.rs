@@ -2,7 +2,6 @@ pub mod client;
 
 use anyhow::Error;
 use async_trait::async_trait;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -10,9 +9,10 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::backend::events::ExecutionEvent;
+use crate::backend::shared::convert_cli_event;
 use crate::backend::{AgentInfo, Backend, Session, SessionConfig};
 
-use client::{ClaudeCodeClient, ClaudeCodeConfig, ClaudeEvent, ContentBlock, StreamEvent};
+use client::{ClaudeCodeClient, ClaudeCodeConfig};
 
 /// Claude Code backend that spawns the Claude CLI for mission execution.
 pub struct ClaudeCodeBackend {
@@ -125,7 +125,7 @@ impl Backend for ClaudeCodeBackend {
             let mut pending_tools: HashMap<String, String> = HashMap::new();
 
             while let Some(event) = claude_rx.recv().await {
-                let exec_events = convert_claude_event(event, &mut pending_tools);
+                let exec_events = convert_cli_event(event, &mut pending_tools);
 
                 for exec_event in exec_events {
                     if tx.send(exec_event).await.is_err() {
@@ -143,144 +143,12 @@ impl Backend for ClaudeCodeBackend {
                 .await;
 
             // Note: claude_handle is dropped here, but the process is managed
-            // by the ClaudeProcessHandle which will clean up when dropped
+            // by the ProcessHandle which will clean up when dropped
             drop(claude_handle);
         });
 
         Ok((rx, handle))
     }
-}
-
-/// Convert a Claude CLI event to one or more ExecutionEvents.
-fn convert_claude_event(
-    event: ClaudeEvent,
-    pending_tools: &mut HashMap<String, String>,
-) -> Vec<ExecutionEvent> {
-    let mut results = vec![];
-
-    match event {
-        ClaudeEvent::System(sys) => {
-            debug!(
-                "Claude session initialized: session_id={}, model={:?}, agents={:?}",
-                sys.session_id, sys.model, sys.agents
-            );
-            // System init doesn't map to an ExecutionEvent
-        }
-
-        ClaudeEvent::StreamEvent(wrapper) => {
-            match wrapper.event {
-                StreamEvent::ContentBlockDelta { delta, .. } => {
-                    // Text streaming
-                    if let Some(text) = delta.text {
-                        if !text.is_empty() {
-                            results.push(ExecutionEvent::TextDelta { content: text });
-                        }
-                    }
-                    // Tool input streaming (partial JSON)
-                    if let Some(partial) = delta.partial_json {
-                        debug!("Tool input delta: {}", partial);
-                    }
-                }
-                StreamEvent::ContentBlockStart { content_block, .. } => {
-                    // Track tool use starts
-                    if content_block.block_type == "tool_use" {
-                        if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                            pending_tools.insert(id, name);
-                        }
-                    }
-                }
-                _ => {
-                    // Other stream events (message_start, message_stop, etc.)
-                }
-            }
-        }
-
-        ClaudeEvent::Assistant(evt) => {
-            for block in evt.message.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        // Complete text block - emit as thinking
-                        if !text.is_empty() {
-                            results.push(ExecutionEvent::Thinking { content: text });
-                        }
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        // Track tool for result mapping
-                        pending_tools.insert(id.clone(), name.clone());
-                        results.push(ExecutionEvent::ToolCall {
-                            id,
-                            name,
-                            args: input,
-                        });
-                    }
-                    ContentBlock::Thinking { thinking } => {
-                        if !thinking.is_empty() {
-                            results.push(ExecutionEvent::Thinking { content: thinking });
-                        }
-                    }
-                    ContentBlock::ToolResult { .. } => {
-                        // Tool results in assistant messages are unusual
-                    }
-                }
-            }
-        }
-
-        ClaudeEvent::User(evt) => {
-            // User events contain tool results
-            for block in evt.message.content {
-                if let ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } = block
-                {
-                    // Look up tool name
-                    let name = pending_tools
-                        .get(&tool_use_id)
-                        .cloned()
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    // Convert content to string (handles both text and image results)
-                    let content_str = content.to_string_lossy();
-
-                    // Include extra result info if available
-                    let result_value = if let Some(ref extra) = evt.tool_use_result {
-                        serde_json::json!({
-                            "content": content_str,
-                            "stdout": extra.stdout,
-                            "stderr": extra.stderr,
-                            "is_error": is_error,
-                            "interrupted": extra.interrupted,
-                        })
-                    } else {
-                        Value::String(content_str)
-                    };
-
-                    results.push(ExecutionEvent::ToolResult {
-                        id: tool_use_id,
-                        name,
-                        result: result_value,
-                    });
-                }
-            }
-        }
-
-        ClaudeEvent::Result(res) => {
-            if res.is_error || res.subtype == "error" {
-                results.push(ExecutionEvent::Error {
-                    message: res.result.unwrap_or_else(|| "Unknown error".to_string()),
-                });
-            } else {
-                debug!(
-                    "Claude result: subtype={}, cost={:?}, duration={:?}ms",
-                    res.subtype, res.total_cost_usd, res.duration_ms
-                );
-            }
-            // MessageComplete is sent after the loop
-        }
-    }
-
-    results
 }
 
 /// Create a registry entry for the Claude Code backend.

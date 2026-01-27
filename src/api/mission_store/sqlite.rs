@@ -724,6 +724,60 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn get_all_active_missions(&self) -> Result<Vec<Mission>, String> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
+                            created_at, updated_at, interrupted_at, resumable, desktop_sessions,
+                            COALESCE(backend, 'opencode') as backend
+                     FROM missions
+                     WHERE status = 'active'",
+                )
+                .map_err(|e| e.to_string())?;
+
+            let missions = stmt
+                .query_map(params![], |row| {
+                    let id_str: String = row.get(0)?;
+                    let status_str: String = row.get(1)?;
+                    let workspace_id_str: String = row.get(3)?;
+                    let desktop_sessions_json: Option<String> = row.get(11)?;
+                    let backend: String = row.get(12)?;
+
+                    Ok(Mission {
+                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        status: parse_status(&status_str),
+                        title: row.get(2)?,
+                        workspace_id: Uuid::parse_str(&workspace_id_str)
+                            .unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID),
+                        workspace_name: row.get(4)?,
+                        agent: row.get(5)?,
+                        model_override: row.get(6)?,
+                        backend,
+                        history: vec![],
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                        interrupted_at: row.get(9)?,
+                        resumable: row.get::<_, i32>(10)? != 0,
+                        desktop_sessions: desktop_sessions_json
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default(),
+                        session_id: None,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            Ok(missions)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn insert_mission_summary(
         &self,
         mission_id: Uuid,
@@ -862,7 +916,8 @@ impl MissionStore for SqliteMissionStore {
             | AgentEvent::AgentTree { .. }
             | AgentEvent::Progress { .. }
             | AgentEvent::SessionIdUpdate { .. }
-            | AgentEvent::TextDelta { .. } => return Ok(()),
+            | AgentEvent::TextDelta { .. }
+            | AgentEvent::MissionActivity { .. } => return Ok(()),
         };
 
         let event_type = event_type.to_string();
@@ -870,6 +925,29 @@ impl MissionStore for SqliteMissionStore {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
+
+            // If this event has an event_id that already exists for this mission,
+            // update the existing row's metadata instead of inserting a duplicate.
+            // This happens when a queued UserMessage is re-emitted with queued: false.
+            if let Some(ref eid) = event_id {
+                let existing: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM mission_events WHERE mission_id = ?1 AND event_id = ?2",
+                        params![&mid, eid],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .unwrap_or(None);
+
+                if let Some(row_id) = existing {
+                    conn.execute(
+                        "UPDATE mission_events SET metadata = ?1, timestamp = ?2 WHERE id = ?3",
+                        params![metadata_str, now, row_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+            }
 
             // Get next sequence
             let sequence: i64 = conn

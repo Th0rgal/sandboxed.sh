@@ -3,6 +3,7 @@ pub mod claudecode;
 pub mod events;
 pub mod opencode;
 pub mod registry;
+pub mod shared;
 
 use anyhow::Error;
 use async_trait::async_trait;

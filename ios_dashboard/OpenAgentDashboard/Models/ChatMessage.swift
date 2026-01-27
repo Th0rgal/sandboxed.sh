@@ -78,6 +78,7 @@ enum ChatMessageType {
     case assistant(success: Bool, costCents: Int, model: String?, sharedFiles: [SharedFile]?)
     case thinking(done: Bool, startTime: Date)
     case phase(phase: String, detail: String?, agent: String?)
+    case toolCall(name: String, isActive: Bool)
     case toolUI(name: String)
     case system
     case error
@@ -120,6 +121,21 @@ struct ChatMessage: Identifiable {
     
     var isPhase: Bool {
         if case .phase = type { return true }
+        return false
+    }
+
+    var isToolCall: Bool {
+        if case .toolCall = type { return true }
+        return false
+    }
+
+    var toolCallName: String? {
+        if case .toolCall(let name, _) = type { return name }
+        return nil
+    }
+
+    var isActiveToolCall: Bool {
+        if case .toolCall(_, let isActive) = type { return isActive }
         return false
     }
     

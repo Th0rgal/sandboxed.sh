@@ -243,12 +243,18 @@ fn resolve_command_path(cmd: &str) -> String {
         return cmd.to_string();
     }
 
+    // User-local paths are checked first so that non-root installs (bun, npm,
+    // the official OpenCode installer) take precedence over system-wide copies.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let candidates = [
+        PathBuf::from(&home).join(".opencode/bin").join(cmd),
+        PathBuf::from(&home).join(".local/bin").join(cmd),
+        PathBuf::from(&home).join(".bun/bin").join(cmd),
         Path::new("/usr/local/bin").join(cmd),
         Path::new("/usr/bin").join(cmd),
     ];
 
-    for candidate in candidates.iter() {
+    for candidate in &candidates {
         if candidate.exists() {
             return candidate.to_string_lossy().to_string();
         }

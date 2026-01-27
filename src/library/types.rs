@@ -225,6 +225,10 @@ pub struct WorkspaceTemplate {
     /// Set to false for isolated networking (e.g., Tailscale).
     #[serde(default)]
     pub shared_network: Option<bool>,
+    /// MCP server names to enable for workspaces created from this template.
+    /// Empty = use default MCPs (those with `default_enabled = true`).
+    #[serde(default)]
+    pub mcps: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

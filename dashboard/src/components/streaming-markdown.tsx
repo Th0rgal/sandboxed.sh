@@ -101,6 +101,7 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
           key={`stable-${index}-${block.slice(0, 20)}`}
           content={block}
           basePath={basePath}
+          className={className}
         />
       ))}
 
@@ -111,6 +112,7 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
             key={`streaming-stable`}
             content={streamingBlock}
             basePath={basePath}
+            className={className}
           />
         ) : (
           <StreamingBlock content={streamingBlock} />
@@ -126,22 +128,24 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
 const MemoizedBlock = memo(function MemoizedBlock({
   content,
   basePath,
+  className,
 }: {
   content: string;
   basePath?: string;
+  className?: string;
 }) {
   return (
     <MarkdownContent
       content={content}
-      className="[&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
+      className={cn("[&>*:first-child]:mt-0 [&>*:last-child]:mb-0", className)}
       basePath={basePath}
     />
   );
-}, (prev, next) => prev.content === next.content && prev.basePath === next.basePath);
+}, (prev, next) => prev.content === next.content && prev.basePath === next.basePath && prev.className === next.className);
 
 /**
  * Plain text streaming block - minimal DOM updates
- * Uses text-sm to match MarkdownContent's prose-glass styling
+ * Inherits text size from parent to match final MarkdownContent rendering
  */
 const StreamingBlock = memo(function StreamingBlock({
   content,
@@ -149,7 +153,7 @@ const StreamingBlock = memo(function StreamingBlock({
   content: string;
 }) {
   return (
-    <p className="my-2 whitespace-pre-wrap text-sm">{content}</p>
+    <p className="my-1 whitespace-pre-wrap">{content}</p>
   );
 });
 

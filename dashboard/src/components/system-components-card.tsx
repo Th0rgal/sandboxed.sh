@@ -85,13 +85,12 @@ export function SystemComponentsCard() {
           },
         ]);
       },
-      () => {
+      async () => {
         toast.success(
           `${componentNames[component.name] || component.name} updated successfully!`
         );
         setUpdatingComponent(null);
-        // Small delay to ensure backend has updated its cache/state
-        setTimeout(() => loadComponents(), 500);
+        await loadComponents();
       },
       (error: string) => {
         toast.error(`Update failed: ${error}`);

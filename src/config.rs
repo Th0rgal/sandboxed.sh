@@ -341,10 +341,12 @@ impl Config {
                 ConfigError::InvalidValue("MAX_ITERATIONS".to_string(), format!("{}", e))
             })?;
 
-        // Hours of inactivity after which an active mission is auto-closed
-        // Default: 24 hours. Set to 0 to disable.
+        // Hours of inactivity after which an active mission is auto-closed.
+        // Default: 2 hours. Set to 0 to disable.
+        // Note: orphaned missions (process died) are detected every 5 minutes
+        // regardless of this setting. This is only a safety-net timeout.
         let stale_mission_hours = std::env::var("STALE_MISSION_HOURS")
-            .unwrap_or_else(|_| "24".to_string())
+            .unwrap_or_else(|_| "2".to_string())
             .parse()
             .map_err(|e| {
                 ConfigError::InvalidValue("STALE_MISSION_HOURS".to_string(), format!("{}", e))
@@ -477,7 +479,7 @@ impl Config {
             host: "127.0.0.1".to_string(),
             port: 3000,
             max_iterations: 50,
-            stale_mission_hours: 24,
+            stale_mission_hours: 2,
             max_parallel_missions: 1,
             dev_mode: true,
             auth: AuthConfig::default(),

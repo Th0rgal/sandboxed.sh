@@ -963,6 +963,63 @@ fn sync_to_opencode_auth(
         keys
     );
 
+    // Also write to Open Agent's canonical credential store
+    if let Err(e) = write_openagent_credential(provider_type, refresh_token, access_token, expires_at) {
+        tracing::warn!("Failed to write Open Agent credentials: {}", e);
+    }
+
+    // For Anthropic, also sync to Claude Code's .credentials.json
+    if matches!(provider_type, ProviderType::Anthropic) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let claude_dir = PathBuf::from(home).join(".claude");
+        if let Err(e) = write_claudecode_credentials_from_entry(&claude_dir, access_token, refresh_token, expires_at) {
+            tracing::warn!("Failed to sync Claude Code credentials: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+/// Write Claude Code credentials from explicit values (avoids re-reading from auth.json).
+fn write_claudecode_credentials_from_entry(
+    credentials_dir: &std::path::Path,
+    access_token: &str,
+    refresh_token: &str,
+    expires_at: i64,
+) -> Result<(), String> {
+    let credentials_path = credentials_dir.join(".credentials.json");
+
+    std::fs::create_dir_all(credentials_dir)
+        .map_err(|e| format!("Failed to create Claude credentials directory: {}", e))?;
+
+    // Read-modify-write to preserve other entries in the credentials file
+    let mut credentials: serde_json::Value = if credentials_path.exists() {
+        let existing = std::fs::read_to_string(&credentials_path)
+            .map_err(|e| format!("Failed to read Claude credentials: {}", e))?;
+        serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    credentials["claudeAiOauth"] = serde_json::json!({
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "expiresAt": expires_at,
+        "scopes": ["user:inference", "user:profile"]
+    });
+
+    let contents = serde_json::to_string_pretty(&credentials)
+        .map_err(|e| format!("Failed to serialize Claude credentials: {}", e))?;
+
+    std::fs::write(&credentials_path, contents)
+        .map_err(|e| format!("Failed to write Claude credentials: {}", e))?;
+
+    tracing::info!(
+        path = %credentials_path.display(),
+        expires_at = expires_at,
+        "Synced Claude Code credentials from token refresh"
+    );
+
     Ok(())
 }
 
@@ -973,10 +1030,241 @@ struct OAuthTokenEntry {
     expires_at: i64,
 }
 
+/// Path to Open Agent's canonical credential store.
+fn get_openagent_credentials_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home)
+        .join(".openagent")
+        .join("credentials.json")
+}
+
+/// Read an OAuth credential from Open Agent's canonical credential store.
+/// The file uses the same format as OpenCode's auth.json:
+/// ```json
+/// {
+///   "anthropic": { "type": "oauth", "refresh": "...", "access": "...", "expires": 123 }
+/// }
+/// ```
+fn read_openagent_credential(provider_type: ProviderType) -> Option<OAuthTokenEntry> {
+    let path = get_openagent_credentials_path();
+    if !path.exists() {
+        return None;
+    }
+
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
+
+    for key in opencode_auth_keys(provider_type) {
+        let entry = match auth.get(key) {
+            Some(entry) => entry,
+            None => continue,
+        };
+        if entry.get("type").and_then(|v| v.as_str()) != Some("oauth") {
+            continue;
+        }
+        let refresh_token = match entry.get("refresh").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => continue,
+        };
+        let access_token = entry
+            .get("access")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let expires_at = entry.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        tracing::debug!(
+            provider = ?provider_type,
+            path = %path.display(),
+            expires_at = expires_at,
+            "Found OAuth token in Open Agent credentials"
+        );
+
+        return Some(OAuthTokenEntry {
+            refresh_token: refresh_token.to_string(),
+            access_token: access_token.to_string(),
+            expires_at,
+        });
+    }
+
+    None
+}
+
+/// Write an OAuth credential to Open Agent's canonical credential store.
+/// Read-modify-write to preserve entries for other providers.
+fn write_openagent_credential(
+    provider_type: ProviderType,
+    refresh_token: &str,
+    access_token: &str,
+    expires_at: i64,
+) -> Result<(), String> {
+    let path = get_openagent_credentials_path();
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create ~/.openagent directory: {}", e))?;
+    }
+
+    let mut auth: serde_json::Map<String, serde_json::Value> = if path.exists() {
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read Open Agent credentials: {}", e))?;
+        serde_json::from_str(&contents).unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+
+    let entry = serde_json::json!({
+        "type": "oauth",
+        "refresh": refresh_token,
+        "access": access_token,
+        "expires": expires_at
+    });
+
+    let keys = opencode_auth_keys(provider_type);
+    for key in &keys {
+        auth.insert((*key).to_string(), entry.clone());
+    }
+
+    let contents = serde_json::to_string_pretty(&auth)
+        .map_err(|e| format!("Failed to serialize Open Agent credentials: {}", e))?;
+    std::fs::write(&path, contents)
+        .map_err(|e| format!("Failed to write Open Agent credentials: {}", e))?;
+
+    tracing::info!(
+        path = %path.display(),
+        keys = ?keys,
+        "Synced OAuth credentials to Open Agent credentials.json"
+    );
+
+    Ok(())
+}
+
+/// Remove a provider entry from Open Agent's credential store.
+fn remove_openagent_credential(provider_type: ProviderType) -> Result<(), String> {
+    let path = get_openagent_credentials_path();
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let mut auth: serde_json::Map<String, serde_json::Value> = {
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read Open Agent credentials: {}", e))?;
+        serde_json::from_str(&contents).unwrap_or_default()
+    };
+
+    let keys = opencode_auth_keys(provider_type);
+    let mut changed = false;
+    for key in &keys {
+        if auth.remove(*key).is_some() {
+            changed = true;
+        }
+    }
+
+    if changed {
+        let contents = serde_json::to_string_pretty(&auth)
+            .map_err(|e| format!("Failed to serialize Open Agent credentials: {}", e))?;
+        std::fs::write(&path, contents)
+            .map_err(|e| format!("Failed to write Open Agent credentials: {}", e))?;
+    }
+
+    Ok(())
+}
+
+/// Read Anthropic OAuth credentials from Claude Code's `.credentials.json`.
+/// Checks `$HOME/.claude/.credentials.json` and `/var/lib/opencode/.claude/.credentials.json`.
+/// Parses the `claudeAiOauth` format and converts to `OAuthTokenEntry`.
+fn read_anthropic_from_claude_credentials() -> Option<OAuthTokenEntry> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let candidates = vec![
+        PathBuf::from(&home).join(".claude").join(".credentials.json"),
+        PathBuf::from("/var/lib/opencode")
+            .join(".claude")
+            .join(".credentials.json"),
+    ];
+
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let creds: serde_json::Value = match serde_json::from_str(&contents) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let oauth = match creds.get("claudeAiOauth") {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let refresh_token = match oauth.get("refreshToken").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => continue,
+        };
+        let access_token = oauth
+            .get("accessToken")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let expires_at = oauth
+            .get("expiresAt")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        tracing::debug!(
+            path = %path.display(),
+            expires_at = expires_at,
+            "Found Anthropic OAuth token in Claude credentials"
+        );
+
+        return Some(OAuthTokenEntry {
+            refresh_token: refresh_token.to_string(),
+            access_token: access_token.to_string(),
+            expires_at,
+        });
+    }
+
+    None
+}
+
 fn read_oauth_token_entry(provider_type: ProviderType) -> Option<OAuthTokenEntry> {
-    // Search ALL potential auth file paths for the requested provider.
-    // This is important because auth files might be split across different locations
-    // (e.g., /root/.local/share/opencode/auth.json for OpenAI, /var/lib/opencode/... for Anthropic)
+    // Tier 1: Open Agent's canonical credential store
+    if let Some(entry) = read_openagent_credential(provider_type) {
+        return Some(entry);
+    }
+
+    // Tier 2: OpenCode auth.json paths (legacy / external auth flows)
+    if let Some(entry) = read_from_opencode_auth_paths(provider_type) {
+        // Auto-sync to Open Agent's file so future reads hit tier 1
+        let _ = write_openagent_credential(
+            provider_type,
+            &entry.refresh_token,
+            &entry.access_token,
+            entry.expires_at,
+        );
+        return Some(entry);
+    }
+
+    // Tier 3: Claude .credentials.json (Anthropic only, from Claude CLI auth)
+    if matches!(provider_type, ProviderType::Anthropic) {
+        if let Some(entry) = read_anthropic_from_claude_credentials() {
+            // Auto-sync to Open Agent's file
+            let _ = write_openagent_credential(
+                provider_type,
+                &entry.refresh_token,
+                &entry.access_token,
+                entry.expires_at,
+            );
+            return Some(entry);
+        }
+    }
+
+    None
+}
+
+/// Read an OAuth token entry from OpenCode auth.json paths (tier 2 fallback).
+fn read_from_opencode_auth_paths(provider_type: ProviderType) -> Option<OAuthTokenEntry> {
     let auth_paths = get_all_opencode_auth_paths();
 
     for auth_path in auth_paths {
@@ -1015,7 +1303,7 @@ fn read_oauth_token_entry(provider_type: ProviderType) -> Option<OAuthTokenEntry
                 provider = ?provider_type,
                 auth_path = %auth_path.display(),
                 expires_at = expires_at,
-                "Found OAuth token entry"
+                "Found OAuth token entry in OpenCode auth"
             );
 
             return Some(OAuthTokenEntry {
@@ -1370,13 +1658,20 @@ pub fn write_claudecode_credentials_to_path(credentials_dir: &std::path::Path) -
     std::fs::create_dir_all(credentials_dir)
         .map_err(|e| format!("Failed to create Claude credentials directory: {}", e))?;
 
-    let credentials = serde_json::json!({
-        "claudeAiOauth": {
-            "accessToken": entry.access_token,
-            "refreshToken": entry.refresh_token,
-            "expiresAt": entry.expires_at,
-            "scopes": ["user:inference", "user:profile"]
-        }
+    // Read-modify-write to preserve other entries in the credentials file
+    let mut credentials: serde_json::Value = if credentials_path.exists() {
+        let existing = std::fs::read_to_string(&credentials_path)
+            .map_err(|e| format!("Failed to read Claude credentials: {}", e))?;
+        serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    credentials["claudeAiOauth"] = serde_json::json!({
+        "accessToken": entry.access_token,
+        "refreshToken": entry.refresh_token,
+        "expiresAt": entry.expires_at,
+        "scopes": ["user:inference", "user:profile"]
     });
 
     let contents = serde_json::to_string_pretty(&credentials)
@@ -1489,6 +1784,8 @@ fn remove_opencode_auth_entry(provider_type: ProviderType) -> Result<(), String>
                     .map_err(|e| format!("Failed to remove OpenCode provider auth: {}", e))?;
             }
         }
+        // Also clean Open Agent's credential store
+        let _ = remove_openagent_credential(provider_type);
         return Ok(());
     }
 
@@ -1526,6 +1823,11 @@ fn remove_opencode_auth_entry(provider_type: ProviderType) -> Result<(), String>
             std::fs::remove_file(&provider_path)
                 .map_err(|e| format!("Failed to remove OpenCode provider auth: {}", e))?;
         }
+    }
+
+    // Also clean Open Agent's credential store
+    if let Err(e) = remove_openagent_credential(provider_type) {
+        tracing::warn!("Failed to remove Open Agent credential entry: {}", e);
     }
 
     Ok(())
@@ -2211,6 +2513,12 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
             name: "xAI".to_string(),
             uses_oauth: false,
             env_var: Some("XAI_API_KEY".to_string()),
+        },
+        ProviderTypeInfo {
+            id: "zai".to_string(),
+            name: "Z.AI".to_string(),
+            uses_oauth: false,
+            env_var: Some("ZHIPU_API_KEY".to_string()),
         },
         ProviderTypeInfo {
             id: "github-copilot".to_string(),

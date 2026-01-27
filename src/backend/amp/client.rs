@@ -1,251 +1,16 @@
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
-use serde_json::Value;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
-/// Handle to a running Amp CLI process.
-/// Call `kill()` to terminate the process when cancelling a mission.
-pub struct AmpProcessHandle {
-    child: Arc<Mutex<Option<Child>>>,
-    _task_handle: tokio::task::JoinHandle<()>,
-}
-
-impl AmpProcessHandle {
-    /// Kill the underlying CLI process.
-    pub async fn kill(&self) {
-        if let Some(mut child) = self.child.lock().await.take() {
-            if let Err(e) = child.kill().await {
-                warn!("Failed to kill Amp CLI process: {}", e);
-            } else {
-                info!("Amp CLI process killed");
-            }
-        }
-    }
-}
-
-/// Events emitted by the Amp CLI in stream-json mode.
-/// Amp's format is Claude Code compatible with some extensions.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
-pub enum AmpEvent {
-    #[serde(rename = "system")]
-    System(SystemEvent),
-    #[serde(rename = "stream_event")]
-    StreamEvent(StreamEventWrapper),
-    #[serde(rename = "assistant")]
-    Assistant(AssistantEvent),
-    #[serde(rename = "user")]
-    User(UserEvent),
-    #[serde(rename = "result")]
-    Result(ResultEvent),
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SystemEvent {
-    pub subtype: String,
-    pub session_id: String,
-    #[serde(default)]
-    pub tools: Vec<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub mcp_servers: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct StreamEventWrapper {
-    pub event: StreamEvent,
-    pub session_id: String,
-    #[serde(default)]
-    pub parent_tool_use_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
-pub enum StreamEvent {
-    #[serde(rename = "message_start")]
-    MessageStart { message: Value },
-    #[serde(rename = "content_block_start")]
-    ContentBlockStart {
-        index: u32,
-        content_block: ContentBlockInfo,
-    },
-    #[serde(rename = "content_block_delta")]
-    ContentBlockDelta { index: u32, delta: Delta },
-    #[serde(rename = "content_block_stop")]
-    ContentBlockStop { index: u32 },
-    #[serde(rename = "message_delta")]
-    MessageDelta { delta: Value, usage: Option<Value> },
-    #[serde(rename = "message_stop")]
-    MessageStop,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ContentBlockInfo {
-    #[serde(rename = "type")]
-    pub block_type: String,
-    #[serde(default)]
-    pub text: Option<String>,
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Delta {
-    #[serde(rename = "type")]
-    pub delta_type: String,
-    #[serde(default)]
-    pub text: Option<String>,
-    #[serde(default)]
-    pub partial_json: Option<String>,
-    /// Thinking content for thinking_delta events (extended thinking).
-    #[serde(default)]
-    pub thinking: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AssistantEvent {
-    pub message: AssistantMessage,
-    pub session_id: String,
-    #[serde(default)]
-    pub parent_tool_use_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AssistantMessage {
-    #[serde(default)]
-    pub content: Vec<ContentBlock>,
-    #[serde(default)]
-    pub stop_reason: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Usage {
-    #[serde(default)]
-    pub input_tokens: Option<u64>,
-    #[serde(default)]
-    pub output_tokens: Option<u64>,
-    #[serde(default)]
-    pub cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
-    pub cache_read_input_tokens: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
-pub enum ContentBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: Value,
-    },
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        tool_use_id: String,
-        content: ToolResultContent,
-        #[serde(default)]
-        is_error: bool,
-    },
-    #[serde(rename = "thinking")]
-    Thinking { thinking: String },
-    #[serde(rename = "redacted_thinking")]
-    RedactedThinking { data: String },
-}
-
-/// Tool result content can be a string or an array of content items.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum ToolResultContent {
-    Text(String),
-    Items(Vec<ToolResultItem>),
-}
-
-impl ToolResultContent {
-    /// Convert to a lossy string representation.
-    pub fn to_string_lossy(&self) -> String {
-        match self {
-            ToolResultContent::Text(s) => s.clone(),
-            ToolResultContent::Items(items) => {
-                items
-                    .iter()
-                    .filter_map(|item| match item {
-                        ToolResultItem::Text { text } => Some(text.clone()),
-                        ToolResultItem::Image { .. } => Some("[image]".to_string()),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
-pub enum ToolResultItem {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "image")]
-    Image { source: Value },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct UserEvent {
-    pub message: UserMessage,
-    pub session_id: String,
-    #[serde(default)]
-    pub parent_tool_use_id: Option<String>,
-    #[serde(default)]
-    pub tool_use_result: Option<ToolUseResultInfo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct UserMessage {
-    #[serde(default)]
-    pub content: Vec<ContentBlock>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ToolUseResultInfo {
-    #[serde(default)]
-    pub stdout: Option<String>,
-    #[serde(default)]
-    pub stderr: Option<String>,
-    #[serde(default)]
-    pub interrupted: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ResultEvent {
-    pub subtype: String,
-    pub session_id: String,
-    #[serde(default)]
-    pub duration_ms: Option<u64>,
-    #[serde(default)]
-    pub is_error: bool,
-    #[serde(default)]
-    pub num_turns: Option<u32>,
-    #[serde(default)]
-    pub result: Option<String>,
-}
+// Re-export shared types with Amp-specific aliases for backward compat.
+pub use crate::backend::shared::{
+    CliEvent as AmpEvent, ContentBlock, ProcessHandle as AmpProcessHandle, StreamEvent,
+};
 
 /// Configuration for the Amp CLI client.
 #[derive(Debug, Clone, Default)]
@@ -393,13 +158,7 @@ impl AmpClient {
             }
         });
 
-        Ok((
-            rx,
-            AmpProcessHandle {
-                child: child_arc,
-                _task_handle: task_handle,
-            },
-        ))
+        Ok((rx, AmpProcessHandle::new(child_arc, task_handle)))
     }
 
     /// Continue an existing thread with a new message.
@@ -502,13 +261,7 @@ impl AmpClient {
             }
         });
 
-        Ok((
-            rx,
-            AmpProcessHandle {
-                child: child_arc,
-                _task_handle: task_handle,
-            },
-        ))
+        Ok((rx, AmpProcessHandle::new(child_arc, task_handle)))
     }
 }
 

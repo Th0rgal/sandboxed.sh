@@ -86,6 +86,7 @@ pub enum ProviderType {
     TogetherAI,
     Perplexity,
     GithubCopilot,
+    Zai,
     Custom,
 }
 
@@ -107,6 +108,7 @@ impl ProviderType {
             Self::TogetherAI => "Together AI",
             Self::Perplexity => "Perplexity",
             Self::GithubCopilot => "GitHub Copilot",
+            Self::Zai => "Z.AI",
             Self::Custom => "Custom",
         }
     }
@@ -128,6 +130,7 @@ impl ProviderType {
             Self::TogetherAI => "together-ai",
             Self::Perplexity => "perplexity",
             Self::GithubCopilot => "github-copilot",
+            Self::Zai => "zai",
             Self::Custom => "custom",
         }
     }
@@ -150,6 +153,7 @@ impl ProviderType {
             "together-ai" => Some(Self::TogetherAI),
             "perplexity" => Some(Self::Perplexity),
             "github-copilot" => Some(Self::GithubCopilot),
+            "zai" => Some(Self::Zai),
             "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -172,6 +176,7 @@ impl ProviderType {
             Self::TogetherAI => Some("TOGETHER_API_KEY"),
             Self::Perplexity => Some("PERPLEXITY_API_KEY"),
             Self::GithubCopilot => None, // Uses OAuth
+            Self::Zai => Some("ZHIPU_API_KEY"),
             Self::Custom => None,
         }
     }

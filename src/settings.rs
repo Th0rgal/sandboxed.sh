@@ -103,11 +103,11 @@ impl SettingsStore {
 
     /// Update the library remote URL.
     ///
-    /// Returns the previous value if it changed, or None if unchanged.
+    /// Returns `(changed, previous_value)`.
     pub async fn set_library_remote(
         &self,
         remote: Option<String>,
-    ) -> Result<Option<String>, std::io::Error> {
+    ) -> Result<(bool, Option<String>), std::io::Error> {
         let mut settings = self.settings.write().await;
         let previous = settings.library_remote.clone();
 
@@ -115,9 +115,9 @@ impl SettingsStore {
             settings.library_remote = remote;
             drop(settings); // Release lock before saving
             self.save_to_disk().await?;
-            Ok(previous)
+            Ok((true, previous))
         } else {
-            Ok(None) // No change
+            Ok((false, previous))
         }
     }
 

@@ -44,7 +44,6 @@ pub mod library;
 pub mod mcp;
 pub mod nspawn;
 pub mod opencode;
-pub mod opencode_agents;
 pub mod opencode_config;
 pub mod secrets;
 pub mod settings;

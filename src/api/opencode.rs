@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::opencode_config::OpenCodeConnection;
-use crate::opencode_agents;
 
 /// Create OpenCode connection routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -242,18 +241,18 @@ pub async fn fetch_opencode_agents(state: &super::routes::AppState) -> Result<Va
                         return Ok(Value::Array(agent_names));
                     }
                 }
-                tracing::debug!("No agents in Library oh-my-opencode.json, using defaults");
+                tracing::debug!("No agents in Library oh-my-opencode.json");
             }
             Err(e) => {
-                tracing::warn!("Failed to read Library opencode settings: {}. Using defaults.", e);
+                tracing::warn!("Failed to read Library opencode settings: {}", e);
             }
         }
     } else {
-        tracing::debug!("Library not configured, using default agents");
+        tracing::debug!("Library not configured, no agents available");
     }
 
-    // Fall back to hardcoded defaults
-    Ok(opencode_agents::default_agent_payload())
+    // No hardcoded fallback — Library is the source of truth
+    Ok(Value::Array(vec![]))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

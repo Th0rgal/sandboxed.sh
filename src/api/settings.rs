@@ -102,14 +102,14 @@ async fn update_library_remote(
     let new_remote = req.library_remote.filter(|s| !s.trim().is_empty());
 
     // Update the setting
-    let previous = state
+    let (changed, _previous) = state
         .settings
         .set_library_remote(new_remote.clone())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // If the value actually changed, reinitialize the library
-    let (library_reinitialized, library_error) = if previous.is_some() {
+    let (library_reinitialized, library_error) = if changed {
         if let Some(ref remote) = new_remote {
             // Reinitialize with new remote
             match reinitialize_library(&state, remote).await {
@@ -198,6 +198,7 @@ const BACKUP_FILES: &[&str] = &[
     "backend_config.json",
     "workspaces.json",
     "mcp/config.json",
+    "private_key",
 ];
 
 /// Directories included in the backup (relative to .openagent/)
@@ -464,6 +465,24 @@ async fn restore_backup(
     if restored_files.iter().any(|f| f == "settings.json") {
         if let Err(e) = state.settings.reload().await {
             errors.push(format!("Failed to reload settings: {}", e));
+        }
+    }
+
+    // Load restored encryption key into the process environment
+    if restored_files.iter().any(|f| f == "private_key") {
+        let key_path = openagent_dir.join("private_key");
+        match std::fs::read_to_string(&key_path) {
+            Ok(key_hex) => {
+                let trimmed = key_hex.trim();
+                if !trimmed.is_empty() {
+                    if let Err(e) = crate::library::env_crypto::set_private_key_hex(trimmed).await {
+                        errors.push(format!("Failed to activate restored encryption key: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push(format!("Failed to read restored private_key: {}", e));
+            }
         }
     }
 

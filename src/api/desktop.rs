@@ -423,7 +423,7 @@ async fn is_xvfb_running(display: &str) -> bool {
 }
 
 /// Get list of running Xvfb displays.
-async fn get_running_xvfb_displays() -> Vec<String> {
+pub(crate) async fn get_running_xvfb_displays() -> Vec<String> {
     let output = Command::new("pgrep").args(["-a", "Xvfb"]).output().await;
 
     let mut displays = Vec::new();

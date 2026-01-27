@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { cn } from "@/lib/utils";
+import { formatBytes, formatBytesPerSec } from "@/lib/format";
 import { getValidJwt } from "@/lib/auth";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { Activity } from "lucide-react";
@@ -23,20 +24,6 @@ interface SystemMonitorProps {
 }
 
 type ConnectionState = "connecting" | "connected" | "disconnected" | "error";
-
-// Format bytes to human-readable string
-function formatBytes(bytes: number, decimals = 1): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(decimals)) + " " + sizes[i];
-}
-
-// Format bytes per second to human-readable string
-function formatBytesPerSec(bytes: number): string {
-  return formatBytes(bytes) + "/s";
-}
 
 // Design system colors - indigo accent with varying opacity
 const CHART_COLORS = {

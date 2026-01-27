@@ -78,6 +78,107 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   return res;
 }
 
+// ---------------------------------------------------------------------------
+// Internal request helpers – reduce repeated Content-Type / throw / .json()
+// ---------------------------------------------------------------------------
+
+async function apiGet<T>(path: string, errorMsg: string): Promise<T> {
+  const res = await apiFetch(path);
+  if (!res.ok) throw new Error(errorMsg);
+  return res.json();
+}
+
+async function apiPost<T = void>(
+  path: string,
+  body?: unknown,
+  errorMsg = "Request failed",
+): Promise<T> {
+  const init: RequestInit = { method: "POST" };
+  if (body !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  const res = await apiFetch(path, init);
+  if (!res.ok) throw new Error(errorMsg);
+  // For void returns the caller simply ignores the result
+  return res.json().catch(() => undefined as unknown as T);
+}
+
+async function apiPut<T = void>(
+  path: string,
+  body: unknown,
+  errorMsg = "Request failed",
+): Promise<T> {
+  const res = await apiFetch(path, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(errorMsg);
+  return res.json().catch(() => undefined as unknown as T);
+}
+
+async function apiPatch<T = void>(
+  path: string,
+  body: unknown,
+  errorMsg = "Request failed",
+): Promise<T> {
+  const res = await apiFetch(path, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(errorMsg);
+  return res.json().catch(() => undefined as unknown as T);
+}
+
+async function apiDel<T = void>(path: string, errorMsg = "Request failed"): Promise<T> {
+  const res = await apiFetch(path, { method: "DELETE" });
+  if (!res.ok) throw new Error(errorMsg);
+  return res.json().catch(() => undefined as unknown as T);
+}
+
+// Library-specific variants that use ensureLibraryResponse (handles 503 → LibraryUnavailableError)
+async function libGet<T>(path: string, errorMsg: string): Promise<T> {
+  const res = await apiFetch(path);
+  await ensureLibraryResponse(res, errorMsg);
+  return res.json();
+}
+
+async function libPost<T = void>(
+  path: string,
+  body?: unknown,
+  errorMsg = "Request failed",
+): Promise<T> {
+  const init: RequestInit = { method: "POST" };
+  if (body !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  const res = await apiFetch(path, init);
+  await ensureLibraryResponse(res, errorMsg);
+  return res.json().catch(() => undefined as unknown as T);
+}
+
+async function libPut<T = void>(
+  path: string,
+  body: unknown,
+  errorMsg = "Request failed",
+): Promise<T> {
+  const res = await apiFetch(path, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  await ensureLibraryResponse(res, errorMsg);
+  return res.json().catch(() => undefined as unknown as T);
+}
+
+async function libDel(path: string, errorMsg = "Request failed"): Promise<void> {
+  const res = await apiFetch(path, { method: "DELETE" });
+  await ensureLibraryResponse(res, errorMsg);
+}
+
 export class LibraryUnavailableError extends Error {
   status: number;
 
@@ -143,51 +244,34 @@ export async function login(password: string, username?: string): Promise<LoginR
 
 // Get statistics
 export async function getStats(): Promise<StatsResponse> {
-  const res = await apiFetch("/api/stats");
-  if (!res.ok) throw new Error("Failed to fetch stats");
-  return res.json();
+  return apiGet("/api/stats", "Failed to fetch stats");
 }
 
 // List all tasks
 export async function listTasks(): Promise<TaskState[]> {
-  const res = await apiFetch("/api/tasks");
-  if (!res.ok) throw new Error("Failed to fetch tasks");
-  return res.json();
+  return apiGet("/api/tasks", "Failed to fetch tasks");
 }
 
 // List OpenCode agents
 export async function listOpenCodeAgents(): Promise<unknown> {
-  const res = await apiFetch("/api/opencode/agents");
-  if (!res.ok) throw new Error("Failed to fetch OpenCode agents");
-  return res.json();
+  return apiGet("/api/opencode/agents", "Failed to fetch OpenCode agents");
 }
 
 // Get a specific task
 export async function getTask(id: string): Promise<TaskState> {
-  const res = await apiFetch(`/api/task/${id}`);
-  if (!res.ok) throw new Error("Failed to fetch task");
-  return res.json();
+  return apiGet(`/api/task/${id}`, "Failed to fetch task");
 }
 
 // Create a new task
 export async function createTask(
   request: CreateTaskRequest
 ): Promise<{ id: string; status: string }> {
-  const res = await apiFetch("/api/task", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request),
-  });
-  if (!res.ok) throw new Error("Failed to create task");
-  return res.json();
+  return apiPost("/api/task", request, "Failed to create task");
 }
 
 // Stop a task
 export async function stopTask(id: string): Promise<void> {
-  const res = await apiFetch(`/api/task/${id}/stop`, {
-    method: "POST",
-  });
-  if (!res.ok) throw new Error("Failed to stop task");
+  return apiPost(`/api/task/${id}/stop`, undefined, "Failed to stop task");
 }
 
 // Stream task progress (SSE)
@@ -285,16 +369,12 @@ export async function listRuns(
   limit = 20,
   offset = 0
 ): Promise<{ runs: Run[]; limit: number; offset: number }> {
-  const res = await apiFetch(`/api/runs?limit=${limit}&offset=${offset}`);
-  if (!res.ok) throw new Error("Failed to fetch runs");
-  return res.json();
+  return apiGet(`/api/runs?limit=${limit}&offset=${offset}`, "Failed to fetch runs");
 }
 
 // Get run details
 export async function getRun(id: string): Promise<Run> {
-  const res = await apiFetch(`/api/runs/${id}`);
-  if (!res.ok) throw new Error("Failed to fetch run");
-  return res.json();
+  return apiGet(`/api/runs/${id}`, "Failed to fetch run");
 }
 
 // Get run events
@@ -305,18 +385,14 @@ export async function getRunEvents(
   const url = limit
     ? `/api/runs/${id}/events?limit=${limit}`
     : `/api/runs/${id}/events`;
-  const res = await apiFetch(url);
-  if (!res.ok) throw new Error("Failed to fetch run events");
-  return res.json();
+  return apiGet(url, "Failed to fetch run events");
 }
 
 // Get run tasks
 export async function getRunTasks(
   id: string
 ): Promise<{ run_id: string; tasks: unknown[] }> {
-  const res = await apiFetch(`/api/runs/${id}/tasks`);
-  if (!res.ok) throw new Error("Failed to fetch run tasks");
-  return res.json();
+  return apiGet(`/api/runs/${id}/tasks`, "Failed to fetch run tasks");
 }
 
 // ==================== Missions ====================
@@ -357,16 +433,12 @@ export interface Mission {
 
 // List all missions
 export async function listMissions(): Promise<Mission[]> {
-  const res = await apiFetch("/api/control/missions");
-  if (!res.ok) throw new Error("Failed to fetch missions");
-  return res.json();
+  return apiGet("/api/control/missions", "Failed to fetch missions");
 }
 
 // Get a specific mission
 export async function getMission(id: string): Promise<Mission> {
-  const res = await apiFetch(`/api/control/missions/${id}`);
-  if (!res.ok) throw new Error("Failed to fetch mission");
-  return res.json();
+  return apiGet(`/api/control/missions/${id}`, "Failed to fetch mission");
 }
 
 // Stored event from SQLite (for event replay)
@@ -393,17 +465,12 @@ export async function getMissionEvents(
   if (options?.limit) params.set("limit", String(options.limit));
   if (options?.offset) params.set("offset", String(options.offset));
   const query = params.toString();
-  const url = `/api/control/missions/${id}/events${query ? `?${query}` : ""}`;
-  const res = await apiFetch(url);
-  if (!res.ok) throw new Error("Failed to fetch mission events");
-  return res.json();
+  return apiGet(`/api/control/missions/${id}/events${query ? `?${query}` : ""}`, "Failed to fetch mission events");
 }
 
 // Get current mission
 export async function getCurrentMission(): Promise<Mission | null> {
-  const res = await apiFetch("/api/control/missions/current");
-  if (!res.ok) throw new Error("Failed to fetch current mission");
-  return res.json();
+  return apiGet("/api/control/missions/current", "Failed to fetch current mission");
 }
 
 // Create a new mission
@@ -446,11 +513,7 @@ export async function createMission(
 
 // Load/switch to a mission
 export async function loadMission(id: string): Promise<Mission> {
-  const res = await apiFetch(`/api/control/missions/${id}/load`, {
-    method: "POST",
-  });
-  if (!res.ok) throw new Error("Failed to load mission");
-  return res.json();
+  return apiPost(`/api/control/missions/${id}/load`, undefined, "Failed to load mission");
 }
 
 // ==================== Parallel Missions ====================
@@ -466,9 +529,7 @@ export interface RunningMissionInfo {
 
 // Get all running parallel missions
 export async function getRunningMissions(): Promise<RunningMissionInfo[]> {
-  const res = await apiFetch("/api/control/running");
-  if (!res.ok) throw new Error("Failed to fetch running missions");
-  return res.json();
+  return apiGet("/api/control/running", "Failed to fetch running missions");
 }
 
 // Start a mission in parallel
@@ -490,10 +551,7 @@ export async function startMissionParallel(
 
 // Cancel a specific mission
 export async function cancelMission(missionId: string): Promise<void> {
-  const res = await apiFetch(`/api/control/missions/${missionId}/cancel`, {
-    method: "POST",
-  });
-  if (!res.ok) throw new Error("Failed to cancel mission");
+  return apiPost(`/api/control/missions/${missionId}/cancel`, undefined, "Failed to cancel mission");
 }
 
 // Set mission status
@@ -501,12 +559,7 @@ export async function setMissionStatus(
   id: string,
   status: MissionStatus
 ): Promise<void> {
-  const res = await apiFetch(`/api/control/missions/${id}/status`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status }),
-  });
-  if (!res.ok) throw new Error("Failed to set mission status");
+  return apiPost(`/api/control/missions/${id}/status`, { status }, "Failed to set mission status");
 }
 
 // Delete a mission
@@ -626,17 +679,11 @@ export async function postControlToolResult(payload: {
   name: string;
   result: unknown;
 }): Promise<void> {
-  const res = await apiFetch("/api/control/tool_result", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error("Failed to post tool result");
+  return apiPost("/api/control/tool_result", payload, "Failed to post tool result");
 }
 
 export async function cancelControl(): Promise<void> {
-  const res = await apiFetch("/api/control/cancel", { method: "POST" });
-  if (!res.ok) throw new Error("Failed to cancel control session");
+  return apiPost("/api/control/cancel", undefined, "Failed to cancel control session");
 }
 
 // Queue management
@@ -647,22 +694,15 @@ export interface QueuedMessage {
 }
 
 export async function getQueue(): Promise<QueuedMessage[]> {
-  const res = await apiFetch("/api/control/queue");
-  if (!res.ok) throw new Error("Failed to fetch queue");
-  return res.json();
+  return apiGet("/api/control/queue", "Failed to fetch queue");
 }
 
 export async function removeFromQueue(messageId: string): Promise<void> {
-  const res = await apiFetch(`/api/control/queue/${messageId}`, {
-    method: "DELETE",
-  });
-  if (!res.ok) throw new Error("Failed to remove from queue");
+  return apiDel(`/api/control/queue/${messageId}`, "Failed to remove from queue");
 }
 
 export async function clearQueue(): Promise<{ cleared: number }> {
-  const res = await apiFetch("/api/control/queue", { method: "DELETE" });
-  if (!res.ok) throw new Error("Failed to clear queue");
-  return res.json();
+  return apiDel("/api/control/queue", "Failed to clear queue");
 }
 
 // Agent tree snapshot (for refresh resilience)
@@ -680,18 +720,14 @@ export interface AgentTreeNode {
 }
 
 export async function getAgentTree(): Promise<AgentTreeNode | null> {
-  const res = await apiFetch("/api/control/tree");
-  if (!res.ok) throw new Error("Failed to fetch agent tree");
-  return res.json();
+  return apiGet("/api/control/tree", "Failed to fetch agent tree");
 }
 
 // Get tree for a specific mission (either live from memory or saved from database)
 export async function getMissionTree(
   missionId: string
 ): Promise<AgentTreeNode | null> {
-  const res = await apiFetch(`/api/control/missions/${missionId}/tree`);
-  if (!res.ok) throw new Error("Failed to fetch mission tree");
-  return res.json();
+  return apiGet(`/api/control/missions/${missionId}/tree`, "Failed to fetch mission tree");
 }
 
 // Execution progress
@@ -703,9 +739,7 @@ export interface ExecutionProgress {
 }
 
 export async function getProgress(): Promise<ExecutionProgress> {
-  const res = await apiFetch("/api/control/progress");
-  if (!res.ok) throw new Error("Failed to fetch progress");
-  return res.json();
+  return apiGet("/api/control/progress", "Failed to fetch progress");
 }
 
 export type StreamDiagnosticPhase = "connecting" | "open" | "chunk" | "event" | "closed" | "error";
@@ -917,16 +951,12 @@ export interface ToolInfo {
 
 // List all MCP servers
 export async function listMcps(): Promise<McpServerState[]> {
-  const res = await apiFetch("/api/mcp");
-  if (!res.ok) throw new Error("Failed to fetch MCPs");
-  return res.json();
+  return apiGet("/api/mcp", "Failed to fetch MCPs");
 }
 
 // Get a specific MCP server
 export async function getMcp(id: string): Promise<McpServerState> {
-  const res = await apiFetch(`/api/mcp/${id}`);
-  if (!res.ok) throw new Error("Failed to fetch MCP");
-  return res.json();
+  return apiGet(`/api/mcp/${id}`, "Failed to fetch MCP");
 }
 
 // Add a new MCP server
@@ -936,40 +966,27 @@ export async function addMcp(data: {
   description?: string;
   scope?: McpScope;
 }): Promise<McpServerState> {
-  const res = await apiFetch("/api/mcp", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error("Failed to add MCP");
-  return res.json();
+  return apiPost("/api/mcp", data, "Failed to add MCP");
 }
 
 // Remove an MCP server
 export async function removeMcp(id: string): Promise<void> {
-  const res = await apiFetch(`/api/mcp/${id}`, { method: "DELETE" });
-  if (!res.ok) throw new Error("Failed to remove MCP");
+  return apiDel(`/api/mcp/${id}`, "Failed to remove MCP");
 }
 
 // Enable an MCP server
 export async function enableMcp(id: string): Promise<McpServerState> {
-  const res = await apiFetch(`/api/mcp/${id}/enable`, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to enable MCP");
-  return res.json();
+  return apiPost(`/api/mcp/${id}/enable`, undefined, "Failed to enable MCP");
 }
 
 // Disable an MCP server
 export async function disableMcp(id: string): Promise<McpServerState> {
-  const res = await apiFetch(`/api/mcp/${id}/disable`, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to disable MCP");
-  return res.json();
+  return apiPost(`/api/mcp/${id}/disable`, undefined, "Failed to disable MCP");
 }
 
 // Refresh an MCP server (reconnect and discover tools)
 export async function refreshMcp(id: string): Promise<McpServerState> {
-  const res = await apiFetch(`/api/mcp/${id}/refresh`, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to refresh MCP");
-  return res.json();
+  return apiPost(`/api/mcp/${id}/refresh`, undefined, "Failed to refresh MCP");
 }
 
 // Update an MCP server configuration
@@ -982,26 +999,17 @@ export interface UpdateMcpRequest {
 }
 
 export async function updateMcp(id: string, data: UpdateMcpRequest): Promise<McpServerState> {
-  const res = await apiFetch(`/api/mcp/${id}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error("Failed to update MCP");
-  return res.json();
+  return apiPatch(`/api/mcp/${id}`, data, "Failed to update MCP");
 }
 
 // Refresh all MCP servers
 export async function refreshAllMcps(): Promise<void> {
-  const res = await apiFetch("/api/mcp/refresh", { method: "POST" });
-  if (!res.ok) throw new Error("Failed to refresh MCPs");
+  return apiPost("/api/mcp/refresh", undefined, "Failed to refresh MCPs");
 }
 
 // List all tools
 export async function listTools(): Promise<ToolInfo[]> {
-  const res = await apiFetch("/api/tools");
-  if (!res.ok) throw new Error("Failed to fetch tools");
-  return res.json();
+  return apiGet("/api/tools", "Failed to fetch tools");
 }
 
 // Toggle a tool
@@ -1009,12 +1017,7 @@ export async function toggleTool(
   name: string,
   enabled: boolean
 ): Promise<void> {
-  const res = await apiFetch(`/api/tools/${encodeURIComponent(name)}/toggle`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled }),
-  });
-  if (!res.ok) throw new Error("Failed to toggle tool");
+  return apiPost(`/api/tools/${encodeURIComponent(name)}/toggle`, { enabled }, "Failed to toggle tool");
 }
 
 // ==================== File System ====================
@@ -1259,23 +1262,8 @@ export async function downloadFromUrl(
   return res.json();
 }
 
-// Format bytes for display (handles up to petabyte scale)
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "-";
-  if (bytes === 0) return "0 B";
-  if (bytes < 1024) return `${bytes} B`;
-  
-  const units = ["KB", "MB", "GB", "TB", "PB"] as const;
-  let value = bytes / 1024;
-  let unitIndex = 0;
-  
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024;
-    unitIndex++;
-  }
-  
-  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unitIndex]}`;
-}
+// Re-export from shared module for backwards compatibility
+export { formatBytes } from "./format";
 
 // ==================== Providers ====================
 
@@ -1448,64 +1436,44 @@ export interface Command {
 
 // Git status
 export async function getLibraryStatus(): Promise<LibraryStatus> {
-  const res = await apiFetch("/api/library/status");
-  await ensureLibraryResponse(res, "Failed to fetch library status");
-  return res.json();
+  return libGet("/api/library/status", "Failed to fetch library status");
 }
 
 // Sync (git pull)
 export async function syncLibrary(): Promise<void> {
-  const res = await apiFetch("/api/library/sync", { method: "POST" });
-  await ensureLibraryResponse(res, "Failed to sync library");
+  return libPost("/api/library/sync", undefined, "Failed to sync library");
 }
 
 // Commit changes
 export async function commitLibrary(message: string): Promise<void> {
-  const res = await apiFetch("/api/library/commit", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
-  });
-  await ensureLibraryResponse(res, "Failed to commit library");
+  return libPost("/api/library/commit", { message }, "Failed to commit library");
 }
 
 // Push changes
 export async function pushLibrary(): Promise<void> {
-  const res = await apiFetch("/api/library/push", { method: "POST" });
-  await ensureLibraryResponse(res, "Failed to push library");
+  return libPost("/api/library/push", undefined, "Failed to push library");
 }
 
 // Get MCP servers
 export async function getLibraryMcps(): Promise<Record<string, McpServerDef>> {
-  const res = await apiFetch("/api/library/mcps");
-  await ensureLibraryResponse(res, "Failed to fetch MCPs");
-  return res.json();
+  return libGet("/api/library/mcps", "Failed to fetch MCPs");
 }
 
 // Save MCP servers
 export async function saveLibraryMcps(
   servers: Record<string, McpServerDef>
 ): Promise<void> {
-  const res = await apiFetch("/api/library/mcps", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(servers),
-  });
-  await ensureLibraryResponse(res, "Failed to save MCPs");
+  return libPut("/api/library/mcps", servers, "Failed to save MCPs");
 }
 
 // List skills
 export async function listLibrarySkills(): Promise<SkillSummary[]> {
-  const res = await apiFetch("/api/library/skills");
-  await ensureLibraryResponse(res, "Failed to fetch skills");
-  return res.json();
+  return libGet("/api/library/skills", "Failed to fetch skills");
 }
 
 // Get skill
 export async function getLibrarySkill(name: string): Promise<Skill> {
-  const res = await apiFetch(`/api/library/skills/${encodeURIComponent(name)}`);
-  await ensureLibraryResponse(res, "Failed to fetch skill");
-  return res.json();
+  return libGet(`/api/library/skills/${encodeURIComponent(name)}`, "Failed to fetch skill");
 }
 
 // Save skill
@@ -1513,23 +1481,15 @@ export async function saveLibrarySkill(
   name: string,
   content: string
 ): Promise<void> {
-  const res = await apiFetch(`/api/library/skills/${encodeURIComponent(name)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
-  await ensureLibraryResponse(res, "Failed to save skill");
+  return libPut(`/api/library/skills/${encodeURIComponent(name)}`, { content }, "Failed to save skill");
 }
 
 // Delete skill
 export async function deleteLibrarySkill(name: string): Promise<void> {
-  const res = await apiFetch(`/api/library/skills/${encodeURIComponent(name)}`, {
-    method: "DELETE",
-  });
-  await ensureLibraryResponse(res, "Failed to delete skill");
+  return libDel(`/api/library/skills/${encodeURIComponent(name)}`, "Failed to delete skill");
 }
 
-// Get skill reference file
+// Get skill reference file (returns text, not JSON)
 export async function getSkillReference(
   skillName: string,
   refPath: string
@@ -1547,15 +1507,11 @@ export async function saveSkillReference(
   refPath: string,
   content: string
 ): Promise<void> {
-  const res = await apiFetch(
+  return libPut(
     `/api/library/skills/${encodeURIComponent(skillName)}/references/${refPath}`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
-    }
+    { content },
+    "Failed to save reference file",
   );
-  await ensureLibraryResponse(res, "Failed to save reference file");
 }
 
 // Delete skill reference file
@@ -1563,11 +1519,10 @@ export async function deleteSkillReference(
   skillName: string,
   refPath: string
 ): Promise<void> {
-  const res = await apiFetch(
+  return libDel(
     `/api/library/skills/${encodeURIComponent(skillName)}/references/${refPath}`,
-    { method: "DELETE" }
+    "Failed to delete reference file",
   );
-  await ensureLibraryResponse(res, "Failed to delete reference file");
 }
 
 // Import skill from Git URL
@@ -1578,13 +1533,7 @@ export interface ImportSkillRequest {
 }
 
 export async function importSkill(request: ImportSkillRequest): Promise<Skill> {
-  const res = await apiFetch("/api/library/skills/import", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request),
-  });
-  await ensureLibraryResponse(res, "Failed to import skill");
-  return res.json();
+  return libPost("/api/library/skills/import", request, "Failed to import skill");
 }
 
 // Validate skill name (matches backend pattern)
@@ -1609,9 +1558,7 @@ export function validateSkillName(name: string): { valid: boolean; error?: strin
 
 // List commands
 export async function listLibraryCommands(): Promise<CommandSummary[]> {
-  const res = await apiFetch("/api/library/commands");
-  await ensureLibraryResponse(res, "Failed to fetch commands");
-  return res.json();
+  return libGet("/api/library/commands", "Failed to fetch commands");
 }
 
 // Builtin commands response
@@ -1632,9 +1579,7 @@ export async function getBuiltinCommands(): Promise<BuiltinCommandsResponse> {
 
 // Get command
 export async function getLibraryCommand(name: string): Promise<Command> {
-  const res = await apiFetch(`/api/library/commands/${encodeURIComponent(name)}`);
-  await ensureLibraryResponse(res, "Failed to fetch command");
-  return res.json();
+  return libGet(`/api/library/commands/${encodeURIComponent(name)}`, "Failed to fetch command");
 }
 
 // Save command
@@ -1642,20 +1587,12 @@ export async function saveLibraryCommand(
   name: string,
   content: string
 ): Promise<void> {
-  const res = await apiFetch(`/api/library/commands/${encodeURIComponent(name)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
-  await ensureLibraryResponse(res, "Failed to save command");
+  return libPut(`/api/library/commands/${encodeURIComponent(name)}`, { content }, "Failed to save command");
 }
 
 // Delete command
 export async function deleteLibraryCommand(name: string): Promise<void> {
-  const res = await apiFetch(`/api/library/commands/${encodeURIComponent(name)}`, {
-    method: "DELETE",
-  });
-  await ensureLibraryResponse(res, "Failed to delete command");
+  return libDel(`/api/library/commands/${encodeURIComponent(name)}`, "Failed to delete command");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1664,21 +1601,14 @@ export async function deleteLibraryCommand(name: string): Promise<void> {
 
 // Get all plugins
 export async function getLibraryPlugins(): Promise<Record<string, Plugin>> {
-  const res = await apiFetch("/api/library/plugins");
-  await ensureLibraryResponse(res, "Failed to fetch plugins");
-  return res.json();
+  return libGet("/api/library/plugins", "Failed to fetch plugins");
 }
 
 // Save all plugins
 export async function saveLibraryPlugins(
   plugins: Record<string, Plugin>
 ): Promise<void> {
-  const res = await apiFetch("/api/library/plugins", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(plugins),
-  });
-  await ensureLibraryResponse(res, "Failed to save plugins");
+  return libPut("/api/library/plugins", plugins, "Failed to save plugins");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1699,11 +1629,7 @@ export interface InstalledPluginsResponse {
 
 // Get installed plugins from OpenCode config with version info
 export async function getInstalledPlugins(): Promise<InstalledPluginsResponse> {
-  const res = await apiFetch("/api/system/plugins/installed");
-  if (!res.ok) {
-    throw new Error("Failed to fetch installed plugins");
-  }
-  return res.json();
+  return apiGet("/api/system/plugins/installed", "Failed to fetch installed plugins");
 }
 
 // Update a plugin (returns SSE stream)
@@ -1745,16 +1671,12 @@ export function updatePlugin(
 
 // List rules
 export async function listLibraryRules(): Promise<RuleSummary[]> {
-  const res = await apiFetch("/api/library/rule");
-  await ensureLibraryResponse(res, "Failed to fetch rules");
-  return res.json();
+  return libGet("/api/library/rule", "Failed to fetch rules");
 }
 
 // Get rule
 export async function getLibraryRule(name: string): Promise<Rule> {
-  const res = await apiFetch(`/api/library/rule/${encodeURIComponent(name)}`);
-  await ensureLibraryResponse(res, "Failed to fetch rule");
-  return res.json();
+  return libGet(`/api/library/rule/${encodeURIComponent(name)}`, "Failed to fetch rule");
 }
 
 // Save rule
@@ -1762,20 +1684,12 @@ export async function saveLibraryRule(
   name: string,
   content: string
 ): Promise<void> {
-  const res = await apiFetch(`/api/library/rule/${encodeURIComponent(name)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
-  await ensureLibraryResponse(res, "Failed to save rule");
+  return libPut(`/api/library/rule/${encodeURIComponent(name)}`, { content }, "Failed to save rule");
 }
 
 // Delete rule
 export async function deleteLibraryRule(name: string): Promise<void> {
-  const res = await apiFetch(`/api/library/rule/${encodeURIComponent(name)}`, {
-    method: "DELETE",
-  });
-  await ensureLibraryResponse(res, "Failed to delete rule");
+  return libDel(`/api/library/rule/${encodeURIComponent(name)}`, "Failed to delete rule");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1784,16 +1698,12 @@ export async function deleteLibraryRule(name: string): Promise<void> {
 
 // List library agents
 export async function listLibraryAgents(): Promise<LibraryAgentSummary[]> {
-  const res = await apiFetch("/api/library/agent");
-  await ensureLibraryResponse(res, "Failed to fetch library agents");
-  return res.json();
+  return libGet("/api/library/agent", "Failed to fetch library agents");
 }
 
 // Get library agent
 export async function getLibraryAgent(name: string): Promise<LibraryAgent> {
-  const res = await apiFetch(`/api/library/agent/${encodeURIComponent(name)}`);
-  await ensureLibraryResponse(res, "Failed to fetch library agent");
-  return res.json();
+  return libGet(`/api/library/agent/${encodeURIComponent(name)}`, "Failed to fetch library agent");
 }
 
 // Save library agent
@@ -1801,20 +1711,12 @@ export async function saveLibraryAgent(
   name: string,
   agent: LibraryAgent
 ): Promise<void> {
-  const res = await apiFetch(`/api/library/agent/${encodeURIComponent(name)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(agent),
-  });
-  await ensureLibraryResponse(res, "Failed to save library agent");
+  return libPut(`/api/library/agent/${encodeURIComponent(name)}`, agent, "Failed to save library agent");
 }
 
 // Delete library agent
 export async function deleteLibraryAgent(name: string): Promise<void> {
-  const res = await apiFetch(`/api/library/agent/${encodeURIComponent(name)}`, {
-    method: "DELETE",
-  });
-  await ensureLibraryResponse(res, "Failed to delete library agent");
+  return libDel(`/api/library/agent/${encodeURIComponent(name)}`, "Failed to delete library agent");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1823,16 +1725,12 @@ export async function deleteLibraryAgent(name: string): Promise<void> {
 
 // List library tools
 export async function listLibraryTools(): Promise<LibraryToolSummary[]> {
-  const res = await apiFetch("/api/library/tool");
-  await ensureLibraryResponse(res, "Failed to fetch library tools");
-  return res.json();
+  return libGet("/api/library/tool", "Failed to fetch library tools");
 }
 
 // Get library tool
 export async function getLibraryTool(name: string): Promise<LibraryTool> {
-  const res = await apiFetch(`/api/library/tool/${encodeURIComponent(name)}`);
-  await ensureLibraryResponse(res, "Failed to fetch library tool");
-  return res.json();
+  return libGet(`/api/library/tool/${encodeURIComponent(name)}`, "Failed to fetch library tool");
 }
 
 // Save library tool
@@ -1840,20 +1738,12 @@ export async function saveLibraryTool(
   name: string,
   content: string
 ): Promise<void> {
-  const res = await apiFetch(`/api/library/tool/${encodeURIComponent(name)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
-  await ensureLibraryResponse(res, "Failed to save library tool");
+  return libPut(`/api/library/tool/${encodeURIComponent(name)}`, { content }, "Failed to save library tool");
 }
 
 // Delete library tool
 export async function deleteLibraryTool(name: string): Promise<void> {
-  const res = await apiFetch(`/api/library/tool/${encodeURIComponent(name)}`, {
-    method: "DELETE",
-  });
-  await ensureLibraryResponse(res, "Failed to delete library tool");
+  return libDel(`/api/library/tool/${encodeURIComponent(name)}`, "Failed to delete library tool");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1881,15 +1771,11 @@ export interface WorkspaceTemplate {
 }
 
 export async function listWorkspaceTemplates(): Promise<WorkspaceTemplateSummary[]> {
-  const res = await apiFetch("/api/library/workspace-template");
-  await ensureLibraryResponse(res, "Failed to fetch workspace templates");
-  return res.json();
+  return libGet("/api/library/workspace-template", "Failed to fetch workspace templates");
 }
 
 export async function getWorkspaceTemplate(name: string): Promise<WorkspaceTemplate> {
-  const res = await apiFetch(`/api/library/workspace-template/${encodeURIComponent(name)}`);
-  await ensureLibraryResponse(res, "Failed to fetch workspace template");
-  return res.json();
+  return libGet(`/api/library/workspace-template/${encodeURIComponent(name)}`, "Failed to fetch workspace template");
 }
 
 export async function saveWorkspaceTemplate(
@@ -1904,19 +1790,11 @@ export async function saveWorkspaceTemplate(
     shared_network?: boolean | null;
   }
 ): Promise<void> {
-  const res = await apiFetch(`/api/library/workspace-template/${encodeURIComponent(name)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  await ensureLibraryResponse(res, "Failed to save workspace template");
+  return libPut(`/api/library/workspace-template/${encodeURIComponent(name)}`, data, "Failed to save workspace template");
 }
 
 export async function deleteWorkspaceTemplate(name: string): Promise<void> {
-  const res = await apiFetch(`/api/library/workspace-template/${encodeURIComponent(name)}`, {
-    method: "DELETE",
-  });
-  await ensureLibraryResponse(res, "Failed to delete workspace template");
+  return libDel(`/api/library/workspace-template/${encodeURIComponent(name)}`, "Failed to delete workspace template");
 }
 
 export async function renameWorkspaceTemplate(oldName: string, newName: string): Promise<void> {
@@ -1977,16 +1855,11 @@ export async function renameLibraryItem(
   newName: string,
   dryRun: boolean = false
 ): Promise<RenameResult> {
-  const res = await apiFetch(
+  return libPost(
     `/api/library/rename/${itemType}/${encodeURIComponent(oldName)}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ new_name: newName, dry_run: dryRun }),
-    }
+    { new_name: newName, dry_run: dryRun },
+    "Failed to rename item",
   );
-  await ensureLibraryResponse(res, "Failed to rename item");
-  return res.json();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1995,9 +1868,7 @@ export async function renameLibraryItem(
 
 // Migrate library structure to new format
 export async function migrateLibrary(): Promise<MigrationReport> {
-  const res = await apiFetch("/api/library/migrate", { method: "POST" });
-  await ensureLibraryResponse(res, "Failed to migrate library");
-  return res.json();
+  return libPost("/api/library/migrate", undefined, "Failed to migrate library");
 }
 
 // ==================== Workspaces ====================
@@ -2024,16 +1895,12 @@ export interface Workspace {
 
 // List workspaces
 export async function listWorkspaces(): Promise<Workspace[]> {
-  const res = await apiFetch("/api/workspaces");
-  if (!res.ok) throw new Error("Failed to fetch workspaces");
-  return res.json();
+  return apiGet("/api/workspaces", "Failed to fetch workspaces");
 }
 
 // Get workspace
 export async function getWorkspace(id: string): Promise<Workspace> {
-  const res = await apiFetch(`/api/workspaces/${id}`);
-  if (!res.ok) throw new Error("Failed to fetch workspace");
-  return res.json();
+  return apiGet(`/api/workspaces/${id}`, "Failed to fetch workspace");
 }
 
 // Create workspace
@@ -2049,13 +1916,7 @@ export async function createWorkspace(data: {
   init_script?: string;
   shared_network?: boolean | null;
 }): Promise<Workspace> {
-  const res = await apiFetch("/api/workspaces", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error("Failed to create workspace");
-  return res.json();
+  return apiPost("/api/workspaces", data, "Failed to create workspace");
 }
 
 // Update workspace
@@ -2072,28 +1933,17 @@ export async function updateWorkspace(
     shared_network?: boolean | null;
   }
 ): Promise<Workspace> {
-  const res = await apiFetch(`/api/workspaces/${id}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error("Failed to update workspace");
-  return res.json();
+  return apiPut(`/api/workspaces/${id}`, data, "Failed to update workspace");
 }
 
 // Sync workspace skills
 export async function syncWorkspace(id: string): Promise<Workspace> {
-  const res = await apiFetch(`/api/workspaces/${id}/sync`, {
-    method: "POST",
-  });
-  if (!res.ok) throw new Error("Failed to sync workspace");
-  return res.json();
+  return apiPost(`/api/workspaces/${id}/sync`, undefined, "Failed to sync workspace");
 }
 
 // Delete workspace
 export async function deleteWorkspace(id: string): Promise<void> {
-  const res = await apiFetch(`/api/workspaces/${id}`, { method: "DELETE" });
-  if (!res.ok) throw new Error("Failed to delete workspace");
+  return apiDel(`/api/workspaces/${id}`, "Failed to delete workspace");
 }
 
 // Supported Linux distributions for container workspaces
@@ -2195,16 +2045,12 @@ export interface TestConnectionResponse {
 
 // List all OpenCode connections
 export async function listOpenCodeConnections(): Promise<OpenCodeConnection[]> {
-  const res = await apiFetch("/api/opencode/connections");
-  if (!res.ok) throw new Error("Failed to list OpenCode connections");
-  return res.json();
+  return apiGet("/api/opencode/connections", "Failed to list OpenCode connections");
 }
 
 // Get connection by ID
 export async function getOpenCodeConnection(id: string): Promise<OpenCodeConnection> {
-  const res = await apiFetch(`/api/opencode/connections/${id}`);
-  if (!res.ok) throw new Error("Failed to get OpenCode connection");
-  return res.json();
+  return apiGet(`/api/opencode/connections/${id}`, "Failed to get OpenCode connection");
 }
 
 // Create new connection
@@ -2215,13 +2061,7 @@ export async function createOpenCodeConnection(data: {
   permissive?: boolean;
   enabled?: boolean;
 }): Promise<OpenCodeConnection> {
-  const res = await apiFetch("/api/opencode/connections", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error("Failed to create OpenCode connection");
-  return res.json();
+  return apiPost("/api/opencode/connections", data, "Failed to create OpenCode connection");
 }
 
 // Update connection
@@ -2235,33 +2075,22 @@ export async function updateOpenCodeConnection(
     enabled?: boolean;
   }
 ): Promise<OpenCodeConnection> {
-  const res = await apiFetch(`/api/opencode/connections/${id}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error("Failed to update OpenCode connection");
-  return res.json();
+  return apiPut(`/api/opencode/connections/${id}`, data, "Failed to update OpenCode connection");
 }
 
 // Delete connection
 export async function deleteOpenCodeConnection(id: string): Promise<void> {
-  const res = await apiFetch(`/api/opencode/connections/${id}`, { method: "DELETE" });
-  if (!res.ok) throw new Error("Failed to delete OpenCode connection");
+  return apiDel(`/api/opencode/connections/${id}`, "Failed to delete OpenCode connection");
 }
 
 // Test connection
 export async function testOpenCodeConnection(id: string): Promise<TestConnectionResponse> {
-  const res = await apiFetch(`/api/opencode/connections/${id}/test`, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to test OpenCode connection");
-  return res.json();
+  return apiPost(`/api/opencode/connections/${id}/test`, undefined, "Failed to test OpenCode connection");
 }
 
 // Set default connection
 export async function setDefaultOpenCodeConnection(id: string): Promise<OpenCodeConnection> {
-  const res = await apiFetch(`/api/opencode/connections/${id}/default`, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to set default OpenCodeconnection");
-  return res.json();
+  return apiPost(`/api/opencode/connections/${id}/default`, undefined, "Failed to set default OpenCode connection");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2270,27 +2099,17 @@ export async function setDefaultOpenCodeConnection(id: string): Promise<OpenCode
 
 // Get OpenCode settings (oh-my-opencode.json)
 export async function getOpenCodeSettings(): Promise<Record<string, unknown>> {
-  const res = await apiFetch("/api/opencode/settings");
-  if (!res.ok) throw new Error("Failed to get OpenCode settings");
-  return res.json();
+  return apiGet("/api/opencode/settings", "Failed to get OpenCode settings");
 }
 
 // Update OpenCode settings (oh-my-opencode.json)
 export async function updateOpenCodeSettings(settings: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const res = await apiFetch("/api/opencode/settings", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(settings),
-  });
-  if (!res.ok) throw new Error("Failed to update OpenCode settings");
-  return res.json();
+  return apiPut("/api/opencode/settings", settings, "Failed to update OpenCode settings");
 }
 
 // Restart OpenCode service (to apply settings changes)
 export async function restartOpenCodeService(): Promise<{ success: boolean; message: string }> {
-  const res = await apiFetch("/api/opencode/restart", { method: "POST" });
-  if (!res.ok) throw new Error("Failed to restart OpenCode service");
-  return res.json();
+  return apiPost("/api/opencode/restart", undefined, "Failed to restart OpenCode service");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2299,19 +2118,12 @@ export async function restartOpenCodeService(): Promise<{ success: boolean; mess
 
 // Get OpenCode settings from Library (oh-my-opencode.json)
 export async function getLibraryOpenCodeSettings(): Promise<Record<string, unknown>> {
-  const res = await apiFetch("/api/library/opencode/settings");
-  if (!res.ok) throw new Error("Failed to get Library OpenCode settings");
-  return res.json();
+  return apiGet("/api/library/opencode/settings", "Failed to get Library OpenCode settings");
 }
 
 // Save OpenCode settings to Library and sync to system
 export async function saveLibraryOpenCodeSettings(settings: Record<string, unknown>): Promise<void> {
-  const res = await apiFetch("/api/library/opencode/settings", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(settings),
-  });
-  if (!res.ok) throw new Error("Failed to save Library OpenCode settings");
+  return apiPut("/api/library/opencode/settings", settings, "Failed to save Library OpenCode settings");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2325,26 +2137,17 @@ export interface OpenAgentConfig {
 
 // Get OpenAgent config from Library
 export async function getOpenAgentConfig(): Promise<OpenAgentConfig> {
-  const res = await apiFetch("/api/library/openagent/config");
-  if (!res.ok) throw new Error("Failed to get OpenAgent config");
-  return res.json();
+  return apiGet("/api/library/openagent/config", "Failed to get OpenAgent config");
 }
 
 // Save OpenAgent config to Library
 export async function saveOpenAgentConfig(config: OpenAgentConfig): Promise<void> {
-  const res = await apiFetch("/api/library/openagent/config", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(config),
-  });
-  if (!res.ok) throw new Error("Failed to save OpenAgent config");
+  return apiPut("/api/library/openagent/config", config, "Failed to save OpenAgent config");
 }
 
 // Get visible agents (filtered by OpenAgent config)
 export async function getVisibleAgents(): Promise<unknown> {
-  const res = await apiFetch("/api/library/openagent/agents");
-  if (!res.ok) throw new Error("Failed to get visible agents");
-  return res.json();
+  return apiGet("/api/library/openagent/agents", "Failed to get visible agents");
 }
 
 // Claude Code config stored in Library
@@ -2356,21 +2159,14 @@ export interface ClaudeCodeConfig {
 
 // Get Claude Code config from Library
 export async function getClaudeCodeConfig(): Promise<ClaudeCodeConfig> {
-  const res = await apiFetch("/api/library/claudecode/config");
-  if (!res.ok) throw new Error("Failed to get Claude Code config");
-  return res.json();
+  return apiGet("/api/library/claudecode/config", "Failed to get Claude Code config");
 }
 
 // Save Claude Code config to Library
 export async function saveClaudeCodeConfig(
   config: ClaudeCodeConfig
 ): Promise<void> {
-  const res = await apiFetch("/api/library/claudecode/config", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(config),
-  });
-  if (!res.ok) throw new Error("Failed to save Claude Code config");
+  return apiPut("/api/library/claudecode/config", config, "Failed to save Claude Code config");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2393,6 +2189,7 @@ export type AIProviderType =
   | "together-ai"
   | "perplexity"
   | "github-copilot"
+  | "zai"
   | "custom";
 
 export interface AIProviderTypeInfo {
@@ -2448,23 +2245,17 @@ export interface OAuthAuthorizeResponse {
 
 // List all AI providers
 export async function listAIProviders(): Promise<AIProvider[]> {
-  const res = await apiFetch("/api/ai/providers");
-  if (!res.ok) throw new Error("Failed to list AI providers");
-  return res.json();
+  return apiGet("/api/ai/providers", "Failed to list AI providers");
 }
 
 // List available provider types
 export async function listAIProviderTypes(): Promise<AIProviderTypeInfo[]> {
-  const res = await apiFetch("/api/ai/providers/types");
-  if (!res.ok) throw new Error("Failed to list AI provider types");
-  return res.json();
+  return apiGet("/api/ai/providers/types", "Failed to list AI provider types");
 }
 
 // Get provider by ID
 export async function getAIProvider(id: string): Promise<AIProvider> {
-  const res = await apiFetch(`/api/ai/providers/${id}`);
-  if (!res.ok) throw new Error("Failed to get AI provider");
-  return res.json();
+  return apiGet(`/api/ai/providers/${id}`, "Failed to get AI provider");
 }
 
 // Create new provider
@@ -2478,13 +2269,7 @@ export async function createAIProvider(data: {
   /** Which backends this provider is used for (e.g., ["opencode", "claudecode"]) */
   use_for_backends?: string[];
 }): Promise<AIProvider> {
-  const res = await apiFetch("/api/ai/providers", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error("Failed to create AI provider");
-  return res.json();
+  return apiPost("/api/ai/providers", data, "Failed to create AI provider");
 }
 
 // Update provider
@@ -2500,19 +2285,12 @@ export async function updateAIProvider(
     use_for_backends?: string[];
   }
 ): Promise<AIProvider> {
-  const res = await apiFetch(`/api/ai/providers/${id}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error("Failed to update AI provider");
-  return res.json();
+  return apiPut(`/api/ai/providers/${id}`, data, "Failed to update AI provider");
 }
 
 // Delete provider
 export async function deleteAIProvider(id: string): Promise<void> {
-  const res = await apiFetch(`/api/ai/providers/${id}`, { method: "DELETE" });
-  if (!res.ok) throw new Error("Failed to delete AI provider");
+  return apiDel(`/api/ai/providers/${id}`, "Failed to delete AI provider");
 }
 
 // Provider credentials for a backend
@@ -2531,30 +2309,22 @@ export interface BackendProviderResponse {
 
 // Get provider credentials for a specific backend (e.g., "claudecode")
 export async function getProviderForBackend(backendId: string): Promise<BackendProviderResponse> {
-  const res = await apiFetch(`/api/ai/providers/for-backend/${backendId}`);
-  if (!res.ok) throw new Error("Failed to get provider for backend");
-  return res.json();
+  return apiGet(`/api/ai/providers/for-backend/${backendId}`, "Failed to get provider for backend");
 }
 
 // Authenticate provider (initiate OAuth or check API key)
 export async function authenticateAIProvider(id: string): Promise<AIProviderAuthResponse> {
-  const res = await apiFetch(`/api/ai/providers/${id}/auth`, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to authenticate AI provider");
-  return res.json();
+  return apiPost(`/api/ai/providers/${id}/auth`, undefined, "Failed to authenticate AI provider");
 }
 
 // Set default provider
 export async function setDefaultAIProvider(id: string): Promise<AIProvider> {
-  const res = await apiFetch(`/api/ai/providers/${id}/default`, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to set default AI provider");
-  return res.json();
+  return apiPost(`/api/ai/providers/${id}/default`, undefined, "Failed to set default AI provider");
 }
 
 // Get auth methods for a provider
 export async function getAuthMethods(id: string): Promise<AIProviderAuthMethod[]> {
-  const res = await apiFetch(`/api/ai/providers/${id}/auth/methods`);
-  if (!res.ok) throw new Error("Failed to get auth methods");
-  return res.json();
+  return apiGet(`/api/ai/providers/${id}/auth/methods`, "Failed to get auth methods");
 }
 
 // Start OAuth authorization flow
@@ -2628,20 +2398,12 @@ export interface SecretMetadata {
 
 // Get secrets status
 export async function getSecretsStatus(): Promise<SecretsStatus> {
-  const res = await apiFetch('/api/secrets/status');
-  if (!res.ok) throw new Error('Failed to get secrets status');
-  return res.json();
+  return apiGet('/api/secrets/status', 'Failed to get secrets status');
 }
 
 // Initialize secrets system
 export async function initializeSecrets(keyId: string = 'default'): Promise<{ key_id: string; message: string }> {
-  const res = await apiFetch('/api/secrets/initialize', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key_id: keyId }),
-  });
-  if (!res.ok) throw new Error('Failed to initialize secrets');
-  return res.json();
+  return apiPost('/api/secrets/initialize', { key_id: keyId }, 'Failed to initialize secrets');
 }
 
 // Unlock secrets with passphrase
@@ -2659,29 +2421,22 @@ export async function unlockSecrets(passphrase: string): Promise<void> {
 
 // Lock secrets
 export async function lockSecrets(): Promise<void> {
-  const res = await apiFetch('/api/secrets/lock', { method: 'POST' });
-  if (!res.ok) throw new Error('Failed to lock secrets');
+  return apiPost('/api/secrets/lock', undefined, 'Failed to lock secrets');
 }
 
 // List registries
 export async function listSecretRegistries(): Promise<RegistryInfo[]> {
-  const res = await apiFetch('/api/secrets/registries');
-  if (!res.ok) throw new Error('Failed to list registries');
-  return res.json();
+  return apiGet('/api/secrets/registries', 'Failed to list registries');
 }
 
 // List secrets in a registry
 export async function listSecrets(registryName: string): Promise<SecretInfo[]> {
-  const res = await apiFetch(`/api/secrets/registries/${encodeURIComponent(registryName)}`);
-  if (!res.ok) throw new Error('Failed to list secrets');
-  return res.json();
+  return apiGet(`/api/secrets/registries/${encodeURIComponent(registryName)}`, 'Failed to list secrets');
 }
 
 // Get secret metadata (not the value)
 export async function getSecretInfo(registryName: string, key: string): Promise<SecretInfo> {
-  const res = await apiFetch(`/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}`);
-  if (!res.ok) throw new Error('Failed to get secret info');
-  return res.json();
+  return apiGet(`/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}`, 'Failed to get secret info');
 }
 
 // Reveal (decrypt) a secret value
@@ -2715,18 +2470,12 @@ export async function setSecret(
 
 // Delete a secret
 export async function deleteSecret(registryName: string, key: string): Promise<void> {
-  const res = await apiFetch(`/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}`, {
-    method: 'DELETE',
-  });
-  if (!res.ok) throw new Error('Failed to delete secret');
+  return apiDel(`/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}`, 'Failed to delete secret');
 }
 
 // Delete a registry
 export async function deleteSecretRegistry(registryName: string): Promise<void> {
-  const res = await apiFetch(`/api/secrets/registries/${encodeURIComponent(registryName)}`, {
-    method: 'DELETE',
-  });
-  if (!res.ok) throw new Error('Failed to delete registry');
+  return apiDel(`/api/secrets/registries/${encodeURIComponent(registryName)}`, 'Failed to delete registry');
 }
 
 // ============================================================
@@ -2799,11 +2548,7 @@ export async function keepAliveDesktopSession(
 
 // Close all orphaned desktop sessions
 export async function cleanupOrphanedDesktopSessions(): Promise<OperationResponse> {
-  const res = await apiFetch('/api/desktop/sessions/cleanup', {
-    method: 'POST',
-  });
-  if (!res.ok) throw new Error('Failed to cleanup orphaned sessions');
-  return res.json();
+  return apiPost('/api/desktop/sessions/cleanup', undefined, 'Failed to cleanup orphaned sessions');
 }
 
 // ============================================
@@ -2833,9 +2578,7 @@ export interface UpdateProgressEvent {
 
 // Get all system components and their versions
 export async function getSystemComponents(): Promise<SystemComponentsResponse> {
-  const res = await apiFetch('/api/system/components');
-  if (!res.ok) throw new Error('Failed to get system components');
-  return res.json();
+  return apiGet('/api/system/components', 'Failed to get system components');
 }
 
 // Update a system component (streams progress via SSE)
@@ -2922,9 +2665,7 @@ export interface UpdateLibraryRemoteResponse {
 
 // Get all settings
 export async function getSettings(): Promise<SettingsResponse> {
-  const res = await apiFetch('/api/settings');
-  if (!res.ok) throw new Error('Failed to get settings');
-  return res.json();
+  return apiGet('/api/settings', 'Failed to get settings');
 }
 
 // Update the library remote URL
@@ -2966,30 +2707,22 @@ export interface BackendConfig {
 
 // List all available backends
 export async function listBackends(): Promise<Backend[]> {
-  const res = await apiFetch('/api/backends');
-  if (!res.ok) throw new Error('Failed to list backends');
-  return res.json();
+  return apiGet('/api/backends', 'Failed to list backends');
 }
 
 // Get a specific backend
 export async function getBackend(id: string): Promise<Backend> {
-  const res = await apiFetch(`/api/backends/${encodeURIComponent(id)}`);
-  if (!res.ok) throw new Error('Failed to get backend');
-  return res.json();
+  return apiGet(`/api/backends/${encodeURIComponent(id)}`, 'Failed to get backend');
 }
 
 // List agents for a specific backend
 export async function listBackendAgents(backendId: string): Promise<BackendAgent[]> {
-  const res = await apiFetch(`/api/backends/${encodeURIComponent(backendId)}/agents`);
-  if (!res.ok) throw new Error('Failed to list backend agents');
-  return res.json();
+  return apiGet(`/api/backends/${encodeURIComponent(backendId)}/agents`, 'Failed to list backend agents');
 }
 
 // Get backend configuration
 export async function getBackendConfig(backendId: string): Promise<BackendConfig> {
-  const res = await apiFetch(`/api/backends/${encodeURIComponent(backendId)}/config`);
-  if (!res.ok) throw new Error('Failed to get backend config');
-  return res.json();
+  return apiGet(`/api/backends/${encodeURIComponent(backendId)}/config`, 'Failed to get backend config');
 }
 
 // Update backend configuration
@@ -2998,13 +2731,11 @@ export async function updateBackendConfig(
   settings: Record<string, unknown>,
   options?: { enabled?: boolean }
 ): Promise<{ ok: boolean; message?: string }> {
-  const res = await apiFetch(`/api/backends/${encodeURIComponent(backendId)}/config`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ settings, enabled: options?.enabled }),
-  });
-  if (!res.ok) throw new Error('Failed to update backend config');
-  return res.json();
+  return apiPut(
+    `/api/backends/${encodeURIComponent(backendId)}/config`,
+    { settings, enabled: options?.enabled },
+    'Failed to update backend config',
+  );
 }
 
 // ============================================

@@ -2,7 +2,6 @@ pub mod client;
 
 use anyhow::Error;
 use async_trait::async_trait;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -10,9 +9,10 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::backend::events::ExecutionEvent;
+use crate::backend::shared::convert_cli_event;
 use crate::backend::{AgentInfo, Backend, Session, SessionConfig};
 
-use client::{AmpClient, AmpConfig, AmpEvent, ContentBlock, StreamEvent};
+use client::{AmpClient, AmpConfig};
 
 /// Amp backend that spawns the Amp CLI for mission execution.
 pub struct AmpBackend {
@@ -116,7 +116,7 @@ impl Backend for AmpBackend {
             let mut pending_tools: HashMap<String, String> = HashMap::new();
 
             while let Some(event) = amp_rx.recv().await {
-                let exec_events = convert_amp_event(event, &mut pending_tools);
+                let exec_events = convert_cli_event(event, &mut pending_tools);
 
                 for exec_event in exec_events {
                     if tx.send(exec_event).await.is_err() {
@@ -138,137 +138,6 @@ impl Backend for AmpBackend {
 
         Ok((rx, handle))
     }
-}
-
-/// Convert an Amp CLI event to one or more ExecutionEvents.
-fn convert_amp_event(
-    event: AmpEvent,
-    pending_tools: &mut HashMap<String, String>,
-) -> Vec<ExecutionEvent> {
-    let mut results = vec![];
-
-    match event {
-        AmpEvent::System(sys) => {
-            debug!(
-                "Amp session initialized: session_id={}, model={:?}",
-                sys.session_id, sys.model
-            );
-        }
-
-        AmpEvent::StreamEvent(wrapper) => {
-            match wrapper.event {
-                StreamEvent::ContentBlockDelta { delta, .. } => {
-                    // Text streaming
-                    if let Some(text) = delta.text {
-                        if !text.is_empty() {
-                            results.push(ExecutionEvent::TextDelta { content: text });
-                        }
-                    }
-                    // Thinking streaming
-                    if let Some(thinking) = delta.thinking {
-                        if !thinking.is_empty() {
-                            results.push(ExecutionEvent::Thinking { content: thinking });
-                        }
-                    }
-                    // Tool input streaming (partial JSON)
-                    if let Some(partial) = delta.partial_json {
-                        debug!("Tool input delta: {}", partial);
-                    }
-                }
-                StreamEvent::ContentBlockStart { content_block, .. } => {
-                    // Track tool use starts
-                    if content_block.block_type == "tool_use" {
-                        if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                            pending_tools.insert(id, name);
-                        }
-                    }
-                }
-                _ => {
-                    // Other stream events
-                }
-            }
-        }
-
-        AmpEvent::Assistant(evt) => {
-            for block in evt.message.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        if !text.is_empty() {
-                            results.push(ExecutionEvent::Thinking { content: text });
-                        }
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        pending_tools.insert(id.clone(), name.clone());
-                        results.push(ExecutionEvent::ToolCall {
-                            id,
-                            name,
-                            args: input,
-                        });
-                    }
-                    ContentBlock::Thinking { thinking } => {
-                        if !thinking.is_empty() {
-                            results.push(ExecutionEvent::Thinking { content: thinking });
-                        }
-                    }
-                    ContentBlock::ToolResult { .. } | ContentBlock::RedactedThinking { .. } => {
-                        // Handled elsewhere or ignored
-                    }
-                }
-            }
-        }
-
-        AmpEvent::User(evt) => {
-            // User events contain tool results
-            for block in evt.message.content {
-                if let ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } = block
-                {
-                    let name = pending_tools
-                        .get(&tool_use_id)
-                        .cloned()
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    let content_str = content.to_string_lossy();
-
-                    let result_value = if let Some(ref extra) = evt.tool_use_result {
-                        serde_json::json!({
-                            "content": content_str,
-                            "stdout": extra.stdout,
-                            "stderr": extra.stderr,
-                            "is_error": is_error,
-                            "interrupted": extra.interrupted,
-                        })
-                    } else {
-                        Value::String(content_str)
-                    };
-
-                    results.push(ExecutionEvent::ToolResult {
-                        id: tool_use_id,
-                        name,
-                        result: result_value,
-                    });
-                }
-            }
-        }
-
-        AmpEvent::Result(res) => {
-            if res.is_error || res.subtype == "error" {
-                results.push(ExecutionEvent::Error {
-                    message: res.result.unwrap_or_else(|| "Unknown error".to_string()),
-                });
-            } else {
-                debug!(
-                    "Amp result: subtype={}, duration={:?}ms, turns={:?}",
-                    res.subtype, res.duration_ms, res.num_turns
-                );
-            }
-        }
-    }
-
-    results
 }
 
 /// Create a registry entry for the Amp backend.

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useCallback, memo } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
 import { MarkdownContent } from "@/components/markdown-content";
@@ -1967,6 +1967,9 @@ export default function ControlClient() {
   const [hasDesktopSession, setHasDesktopSession] = useState(false);
   const [desktopSessions, setDesktopSessions] = useState<DesktopSessionDetail[]>([]);
   const [isClosingDesktop, setIsClosingDesktop] = useState<string | null>(null);
+  // Track when we're expecting a desktop session (from ToolCall before ToolResult arrives)
+  const expectingDesktopSessionRef = useRef(false);
+  const desktopRapidPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Thinking panel state
   const [showThinkingPanel, setShowThinkingPanel] = useState(false);
@@ -2223,8 +2226,18 @@ export default function ControlClient() {
   }, [items]);
 
   // Smart auto-scroll
-  const { containerRef, endRef, isAtBottom, scrollToBottom } =
+  const { containerRef, endRef, isAtBottom, scrollToBottom, scrollToBottomImmediate } =
     useScrollToBottom();
+
+  // Scroll to bottom synchronously before paint when items change.
+  // This ensures the page appears at the bottom instantly when returning
+  // to the control page (no visible scroll animation).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useLayoutEffect(() => {
+    if (items.length > 0 && isAtBottom) {
+      scrollToBottomImmediate();
+    }
+  }, [items]);
 
   // Sync input to localStorage draft
   useEffect(() => {
@@ -2470,14 +2483,16 @@ export default function ControlClient() {
         // Check for session start
         if (
           entry.content.includes("desktop_start_session") ||
-          entry.content.includes("desktop_desktop_start_session")
+          entry.content.includes("desktop_desktop_start_session") ||
+          entry.content.includes("mcp__desktop__desktop_start_session")
         ) {
           hasSession = true;
         }
         // Check for session close (must come after start check to handle same entry)
         if (
           entry.content.includes("desktop_close_session") ||
-          entry.content.includes("desktop_desktop_close_session")
+          entry.content.includes("desktop_desktop_close_session") ||
+          entry.content.includes("mcp__desktop__desktop_close_session")
         ) {
           hasSession = false;
         }
@@ -2519,10 +2534,12 @@ export default function ControlClient() {
         const toolName = event.tool_name;
         const isStart =
           toolName === "desktop_start_session" ||
-          toolName === "desktop_desktop_start_session";
+          toolName === "desktop_desktop_start_session" ||
+          toolName === "mcp__desktop__desktop_start_session";
         const isClose =
           toolName === "desktop_close_session" ||
-          toolName === "desktop_desktop_close_session";
+          toolName === "desktop_desktop_close_session" ||
+          toolName === "mcp__desktop__desktop_close_session";
 
         if (!isStart && !isClose) continue;
 
@@ -3127,10 +3144,18 @@ export default function ControlClient() {
         const activeMission = viewingMissionRef.current ?? currentMissionRef.current;
         const activeMissionId = activeMission?.id;
 
-        // Only auto-open for sessions belonging to the current mission
+        // Only auto-open for sessions belonging to the current mission.
+        // When expecting a desktop session (ToolCall detected but no ToolResult yet),
+        // also include unattributed sessions (mission_id is null) since the backend
+        // background task may not have attributed them yet.
+        const expecting = expectingDesktopSessionRef.current;
         const currentMissionSessions = activeMissionId
-          ? runningSessions.filter(s => s.mission_id === activeMissionId)
-          : [];
+          ? runningSessions.filter(s =>
+              s.mission_id === activeMissionId || (expecting && !s.mission_id)
+            )
+          : expecting
+            ? runningSessions.filter(s => !s.mission_id)
+            : [];
         const hasCurrentMissionSession = currentMissionSessions.length > 0;
 
         // Auto-select first active session from current mission if current display isn't running
@@ -3144,6 +3169,14 @@ export default function ControlClient() {
             setHasDesktopSession(true);
             setShowDesktopStream(true);
           }
+          // Clear expecting flag once we found a session
+          if (expecting) {
+            expectingDesktopSessionRef.current = false;
+            if (desktopRapidPollRef.current) {
+              clearInterval(desktopRapidPollRef.current);
+              desktopRapidPollRef.current = null;
+            }
+          }
         }
       }
     } catch (err) {
@@ -3155,7 +3188,14 @@ export default function ControlClient() {
   useEffect(() => {
     refreshDesktopSessions();
     const interval = setInterval(refreshDesktopSessions, 10000);
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      // Also clean up rapid polling interval
+      if (desktopRapidPollRef.current) {
+        clearInterval(desktopRapidPollRef.current);
+        desktopRapidPollRef.current = null;
+      }
+    };
   }, [refreshDesktopSessions]);
 
   // Handle closing a desktop session
@@ -3902,6 +3942,31 @@ export default function ControlClient() {
             startTime: Date.now(),
           },
         ]);
+
+        // Detect desktop_start_session from ToolCall (Claude Code/Amp don't emit ToolResult for MCP tools)
+        const isDesktopStart =
+          name === "desktop_start_session" ||
+          name === "desktop_desktop_start_session" ||
+          name === "mcp__desktop__desktop_start_session";
+        if (isDesktopStart) {
+          setHasDesktopSession(true);
+          setShowDesktopStream(true);
+          expectingDesktopSessionRef.current = true;
+          // Start rapid polling (every 2s) to pick up the session once the backend attributes it
+          if (desktopRapidPollRef.current) clearInterval(desktopRapidPollRef.current);
+          desktopRapidPollRef.current = setInterval(() => {
+            refreshDesktopSessions();
+          }, 2000);
+          // Stop rapid polling after 30s
+          setTimeout(() => {
+            if (desktopRapidPollRef.current) {
+              clearInterval(desktopRapidPollRef.current);
+              desktopRapidPollRef.current = null;
+            }
+            expectingDesktopSessionRef.current = false;
+          }, 30000);
+        }
+
         return;
       }
 
@@ -3915,7 +3980,7 @@ export default function ControlClient() {
 
         // Check for desktop_start_session right away using event data
         // This handles the case where tool_call events might be filtered or missed
-        if (eventToolName === "desktop_start_session" || eventToolName === "desktop_desktop_start_session") {
+        if (eventToolName === "desktop_start_session" || eventToolName === "desktop_desktop_start_session" || eventToolName === "mcp__desktop__desktop_start_session") {
           let result = data["result"];
           // Handle case where result is a JSON string that needs parsing
           if (typeof result === "string") {
@@ -3934,7 +3999,7 @@ export default function ControlClient() {
           }
         }
         // Handle desktop session close
-        if (eventToolName === "desktop_close_session" || eventToolName === "desktop_desktop_close_session") {
+        if (eventToolName === "desktop_close_session" || eventToolName === "desktop_desktop_close_session" || eventToolName === "mcp__desktop__desktop_close_session") {
           setHasDesktopSession(false);
           setShowDesktopStream(false);
         }
@@ -3948,7 +4013,7 @@ export default function ControlClient() {
           if (toolItem && toolItem.kind === "tool") {
             const toolName = toolItem.name;
             // Check for desktop_start_session (with or without desktop_ prefix from MCP)
-            if (toolName === "desktop_start_session" || toolName === "desktop_desktop_start_session") {
+            if (toolName === "desktop_start_session" || toolName === "desktop_desktop_start_session" || toolName === "mcp__desktop__desktop_start_session") {
               let result = data["result"];
               // Handle case where result is a JSON string that needs parsing
               if (typeof result === "string") {
@@ -3966,7 +4031,7 @@ export default function ControlClient() {
               }
             }
             // Check for desktop_close_session
-            if (toolName === "desktop_close_session" || toolName === "desktop_desktop_close_session") {
+            if (toolName === "desktop_close_session" || toolName === "desktop_desktop_close_session" || toolName === "mcp__desktop__desktop_close_session") {
               setHasDesktopSession(false);
               setShowDesktopStream(false);
             }
@@ -4471,7 +4536,7 @@ export default function ControlClient() {
       />
 
       {/* Header */}
-      <div className="mb-6 flex items-center justify-between gap-4">
+      <div className="relative z-10 mb-6 flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
           {/* Unified Mission Selector */}
           <div className="relative">
@@ -4588,7 +4653,7 @@ export default function ControlClient() {
                     {/* Show sessions from API if available, otherwise show hardcoded list */}
                     {desktopSessions.length > 0 ? (
                       <>
-                        {desktopSessions.filter(s => s.process_running).map((session, index) => (
+                        {desktopSessions.map((session, index) => (
                           <div
                             key={`${session.display}-${session.mission_id || index}`}
                             className={cn(
@@ -4608,10 +4673,11 @@ export default function ControlClient() {
                               {/* Status indicator */}
                               <span className={cn(
                                 "h-2 w-2 rounded-full",
+                                !session.process_running ? "bg-gray-600" :
                                 session.status === 'active' ? "bg-emerald-500" :
                                 session.status === 'orphaned' ? "bg-amber-500" :
                                 "bg-gray-500"
-                              )} title={session.status} />
+                              )} title={session.process_running ? session.status : 'stopped'} />
 
                               {/* Display ID */}
                               <span className={cn(
@@ -4626,11 +4692,13 @@ export default function ControlClient() {
                               {/* Status label */}
                               <span className={cn(
                                 "text-xs",
+                                !session.process_running ? "text-white/30" :
                                 session.status === 'active' ? "text-emerald-500/70" :
                                 session.status === 'orphaned' ? "text-amber-500/70" :
                                 "text-white/40"
                               )}>
-                                {session.status === 'active' ? 'Active' :
+                                {!session.process_running ? 'Stopped' :
+                                 session.status === 'active' ? 'Active' :
                                  session.status === 'orphaned' ? 'Orphaned' :
                                  session.status}
                               </span>

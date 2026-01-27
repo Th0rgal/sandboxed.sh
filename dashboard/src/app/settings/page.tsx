@@ -59,6 +59,7 @@ const providerConfig: Record<string, { color: string; icon: string }> = {
   mistral: { color: 'bg-indigo-500/10 text-indigo-400', icon: '🌪️' },
   groq: { color: 'bg-pink-500/10 text-pink-400', icon: '⚡' },
   xai: { color: 'bg-slate-500/10 text-slate-400', icon: '𝕏' },
+  zai: { color: 'bg-cyan-500/10 text-cyan-400', icon: 'Z' },
   'github-copilot': { color: 'bg-gray-500/10 text-gray-400', icon: '🐙' },
   custom: { color: 'bg-white/10 text-white/60', icon: '🔧' },
 };
@@ -76,6 +77,7 @@ const defaultProviderTypes: AIProviderTypeInfo[] = [
   { id: 'groq', name: 'Groq', uses_oauth: false, env_var: 'GROQ_API_KEY' },
   { id: 'mistral', name: 'Mistral AI', uses_oauth: false, env_var: 'MISTRAL_API_KEY' },
   { id: 'xai', name: 'xAI', uses_oauth: false, env_var: 'XAI_API_KEY' },
+  { id: 'zai', name: 'Z.AI', uses_oauth: false, env_var: 'ZHIPU_API_KEY' },
   { id: 'github-copilot', name: 'GitHub Copilot', uses_oauth: true, env_var: null },
 ];
 
@@ -1192,7 +1194,8 @@ export default function SettingsPage() {
             <div className="space-y-3">
               <p className="text-xs text-white/50">
                 Backup includes: AI provider credentials, backend settings (Amp API key, etc.),
-                workspace definitions, MCP configurations, and encrypted secrets.
+                workspace definitions, MCP configurations, encrypted secrets, and the
+                library encryption key.
               </p>
 
               <div className="flex items-center gap-3">

@@ -29,7 +29,8 @@ use crate::workspace::{self, Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
 
 use super::control::{
-    AgentEvent, AgentTreeNode, ControlStatus, ExecutionProgress, FrontendToolHub,
+    safe_truncate_index, AgentEvent, AgentTreeNode, ControlStatus, ExecutionProgress,
+    FrontendToolHub,
 };
 use super::library::SharedLibrary;
 
@@ -413,9 +414,65 @@ fn parse_opencode_sse_event(
             }
         }
         "message.part.updated" => handle_part_update(&props, state, mission_id),
+        "tool.execute" => {
+            let tool_name = props
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let tool_id = format!("opencode-{}", uuid::Uuid::new_v4());
+            let args = props
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            state
+                .emitted_tool_calls
+                .insert(tool_id.clone(), ());
+            Some(AgentEvent::ToolCall {
+                tool_call_id: tool_id,
+                name: tool_name,
+                args,
+                mission_id: Some(mission_id),
+            })
+        }
+        "tool.result" => {
+            let tool_name = props
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let output = props
+                .get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Use the most recent tool call id if tracking
+            let tool_id = format!("opencode-{}", uuid::Uuid::new_v4());
+            Some(AgentEvent::ToolResult {
+                tool_call_id: tool_id,
+                name: tool_name,
+                result: serde_json::json!({ "output": output }),
+                mission_id: Some(mission_id),
+            })
+        }
         "message.completed" | "assistant.message.completed" => {
             message_complete = true;
             None
+        }
+        "session.error" => {
+            let message = props
+                .get("error")
+                .and_then(|v| {
+                    v.as_str().map(|s| s.to_string()).or_else(|| {
+                        serde_json::to_string(v).ok()
+                    })
+                })
+                .unwrap_or_else(|| "Unknown session error".to_string());
+            Some(AgentEvent::Error {
+                message,
+                mission_id: Some(mission_id),
+                resumable: true,
+            })
         }
         "error" | "message.error" => {
             let message = props
@@ -479,6 +536,14 @@ pub struct QueuedMessage {
 }
 
 /// Isolated runner for a single mission.
+/// Info about a tracked subtask (from delegate_task/Task tool calls).
+#[derive(Debug, Clone)]
+pub struct SubtaskInfo {
+    pub tool_call_id: String,
+    pub description: String,
+    pub completed: bool,
+}
+
 pub struct MissionRunner {
     /// Mission ID
     pub mission_id: Uuid,
@@ -524,6 +589,12 @@ pub struct MissionRunner {
 
     /// Whether complete_mission was explicitly called
     pub explicitly_completed: bool,
+
+    /// Current activity label (derived from latest tool call)
+    pub current_activity: Option<String>,
+
+    /// Tracked subtasks (from delegate_task/Task tool calls)
+    pub subtasks: Vec<SubtaskInfo>,
 }
 
 impl MissionRunner {
@@ -551,6 +622,8 @@ impl MissionRunner {
             deliverables: DeliverableSet::default(),
             last_activity: Instant::now(),
             explicitly_completed: false,
+            current_activity: None,
+            subtasks: Vec::new(),
         }
     }
 
@@ -817,6 +890,56 @@ async fn resolve_claudecode_default_model(library: &SharedLibrary) -> Option<Str
     }
 }
 
+/// Try to resolve a library command from a user message starting with `/`.
+/// If the message starts with `/command-name` and a matching command exists in the library,
+/// returns the command's body content (frontmatter stripped). Otherwise returns the original message.
+async fn resolve_library_command(library: &SharedLibrary, message: &str) -> String {
+    let trimmed = message.trim();
+
+    // Must start with / and have at least one non-slash character
+    if !trimmed.starts_with('/') || trimmed.len() < 2 {
+        return message.to_string();
+    }
+
+    // Extract command name and optional arguments
+    let without_slash = &trimmed[1..];
+    let (command_name, args) = match without_slash.find(|c: char| c.is_whitespace()) {
+        Some(pos) => (&without_slash[..pos], without_slash[pos..].trim()),
+        None => (without_slash, ""),
+    };
+
+    // Try to fetch from library
+    let lib_guard = library.read().await;
+    let Some(lib) = lib_guard.as_ref() else {
+        return message.to_string();
+    };
+
+    match lib.get_command(command_name).await {
+        Ok(command) => {
+            // Strip frontmatter from content to get the body
+            let (_frontmatter, body) =
+                crate::library::types::parse_frontmatter(&command.content);
+            let body = body.trim();
+
+            tracing::info!(
+                command_name = command_name,
+                has_args = !args.is_empty(),
+                "Resolved library command"
+            );
+
+            if args.is_empty() {
+                body.to_string()
+            } else {
+                format!("{}\n\nArguments: {}", body, args)
+            }
+        }
+        Err(_) => {
+            // Not a library command, pass through as-is (may be a builtin like /plan)
+            message.to_string()
+        }
+    }
+}
+
 /// Execute a single turn for a mission.
 async fn run_mission_turn(
     config: Config,
@@ -825,7 +948,7 @@ async fn run_mission_turn(
     workspaces: workspace::SharedWorkspaceStore,
     library: SharedLibrary,
     events_tx: broadcast::Sender<AgentEvent>,
-    _tool_hub: Arc<FrontendToolHub>,
+    tool_hub: Arc<FrontendToolHub>,
     _status: Arc<RwLock<ControlStatus>>,
     cancel: CancellationToken,
     history: Vec<(String, String)>,
@@ -858,6 +981,9 @@ async fn run_mission_turn(
         user_message_len = user_message.len(),
         "Mission turn started"
     );
+
+    // Resolve library commands (e.g., /bugbot-review → expanded command content)
+    let user_message = resolve_library_command(&library, &user_message).await;
 
     // Build context with history
     let max_history_chars = config.context.max_history_total_chars;
@@ -961,6 +1087,7 @@ async fn run_mission_turn(
                 &config.working_dir,
                 session_id.as_deref(),
                 is_continuation,
+                Some(Arc::clone(&tool_hub)),
             )
             .await
         }
@@ -1140,20 +1267,22 @@ fn get_amp_url_from_settings() -> Option<String> {
 ///
 /// For Host workspaces: spawns the CLI directly on the host.
 /// For Container workspaces: spawns the CLI inside the container using systemd-nspawn.
-pub async fn run_claudecode_turn(
-    workspace: &Workspace,
-    work_dir: &std::path::Path,
-    message: &str,
-    model: Option<&str>,
-    agent: Option<&str>,
+pub fn run_claudecode_turn<'a>(
+    workspace: &'a Workspace,
+    work_dir: &'a std::path::Path,
+    message: &'a str,
+    model: Option<&'a str>,
+    agent: Option<&'a str>,
     mission_id: Uuid,
     events_tx: broadcast::Sender<AgentEvent>,
     cancel: CancellationToken,
     secrets: Option<Arc<SecretsStore>>,
-    app_working_dir: &std::path::Path,
-    session_id: Option<&str>,
+    app_working_dir: &'a std::path::Path,
+    session_id: Option<&'a str>,
     is_continuation: bool,
-) -> AgentResult {
+    tool_hub: Option<Arc<FrontendToolHub>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
+    Box::pin(async move {
     use super::ai_providers::{
         get_anthropic_auth_from_workspace, get_anthropic_auth_from_host_with_expiry,
         get_workspace_auth_path, ClaudeCodeAuth, ensure_anthropic_oauth_token_valid,
@@ -1451,9 +1580,9 @@ pub async fn run_claudecode_turn(
         args.push(mode.to_string());
     }
 
-    // NOTE: --dangerously-skip-permissions cannot be used when running as root.
-    // The container runs as root, so we rely on the permissions in settings.local.json instead.
-    // The "mcp__*" permission pattern should allow all MCP tools.
+    // Skip all permission checks. IS_SANDBOX=1 is set in env vars below
+    // to allow --dangerously-skip-permissions even when running as root.
+    args.push("--dangerously-skip-permissions".to_string());
 
     // Ensure per-workspace MCP config is loaded (Claude CLI may not auto-load .claude in --print mode).
     // For container workspaces, we must translate the path to be relative to the container filesystem.
@@ -1497,6 +1626,8 @@ pub async fn run_claudecode_turn(
 
     // Build environment variables
     let mut env: HashMap<String, String> = HashMap::new();
+    // Allow --dangerously-skip-permissions when running as root inside containers.
+    env.insert("IS_SANDBOX".to_string(), "1".to_string());
     if let Some(ref auth) = api_auth {
         match auth {
             ClaudeCodeAuth::OAuthToken(token) => {
@@ -1571,7 +1702,7 @@ pub async fn run_claudecode_turn(
     let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
     let stderr_capture_clone = stderr_capture.clone();
     let mission_id_for_stderr = mission_id;
-    let stderr_handle = if let Some(stderr) = stderr {
+    let mut stderr_handle = if let Some(stderr) = stderr {
         Some(tokio::spawn(async move {
             let stderr_reader = BufReader::new(stderr);
             let mut stderr_lines = stderr_reader.lines();
@@ -1620,7 +1751,7 @@ pub async fn run_claudecode_turn(
                 tracing::info!(mission_id = %mission_id, "Claude Code execution cancelled, killing process");
                 // Kill the process to stop consuming API resources
                 let _ = child.kill().await;
-                if let Some(handle) = stderr_handle {
+                if let Some(handle) = stderr_handle.take() {
                     handle.abort();
                 }
                 return AgentResult::failure("Cancelled".to_string(), 0)
@@ -1630,7 +1761,7 @@ pub async fn run_claudecode_turn(
                 let err_msg = "Claude Code produced no output. No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
                 tracing::warn!(mission_id = %mission_id, "{}", err_msg);
                 let _ = child.kill().await;
-                if let Some(handle) = stderr_handle {
+                if let Some(handle) = stderr_handle.take() {
                     handle.abort();
                 }
                 return AgentResult::failure(err_msg.to_string(), 0)
@@ -1647,10 +1778,12 @@ pub async fn run_claudecode_turn(
                             Ok(event) => event,
                             Err(e) => {
                                 tracing::warn!(
+                                    mission_id = %mission_id,
                                     "Failed to parse Claude event: {} - line: {}",
                                     e,
                                     if line.len() > 200 {
-                                        format!("{}...", &line[..200])
+                                        let end = safe_truncate_index(&line, 200);
+                                        format!("{}...", &line[..end])
                                     } else {
                                         line.clone()
                                     }
@@ -1737,9 +1870,73 @@ pub async fn run_claudecode_turn(
                                             let _ = events_tx.send(AgentEvent::ToolCall {
                                                 tool_call_id: id.clone(),
                                                 name: name.clone(),
-                                                args: input,
+                                                args: input.clone(),
                                                 mission_id: Some(mission_id),
                                             });
+
+                                            if name == "question" || name.starts_with("ui_") {
+                                                if let Some(ref hub) = tool_hub {
+                                                    tracing::info!(
+                                                        mission_id = %mission_id,
+                                                        tool_call_id = %id,
+                                                        tool_name = %name,
+                                                        "Frontend tool detected, pausing for user input"
+                                                    );
+                                                    let hub = Arc::clone(hub);
+                                                    let rx = hub.register(id.clone()).await;
+
+                                                    let _ = child.kill().await;
+                                                    if let Some(handle) = stderr_handle.take() {
+                                                        handle.abort();
+                                                    }
+
+                                                    let answer = tokio::select! {
+                                                        _ = cancel.cancelled() => {
+                                                            return AgentResult::failure("Cancelled".to_string(), 0)
+                                                                .with_terminal_reason(TerminalReason::Cancelled);
+                                                        }
+                                                        res = rx => {
+                                                            match res {
+                                                                Ok(v) => v,
+                                                                Err(_) => {
+                                                                    return AgentResult::failure(
+                                                                        "Frontend tool result channel closed".to_string(), 0
+                                                                    ).with_terminal_reason(TerminalReason::LlmError);
+                                                                }
+                                                            }
+                                                        }
+                                                    };
+
+                                                    let _ = events_tx.send(AgentEvent::ToolResult {
+                                                        tool_call_id: id.clone(),
+                                                        name: name.clone(),
+                                                        result: answer.clone(),
+                                                        mission_id: Some(mission_id),
+                                                    });
+
+                                                    let answer_text = if let Some(answers) = answer.get("answers") {
+                                                        answers.to_string()
+                                                    } else {
+                                                        answer.to_string()
+                                                    };
+
+                                                    return run_claudecode_turn(
+                                                        workspace,
+                                                        work_dir,
+                                                        &answer_text,
+                                                        model,
+                                                        agent,
+                                                        mission_id,
+                                                        events_tx,
+                                                        cancel,
+                                                        secrets,
+                                                        app_working_dir,
+                                                        Some(&session_id),
+                                                        true,
+                                                        tool_hub,
+                                                    ).await;
+                                                }
+                                            }
                                         }
                                         ContentBlock::Thinking { thinking } => {
                                             // Only send if this is new content not already streamed
@@ -1882,6 +2079,7 @@ pub async fn run_claudecode_turn(
     } else {
         AgentResult::success(final_result, cost_cents)
     }
+    }) // end Box::pin(async move { ... })
 }
 
 /// Read CLI path for opencode from backend config file if available.
@@ -1974,6 +2172,96 @@ fn parse_opencode_session_token(value: &str) -> Option<String> {
     } else {
         Some(token)
     }
+}
+
+/// Install a lightweight `opencode` wrapper script that intercepts `opencode serve` commands
+/// and overrides the `--port` argument using the `OPENCODE_SERVER_PORT` environment variable.
+///
+/// oh-my-opencode v3 is a compiled binary that always calls `opencode serve --port=4096`.
+/// Patching the JS source files has no effect on the binary. This wrapper sits at a higher
+/// PATH priority and intercepts the `serve` call to use the allocated port instead.
+fn install_opencode_serve_port_wrapper(
+    env: &mut HashMap<String, String>,
+    workspace: &Workspace,
+    port: &str,
+) -> bool {
+    // Only needed when a non-default port override is required
+    if port == "4096" || port == "0" || port.is_empty() {
+        return false;
+    }
+
+    // Determine the wrapper directory.
+    // For containers: use /root/.openagent-bin (NOT /tmp) because nspawn mounts
+    // a fresh tmpfs over /tmp, hiding anything we write to the container rootfs.
+    let (wrapper_dir_host, wrapper_dir_env) =
+        if workspace.workspace_type == WorkspaceType::Container
+            && workspace::use_nspawn_for_workspace(workspace)
+        {
+            (
+                workspace.path.join("root").join(".openagent-bin"),
+                "/root/.openagent-bin".to_string(),
+            )
+        } else {
+            (
+                std::path::PathBuf::from("/tmp/.openagent-bin"),
+                "/tmp/.openagent-bin".to_string(),
+            )
+        };
+
+    if let Err(e) = std::fs::create_dir_all(&wrapper_dir_host) {
+        tracing::warn!("Failed to create opencode wrapper dir: {}", e);
+        return false;
+    }
+
+    // The wrapper script: intercepts `opencode serve` and overrides --port
+    let wrapper_script = r#"#!/bin/sh
+# opencode serve port override wrapper (installed by Open Agent)
+REAL_OPENCODE="$(command -v opencode 2>/dev/null || echo /usr/local/bin/opencode)"
+if [ -n "$OPENCODE_SERVER_PORT" ] && [ "$1" = "serve" ]; then
+  shift
+  new_args=""
+  for arg in "$@"; do
+    case "$arg" in
+      --port=*) ;;
+      *) new_args="$new_args $arg" ;;
+    esac
+  done
+  exec "$REAL_OPENCODE" serve --port="$OPENCODE_SERVER_PORT" $new_args
+fi
+exec "$REAL_OPENCODE" "$@"
+"#;
+
+    let wrapper_path = wrapper_dir_host.join("opencode");
+    if let Err(e) = std::fs::write(&wrapper_path, wrapper_script) {
+        tracing::warn!("Failed to write opencode wrapper: {}", e);
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    // Prepend the wrapper directory to PATH so it takes priority over the real binary
+    let current = env
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let new_path = if current.is_empty() {
+        wrapper_dir_env.clone()
+    } else {
+        format!("{}:{}", wrapper_dir_env, current)
+    };
+    env.insert("PATH".to_string(), new_path);
+
+    tracing::debug!(
+        "Installed opencode serve port wrapper at {} (port={})",
+        wrapper_dir_env,
+        port
+    );
+    true
 }
 
 fn prepend_opencode_bin_to_path(env: &mut HashMap<String, String>, workspace: &Workspace) {
@@ -2931,7 +3219,13 @@ fn find_oh_my_opencode_cli_js(workspace: &Workspace) -> Option<std::path::PathBu
 
     // Search bun cache for oh-my-opencode (used when installed via bunx)
     // Pattern: ~/.cache/.bun/install/cache/oh-my-opencode@<version>@@@1/dist/cli/index.js
-    let bun_cache_bases = ["/root/.cache/.bun/install/cache", "/home/*/.cache/.bun/install/cache"];
+    // Some bun versions use ~/.bun/install/cache instead of ~/.cache/.bun/install/cache
+    let bun_cache_bases = [
+        "/root/.cache/.bun/install/cache",
+        "/root/.bun/install/cache",
+        "/home/*/.cache/.bun/install/cache",
+        "/home/*/.bun/install/cache",
+    ];
     for base in bun_cache_bases {
         let base_path = workspace_abs_path(workspace, std::path::Path::new(base));
         if let Ok(entries) = std::fs::read_dir(&base_path) {
@@ -4208,7 +4502,24 @@ pub async fn run_opencode_turn(
         )
         .await;
     }
-    let port_override_supported = patch_oh_my_opencode_port_override(workspace);
+    // Pre-cache oh-my-opencode via bunx/npx so the port override patch can find the CLI JS.
+    // When the runner is bunx/npx, the package isn't cached until the actual run command.
+    // Without pre-caching, the patch fails and the port falls back to 4096, which may
+    // conflict with a standalone opencode.service on the host (shared network namespace).
+    if !runner_is_direct && find_oh_my_opencode_cli_js(workspace).is_none() {
+        tracing::debug!(
+            mission_id = %mission_id,
+            cli_runner = %cli_runner,
+            "Pre-caching oh-my-opencode for port override patch"
+        );
+        let precache_args = vec!["oh-my-opencode".to_string(), "--version".to_string()];
+        let _ = workspace_exec
+            .output(work_dir, &cli_runner, &precache_args, HashMap::new())
+            .await;
+    }
+    // Patch JS source for older (pre-v3) JS-based oh-my-opencode versions.
+    // For v3+ compiled binaries, the wrapper script handles port override instead.
+    let _ = patch_oh_my_opencode_port_override(workspace);
 
     // Build CLI arguments for oh-my-opencode run
     // The 'run' command takes a prompt and executes it with completion detection
@@ -4230,6 +4541,10 @@ pub async fn run_opencode_turn(
     // Add timeout (0 = no timeout, let the agent complete)
     args.push("--timeout".to_string());
     args.push("0".to_string());
+
+    // JSON format for structured event streaming on stdout
+    args.push("--format".to_string());
+    args.push("json".to_string());
 
     // The message is passed as the final argument
     args.push(message.to_string());
@@ -4258,15 +4573,6 @@ pub async fn run_opencode_turn(
         opencode_port = "4096".to_string();
     }
 
-    if !port_override_supported {
-        if requested_port.is_some() {
-            tracing::warn!(
-                mission_id = %mission_id,
-                "Requested OPENCODE_SERVER_PORT override but oh-my-opencode could not be patched; falling back to port 4096"
-            );
-        }
-        opencode_port = "4096".to_string();
-    }
     env.insert("OPENCODE_SERVER_PORT".to_string(), opencode_port.clone());
     if let Ok(host) = std::env::var("OPEN_AGENT_OPENCODE_SERVER_HOSTNAME") {
         if !host.trim().is_empty() {
@@ -4340,6 +4646,15 @@ pub async fn run_opencode_turn(
 
     prepend_opencode_bin_to_path(&mut env, workspace);
 
+    // Install the opencode serve wrapper AFTER prepend_opencode_bin_to_path so the
+    // wrapper dir (/tmp/.openagent-bin) is prepended last and takes priority over
+    // the real binary at ~/.opencode/bin/opencode.
+    // oh-my-opencode v3+ is a compiled binary that spawns `opencode serve --port=4096`;
+    // the wrapper intercepts this and overrides the port.
+    if opencode_port != "4096" {
+        install_opencode_serve_port_wrapper(&mut env, workspace, &opencode_port);
+    }
+
     cleanup_opencode_listeners(&workspace_exec, work_dir, Some(&opencode_port)).await;
 
     // Use WorkspaceExec to spawn the CLI in the correct workspace context
@@ -4378,7 +4693,9 @@ pub async fn run_opencode_turn(
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
 
-    let sse_handle = if command_available(&workspace_exec, work_dir, "curl").await {
+    // With --format json, events stream on stdout so skip the SSE curl approach.
+    let use_json_stdout = true;
+    let sse_handle = if !use_json_stdout && command_available(&workspace_exec, work_dir, "curl").await {
         let workspace_exec = workspace_exec.clone();
         let work_dir = work_dir.to_path_buf();
         let work_dir_arg = work_dir_arg.clone();
@@ -4531,87 +4848,28 @@ pub async fn run_opencode_turn(
         None
     };
 
-    let mut stdout_reader = stdout;
-
-    // Spawn a task to read stderr events if available
-    let events_tx_clone = events_tx.clone();
+    // Spawn a task to read stderr (just log in JSON mode, events come on stdout)
     let mission_id_clone = mission_id;
-    let session_id_clone = session_id_capture.clone();
     let stderr_handle = if let Some(stderr) = stderr {
         Some(tokio::spawn(async move {
             let stderr_reader = BufReader::new(stderr);
             let mut stderr_lines = stderr_reader.lines();
-            let mut last_tool_id: Option<String> = None;
-            let mut last_tool_name: Option<String> = None;
-
             while let Ok(Some(line)) = stderr_lines.next_line().await {
-                let clean = strip_ansi_codes(&line);
-                let clean = clean.trim().to_string();
-                if clean.is_empty() {
-                    continue;
+                let clean = line.trim().to_string();
+                if !clean.is_empty() {
+                    tracing::debug!(mission_id = %mission_id_clone, line = %clean, "OpenCode CLI stderr");
                 }
-
-                tracing::debug!(mission_id = %mission_id_clone, line = %clean, "OpenCode CLI stderr");
-
-                if let Some(session) = extract_opencode_session_id(&clean) {
-                    let mut guard = session_id_clone.lock().unwrap();
-                    if guard.is_none() {
-                        *guard = Some(session);
-                    }
-                }
-
-                // Parse stderr for tool execution events
-                // Format: "[MAIN] ⚡ TOOL.EXECUTE: <tool>" or "✓ TOOL.RESULT: \"...\""
-                if clean.contains("TOOL.EXECUTE:") {
-                    // Extract tool name from the line
-                    if let Some(name_start) = clean.find("TOOL.EXECUTE:") {
-                        let name_part = &clean[name_start + 14..];
-                        let tool_name = name_part.trim().trim_matches('"');
-                        let tool_id = format!("opencode-{}", uuid::Uuid::new_v4());
-                        last_tool_id = Some(tool_id.clone());
-                        last_tool_name = Some(tool_name.to_string());
-                        let _ = events_tx_clone.send(AgentEvent::ToolCall {
-                            tool_call_id: tool_id,
-                            name: tool_name.to_string(),
-                            args: serde_json::json!({}),
-                            mission_id: Some(mission_id_clone),
-                        });
-                    }
-                } else if clean.contains("TOOL.RESULT:") {
-                    // Emit tool result using the most recent tool call if available
-                    let tool_id = last_tool_id
-                        .clone()
-                        .unwrap_or_else(|| format!("opencode-{}", uuid::Uuid::new_v4()));
-                    let tool_name = last_tool_name
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let _ = events_tx_clone.send(AgentEvent::ToolResult {
-                        tool_call_id: tool_id,
-                        name: tool_name,
-                        result: serde_json::json!({ "output": clean }),
-                        mission_id: Some(mission_id_clone),
-                    });
-                } else if clean.contains("SESSION.ERROR:")
-                    || clean.contains("Error:")
-                    || clean.contains("error:")
-                {
-                    // Emit error event
-                    let _ = events_tx_clone.send(AgentEvent::Error {
-                        message: clean.clone(),
-                        mission_id: Some(mission_id_clone),
-                        resumable: true,
-                    });
-                }
-
             }
         }))
     } else {
         None
     };
 
-    // Process stdout until completion or cancellation
-    // stdout contains the actual assistant response text
-    let mut buffer = [0u8; 4096];
+    // Process stdout NDJSON events from --format json
+    // Each line is a JSON event: {"type":"message.part.updated","properties":{...}}
+    let stdout_reader = BufReader::new(stdout);
+    let mut stdout_lines = stdout_reader.lines();
+    let mut state = OpencodeSseState::default();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -4623,21 +4881,96 @@ pub async fn run_opencode_turn(
                 return AgentResult::failure("Cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
             }
-            read_result = stdout_reader.read(&mut buffer) => {
-                match read_result {
-                    Ok(0) => {
+            line_result = stdout_lines.next_line() => {
+                match line_result {
+                    Ok(None) => {
                         // EOF - process finished
                         break;
                     }
-                    Ok(n) => {
-                        let chunk = String::from_utf8_lossy(&buffer[..n]);
-                        if !chunk.is_empty() {
-                            tracing::debug!(mission_id = %mission_id, chunk = %chunk, "OpenCode CLI stdout");
-                            final_result.push_str(&chunk);
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
 
-                            if chunk.contains("Error:") || chunk.contains("error:") {
-                                had_error = true;
+                        // Try to parse as JSON event
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                            let event_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            tracing::debug!(
+                                mission_id = %mission_id,
+                                event_type = %event_type,
+                                "OpenCode JSON event"
+                            );
+
+                            // Extract text content from message.part.updated for final result
+                            if event_type == "message.part.updated" {
+                                if let Some(props) = json.get("properties") {
+                                    if let Some(part) = props.get("part") {
+                                        let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                        if part_type == "text" {
+                                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                                final_result = text.to_string();
+                                            }
+                                        }
+                                    }
+                                }
                             }
+
+                            // Handle completion and error events from oh-my-opencode
+                            if event_type == "completion" {
+                                tracing::info!(mission_id = %mission_id, "OpenCode JSON completion event");
+                            } else if event_type == "error" {
+                                had_error = true;
+                                if let Some(props) = json.get("properties") {
+                                    if let Some(err) = props.get("error").and_then(|e| e.as_str()) {
+                                        tracing::warn!(mission_id = %mission_id, error = %err, "OpenCode JSON error event");
+                                        if final_result.is_empty() {
+                                            final_result = err.to_string();
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Route through SSE event parser for thinking/tool events
+                            let current_session = session_id_capture.lock().unwrap().clone();
+                            if let Some(parsed) = parse_opencode_sse_event(
+                                trimmed,
+                                None,
+                                current_session.as_deref(),
+                                &mut state,
+                                mission_id,
+                            ) {
+                                if let Some(session_id) = parsed.session_id {
+                                    let mut guard = session_id_capture.lock().unwrap();
+                                    if guard.is_none() {
+                                        *guard = Some(session_id);
+                                    }
+                                }
+                                if let Some(event) = parsed.event {
+                                    if matches!(event, AgentEvent::Thinking { .. }) {
+                                        sse_emitted_thinking.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                    let _ = events_tx.send(event);
+                                }
+                                if parsed.message_complete {
+                                    // Send thinking done signal if needed
+                                    if sse_emitted_thinking.load(std::sync::atomic::Ordering::SeqCst)
+                                        && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst)
+                                    {
+                                        let _ = events_tx.send(AgentEvent::Thinking {
+                                            content: String::new(),
+                                            done: true,
+                                            mission_id: Some(mission_id),
+                                        });
+                                        sse_done_sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                }
+                            }
+                        } else {
+                            // Non-JSON line (shouldn't happen with --format json, but handle gracefully)
+                            tracing::debug!(mission_id = %mission_id, line = %trimmed, "OpenCode non-JSON stdout");
+                            final_result.push_str(trimmed);
+                            final_result.push('\n');
                         }
                     }
                     Err(e) => {
@@ -5039,7 +5372,7 @@ pub async fn run_amp_turn(
                                 tracing::warn!(
                                     mission_id = %mission_id,
                                     error = %e,
-                                    line = %if line.len() > 200 { format!("{}...", &line[..200]) } else { line.clone() },
+                                    line = %if line.len() > 200 { let end = safe_truncate_index(&line, 200); format!("{}...", &line[..end]) } else { line.clone() },
                                     "Failed to parse Amp event"
                                 );
                                 continue;
@@ -5206,12 +5539,20 @@ pub async fn run_amp_turn(
                             AmpEvent::Result(res) => {
                                 if res.is_error || res.subtype == "error" {
                                     had_error = true;
-                                    let err_msg = res.result.clone().unwrap_or_else(|| "Unknown error".to_string());
-                                    let _ = events_tx.send(AgentEvent::Error {
-                                        message: err_msg.clone(),
-                                        mission_id: Some(mission_id),
-                                        resumable: true,
-                                    });
+                                    let err_msg = res.error_message();
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        subtype = %res.subtype,
+                                        result = ?res.result,
+                                        error = ?res.error,
+                                        message = ?res.message,
+                                        raw_line = %if line.len() > 500 { let end = safe_truncate_index(&line, 500); format!("{}...", &line[..end]) } else { line.clone() },
+                                        "Amp error result event"
+                                    );
+                                    // Don't send an Error event here - let the failure propagate
+                                    // through the AgentResult. control.rs will emit an AssistantMessage
+                                    // with success=false which the UI displays as a failure message.
+                                    // Sending Error here would cause duplicate messages.
                                     final_result = err_msg;
                                 } else {
                                     if let Some(result) = res.result {
@@ -5247,18 +5588,11 @@ pub async fn run_amp_turn(
 
     // Wait for process to finish
     let exit_status = child.wait().await;
-    if let Some(handle) = stderr_handle {
-        handle.abort();
-    }
 
-    // Check exit status
-    let success = match exit_status {
-        Ok(status) => status.success() && !had_error,
-        Err(e) => {
-            tracing::error!(mission_id = %mission_id, error = %e, "Failed to wait for Amp process");
-            false
-        }
-    };
+    // Wait for stderr capture to complete (don't abort - we need the content)
+    if let Some(handle) = stderr_handle {
+        let _ = handle.await;
+    }
 
     // Compute cost from accumulated token usage
     let usage = crate::cost::TokenUsage {
@@ -5271,7 +5605,7 @@ pub async fn run_amp_turn(
         .as_deref()
         .map(|m| crate::cost::cost_cents_from_usage(m, &usage))
         .unwrap_or(0);
-    
+
     tracing::debug!(
         mission_id = %mission_id,
         model = ?model_used,
@@ -5282,6 +5616,69 @@ pub async fn run_amp_turn(
         cost_cents = cost_cents,
         "Amp cost computed from token usage"
     );
+
+    // If no final result from Assistant or Result events, use accumulated text buffer
+    if final_result.trim().is_empty() && !text_buffer.is_empty() {
+        let mut sorted_entries: Vec<_> = text_buffer.iter().collect();
+        sorted_entries.sort_by_key(|(idx, _)| *idx);
+        final_result = sorted_entries.into_iter().map(|(_, text)| text.clone()).collect::<Vec<_>>().join("");
+        tracing::debug!(
+            mission_id = %mission_id,
+            "Using accumulated text buffer as final result ({} chars)",
+            final_result.len()
+        );
+    }
+
+    // If result is still empty/generic, include stderr for a useful error message
+    if (final_result.trim().is_empty() || final_result == "Unknown error") && !had_error {
+        had_error = true;
+        let stderr_content = stderr_capture.lock().await;
+        if !stderr_content.is_empty() {
+            tracing::warn!(
+                mission_id = %mission_id,
+                stderr = %stderr_content,
+                exit_status = ?exit_status,
+                "Amp CLI produced no useful output but had stderr"
+            );
+            final_result = format!(
+                "Amp error: {}",
+                stderr_content.lines().take(5).collect::<Vec<_>>().join(" | ")
+            );
+        } else {
+            tracing::warn!(
+                mission_id = %mission_id,
+                exit_status = ?exit_status,
+                "Amp CLI produced no output and no stderr"
+            );
+            final_result =
+                "Amp CLI produced no output. Check CLI installation or API key.".to_string();
+        }
+    } else if had_error && (final_result.trim().is_empty() || final_result == "Unknown error") {
+        // Error was flagged by Result event but message is empty/generic - enrich with stderr
+        let stderr_content = stderr_capture.lock().await;
+        if !stderr_content.is_empty() {
+            tracing::warn!(
+                mission_id = %mission_id,
+                stderr = %stderr_content,
+                "Amp error with no result text, using stderr"
+            );
+            final_result = format!(
+                "Amp error: {}",
+                stderr_content.lines().take(5).collect::<Vec<_>>().join(" | ")
+            );
+        } else {
+            final_result = "Amp CLI returned an error with no details. Check API key and network connectivity.".to_string();
+        }
+    }
+
+    // Check exit status
+    let success = match exit_status {
+        Ok(status) => status.success() && !had_error,
+        Err(e) => {
+            tracing::error!(mission_id = %mission_id, error = %e, "Failed to wait for Amp process");
+            false
+        }
+    };
 
     // Note: Do NOT emit AssistantMessage here - control.rs emits it based on AgentResult.
     // Emitting here would cause duplicate messages in the UI.
@@ -5309,6 +5706,13 @@ pub struct RunningMissionInfo {
     pub history_len: usize,
     pub seconds_since_activity: u64,
     pub expected_deliverables: usize,
+    /// Current activity label (e.g., "Reading: main.rs")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_activity: Option<String>,
+    /// Total tracked subtasks
+    pub subtask_total: usize,
+    /// Completed subtasks
+    pub subtask_completed: usize,
 }
 
 impl From<&MissionRunner> for RunningMissionInfo {
@@ -5325,6 +5729,9 @@ impl From<&MissionRunner> for RunningMissionInfo {
             history_len: runner.history.len(),
             seconds_since_activity: runner.last_activity.elapsed().as_secs(),
             expected_deliverables: runner.deliverables.deliverables.len(),
+            current_activity: runner.current_activity.clone(),
+            subtask_total: runner.subtasks.len(),
+            subtask_completed: runner.subtasks.iter().filter(|s| s.completed).count(),
         }
     }
 }

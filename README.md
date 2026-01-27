@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Self-hosted cloud orchestrator for AI coding agents</strong><br/>
-  Isolated Linux workspaces with Claude Code & OpenCode runtimes
+  Isolated Linux workspaces with Claude Code, OpenCode & Amp runtimes
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@
 </p>
 
 <p align="center">
-  <strong>Ready to deploy?</strong> Ask your local AI agent to check out <a href="./INSTALL.md">INSTALL.md</a> it'll guide you through everything.
+  <strong>Ready to deploy?</strong> Jump to the <a href="#choose-your-installation-method">installation comparison</a>, or go straight to the <a href="docs/install-docker.md">Docker guide</a> / <a href="docs/install-native.md">native guide</a>.
 </p>
 
 ---
@@ -89,36 +89,45 @@ Each runtime executes inside isolated workspaces, so bash commands and file oper
 
 ## Getting Started
 
-### Production Setup (the easy way)
+### Choose your installation method
 
-1. Get a dedicated server (e.g., [Hetzner](https://www.hetzner.com/), Ubuntu 24.04)
-2. Point a domain to your server IP
-3. Clone this repo locally
-4. Ask Claude to set it up:
-   > "Please deploy Open Agent on my server at `<IP>` with domain `agent.example.com`"
+| | Docker (recommended) | Native (bare metal) |
+|---|---|---|
+| **Best for** | Getting started, macOS users, quick deployment | Production servers, maximum performance |
+| **Platform** | Any OS with Docker | Ubuntu 24.04 LTS |
+| **Setup time** | ~5 minutes | ~30 minutes |
+| **Container workspaces** | Yes (with `privileged: true`) | Yes (native systemd-nspawn) |
+| **Desktop automation** | Yes (headless Xvfb inside Docker) | Yes (native X11 or Xvfb) |
+| **Performance** | Good (slight overhead on macOS) | Best (native Linux) |
+| **Updates** | `docker compose pull` / rebuild | Git pull + cargo build, or one-click from dashboard |
 
-That's it. Claude will handle nginx, SSL, systemd services, and everything else.
+### Docker (recommended for most users)
 
-If you feel smarter than the AI, check out **[INSTALL.md](./INSTALL.md)**.
-
-### Local Development
-
-**Backend** (local dev):
 ```bash
-export OPENCODE_BASE_URL="http://127.0.0.1:4096"
-cargo run
+git clone https://github.com/Th0rgal/openagent.git
+cd openagent
+cp .env.example .env
+# Edit .env with your settings
+docker compose up -d
 ```
 
-`OPENCODE_BASE_URL` is optional for mission execution (per-workspace CLI is used). Keep it set if you rely on a shared OpenCode server for provider/auth management.
+Open `http://localhost:3000` — that's it.
 
-**Dashboard**:
-```bash
-cd dashboard
-bun install
-bun dev
-```
+For container workspace isolation (recommended), uncomment `privileged: true` in `docker-compose.yml`.
 
-Open `http://localhost:3001`
+→ **[Full Docker setup guide](docs/install-docker.md)**
+
+### Native (bare metal)
+
+For production servers running Ubuntu 24.04 with maximum performance and native systemd-nspawn isolation.
+
+→ **[Full native installation guide](docs/install-native.md)**
+
+### AI-assisted setup
+
+Point your coding agent at the installation guide and let it handle the deployment:
+
+> "Deploy Open Agent on my server at `1.2.3.4` with domain `agent.example.com`"
 
 ---
 

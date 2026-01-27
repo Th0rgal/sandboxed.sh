@@ -143,6 +143,11 @@ pub struct Workspace {
     /// Set to false for isolated networking (e.g., Tailscale).
     #[serde(default)]
     pub shared_network: Option<bool>,
+    /// MCP server names to enable for this workspace.
+    /// Empty = use all MCPs with `default_enabled = true`.
+    /// Non-empty = allowlist of MCP names.
+    #[serde(default)]
+    pub mcps: Vec<String>,
 }
 
 impl Workspace {
@@ -165,6 +170,7 @@ impl Workspace {
             tools: Vec::new(),
             plugins: Vec::new(),
             shared_network: None,
+            mcps: Vec::new(),
         }
     }
 
@@ -187,6 +193,7 @@ impl Workspace {
             tools: Vec::new(),
             plugins: Vec::new(),
             shared_network: None,
+            mcps: Vec::new(),
         }
     }
 }
@@ -375,6 +382,7 @@ impl WorkspaceStore {
                     tools: Vec::new(),
                     plugins: Vec::new(),
                     shared_network: None, // Default to shared network
+                    mcps: Vec::new(),
                 };
 
                 orphaned.push(workspace);
@@ -714,6 +722,32 @@ fn opencode_entry_from_mcp(
                 cmd.extend(args.clone());
                 entry.insert("command".to_string(), json!(cmd));
             } else {
+                // When per_workspace_runner is true and workspace is a container,
+                // the harness (Claude Code / OpenCode) runs inside the container
+                // and spawns MCP servers as subprocesses. Env vars must use
+                // container-relative paths, not host paths.
+                if workspace_type == WorkspaceType::Container
+                    && per_workspace_runner
+                    && !container_fallback
+                {
+                    let rel = workspace_dir
+                        .strip_prefix(workspace_root)
+                        .unwrap_or_else(|_| Path::new(""));
+                    let rel_str = if rel.as_os_str().is_empty() {
+                        "/".to_string()
+                    } else {
+                        format!("/{}", rel.to_string_lossy())
+                    };
+                    merged_env
+                        .insert("OPEN_AGENT_WORKSPACE".to_string(), rel_str.clone());
+                    merged_env.insert(
+                        "OPEN_AGENT_WORKSPACE_ROOT".to_string(),
+                        "/".to_string(),
+                    );
+                    merged_env
+                        .insert("WORKING_DIR".to_string(), rel_str);
+                }
+
                 let mut cmd = vec![resolve_command_path(command)];
                 cmd.extend(args.clone());
                 entry.insert("command".to_string(), json!(cmd));
@@ -2255,6 +2289,31 @@ async fn prepare_workspace_dir(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Filter MCP configs based on a workspace's MCP allowlist.
+///
+/// - Empty `workspace_mcps` → include only MCPs with `default_enabled = true`
+/// - Non-empty `workspace_mcps` → include only MCPs whose name is in the list
+///
+/// In both cases, globally disabled MCPs are excluded.
+fn filter_mcp_configs_for_workspace(
+    configs: Vec<McpServerConfig>,
+    workspace_mcps: &[String],
+) -> Vec<McpServerConfig> {
+    configs
+        .into_iter()
+        .filter(|c| {
+            if !c.enabled {
+                return false;
+            }
+            if workspace_mcps.is_empty() {
+                c.default_enabled
+            } else {
+                workspace_mcps.iter().any(|name| name == &c.name)
+            }
+        })
+        .collect()
+}
+
 /// Prepare a custom workspace directory and write `opencode.json`.
 pub async fn prepare_custom_workspace(
     _config: &Config,
@@ -2296,7 +2355,7 @@ pub async fn prepare_mission_workspace_in(
 ) -> anyhow::Result<PathBuf> {
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
-    let mcp_configs = mcp.list_configs().await;
+    let mcp_configs = filter_mcp_configs_for_workspace(mcp.list_configs().await, &workspace.mcps);
     let skill_allowlist = if workspace.skills.is_empty() {
         None
     } else {
@@ -2338,7 +2397,8 @@ pub async fn prepare_mission_workspace_with_skills_backend(
 ) -> anyhow::Result<PathBuf> {
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
-    let mcp_configs = mcp.list_configs().await;
+    let mcp_configs =
+        filter_mcp_configs_for_workspace(mcp.list_configs().await, &workspace.mcps);
     let skill_allowlist = if workspace.skills.is_empty() {
         None
     } else {
@@ -2995,9 +3055,20 @@ pub async fn build_container_workspace(
         distro.as_str()
     );
 
+    // Initialize the build log so the dashboard can show progress immediately.
+    let build_log = nspawn::build_log_path_for(&workspace.path);
+    let _ = std::fs::write(
+        &build_log,
+        format!(
+            "[openagent] Building container with {} (this may take a few minutes)...\n",
+            distro.as_str()
+        ),
+    );
+
     // Create the container
     match nspawn::create_container(&workspace.path, distro).await {
         Ok(()) => {
+            append_to_init_log(&workspace.path, "[openagent] Base system installed\n");
             match seed_shard_data(&workspace.path).await {
                 Ok(true) => {
                     tracing::info!(workspace = %workspace.name, "Seeded Shard data into container workspace")
@@ -3017,12 +3088,20 @@ pub async fn build_container_workspace(
                 return Err(e);
             }
 
+            if workspace.init_script.as_ref().map_or(false, |s| !s.trim().is_empty()) {
+                append_to_init_log(&workspace.path, "[openagent] Running init script...\n");
+            }
             if let Err(e) = run_workspace_init_script(workspace).await {
+                append_to_init_log(
+                    &workspace.path,
+                    &format!("[openagent] Init script failed: {}\n", e),
+                );
                 workspace.status = WorkspaceStatus::Error;
                 workspace.error_message = Some(format!("Init script failed: {}", e));
                 tracing::error!("Init script failed: {}", e);
                 return Err(e);
             }
+            append_to_init_log(&workspace.path, "[openagent] Installing harnesses...\n");
             if let Err(e) = bootstrap_workspace_harnesses(workspace).await {
                 tracing::warn!(
                     workspace = %workspace.name,
@@ -3046,6 +3125,25 @@ pub async fn build_container_workspace(
                 Err(anyhow::anyhow!("Container build failed: {}", e))
             }
         }
+    }
+}
+
+/// Append a line to the container's init log (var/log/openagent-init.log).
+/// Falls back to the build log sibling file if the container filesystem isn't ready yet.
+fn append_to_init_log(container_path: &Path, msg: &str) {
+    use std::io::Write;
+    let log_path = container_path.join("var/log/openagent-init.log");
+    let target = if log_path.parent().map_or(false, |p| p.exists()) {
+        log_path
+    } else {
+        nspawn::build_log_path_for(container_path)
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&target)
+    {
+        let _ = f.write_all(msg.as_bytes());
     }
 }
 
@@ -3267,18 +3365,26 @@ async fn run_workspace_init_script(workspace: &Workspace) -> anyhow::Result<()> 
     // Clean up the script file after execution.
     let _ = tokio::fs::remove_file(&script_path).await;
 
+    // Append init script output to the build log so the dashboard can show it.
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    if !stdout_str.trim().is_empty() {
+        append_to_init_log(&workspace.path, &stdout_str);
+    }
+    if !stderr_str.trim().is_empty() {
+        append_to_init_log(&workspace.path, &stderr_str);
+    }
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let mut message = String::new();
-        if !stderr.trim().is_empty() {
-            message.push_str(stderr.trim());
+        if !stderr_str.trim().is_empty() {
+            message.push_str(stderr_str.trim());
         }
-        if !stdout.trim().is_empty() {
+        if !stdout_str.trim().is_empty() {
             if !message.is_empty() {
                 message.push_str(" | ");
             }
-            message.push_str(stdout.trim());
+            message.push_str(stdout_str.trim());
         }
         if message.is_empty() {
             message = "Init script failed with no output".to_string();

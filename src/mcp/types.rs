@@ -181,6 +181,11 @@ pub struct McpServerConfig {
     pub description: Option<String>,
     /// Whether this MCP is enabled
     pub enabled: bool,
+    /// Whether this MCP is included by default in new workspaces.
+    /// When a workspace has an empty `mcps` list, only MCPs with
+    /// `default_enabled = true` are written into its config.
+    #[serde(default)]
+    pub default_enabled: bool,
     /// Optional version string
     pub version: Option<String>,
     /// Tool names exposed by this MCP (populated after connection)
@@ -208,6 +213,7 @@ impl McpServerConfig {
             scope: McpScope::Global,
             description: None,
             enabled: true,
+            default_enabled: false,
             version: None,
             tools: Vec::new(),
             tool_descriptors: Vec::new(),
@@ -230,6 +236,7 @@ impl McpServerConfig {
             scope: McpScope::Global,
             description: None,
             enabled: true,
+            default_enabled: false,
             version: None,
             tools: Vec::new(),
             tool_descriptors: Vec::new(),
@@ -296,6 +303,9 @@ pub struct AddMcpRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub scope: Option<McpScope>,
+    /// Whether this MCP is included by default in new workspaces.
+    #[serde(default)]
+    pub default_enabled: Option<bool>,
 }
 
 /// Request to update an MCP server.
@@ -306,6 +316,8 @@ pub struct UpdateMcpRequest {
     pub description: Option<String>,
     pub enabled: Option<bool>,
     pub scope: Option<McpScope>,
+    /// Whether this MCP is included by default in new workspaces.
+    pub default_enabled: Option<bool>,
 }
 
 /// MCP tool list response from server.

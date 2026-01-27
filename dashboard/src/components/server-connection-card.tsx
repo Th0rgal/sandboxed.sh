@@ -77,7 +77,7 @@ export function ServerConnectionCard({
       const result = await getSystemComponents();
       return result.components;
     },
-    { revalidateOnFocus: false }
+    { revalidateOnFocus: false, dedupingInterval: 0 }
   );
   const components = data ?? [];
 
@@ -103,13 +103,13 @@ export function ServerConnectionCard({
           },
         ]);
       },
-      () => {
+      async () => {
         toast.success(
           `${componentNames[component.name] || component.name} updated successfully!`
         );
         setUpdatingComponent(null);
-        // Small delay to ensure backend has updated its cache/state
-        setTimeout(() => mutate(), 500);
+        // Force SWR to refetch fresh data (bypass cache).
+        await mutate(undefined, { revalidate: true });
       },
       (error: string) => {
         toast.error(`Update failed: ${error}`);

@@ -38,6 +38,9 @@ struct ControlView: View {
     // Track pending fetch to prevent race conditions
     @State private var fetchingMissionId: String?
 
+    // Thoughts panel state
+    @State private var showThoughts = false
+
     // Desktop stream state
     @State private var showDesktopStream = false
     @State private var desktopDisplayId = ":101"
@@ -186,14 +189,16 @@ struct ControlView: View {
             }
 
             ToolbarItem(placement: .topBarTrailing) {
-                // Desktop stream button
+                // Thoughts panel button
                 Button {
-                    showDesktopStream = true
+                    showThoughts = true
                     HapticService.lightTap()
                 } label: {
-                    Image(systemName: "display")
+                    Image(systemName: "brain")
                         .font(.system(size: 14))
-                        .foregroundStyle(Theme.textSecondary)
+                        .foregroundStyle(
+                            messages.contains(where: { $0.isThinking }) ? Theme.accent : Theme.textSecondary
+                        )
                 }
             }
 
@@ -206,6 +211,12 @@ struct ControlView: View {
                         }
                     } label: {
                         Label("New Mission", systemImage: "plus")
+                    }
+
+                    Button {
+                        showThoughts = true
+                    } label: {
+                        Label("View Thoughts", systemImage: "brain")
                     }
 
                     // Desktop stream option with display selector
@@ -320,6 +331,12 @@ struct ControlView: View {
         }
         .sheet(isPresented: $showDesktopStream) {
             DesktopStreamView(displayId: desktopDisplayId)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+        }
+        .sheet(isPresented: $showThoughts) {
+            ThoughtsSheet(messages: messages)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .presentationBackgroundInteraction(.enabled(upThrough: .medium))
@@ -518,7 +535,7 @@ struct ControlView: View {
     
     private var hasActiveStreamingItem: Bool {
         messages.contains { msg in
-            (msg.isThinking && !msg.thinkingDone) || msg.isPhase
+            (msg.isThinking && !msg.thinkingDone) || msg.isPhase || (msg.isToolCall && msg.isActiveToolCall)
         }
     }
 
@@ -1271,8 +1288,8 @@ struct ControlView: View {
                     }
                 }
 
-                // Remove any incomplete thinking messages and phase messages
-                messages.removeAll { ($0.isThinking && !$0.thinkingDone) || $0.isPhase }
+                // Remove any incomplete thinking messages, phase messages, and active tool calls
+                messages.removeAll { ($0.isThinking && !$0.thinkingDone) || $0.isPhase || ($0.isToolCall && $0.isActiveToolCall) }
 
                 let message = ChatMessage(
                     id: id,
@@ -1376,6 +1393,16 @@ struct ControlView: View {
                         toolUI: toolUI
                     )
                     messages.append(message)
+                } else {
+                    // Non-UI tool call: replace the previous active tool indicator
+                    // to show only the latest tool being used
+                    messages.removeAll { $0.isToolCall && $0.isActiveToolCall }
+                    let message = ChatMessage(
+                        id: "tool-\(toolCallId)",
+                        type: .toolCall(name: name, isActive: true),
+                        content: ""
+                    )
+                    messages.append(message)
                 }
             }
 
@@ -1430,6 +1457,9 @@ private struct MessageBubble: View {
                 Spacer(minLength: 60)
             } else if message.isPhase {
                 PhaseBubble(message: message)
+                Spacer(minLength: 60)
+            } else if message.isToolCall {
+                ToolCallBubble(message: message)
                 Spacer(minLength: 60)
             } else if message.isToolUI {
                 toolUIBubble
@@ -1769,6 +1799,68 @@ private struct PhaseBubble: View {
     }
 }
 
+// MARK: - Tool Call Bubble
+
+private struct ToolCallBubble: View {
+    let message: ChatMessage
+
+    var body: some View {
+        if let name = message.toolCallName {
+            HStack(spacing: 8) {
+                Image(systemName: toolIcon(for: name))
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.textSecondary)
+                    .frame(width: 24, height: 24)
+                    .background(Theme.backgroundTertiary)
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                Text(name)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(Theme.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Spacer()
+
+                if message.isActiveToolCall {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .scaleEffect(0.6)
+                        .tint(Theme.textMuted)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Theme.textMuted.opacity(0.15), lineWidth: 1)
+            )
+            .transition(.opacity.combined(with: .scale(scale: 0.95)))
+        }
+    }
+
+    private func toolIcon(for name: String) -> String {
+        let lower = name.lowercased()
+        if lower.contains("bash") || lower.contains("shell") || lower.contains("terminal") || lower.contains("exec") {
+            return "terminal"
+        } else if lower.contains("read") || lower.contains("file") || lower.contains("write") {
+            return "doc.text"
+        } else if lower.contains("search") || lower.contains("grep") || lower.contains("find") || lower.contains("glob") {
+            return "magnifyingglass"
+        } else if lower.contains("browser") || lower.contains("web") || lower.contains("http") || lower.contains("fetch") {
+            return "globe"
+        } else if lower.contains("edit") || lower.contains("patch") || lower.contains("notebook") {
+            return "chevron.left.forwardslash.chevron.right"
+        } else if lower.contains("task") || lower.contains("agent") || lower.contains("subagent") {
+            return "person.2"
+        } else {
+            return "wrench"
+        }
+    }
+}
+
 // MARK: - Thinking Bubble
 
 private struct ThinkingBubble: View {
@@ -1907,6 +1999,163 @@ private struct ThinkingBubble: View {
     }
 }
 
+
+// MARK: - Thoughts Sheet
+
+private struct ThoughtsSheet: View {
+    let messages: [ChatMessage]
+    @Environment(\.dismiss) private var dismiss
+
+    private var thinkingMessages: [ChatMessage] {
+        messages.filter { $0.isThinking }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if thinkingMessages.isEmpty {
+                    ContentUnavailableView(
+                        "No Thoughts Yet",
+                        systemImage: "brain",
+                        description: Text("Agent thoughts will appear here during execution.")
+                    )
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 12) {
+                                ForEach(thinkingMessages) { msg in
+                                    ThoughtRow(message: msg)
+                                        .id(msg.id)
+                                }
+                            }
+                            .padding()
+                        }
+                        .onAppear {
+                            if let last = thinkingMessages.last {
+                                proxy.scrollTo(last.id, anchor: .bottom)
+                            }
+                        }
+                        .onChange(of: thinkingMessages.count) { _, _ in
+                            if let last = thinkingMessages.last {
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    proxy.scrollTo(last.id, anchor: .bottom)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Thoughts")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Text("\(thinkingMessages.count)")
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundStyle(Theme.textMuted)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+private struct ThoughtRow: View {
+    let message: ChatMessage
+    @State private var isExpanded = true
+    @State private var elapsedSeconds: Int = 0
+    @State private var timerTask: Task<Void, Never>?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // Header
+            Button {
+                withAnimation(.spring(duration: 0.2)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "brain")
+                        .font(.caption)
+                        .foregroundStyle(message.thinkingDone ? Theme.textMuted : Theme.accent)
+                        .symbolEffect(.pulse, options: message.thinkingDone ? .nonRepeating : .repeating)
+
+                    Text(message.thinkingDone ? "Thought for \(formatDuration(elapsedSeconds))" : "Thinking for \(formatDuration(elapsedSeconds))")
+                        .font(.caption)
+                        .foregroundStyle(Theme.textSecondary)
+
+                    Spacer()
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Theme.textMuted)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                }
+            }
+            .buttonStyle(.plain)
+
+            // Content
+            if isExpanded && !message.content.isEmpty {
+                Text(message.content)
+                    .font(.caption)
+                    .foregroundStyle(Theme.textSecondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .background(Theme.backgroundSecondary)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .onAppear {
+            startTimer()
+        }
+        .onDisappear {
+            timerTask?.cancel()
+            timerTask = nil
+        }
+        .onChange(of: message.thinkingDone) { _, done in
+            if done {
+                timerTask?.cancel()
+                timerTask = nil
+                if let startTime = message.thinkingStartTime {
+                    elapsedSeconds = Int(Date().timeIntervalSince(startTime))
+                }
+            }
+        }
+    }
+
+    private func startTimer() {
+        timerTask?.cancel()
+        timerTask = nil
+
+        guard !message.thinkingDone else {
+            if let startTime = message.thinkingStartTime {
+                elapsedSeconds = Int(Date().timeIntervalSince(startTime))
+            }
+            return
+        }
+
+        timerTask = Task { @MainActor in
+            while !Task.isCancelled {
+                if let startTime = message.thinkingStartTime {
+                    elapsedSeconds = Int(Date().timeIntervalSince(startTime))
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func formatDuration(_ seconds: Int) -> String {
+        if seconds < 60 {
+            return "\(seconds)s"
+        } else {
+            let mins = seconds / 60
+            let secs = seconds % 60
+            return secs > 0 ? "\(mins)m \(secs)s" : "\(mins)m"
+        }
+    }
+}
 
 // MARK: - Flow Layout
 

@@ -173,6 +173,9 @@ pub trait MissionStore: Send + Sync {
     /// Get missions that have been active but stale for the specified hours.
     async fn get_stale_active_missions(&self, stale_hours: u64) -> Result<Vec<Mission>, String>;
 
+    /// Get all missions currently in active status (for startup recovery).
+    async fn get_all_active_missions(&self) -> Result<Vec<Mission>, String>;
+
     /// Insert a mission summary (for historical lookup).
     async fn insert_mission_summary(
         &self,

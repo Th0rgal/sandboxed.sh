@@ -12,9 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::RngCore;
 use std::collections::HashMap;
-use std::path::Path;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 
 /// Key length in bytes (256 bits for AES-256)
 const KEY_LENGTH: usize = 32;
@@ -173,6 +171,63 @@ pub fn load_private_key_from_env() -> Result<Option<[u8; KEY_LENGTH]>> {
         .context("Invalid PRIVATE_KEY format")
 }
 
+/// Get the path to the private key file.
+/// Uses `PRIVATE_KEY_FILE` env var, or defaults to `{WORKING_DIR}/.openagent/private_key`.
+fn private_key_file_path() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("PRIVATE_KEY_FILE") {
+        return std::path::PathBuf::from(path);
+    }
+    let working_dir = std::env::var("WORKING_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/root"));
+    working_dir.join(".openagent").join("private_key")
+}
+
+/// Ensure a private key is available, generating one lazily if needed.
+///
+/// 1. Checks `PRIVATE_KEY` env var (fast path, no I/O).
+/// 2. Reads from the key file (`{WORKING_DIR}/.openagent/private_key`).
+/// 3. Generates a new key, persists it to the file, and sets the env var.
+pub async fn ensure_private_key() -> Result<[u8; KEY_LENGTH]> {
+    // 1. Fast path: env var already set
+    if let Some(key) = load_private_key_from_env()? {
+        return Ok(key);
+    }
+
+    // 2. Try reading from persisted key file
+    let key_file = private_key_file_path();
+    if key_file.exists() {
+        if let Ok(contents) = fs::read_to_string(&key_file).await {
+            let trimmed = contents.trim();
+            if !trimmed.is_empty() {
+                let key = parse_key(trimmed)
+                    .context("Invalid key in private_key file")?;
+                // Cache in process env for future calls
+                std::env::set_var(PRIVATE_KEY_ENV, trimmed);
+                tracing::info!("Loaded PRIVATE_KEY from {}", key_file.display());
+                return Ok(key);
+            }
+        }
+    }
+
+    // 3. Generate new key and persist
+    let key = generate_private_key();
+    let key_hex = hex::encode(key);
+
+    if let Some(parent) = key_file.parent() {
+        fs::create_dir_all(parent).await
+            .context("Failed to create directory for private_key file")?;
+    }
+    fs::write(&key_file, &key_hex).await
+        .context("Failed to write private_key file")?;
+
+    // Set in process env
+    std::env::set_var(PRIVATE_KEY_ENV, &key_hex);
+
+    tracing::info!("Generated new PRIVATE_KEY and saved to {}", key_file.display());
+    Ok(key)
+}
+
 /// Parse a key from hex or base64 format.
 fn parse_key(key_str: &str) -> Result<[u8; KEY_LENGTH]> {
     let trimmed = key_str.trim();
@@ -297,42 +352,31 @@ pub fn decrypt_content_tags(key: &[u8; KEY_LENGTH], content: &str) -> Result<Str
     Ok(result)
 }
 
-/// Load the encryption key from environment, generating one if missing.
-/// If a key is generated, it will be appended to the .env file at the given path.
-pub async fn load_or_create_private_key(env_file_path: &Path) -> Result<[u8; KEY_LENGTH]> {
-    // Try to load existing key
-    if let Some(key) = load_private_key_from_env()? {
-        return Ok(key);
+/// Get the hex-encoded private key from environment (for backup export).
+/// Returns None if no key is configured.
+pub fn get_private_key_hex() -> Option<String> {
+    std::env::var(PRIVATE_KEY_ENV).ok().filter(|k| !k.trim().is_empty())
+}
+
+/// Set the private key from a hex string (for backup restore).
+/// Persists to the key file and sets the env var.
+pub async fn set_private_key_hex(key_hex: &str) -> Result<()> {
+    // Validate
+    let _key = parse_key(key_hex).context("Invalid key format")?;
+
+    // Persist to file
+    let key_file = private_key_file_path();
+    if let Some(parent) = key_file.parent() {
+        fs::create_dir_all(parent).await?;
     }
+    fs::write(&key_file, key_hex.trim()).await
+        .context("Failed to write private_key file")?;
 
-    // Generate new key
-    let key = generate_private_key();
-    let key_hex = hex::encode(key);
+    // Set in process env
+    std::env::set_var(PRIVATE_KEY_ENV, key_hex.trim());
 
-    // Append to .env file
-    let env_line = format!(
-        "\n# Auto-generated encryption key for template env vars\n{}={}\n",
-        PRIVATE_KEY_ENV, key_hex
-    );
-
-    // Create or append to .env file
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(env_file_path)
-        .await
-        .context("Failed to open .env file for writing")?;
-
-    file.write_all(env_line.as_bytes())
-        .await
-        .context("Failed to write PRIVATE_KEY to .env file")?;
-
-    // Also set in current process environment
-    std::env::set_var(PRIVATE_KEY_ENV, &key_hex);
-
-    tracing::info!("Generated new PRIVATE_KEY and saved to .env");
-
-    Ok(key)
+    tracing::info!("Restored PRIVATE_KEY from backup");
+    Ok(())
 }
 
 #[cfg(test)]

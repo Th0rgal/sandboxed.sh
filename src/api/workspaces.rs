@@ -72,6 +72,10 @@ pub struct CreateWorkspaceRequest {
     /// Whether to share the host network (default: true).
     /// Set to false for isolated networking (e.g., Tailscale).
     pub shared_network: Option<bool>,
+    /// MCP server names to enable for this workspace.
+    /// Empty = use default MCPs (those with `default_enabled = true`).
+    #[serde(default)]
+    pub mcps: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +99,8 @@ pub struct UpdateWorkspaceRequest {
     /// Whether to share the host network (default: true).
     /// Set to false for isolated networking (e.g., Tailscale).
     pub shared_network: Option<bool>,
+    /// MCP server names to enable for this workspace.
+    pub mcps: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +120,7 @@ pub struct WorkspaceResponse {
     pub env_vars: HashMap<String, String>,
     pub init_script: Option<String>,
     pub shared_network: Option<bool>,
+    pub mcps: Vec<String>,
 }
 
 impl From<Workspace> for WorkspaceResponse {
@@ -134,6 +141,7 @@ impl From<Workspace> for WorkspaceResponse {
             env_vars: w.env_vars,
             init_script: w.init_script,
             shared_network: w.shared_network,
+            mcps: w.mcps,
         }
     }
 }
@@ -339,6 +347,16 @@ async fn create_workspace(
         .shared_network
         .or_else(|| template_data.as_ref().and_then(|t| t.shared_network));
 
+    // MCPs: request overrides template
+    let mcps = if !req.mcps.is_empty() {
+        req.mcps.clone()
+    } else {
+        template_data
+            .as_ref()
+            .map(|t| t.mcps.clone())
+            .unwrap_or_default()
+    };
+
     let mut workspace = match workspace_type {
         WorkspaceType::Host => Workspace {
             id: Uuid::new_v4(),
@@ -357,6 +375,7 @@ async fn create_workspace(
             tools: req.tools,
             plugins: req.plugins,
             shared_network,
+            mcps: mcps.clone(),
         },
         WorkspaceType::Container => {
             let mut ws = Workspace::new_container(req.name, path);
@@ -368,6 +387,7 @@ async fn create_workspace(
             ws.env_vars = env_vars;
             ws.init_script = init_script;
             ws.shared_network = shared_network;
+            ws.mcps = mcps;
             ws
         }
     };
@@ -537,6 +557,11 @@ async fn update_workspace(
 
     // Always update shared_network to allow resetting to None (default)
     workspace.shared_network = req.shared_network;
+
+    // Update MCPs if provided
+    if let Some(mcps) = req.mcps {
+        workspace.mcps = mcps;
+    }
 
     // Save the updated workspace
     state.workspaces.update(workspace.clone()).await;
@@ -1203,17 +1228,27 @@ async fn get_init_log(
     let log_path = "/var/log/openagent-init.log";
     let host_log_path = workspace.path.join("var/log/openagent-init.log");
 
-    if !host_log_path.exists() {
-        return Ok(Json(InitLogResponse {
-            exists: false,
-            content: String::new(),
-            total_lines: None,
-            log_path: log_path.to_string(),
-        }));
-    }
+    // During debootstrap, the container filesystem doesn't exist yet so
+    // var/log/openagent-init.log won't be there. Check the build log sibling
+    // file that debootstrap streams output to.
+    let effective_log_path = if host_log_path.exists() {
+        host_log_path
+    } else {
+        let build_log = crate::nspawn::build_log_path_for(&workspace.path);
+        if build_log.exists() {
+            build_log
+        } else {
+            return Ok(Json(InitLogResponse {
+                exists: false,
+                content: String::new(),
+                total_lines: None,
+                log_path: log_path.to_string(),
+            }));
+        }
+    };
 
     // Read the log file
-    let content = tokio::fs::read_to_string(&host_log_path)
+    let content = tokio::fs::read_to_string(&effective_log_path)
         .await
         .map_err(|e| {
             (

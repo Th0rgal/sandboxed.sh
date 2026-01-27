@@ -1,0 +1,75 @@
+# Open Agent i3 Config - Optimized for LLM Vision & Control
+# Key principle: LLM needs to SEE state (URL bar, focus indicator, all windows)
+
+set $mod Mod4
+
+font pango:DejaVu Sans Mono 10
+
+# Window decorations
+default_border pixel 3
+default_floating_border pixel 3
+
+# class                 border  backgr. text    indicator child_border
+client.focused          #4c7899 #285577 #ffffff #2e9ef4   #ff5500
+client.focused_inactive #333333 #5f676a #ffffff #484e50   #333333
+client.unfocused        #333333 #222222 #888888 #292d2e   #222222
+
+hide_edge_borders smart
+
+# Focus behavior
+focus_follows_mouse no
+focus_wrapping no
+force_display_urgency_hint 0 ms
+workspace_auto_back_and_forth yes
+
+# Layout
+default_orientation horizontal
+workspace_layout default
+
+# Chromium — not fullscreen (need to see URL bar)
+for_window [class="Chromium"] border pixel 2
+for_window [class="chromium"] border pixel 2
+for_window [class="Google-chrome"] border pixel 2
+
+# Floating windows
+for_window [window_role="pop-up"] floating enable, move position center
+for_window [window_role="dialog"] floating enable, move position center
+for_window [window_role="alert"] floating enable, move position center
+for_window [window_type="dialog"] floating enable, move position center
+for_window [class="Gcr-prompter"] floating enable, move position center
+for_window [floating] move position center
+
+# Keybindings
+bindsym $mod+Shift+q kill
+bindsym $mod+h focus left
+bindsym $mod+j focus down
+bindsym $mod+k focus up
+bindsym $mod+l focus right
+bindsym $mod+Shift+h move left
+bindsym $mod+Shift+j move down
+bindsym $mod+Shift+k move up
+bindsym $mod+Shift+l move right
+bindsym $mod+f fullscreen toggle
+bindsym $mod+Shift+space floating toggle
+bindsym $mod+space focus mode_toggle
+bindsym $mod+b split h
+bindsym $mod+v split v
+bindsym $mod+s layout stacking
+bindsym $mod+w layout tabbed
+bindsym $mod+e layout toggle split
+bindsym $mod+1 workspace 1
+bindsym $mod+2 workspace 2
+bindsym $mod+3 workspace 3
+bindsym $mod+Shift+1 move container to workspace 1
+bindsym $mod+Shift+2 move container to workspace 2
+bindsym $mod+Shift+3 move container to workspace 3
+bindsym $mod+Shift+e exit
+bindsym $mod+Shift+r reload
+
+# Startup
+workspace 1 output primary
+exec --no-startup-id i3-msg workspace 1
+exec --no-startup-id xset s off
+exec --no-startup-id xset -dpms
+exec --no-startup-id xset s noblank
+exec --no-startup-id xsetroot -solid "#1a1a2e"

@@ -28,6 +28,17 @@ use crate::config::{AuthMode, Config};
 use crate::mcp::McpRegistry;
 use crate::workspace;
 
+/// Check whether a CLI binary is available on `$PATH`.
+fn cli_available(name: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 use super::ai_providers as ai_providers_api;
 use super::auth::{self, AuthUser};
 use super::backends as backends_api;
@@ -141,19 +152,43 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Initialize global settings store
     let settings = Arc::new(crate::settings::SettingsStore::new(&config.working_dir).await);
 
-    // Initialize backend config store (persisted settings)
+    // Initialize backend config store (persisted settings).
+    // Probe each CLI binary so backends whose CLI is missing default to disabled.
+    // Persisted configs are preserved — this only affects fresh installs or new backends.
+    let opencode_detected = cli_available("opencode");
+    let claude_detected = cli_available("claude");
+    let amp_detected = cli_available("amp");
+    tracing::info!(
+        opencode = opencode_detected,
+        claude = claude_detected,
+        amp = amp_detected,
+        "CLI detection for backend defaults"
+    );
+
     let backend_defaults = vec![
-        BackendConfigEntry::new(
-            "opencode",
-            "OpenCode",
-            serde_json::json!({
-                "base_url": config.opencode_base_url,
-                "default_agent": config.opencode_agent,
-                "permissive": config.opencode_permissive,
-            }),
-        ),
-        BackendConfigEntry::new("claudecode", "Claude Code", serde_json::json!({})),
-        BackendConfigEntry::new("amp", "Amp", serde_json::json!({})),
+        {
+            let mut entry = BackendConfigEntry::new(
+                "opencode",
+                "OpenCode",
+                serde_json::json!({
+                    "base_url": config.opencode_base_url,
+                    "default_agent": config.opencode_agent,
+                    "permissive": config.opencode_permissive,
+                }),
+            );
+            entry.enabled = opencode_detected;
+            entry
+        },
+        {
+            let mut entry = BackendConfigEntry::new("claudecode", "Claude Code", serde_json::json!({}));
+            entry.enabled = claude_detected;
+            entry
+        },
+        {
+            let mut entry = BackendConfigEntry::new("amp", "Amp", serde_json::json!({}));
+            entry.enabled = amp_detected;
+            entry
+        },
     ];
     let backend_configs = Arc::new(
         crate::backend_config::BackendConfigStore::new(

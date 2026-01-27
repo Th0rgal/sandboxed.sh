@@ -221,7 +221,122 @@ pub fn tailscale_nspawn_extra_args(env: &HashMap<String, String>) -> Vec<String>
     args
 }
 
+/// Return the cache directory for rootfs tarballs.
+/// Defaults to `{WORKING_DIR}/.openagent/cache` (sibling of `containers/`).
+fn rootfs_cache_dir() -> PathBuf {
+    let working_dir = std::env::var("WORKING_DIR")
+        .unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(working_dir)
+        .join(".openagent")
+        .join("cache")
+}
+
+/// Return the path for a cached rootfs tarball for the given distro.
+fn rootfs_cache_path(distro: NspawnDistro) -> PathBuf {
+    rootfs_cache_dir().join(format!("rootfs-{}.tar", distro.as_str()))
+}
+
+/// Try to restore a container from a cached rootfs tarball.
+/// Returns Ok(true) if cache hit, Ok(false) if no cache.
+async fn restore_from_cache(path: &Path, distro: NspawnDistro) -> NspawnResult<bool> {
+    let cache_path = rootfs_cache_path(distro);
+    if !cache_path.exists() {
+        return Ok(false);
+    }
+
+    tracing::info!(
+        "Restoring container from cache: {} -> {}",
+        cache_path.display(),
+        path.display()
+    );
+
+    // Append to the build log so the dashboard can show progress.
+    let build_log_path = build_log_path_for(path);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&build_log_path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "[openagent] Restoring from cached rootfs...");
+    }
+
+    let output = Command::new("tar")
+        .arg("xf")
+        .arg(&cache_path)
+        .arg("-C")
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| NspawnError::Debootstrap(format!("tar extract failed: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(
+            "Cache restore failed (will fall back to debootstrap): {}",
+            stderr
+        );
+        // Clean up partial extraction
+        let _ = tokio::fs::remove_dir_all(path).await;
+        let _ = tokio::fs::create_dir_all(path).await;
+        return Ok(false);
+    }
+
+    tracing::info!("Container restored from cache successfully");
+    Ok(true)
+}
+
+/// Save a freshly-created container rootfs to the cache for reuse.
+async fn save_to_cache(path: &Path, distro: NspawnDistro) {
+    let cache_path = rootfs_cache_path(distro);
+    let cache_dir = rootfs_cache_dir();
+
+    if let Err(e) = tokio::fs::create_dir_all(&cache_dir).await {
+        tracing::warn!("Failed to create cache dir {}: {}", cache_dir.display(), e);
+        return;
+    }
+
+    // Write to a temp file first, then rename for atomicity.
+    let tmp_path = cache_path.with_extension("tar.tmp");
+
+    tracing::info!(
+        "Caching rootfs: {} -> {}",
+        path.display(),
+        cache_path.display()
+    );
+
+    let result = Command::new("tar")
+        .arg("cf")
+        .arg(&tmp_path)
+        .arg("-C")
+        .arg(path)
+        .arg(".")
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            if let Err(e) = tokio::fs::rename(&tmp_path, &cache_path).await {
+                tracing::warn!("Failed to finalize cache file: {}", e);
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+            } else {
+                tracing::info!("Rootfs cached at {}", cache_path.display());
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!("Cache tar creation failed: {}", stderr);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+        }
+        Err(e) => {
+            tracing::warn!("Failed to run tar for caching: {}", e);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+        }
+    }
+}
+
 /// Create a minimal container environment using debootstrap or pacstrap.
+/// Uses a cached rootfs tarball when available to avoid repeating slow bootstraps.
 pub async fn create_container(path: &Path, distro: NspawnDistro) -> NspawnResult<()> {
     // Create the container directory
     tokio::fs::create_dir_all(path).await?;
@@ -232,6 +347,13 @@ pub async fn create_container(path: &Path, distro: NspawnDistro) -> NspawnResult
         distro.as_str()
     );
 
+    // Try cache first
+    if restore_from_cache(path, distro).await? {
+        tracing::info!("Container created from cache at {}", path.display());
+        return Ok(());
+    }
+
+    // No cache — bootstrap from scratch
     match distro {
         NspawnDistro::ArchLinux => create_arch_container(path).await?,
         _ => create_debootstrap_container(path, distro).await?,
@@ -239,17 +361,31 @@ pub async fn create_container(path: &Path, distro: NspawnDistro) -> NspawnResult
 
     tracing::info!("Container created successfully at {}", path.display());
 
+    // Cache the fresh rootfs in the background for next time
+    save_to_cache(path, distro).await;
+
     Ok(())
 }
 
 async fn create_debootstrap_container(path: &Path, distro: NspawnDistro) -> NspawnResult<()> {
-    let output = tokio::process::Command::new("debootstrap")
+    // Stream debootstrap output to a build log file so the dashboard can show progress.
+    // The log is stored as a sibling file (e.g. /root/.openagent/containers/alex.build.log)
+    // because the container filesystem doesn't exist yet during debootstrap.
+    let build_log_path = build_log_path_for(path);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&build_log_path)
+        .ok();
+
+    let mut child = tokio::process::Command::new("debootstrap")
         .arg("--variant=minbase")
         .arg(distro.as_str())
         .arg(path)
         .arg(distro.mirror_url())
-        .output()
-        .await
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 NspawnError::Debootstrap(
@@ -260,12 +396,91 @@ async fn create_debootstrap_container(path: &Path, distro: NspawnDistro) -> Nspa
             }
         })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    // Stream stdout and stderr to the build log file in real-time
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let log_for_stdout = log_file
+        .as_ref()
+        .and_then(|f| f.try_clone().ok());
+    let log_for_stderr = log_file
+        .as_ref()
+        .and_then(|f| f.try_clone().ok());
+
+    let stdout_handle = tokio::spawn(async move {
+        let mut collected = Vec::new();
+        if let Some(stdout) = stdout {
+            use tokio::io::AsyncReadExt;
+            let mut reader = tokio::io::BufReader::new(stdout);
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.extend_from_slice(&buf[..n]);
+                        if let Some(ref mut f) = log_for_stdout.as_ref() {
+                            use std::io::Write;
+                            let _ = f.write_all(&buf[..n]);
+                            let _ = f.flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        collected
+    });
+
+    let stderr_handle = tokio::spawn(async move {
+        let mut collected = Vec::new();
+        if let Some(stderr) = stderr {
+            use tokio::io::AsyncReadExt;
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.extend_from_slice(&buf[..n]);
+                        if let Some(ref mut f) = log_for_stderr.as_ref() {
+                            use std::io::Write;
+                            let _ = f.write_all(&buf[..n]);
+                            let _ = f.flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        collected
+    });
+
+    let status = child.wait().await.map_err(|e| NspawnError::Debootstrap(e.to_string()))?;
+    let _ = stdout_handle.await;
+    let stderr_bytes = stderr_handle.await.unwrap_or_default();
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         return Err(NspawnError::Debootstrap(stderr.to_string()));
     }
 
+    // Copy the build log into the container's var/log/ so the dashboard can read it
+    // from the standard init-log path after debootstrap completes.
+    let container_log_dir = path.join("var/log");
+    if container_log_dir.exists() {
+        let container_log = container_log_dir.join("openagent-init.log");
+        let _ = std::fs::copy(&build_log_path, &container_log);
+    }
+
     Ok(())
+}
+
+/// Returns the path to the build log file stored as a sibling to the container directory.
+/// This is used during debootstrap when the container filesystem doesn't exist yet.
+pub(crate) fn build_log_path_for(container_path: &Path) -> std::path::PathBuf {
+    let mut log_path = container_path.to_path_buf().into_os_string();
+    log_path.push(".build.log");
+    std::path::PathBuf::from(log_path)
 }
 
 async fn create_arch_container(path: &Path) -> NspawnResult<()> {

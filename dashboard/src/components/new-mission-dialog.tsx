@@ -27,19 +27,6 @@ interface CombinedAgent {
   value: string; // "backend:agent" format
 }
 
-const DEFAULT_OPENCODE_AGENTS = [
-  'Sisyphus',
-  'oracle',
-  'librarian',
-  'explore',
-  'frontend-ui-ux-engineer',
-  'document-writer',
-  'multimodal-looker',
-  'Prometheus',
-  'Metis',
-  'Momus',
-];
-
 // Parse agent names from API response
 const parseAgentNames = (payload: unknown): string[] => {
   const normalizeEntry = (entry: unknown): string | null => {
@@ -171,13 +158,6 @@ export function NewMissionDialog({
           agents = fallbackNames.map(name => ({ id: name, name }));
         }
 
-        if (agents.length === 0) {
-          const visibleDefaults = DEFAULT_OPENCODE_AGENTS.filter(
-            name => !openCodeHiddenAgents.includes(name),
-          );
-          const defaultNames = visibleDefaults.length > 0 ? visibleDefaults : [...DEFAULT_OPENCODE_AGENTS];
-          agents = defaultNames.map(name => ({ id: name, name }));
-        }
       } else if (backend.id === 'claudecode') {
         // Filter out hidden Claude Code agents by name
         const allClaudeAgents = claudecodeAgents || [];

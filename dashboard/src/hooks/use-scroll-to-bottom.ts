@@ -21,15 +21,29 @@ export function useScrollToBottom() {
     return scrollTop + clientHeight >= scrollHeight - 100;
   }, []);
 
+  // Immediate synchronous scroll to bottom — no animation, no RAF.
+  // Use this after setting items during load so the browser paints
+  // with the scroll already at the bottom.
+  const scrollToBottomImmediate = useCallback(() => {
+    if (!containerRef.current) return;
+    containerRef.current.scrollTop = containerRef.current.scrollHeight;
+    setIsAtBottom(true);
+    isAtBottomRef.current = true;
+  }, []);
+
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
     if (!containerRef.current) {
       return;
     }
-    containerRef.current.scrollTo({
-      top: containerRef.current.scrollHeight,
-      behavior,
-    });
-  }, []);
+    if (behavior === 'instant') {
+      scrollToBottomImmediate();
+    } else {
+      containerRef.current.scrollTo({
+        top: containerRef.current.scrollHeight,
+        behavior,
+      });
+    }
+  }, [scrollToBottomImmediate]);
 
   // Handle user scroll events
   useEffect(() => {
@@ -63,21 +77,25 @@ export function useScrollToBottom() {
     };
   }, [checkIfAtBottom]);
 
-  // Auto-scroll when content changes
+  // Auto-scroll when content changes (for streaming updates)
   useEffect(() => {
     const container = containerRef.current;
     if (!container) {
       return;
     }
 
+    let rafId: number | null = null;
+
     const scrollIfNeeded = () => {
       // Only auto-scroll if user was at bottom and isn't actively scrolling
       if (isAtBottomRef.current && !isUserScrollingRef.current) {
-        requestAnimationFrame(() => {
-          container.scrollTo({
-            top: container.scrollHeight,
-            behavior: 'instant',
-          });
+        // Coalesce multiple observer callbacks into a single RAF
+        if (rafId !== null) return;
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          // Use direct scrollTop assignment — synchronous and reliable
+          // across all platforms including iOS WebView
+          container.scrollTop = container.scrollHeight;
           setIsAtBottom(true);
           isAtBottomRef.current = true;
         });
@@ -104,6 +122,7 @@ export function useScrollToBottom() {
     return () => {
       mutationObserver.disconnect();
       resizeObserver.disconnect();
+      if (rafId !== null) cancelAnimationFrame(rafId);
     };
   }, []);
 
@@ -112,5 +131,6 @@ export function useScrollToBottom() {
     endRef,
     isAtBottom,
     scrollToBottom,
+    scrollToBottomImmediate,
   };
 }

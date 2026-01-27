@@ -1,0 +1,21 @@
+services:
+  openagent:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    volumes:
+      - openagent-data:/root/.openagent
+      - claude-auth:/root/.claude
+      # Uncomment to mount SSH keys for private git repos (Library):
+      - ~/.ssh:/root/.ssh:ro
+    env_file:
+      - path: .env
+        required: false
+    # Uncomment for container workspace support (systemd-nspawn):
+    # privileged: true
+    # cgroup: host
+
+volumes:
+  openagent-data:
+  claude-auth:

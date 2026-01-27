@@ -158,18 +158,27 @@ impl WorkspaceExec {
     /// This runs the openagent-tailscale-up script (which also calls openagent-network-up)
     /// to bring up the veth interface, get an IP via DHCP, start tailscaled, and authenticate.
     /// The scripts are installed by the workspace template's init_script.
+    ///
+    /// When `export_all_env` is true (nsenter path), all env vars are exported in the
+    /// shell command since nsenter doesn't propagate env vars into the namespace.
+    /// When false (nspawn path), only TS_* vars are exported (others use --setenv).
     fn build_tailscale_bootstrap_command(
         rel_cwd: &str,
         program: &str,
         args: &[String],
         env: &HashMap<String, String>,
+        export_all_env: bool,
     ) -> String {
         let mut cmd = String::new();
 
-        // Export TS_* env vars so the bootstrap script can use them.
-        // These are also passed via --setenv, but the shell script needs them exported.
+        // Export env vars so the bootstrap script and program can use them.
         for (k, v) in env {
-            if k.starts_with("TS_") && !v.trim().is_empty() {
+            if k.trim().is_empty() {
+                continue;
+            }
+            // When using nsenter, export ALL env vars (nsenter doesn't propagate them).
+            // When using nspawn, only export TS_* vars (others are passed via --setenv).
+            if export_all_env || (k.starts_with("TS_") && !v.trim().is_empty()) {
                 cmd.push_str("export ");
                 cmd.push_str(k);
                 cmd.push('=');
@@ -179,14 +188,26 @@ impl WorkspaceExec {
         }
 
         // Run the Tailscale bootstrap script if it exists.
-        // The script is expected to:
-        // 1. Bring up the host0 veth interface with DHCP
-        // 2. Start tailscaled daemon
-        // 3. Authenticate and connect to the exit node
+        // The script calls openagent-network-up (DHCP via udhcpc, which sets up
+        // the IP, default route, and DNS), then starts tailscaled and authenticates.
         // Errors are suppressed to allow the main program to run even if networking fails.
         cmd.push_str(
             "if [ -x /usr/local/bin/openagent-tailscale-up ]; then \
              /usr/local/bin/openagent-tailscale-up >/dev/null 2>&1 || true; \
+             fi; ",
+        );
+
+        // Fallback: if the DHCP-based network-up didn't set a default route
+        // (e.g., udhcpc failed or the script is missing), detect the gateway
+        // from the assigned IP and add the route manually.
+        cmd.push_str(
+            "if ! ip route show default 2>/dev/null | grep -q default; then \
+             _oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
+             _oa_gw=\"${_oa_ip%.*}.1\"; \
+             [ -n \"$_oa_ip\" ] && ip route add default via \"$_oa_gw\" 2>/dev/null || true; \
+             fi; \
+             if [ ! -s /etc/resolv.conf ]; then \
+             printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf 2>/dev/null || true; \
              fi; ",
         );
 
@@ -241,6 +262,7 @@ impl WorkspaceExec {
         program: &str,
         args: &[String],
         env: HashMap<String, String>,
+        tailscale_bootstrap: bool,
         stdin: Stdio,
         stdout: Stdio,
         stderr: Stdio,
@@ -253,8 +275,16 @@ impl WorkspaceExec {
         let rel_cwd = self.rel_path_in_container(cwd);
         // Build shell command with env exports - nsenter doesn't pass env vars
         // into the container namespace, so we need to export them in the shell.
-        let env_ref = if env.is_empty() { None } else { Some(&env) };
-        let shell_cmd = Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref);
+        let shell_cmd = if tailscale_bootstrap {
+            tracing::info!(
+                workspace = %self.workspace.name,
+                "WorkspaceExec: nsenter with Tailscale bootstrap"
+            );
+            Self::build_tailscale_bootstrap_command(&rel_cwd, program, args, &env, true)
+        } else {
+            let env_ref = if env.is_empty() { None } else { Some(&env) };
+            Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
+        };
         let mut cmd = Command::new(nsenter);
         cmd.args([
             "--target",
@@ -319,9 +349,14 @@ impl WorkspaceExec {
                 if !env.contains_key("HOME") {
                     env.insert("HOME".to_string(), "/root".to_string());
                 }
+                // Determine if Tailscale bootstrap is needed before the nsenter
+                // check, so the nsenter path can also include the bootstrap.
+                let needs_tailscale_bootstrap = nspawn::tailscale_enabled(&env)
+                    && !nspawn::tailscale_nspawn_extra_args(&env).is_empty();
                 if let Some(leader) = self.running_container_leader().await {
                     return self.build_nsenter_command(
-                        &leader, cwd, program, args, env, stdin, stdout, stderr,
+                        &leader, cwd, program, args, env, needs_tailscale_bootstrap,
+                        stdin, stdout, stderr,
                     );
                 }
 
@@ -426,7 +461,7 @@ impl WorkspaceExec {
                     // Build a shell command that:
                     // 1. Runs openagent-tailscale-up (which also calls openagent-network-up)
                     // 2. Execs the actual program to hand off control
-                    let shell_cmd = Self::build_tailscale_bootstrap_command(&rel_cwd, program, args, &env);
+                    let shell_cmd = Self::build_tailscale_bootstrap_command(&rel_cwd, program, args, &env, false);
                     tracing::info!(
                         workspace = %self.workspace.name,
                         program = %program,

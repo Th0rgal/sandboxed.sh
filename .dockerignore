@@ -1,0 +1,32 @@
+# Rust build artifacts
+target/
+
+# Git
+.git/
+.gitignore
+
+# Node modules (rebuilt in Docker)
+dashboard/node_modules/
+dashboard/.next/
+context/oh-my-opencode/node_modules/
+
+# Documentation & non-essential
+docs/
+docs-site/
+ios_dashboard/
+*.md
+LICENSE
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local env (users mount their own)
+.env
+.env.local

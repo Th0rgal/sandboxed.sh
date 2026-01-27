@@ -157,6 +157,7 @@ impl McpRegistry {
             desktop_env,
         );
         desktop.scope = McpScope::Workspace;
+        desktop.default_enabled = true;
 
         let workspace_command = {
             let release = working_dir
@@ -182,6 +183,7 @@ impl McpRegistry {
             HashMap::new(),
         );
         workspace.scope = McpScope::Workspace;
+        workspace.default_enabled = true;
         // Prefer bunx (Bun) when present, but fall back to npx for compatibility.
         let js_runner = if command_exists("bunx") {
             "bunx"
@@ -193,12 +195,14 @@ impl McpRegistry {
             js_runner.to_string(),
             vec![
                 "@playwright/mcp@latest".to_string(),
+                "--headless".to_string(),
                 "--isolated".to_string(),
                 "--no-sandbox".to_string(),
             ],
             HashMap::new(),
         );
         playwright.scope = McpScope::Workspace;
+        playwright.default_enabled = true;
 
         vec![workspace, desktop, playwright]
     }
@@ -267,11 +271,13 @@ impl McpRegistry {
             }
 
             let missing_flags: Vec<&str> = match &config.transport {
-                McpTransport::Stdio { args, .. } => ["--isolated", "--no-sandbox"]
-                    .iter()
-                    .copied()
-                    .filter(|flag| !args.iter().any(|arg| arg == *flag))
-                    .collect(),
+                McpTransport::Stdio { args, .. } => {
+                    ["--headless", "--isolated", "--no-sandbox"]
+                        .iter()
+                        .copied()
+                        .filter(|flag| !args.iter().any(|arg| arg == *flag))
+                        .collect()
+                }
                 McpTransport::Http { .. } => Vec::new(),
             };
 
@@ -289,7 +295,7 @@ impl McpRegistry {
             let _ = config_store
                 .update(id, |c| {
                     if let McpTransport::Stdio { args, .. } = &mut c.transport {
-                        for flag in ["--isolated", "--no-sandbox"] {
+                        for flag in ["--headless", "--isolated", "--no-sandbox"] {
                             if !args.iter().any(|arg| arg == flag) {
                                 args.push(flag.to_string());
                             }
@@ -312,6 +318,23 @@ impl McpRegistry {
                 let _ = config_store
                     .update(id, |c| {
                         c.scope = McpScope::Workspace;
+                    })
+                    .await;
+            }
+        }
+
+        // Ensure built-in MCPs have default_enabled = true (migrate old configs).
+        for config in configs.iter_mut() {
+            if !matches!(config.name.as_str(), "workspace" | "desktop" | "playwright") {
+                continue;
+            }
+
+            if !config.default_enabled {
+                config.default_enabled = true;
+                let id = config.id;
+                let _ = config_store
+                    .update(id, |c| {
+                        c.default_enabled = true;
                     })
                     .await;
             }
@@ -584,6 +607,9 @@ impl McpRegistry {
         if let Some(scope) = req.scope {
             config.scope = scope;
         }
+        if let Some(default_enabled) = req.default_enabled {
+            config.default_enabled = default_enabled;
+        }
 
         // Save to persistent store
         let config = self.config_store.add(config).await?;
@@ -706,6 +732,9 @@ impl McpRegistry {
                 }
                 if let Some(transport) = &req.transport {
                     c.transport = transport.clone();
+                }
+                if let Some(default_enabled) = req.default_enabled {
+                    c.default_enabled = default_enabled;
                 }
             })
             .await?;
