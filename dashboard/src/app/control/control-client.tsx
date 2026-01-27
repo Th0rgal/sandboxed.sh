@@ -2483,14 +2483,16 @@ export default function ControlClient() {
         // Check for session start
         if (
           entry.content.includes("desktop_start_session") ||
-          entry.content.includes("desktop_desktop_start_session")
+          entry.content.includes("desktop_desktop_start_session") ||
+          entry.content.includes("mcp__desktop__desktop_start_session")
         ) {
           hasSession = true;
         }
         // Check for session close (must come after start check to handle same entry)
         if (
           entry.content.includes("desktop_close_session") ||
-          entry.content.includes("desktop_desktop_close_session")
+          entry.content.includes("desktop_desktop_close_session") ||
+          entry.content.includes("mcp__desktop__desktop_close_session")
         ) {
           hasSession = false;
         }
