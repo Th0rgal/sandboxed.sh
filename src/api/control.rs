@@ -2023,6 +2023,56 @@ fn spawn_control_session(
         secrets,
     ));
 
+    // Recover orphaned missions from previous run.
+    // Any mission still marked "active" in the DB cannot be running because
+    // we just started — mark them as interrupted.
+    if state.mission_store.is_persistent() {
+        let store = Arc::clone(&state.mission_store);
+        let tx = events_tx.clone();
+        tokio::spawn(async move {
+            match store.get_all_active_missions().await {
+                Ok(orphans) if !orphans.is_empty() => {
+                    tracing::info!(
+                        "Startup recovery: marking {} orphaned active missions as interrupted",
+                        orphans.len()
+                    );
+                    for mission in orphans {
+                        tracing::info!(
+                            "  → {} '{}' (last update: {})",
+                            mission.id,
+                            mission.title.as_deref().unwrap_or("Untitled"),
+                            mission.updated_at
+                        );
+                        if let Err(e) = store
+                            .update_mission_status(mission.id, MissionStatus::Interrupted)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to mark orphaned mission {} as interrupted: {}",
+                                mission.id, e
+                            );
+                        } else {
+                            let _ = tx.send(AgentEvent::MissionStatusChanged {
+                                mission_id: mission.id,
+                                status: MissionStatus::Interrupted,
+                                summary: Some(
+                                    "Interrupted: server restarted while mission was active"
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                    }
+                }
+                Ok(_) => {
+                    tracing::debug!("Startup recovery: no orphaned active missions found");
+                }
+                Err(e) => {
+                    tracing::warn!("Startup recovery: failed to check for orphaned missions: {}", e);
+                }
+            }
+        });
+    }
+
     // Spawn background stale mission cleanup task (if enabled)
     if config.stale_mission_hours > 0 && state.mission_store.is_persistent() {
         tokio::spawn(stale_mission_cleanup_loop(

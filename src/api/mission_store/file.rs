@@ -274,6 +274,18 @@ impl MissionStore for FileMissionStore {
         Ok(missions)
     }
 
+    async fn get_all_active_missions(&self) -> Result<Vec<Mission>, String> {
+        let missions: Vec<Mission> = self
+            .missions
+            .read()
+            .await
+            .values()
+            .filter(|m| m.status == MissionStatus::Active)
+            .cloned()
+            .collect();
+        Ok(missions)
+    }
+
     async fn insert_mission_summary(
         &self,
         _mission_id: Uuid,
