@@ -992,13 +992,20 @@ fn write_claudecode_credentials_from_entry(
     std::fs::create_dir_all(credentials_dir)
         .map_err(|e| format!("Failed to create Claude credentials directory: {}", e))?;
 
-    let credentials = serde_json::json!({
-        "claudeAiOauth": {
-            "accessToken": access_token,
-            "refreshToken": refresh_token,
-            "expiresAt": expires_at,
-            "scopes": ["user:inference", "user:profile"]
-        }
+    // Read-modify-write to preserve other entries in the credentials file
+    let mut credentials: serde_json::Value = if credentials_path.exists() {
+        let existing = std::fs::read_to_string(&credentials_path)
+            .map_err(|e| format!("Failed to read Claude credentials: {}", e))?;
+        serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    credentials["claudeAiOauth"] = serde_json::json!({
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "expiresAt": expires_at,
+        "scopes": ["user:inference", "user:profile"]
     });
 
     let contents = serde_json::to_string_pretty(&credentials)
@@ -1651,13 +1658,20 @@ pub fn write_claudecode_credentials_to_path(credentials_dir: &std::path::Path) -
     std::fs::create_dir_all(credentials_dir)
         .map_err(|e| format!("Failed to create Claude credentials directory: {}", e))?;
 
-    let credentials = serde_json::json!({
-        "claudeAiOauth": {
-            "accessToken": entry.access_token,
-            "refreshToken": entry.refresh_token,
-            "expiresAt": entry.expires_at,
-            "scopes": ["user:inference", "user:profile"]
-        }
+    // Read-modify-write to preserve other entries in the credentials file
+    let mut credentials: serde_json::Value = if credentials_path.exists() {
+        let existing = std::fs::read_to_string(&credentials_path)
+            .map_err(|e| format!("Failed to read Claude credentials: {}", e))?;
+        serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    credentials["claudeAiOauth"] = serde_json::json!({
+        "accessToken": entry.access_token,
+        "refreshToken": entry.refresh_token,
+        "expiresAt": entry.expires_at,
+        "scopes": ["user:inference", "user:profile"]
     });
 
     let contents = serde_json::to_string_pretty(&credentials)
