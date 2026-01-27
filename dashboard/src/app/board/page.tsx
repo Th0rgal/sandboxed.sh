@@ -293,7 +293,7 @@ export default function BoardPage() {
       try {
         await deleteMission(id);
         mutateMissions(
-          missions.filter((m) => m.id !== id),
+          (current) => current ? current.filter((m) => m.id !== id) : current,
           false
         );
         toast.success('Mission deleted');
@@ -301,7 +301,7 @@ export default function BoardPage() {
         toast.error('Failed to delete mission');
       }
     },
-    [missions, mutateMissions]
+    [mutateMissions]
   );
 
   const totalCount = missions.length;
