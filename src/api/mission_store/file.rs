@@ -107,7 +107,7 @@ impl MissionStore for FileMissionStore {
         let now = now_string();
         let mission = Mission {
             id: Uuid::new_v4(),
-            status: MissionStatus::Active,
+            status: MissionStatus::Pending,
             title: title.map(|s| s.to_string()),
             workspace_id: workspace_id.unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID),
             workspace_name: None,

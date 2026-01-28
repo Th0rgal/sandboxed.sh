@@ -706,6 +706,8 @@ pub enum ControlCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissionStatus {
+    /// Mission created but hasn't received any messages yet
+    Pending,
     Active,
     Completed,
     Failed,
@@ -720,6 +722,7 @@ pub enum MissionStatus {
 impl std::fmt::Display for MissionStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Pending => write!(f, "pending"),
             Self::Active => write!(f, "active"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),

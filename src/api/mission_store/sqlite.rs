@@ -221,18 +221,20 @@ impl SqliteMissionStore {
 
 fn parse_status(s: &str) -> MissionStatus {
     match s {
+        "pending" => MissionStatus::Pending,
         "active" => MissionStatus::Active,
         "completed" => MissionStatus::Completed,
         "failed" => MissionStatus::Failed,
         "interrupted" => MissionStatus::Interrupted,
         "blocked" => MissionStatus::Blocked,
         "not_feasible" => MissionStatus::NotFeasible,
-        _ => MissionStatus::Active,
+        _ => MissionStatus::Pending,
     }
 }
 
 fn status_to_string(status: MissionStatus) -> &'static str {
     match status {
+        MissionStatus::Pending => "pending",
         MissionStatus::Active => "active",
         MissionStatus::Completed => "completed",
         MissionStatus::Failed => "failed",
@@ -420,7 +422,7 @@ impl MissionStore for SqliteMissionStore {
 
         let mission = Mission {
             id,
-            status: MissionStatus::Active,
+            status: MissionStatus::Pending,
             title: title.map(|s| s.to_string()),
             workspace_id,
             workspace_name: None,
