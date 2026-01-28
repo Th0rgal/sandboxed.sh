@@ -4593,10 +4593,6 @@ pub async fn run_opencode_turn(
     args.push("--timeout".to_string());
     args.push("0".to_string());
 
-    // JSON format for structured event streaming on stdout
-    args.push("--format".to_string());
-    args.push("json".to_string());
-
     // The message is passed as the final argument
     args.push(message.to_string());
 
@@ -4744,8 +4740,8 @@ pub async fn run_opencode_turn(
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
 
-    // With --format json, events stream on stdout so skip the SSE curl approach.
-    let use_json_stdout = true;
+    // oh-my-opencode doesn't support --format json, so use SSE curl for events.
+    let use_json_stdout = false;
     let sse_handle =
         if !use_json_stdout && command_available(&workspace_exec, work_dir, "curl").await {
             let workspace_exec = workspace_exec.clone();
@@ -4926,8 +4922,8 @@ pub async fn run_opencode_turn(
         None
     };
 
-    // Process stdout NDJSON events from --format json
-    // Each line is a JSON event: {"type":"message.part.updated","properties":{...}}
+    // Process stdout output from oh-my-opencode
+    // Events come via SSE (when curl is available), stdout contains the assistant's text response.
     let stdout_reader = BufReader::new(stdout);
     let mut stdout_lines = stdout_reader.lines();
     let mut state = OpencodeSseState::default();
@@ -5028,8 +5024,8 @@ pub async fn run_opencode_turn(
                                 }
                             }
                         } else {
-                            // Non-JSON line (shouldn't happen with --format json, but handle gracefully)
-                            tracing::debug!(mission_id = %mission_id, line = %trimmed, "OpenCode non-JSON stdout");
+                            // Non-JSON line - this is the expected output format without --format json
+                            tracing::debug!(mission_id = %mission_id, line = %trimmed, "OpenCode stdout");
                             final_result.push_str(trimmed);
                             final_result.push('\n');
                         }
