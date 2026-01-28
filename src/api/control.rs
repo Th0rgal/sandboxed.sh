@@ -2720,6 +2720,19 @@ async fn control_actor_loop(
                                                 mission.history.len(), tid
                                             );
                                         }
+                                        // Activate mission if it was interrupted/blocked
+                                        if matches!(mission.status, MissionStatus::Pending | MissionStatus::Interrupted | MissionStatus::Blocked) {
+                                            tracing::info!("Activating main mission {} (was {})", tid, mission.status);
+                                            if let Err(e) = mission_store.update_mission_status(tid, MissionStatus::Active).await {
+                                                tracing::warn!("Failed to activate main mission {}: {}", tid, e);
+                                            } else {
+                                                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                                    mission_id: tid,
+                                                    status: MissionStatus::Active,
+                                                    summary: None,
+                                                });
+                                            }
+                                        }
                                     }
                                     *current_mission.write().await = Some(tid);
                                     tracing::info!("Set current mission to target: {}", tid);
@@ -2736,6 +2749,19 @@ async fn control_actor_loop(
                                             history.clear();
                                             for entry in &mission.history {
                                                 history.push((entry.role.clone(), entry.content.clone()));
+                                            }
+                                            // Activate mission if it was interrupted/blocked
+                                            if matches!(mission.status, MissionStatus::Pending | MissionStatus::Interrupted | MissionStatus::Blocked) {
+                                                tracing::info!("Activating switched mission {} (was {})", tid, mission.status);
+                                                if let Err(e) = mission_store.update_mission_status(tid, MissionStatus::Active).await {
+                                                    tracing::warn!("Failed to activate switched mission {}: {}", tid, e);
+                                                } else {
+                                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                                        mission_id: tid,
+                                                        status: MissionStatus::Active,
+                                                        summary: None,
+                                                    });
+                                                }
                                             }
                                         }
                                         *current_mission.write().await = Some(tid);
@@ -2754,6 +2780,19 @@ async fn control_actor_loop(
                                                     "Reloaded {} history entries for mission {} (session continuity)",
                                                     mission.history.len(), tid
                                                 );
+                                            }
+                                            // Activate mission if it was interrupted/blocked (same mission, reloading)
+                                            if matches!(mission.status, MissionStatus::Pending | MissionStatus::Interrupted | MissionStatus::Blocked) {
+                                                tracing::info!("Activating reloaded mission {} (was {})", tid, mission.status);
+                                                if let Err(e) = mission_store.update_mission_status(tid, MissionStatus::Active).await {
+                                                    tracing::warn!("Failed to activate reloaded mission {}: {}", tid, e);
+                                                } else {
+                                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                                        mission_id: tid,
+                                                        status: MissionStatus::Active,
+                                                        summary: None,
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -3212,6 +3251,13 @@ async fn control_actor_loop(
                                     .await
                                 {
                                     tracing::warn!("Failed to resume mission {}: {}", mission_id, e);
+                                } else {
+                                    // Send status changed event so UI updates
+                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        mission_id,
+                                        status: MissionStatus::Active,
+                                        summary: None,
+                                    });
                                 }
 
                                 // Queue the resume prompt as a message (no per-message agent override)
@@ -3583,7 +3629,9 @@ async fn control_actor_loop(
                                 if let Some(mission_id) = completed_mission_id {
                                     match mission_store.get_mission(mission_id).await {
                                         Ok(Some(mission)) => {
-                                            if mission.status == MissionStatus::Active {
+                                            // Auto-complete if mission is Active OR Interrupted (resumed missions may
+                                            // still have Interrupted status if the status update event was not persisted)
+                                            if matches!(mission.status, MissionStatus::Active | MissionStatus::Interrupted) {
                                                 let new_status = match agent_result.terminal_reason {
                                                     Some(TerminalReason::Completed) => MissionStatus::Completed,
                                                     Some(TerminalReason::MaxIterations) => MissionStatus::Blocked,
