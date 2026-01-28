@@ -1,6 +1,6 @@
 [package]
 name = "open_agent"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Cloud orchestrator for AI coding agents (Claude Code & OpenCode)"
 authors = ["Open Agent Contributors"]
