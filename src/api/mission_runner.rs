@@ -2240,9 +2240,13 @@ fn install_opencode_serve_port_wrapper(
     }
 
     // The wrapper script: intercepts `opencode serve` and overrides --port
+    // Note: We exclude our wrapper directory from PATH when searching for the real binary
+    // to avoid finding ourselves in an infinite loop.
     let wrapper_script = r#"#!/bin/sh
 # opencode serve port override wrapper (installed by Open Agent)
-REAL_OPENCODE="$(command -v opencode 2>/dev/null || echo /usr/local/bin/opencode)"
+WRAPPER_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLEAN_PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^$WRAPPER_DIR$" | tr '\n' ':' | sed 's/:$//')"
+REAL_OPENCODE="$(PATH="$CLEAN_PATH" command -v opencode 2>/dev/null || echo /usr/local/bin/opencode)"
 if [ -n "$OPENCODE_SERVER_PORT" ] && [ "$1" = "serve" ]; then
   shift
   new_args=""

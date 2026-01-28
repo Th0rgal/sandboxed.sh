@@ -262,3 +262,155 @@ pub async fn create_mission_store(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that missions are created with Pending status (not Active).
+    /// This is critical to prevent the race condition where startup recovery
+    /// marks newly created missions as interrupted.
+    #[tokio::test]
+    async fn test_mission_created_with_pending_status() {
+        let store = InMemoryMissionStore::new();
+
+        let mission = store
+            .create_mission(Some("Test Mission"), None, None, None, None)
+            .await
+            .expect("Failed to create mission");
+
+        assert_eq!(
+            mission.status,
+            MissionStatus::Pending,
+            "New missions should have Pending status, not {:?}",
+            mission.status
+        );
+    }
+
+    /// Test that Pending missions are NOT returned by get_all_active_missions.
+    /// This ensures the orphan detection won't mark Pending missions as interrupted.
+    #[tokio::test]
+    async fn test_pending_missions_not_in_active_list() {
+        let store = InMemoryMissionStore::new();
+
+        // Create a pending mission
+        let mission = store
+            .create_mission(Some("Pending Mission"), None, None, None, None)
+            .await
+            .expect("Failed to create mission");
+
+        assert_eq!(mission.status, MissionStatus::Pending);
+
+        // get_all_active_missions should NOT include pending missions
+        let active_missions = store
+            .get_all_active_missions()
+            .await
+            .expect("Failed to get active missions");
+
+        assert!(
+            active_missions.is_empty(),
+            "Pending missions should not appear in active missions list"
+        );
+    }
+
+    /// Test that missions transition correctly from Pending to Active.
+    #[tokio::test]
+    async fn test_mission_status_transition_pending_to_active() {
+        let store = InMemoryMissionStore::new();
+
+        // Create a pending mission
+        let mission = store
+            .create_mission(Some("Test Mission"), None, None, None, None)
+            .await
+            .expect("Failed to create mission");
+
+        assert_eq!(mission.status, MissionStatus::Pending);
+
+        // Update status to Active
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("Failed to update status");
+
+        // Verify status changed
+        let updated = store
+            .get_mission(mission.id)
+            .await
+            .expect("Failed to get mission")
+            .expect("Mission not found");
+
+        assert_eq!(
+            updated.status,
+            MissionStatus::Active,
+            "Mission status should be Active after update"
+        );
+
+        // Now it should appear in active missions
+        let active_missions = store
+            .get_all_active_missions()
+            .await
+            .expect("Failed to get active missions");
+
+        assert_eq!(
+            active_missions.len(),
+            1,
+            "Active mission should appear in active missions list"
+        );
+        assert_eq!(active_missions[0].id, mission.id);
+    }
+
+    /// Test the orphan detection scenario: Active missions should be detected,
+    /// but Pending missions should not.
+    #[tokio::test]
+    async fn test_orphan_detection_ignores_pending() {
+        let store = InMemoryMissionStore::new();
+
+        // Create two missions
+        let pending_mission = store
+            .create_mission(Some("Pending"), None, None, None, None)
+            .await
+            .expect("Failed to create pending mission");
+
+        let active_mission = store
+            .create_mission(Some("Will be Active"), None, None, None, None)
+            .await
+            .expect("Failed to create mission");
+
+        // Activate only one mission
+        store
+            .update_mission_status(active_mission.id, MissionStatus::Active)
+            .await
+            .expect("Failed to activate mission");
+
+        // Check active missions (simulating orphan detection)
+        let active_missions = store
+            .get_all_active_missions()
+            .await
+            .expect("Failed to get active missions");
+
+        // Only the active mission should be in the list
+        assert_eq!(
+            active_missions.len(),
+            1,
+            "Only Active missions should be returned, not Pending ones"
+        );
+        assert_eq!(active_missions[0].id, active_mission.id);
+
+        // Pending mission should still exist but not be in active list
+        let pending = store
+            .get_mission(pending_mission.id)
+            .await
+            .expect("Failed to get pending mission")
+            .expect("Pending mission not found");
+        assert_eq!(pending.status, MissionStatus::Pending);
+    }
+
+    /// Test MissionStatus Display implementation includes Pending.
+    #[test]
+    fn test_mission_status_display() {
+        assert_eq!(format!("{}", MissionStatus::Pending), "pending");
+        assert_eq!(format!("{}", MissionStatus::Active), "active");
+        assert_eq!(format!("{}", MissionStatus::Completed), "completed");
+        assert_eq!(format!("{}", MissionStatus::Interrupted), "interrupted");
+    }
+}
