@@ -90,7 +90,8 @@ test.describe('Mission backend configs', () => {
       expect(missionRes.ok()).toBeTruthy();
       const mission = (await missionRes.json()) as { id: string };
 
-      await request.get(`${API_BASE}/api/control/missions/${mission.id}/load`);
+      const loadRes = await request.get(`${API_BASE}/api/control/missions/${mission.id}/load`);
+      expect(loadRes.ok()).toBeTruthy();
 
       const messageRes = await request.post(`${API_BASE}/api/control/message`, {
         data: { content: prompt, mission_id: mission.id },
