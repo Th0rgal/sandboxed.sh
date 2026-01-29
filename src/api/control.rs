@@ -276,6 +276,8 @@ pub struct QueuedMessage {
     pub id: Uuid,
     pub content: String,
     pub agent: Option<String>,
+    /// Which mission this queued message belongs to
+    pub mission_id: Option<Uuid>,
 }
 
 /// Tool result posted by the frontend for an interactive tool call.
@@ -3422,14 +3424,27 @@ async fn control_actor_loop(
                         let _ = respond.send(interrupted_ids);
                     }
                     ControlCommand::GetQueue { respond } => {
-                        let queued: Vec<QueuedMessage> = queue
+                        // Collect queued messages from main runner
+                        let mut queued: Vec<QueuedMessage> = queue
                             .iter()
                             .map(|(id, content, agent)| QueuedMessage {
                                 id: *id,
                                 content: content.clone(),
                                 agent: agent.clone(),
+                                mission_id: running_mission_id,
                             })
                             .collect();
+                        // Also collect queued messages from parallel runners
+                        for (mid, runner) in parallel_runners.iter() {
+                            for qm in runner.queue.iter() {
+                                queued.push(QueuedMessage {
+                                    id: qm.id,
+                                    content: qm.content.clone(),
+                                    agent: qm.agent.clone(),
+                                    mission_id: Some(*mid),
+                                });
+                            }
+                        }
                         let _ = respond.send(queued);
                     }
                     ControlCommand::RemoveFromQueue { message_id, respond } => {

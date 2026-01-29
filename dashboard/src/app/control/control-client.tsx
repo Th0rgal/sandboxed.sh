@@ -2918,9 +2918,10 @@ export default function ControlClient() {
         setViewingMission(mission);
         // Use events if available, otherwise fall back to basic history
         let historyItems = events ? eventsToItems(events) : missionHistoryToItems(mission);
-        // Merge queued messages
-        if (queuedMessages.length > 0) {
-          const queuedChatItems: ChatItem[] = queuedMessages.map((qm) => ({
+        // Merge queued messages that belong to this mission
+        const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === id);
+        if (missionQueuedMessages.length > 0) {
+          const queuedChatItems: ChatItem[] = missionQueuedMessages.map((qm) => ({
             kind: "user" as const,
             id: qm.id,
             content: qm.content,
@@ -2983,9 +2984,10 @@ export default function ControlClient() {
             .then(([events, queuedMessages]) => {
               if (cancelled) return;
               let historyItems = eventsToItems(events);
-              // Merge queued messages
-              if (queuedMessages.length > 0) {
-                const queuedChatItems: ChatItem[] = queuedMessages.map((qm) => ({
+              // Merge queued messages that belong to this mission
+              const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === mission.id);
+              if (missionQueuedMessages.length > 0) {
+                const queuedChatItems: ChatItem[] = missionQueuedMessages.map((qm) => ({
                   kind: "user" as const,
                   id: qm.id,
                   content: qm.content,
@@ -3368,10 +3370,10 @@ export default function ControlClient() {
         // Use events if available, otherwise fall back to basic history
         let historyItems = events ? eventsToItems(events) : missionHistoryToItems(mission);
 
-        // Merge queued messages if this is the running mission
-        // Queue is global and applies to whatever mission is currently active
-        if (queuedMessages.length > 0) {
-          const queuedChatItems: ChatItem[] = queuedMessages.map((qm) => ({
+        // Merge queued messages that belong to this mission
+        const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === missionId);
+        if (missionQueuedMessages.length > 0) {
+          const queuedChatItems: ChatItem[] = missionQueuedMessages.map((qm) => ({
             kind: "user" as const,
             id: qm.id,
             content: qm.content,
@@ -3647,9 +3649,10 @@ export default function ControlClient() {
             .then(([mission, events, queuedMessages]) => {
               if (!mounted) return;
               let historyItems = eventsToItems(events);
-              // Merge queued messages
-              if (queuedMessages.length > 0) {
-                const queuedChatItems: ChatItem[] = queuedMessages.map((qm) => ({
+              // Merge queued messages that belong to this mission
+              const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === viewingId);
+              if (missionQueuedMessages.length > 0) {
+                const queuedChatItems: ChatItem[] = missionQueuedMessages.map((qm) => ({
                   kind: "user" as const,
                   id: qm.id,
                   content: qm.content,
