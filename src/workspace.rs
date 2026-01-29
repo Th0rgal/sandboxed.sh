@@ -3594,8 +3594,29 @@ async fn run_workspace_init_script(
             } else {
                 Some(custom_script)
             };
+
+            // Collect setup commands from workspace skills
+            let skill_setup_commands = if !workspace.skills.is_empty() {
+                let commands = library
+                    .collect_skill_setup_commands(&workspace.skills)
+                    .await;
+                if commands.is_empty() {
+                    None
+                } else {
+                    tracing::info!(
+                        workspace = %workspace.name,
+                        skills_with_setup = commands.len(),
+                        "Collected setup commands from {} skills",
+                        commands.len()
+                    );
+                    Some(commands)
+                }
+            } else {
+                None
+            };
+
             match library
-                .assemble_init_script(&workspace.init_scripts, custom)
+                .assemble_init_script(&workspace.init_scripts, custom, skill_setup_commands.as_deref())
                 .await
             {
                 Ok(assembled) => assembled,

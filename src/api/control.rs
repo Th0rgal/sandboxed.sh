@@ -4301,6 +4301,7 @@ async fn run_single_control_turn(
             lib_ref,
             mid,
             backend_id.as_deref().unwrap_or("opencode"),
+            None, // custom_providers: TODO integrate with provider store
         )
         .await
         {

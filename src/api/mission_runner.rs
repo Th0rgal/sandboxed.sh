@@ -1049,6 +1049,7 @@ async fn run_mission_turn(
             lib_ref,
             mission_id,
             &backend_id,
+            None, // custom_providers: TODO integrate with provider store
         )
         .await
     } {

@@ -293,6 +293,9 @@ pub struct SkillSummary {
     /// Source/provenance of the skill
     #[serde(default)]
     pub source: SkillSource,
+    /// Shell commands to run during workspace setup (e.g., install dependencies)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_commands: Vec<String>,
 }
 
 /// Full skill with content.
@@ -316,6 +319,9 @@ pub struct Skill {
     /// List of non-.md reference files
     #[serde(default)]
     pub references: Vec<String>,
+    /// Shell commands to run during workspace setup (e.g., install dependencies)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_commands: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

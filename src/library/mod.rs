@@ -246,6 +246,7 @@ impl LibraryStore {
                 .unwrap_or((None, ""));
 
             let description = extract_description(&frontmatter);
+            let setup_commands = extract_string_array(&frontmatter, "setup_commands");
 
             // Read skill source metadata if present
             let source_file = entry_path.join(".skill-source.json");
@@ -264,6 +265,7 @@ impl LibraryStore {
                 description,
                 path: format!("{}/{}", SKILL_DIR, entry.file_name().to_string_lossy()),
                 source,
+                setup_commands,
             });
         }
 
@@ -314,6 +316,9 @@ impl LibraryStore {
             SkillSource::default()
         };
 
+        // Extract setup_commands from frontmatter
+        let setup_commands = extract_string_array(&frontmatter, "setup_commands");
+
         Ok(Skill {
             name: name.to_string(),
             description,
@@ -322,6 +327,7 @@ impl LibraryStore {
             content,
             files,
             references,
+            setup_commands,
         })
     }
 
@@ -1277,24 +1283,22 @@ impl LibraryStore {
         let config: WorkspaceTemplateConfig =
             serde_json::from_str(&content).context("Failed to parse workspace template file")?;
 
-        // Decrypt env vars if we have a key configured
-        let env_vars = match env_crypto::load_private_key_from_env()? {
-            Some(key) => env_crypto::decrypt_env_vars(&key, &config.env_vars)
-                .context("Failed to decrypt template env vars")?,
-            None => {
-                // No key configured - check if any values are encrypted
-                let has_encrypted = config
-                    .env_vars
-                    .values()
-                    .any(|v| env_crypto::is_encrypted(v));
-                if has_encrypted {
-                    tracing::warn!(
-                        "Template '{}' has encrypted env vars but PRIVATE_KEY is not configured",
-                        name
-                    );
-                }
-                config.env_vars.clone()
-            }
+        // Decrypt env vars if we have a key configured (file or env var)
+        let has_encrypted = config
+            .env_vars
+            .values()
+            .any(|v| env_crypto::is_encrypted(v));
+
+        let env_vars = if has_encrypted {
+            // Try to load key from env var or file
+            let key = env_crypto::ensure_private_key()
+                .await
+                .context("Failed to load encryption key for decrypting template env vars")?;
+            env_crypto::decrypt_env_vars(&key, &config.env_vars)
+                .context("Failed to decrypt template env vars")?
+        } else {
+            // No encrypted values, pass through as-is
+            config.env_vars.clone()
         };
 
         // Determine encrypted_keys: use stored list if available, otherwise detect from values
@@ -1509,12 +1513,13 @@ impl LibraryStore {
         Ok(())
     }
 
-    /// Assemble a combined init script from fragments and optional custom script.
+    /// Assemble a combined init script from fragments, skill setup commands, and optional custom script.
     /// Each fragment is prefixed with a header comment for debugging.
     pub async fn assemble_init_script(
         &self,
         fragment_names: &[String],
         custom_script: Option<&str>,
+        skill_setup_commands: Option<&[(String, Vec<String>)]>,
     ) -> Result<String> {
         let mut assembled = String::new();
 
@@ -1546,6 +1551,23 @@ impl LibraryStore {
             assembled.push_str("\n");
         }
 
+        // Add skill setup commands if provided
+        if let Some(skills) = skill_setup_commands {
+            let has_commands = skills.iter().any(|(_, cmds)| !cmds.is_empty());
+            if has_commands {
+                assembled.push_str("\n# === Skill Setup Commands ===\n");
+                for (skill_name, commands) in skills {
+                    if !commands.is_empty() {
+                        assembled.push_str(&format!("# Skill: {}\n", skill_name));
+                        for cmd in commands {
+                            assembled.push_str(cmd);
+                            assembled.push_str("\n");
+                        }
+                    }
+                }
+            }
+        }
+
         // Add custom script at the end if provided
         if let Some(custom) = custom_script {
             let trimmed = custom.trim();
@@ -1565,6 +1587,32 @@ impl LibraryStore {
         }
 
         Ok(assembled)
+    }
+
+    /// Collect setup commands from skills by name.
+    /// Returns a list of (skill_name, setup_commands) pairs.
+    pub async fn collect_skill_setup_commands(
+        &self,
+        skill_names: &[String],
+    ) -> Vec<(String, Vec<String>)> {
+        let mut result = Vec::new();
+        for name in skill_names {
+            match self.get_skill(name).await {
+                Ok(skill) => {
+                    if !skill.setup_commands.is_empty() {
+                        result.push((skill.name, skill.setup_commands));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        skill = %name,
+                        error = %e,
+                        "Failed to load skill for setup commands"
+                    );
+                }
+            }
+        }
+        result
     }
 
     /// Extract description from the first comment line after shebang.
