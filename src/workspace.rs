@@ -2587,6 +2587,10 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                             let dest_path = opencode_dir.join("oh-my-opencode.json");
                             match serde_json::to_string_pretty(&settings) {
                                 Ok(content) => {
+                                    // Patch agent models for Claude Code OAuth compatibility
+                                    let patched_content =
+                                        patch_opencode_agent_models_for_oauth(&content);
+
                                     let jsonc_path = opencode_dir.join("oh-my-opencode.jsonc");
                                     if jsonc_path.exists() {
                                         if let Err(e) = tokio::fs::remove_file(&jsonc_path).await {
@@ -2598,7 +2602,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                                             );
                                         }
                                     }
-                                    if let Err(e) = tokio::fs::write(&dest_path, content).await {
+                                    if let Err(e) = tokio::fs::write(&dest_path, &patched_content).await {
                                         tracing::warn!(
                                             mission = %mission_id,
                                             workspace = %workspace.name,
@@ -3651,5 +3655,69 @@ pub async fn read_openagent_config(
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => crate::library::OpenAgentConfig::default(),
+    }
+}
+
+/// Patch oh-my-opencode.json agent models for Claude Code OAuth compatibility.
+///
+/// Claude Code OAuth tokens only work with specific models. This function:
+/// - Replaces `anthropic/claude-opus-4-5` with `anthropic/claude-sonnet-4-5`
+/// - Removes the "variant" field from Anthropic model agents (e.g., "max" for extended thinking)
+///
+/// This ensures agents like Prometheus work correctly when using Claude Code OAuth.
+fn patch_opencode_agent_models_for_oauth(content: &str) -> String {
+    let mut json: serde_json::Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return content.to_string(),
+    };
+
+    let Some(agents) = json.get_mut("agents").and_then(|v| v.as_object_mut()) else {
+        return content.to_string();
+    };
+
+    let mut patched = false;
+
+    for (_name, agent) in agents.iter_mut() {
+        let Some(agent_obj) = agent.as_object_mut() else {
+            continue;
+        };
+
+        // Check if this agent uses an Anthropic model
+        let is_anthropic = agent_obj
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|m| m.starts_with("anthropic/"))
+            .unwrap_or(false);
+
+        if is_anthropic {
+            // Replace claude-opus-4-5 with claude-sonnet-4-5
+            if let Some(model_str) = agent_obj
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+            {
+                if model_str.contains("claude-opus-4-5") {
+                    let new_model = model_str.replace("claude-opus-4-5", "claude-sonnet-4-5");
+                    agent_obj.insert("model".to_string(), serde_json::Value::String(new_model));
+                    patched = true;
+                    tracing::info!(
+                        "Patched oh-my-opencode agent model: {} -> claude-sonnet-4-5",
+                        model_str
+                    );
+                }
+            }
+
+            // Remove "variant" field (e.g., "max" for extended thinking) as it's not supported
+            if agent_obj.remove("variant").is_some() {
+                patched = true;
+                tracing::info!("Removed 'variant' field from Anthropic agent for OAuth compatibility");
+            }
+        }
+    }
+
+    if patched {
+        serde_json::to_string_pretty(&json).unwrap_or_else(|_| content.to_string())
+    } else {
+        content.to_string()
     }
 }
