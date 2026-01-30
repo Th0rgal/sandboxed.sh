@@ -2335,10 +2335,12 @@ mod opencode_settings_tests {
         assert!(agents.contains_key("prometheus"));
 
         // Library file should be updated with prometheus.
-        let updated =
-            tokio::fs::read_to_string(temp.path().join("library/configs/default/.opencode/settings.json"))
-                .await
-                .expect("read updated library");
+        let updated_path =
+            temp.path()
+                .join("library/configs/default/.opencode/settings.json");
+        let updated = tokio::fs::read_to_string(updated_path)
+            .await
+            .expect("read updated library");
         let updated_value: serde_json::Value = serde_json::from_str(&updated).unwrap();
         let updated_agents = updated_value
             .get("agents")
