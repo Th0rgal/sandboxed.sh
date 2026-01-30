@@ -499,7 +499,7 @@ export function NewMissionDialog({
                 disabled={isBusy}
                 className="flex-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] transition-colors disabled:opacity-50"
               >
-                Create
+                Create here
               </button>
               <button
                 type="button"
