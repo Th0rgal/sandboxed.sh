@@ -288,6 +288,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
             "/config-profile/:name/file/*file_path",
             put(save_config_profile_file),
         )
+        .route(
+            "/config-profile/:name/file/*file_path",
+            delete(delete_config_profile_file),
+        )
         // Harness defaults (library base configs)
         .route("/harness-default/:harness", get(list_harness_default_files))
         .route(
@@ -2143,6 +2147,26 @@ async fn save_config_profile_file(
         .await
         .map(|_| (StatusCode::OK, "File saved successfully".to_string()))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// DELETE /api/library/config-profile/:name/file/*file_path - Delete a specific file from a config profile.
+async fn delete_config_profile_file(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path((name, file_path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .delete_config_profile_file(&name, &file_path)
+        .await
+        .map(|_| (StatusCode::OK, "File deleted successfully".to_string()))
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                (StatusCode::NOT_FOUND, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

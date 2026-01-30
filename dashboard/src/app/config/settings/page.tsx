@@ -9,11 +9,12 @@ import {
   listConfigProfileFiles,
   getConfigProfileFile,
   saveConfigProfileFile,
+  deleteConfigProfileFile,
   getHarnessDefaultFile,
   ConfigProfileSummary,
   DivergedHistoryError,
 } from '@/lib/api';
-import { Save, Loader, AlertCircle, Check, RefreshCw, X, GitBranch, Upload, Download, GitMerge, ChevronDown, Plus, Layers, FileJson, FolderOpen } from 'lucide-react';
+import { Save, Loader, AlertCircle, Check, RefreshCw, X, GitBranch, Upload, Download, GitMerge, ChevronDown, Plus, Layers, FileJson, FolderOpen, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
 import { useLibrary } from '@/contexts/library-context';
@@ -132,6 +133,7 @@ export default function SettingsPage() {
   const [isLibraryDefault, setIsLibraryDefault] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [parseError, setParseError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -243,6 +245,29 @@ export default function SettingsPage() {
       setSaving(false);
     }
   }, [parseError, selectedFile, selectedProfile, fileContent, refreshStatus, loadProfileFiles]);
+
+  const handleDelete = useCallback(async () => {
+    if (!selectedFile) return;
+
+    // Confirm deletion
+    if (!confirm(`Delete ${selectedFile.split('/').pop()}? This will remove your customizations and revert to library defaults.`)) {
+      return;
+    }
+
+    try {
+      setDeleting(true);
+      setError(null);
+      await deleteConfigProfileFile(selectedProfile, selectedFile);
+      // Reload the file (will now show library default)
+      await loadProfileFiles();
+      await loadFile(selectedFile);
+      await refreshStatus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete file');
+    } finally {
+      setDeleting(false);
+    }
+  }, [selectedFile, selectedProfile, loadProfileFiles, loadFile, refreshStatus]);
 
   // Handle keyboard shortcuts
   useEffect(() => {
@@ -693,6 +718,21 @@ export default function SettingsPage() {
               )}
             </div>
             <div className="flex items-center gap-2">
+              {selectedFile && profileFiles.includes(selectedFile) && (
+                <button
+                  onClick={handleDelete}
+                  disabled={deleting}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-red-400/70 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors disabled:opacity-50"
+                  title="Delete customizations and revert to library default"
+                >
+                  {deleting ? (
+                    <Loader className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-4 w-4" />
+                  )}
+                  Delete
+                </button>
+              )}
               {isDirty && (
                 <button
                   onClick={handleReset}

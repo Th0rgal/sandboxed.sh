@@ -2132,6 +2132,31 @@ impl LibraryStore {
         Ok(())
     }
 
+    /// Delete a specific file from a config profile.
+    pub async fn delete_config_profile_file(&self, profile: &str, file_path: &str) -> Result<()> {
+        Self::validate_name(profile)?;
+
+        let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
+        let path = profile_dir.join(file_path);
+
+        if !path.exists() {
+            anyhow::bail!("File not found: {}", file_path);
+        }
+
+        fs::remove_file(&path)
+            .await
+            .context("Failed to delete config file")?;
+
+        // Clean up empty parent directories
+        if let Some(parent) = path.parent() {
+            if parent != profile_dir {
+                let _ = fs::remove_dir(parent).await; // Ignore error if not empty
+            }
+        }
+
+        Ok(())
+    }
+
     /// List all files in a config profile.
     pub async fn list_config_profile_files(&self, profile: &str) -> Result<Vec<String>> {
         Self::validate_name(profile)?;

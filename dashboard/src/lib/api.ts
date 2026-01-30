@@ -1920,6 +1920,23 @@ export async function saveConfigProfileFile(
   }
 }
 
+// Delete a specific file from a config profile
+export async function deleteConfigProfileFile(
+  profile: string,
+  filePath: string
+): Promise<void> {
+  const response = await fetch(
+    apiUrl(`/api/library/config-profile/${encodeURIComponent(profile)}/file/${filePath}`),
+    {
+      method: "DELETE",
+      headers: authHeader(),
+    }
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to delete config profile file: ${response.statusText}`);
+  }
+}
+
 // List default files for a harness from the library
 export async function listHarnessDefaultFiles(harness: string): Promise<string[]> {
   return apiGet(
