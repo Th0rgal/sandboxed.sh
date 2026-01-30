@@ -142,6 +142,8 @@ export default function SettingsPage() {
   const [profileFiles, setProfileFiles] = useState<string[]>([]);
 
   const profileDropdownRef = useRef<HTMLDivElement>(null);
+  // Track current load request to prevent race conditions when switching files rapidly
+  const currentLoadRequestRef = useRef<number>(0);
 
   const isDirty = fileContent !== originalFileContent;
 
@@ -161,15 +163,28 @@ export default function SettingsPage() {
 
   // Load file content
   const loadFile = useCallback(async (filePath: string) => {
+    // Increment request ID to track this specific load request
+    const requestId = ++currentLoadRequestRef.current;
+
+    // Helper to check if this request is still the current one
+    const isStale = () => currentLoadRequestRef.current !== requestId;
+
     try {
       setLoading(true);
       setError(null);
       setIsLibraryDefault(false);
       const content = await getConfigProfileFile(selectedProfile, filePath);
+
+      // Discard stale responses to prevent race conditions
+      if (isStale()) return;
+
       setFileContent(content);
       setOriginalFileContent(content);
       setSelectedFile(filePath);
     } catch {
+      // Discard stale responses
+      if (isStale()) return;
+
       // File doesn't exist in profile, try to load library default
       const harness = Object.entries(HARNESS_CONFIG).find(([, cfg]) =>
         filePath.startsWith(cfg.dir)
@@ -183,11 +198,18 @@ export default function SettingsPage() {
         try {
           // Try to fetch from library defaults
           const libraryContent = await getHarnessDefaultFile(harnessConfig.libraryDir, libraryFileName);
+
+          // Discard stale responses
+          if (isStale()) return;
+
           setFileContent(libraryContent);
           setOriginalFileContent(libraryContent);
           setIsLibraryDefault(true);
           setSelectedFile(filePath);
         } catch {
+          // Discard stale responses
+          if (isStale()) return;
+
           // Library default doesn't exist either, use fallback
           const fallback = FALLBACK_DEFAULTS[harnessId]?.[fileName] || '{}';
           setFileContent(fallback);
@@ -199,7 +221,10 @@ export default function SettingsPage() {
         setError('Unknown harness for file path');
       }
     } finally {
-      setLoading(false);
+      // Only clear loading if this is still the current request
+      if (!isStale()) {
+        setLoading(false);
+      }
     }
   }, [selectedProfile]);
 
