@@ -2292,7 +2292,8 @@ mod opencode_settings_tests {
         let library_path = temp.path().join("library");
         let system_path = temp.path().join("system");
 
-        tokio::fs::create_dir_all(library_path.join("opencode"))
+        // Use new config profile structure
+        tokio::fs::create_dir_all(library_path.join("configs/default/.opencode"))
             .await
             .expect("create library dir");
         tokio::fs::create_dir_all(&system_path)
@@ -2305,7 +2306,7 @@ mod opencode_settings_tests {
             }
         });
         tokio::fs::write(
-            library_path.join("opencode").join("oh-my-opencode.json"),
+            library_path.join("configs/default/.opencode/settings.json"),
             serde_json::to_string_pretty(&library_settings).unwrap(),
         )
         .await
@@ -2335,7 +2336,7 @@ mod opencode_settings_tests {
 
         // Library file should be updated with prometheus.
         let updated =
-            tokio::fs::read_to_string(temp.path().join("library/opencode/oh-my-opencode.json"))
+            tokio::fs::read_to_string(temp.path().join("library/configs/default/.opencode/settings.json"))
                 .await
                 .expect("read updated library");
         let updated_value: serde_json::Value = serde_json::from_str(&updated).unwrap();
