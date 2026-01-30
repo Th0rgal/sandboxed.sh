@@ -66,10 +66,6 @@ const PLUGINS_FILE: &str = "plugins.json";
 const WORKSPACE_TEMPLATE_DIR: &str = "workspace-template";
 const CONFIGS_DIR: &str = "configs";
 const DEFAULT_PROFILE: &str = "default";
-// Legacy directories (for backward compatibility)
-const OPENCODE_DIR: &str = "opencode";
-const OPENAGENT_DIR: &str = "openagent";
-const CLAUDECODE_DIR: &str = "claudecode";
 
 /// Store for managing the configuration library.
 pub struct LibraryStore {
@@ -1720,232 +1716,53 @@ impl LibraryStore {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // OpenCode Settings (opencode/oh-my-opencode.json)
+    // OpenCode Settings (delegates to default profile)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Get oh-my-opencode settings from the Library.
-    /// If the Library file doesn't exist but a system config exists
-    /// (~/.config/opencode/oh-my-opencode.json), copies it to the Library first.
-    /// Returns an empty object if neither file exists.
+    /// Get oh-my-opencode settings from the Library (default profile).
+    /// Returns an empty object if the file doesn't exist.
     pub async fn get_opencode_settings(&self) -> Result<serde_json::Value> {
-        let path = self.path.join(OPENCODE_DIR).join("oh-my-opencode.json");
-        let system_path = Self::resolve_system_opencode_path();
-
-        let mut library_settings = if path.exists() {
-            let content = fs::read_to_string(&path)
-                .await
-                .context("Failed to read opencode/oh-my-opencode.json")?;
-            serde_json::from_str(&content).context("Failed to parse oh-my-opencode.json")?
-        } else {
-            serde_json::json!({})
-        };
-
-        let system_settings = if system_path.exists() {
-            let content = fs::read_to_string(&system_path)
-                .await
-                .context("Failed to read system oh-my-opencode.json")?;
-            Some(
-                serde_json::from_str::<serde_json::Value>(&content)
-                    .context("Failed to parse system oh-my-opencode.json")?,
-            )
-        } else {
-            None
-        };
-
-        if path.exists() {
-            let mut changed = false;
-
-            if !library_settings.is_object() {
-                library_settings = serde_json::json!({});
-                changed = true;
-            }
-
-            // If the library file is empty but the system config exists, prefer the system version.
-            if library_settings
-                .as_object()
-                .map(|o| o.is_empty())
-                .unwrap_or(true)
-            {
-                if let Some(system_settings) = system_settings.clone() {
-                    library_settings = system_settings;
-                    changed = true;
-                }
-            } else if let Some(system_settings) = system_settings.as_ref() {
-                // Merge missing agents from the system config (preserve library overrides).
-                if let Some(system_agents) =
-                    system_settings.get("agents").and_then(|v| v.as_object())
-                {
-                    let lib_agents = library_settings
-                        .get_mut("agents")
-                        .and_then(|v| v.as_object_mut());
-
-                    match lib_agents {
-                        Some(lib_agents) => {
-                            for (name, entry) in system_agents {
-                                if !lib_agents.contains_key(name) {
-                                    lib_agents.insert(name.clone(), entry.clone());
-                                    changed = true;
-                                }
-                            }
-                        }
-                        None => {
-                            if !system_agents.is_empty() {
-                                library_settings.as_object_mut().unwrap().insert(
-                                    "agents".to_string(),
-                                    serde_json::Value::Object(system_agents.clone()),
-                                );
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if changed {
-                let opencode_dir = self.path.join(OPENCODE_DIR);
-                if let Err(e) = fs::create_dir_all(&opencode_dir).await {
-                    tracing::warn!("Failed to create opencode directory in Library: {}", e);
-                } else if let Ok(content) = serde_json::to_string_pretty(&library_settings) {
-                    if let Err(e) = fs::write(&path, content).await {
-                        tracing::warn!("Failed to update oh-my-opencode.json in Library: {}", e);
-                    } else {
-                        tracing::info!(
-                            "Merged missing agents from system oh-my-opencode.json into Library"
-                        );
-                    }
-                }
-            }
-
-            return Ok(library_settings);
-        }
-
-        // Library file doesn't exist - try to copy from system location
-        if system_path.exists() {
-            let content = fs::read_to_string(&system_path)
-                .await
-                .context("Failed to read system oh-my-opencode.json")?;
-
-            // Parse first to validate it's valid JSON
-            let settings: serde_json::Value = serde_json::from_str(&content)
-                .context("Failed to parse system oh-my-opencode.json")?;
-
-            // Copy to Library so it's versioned and editable via dashboard
-            let opencode_dir = self.path.join(OPENCODE_DIR);
-            if let Err(e) = fs::create_dir_all(&opencode_dir).await {
-                tracing::warn!("Failed to create opencode directory in Library: {}", e);
-            } else if let Err(e) = fs::write(&path, &content).await {
-                tracing::warn!("Failed to copy oh-my-opencode.json to Library: {}", e);
-            } else {
-                tracing::info!("Copied oh-my-opencode.json from system to Library for versioning");
-            }
-
-            return Ok(settings);
-        }
-
-        // Neither file exists
-        Ok(serde_json::json!({}))
-    }
-
-    /// Resolve the system path to oh-my-opencode.json.
-    fn resolve_system_opencode_path() -> std::path::PathBuf {
-        if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
-            if !dir.trim().is_empty() {
-                return std::path::PathBuf::from(dir).join("oh-my-opencode.json");
-            }
-        }
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        std::path::PathBuf::from(home)
-            .join(".config")
-            .join("opencode")
-            .join("oh-my-opencode.json")
-    }
-
-    /// Save oh-my-opencode settings to the Library.
-    pub async fn save_opencode_settings(&self, settings: &serde_json::Value) -> Result<()> {
-        let opencode_dir = self.path.join(OPENCODE_DIR);
-        let path = opencode_dir.join("oh-my-opencode.json");
-
-        // Ensure directory exists
-        fs::create_dir_all(&opencode_dir).await?;
-
-        let content = serde_json::to_string_pretty(settings)?;
-        fs::write(&path, content)
+        self.get_opencode_settings_for_profile(DEFAULT_PROFILE)
             .await
-            .context("Failed to write opencode/oh-my-opencode.json")?;
+    }
 
-        Ok(())
+    /// Save oh-my-opencode settings to the Library (default profile).
+    pub async fn save_opencode_settings(&self, settings: &serde_json::Value) -> Result<()> {
+        self.save_opencode_settings_for_profile(DEFAULT_PROFILE, settings)
+            .await
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // OpenAgent Config (openagent/config.json)
+    // OpenAgent Config (delegates to default profile)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Get OpenAgent configuration from the Library.
+    /// Get OpenAgent configuration from the Library (default profile).
     /// Returns default config if the file doesn't exist.
     pub async fn get_openagent_config(&self) -> Result<OpenAgentConfig> {
-        let path = self.path.join(OPENAGENT_DIR).join("config.json");
-
-        if !path.exists() {
-            return Ok(OpenAgentConfig::default());
-        }
-
-        let content = fs::read_to_string(&path)
-            .await
-            .context("Failed to read openagent/config.json")?;
-
-        serde_json::from_str(&content).context("Failed to parse openagent/config.json")
+        self.get_openagent_config_for_profile(DEFAULT_PROFILE).await
     }
 
-    /// Save OpenAgent configuration to the Library.
+    /// Save OpenAgent configuration to the Library (default profile).
     pub async fn save_openagent_config(&self, config: &OpenAgentConfig) -> Result<()> {
-        let openagent_dir = self.path.join(OPENAGENT_DIR);
-        let path = openagent_dir.join("config.json");
-
-        // Ensure directory exists
-        fs::create_dir_all(&openagent_dir).await?;
-
-        let content = serde_json::to_string_pretty(config)?;
-        fs::write(&path, content)
+        self.save_openagent_config_for_profile(DEFAULT_PROFILE, config)
             .await
-            .context("Failed to write openagent/config.json")?;
-
-        Ok(())
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Claude Code Config (claudecode/config.json)
+    // Claude Code Config (delegates to default profile)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Get Claude Code configuration from the Library.
+    /// Get Claude Code configuration from the Library (default profile).
     /// Returns default config if the file doesn't exist.
     pub async fn get_claudecode_config(&self) -> Result<ClaudeCodeConfig> {
-        let path = self.path.join(CLAUDECODE_DIR).join("config.json");
-
-        if !path.exists() {
-            return Ok(ClaudeCodeConfig::default());
-        }
-
-        let content = fs::read_to_string(&path)
+        self.get_claudecode_config_for_profile(DEFAULT_PROFILE)
             .await
-            .context("Failed to read claudecode/config.json")?;
-
-        serde_json::from_str(&content).context("Failed to parse claudecode/config.json")
     }
 
-    /// Save Claude Code configuration to the Library.
+    /// Save Claude Code configuration to the Library (default profile).
     pub async fn save_claudecode_config(&self, config: &ClaudeCodeConfig) -> Result<()> {
-        let claudecode_dir = self.path.join(CLAUDECODE_DIR);
-        let path = claudecode_dir.join("config.json");
-
-        // Ensure directory exists
-        fs::create_dir_all(&claudecode_dir).await?;
-
-        let content = serde_json::to_string_pretty(config)?;
-        fs::write(&path, content)
+        self.save_claudecode_config_for_profile(DEFAULT_PROFILE, config)
             .await
-            .context("Failed to write claudecode/config.json")?;
-
-        Ok(())
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1956,20 +1773,7 @@ impl LibraryStore {
     pub async fn list_config_profiles(&self) -> Result<Vec<ConfigProfileSummary>> {
         let configs_dir = self.path.join(CONFIGS_DIR);
 
-        // Check for legacy directories - if they exist and configs/ doesn't, include "default"
-        let has_legacy = self.path.join(OPENCODE_DIR).exists()
-            || self.path.join(OPENAGENT_DIR).exists()
-            || self.path.join(CLAUDECODE_DIR).exists();
-
         if !configs_dir.exists() {
-            // If we have legacy configs, present them as the "default" profile
-            if has_legacy {
-                return Ok(vec![ConfigProfileSummary {
-                    name: DEFAULT_PROFILE.to_string(),
-                    is_default: true,
-                    path: format!("{}/{}", CONFIGS_DIR, DEFAULT_PROFILE),
-                }]);
-            }
             return Ok(Vec::new());
         }
 
@@ -2009,40 +1813,17 @@ impl LibraryStore {
             }
         });
 
-        // If no profiles exist but we have legacy configs, add "default"
-        if profiles.is_empty() && has_legacy {
-            profiles.push(ConfigProfileSummary {
-                name: DEFAULT_PROFILE.to_string(),
-                is_default: true,
-                path: format!("{}/{}", CONFIGS_DIR, DEFAULT_PROFILE),
-            });
-        }
-
         Ok(profiles)
     }
 
     /// Get a config profile by name with full content.
-    /// Falls back to legacy directory structure if profile doesn't exist.
     pub async fn get_config_profile(&self, name: &str) -> Result<ConfigProfile> {
         Self::validate_name(name)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(name);
-        let use_legacy = !profile_dir.exists() && name == DEFAULT_PROFILE;
-
-        // Resolve paths based on whether we're using legacy or new structure
-        let (opencode_path, openagent_path, claudecode_path) = if use_legacy {
-            (
-                self.path.join(OPENCODE_DIR).join("oh-my-opencode.json"),
-                self.path.join(OPENAGENT_DIR).join("config.json"),
-                self.path.join(CLAUDECODE_DIR).join("config.json"),
-            )
-        } else {
-            (
-                profile_dir.join("opencode").join("oh-my-opencode.json"),
-                profile_dir.join("openagent").join("config.json"),
-                profile_dir.join("claudecode").join("config.json"),
-            )
-        };
+        let opencode_path = profile_dir.join("opencode").join("oh-my-opencode.json");
+        let openagent_path = profile_dir.join("openagent").join("config.json");
+        let claudecode_path = profile_dir.join("claudecode").join("config.json");
 
         // Load OpenCode settings
         let opencode_settings = if opencode_path.exists() {
@@ -2190,13 +1971,7 @@ impl LibraryStore {
         Self::validate_name(profile)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
-        let use_legacy = !profile_dir.exists() && profile == DEFAULT_PROFILE;
-
-        let path = if use_legacy {
-            self.path.join(OPENCODE_DIR).join("oh-my-opencode.json")
-        } else {
-            profile_dir.join("opencode").join("oh-my-opencode.json")
-        };
+        let path = profile_dir.join("opencode").join("oh-my-opencode.json");
 
         if !path.exists() {
             return Ok(serde_json::json!({}));
@@ -2235,13 +2010,7 @@ impl LibraryStore {
         Self::validate_name(profile)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
-        let use_legacy = !profile_dir.exists() && profile == DEFAULT_PROFILE;
-
-        let path = if use_legacy {
-            self.path.join(OPENAGENT_DIR).join("config.json")
-        } else {
-            profile_dir.join("openagent").join("config.json")
-        };
+        let path = profile_dir.join("openagent").join("config.json");
 
         if !path.exists() {
             return Ok(OpenAgentConfig::default());
@@ -2283,13 +2052,7 @@ impl LibraryStore {
         Self::validate_name(profile)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
-        let use_legacy = !profile_dir.exists() && profile == DEFAULT_PROFILE;
-
-        let path = if use_legacy {
-            self.path.join(CLAUDECODE_DIR).join("config.json")
-        } else {
-            profile_dir.join("claudecode").join("config.json")
-        };
+        let path = profile_dir.join("claudecode").join("config.json");
 
         if !path.exists() {
             return Ok(ClaudeCodeConfig::default());

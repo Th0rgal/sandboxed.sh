@@ -182,13 +182,17 @@ fn build_history_context(history: &[(String, String)], max_chars: usize) -> Stri
     result
 }
 
-async fn resolve_claudecode_default_model(library: &SharedLibrary) -> Option<String> {
+async fn resolve_claudecode_default_model(
+    library: &SharedLibrary,
+    config_profile: Option<&str>,
+) -> Option<String> {
     let lib = {
         let guard = library.read().await;
         guard.clone()
     }?;
 
-    match lib.get_claudecode_config().await {
+    let profile = config_profile.unwrap_or("default");
+    match lib.get_claudecode_config_for_profile(profile).await {
         Ok(config) => config.default_model.and_then(|model| {
             let trimmed = model.trim().to_string();
             if trimmed.is_empty() {
@@ -198,7 +202,11 @@ async fn resolve_claudecode_default_model(library: &SharedLibrary) -> Option<Str
             }
         }),
         Err(err) => {
-            tracing::warn!("Failed to load Claude Code config from library: {}", err);
+            tracing::warn!(
+                "Failed to load Claude Code config from library (profile: {}): {}",
+                profile,
+                err
+            );
             None
         }
     }
@@ -1317,7 +1325,19 @@ pub async fn create_mission(
     }
 
     if backend.as_deref() == Some("claudecode") && model_override.is_none() {
-        if let Some(default_model) = resolve_claudecode_default_model(&state.library).await {
+        // Get workspace's config profile to use the right Claude Code config
+        let config_profile = if let Some(ws_id) = workspace_id {
+            state
+                .workspaces
+                .get(ws_id)
+                .await
+                .and_then(|ws| ws.config_profile)
+        } else {
+            None
+        };
+        if let Some(default_model) =
+            resolve_claudecode_default_model(&state.library, config_profile.as_deref()).await
+        {
             model_override = Some(default_model);
         }
     }
@@ -4291,10 +4311,18 @@ async fn run_single_control_turn(
     force_session_resume: bool,
 ) -> crate::agents::AgentResult {
     let is_claudecode = backend_id.as_deref() == Some("claudecode");
+    // Get workspace's config profile for Claude Code model resolution
+    let workspace_config_profile = if let Some(ws_id) = workspace_id {
+        workspaces.get(ws_id).await.and_then(|ws| ws.config_profile)
+    } else {
+        None
+    };
     if let Some(model) = model_override {
         config.default_model = Some(model);
     } else if is_claudecode && config.default_model.is_none() {
-        if let Some(default_model) = resolve_claudecode_default_model(&library).await {
+        if let Some(default_model) =
+            resolve_claudecode_default_model(&library, workspace_config_profile.as_deref()).await
+        {
             config.default_model = Some(default_model);
         }
     }

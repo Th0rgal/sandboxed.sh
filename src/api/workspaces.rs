@@ -122,6 +122,7 @@ pub struct WorkspaceResponse {
     pub init_script: Option<String>,
     pub shared_network: Option<bool>,
     pub mcps: Vec<String>,
+    pub config_profile: Option<String>,
 }
 
 impl From<Workspace> for WorkspaceResponse {
@@ -144,6 +145,7 @@ impl From<Workspace> for WorkspaceResponse {
             init_script: w.init_script,
             shared_network: w.shared_network,
             mcps: w.mcps,
+            config_profile: w.config_profile,
         }
     }
 }
@@ -365,6 +367,11 @@ async fn create_workspace(
             .unwrap_or_default()
     };
 
+    // Config profile from template
+    let config_profile = template_data
+        .as_ref()
+        .and_then(|t| t.config_profile.clone());
+
     let mut workspace = match workspace_type {
         WorkspaceType::Host => Workspace {
             id: Uuid::new_v4(),
@@ -385,6 +392,7 @@ async fn create_workspace(
             plugins: req.plugins,
             shared_network,
             mcps: mcps.clone(),
+            config_profile: config_profile.clone(),
         },
         WorkspaceType::Container => {
             let mut ws = Workspace::new_container(req.name, path);
@@ -398,6 +406,7 @@ async fn create_workspace(
             ws.init_script = init_script;
             ws.shared_network = shared_network;
             ws.mcps = mcps;
+            ws.config_profile = config_profile;
             ws
         }
     };
