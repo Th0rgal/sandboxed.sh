@@ -27,6 +27,7 @@ import {
   getClaudeCodeConfigForProfile,
   saveClaudeCodeConfigForProfile,
   ConfigProfileSummary,
+  DivergedHistoryError,
 } from '@/lib/api';
 import { Save, Loader, AlertCircle, Check, RefreshCw, RotateCcw, Eye, EyeOff, AlertTriangle, X, GitBranch, Upload, Info, Download, GitMerge, ChevronDown, Plus, Layers } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -158,8 +159,6 @@ export default function SettingsPage() {
   const [showCommitDialog, setShowCommitDialog] = useState(false);
   const [commitMessage, setCommitMessage] = useState('');
   const [showForceSyncDialog, setShowForceSyncDialog] = useState(false);
-  const [forceSyncing, setForceSyncing] = useState(false);
-  const [forcePushing, setForcePushing] = useState(false);
 
   // Ref for profile dropdown click-outside handling
   const profileDropdownRef = useRef<HTMLDivElement>(null);
@@ -422,9 +421,9 @@ export default function SettingsPage() {
     try {
       await sync();
       await loadSettings();
-    } catch {
+    } catch (err) {
       // If diverged history error, show the force sync dialog
-      if (divergedHistory) {
+      if (err instanceof DivergedHistoryError) {
         setShowForceSyncDialog(true);
       }
       // Other errors handled by context
@@ -433,27 +432,21 @@ export default function SettingsPage() {
 
   const handleForceSync = async () => {
     try {
-      setForceSyncing(true);
       await forceSync();
       setShowForceSyncDialog(false);
       await loadSettings();
     } catch {
       // Error handled by context
-    } finally {
-      setForceSyncing(false);
     }
   };
 
   const handleForcePush = async () => {
     try {
-      setForcePushing(true);
       await forcePush();
       setShowForceSyncDialog(false);
       await refreshStatus();
     } catch {
       // Error handled by context
-    } finally {
-      setForcePushing(false);
     }
   };
 
@@ -1393,10 +1386,10 @@ export default function SettingsPage() {
                     </div>
                     <button
                       onClick={handleForceSync}
-                      disabled={forceSyncing || forcePushing}
+                      disabled={syncing || pushing}
                       className="flex-shrink-0 flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white bg-blue-500 hover:bg-blue-600 rounded-lg disabled:opacity-50 transition-colors"
                     >
-                      {forceSyncing ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+                      {syncing ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
                       Force Pull
                     </button>
                   </div>
@@ -1414,10 +1407,10 @@ export default function SettingsPage() {
                     </div>
                     <button
                       onClick={handleForcePush}
-                      disabled={forceSyncing || forcePushing}
+                      disabled={syncing || pushing}
                       className="flex-shrink-0 flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white bg-orange-500 hover:bg-orange-600 rounded-lg disabled:opacity-50 transition-colors"
                     >
-                      {forcePushing ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
+                      {pushing ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
                       Force Push
                     </button>
                   </div>

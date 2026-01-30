@@ -405,6 +405,37 @@ fn sanitize_skill_list(skills: Vec<String>) -> Vec<String> {
 // Git Operations
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Sync all library configurations after a git sync/pull operation.
+/// This includes plugins, OpenCode settings, OpenAgent config, and workspaces.
+async fn sync_library_configs(
+    state: &Arc<super::routes::AppState>,
+    library: &dyn crate::library::LibraryStore,
+) -> Result<(), (StatusCode, String)> {
+    // Sync plugins to global OpenCode config
+    let plugins = library
+        .get_plugins()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::opencode_config::sync_global_plugins(&plugins)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Sync OpenCode settings (oh-my-opencode.json) from Library to system
+    if let Err(e) = workspace::sync_opencode_settings(library).await {
+        tracing::warn!(error = %e, "Failed to sync oh-my-opencode settings during library sync");
+    }
+
+    // Sync OpenAgent config from Library to working directory
+    if let Err(e) = workspace::sync_openagent_config(library, &state.config.working_dir).await {
+        tracing::warn!(error = %e, "Failed to sync openagent config during library sync");
+    }
+
+    // Sync skills and tools to workspaces
+    sync_all_workspaces(state, library).await;
+
+    Ok(())
+}
+
 /// GET /api/library/status - Get git status of the library.
 async fn get_status(
     State(state): State<Arc<super::routes::AppState>>,
@@ -441,27 +472,8 @@ async fn sync_library(
         return Err((StatusCode::INTERNAL_SERVER_ERROR, error_msg));
     }
 
-    // Sync plugins to global OpenCode config
-    let plugins = library
-        .get_plugins()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    crate::opencode_config::sync_global_plugins(&plugins)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Sync OpenCode settings (oh-my-opencode.json) from Library to system
-    if let Err(e) = workspace::sync_opencode_settings(&library).await {
-        tracing::warn!(error = %e, "Failed to sync oh-my-opencode settings during library sync");
-    }
-
-    // Sync OpenAgent config from Library to working directory
-    if let Err(e) = workspace::sync_openagent_config(&library, &state.config.working_dir).await {
-        tracing::warn!(error = %e, "Failed to sync openagent config during library sync");
-    }
-
-    // Sync skills and tools to workspaces
-    sync_all_workspaces(&state, library.as_ref()).await;
+    // Sync all library configurations
+    sync_library_configs(&state, library.as_ref()).await?;
 
     Ok((StatusCode::OK, "Synced successfully".to_string()))
 }
@@ -480,27 +492,8 @@ async fn force_sync_library(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Sync plugins to global OpenCode config
-    let plugins = library
-        .get_plugins()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    crate::opencode_config::sync_global_plugins(&plugins)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Sync OpenCode settings (oh-my-opencode.json) from Library to system
-    if let Err(e) = workspace::sync_opencode_settings(&library).await {
-        tracing::warn!(error = %e, "Failed to sync oh-my-opencode settings during force sync");
-    }
-
-    // Sync OpenAgent config from Library to working directory
-    if let Err(e) = workspace::sync_openagent_config(&library, &state.config.working_dir).await {
-        tracing::warn!(error = %e, "Failed to sync openagent config during force sync");
-    }
-
-    // Sync skills and tools to workspaces
-    sync_all_workspaces(&state, library.as_ref()).await;
+    // Sync all library configurations
+    sync_library_configs(&state, library.as_ref()).await?;
 
     Ok((
         StatusCode::OK,
