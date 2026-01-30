@@ -16,6 +16,7 @@
 //!   If unset, uses default SSH behavior.
 //! - `LIBRARY_REMOTE` - Optional. Initial library remote URL (can be changed via Settings in the dashboard).
 //!   This environment variable is used as the initial default when no settings file exists.
+//!   If not set, defaults to: https://github.com/Th0rgal/openagent-library-template.git
 //!
 //! Note: The agent has **full system access**. It can read/write any file, execute any command,
 //! and search anywhere on the machine. The `WORKING_DIR` is just the default for relative paths.

@@ -63,7 +63,9 @@ impl SettingsStore {
     /// Load settings from environment variables as initial defaults.
     fn defaults_from_env() -> Settings {
         Settings {
-            library_remote: std::env::var("LIBRARY_REMOTE").ok(),
+            library_remote: std::env::var("LIBRARY_REMOTE")
+                .ok()
+                .or_else(|| Some("https://github.com/Th0rgal/openagent-library-template.git".to_string())),
         }
     }
 

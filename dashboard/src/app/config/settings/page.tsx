@@ -25,6 +25,7 @@ const HARNESS_CONFIG = {
     dir: '.opencode',
     files: [
       { name: 'settings.json', description: 'Main settings (agents, models, providers)' },
+      { name: 'oh-my-opencode.json', description: 'oh-my-opencode plugin configuration' },
     ],
     defaultContent: {
       'settings.json': JSON.stringify({
@@ -33,6 +34,9 @@ const HARNESS_CONFIG = {
             model: 'anthropic/claude-sonnet-4-20250514'
           }
         }
+      }, null, 2),
+      'oh-my-opencode.json': JSON.stringify({
+        // Default oh-my-opencode config
       }, null, 2),
     },
   },
@@ -601,38 +605,69 @@ export default function SettingsPage() {
       {/* Main Content: File Browser + Editor */}
       <div className="flex gap-4 flex-1 min-h-0">
         {/* File Browser Sidebar */}
-        <div className="w-64 flex-shrink-0 rounded-xl bg-white/[0.02] border border-white/[0.06] p-4">
+        <div className="w-64 flex-shrink-0 rounded-xl bg-white/[0.02] border border-white/[0.06] p-4 flex flex-col">
           <div className="flex items-center gap-2 mb-4">
             <FolderOpen className="h-4 w-4 text-white/50" />
             <span className="text-sm font-medium text-white">{harnessConfig.dir}/</span>
           </div>
-          <div className="space-y-1">
-            {harnessConfig.files.map((file) => {
-              const filePath = `${harnessConfig.dir}/${file.name}`;
-              const isSelected = selectedFile === filePath;
-              const exists = profileFiles.includes(filePath);
-              return (
-                <button
-                  key={file.name}
-                  onClick={() => loadFile(filePath)}
-                  className={cn(
-                    'w-full flex items-start gap-2 px-3 py-2 text-sm rounded-lg transition-colors text-left',
-                    isSelected
-                      ? 'bg-indigo-500/20 text-indigo-300'
-                      : 'text-white/70 hover:bg-white/[0.06]'
-                  )}
-                >
-                  <FileJson className="h-4 w-4 flex-shrink-0 mt-0.5" />
-                  <div className="flex-1 min-w-0">
-                    <div className="truncate">{file.name}</div>
-                    <div className="text-[10px] text-white/40 truncate">{file.description}</div>
-                    {!exists && (
-                      <div className="text-[10px] text-amber-400/60 mt-1">Will be created on save</div>
+          <div className="space-y-1 flex-1 overflow-y-auto">
+            {/* Show all files that exist in the profile for this harness */}
+            {profileFiles
+              .filter((file) => file.startsWith(harnessConfig.dir))
+              .map((filePath) => {
+                const fileName = filePath.split('/').pop() || '';
+                const isSelected = selectedFile === filePath;
+                const fileConfig = harnessConfig.files.find(f => f.name === fileName);
+                return (
+                  <button
+                    key={filePath}
+                    onClick={() => loadFile(filePath)}
+                    className={cn(
+                      'w-full flex items-start gap-2 px-3 py-2 text-sm rounded-lg transition-colors text-left',
+                      isSelected
+                        ? 'bg-indigo-500/20 text-indigo-300'
+                        : 'text-white/70 hover:bg-white/[0.06]'
                     )}
-                  </div>
-                </button>
-              );
-            })}
+                  >
+                    <FileJson className="h-4 w-4 flex-shrink-0 mt-0.5" />
+                    <div className="flex-1 min-w-0">
+                      <div className="truncate">{fileName}</div>
+                      {fileConfig && (
+                        <div className="text-[10px] text-white/40 truncate">{fileConfig.description}</div>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            {/* Show predefined files that don't exist yet */}
+            {harnessConfig.files
+              .filter((file) => {
+                const filePath = `${harnessConfig.dir}/${file.name}`;
+                return !profileFiles.includes(filePath);
+              })
+              .map((file) => {
+                const filePath = `${harnessConfig.dir}/${file.name}`;
+                const isSelected = selectedFile === filePath;
+                return (
+                  <button
+                    key={filePath}
+                    onClick={() => loadFile(filePath)}
+                    className={cn(
+                      'w-full flex items-start gap-2 px-3 py-2 text-sm rounded-lg transition-colors text-left',
+                      isSelected
+                        ? 'bg-indigo-500/20 text-indigo-300'
+                        : 'text-white/70 hover:bg-white/[0.06]'
+                    )}
+                  >
+                    <FileJson className="h-4 w-4 flex-shrink-0 mt-0.5" />
+                    <div className="flex-1 min-w-0">
+                      <div className="truncate">{file.name}</div>
+                      <div className="text-[10px] text-white/40 truncate">{file.description}</div>
+                      <div className="text-[10px] text-amber-400/60 mt-1">Will be created on save</div>
+                    </div>
+                  </button>
+                );
+              })}
           </div>
         </div>
 
