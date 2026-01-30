@@ -162,29 +162,6 @@ struct ToolCallData {
         return preview.count > 50 ? String(preview.prefix(47)) + "..." : preview
     }
 
-    /// Extract image paths from result (for screenshot tools)
-    var imagePaths: [String] {
-        guard let str = resultString else { return [] }
-        // Match common image file patterns
-        let pattern = #"/[\w/.-]+\.(png|jpg|jpeg|gif|webp|bmp|svg)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
-            return []
-        }
-        let range = NSRange(str.startIndex..., in: str)
-        let matches = regex.matches(in: str, options: [], range: range)
-        return matches.compactMap { match in
-            guard let range = Range(match.range, in: str) else { return nil }
-            return String(str[range])
-        }
-    }
-
-    /// Check if this tool produces images (screenshots, captures, etc.)
-    var isImageProducingTool: Bool {
-        let lower = name.lowercased()
-        return lower.contains("screenshot") || lower.contains("capture") ||
-               lower.contains("desktop_screenshot") || lower.contains("browser_take_screenshot")
-    }
-
     private func formatAsJSON(_ dict: [String: Any]) -> String {
         do {
             let data = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])

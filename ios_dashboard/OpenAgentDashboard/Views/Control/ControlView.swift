@@ -1522,8 +1522,9 @@ struct ControlView: View {
                let newStatus = MissionStatus(rawValue: statusStr) {
                 // Only process known status values - ignore unknown statuses
 
-                // If mission is no longer active, mark all pending tools as cancelled
-                if newStatus != .active {
+                // If mission is no longer active AND it's the currently viewed mission,
+                // mark all pending tools as cancelled
+                if newStatus != .active && viewingMissionId == missionId {
                     for i in messages.indices {
                         if messages[i].isToolCall && messages[i].isActiveToolCall {
                             if var toolData = messages[i].toolData {
