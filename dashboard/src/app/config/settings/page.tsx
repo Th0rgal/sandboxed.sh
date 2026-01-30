@@ -3,7 +3,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import useSWR from 'swr';
 import {
-  listBackends,
   getBackendConfig,
   listConfigProfiles,
   createConfigProfile,
@@ -107,15 +106,7 @@ export default function SettingsPage() {
   // Harness tab state
   const [activeHarness, setActiveHarness] = useState<HarnessId>('opencode');
 
-  // Fetch backends and their config to show enabled harnesses
-  const { data: backends = [] } = useSWR('backends', listBackends, {
-    revalidateOnFocus: false,
-    fallbackData: [
-      { id: 'opencode', name: 'OpenCode' },
-      { id: 'claudecode', name: 'Claude Code' },
-      { id: 'amp', name: 'Amp' },
-    ],
-  });
+  // Fetch backend configs to determine which harnesses are enabled
   const { data: opencodeConfig } = useSWR('backend-opencode-config', () => getBackendConfig('opencode'), {
     revalidateOnFocus: false,
   });

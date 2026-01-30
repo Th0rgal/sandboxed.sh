@@ -68,8 +68,6 @@ interface LibraryContextValue {
   forceSync: () => Promise<void>;
   /** Force push local to remote (use when you want to keep local changes) */
   forcePush: () => Promise<void>;
-  /** Clear the diverged history state (e.g., after user acknowledges) */
-  clearDivergedHistory: () => void;
   commit: (message: string) => Promise<void>;
   push: () => Promise<void>;
 
@@ -238,11 +236,6 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
     }
   }, [refreshStatus, showError]);
 
-  const clearDivergedHistory = useCallback(() => {
-    setDivergedHistory(false);
-    setDivergedHistoryMessage(null);
-  }, []);
-
   const commit = useCallback(async (message: string) => {
     try {
       setCommitting(true);
@@ -374,7 +367,6 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       sync,
       forceSync,
       forcePush,
-      clearDivergedHistory,
       commit,
       push,
       saveMcps,
@@ -409,7 +401,6 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       sync,
       forceSync,
       forcePush,
-      clearDivergedHistory,
       commit,
       push,
       saveMcps,

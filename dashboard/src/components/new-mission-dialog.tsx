@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import { Plus, X, ExternalLink, Layers } from 'lucide-react';
 import useSWR from 'swr';
 import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getBackendConfig, getClaudeCodeConfig, listConfigProfiles, type Backend, type BackendAgent, type ConfigProfileSummary } from '@/lib/api';
-import type { Provider, Workspace } from '@/lib/api';
+import type { Workspace } from '@/lib/api';
 
 /** Options returned by the dialog's getCreateOptions() method */
 export interface NewMissionDialogOptions {
@@ -33,7 +33,6 @@ export interface InitialMissionValues {
 
 interface NewMissionDialogProps {
   workspaces: Workspace[];
-  providers?: Provider[];
   disabled?: boolean;
   /** Creates a mission and returns its ID for navigation */
   onCreate: (options?: NewMissionDialogOptions) => Promise<CreatedMission>;
@@ -78,7 +77,6 @@ const parseAgentNames = (payload: unknown): string[] => {
 
 export function NewMissionDialog({
   workspaces,
-  providers = [],
   disabled = false,
   onCreate,
   controlPath = '/control',
