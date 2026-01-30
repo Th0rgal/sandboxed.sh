@@ -111,36 +111,6 @@ pub struct LibraryAgent {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Library Tool Types (TypeScript tool definitions)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Library tool summary for listing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LibraryToolSummary {
-    /// Tool name (filename without .ts)
-    pub name: String,
-    /// Description extracted from code comments or export
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Path relative to library root (e.g., "tool/database-query.ts")
-    pub path: String,
-}
-
-/// Full library tool with content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LibraryTool {
-    /// Tool name
-    pub name: String,
-    /// Description
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Path relative to library root
-    pub path: String,
-    /// Full TypeScript content
-    pub content: String,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Workspace Template Types
 // ─────────────────────────────────────────────────────────────────────────────
 

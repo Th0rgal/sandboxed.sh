@@ -1066,20 +1066,6 @@ export interface LibraryAgent {
   permissions: Record<string, string>;
 }
 
-// Library Tool types
-export interface LibraryToolSummary {
-  name: string;
-  description: string | null;
-  path: string;
-}
-
-export interface LibraryTool {
-  name: string;
-  description: string | null;
-  path: string;
-  content: string;
-}
-
 // Migration report
 export interface MigrationReport {
   directories_renamed: [string, string][];
@@ -1437,33 +1423,6 @@ export async function saveLibraryAgent(
 // Delete library agent
 export async function deleteLibraryAgent(name: string): Promise<void> {
   return libDel(`/api/library/agent/${encodeURIComponent(name)}`, "Failed to delete library agent");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Library Tools
-// ─────────────────────────────────────────────────────────────────────────────
-
-// List library tools
-export async function listLibraryTools(): Promise<LibraryToolSummary[]> {
-  return libGet("/api/library/tool", "Failed to fetch library tools");
-}
-
-// Get library tool
-export async function getLibraryTool(name: string): Promise<LibraryTool> {
-  return libGet(`/api/library/tool/${encodeURIComponent(name)}`, "Failed to fetch library tool");
-}
-
-// Save library tool
-export async function saveLibraryTool(
-  name: string,
-  content: string
-): Promise<void> {
-  return libPut(`/api/library/tool/${encodeURIComponent(name)}`, { content }, "Failed to save library tool");
-}
-
-// Delete library tool
-export async function deleteLibraryTool(name: string): Promise<void> {
-  return libDel(`/api/library/tool/${encodeURIComponent(name)}`, "Failed to delete library tool");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1928,9 +1887,9 @@ export async function listConfigProfileFiles(profile: string): Promise<string[]>
 // Get a specific file from a config profile
 export async function getConfigProfileFile(profile: string, filePath: string): Promise<string> {
   const response = await fetch(
-    `${API_BASE_URL}/api/library/config-profile/${encodeURIComponent(profile)}/file/${filePath}`,
+    apiUrl(`/api/library/config-profile/${encodeURIComponent(profile)}/file/${filePath}`),
     {
-      headers: getAuthHeaders(),
+      headers: authHeader(),
     }
   );
   if (!response.ok) {
@@ -1946,11 +1905,11 @@ export async function saveConfigProfileFile(
   content: string
 ): Promise<void> {
   const response = await fetch(
-    `${API_BASE_URL}/api/library/config-profile/${encodeURIComponent(profile)}/file/${filePath}`,
+    apiUrl(`/api/library/config-profile/${encodeURIComponent(profile)}/file/${filePath}`),
     {
       method: "PUT",
       headers: {
-        ...getAuthHeaders(),
+        ...authHeader(),
         "Content-Type": "text/plain",
       },
       body: content,

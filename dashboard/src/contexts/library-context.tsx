@@ -31,10 +31,6 @@ import {
   getLibraryAgent as apiGetLibraryAgent,
   saveLibraryAgent as apiSaveLibraryAgent,
   deleteLibraryAgent,
-  listLibraryTools,
-  getLibraryTool as apiGetLibraryTool,
-  saveLibraryTool as apiSaveLibraryTool,
-  deleteLibraryTool,
   LibraryUnavailableError,
   DivergedHistoryError,
   type LibraryStatus,
@@ -44,8 +40,6 @@ import {
   type Plugin,
   type LibraryAgentSummary,
   type LibraryAgent,
-  type LibraryToolSummary,
-  type LibraryTool,
 } from '@/lib/api';
 
 // Re-export types for consumers
@@ -59,7 +53,6 @@ interface LibraryContextValue {
   commands: CommandSummary[];
   plugins: Record<string, Plugin>;
   libraryAgents: LibraryAgentSummary[];
-  libraryTools: LibraryToolSummary[];
   loading: boolean;
   libraryUnavailable: boolean;
   libraryUnavailableMessage: string | null;
@@ -101,12 +94,6 @@ interface LibraryContextValue {
   removeLibraryAgent: (name: string) => Promise<void>;
   refreshLibraryAgents: () => Promise<void>;
 
-  // Library Tool operations
-  getLibraryTool: (name: string) => Promise<LibraryTool>;
-  saveLibraryTool: (name: string, content: string) => Promise<void>;
-  removeLibraryTool: (name: string) => Promise<void>;
-  refreshLibraryTools: () => Promise<void>;
-
   // Operation states
   syncing: boolean;
   committing: boolean;
@@ -135,7 +122,6 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
   const [commands, setCommands] = useState<CommandSummary[]>([]);
   const [plugins, setPlugins] = useState<Record<string, Plugin>>({});
   const [libraryAgents, setLibraryAgents] = useState<LibraryAgentSummary[]>([]);
-  const [libraryTools, setLibraryTools] = useState<LibraryToolSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [libraryUnavailable, setLibraryUnavailable] = useState(false);
   const [libraryUnavailableMessage, setLibraryUnavailableMessage] = useState<string | null>(null);
@@ -152,14 +138,13 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       setLibraryUnavailable(false);
       setLibraryUnavailableMessage(null);
 
-      const [statusData, mcpsData, skillsData, commandsData, pluginsData, agentsData, toolsData] = await Promise.all([
+      const [statusData, mcpsData, skillsData, commandsData, pluginsData, agentsData] = await Promise.all([
         getLibraryStatus(),
         getLibraryMcps(),
         listLibrarySkills(),
         listLibraryCommands(),
         getLibraryPlugins().catch(() => ({})), // May not exist yet
         listLibraryAgents().catch(() => []),
-        listLibraryTools().catch(() => []),
       ]);
 
       setStatus(statusData);
@@ -168,7 +153,6 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       setCommands(commandsData);
       setPlugins(pluginsData);
       setLibraryAgents(agentsData);
-      setLibraryTools(toolsData);
     } catch (err) {
       if (err instanceof LibraryUnavailableError) {
         setLibraryUnavailable(true);
@@ -179,7 +163,6 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
         setCommands([]);
         setPlugins({});
         setLibraryAgents([]);
-        setLibraryTools([]);
         return;
       }
       showError(err instanceof Error ? err.message : 'Failed to load library data');
@@ -373,33 +356,6 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
     }
   }, []);
 
-  // Library Tool operations
-  const getLibraryTool = useCallback(async (name: string): Promise<LibraryTool> => {
-    return apiGetLibraryTool(name);
-  }, []);
-
-  const saveLibraryToolFn = useCallback(async (name: string, content: string) => {
-    await apiSaveLibraryTool(name, content);
-    const toolsData = await listLibraryTools();
-    setLibraryTools(toolsData);
-    await refreshStatus();
-  }, [refreshStatus]);
-
-  const removeLibraryTool = useCallback(async (name: string) => {
-    await deleteLibraryTool(name);
-    setLibraryTools((prev) => prev.filter((t) => t.name !== name));
-    await refreshStatus();
-  }, [refreshStatus]);
-
-  const refreshLibraryTools = useCallback(async () => {
-    try {
-      const toolsData = await listLibraryTools();
-      setLibraryTools(toolsData);
-    } catch {
-      // Silently fail
-    }
-  }, []);
-
   const value = useMemo<LibraryContextValue>(
     () => ({
       status,
@@ -408,7 +364,6 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       commands,
       plugins,
       libraryAgents,
-      libraryTools,
       loading,
       libraryUnavailable,
       libraryUnavailableMessage,
@@ -433,10 +388,6 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       saveLibraryAgent: saveLibraryAgentFn,
       removeLibraryAgent,
       refreshLibraryAgents,
-      getLibraryTool,
-      saveLibraryTool: saveLibraryToolFn,
-      removeLibraryTool,
-      refreshLibraryTools,
       syncing,
       committing,
       pushing,
@@ -448,7 +399,6 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       commands,
       plugins,
       libraryAgents,
-      libraryTools,
       loading,
       libraryUnavailable,
       libraryUnavailableMessage,
@@ -473,10 +423,6 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
       saveLibraryAgentFn,
       removeLibraryAgent,
       refreshLibraryAgents,
-      getLibraryTool,
-      saveLibraryToolFn,
-      removeLibraryTool,
-      refreshLibraryTools,
       syncing,
       committing,
       pushing,

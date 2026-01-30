@@ -137,9 +137,6 @@ pub struct Workspace {
     /// Skill names from library to sync to this workspace
     #[serde(default)]
     pub skills: Vec<String>,
-    /// Tool names from library to sync to this workspace
-    #[serde(default)]
-    pub tools: Vec<String>,
     /// Plugin identifiers for hooks
     #[serde(default)]
     pub plugins: Vec<String>,
@@ -177,7 +174,6 @@ impl Workspace {
             init_script: None,
             created_at: Utc::now(),
             skills: Vec::new(),
-            tools: Vec::new(),
             plugins: Vec::new(),
             shared_network: None,
             mcps: Vec::new(),
@@ -203,7 +199,6 @@ impl Workspace {
             created_at: Utc::now(),
             skills: Vec::new(),
             config_profile: None,
-            tools: Vec::new(),
             plugins: Vec::new(),
             shared_network: None,
             mcps: Vec::new(),
@@ -393,7 +388,6 @@ impl WorkspaceStore {
                     init_script: None,
                     created_at: Utc::now(), // We don't know the actual creation time
                     skills: Vec::new(),
-                    tools: Vec::new(),
                     plugins: Vec::new(),
                     shared_network: None, // Default to shared network
                     mcps: Vec::new(),
@@ -2084,29 +2078,6 @@ async fn resolve_workspace_skill_names(
     Ok(Vec::new())
 }
 
-async fn resolve_workspace_tool_names(
-    workspace: &Workspace,
-    library: &LibraryStore,
-) -> anyhow::Result<Vec<String>> {
-    if !workspace.tools.is_empty() {
-        return Ok(workspace.tools.clone());
-    }
-
-    // Default host workspace should expose all library tools when none are explicitly configured.
-    if workspace.id == DEFAULT_WORKSPACE_ID && workspace.workspace_type == WorkspaceType::Host {
-        let tools = library.list_library_tools().await?;
-        let names: Vec<String> = tools.into_iter().map(|tool| tool.name).collect();
-        tracing::debug!(
-            workspace = %workspace.name,
-            count = names.len(),
-            "Using all library tools for default host workspace"
-        );
-        return Ok(names);
-    }
-
-    Ok(Vec::new())
-}
-
 /// Sync skills from library to workspace's `.opencode/skill/` directory.
 /// Called when workspace is created, updated, or before mission execution.
 pub async fn sync_workspace_skills(
@@ -2252,14 +2223,6 @@ async fn collect_command_contents(
     commands_to_write
 }
 
-/// Tool content to be written to the workspace.
-pub struct ToolContent {
-    /// Tool name (filename without .ts)
-    pub name: String,
-    /// Full TypeScript content
-    pub content: String,
-}
-
 /// Agent content to be written to the workspace.
 pub struct AgentContent {
     /// Agent name (filename without .md)
@@ -2343,126 +2306,6 @@ pub async fn sync_agents_to_dir(
         agents = ?agent_names,
         target = %target_dir.display(),
         "Synced agents to directory"
-    );
-
-    Ok(())
-}
-/// Write tool files to the workspace's `.opencode/tool/` directory.
-/// This makes custom tools available to OpenCode when running in this workspace.
-/// OpenCode looks for tools in `.opencode/tool/*.ts`
-pub async fn write_tools_to_workspace(
-    workspace_dir: &Path,
-    tools: &[ToolContent],
-) -> anyhow::Result<()> {
-    if tools.is_empty() {
-        return Ok(());
-    }
-
-    let tools_dir = workspace_dir.join(".opencode").join("tool");
-    tokio::fs::create_dir_all(&tools_dir).await?;
-
-    for tool in tools {
-        let tool_path = tools_dir.join(format!("{}.ts", &tool.name));
-        tokio::fs::write(&tool_path, &tool.content).await?;
-
-        tracing::debug!(
-            tool = %tool.name,
-            workspace = %workspace_dir.display(),
-            "Wrote tool to workspace"
-        );
-    }
-
-    tracing::info!(
-        count = tools.len(),
-        workspace = %workspace_dir.display(),
-        "Wrote tools to workspace"
-    );
-
-    Ok(())
-}
-
-/// Sync tools from library to workspace's `.opencode/tool/` directory.
-/// Called when workspace is created, updated, or before mission execution.
-/// Default host workspace will include all library tools when none are explicitly configured.
-pub async fn sync_workspace_tools(
-    workspace: &Workspace,
-    library: &LibraryStore,
-) -> anyhow::Result<()> {
-    let tool_names = resolve_workspace_tool_names(workspace, library).await?;
-    sync_tools_to_dir(&workspace.path, &tool_names, &workspace.name, library).await
-}
-
-/// Sync tools from library to a specific directory's `.opencode/tool/` folder.
-/// Used for syncing tools to mission directories.
-/// This performs a full sync: adds new tools and removes tools no longer in the allowlist.
-pub async fn sync_tools_to_dir(
-    target_dir: &Path,
-    tool_names: &[String],
-    context_name: &str,
-    library: &LibraryStore,
-) -> anyhow::Result<()> {
-    let tools_dir = target_dir.join(".opencode").join("tool");
-
-    // Clean up tools that are no longer in the allowlist
-    if tools_dir.exists() {
-        let allowed: std::collections::HashSet<&str> =
-            tool_names.iter().map(|s| s.as_str()).collect();
-
-        if let Ok(mut entries) = tokio::fs::read_dir(&tools_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
-                        if !allowed.contains(name) {
-                            tracing::info!(
-                                tool = %name,
-                                context = %context_name,
-                                "Removing tool no longer in allowlist"
-                            );
-                            let _ = tokio::fs::remove_file(&path).await;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if tool_names.is_empty() {
-        tracing::debug!(
-            context = %context_name,
-            "No tools to sync"
-        );
-        return Ok(());
-    }
-
-    let mut tools_to_write: Vec<ToolContent> = Vec::new();
-
-    for tool_name in tool_names {
-        match library.get_library_tool(tool_name).await {
-            Ok(tool) => {
-                tools_to_write.push(ToolContent {
-                    name: tool.name,
-                    content: tool.content,
-                });
-            }
-            Err(e) => {
-                tracing::warn!(
-                    tool = %tool_name,
-                    context = %context_name,
-                    error = %e,
-                    "Failed to load tool from library, skipping"
-                );
-            }
-        }
-    }
-
-    write_tools_to_workspace(target_dir, &tools_to_write).await?;
-
-    tracing::info!(
-        context = %context_name,
-        tools = ?tool_names,
-        target = %target_dir.display(),
-        "Synced tools to directory"
     );
 
     Ok(())
@@ -2820,30 +2663,6 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                     workspace = %workspace.name,
                     error = %e,
                     "Failed to sync skills to mission directory"
-                );
-            }
-        }
-
-        // Sync tools
-        let tool_names = match resolve_workspace_tool_names(workspace, lib).await {
-            Ok(names) => names,
-            Err(e) => {
-                tracing::warn!(
-                    mission = %mission_id,
-                    workspace = %workspace.name,
-                    error = %e,
-                    "Failed to resolve tools from library"
-                );
-                Vec::new()
-            }
-        };
-        if !tool_names.is_empty() {
-            if let Err(e) = sync_tools_to_dir(&dir, &tool_names, &context, lib).await {
-                tracing::warn!(
-                    mission = %mission_id,
-                    workspace = %workspace.name,
-                    error = %e,
-                    "Failed to sync tools to mission directory"
                 );
             }
         }

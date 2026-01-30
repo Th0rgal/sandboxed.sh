@@ -7,7 +7,6 @@
 //! - Commands CRUD
 //! - Plugins CRUD
 //! - Library Agents CRUD
-//! - Library Tools CRUD
 //! - OpenCode settings (oh-my-opencode.json)
 //! - OpenAgent config (agent visibility, defaults)
 //! - Migration
@@ -27,8 +26,8 @@ use crate::library::{
     rename::{ItemType, RenameResult},
     AmpCodeConfig, ClaudeCodeConfig, Command, CommandSummary, ConfigProfile, ConfigProfileSummary,
     GitAuthor, InitScript, InitScriptSummary, LibraryAgent, LibraryAgentSummary, LibraryStatus,
-    LibraryStore, LibraryTool, LibraryToolSummary, McpServer, MigrationReport, OpenAgentConfig,
-    Plugin, Skill, SkillSummary, WorkspaceTemplate, WorkspaceTemplateSummary,
+    LibraryStore, McpServer, MigrationReport, OpenAgentConfig, Plugin, Skill, SkillSummary,
+    WorkspaceTemplate, WorkspaceTemplateSummary,
 };
 use crate::nspawn::NspawnDistro;
 use crate::workspace::{self, WorkspaceType, DEFAULT_WORKSPACE_ID};
@@ -85,15 +84,6 @@ async fn sync_all_workspaces(state: &super::routes::AppState, library: &LibraryS
                 );
             }
         }
-        if is_default_host_workspace(&workspace) || !workspace.tools.is_empty() {
-            if let Err(e) = workspace::sync_workspace_tools(&workspace, library).await {
-                tracing::warn!(
-                    workspace = %workspace.name,
-                    error = %e,
-                    "Failed to sync tools after library update"
-                );
-            }
-        }
     }
 }
 
@@ -112,26 +102,6 @@ async fn sync_skill_to_workspaces(
                     skill = %skill_name,
                     error = %e,
                     "Failed to sync skill to workspace"
-                );
-            }
-        }
-    }
-}
-
-async fn sync_tool_to_workspaces(
-    state: &super::routes::AppState,
-    library: &LibraryStore,
-    tool_name: &str,
-) {
-    let workspaces = state.workspaces.list().await;
-    for workspace in workspaces {
-        if is_default_host_workspace(&workspace) || workspace.tools.iter().any(|t| t == tool_name) {
-            if let Err(e) = workspace::sync_workspace_tools(&workspace, library).await {
-                tracing::warn!(
-                    workspace = %workspace.name,
-                    tool = %tool_name,
-                    error = %e,
-                    "Failed to sync tool to workspace"
                 );
             }
         }
@@ -239,11 +209,6 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/agent/:name", get(get_library_agent))
         .route("/agent/:name", put(save_library_agent))
         .route("/agent/:name", delete(delete_library_agent))
-        // Library Tools
-        .route("/tool", get(list_library_tools))
-        .route("/tool/:name", get(get_library_tool))
-        .route("/tool/:name", put(save_library_tool))
-        .route("/tool/:name", delete(delete_library_tool))
         // Workspace Templates
         .route("/workspace-template", get(list_workspace_templates))
         .route("/workspace-template/:name", get(get_workspace_template))
@@ -1241,74 +1206,6 @@ async fn delete_library_agent(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Library Tools
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// GET /api/library/tool - List all library tools.
-async fn list_library_tools(
-    State(state): State<Arc<super::routes::AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<LibraryToolSummary>>, (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .list_library_tools()
-        .await
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}
-
-/// GET /api/library/tool/:name - Get a library tool by name.
-async fn get_library_tool(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<LibraryTool>, (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .get_library_tool(&name)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                (StatusCode::NOT_FOUND, e.to_string())
-            } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            }
-        })
-}
-
-/// PUT /api/library/tool/:name - Save a library tool.
-async fn save_library_tool(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    Json(req): Json<SaveContentRequest>,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .save_library_tool(&name, &req.content)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    sync_tool_to_workspaces(&state, library.as_ref(), &name).await;
-    Ok((StatusCode::OK, "Tool saved successfully".to_string()))
-}
-
-/// DELETE /api/library/tool/:name - Delete a library tool.
-async fn delete_library_tool(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .delete_library_tool(&name)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    sync_tool_to_workspaces(&state, library.as_ref(), &name).await;
-    Ok((StatusCode::OK, "Tool deleted successfully".to_string()))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Workspace Templates
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1835,12 +1732,6 @@ async fn rename_item(
                 // Sync skills to workspaces
                 sync_skill_to_workspaces(&state, library.as_ref(), &req.new_name).await;
             }
-            ItemType::Tool => {
-                // Update workspace tool lists
-                update_workspace_tool_references(&state, &name, &req.new_name).await;
-                // Sync tools to workspaces
-                sync_tool_to_workspaces(&state, library.as_ref(), &req.new_name).await;
-            }
             ItemType::WorkspaceTemplate => {
                 // Update workspace template references
                 update_workspace_template_references(&state, &name, &req.new_name).await;
@@ -1889,39 +1780,6 @@ async fn update_workspace_skill_references(
                 tracing::warn!(
                     workspace = %workspace_name,
                     "Failed to update workspace skill reference"
-                );
-            }
-        }
-    }
-}
-
-/// Update workspace tool references when a tool is renamed.
-async fn update_workspace_tool_references(
-    state: &super::routes::AppState,
-    old_name: &str,
-    new_name: &str,
-) {
-    let workspaces = state.workspaces.list().await;
-    for workspace in workspaces {
-        if workspace.tools.contains(&old_name.to_string()) {
-            let mut updated_workspace = workspace.clone();
-            updated_workspace.tools = updated_workspace
-                .tools
-                .iter()
-                .map(|t| {
-                    if t == old_name {
-                        new_name.to_string()
-                    } else {
-                        t.clone()
-                    }
-                })
-                .collect();
-
-            let workspace_name = workspace.name.clone();
-            if !state.workspaces.update(updated_workspace).await {
-                tracing::warn!(
-                    workspace = %workspace_name,
-                    "Failed to update workspace tool reference"
                 );
             }
         }

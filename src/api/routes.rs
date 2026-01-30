@@ -276,17 +276,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                                     );
                                 }
                             }
-                            if is_default_host || !workspace.tools.is_empty() {
-                                if let Err(e) =
-                                    workspace::sync_workspace_tools(&workspace, library).await
-                                {
-                                    tracing::warn!(
-                                        workspace = %workspace.name,
-                                        error = %e,
-                                        "Failed to sync tools after library init"
-                                    );
-                                }
-                            }
                         }
                     }
                 }

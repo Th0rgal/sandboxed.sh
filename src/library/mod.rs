@@ -63,7 +63,6 @@ struct WorkspaceTemplateConfig {
 const SKILL_DIR: &str = "skill";
 const COMMAND_DIR: &str = "command";
 const AGENT_DIR: &str = "agent";
-const TOOL_DIR: &str = "tool";
 const INIT_SCRIPT_DIR: &str = "init-script";
 const PLUGINS_FILE: &str = "plugins.json";
 const WORKSPACE_TEMPLATE_DIR: &str = "workspace-template";
@@ -1097,139 +1096,6 @@ impl LibraryStore {
             fs::remove_file(&agent_path)
                 .await
                 .context("Failed to delete agent file")?;
-        }
-
-        Ok(())
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Library Tools (tool/*.ts)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// List all library tools with their summaries.
-    pub async fn list_library_tools(&self) -> Result<Vec<LibraryToolSummary>> {
-        let tools_dir = self.path.join(TOOL_DIR);
-
-        if !tools_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut tools = Vec::new();
-        let mut entries = fs::read_dir(&tools_dir).await?;
-
-        while let Some(entry) = entries.next_entry().await? {
-            let entry_path = entry.path();
-
-            // Only process .ts files
-            let Some(ext) = entry_path.extension() else {
-                continue;
-            };
-            if ext != "ts" {
-                continue;
-            }
-
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            let name = file_name.trim_end_matches(".ts").to_string();
-
-            // Try to extract description from first comment block
-            let content = fs::read_to_string(&entry_path).await.ok();
-            let description = content.as_ref().and_then(|c| {
-                // Look for /** ... */ or // description pattern
-                if let Some(start) = c.find("/**") {
-                    if let Some(end) = c[start..].find("*/") {
-                        let comment = &c[start + 3..start + end];
-                        let desc = comment
-                            .lines()
-                            .map(|l| l.trim().trim_start_matches('*').trim())
-                            .filter(|l| !l.is_empty())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        if !desc.is_empty() {
-                            return Some(desc);
-                        }
-                    }
-                }
-                None
-            });
-
-            tools.push(LibraryToolSummary {
-                name,
-                description,
-                path: format!("{}/{}", TOOL_DIR, file_name),
-            });
-        }
-
-        tools.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(tools)
-    }
-
-    /// Get a library tool by name with full content.
-    pub async fn get_library_tool(&self, name: &str) -> Result<LibraryTool> {
-        Self::validate_name(name)?;
-        let tool_path = self.path.join(TOOL_DIR).join(format!("{}.ts", name));
-
-        if !tool_path.exists() {
-            anyhow::bail!("Library tool not found: {}", name);
-        }
-
-        let content = fs::read_to_string(&tool_path)
-            .await
-            .context("Failed to read tool file")?;
-
-        // Extract description from first comment block
-        let description = if let Some(start) = content.find("/**") {
-            if let Some(end) = content[start..].find("*/") {
-                let comment = &content[start + 3..start + end];
-                let desc = comment
-                    .lines()
-                    .map(|l| l.trim().trim_start_matches('*').trim())
-                    .filter(|l| !l.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !desc.is_empty() {
-                    Some(desc)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        Ok(LibraryTool {
-            name: name.to_string(),
-            description,
-            path: format!("{}/{}.ts", TOOL_DIR, name),
-            content,
-        })
-    }
-
-    /// Save a library tool's content.
-    pub async fn save_library_tool(&self, name: &str, content: &str) -> Result<()> {
-        Self::validate_name(name)?;
-        let tools_dir = self.path.join(TOOL_DIR);
-        let tool_path = tools_dir.join(format!("{}.ts", name));
-
-        fs::create_dir_all(&tools_dir).await?;
-
-        fs::write(&tool_path, content)
-            .await
-            .context("Failed to write tool file")?;
-
-        Ok(())
-    }
-
-    /// Delete a library tool.
-    pub async fn delete_library_tool(&self, name: &str) -> Result<()> {
-        Self::validate_name(name)?;
-        let tool_path = self.path.join(TOOL_DIR).join(format!("{}.ts", name));
-
-        if tool_path.exists() {
-            fs::remove_file(&tool_path)
-                .await
-                .context("Failed to delete tool file")?;
         }
 
         Ok(())
@@ -2329,7 +2195,6 @@ impl LibraryStore {
         let _ = fs::create_dir_all(self.path.join(SKILL_DIR)).await;
         let _ = fs::create_dir_all(self.path.join(COMMAND_DIR)).await;
         let _ = fs::create_dir_all(self.path.join(AGENT_DIR)).await;
-        let _ = fs::create_dir_all(self.path.join(TOOL_DIR)).await;
         let _ = fs::create_dir_all(self.path.join(INIT_SCRIPT_DIR)).await;
 
         report.success = true;

@@ -55,9 +55,6 @@ pub struct CreateWorkspaceRequest {
     /// Skill names from library to sync to this workspace
     #[serde(default)]
     pub skills: Vec<String>,
-    /// Tool names from library to sync to this workspace
-    #[serde(default)]
-    pub tools: Vec<String>,
     /// Plugin identifiers for hooks
     #[serde(default)]
     pub plugins: Vec<String>,
@@ -84,8 +81,6 @@ pub struct UpdateWorkspaceRequest {
     pub name: Option<String>,
     /// Skill names from library to sync to this workspace
     pub skills: Option<Vec<String>>,
-    /// Tool names from library to sync to this workspace
-    pub tools: Option<Vec<String>>,
     /// Plugin identifiers for hooks
     pub plugins: Option<Vec<String>>,
     /// Optional workspace template name
@@ -113,7 +108,6 @@ pub struct WorkspaceResponse {
     pub error_message: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub skills: Vec<String>,
-    pub tools: Vec<String>,
     pub plugins: Vec<String>,
     pub template: Option<String>,
     pub distro: Option<String>,
@@ -136,7 +130,6 @@ impl From<Workspace> for WorkspaceResponse {
             error_message: w.error_message,
             created_at: w.created_at,
             skills: w.skills,
-            tools: w.tools,
             plugins: w.plugins,
             template: w.template,
             distro: w.distro,
@@ -388,7 +381,6 @@ async fn create_workspace(
             init_script,
             created_at: chrono::Utc::now(),
             skills,
-            tools: req.tools,
             plugins: req.plugins,
             shared_network,
             mcps: mcps.clone(),
@@ -397,7 +389,6 @@ async fn create_workspace(
         WorkspaceType::Container => {
             let mut ws = Workspace::new_container(req.name, path);
             ws.skills = skills;
-            ws.tools = req.tools;
             ws.plugins = req.plugins;
             ws.template = req.template.clone();
             ws.distro = distro;
@@ -425,19 +416,10 @@ async fn create_workspace(
                 );
             }
         }
-        if !workspace.tools.is_empty() {
-            if let Err(e) = workspace::sync_workspace_tools(&workspace, library).await {
-                tracing::warn!(
-                    workspace = %workspace.name,
-                    error = %e,
-                    "Failed to sync tools to workspace during creation"
-                );
-            }
-        }
-    } else if !workspace.skills.is_empty() || !workspace.tools.is_empty() {
+    } else if !workspace.skills.is_empty() {
         tracing::warn!(
             workspace = %workspace.name,
-            "Library not initialized, cannot sync skills/tools"
+            "Library not initialized, cannot sync skills"
         );
     }
     drop(library_guard);
@@ -541,14 +523,6 @@ async fn update_workspace(
         false
     };
 
-    // Update tools if provided
-    let tools_changed = if let Some(tools) = req.tools {
-        workspace.tools = tools;
-        true
-    } else {
-        false
-    };
-
     // Update plugins if provided
     if let Some(plugins) = req.plugins {
         workspace.plugins = plugins;
@@ -603,21 +577,10 @@ async fn update_workspace(
                 );
             }
         }
-        if tools_changed && !workspace.tools.is_empty() {
-            if let Err(e) = workspace::sync_workspace_tools(&workspace, library).await {
-                tracing::warn!(
-                    workspace = %workspace.name,
-                    error = %e,
-                    "Failed to sync tools to workspace during update"
-                );
-            }
-        }
-    } else if (skills_changed && !workspace.skills.is_empty())
-        || (tools_changed && !workspace.tools.is_empty())
-    {
+    } else if skills_changed && !workspace.skills.is_empty() {
         tracing::warn!(
             workspace = %workspace.name,
-            "Library not initialized, cannot sync skills/tools"
+            "Library not initialized, cannot sync skills"
         );
     }
 
@@ -656,18 +619,8 @@ async fn sync_workspace(
             )
         })?;
 
-    // Sync tools to workspace
-    workspace::sync_workspace_tools(&workspace, library)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to sync tools: {}", e),
-            )
-        })?;
-
     tracing::info!(
-        "Synced skills and tools to workspace: {} ({})",
+        "Synced skills to workspace: {} ({})",
         workspace.name,
         id
     );

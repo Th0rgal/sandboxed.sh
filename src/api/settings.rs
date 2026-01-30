@@ -167,15 +167,6 @@ async fn reinitialize_library(state: &Arc<AppState>, remote: &str) -> Result<(),
                     }
                 }
 
-                if is_default_host || !ws.tools.is_empty() {
-                    if let Err(e) = workspace::sync_workspace_tools(&ws, &library).await {
-                        tracing::warn!(
-                            workspace = %ws.name,
-                            error = %e,
-                            "Failed to sync tools after library reinit"
-                        );
-                    }
-                }
             }
 
             Ok(())
