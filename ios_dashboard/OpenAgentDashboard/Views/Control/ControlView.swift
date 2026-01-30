@@ -1518,8 +1518,9 @@ struct ControlView: View {
         case "mission_status_changed":
             // Handle mission status changes (e.g., completed, failed, interrupted)
             if let statusStr = data["status"] as? String,
-               let missionId = data["mission_id"] as? String {
-                let newStatus = MissionStatus(rawValue: statusStr)
+               let missionId = data["mission_id"] as? String,
+               let newStatus = MissionStatus(rawValue: statusStr) {
+                // Only process known status values - ignore unknown statuses
 
                 // If mission is no longer active, mark all pending tools as cancelled
                 if newStatus != .active {
@@ -1546,12 +1547,12 @@ struct ControlView: View {
 
                 // Update the viewing mission status if it matches
                 if viewingMissionId == missionId {
-                    viewingMission?.status = newStatus ?? .active
+                    viewingMission?.status = newStatus
                 }
 
                 // Update the current mission status if it matches
                 if currentMission?.id == missionId {
-                    currentMission?.status = newStatus ?? .active
+                    currentMission?.status = newStatus
                 }
 
                 // Refresh running missions list
