@@ -2284,7 +2284,9 @@ fn get_default_provider(config: &serde_json::Value) -> Option<ProviderType> {
 }
 
 fn default_provider_state_path(working_dir: &Path) -> PathBuf {
-    working_dir.join(".sandboxed-sh").join("default_provider.json")
+    working_dir
+        .join(".sandboxed-sh")
+        .join("default_provider.json")
 }
 
 fn read_default_provider_state(working_dir: &Path) -> Option<ProviderType> {

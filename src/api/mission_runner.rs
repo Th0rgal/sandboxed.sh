@@ -3521,7 +3521,9 @@ fn workspace_opencode_provider_auth_dir(workspace: &Workspace) -> Option<std::pa
 fn build_opencode_auth_from_ai_providers(
     app_working_dir: &std::path::Path,
 ) -> Option<serde_json::Value> {
-    let path = app_working_dir.join(".sandboxed-sh").join("ai_providers.json");
+    let path = app_working_dir
+        .join(".sandboxed-sh")
+        .join("ai_providers.json");
     let contents = std::fs::read_to_string(&path).ok()?;
     let providers: Vec<crate::ai_providers::AIProvider> = serde_json::from_str(&contents).ok()?;
 

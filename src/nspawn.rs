@@ -225,7 +225,9 @@ pub fn tailscale_nspawn_extra_args(env: &HashMap<String, String>) -> Vec<String>
 /// Defaults to `{WORKING_DIR}/.sandboxed-sh/cache` (sibling of `containers/`).
 fn rootfs_cache_dir() -> PathBuf {
     let working_dir = std::env::var("WORKING_DIR").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(working_dir).join(".sandboxed-sh").join("cache")
+    PathBuf::from(working_dir)
+        .join(".sandboxed-sh")
+        .join("cache")
 }
 
 /// Return the path for a cached rootfs tarball for the given distro.

@@ -910,7 +910,11 @@ impl ControlHub {
             .map(|s| MissionStoreType::from_str(&s))
             .unwrap_or(MissionStoreType::Sqlite);
 
-        let base_dir = self.config.working_dir.join(".sandboxed-sh").join("missions");
+        let base_dir = self
+            .config
+            .working_dir
+            .join(".sandboxed-sh")
+            .join("missions");
         let mission_store: Arc<dyn MissionStore> =
             match create_mission_store(store_type, base_dir, &user.id).await {
                 Ok(store) => Arc::from(store),
@@ -954,7 +958,11 @@ impl ControlHub {
             .map(|s| MissionStoreType::from_str(&s))
             .unwrap_or(MissionStoreType::Sqlite);
 
-        let base_dir = self.config.working_dir.join(".sandboxed-sh").join("missions");
+        let base_dir = self
+            .config
+            .working_dir
+            .join(".sandboxed-sh")
+            .join("missions");
 
         match create_mission_store(store_type, base_dir, "default").await {
             Ok(store) => Arc::from(store),

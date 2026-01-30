@@ -624,7 +624,8 @@ fn opencode_entry_from_mcp(
                     }
                 }
             }
-            if let Ok(runtime_workspace_file) = std::env::var("SANDBOXED_SH_RUNTIME_WORKSPACE_FILE") {
+            if let Ok(runtime_workspace_file) = std::env::var("SANDBOXED_SH_RUNTIME_WORKSPACE_FILE")
+            {
                 if !runtime_workspace_file.trim().is_empty() {
                     merged_env
                         .entry("SANDBOXED_SH_RUNTIME_WORKSPACE_FILE".to_string())
@@ -705,7 +706,10 @@ fn opencode_entry_from_mcp(
                         "SANDBOXED_SH_CONTEXT_ROOT".to_string(),
                         "/root/context".to_string(),
                     );
-                    nspawn_env.insert("SANDBOXED_SH_CONTEXT_DIR_NAME".to_string(), context_dir_name);
+                    nspawn_env.insert(
+                        "SANDBOXED_SH_CONTEXT_DIR_NAME".to_string(),
+                        context_dir_name,
+                    );
                 }
 
                 // Network configuration based on shared_network setting:
@@ -2424,7 +2428,9 @@ pub async fn prepare_mission_workspace_with_skills(
 fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
     // Try both possible locations for ai_providers.json
     let candidates = [
-        workspace_root.join(".sandboxed-sh").join("ai_providers.json"),
+        workspace_root
+            .join(".sandboxed-sh")
+            .join("ai_providers.json"),
         std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
             .join(".sandboxed-sh")
             .join("ai_providers.json"),

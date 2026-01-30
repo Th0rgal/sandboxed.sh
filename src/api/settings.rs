@@ -263,13 +263,18 @@ async fn download_backup(
         for dir in BACKUP_DIRS {
             let dir_path = sandboxed_dir.join(dir);
             if dir_path.exists() && dir_path.is_dir() {
-                add_directory_to_zip(&mut zip, &dir_path, &format!(".sandboxed-sh/{}", dir), options)
-                    .map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to add directory {} to backup: {}", dir, e),
-                        )
-                    })?;
+                add_directory_to_zip(
+                    &mut zip,
+                    &dir_path,
+                    &format!(".sandboxed-sh/{}", dir),
+                    options,
+                )
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to add directory {} to backup: {}", dir, e),
+                    )
+                })?;
             }
         }
 

@@ -26,7 +26,7 @@ use crate::library::{
     rename::{ItemType, RenameResult},
     AmpCodeConfig, ClaudeCodeConfig, Command, CommandSummary, ConfigProfile, ConfigProfileSummary,
     GitAuthor, InitScript, InitScriptSummary, LibraryAgent, LibraryAgentSummary, LibraryStatus,
-    LibraryStore, McpServer, MigrationReport, SandboxedConfig, Plugin, Skill, SkillSummary,
+    LibraryStore, McpServer, MigrationReport, Plugin, SandboxedConfig, Skill, SkillSummary,
     WorkspaceTemplate, WorkspaceTemplateSummary,
 };
 use crate::nspawn::NspawnDistro;
