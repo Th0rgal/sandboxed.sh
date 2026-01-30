@@ -35,7 +35,9 @@ const HARNESS_CONFIG = {
         }
       }, null, 2),
       'oh-my-opencode.json': JSON.stringify({
-        // Default oh-my-opencode config
+        "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-opencode/master/assets/oh-my-opencode.schema.json",
+        "agents": {},
+        "categories": {}
       }, null, 2),
     },
   },
