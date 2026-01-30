@@ -1,5 +1,6 @@
 export default {
   index: "Overview",
+  "getting-started": "Getting Started",
   setup: "Setup",
   "install-docker": "Docker Install",
   "first-mission": "First Mission",
