@@ -197,7 +197,7 @@ GET /api/workspaces/:id/shell
 
 Opens an interactive PTY shell session via WebSocket.
 
-**Authentication**: Use `Sec-WebSocket-Protocol: openagent` header with JWT token.
+**Authentication**: Use `Sec-WebSocket-Protocol: sandboxed.sh` header with JWT token.
 
 **Note**: For programmatic command execution, prefer the `/exec` HTTP endpoint.
 
@@ -221,7 +221,7 @@ Returns detailed information about the container state, useful for understanding
   "id": "uuid",
   "name": "minecraft",
   "status": "error",
-  "path": "/root/.openagent/containers/minecraft",
+  "path": "/root/.sandboxed.sh/containers/minecraft",
   "path_exists": true,
   "size_bytes": 1234567890,
   "directories": [
@@ -257,7 +257,7 @@ Returns detailed information about the container state, useful for understanding
 GET /api/workspaces/:id/init-log
 ```
 
-Reads the init script log from `/var/log/openagent-init.log` inside the container.
+Reads the init script log from `/var/log/sandboxed.sh-init.log` inside the container.
 
 **Response**:
 ```json
@@ -265,7 +265,7 @@ Reads the init script log from `/var/log/openagent-init.log` inside the containe
   "exists": true,
   "content": "Starting init script\nRunning apt-get update...\n...",
   "total_lines": 1234,
-  "log_path": "/var/log/openagent-init.log"
+  "log_path": "/var/log/sandboxed.sh-init.log"
 }
 ```
 

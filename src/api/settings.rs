@@ -181,7 +181,7 @@ async fn reinitialize_library(state: &Arc<AppState>, remote: &str) -> Result<(),
 // Backup & Restore
 // ============================================
 
-/// Files included in the backup (relative to .openagent/)
+/// Files included in the backup (relative to .sandboxed/)
 const BACKUP_FILES: &[&str] = &[
     "settings.json",
     "ai_providers.json",
@@ -191,7 +191,7 @@ const BACKUP_FILES: &[&str] = &[
     "private_key",
 ];
 
-/// Directories included in the backup (relative to .openagent/)
+/// Directories included in the backup (relative to .sandboxed/)
 const BACKUP_DIRS: &[&str] = &["secrets"];
 
 /// Find Claude credentials file from various possible locations.
@@ -234,7 +234,7 @@ fn find_claude_credentials() -> Option<(std::path::PathBuf, &'static str)> {
 async fn download_backup(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let openagent_dir = state.config.working_dir.join(".openagent");
+    let sandboxed_dir = state.config.working_dir.join(".sandboxed");
 
     // Create a zip archive in memory
     let mut zip_buffer = Vec::new();
@@ -243,12 +243,12 @@ async fn download_backup(
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
 
-        // Add individual files from .openagent/
+        // Add individual files from .sandboxed/
         for file in BACKUP_FILES {
-            let file_path = openagent_dir.join(file);
+            let file_path = sandboxed_dir.join(file);
             if file_path.exists() {
                 if let Ok(contents) = std::fs::read_to_string(&file_path) {
-                    if let Err(e) = zip.start_file(format!(".openagent/{}", file), options) {
+                    if let Err(e) = zip.start_file(format!(".sandboxed/{}", file), options) {
                         tracing::warn!("Failed to add {} to backup: {}", file, e);
                         continue;
                     }
@@ -261,9 +261,9 @@ async fn download_backup(
 
         // Add directories recursively
         for dir in BACKUP_DIRS {
-            let dir_path = openagent_dir.join(dir);
+            let dir_path = sandboxed_dir.join(dir);
             if dir_path.exists() && dir_path.is_dir() {
-                add_directory_to_zip(&mut zip, &dir_path, &format!(".openagent/{}", dir), options)
+                add_directory_to_zip(&mut zip, &dir_path, &format!(".sandboxed/{}", dir), options)
                     .map_err(|e| {
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -299,7 +299,7 @@ async fn download_backup(
 
     // Generate filename with timestamp
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    let filename = format!("openagent-backup-{}.zip", timestamp);
+    let filename = format!("sandboxed-backup-{}.zip", timestamp);
     let content_disposition = format!("attachment; filename=\"{}\"", filename);
 
     let body = Body::from(zip_buffer);
@@ -354,7 +354,7 @@ async fn restore_backup(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<RestoreBackupResponse>, (StatusCode, String)> {
-    let openagent_dir = state.config.working_dir.join(".openagent");
+    let sandboxed_dir = state.config.working_dir.join(".sandboxed");
 
     // Extract the uploaded file
     let mut archive_data: Option<Vec<u8>> = None;
@@ -414,13 +414,13 @@ async fn restore_backup(
         let name = file.name().to_string();
 
         // Determine target path based on archive name
-        let (target_path, display_name) = if name.starts_with(".openagent/") {
-            // Standard .openagent files
-            let relative_path = name.strip_prefix(".openagent/").unwrap_or(&name);
+        let (target_path, display_name) = if name.starts_with(".sandboxed/") {
+            // Standard .sandboxed files
+            let relative_path = name.strip_prefix(".sandboxed/").unwrap_or(&name);
             if relative_path.is_empty() {
                 continue;
             }
-            (openagent_dir.join(relative_path), relative_path.to_string())
+            (sandboxed_dir.join(relative_path), relative_path.to_string())
         } else if name == ".claude/.credentials.json" {
             // Claude credentials file - restore to the appropriate .claude directory
             (claude_creds_dir.join(".credentials.json"), name.clone())
@@ -469,7 +469,7 @@ async fn restore_backup(
 
     // Load restored encryption key into the process environment
     if restored_files.iter().any(|f| f == "private_key") {
-        let key_path = openagent_dir.join("private_key");
+        let key_path = sandboxed_dir.join("private_key");
         match std::fs::read_to_string(&key_path) {
             Ok(key_hex) => {
                 let trimmed = key_hex.trim();

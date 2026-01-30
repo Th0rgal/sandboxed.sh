@@ -16,7 +16,7 @@ use super::types::*;
 
 /// Store for managing encrypted secrets.
 pub struct SecretsStore {
-    /// Base directory (.openagent/secrets)
+    /// Base directory (.sandboxed/secrets)
     base_dir: PathBuf,
     /// Configuration
     config: RwLock<SecretsConfig>,
@@ -29,7 +29,7 @@ pub struct SecretsStore {
 impl SecretsStore {
     /// Create a new secrets store.
     pub async fn new(working_dir: &Path) -> Result<Self> {
-        let base_dir = working_dir.join(".openagent").join("secrets");
+        let base_dir = working_dir.join(".sandboxed").join("secrets");
 
         // Load or create config
         let config_path = base_dir.join("config.json");

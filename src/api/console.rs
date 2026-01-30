@@ -130,7 +130,7 @@ fn extract_jwt_from_protocols(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get("sec-websocket-protocol")
         .and_then(|v| v.to_str().ok())?;
-    // Client sends: ["openagent", "jwt.<token>"]
+    // Client sends: ["sandboxed", "jwt.<token>"]
     for part in raw.split(',').map(|s| s.trim()) {
         if let Some(rest) = part.strip_prefix("jwt.") {
             if !rest.is_empty() {
@@ -164,7 +164,7 @@ pub async fn console_ws(
 
     tracing::info!(session_key = %session_key, "Console websocket upgrade requested");
     // Select a stable subprotocol if client offered it.
-    ws.protocols(["openagent"])
+    ws.protocols(["sandboxed"])
         .on_upgrade(move |socket| handle_console(socket, state, session_key))
 }
 
@@ -551,12 +551,12 @@ pub async fn workspace_shell_ws(
             .into_response();
     }
 
-    ws.protocols(["openagent"])
+    ws.protocols(["sandboxed"])
         .on_upgrade(move |socket| handle_workspace_shell(socket, state, workspace_id, session_key))
 }
 
 fn runtime_display_path() -> Option<PathBuf> {
-    if let Ok(path) = env::var("OPEN_AGENT_RUNTIME_DISPLAY_FILE") {
+    if let Ok(path) = env::var("SANDBOXED_SH_RUNTIME_DISPLAY_FILE") {
         if !path.trim().is_empty() {
             return Some(PathBuf::from(path));
         }
@@ -564,13 +564,13 @@ fn runtime_display_path() -> Option<PathBuf> {
 
     let candidates = [
         env::var("WORKING_DIR").ok(),
-        env::var("OPEN_AGENT_WORKSPACE_ROOT").ok(),
+        env::var("SANDBOXED_SH_WORKSPACE_ROOT").ok(),
         env::var("HOME").ok(),
     ];
 
     for base in candidates.into_iter().flatten() {
         let path = PathBuf::from(base)
-            .join(".openagent")
+            .join(".sandboxed")
             .join("runtime")
             .join("current_display.json");
         if path.exists() {

@@ -1,6 +1,6 @@
 # Harness System
 
-Open Agent supports multiple execution backends ("harnesses") for running agent
+Sandboxed.sh supports multiple execution backends ("harnesses") for running agent
 missions. The current architecture is **per-workspace execution**: OpenCode and
 Claude Code run inside the selected workspace (host or container).
 
@@ -10,7 +10,7 @@ new backends.
 ## Overview
 
 A **harness** (also called a backend) is an execution engine that runs agent
-missions. Open Agent currently supports:
+missions. Sandboxed.sh currently supports:
 
 | Harness | Description | Configuration Model |
 |---------|-------------|---------------------|
@@ -51,7 +51,7 @@ missions. Open Agent currently supports:
 
 ## Backend registry (metadata)
 
-Open Agent still maintains a backend registry for:
+Sandboxed.sh still maintains a backend registry for:
 
 - listing agents
 - backend configuration UI
@@ -97,7 +97,7 @@ Claude Code is executed **per workspace** using the CLI:
 
 ### OAuth credentials for long-running missions
 
-For container workspaces using OAuth authentication, Open Agent writes Claude Code's
+For container workspaces using OAuth authentication, Sandboxed.sh writes Claude Code's
 credentials file to enable automatic token refresh during long-running missions:
 
 - **Container workspaces**: `/root/.claude/.credentials.json` inside the container
@@ -155,17 +155,17 @@ See [AMP_PROXY_SETUP.md](./AMP_PROXY_SETUP.md) for detailed configuration.
 
 ### Harness bootstrap (auto-install)
 
-For **container workspaces**, Open Agent can automatically install the required
+For **container workspaces**, Sandboxed.sh can automatically install the required
 CLIs during container build (best-effort):
 
-- `OPEN_AGENT_BOOTSTRAP_CLAUDECODE=true` (default)
-- `OPEN_AGENT_BOOTSTRAP_OPENCODE=true` (default)
+- `SANDBOXED_SH_BOOTSTRAP_CLAUDECODE=true` (default)
+- `SANDBOXED_SH_BOOTSTRAP_OPENCODE=true` (default)
 
 At runtime, harnesses can self-install on first use if missing:
 
-- `OPEN_AGENT_AUTO_INSTALL_CLAUDECODE=true` (default)
-- `OPEN_AGENT_AUTO_INSTALL_OPENCODE=true` (default)
-- `OPEN_AGENT_AUTO_INSTALL_AMP=true` (default)
+- `SANDBOXED_SH_AUTO_INSTALL_CLAUDECODE=true` (default)
+- `SANDBOXED_SH_AUTO_INSTALL_OPENCODE=true` (default)
+- `SANDBOXED_SH_AUTO_INSTALL_AMP=true` (default)
 
 OpenCode installation uses the official installer (`https://opencode.ai/install`)
 and copies the binary to `/usr/local/bin/opencode`. This requires `curl` inside
@@ -214,14 +214,14 @@ harness process**:
 
 - When the harness runs inside a container (per-workspace runner enabled), MCPs
   execute directly in that container.
-- When the harness runs on the host (`OPEN_AGENT_PER_WORKSPACE_RUNNER=false`),
+- When the harness runs on the host (`SANDBOXED_SH_PER_WORKSPACE_RUNNER=false`),
   container workspaces wrap MCP commands with systemd-nspawn (when available) so
   tools still execute inside the container.
 
 Desktop streaming note:
 - The UI streams X11 from the **host** (Xvfb + MJPEG).
 - Container-local X servers are not visible to the host unless `/tmp/.X11-unix`
-  is bind-mounted and `DISPLAY` is set. Open Agent only does this for
+  is bind-mounted and `DISPLAY` is set. Sandboxed.sh only does this for
   interactive shells, not for harness/MCP execution by default.
 
 ## Adding a new backend

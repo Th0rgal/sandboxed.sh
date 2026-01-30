@@ -385,7 +385,7 @@ pub struct MigrationReport {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenAgent Config Types
+// Sandboxed Config Types
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Desktop session lifecycle configuration.
@@ -430,10 +430,10 @@ impl Default for DesktopConfig {
     }
 }
 
-/// OpenAgent configuration stored in the Library.
+/// Sandboxed configuration stored in the Library.
 /// Controls agent visibility and defaults in the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAgentConfig {
+pub struct SandboxedConfig {
     /// Agents to hide from the mission dialog selector.
     /// These are typically internal/system agents that users shouldn't select directly.
     #[serde(default)]
@@ -446,7 +446,7 @@ pub struct OpenAgentConfig {
     pub desktop: DesktopConfig,
 }
 
-impl Default for OpenAgentConfig {
+impl Default for SandboxedConfig {
     fn default() -> Self {
         Self {
             hidden_agents: vec![
@@ -519,13 +519,13 @@ pub struct ConfigProfileFile {
 }
 
 /// Full config profile with all harness configurations.
-/// A profile is an instance of configs for OpenCode, Claude Code, Amp, and OpenAgent.
+/// A profile is an instance of configs for OpenCode, Claude Code, Amp, and Sandboxed.
 ///
 /// Directory structure mirrors actual harness config directories:
 /// - `.opencode/` - OpenCode settings (settings.json, oh-my-opencode.json)
 /// - `.claudecode/` - Claude Code settings (settings.json)
 /// - `.ampcode/` - Amp settings (settings.json)
-/// - `.openagent/` - OpenAgent config (config.json)
+/// - `.sandboxed/` - Sandboxed config (config.json)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigProfile {
     /// Profile name
@@ -541,9 +541,9 @@ pub struct ConfigProfile {
     /// OpenCode settings (oh-my-opencode.json content) - legacy, for backward compat
     #[serde(default)]
     pub opencode_settings: serde_json::Value,
-    /// OpenAgent config - legacy, for backward compat
+    /// Sandboxed config - legacy, for backward compat
     #[serde(default)]
-    pub openagent_config: OpenAgentConfig,
+    pub sandboxed_config: SandboxedConfig,
     /// Claude Code config - legacy, for backward compat
     #[serde(default)]
     pub claudecode_config: ClaudeCodeConfig,

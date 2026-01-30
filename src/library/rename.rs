@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::fs;
 
-use super::types::OpenAgentConfig;
+use super::types::SandboxedConfig;
 use super::LibraryStore;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -94,7 +94,7 @@ impl LibraryStore {
             }
             ItemType::Agent => {
                 // Agents are referenced by:
-                // 1. openagent/config.json -> hidden_agents, default_agent
+                // 1. sandboxed/config.json -> hidden_agents, default_agent
                 refs.extend(self.find_agent_refs_in_config(name).await?);
             }
             ItemType::Command | ItemType::Tool | ItemType::WorkspaceTemplate => {
@@ -144,20 +144,20 @@ impl LibraryStore {
         Ok(refs)
     }
 
-    /// Find references to an agent in openagent config.
+    /// Find references to an agent in sandboxed config.
     async fn find_agent_refs_in_config(&self, agent_name: &str) -> Result<Vec<RenameChange>> {
         let mut refs = Vec::new();
-        let config_path = self.path.join("openagent/config.json");
+        let config_path = self.path.join("sandboxed/config.json");
 
         if !config_path.exists() {
             return Ok(refs);
         }
 
         if let Ok(content) = fs::read_to_string(&config_path).await {
-            if let Ok(config) = serde_json::from_str::<OpenAgentConfig>(&content) {
+            if let Ok(config) = serde_json::from_str::<SandboxedConfig>(&content) {
                 if config.hidden_agents.contains(&agent_name.to_string()) {
                     refs.push(RenameChange::UpdateReference {
-                        file: "openagent/config.json".to_string(),
+                        file: "sandboxed/config.json".to_string(),
                         field: "hidden_agents".to_string(),
                         old_value: agent_name.to_string(),
                         new_value: String::new(),
@@ -165,7 +165,7 @@ impl LibraryStore {
                 }
                 if config.default_agent.as_deref() == Some(agent_name) {
                     refs.push(RenameChange::UpdateReference {
-                        file: "openagent/config.json".to_string(),
+                        file: "sandboxed/config.json".to_string(),
                         field: "default_agent".to_string(),
                         old_value: agent_name.to_string(),
                         new_value: String::new(),
@@ -380,7 +380,7 @@ impl LibraryStore {
         let file_path = self.path.join(file);
 
         if file.ends_with(".json") {
-            // JSON file (workspace template or openagent config)
+            // JSON file (workspace template or sandboxed config)
             let content = fs::read_to_string(&file_path).await?;
             let mut data: serde_json::Value = serde_json::from_str(&content)?;
 

@@ -8,7 +8,7 @@
 //! - Plugins CRUD
 //! - Library Agents CRUD
 //! - OpenCode settings (oh-my-opencode.json)
-//! - OpenAgent config (agent visibility, defaults)
+//! - Sandboxed config (agent visibility, defaults)
 //! - Migration
 
 use axum::{
@@ -26,7 +26,7 @@ use crate::library::{
     rename::{ItemType, RenameResult},
     AmpCodeConfig, ClaudeCodeConfig, Command, CommandSummary, ConfigProfile, ConfigProfileSummary,
     GitAuthor, InitScript, InitScriptSummary, LibraryAgent, LibraryAgentSummary, LibraryStatus,
-    LibraryStore, McpServer, MigrationReport, OpenAgentConfig, Plugin, Skill, SkillSummary,
+    LibraryStore, McpServer, MigrationReport, SandboxedConfig, Plugin, Skill, SkillSummary,
     WorkspaceTemplate, WorkspaceTemplateSummary,
 };
 use crate::nspawn::NspawnDistro;
@@ -35,9 +35,9 @@ use crate::workspace::{self, WorkspaceType, DEFAULT_WORKSPACE_ID};
 /// Shared library state.
 pub type SharedLibrary = Arc<RwLock<Option<Arc<LibraryStore>>>>;
 
-const LIBRARY_REMOTE_HEADER: &str = "x-openagent-library-remote";
-const GIT_AUTHOR_NAME_HEADER: &str = "x-openagent-git-author-name";
-const GIT_AUTHOR_EMAIL_HEADER: &str = "x-openagent-git-author-email";
+const LIBRARY_REMOTE_HEADER: &str = "x-sandboxed-library-remote";
+const GIT_AUTHOR_NAME_HEADER: &str = "x-sandboxed-git-author-name";
+const GIT_AUTHOR_EMAIL_HEADER: &str = "x-sandboxed-git-author-email";
 
 fn extract_library_remote(headers: &HeaderMap) -> Option<String> {
     headers
@@ -229,10 +229,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         // OpenCode Settings (oh-my-opencode.json)
         .route("/opencode/settings", get(get_opencode_settings))
         .route("/opencode/settings", put(save_opencode_settings))
-        // OpenAgent Config
-        .route("/openagent/config", get(get_openagent_config))
-        .route("/openagent/config", put(save_openagent_config))
-        .route("/openagent/agents", get(get_visible_agents))
+        // Sandboxed Config
+        .route("/sandboxed/config", get(get_sandboxed_config))
+        .route("/sandboxed/config", put(save_sandboxed_config))
+        .route("/sandboxed/agents", get(get_visible_agents))
         // Claude Code Config
         .route("/claudecode/config", get(get_claudecode_config))
         .route("/claudecode/config", put(save_claudecode_config))
@@ -252,12 +252,12 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
             put(save_opencode_settings_for_profile),
         )
         .route(
-            "/config-profile/:name/openagent/config",
-            get(get_openagent_config_for_profile),
+            "/config-profile/:name/sandboxed/config",
+            get(get_sandboxed_config_for_profile),
         )
         .route(
-            "/config-profile/:name/openagent/config",
-            put(save_openagent_config_for_profile),
+            "/config-profile/:name/sandboxed/config",
+            put(save_sandboxed_config_for_profile),
         )
         .route(
             "/config-profile/:name/claudecode/config",
@@ -398,7 +398,7 @@ fn sanitize_skill_list(skills: Vec<String>) -> Vec<String> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Sync all library configurations after a git sync/pull operation.
-/// This includes plugins, OpenCode settings, OpenAgent config, and workspaces.
+/// This includes plugins, OpenCode settings, Sandboxed config, and workspaces.
 async fn sync_library_configs(
     state: &Arc<super::routes::AppState>,
     library: &LibraryStore,
@@ -417,9 +417,9 @@ async fn sync_library_configs(
         tracing::warn!(error = %e, "Failed to sync oh-my-opencode settings during library sync");
     }
 
-    // Sync OpenAgent config from Library to working directory
-    if let Err(e) = workspace::sync_openagent_config(library, &state.config.working_dir).await {
-        tracing::warn!(error = %e, "Failed to sync openagent config during library sync");
+    // Sync Sandboxed config from Library to working directory
+    if let Err(e) = workspace::sync_sandboxed_config(library, &state.config.working_dir).await {
+        tracing::warn!(error = %e, "Failed to sync sandboxed config during library sync");
     }
 
     // Sync skills and tools to workspaces
@@ -1449,78 +1449,78 @@ async fn save_opencode_settings(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenAgent Config
+// Sandboxed Config
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// GET /api/library/openagent/config - Get OpenAgent config from Library.
-async fn get_openagent_config(
+/// GET /api/library/sandboxed/config - Get Sandboxed config from Library.
+async fn get_sandboxed_config(
     State(state): State<Arc<super::routes::AppState>>,
     headers: HeaderMap,
-) -> Result<Json<OpenAgentConfig>, (StatusCode, String)> {
+) -> Result<Json<SandboxedConfig>, (StatusCode, String)> {
     match ensure_library(&state, &headers).await {
         Ok(library) => library
-            .get_openagent_config()
+            .get_sandboxed_config()
             .await
             .map(Json)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
         Err((StatusCode::SERVICE_UNAVAILABLE, _)) => {
-            let config = workspace::read_openagent_config(&state.config.working_dir).await;
+            let config = workspace::read_sandboxed_config(&state.config.working_dir).await;
             Ok(Json(config))
         }
         Err(e) => Err(e),
     }
 }
 
-/// PUT /api/library/openagent/config - Save OpenAgent config to Library.
-async fn save_openagent_config(
+/// PUT /api/library/sandboxed/config - Save Sandboxed config to Library.
+async fn save_sandboxed_config(
     State(state): State<Arc<super::routes::AppState>>,
     headers: HeaderMap,
-    Json(config): Json<OpenAgentConfig>,
+    Json(config): Json<SandboxedConfig>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
     match ensure_library(&state, &headers).await {
         Ok(library) => {
             library
-                .save_openagent_config(&config)
+                .save_sandboxed_config(&config)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
             // Sync to working directory
             if let Err(e) =
-                workspace::sync_openagent_config(&library, &state.config.working_dir).await
+                workspace::sync_sandboxed_config(&library, &state.config.working_dir).await
             {
-                tracing::warn!(error = %e, "Failed to sync openagent config to working dir");
+                tracing::warn!(error = %e, "Failed to sync sandboxed config to working dir");
             }
 
             Ok((
                 StatusCode::OK,
-                "OpenAgent config saved successfully".to_string(),
+                "Sandboxed config saved successfully".to_string(),
             ))
         }
         Err((StatusCode::SERVICE_UNAVAILABLE, _)) => {
             if let Err(e) =
-                workspace::write_openagent_config(&state.config.working_dir, &config).await
+                workspace::write_sandboxed_config(&state.config.working_dir, &config).await
             {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to write openagent config locally: {}", e),
+                    format!("Failed to write sandboxed config locally: {}", e),
                 ));
             }
             Ok((
                 StatusCode::OK,
-                "OpenAgent config saved locally (Library not configured)".to_string(),
+                "Sandboxed config saved locally (Library not configured)".to_string(),
             ))
         }
         Err(e) => Err(e),
     }
 }
 
-/// GET /api/library/openagent/agents - Get filtered list of visible agents.
+/// GET /api/library/sandboxed/agents - Get filtered list of visible agents.
 /// Fetches agents from OpenCode and filters by hidden_agents config.
 async fn get_visible_agents(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Read current config from working directory
-    let config = workspace::read_openagent_config(&state.config.working_dir).await;
+    let config = workspace::read_sandboxed_config(&state.config.working_dir).await;
 
     // Fetch all agents from OpenCode
     let all_agents = crate::api::opencode::fetch_opencode_agents(&state)
@@ -1534,15 +1534,15 @@ async fn get_visible_agents(
 
 fn filter_visible_agents_with_fallback(
     agents: serde_json::Value,
-    config: &OpenAgentConfig,
+    config: &SandboxedConfig,
 ) -> serde_json::Value {
     filter_agents_by_config(agents, config)
 }
 
-/// Filter agents based on OpenAgent config hidden_agents list.
+/// Filter agents based on Sandboxed config hidden_agents list.
 fn filter_agents_by_config(
     agents: serde_json::Value,
-    config: &OpenAgentConfig,
+    config: &SandboxedConfig,
 ) -> serde_json::Value {
     /// Extract agent name from an array entry (can be string or object with name/id)
     fn get_agent_name(entry: &serde_json::Value) -> Option<&str> {
@@ -1622,7 +1622,7 @@ pub async fn validate_agent_exists(
     };
 
     // Read config to get hidden agents list
-    let config = crate::workspace::read_openagent_config(&state.config.working_dir).await;
+    let config = crate::workspace::read_sandboxed_config(&state.config.working_dir).await;
     let visible_agents = filter_visible_agents_with_fallback(all_agents.clone(), &config);
 
     // Extract agent names from the visible agents list.
@@ -1995,35 +1995,35 @@ async fn save_opencode_settings_for_profile(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// GET /api/library/config-profile/:name/openagent/config - Get OpenAgent config for a profile.
-async fn get_openagent_config_for_profile(
+/// GET /api/library/config-profile/:name/sandboxed/config - Get Sandboxed config for a profile.
+async fn get_sandboxed_config_for_profile(
     State(state): State<Arc<super::routes::AppState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<OpenAgentConfig>, (StatusCode, String)> {
+) -> Result<Json<SandboxedConfig>, (StatusCode, String)> {
     let library = ensure_library(&state, &headers).await?;
     library
-        .get_openagent_config_for_profile(&name)
+        .get_sandboxed_config_for_profile(&name)
         .await
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// PUT /api/library/config-profile/:name/openagent/config - Save OpenAgent config for a profile.
-async fn save_openagent_config_for_profile(
+/// PUT /api/library/config-profile/:name/sandboxed/config - Save Sandboxed config for a profile.
+async fn save_sandboxed_config_for_profile(
     State(state): State<Arc<super::routes::AppState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
-    Json(config): Json<OpenAgentConfig>,
+    Json(config): Json<SandboxedConfig>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
     let library = ensure_library(&state, &headers).await?;
     library
-        .save_openagent_config_for_profile(&name, &config)
+        .save_sandboxed_config_for_profile(&name, &config)
         .await
         .map(|_| {
             (
                 StatusCode::OK,
-                "OpenAgent config saved successfully".to_string(),
+                "Sandboxed config saved successfully".to_string(),
             )
         })
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))

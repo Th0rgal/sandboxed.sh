@@ -1,13 +1,13 @@
-# Installing Open Agent — Native (Bare Metal)
+# Installing Sandboxed.sh — Native (Bare Metal)
 
-This guide covers installing Open Agent directly on a **dedicated Ubuntu 24.04
+This guide covers installing Sandboxed.sh directly on a **dedicated Ubuntu 24.04
 server** with systemd. This gives you the best performance and native
 systemd-nspawn container isolation.
 
 > **Looking for the easier path?** See the [Docker installation guide](install-docker.md)
 > — one command gets you running on any OS.
 
-Open Agent is the orchestrator/UI backend. **It does not run model inference**;
+Sandboxed.sh is the orchestrator/UI backend. **It does not run model inference**;
 it executes OpenCode, Claude Code, and Amp **inside each workspace**
 (host/container), so bash commands and file operations are scoped correctly. A
 standalone OpenCode server is **optional** and only required if you want
@@ -54,7 +54,7 @@ centralized OpenCode services (provider/auth management, health checks, etc.).
 - Ubuntu 24.04 LTS, root SSH access
 - A dedicated server (not shared hosting)
 - You want:
-  - Open Agent bound to: `0.0.0.0:3000`
+  - Sandboxed.sh bound to: `0.0.0.0:3000`
   - (Optional) OpenCode server bound to localhost: `127.0.0.1:4096`
 - You have a Git repo for your **Library** (skills/tools/agents/rules/MCP
   configs)
@@ -110,8 +110,8 @@ If your Library repo is private, set up an SSH deploy key on the server:
 
 ```bash
 # On the server
-ssh-keygen -t ed25519 -C "openagent-server" -f /root/.ssh/openagent -N ""
-cat /root/.ssh/openagent.pub
+ssh-keygen -t ed25519 -C "sandboxed.sh-server" -f /root/.ssh/sandboxed.sh -N ""
+cat /root/.ssh/sandboxed.sh.pub
 # Copy this public key
 ```
 
@@ -125,7 +125,7 @@ Configure SSH to use the key:
 ```bash
 cat >> /root/.ssh/config <<'EOF'
 Host github.com
-    IdentityFile /root/.ssh/openagent
+    IdentityFile /root/.ssh/sandboxed.sh
     IdentitiesOnly yes
 EOF
 
@@ -168,7 +168,7 @@ installation.
 OpenCode is distributed as a binary, but:
 
 - OpenCode plugins are installed internally via Bun
-- Open Agent’s default Playwright MCP runner prefers `bunx`
+- Sandboxed.sh’s default Playwright MCP runner prefers `bunx`
 
 Install Bun:
 
@@ -187,7 +187,7 @@ bunx --version
 
 ## 3) Install OpenCode (optional server backend)
 
-OpenCode server is optional for mission execution. Open Agent runs OpenCode
+OpenCode server is optional for mission execution. Sandboxed.sh runs OpenCode
 per-workspace via the CLI. Install the server if you want centralized
 provider/auth management, health checks, or a shared OpenCode service.
 
@@ -248,7 +248,7 @@ Test:
 curl -fsSL http://127.0.0.1:4096/global/health | jq .
 ```
 
-Note: Open Agent will also keep OpenCode's global config updated (MCP + tool
+Note: Sandboxed.sh will also keep OpenCode's global config updated (MCP + tool
 allowlist) in: `~/.config/opencode/opencode.json`.
 
 ### 3.2.1 Strong workspace skill isolation (recommended)
@@ -273,7 +273,7 @@ Environment=XDG_DATA_HOME=/var/lib/opencode/.local/share
 Environment=XDG_CACHE_HOME=/var/lib/opencode/.cache
 ```
 
-3. Point Open Agent at the same OpenCode config dir (see section 6):
+3. Point Sandboxed.sh at the same OpenCode config dir (see section 6):
 
 ```
 OPENCODE_CONFIG_DIR=/var/lib/opencode/.config/opencode
@@ -291,7 +291,7 @@ mv /root/.config/opencode/skill /root/.config/opencode/skill.bak-$(date +%F) 2>/
 ```bash
 systemctl daemon-reload
 systemctl restart opencode.service
-systemctl restart open_agent.service
+systemctl restart sandboxed_sh.service
 ```
 
 Validation (on the server, from the repo root):
@@ -329,7 +329,7 @@ curl -s http://127.0.0.1:4096/agent | jq '.[].name'
 # Should show: Sisyphus, oracle, librarian, etc.
 ```
 
-To preserve plugin defaults: leave the Open Agent agent/model overrides unset to
+To preserve plugin defaults: leave the Sandboxed.sh agent/model overrides unset to
 use the OpenCode / oh-my-opencode defaults.
 
 Update strategy:
@@ -380,7 +380,7 @@ credits purchased through Sourcegraph**.
 2. Purchase credits (Amp does not have a free tier for API access)
 3. Generate an API key from your account dashboard
 
-### 3.5.2 Configure Amp in Open Agent
+### 3.5.2 Configure Amp in Sandboxed.sh
 
 **Option A: Via Dashboard Settings (recommended)**
 
@@ -391,7 +391,7 @@ credits purchased through Sourcegraph**.
 
 **Option B: Via environment file**
 
-Add to `/etc/open_agent/open_agent.env`:
+Add to `/etc/sandboxed_sh/sandboxed_sh.env`:
 
 ```bash
 AMP_API_KEY=sgamp_user_XXXXX...
@@ -411,7 +411,7 @@ To route Amp requests through a local proxy (e.g.,
 environment variable:
 
 ```bash
-# In /etc/open_agent/open_agent.env
+# In /etc/sandboxed_sh/sandboxed_sh.env
 AMP_URL=http://localhost:8080
 ```
 
@@ -423,14 +423,14 @@ This redirects Amp CLI requests to your proxy instead of ampcode.com.
 ampcode.com.
 
 **"Network timeout" error**: This was a known issue in earlier versions. Update
-to the latest Open Agent which includes the fix.
+to the latest Sandboxed.sh which includes the fix.
 
-**CLI not found**: Open Agent auto-installs the Amp CLI via bun/npm. Ensure bun
+**CLI not found**: Sandboxed.sh auto-installs the Amp CLI via bun/npm. Ensure bun
 or npm is available in your PATH.
 
 ---
 
-## 4) Install Open Agent (Rust backend)
+## 4) Install Sandboxed.sh (Rust backend)
 
 ### 4.1 Install Rust toolchain
 
@@ -443,14 +443,14 @@ cargo --version
 
 ### 4.2 Deploy the repository
 
-On the server we keep the repo under `/opt/open_agent/vaduz-v1`. **This must be
+On the server we keep the repo under `/opt/sandboxed_sh/vaduz-v1`. **This must be
 a git clone** (not just copied files) for the dashboard's one-click update
 system to work.
 
 ```bash
-mkdir -p /opt/open_agent
-cd /opt/open_agent
-git clone <YOUR_OPEN_AGENT_REPO_URL> vaduz-v1
+mkdir -p /opt/sandboxed_sh
+cd /opt/sandboxed_sh
+git clone <YOUR_SANDBOXED_SH_REPO_URL> vaduz-v1
 ```
 
 > **Important**: The update system in Settings relies on git tags to detect new
@@ -458,17 +458,17 @@ git clone <YOUR_OPEN_AGENT_REPO_URL> vaduz-v1
 > button won't work. Always use `git clone` for production deployments.
 
 For local development, you can rsync to a _different_ path (e.g.,
-`/root/open_agent`) for rapid iteration, but keep the git clone at
-`/opt/open_agent/vaduz-v1` for the update system:
+`/root/sandboxed_sh`) for rapid iteration, but keep the git clone at
+`/opt/sandboxed_sh/vaduz-v1` for the update system:
 
 ```bash
 # Fast dev loop (to a separate path)
 rsync -az --delete \
   --exclude target --exclude .git --exclude dashboard/node_modules \
   /path/to/local-dev/ \
-  root@<server-ip>:/root/open_agent/
+  root@<server-ip>:/root/sandboxed_sh/
 
-# The git clone at /opt/open_agent/vaduz-v1 is used by the update system
+# The git clone at /opt/sandboxed_sh/vaduz-v1 is used by the update system
 ```
 
 If you need to specify a custom SSH key, add `-e "ssh -i ~/.ssh/your_key"`.
@@ -476,16 +476,16 @@ If you need to specify a custom SSH key, add `-e "ssh -i ~/.ssh/your_key"`.
 ### 4.3 Build and install binaries
 
 ```bash
-cd /opt/open_agent/vaduz-v1
+cd /opt/sandboxed_sh/vaduz-v1
 source /root/.cargo/env
 
 # Debug build (fast) - recommended for rapid iteration
-cargo build --bin open_agent
-install -m 0755 target/debug/open_agent /usr/local/bin/open_agent
+cargo build --bin sandboxed_sh
+install -m 0755 target/debug/sandboxed_sh /usr/local/bin/sandboxed_sh
 
 # Or: Release build (slower compile, faster runtime)
-# cargo build --release --bin open_agent
-# install -m 0755 target/release/open_agent /usr/local/bin/open_agent
+# cargo build --release --bin sandboxed_sh
+# install -m 0755 target/release/sandboxed_sh /usr/local/bin/sandboxed_sh
 
 # Optional: build MCP helpers if you want legacy workspace/desktop tools
 # cargo build --release --bin workspace-mcp --bin desktop-mcp
@@ -497,9 +497,9 @@ install -m 0755 target/debug/open_agent /usr/local/bin/open_agent
 
 ## 5) Bootstrap the Library (config repo)
 
-Open Agent expects a git-backed **Library** repo. At runtime it will:
+Sandboxed.sh expects a git-backed **Library** repo. At runtime it will:
 
-- clone it into `LIBRARY_PATH` (default: `{WORKING_DIR}/.openagent/library`)
+- clone it into `LIBRARY_PATH` (default: `{WORKING_DIR}/.sandboxed.sh/library`)
 - ensure the `origin` remote matches `LIBRARY_REMOTE`
 - pull/sync as needed
 
@@ -513,8 +513,8 @@ One way to bootstrap:
 
 ```bash
 # On your machine
-git clone git@github.com:Th0rgal/openagent-library-template.git openagent-library
-cd openagent-library
+git clone git@github.com:Th0rgal/sandboxed.sh-library-template.git sandboxed.sh-library
+cd sandboxed.sh-library
 
 # Point it at your own repo
 git remote set-url origin git@github.com:<your-org>/<your-library-repo>.git
@@ -523,21 +523,21 @@ git remote set-url origin git@github.com:<your-org>/<your-library-repo>.git
 git push -u origin HEAD:main
 ```
 
-### 5.2 Configure Open Agent to use it
+### 5.2 Configure Sandboxed.sh to use it
 
 **Option A: Via Dashboard Settings (recommended)**
 
-After starting Open Agent, go to **Settings** in the dashboard and set the
+After starting Sandboxed.sh, go to **Settings** in the dashboard and set the
 Library Remote URL. This is the preferred method as it persists the setting to
 disk and allows runtime updates without restart.
 
 **Option B: Via environment variable (initial default)**
 
-Set in `/etc/open_agent/open_agent.env`:
+Set in `/etc/sandboxed_sh/sandboxed_sh.env`:
 
 - `LIBRARY_REMOTE=git@github.com:<your-org>/<your-library-repo>.git` (used as
   initial default if not configured in Settings)
-- optional: `LIBRARY_PATH=/root/.openagent/library`
+- optional: `LIBRARY_PATH=/root/.sandboxed.sh/library`
 
 ### 5.3 Library encryption key
 
@@ -549,9 +549,9 @@ dashboard and when deployed to workspaces.
 **How the key works:**
 
 - A single encryption key protects all encrypted values in the library.
-- The key is stored at `{WORKING_DIR}/.openagent/private_key` (typically
-  `/root/.openagent/private_key`).
-- On first save of any encrypted value, Open Agent **auto-generates** the key if
+- The key is stored at `{WORKING_DIR}/.sandboxed.sh/private_key` (typically
+  `/root/.sandboxed.sh/private_key`).
+- On first save of any encrypted value, Sandboxed.sh **auto-generates** the key if
   none exists.
 - The key can also be set manually via the `PRIVATE_KEY` environment variable
   (hex-encoded, 32 bytes / 64 hex chars).
@@ -578,35 +578,35 @@ Alternatively, copy the key file manually:
 
 ```bash
 # Copy from source to new server
-scp root@source-server:/root/.openagent/private_key root@new-server:/root/.openagent/private_key
+scp root@source-server:/root/.sandboxed.sh/private_key root@new-server:/root/.sandboxed.sh/private_key
 ```
 
 Or set it via the environment:
 
 ```bash
-# In /etc/open_agent/open_agent.env on the new server
+# In /etc/sandboxed_sh/sandboxed_sh.env on the new server
 PRIVATE_KEY=<64-hex-char-key-from-source-server>
 ```
 
 ---
 
-## 6) Configure Open Agent (env file)
+## 6) Configure Sandboxed.sh (env file)
 
-Create `/etc/open_agent/open_agent.env`:
+Create `/etc/sandboxed_sh/sandboxed_sh.env`:
 
 ```bash
-mkdir -p /etc/open_agent
-chmod 700 /etc/open_agent
+mkdir -p /etc/sandboxed_sh
+chmod 700 /etc/sandboxed_sh
 ```
 
 Example (fill in your real values):
 
 ```bash
-cat > /etc/open_agent/open_agent.env <<'EOF'
+cat > /etc/sandboxed_sh/sandboxed_sh.env <<'EOF'
 # OpenCode backend (optional; if set, must match opencode.service)
 OPENCODE_BASE_URL=http://127.0.0.1:4096
 OPENCODE_PERMISSIVE=true
-# Optional: keep Open Agent writing OpenCode global config into the isolated home
+# Optional: keep Sandboxed.sh writing OpenCode global config into the isolated home
 # (recommended if you enabled strong workspace skill isolation in section 3.2.1).
 # OPENCODE_CONFIG_DIR=/var/lib/opencode/.config/opencode
 
@@ -614,9 +614,9 @@ OPENCODE_PERMISSIVE=true
 HOST=0.0.0.0
 PORT=3000
 
-# Default filesystem root for Open Agent (agent still has full system access)
+# Default filesystem root for Sandboxed.sh (agent still has full system access)
 WORKING_DIR=/root
-LIBRARY_PATH=/root/.openagent/library
+LIBRARY_PATH=/root/.sandboxed.sh/library
 # Library remote (optional, can also be set via dashboard Settings page)
 LIBRARY_REMOTE=git@github.com:<your-org>/<your-library-repo>.git
 
@@ -630,7 +630,7 @@ JWT_TTL_DAYS=30
 # No SSH configuration required.
 
 # Default model (provider/model). If omitted or not in provider/model format,
-# Open Agent won’t force a model and OpenCode will use its own defaults.
+# Sandboxed.sh won’t force a model and OpenCode will use its own defaults.
 
 # Desktop tools (optional)
 DESKTOP_ENABLED=true
@@ -640,9 +640,9 @@ EOF
 
 ---
 
-## 7) Create `systemd` unit for Open Agent
+## 7) Create `systemd` unit for Sandboxed.sh
 
-Create `/etc/systemd/system/open_agent.service`:
+Create `/etc/systemd/system/sandboxed_sh.service`:
 
 ```ini
 [Unit]
@@ -654,9 +654,9 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-EnvironmentFile=/etc/open_agent/open_agent.env
+EnvironmentFile=/etc/sandboxed_sh/sandboxed_sh.env
 WorkingDirectory=/root
-ExecStart=/usr/local/bin/open_agent
+ExecStart=/usr/local/bin/sandboxed_sh
 Restart=on-failure
 RestartSec=2
 
@@ -701,9 +701,9 @@ library-template/workspace-template/residential.json
 
 It installs Tailscale and adds helper scripts:
 
-- `openagent-network-up` (brings up host0 veth + DHCP + DNS)
-- `openagent-tailscale-up` (starts tailscaled + sets exit node)
-- `openagent-tailscale-check` (prints Tailscale status + public IP)
+- `sandboxed.sh-network-up` (brings up host0 veth + DHCP + DNS)
+- `sandboxed.sh-tailscale-up` (starts tailscaled + sets exit node)
+- `sandboxed.sh-tailscale-check` (prints Tailscale status + public IP)
 
 Set these **workspace env vars** (not global env):
 
@@ -715,8 +715,8 @@ Set these **workspace env vars** (not global env):
 Then inside the workspace:
 
 ```bash
-openagent-tailscale-up
-openagent-tailscale-check
+sandboxed.sh-tailscale-up
+sandboxed.sh-tailscale-check
 ```
 
 If the public IP matches your home ISP, the exit node is working.
@@ -769,7 +769,7 @@ Enable + start:
 
 ```bash
 systemctl daemon-reload
-systemctl enable --now open_agent.service
+systemctl enable --now sandboxed_sh.service
 ```
 
 Test:
@@ -785,7 +785,7 @@ curl -fsSL http://127.0.0.1:3000/api/health | jq .
 If you want browser/desktop automation on Ubuntu, run:
 
 ```bash
-cd /opt/open_agent/vaduz-v1
+cd /opt/sandboxed_sh/vaduz-v1
 bash scripts/install_desktop.sh
 ```
 
@@ -795,9 +795,9 @@ Or follow `docs/DESKTOP_SETUP.md`.
 
 ## 9) Updating
 
-### 9.1 Update Open Agent via Dashboard (recommended)
+### 9.1 Update Sandboxed.sh via Dashboard (recommended)
 
-The Settings page shows available updates for Open Agent, OpenCode, and
+The Settings page shows available updates for Sandboxed.sh, OpenCode, and
 oh-my-opencode. When a new version is available:
 
 1. Go to **Settings → System Components**
@@ -810,40 +810,40 @@ oh-my-opencode. When a new version is available:
 
 **Requirements for one-click updates:**
 
-- The repository at `/opt/open_agent/vaduz-v1` must be a git clone (not rsync'd
+- The repository at `/opt/sandboxed_sh/vaduz-v1` must be a git clone (not rsync'd
   files)
 - Create GitHub releases with version tags (e.g., `0.2.1` or `v0.2.1`) to
   trigger update detection
 - The server needs SSH access to pull from GitHub (deploy key configured in
   section 0.5.3)
 
-### 9.2 Update Open Agent manually (CLI)
+### 9.2 Update Sandboxed.sh manually (CLI)
 
 ```bash
-cd /opt/open_agent/vaduz-v1
+cd /opt/sandboxed_sh/vaduz-v1
 git fetch --tags origin
 git checkout <version-tag>  # e.g., v0.2.1
 source /root/.cargo/env
-cargo build --bin open_agent --bin workspace-mcp --bin desktop-mcp
-install -m 0755 target/debug/open_agent /usr/local/bin/open_agent
+cargo build --bin sandboxed_sh --bin workspace-mcp --bin desktop-mcp
+install -m 0755 target/debug/sandboxed_sh /usr/local/bin/sandboxed_sh
 install -m 0755 target/debug/workspace-mcp /usr/local/bin/workspace-mcp
 install -m 0755 target/debug/desktop-mcp /usr/local/bin/desktop-mcp
-systemctl restart open_agent.service
+systemctl restart sandboxed_sh.service
 ```
 
 Optional: if you no longer use legacy workspace/desktop MCP tools, build only
-`open_agent`:
+`sandboxed_sh`:
 
 ```bash
-cargo build --bin open_agent
-install -m 0755 target/debug/open_agent /usr/local/bin/open_agent
-systemctl restart open_agent.service
+cargo build --bin sandboxed_sh
+install -m 0755 target/debug/sandboxed_sh /usr/local/bin/sandboxed_sh
+systemctl restart sandboxed_sh.service
 ```
 
 Or to follow the latest master branch:
 
 ```bash
-cd /opt/open_agent/vaduz-v1
+cd /opt/sandboxed_sh/vaduz-v1
 git pull origin master
 # ... build and install as above
 ```
@@ -865,9 +865,9 @@ directory. Updates can be triggered from the dashboard (Settings → System
 Components) or manually:
 
 ```bash
-# Run with the same HOME as the Open Agent service
-# Check your /etc/open_agent/open_agent.env for the correct HOME value
-source /etc/open_agent/open_agent.env
+# Run with the same HOME as the Sandboxed.sh service
+# Check your /etc/sandboxed_sh/sandboxed_sh.env for the correct HOME value
+source /etc/sandboxed_sh/sandboxed_sh.env
 bunx oh-my-opencode@latest install --no-tui --claude=yes --gemini=yes --copilot=no
 ```
 
@@ -900,8 +900,8 @@ ls /root/.nvm/versions/node/*/bin/oh-my-opencode 2>/dev/null
 rm -f /root/.nvm/versions/node/*/bin/oh-my-opencode
 
 # 4. Clear bun cache for the service's HOME
-# Use the same HOME as configured in /etc/open_agent/open_agent.env
-source /etc/open_agent/open_agent.env
+# Use the same HOME as configured in /etc/sandboxed_sh/sandboxed_sh.env
+source /etc/sandboxed_sh/sandboxed_sh.env
 rm -rf $HOME/.bun/install/cache/oh-my-opencode*
 
 # 5. Reinstall and verify
@@ -915,7 +915,7 @@ bunx-cached version.
 
 ## 10) Production Security (TLS + Reverse Proxy)
 
-For production deployments, **always** put Open Agent behind a reverse proxy
+For production deployments, **always** put Sandboxed.sh behind a reverse proxy
 with TLS. The backend serves HTTP only and should never be exposed directly to
 the internet.
 
@@ -956,7 +956,7 @@ Install Nginx and Certbot:
 apt install -y nginx certbot python3-certbot-nginx
 ```
 
-Create `/etc/nginx/sites-available/openagent`:
+Create `/etc/nginx/sites-available/sandboxed.sh`:
 
 ```nginx
 server {
@@ -984,7 +984,7 @@ server {
 Enable the site and obtain certificates:
 
 ```bash
-ln -s /etc/nginx/sites-available/openagent /etc/nginx/sites-enabled/
+ln -s /etc/nginx/sites-available/sandboxed.sh /etc/nginx/sites-enabled/
 nginx -t && systemctl reload nginx
 certbot --nginx -d agent.yourdomain.com
 ```
@@ -994,7 +994,7 @@ certbot --nginx -d agent.yourdomain.com
 Block direct access to port 3000 from the internet:
 
 ```bash
-# Allow only localhost to reach Open Agent directly
+# Allow only localhost to reach Sandboxed.sh directly
 iptables -A INPUT -p tcp --dport 3000 -s 127.0.0.1 -j ACCEPT
 iptables -A INPUT -p tcp --dport 3000 -j DROP
 ```
@@ -1003,13 +1003,13 @@ iptables -A INPUT -p tcp --dport 3000 -j DROP
 
 ## 11) Authentication Modes
 
-Open Agent supports three authentication modes:
+Sandboxed.sh supports three authentication modes:
 
 | Mode              | Environment Variables              | Use Case                      |
 | ----------------- | ---------------------------------- | ----------------------------- |
 | **Disabled**      | `DEV_MODE=true`                    | Local development only        |
 | **Single Tenant** | `DASHBOARD_PASSWORD`, `JWT_SECRET` | Personal server, one user     |
-| **Multi-User**    | `OPEN_AGENT_USERS`, `JWT_SECRET`   | Shared server, multiple users |
+| **Multi-User**    | `SANDBOXED_SH_USERS`, `JWT_SECRET`   | Shared server, multiple users |
 
 ### 11.1 Single Tenant (default for production)
 
@@ -1019,7 +1019,7 @@ Set a strong password and JWT secret:
 # Generate a random JWT secret
 JWT_SECRET=$(openssl rand -base64 32)
 
-# In /etc/open_agent/open_agent.env:
+# In /etc/sandboxed_sh/sandboxed_sh.env:
 DEV_MODE=false
 DASHBOARD_PASSWORD=your-strong-password-here
 JWT_SECRET=$JWT_SECRET
@@ -1031,9 +1031,9 @@ JWT_TTL_DAYS=30
 For multiple users with separate credentials:
 
 ```bash
-# In /etc/open_agent/open_agent.env:
+# In /etc/sandboxed_sh/sandboxed_sh.env:
 DEV_MODE=false
-OPEN_AGENT_USERS='[
+SANDBOXED_SH_USERS='[
   {"username": "alice", "password": "alice-strong-password"},
   {"username": "bob", "password": "bob-strong-password"}
 ]'
@@ -1091,7 +1091,7 @@ To change later: **Menu (⋮) → Settings**
 
 ## 13) OAuth Provider Setup
 
-Open Agent uses OAuth for AI provider authentication. The following providers
+Sandboxed.sh uses OAuth for AI provider authentication. The following providers
 are pre-configured:
 
 | Provider          | OAuth Client      | Setup Required                        |

@@ -18,7 +18,7 @@ pub struct McpConfigStore {
 impl McpConfigStore {
     /// Create a new config store, loading from disk if available.
     pub async fn new(working_dir: &Path) -> Self {
-        let config_dir = working_dir.join(".openagent").join("mcp");
+        let config_dir = working_dir.join(".sandboxed").join("mcp");
         let config_path = config_dir.join("config.json");
 
         let configs = if config_path.exists() {

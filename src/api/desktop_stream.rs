@@ -38,7 +38,7 @@ fn extract_jwt_from_protocols(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get("sec-websocket-protocol")
         .and_then(|v| v.to_str().ok())?;
-    // Client sends: ["openagent", "jwt.<token>"]
+    // Client sends: ["sandboxed", "jwt.<token>"]
     for part in raw.split(',').map(|s| s.trim()) {
         if let Some(rest) = part.strip_prefix("jwt.") {
             if !rest.is_empty() {
@@ -72,7 +72,7 @@ pub async fn desktop_stream_ws(
         return (StatusCode::BAD_REQUEST, "Invalid display format").into_response();
     }
 
-    ws.protocols(["openagent"])
+    ws.protocols(["sandboxed"])
         .on_upgrade(move |socket| handle_desktop_stream(socket, params))
 }
 

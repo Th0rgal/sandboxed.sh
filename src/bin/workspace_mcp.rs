@@ -136,11 +136,11 @@ fn container_root_from_path(path: &Path) -> Option<PathBuf> {
 fn is_inside_container() -> bool {
     // If /workspaces exists but the typical HOST container path doesn't,
     // we're likely inside a container
-    Path::new("/workspaces").exists() && !Path::new("/root/.openagent/containers").exists()
+    Path::new("/workspaces").exists() && !Path::new("/root/.sandboxed/containers").exists()
 }
 
 /// Translate a HOST path to a container-relative path.
-/// HOST path: /root/.openagent/containers/<name>/workspaces/mission-xxx
+/// HOST path: /root/.sandboxed/containers/<name>/workspaces/mission-xxx
 /// Container path: /workspaces/mission-xxx
 fn translate_host_path_for_container(host_path: &str, workspace_root: Option<&str>) -> String {
     // If we have the workspace_root (container root on host), strip it from the path
@@ -157,7 +157,7 @@ fn translate_host_path_for_container(host_path: &str, workspace_root: Option<&st
     }
 
     // Fallback: try to detect and strip container path patterns
-    // Pattern: /root/.openagent/containers/<name>/...
+    // Pattern: /root/.sandboxed/containers/<name>/...
     if let Some(idx) = host_path.find("/containers/") {
         let after_containers = &host_path[idx + "/containers/".len()..];
         if let Some(slash_idx) = after_containers.find('/') {
@@ -171,29 +171,29 @@ fn translate_host_path_for_container(host_path: &str, workspace_root: Option<&st
 fn hydrate_workspace_env(override_path: Option<PathBuf>) -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let workspace = override_path.unwrap_or_else(|| {
-        std::env::var("OPEN_AGENT_WORKSPACE")
+        std::env::var("SANDBOXED_SH_WORKSPACE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| cwd.clone())
     });
 
-    if std::env::var("OPEN_AGENT_WORKSPACE").is_err() {
+    if std::env::var("SANDBOXED_SH_WORKSPACE").is_err() {
         std::env::set_var(
-            "OPEN_AGENT_WORKSPACE",
+            "SANDBOXED_SH_WORKSPACE",
             workspace.to_string_lossy().to_string(),
         );
     }
 
-    if std::env::var("OPEN_AGENT_WORKSPACE_TYPE").is_err() {
+    if std::env::var("SANDBOXED_SH_WORKSPACE_TYPE").is_err() {
         if let Some(root) = container_root_from_path(&workspace) {
-            std::env::set_var("OPEN_AGENT_WORKSPACE_TYPE", "container");
-            if std::env::var("OPEN_AGENT_WORKSPACE_ROOT").is_err() {
+            std::env::set_var("SANDBOXED_SH_WORKSPACE_TYPE", "container");
+            if std::env::var("SANDBOXED_SH_WORKSPACE_ROOT").is_err() {
                 std::env::set_var(
-                    "OPEN_AGENT_WORKSPACE_ROOT",
+                    "SANDBOXED_SH_WORKSPACE_ROOT",
                     root.to_string_lossy().to_string(),
                 );
             }
         } else {
-            std::env::set_var("OPEN_AGENT_WORKSPACE_TYPE", "host");
+            std::env::set_var("SANDBOXED_SH_WORKSPACE_TYPE", "host");
         }
     }
 
@@ -228,14 +228,14 @@ fn extract_workspace_from_initialize(params: &Value) -> Option<PathBuf> {
 }
 
 fn runtime_workspace_path() -> PathBuf {
-    if let Ok(path) = std::env::var("OPEN_AGENT_RUNTIME_WORKSPACE_FILE") {
+    if let Ok(path) = std::env::var("SANDBOXED_SH_RUNTIME_WORKSPACE_FILE") {
         if !path.trim().is_empty() {
             return PathBuf::from(path);
         }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home)
-        .join(".openagent")
+        .join(".sandboxed")
         .join("runtime")
         .join("current_workspace.json")
 }
@@ -252,7 +252,7 @@ fn load_runtime_workspace() -> Option<RuntimeWorkspace> {
     // We use workspace_root (host path) instead of working_dir (which may be container-relative)
     if let Some(ref state) = global_state {
         if let Some(ref workspace_root) = state.workspace_root {
-            let local_context = PathBuf::from(workspace_root).join(".openagent_context.json");
+            let local_context = PathBuf::from(workspace_root).join(".sandboxed_context.json");
             if local_context.exists() {
                 if let Ok(contents) = std::fs::read_to_string(&local_context) {
                     if let Ok(local_state) = serde_json::from_str::<RuntimeWorkspace>(&contents) {
@@ -268,7 +268,7 @@ fn load_runtime_workspace() -> Option<RuntimeWorkspace> {
 }
 
 fn apply_runtime_workspace(working_dir: &Arc<RwLock<PathBuf>>) {
-    // CRITICAL: Do NOT overwrite OPEN_AGENT_WORKSPACE_ROOT and OPEN_AGENT_WORKSPACE_TYPE
+    // CRITICAL: Do NOT overwrite SANDBOXED_SH_WORKSPACE_ROOT and SANDBOXED_SH_WORKSPACE_TYPE
     // These are set correctly at MCP spawn time from opencode.json and determine which
     // container commands run in. Overwriting them from a shared file causes race conditions
     // when multiple missions run in parallel.
@@ -285,7 +285,7 @@ fn apply_runtime_workspace(working_dir: &Arc<RwLock<PathBuf>>) {
     let inside_container = is_inside_container();
 
     // Use workspace_root from spawn env, NOT from the (potentially stale) file
-    let workspace_root = std::env::var("OPEN_AGENT_WORKSPACE_ROOT").ok();
+    let workspace_root = std::env::var("SANDBOXED_SH_WORKSPACE_ROOT").ok();
     let workspace_root_ref = workspace_root.as_deref();
 
     debug_log(
@@ -300,14 +300,14 @@ fn apply_runtime_workspace(working_dir: &Arc<RwLock<PathBuf>>) {
     );
 
     // Only update working_dir if not already set from spawn env
-    if std::env::var("OPEN_AGENT_WORKSPACE").is_err() {
+    if std::env::var("SANDBOXED_SH_WORKSPACE").is_err() {
         if let Some(dir) = state.working_dir.as_ref() {
             let effective_dir = if inside_container {
                 translate_host_path_for_container(dir, workspace_root_ref)
             } else {
                 dir.clone()
             };
-            std::env::set_var("OPEN_AGENT_WORKSPACE", &effective_dir);
+            std::env::set_var("SANDBOXED_SH_WORKSPACE", &effective_dir);
             if let Ok(mut guard) = working_dir.write() {
                 *guard = PathBuf::from(&effective_dir);
             }
@@ -315,22 +315,22 @@ fn apply_runtime_workspace(working_dir: &Arc<RwLock<PathBuf>>) {
     }
 
     // Only update workspace name if not already set
-    if std::env::var("OPEN_AGENT_WORKSPACE_NAME").is_err() {
+    if std::env::var("SANDBOXED_SH_WORKSPACE_NAME").is_err() {
         if let Some(name) = state.workspace_name.as_ref() {
-            std::env::set_var("OPEN_AGENT_WORKSPACE_NAME", name);
+            std::env::set_var("SANDBOXED_SH_WORKSPACE_NAME", name);
         }
     }
 
-    // IMPORTANT: Do NOT modify OPEN_AGENT_WORKSPACE_ROOT or OPEN_AGENT_WORKSPACE_TYPE here!
+    // IMPORTANT: Do NOT modify SANDBOXED_SH_WORKSPACE_ROOT or SANDBOXED_SH_WORKSPACE_TYPE here!
     // These are set at spawn time and must remain stable for the lifetime of the MCP process.
     // The code below handles the special case of running INSIDE a container.
     if inside_container {
         // When running inside a container, clear these variables so RunCommand
         // executes directly (we're already in the container, no need to nspawn again)
-        std::env::remove_var("OPEN_AGENT_WORKSPACE_ROOT");
-        std::env::set_var("OPEN_AGENT_WORKSPACE_TYPE", "host");
+        std::env::remove_var("SANDBOXED_SH_WORKSPACE_ROOT");
+        std::env::set_var("SANDBOXED_SH_WORKSPACE_TYPE", "host");
     }
-    // NOTE: We intentionally do NOT set OPEN_AGENT_WORKSPACE_ROOT or OPEN_AGENT_WORKSPACE_TYPE
+    // NOTE: We intentionally do NOT set SANDBOXED_SH_WORKSPACE_ROOT or SANDBOXED_SH_WORKSPACE_TYPE
     // from the file when not inside a container. These must come from spawn env only.
 
     if let Some(context_root) = state.context_root.as_ref() {
@@ -340,11 +340,11 @@ fn apply_runtime_workspace(working_dir: &Arc<RwLock<PathBuf>>) {
         } else {
             context_root.clone()
         };
-        std::env::set_var("OPEN_AGENT_CONTEXT_ROOT", &effective_context);
+        std::env::set_var("SANDBOXED_SH_CONTEXT_ROOT", &effective_context);
     }
 
     if let Some(mission_id) = state.mission_id.as_ref() {
-        std::env::set_var("OPEN_AGENT_MISSION_ID", mission_id);
+        std::env::set_var("SANDBOXED_SH_MISSION_ID", mission_id);
     }
 
     if let Some(mission_context) = state.mission_context.as_ref() {
@@ -354,16 +354,16 @@ fn apply_runtime_workspace(working_dir: &Arc<RwLock<PathBuf>>) {
         } else {
             mission_context.clone()
         };
-        std::env::set_var("OPEN_AGENT_MISSION_CONTEXT", &effective_mission_context);
+        std::env::set_var("SANDBOXED_SH_MISSION_CONTEXT", &effective_mission_context);
     }
 
     if let Some(context_dir_name) = state.context_dir_name.as_ref() {
-        std::env::set_var("OPEN_AGENT_CONTEXT_DIR_NAME", context_dir_name);
+        std::env::set_var("SANDBOXED_SH_CONTEXT_DIR_NAME", context_dir_name);
     }
 }
 
 fn debug_log(tag: &str, payload: &Value) {
-    if std::env::var("OPEN_AGENT_MCP_DEBUG").ok().as_deref() != Some("1") {
+    if std::env::var("SANDBOXED_SH_MCP_DEBUG").ok().as_deref() != Some("1") {
         return;
     }
     let line = format!("[workspace-mcp] {} {}\n", tag, payload);
@@ -434,11 +434,11 @@ impl Tool for UpdateSkillTool {
         }
 
         // Get backend API URL (defaults to localhost in dev)
-        let api_base = std::env::var("OPEN_AGENT_API_URL")
+        let api_base = std::env::var("SANDBOXED_SH_API_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
 
         // Get auth token if set
-        let auth_token = std::env::var("OPEN_AGENT_API_TOKEN").ok();
+        let auth_token = std::env::var("SANDBOXED_SH_API_TOKEN").ok();
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -540,11 +540,11 @@ impl Tool for UpdateInitScriptTool {
         }
 
         // Get backend API URL (defaults to localhost in dev)
-        let api_base = std::env::var("OPEN_AGENT_API_URL")
+        let api_base = std::env::var("SANDBOXED_SH_API_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
 
         // Get auth token if set
-        let auth_token = std::env::var("OPEN_AGENT_API_TOKEN").ok();
+        let auth_token = std::env::var("SANDBOXED_SH_API_TOKEN").ok();
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))

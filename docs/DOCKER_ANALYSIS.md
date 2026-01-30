@@ -1,8 +1,8 @@
-# Dockerization Analysis for Open Agent
+# Dockerization Analysis for Sandboxed.sh
 
 ## Executive Summary
 
-Open Agent consists of three deployable components: a **Rust backend**
+Sandboxed.sh consists of three deployable components: a **Rust backend**
 (orchestrator + API), a **Next.js dashboard** (frontend), and optional **MCP
 helper binaries**. Today it runs on bare-metal Ubuntu 24.04 with systemd-nspawn
 for workspace isolation. This report analyzes what a Docker-based deployment
@@ -22,7 +22,7 @@ A single `docker compose up` can serve both backend and dashboard.
 
 | Component | Technology | Build | Runtime Dependencies |
 |-----------|-----------|-------|---------------------|
-| **Backend** (`open_agent`) | Rust (Tokio + Axum) | `cargo build` | git, curl, npm/bun (for harness auto-install) |
+| **Backend** (`sandboxed_sh`) | Rust (Tokio + Axum) | `cargo build` | git, curl, npm/bun (for harness auto-install) |
 | **Dashboard** | Next.js 16 + React 19 | `bun build` / `next build` | Node/Bun runtime |
 | **desktop-mcp** | Rust binary | `cargo build` | Xvfb, i3, xdotool, scrot, tesseract |
 | **workspace-mcp** | Rust binary | `cargo build` | (none beyond backend) |
@@ -34,15 +34,15 @@ A single `docker compose up` can serve both backend and dashboard.
 
 ### 2.1 Image Strategy: Two Images
 
-**Image 1: `openagent/backend`** (Rust backend + MCP binaries)
+**Image 1: `sandboxed.sh/backend`** (Rust backend + MCP binaries)
 
 Multi-stage build:
-1. **Builder stage** (`rust:1.75-bookworm`): compile `open_agent`,
+1. **Builder stage** (`rust:1.75-bookworm`): compile `sandboxed_sh`,
    `desktop-mcp`, `workspace-mcp`
 2. **Runtime stage** (`debian:bookworm-slim`): minimal runtime with git, curl,
    npm/bun, and the compiled binaries
 
-**Image 2: `openagent/dashboard`** (Next.js frontend)
+**Image 2: `sandboxed.sh/dashboard`** (Next.js frontend)
 
 Multi-stage build:
 1. **Builder stage** (`oven/bun:1`): `bun install && bun run build`
@@ -53,16 +53,16 @@ Multi-stage build:
 ```yaml
 services:
   backend:
-    image: openagent/backend
+    image: sandboxed.sh/backend
     ports:
       - "3000:3000"
     volumes:
-      - openagent-data:/root/.openagent    # SQLite, library, workspaces
+      - sandboxed.sh-data:/root/.sandboxed.sh    # SQLite, library, workspaces
       - /var/run/docker.sock:/var/run/docker.sock  # optional: DinD
     env_file: .env
 
   dashboard:
-    image: openagent/dashboard
+    image: sandboxed.sh/dashboard
     ports:
       - "3001:3000"
     environment:
@@ -71,14 +71,14 @@ services:
       - backend
 
 volumes:
-  openagent-data:
+  sandboxed.sh-data:
 ```
 
 ### 2.3 Single Combined Image (Alternative)
 
 For simpler deployment, a single image could run both backend and dashboard
 behind a lightweight reverse proxy (Caddy). This avoids cross-origin issues and
-lets users do `docker run -p 443:443 openagent/all-in-one`. The trade-off is a
+lets users do `docker run -p 443:443 sandboxed.sh/all-in-one`. The trade-off is a
 larger image and coupling the frontend release cycle to the backend.
 
 ---
@@ -87,7 +87,7 @@ larger image and coupling the frontend release cycle to the backend.
 
 ### 3.1 Current Architecture
 
-Open Agent uses systemd-nspawn for workspace isolation:
+Sandboxed.sh uses systemd-nspawn for workspace isolation:
 
 ```
 nspawn_available() → checks cfg!(target_os = "linux") && /usr/bin/systemd-nspawn exists
@@ -120,7 +120,7 @@ Required Docker run flags:
 docker run --privileged \
   --cgroupns=host \
   -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-  openagent/backend
+  sandboxed.sh/backend
 ```
 
 Or with granular capabilities:
@@ -134,7 +134,7 @@ docker run \
   --security-opt apparmor=unconfined \
   --cgroupns=host \
   -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-  openagent/backend
+  sandboxed.sh/backend
 ```
 
 **Verdict**: It works with `--privileged` on both Linux hosts and macOS (Docker
@@ -182,7 +182,7 @@ For the Docker image, **support three modes**:
 3. **Docker-in-Docker** (future): Mount Docker socket, use Docker API for
    workspace isolation. More natural fit for Docker deployments.
 
-The existing `OPEN_AGENT_ALLOW_CONTAINER_FALLBACK` env var already handles
+The existing `SANDBOXED_SH_ALLOW_CONTAINER_FALLBACK` env var already handles
 graceful degradation. Setting it to `true` in the Docker image's default env
 makes host-mode the default without requiring code changes.
 
@@ -310,13 +310,13 @@ can produce multi-arch manifests. The OpenCode binary is only available for
 
 | Path | Content | Volume? |
 |------|---------|---------|
-| `~/.openagent/` | SQLite DB, library, container rootfs, runtime state | Yes (critical) |
-| `~/.openagent/library/` | Cloned library repo | Yes (or re-clone on start) |
-| `~/.openagent/containers/` | nspawn rootfs (if using containers) | Yes (large, ~150 MB each) |
+| `~/.sandboxed.sh/` | SQLite DB, library, container rootfs, runtime state | Yes (critical) |
+| `~/.sandboxed.sh/library/` | Cloned library repo | Yes (or re-clone on start) |
+| `~/.sandboxed.sh/containers/` | nspawn rootfs (if using containers) | Yes (large, ~150 MB each) |
 | `~/.claude/` | Claude Code OAuth credentials | Yes (for token persistence) |
 | `~/.config/opencode/` | OpenCode config | Yes |
 
-A single named volume at `/root/.openagent` covers most state. Credentials
+A single named volume at `/root/.sandboxed.sh` covers most state. Credentials
 should be injected via env vars or a secrets volume.
 
 ### 7.2 Configuration Injection
@@ -331,7 +331,7 @@ files need to be mounted.
 
 ### 8.1 Privileged Mode for Container Workspaces
 
-Running `--privileged` Docker containers is a security concern. The Open Agent
+Running `--privileged` Docker containers is a security concern. The Sandboxed.sh
 backend runs as root and has full system access by design (it manages
 workspaces, spawns harnesses, runs arbitrary agent code). In the nspawn model,
 the host kernel provides isolation. In Docker `--privileged`, the container
@@ -351,7 +351,7 @@ need the SSH key injected. Options:
 
 ### 8.3 Harness Auto-Install
 
-On first mission, Open Agent auto-installs Claude Code / OpenCode / Amp CLIs
+On first mission, Sandboxed.sh auto-installs Claude Code / OpenCode / Amp CLIs
 via npm or curl. This requires internet access from the container. For air-gapped
 environments, pre-install these in the Docker image.
 
@@ -359,7 +359,7 @@ environments, pre-install these in the Docker image.
 
 Desktop tools (Xvfb, i3, Chromium, xdotool, scrot, tesseract) add ~500 MB to
 the image. Most Docker users won't need desktop automation. Consider:
-- A separate `openagent/backend-desktop` image variant with desktop deps
+- A separate `sandboxed.sh/backend-desktop` image variant with desktop deps
 - Or a flag to optionally install desktop deps at container start
 
 ---
@@ -388,7 +388,7 @@ WORKDIR /build
 COPY --from=cook /build/target target
 COPY --from=cook /usr/local/cargo /usr/local/cargo
 COPY . .
-RUN cargo build --release --bin open_agent --bin desktop-mcp --bin workspace-mcp
+RUN cargo build --release --bin sandboxed_sh --bin desktop-mcp --bin workspace-mcp
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -406,20 +406,20 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=compile /build/target/release/open_agent /usr/local/bin/
+COPY --from=compile /build/target/release/sandboxed_sh /usr/local/bin/
 COPY --from=compile /build/target/release/desktop-mcp /usr/local/bin/
 COPY --from=compile /build/target/release/workspace-mcp /usr/local/bin/
 
 # Default: host workspaces, no nspawn
-ENV OPEN_AGENT_ALLOW_CONTAINER_FALLBACK=true
+ENV SANDBOXED_SH_ALLOW_CONTAINER_FALLBACK=true
 ENV HOST=0.0.0.0
 ENV PORT=3000
 ENV WORKING_DIR=/root
 
 EXPOSE 3000
-VOLUME ["/root/.openagent"]
+VOLUME ["/root/.sandboxed.sh"]
 
-CMD ["open_agent"]
+CMD ["sandboxed_sh"]
 ```
 
 ### 9.2 Dashboard Dockerfile
@@ -445,14 +445,14 @@ CMD ["bun", "server.js"]
 ### 9.3 All-in-One with Caddy
 
 ```dockerfile
-FROM openagent/backend AS backend
-FROM openagent/dashboard AS dashboard
+FROM sandboxed.sh/backend AS backend
+FROM sandboxed.sh/dashboard AS dashboard
 
 FROM debian:bookworm-slim
 # Install Caddy
 RUN apt-get update && apt-get install -y caddy && rm -rf /var/lib/apt/lists/*
 
-COPY --from=backend /usr/local/bin/open_agent /usr/local/bin/
+COPY --from=backend /usr/local/bin/sandboxed_sh /usr/local/bin/
 COPY --from=dashboard /app /opt/dashboard
 
 # Caddy reverse proxy config
@@ -463,7 +463,7 @@ RUN echo ':80 { \n\
 
 COPY entrypoint.sh /entrypoint.sh
 CMD ["/entrypoint.sh"]
-# entrypoint.sh starts open_agent, next, and caddy
+# entrypoint.sh starts sandboxed_sh, next, and caddy
 ```
 
 ---
@@ -482,7 +482,7 @@ CMD ["/entrypoint.sh"]
 ### Bottom Line
 
 Dockerization is viable and valuable for:
-1. **Lowering the barrier to entry** (one command to try Open Agent)
+1. **Lowering the barrier to entry** (one command to try Sandboxed.sh)
 2. **macOS users** who can't run the bare-metal install
 3. **Reproducible deployments** without the 13-step install guide
 

@@ -1,13 +1,13 @@
 ---
 name: library-management
 description: >
-  Manage the Open Agent library (skills, agents, commands, tools, rules, MCPs) via Library API tools.
+  Manage the Sandboxed.sh library (skills, agents, commands, tools, rules, MCPs) via Library API tools.
   Trigger terms: library, skill, agent, command, tool, rule, MCP, save skill, create skill.
 ---
 
-# Open Agent Library Management
+# Sandboxed.sh Library Management
 
-The Open Agent Library is a Git-backed configuration repo that stores reusable skills, agents,
+The Sandboxed.sh Library is a Git-backed configuration repo that stores reusable skills, agents,
 commands, tools, rules, MCP servers, and workspace templates. Use the `library-*` tools to
 read and update that repo.
 

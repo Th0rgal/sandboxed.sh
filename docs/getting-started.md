@@ -60,7 +60,7 @@ Click on **System** to configure your backend connection:
 The System page shows:
 - **API URL** - Backend endpoint (currently connected status)
 - **System Components** - Installed harnesses and versions
-  - Open Agent (v0.5.1)
+  - Sandboxed.sh (v0.5.1)
   - OpenCode (with update notifications)
   - Claude Code (with update notifications)
   - Amp
@@ -118,7 +118,7 @@ The default library uses the OpenAgent template repository. To use your own:
 
 4. Click **Save**
 
-**Note**: The backend will clone your repository on first use. If it's empty, consider forking the [openagent-library-template](https://github.com/Th0rgal/sandboxed-library-template) as a starting point.
+**Note**: The backend will clone your repository on first use. If it's empty, consider forking the [sandboxed.sh-library-template](https://github.com/Th0rgal/sandboxed-library-template) as a starting point.
 
 ### 3.3 Sync Library
 
@@ -137,7 +137,7 @@ The default library includes several useful skills:
 - **bitwarden-secrets** - Secure credential management
 - **github-cli** - GitHub operations (PRs, issues)
 - **library-management** - Library API tools
-- **openagent-dev** - OpenAgent development guide
+- **sandboxed.sh-dev** - OpenAgent development guide
 
 ### 4.2 Edit a Skill
 

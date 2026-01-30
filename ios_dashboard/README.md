@@ -1,6 +1,6 @@
-# Open Agent iOS Dashboard
+# Sandboxed.sh iOS Dashboard
 
-Native iOS dashboard for Open Agent with **Liquid Glass** design language.
+Native iOS dashboard for Sandboxed.sh with **Liquid Glass** design language.
 
 ## Features
 
@@ -68,7 +68,7 @@ xcodebuild -project OpenAgentDashboard.xcodeproj \
 
 ## Configuration
 
-The app connects to the Open Agent backend. Configure the server URL:
+The app connects to the Sandboxed.sh backend. Configure the server URL:
 - Default: `https://agent-backend.thomas.md`
 - Can be changed in the login screen
 

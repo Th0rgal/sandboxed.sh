@@ -222,7 +222,7 @@ impl WorkspaceStore {
     ///
     /// This also scans for orphaned container directories and restores them.
     pub async fn new(working_dir: PathBuf) -> Self {
-        let storage_path = working_dir.join(".openagent/workspaces.json");
+        let storage_path = working_dir.join(".sandboxed/workspaces.json");
 
         let store = Self {
             workspaces: RwLock::new(HashMap::new()),
@@ -311,7 +311,7 @@ impl WorkspaceStore {
 
     /// Scan for container directories that exist on disk but aren't in the store.
     async fn scan_orphaned_containers(&self, known: &HashMap<Uuid, Workspace>) -> Vec<Workspace> {
-        let containers_dir = self.working_dir.join(".openagent/containers");
+        let containers_dir = self.working_dir.join(".sandboxed/containers");
 
         if !containers_dir.exists() {
             return Vec::new();
@@ -512,7 +512,7 @@ fn unique_key(base: &str, used: &mut std::collections::HashSet<String>) -> Strin
 
 /// Root directory for Open Agent config data (versioned with repo).
 pub fn config_root(working_dir: &Path) -> PathBuf {
-    working_dir.join(".openagent")
+    working_dir.join(".sandboxed")
 }
 
 /// Root directory for workspace folders.
@@ -600,17 +600,17 @@ fn opencode_entry_from_mcp(
                 let workspace_env_json =
                     serde_json::to_string(workspace_env).unwrap_or_else(|_| "{}".to_string());
                 merged_env
-                    .entry("OPEN_AGENT_WORKSPACE_ENV_VARS".to_string())
+                    .entry("SANDBOXED_SH_WORKSPACE_ENV_VARS".to_string())
                     .or_insert(workspace_env_json);
             }
             merged_env
-                .entry("OPEN_AGENT_WORKSPACE".to_string())
+                .entry("SANDBOXED_SH_WORKSPACE".to_string())
                 .or_insert_with(|| workspace_dir.to_string_lossy().to_string());
             merged_env
-                .entry("OPEN_AGENT_WORKSPACE_ROOT".to_string())
+                .entry("SANDBOXED_SH_WORKSPACE_ROOT".to_string())
                 .or_insert_with(|| workspace_root.to_string_lossy().to_string());
             merged_env
-                .entry("OPEN_AGENT_WORKSPACE_TYPE".to_string())
+                .entry("SANDBOXED_SH_WORKSPACE_TYPE".to_string())
                 .or_insert_with(|| workspace_type.as_str().to_string());
             merged_env
                 .entry("WORKING_DIR".to_string())
@@ -619,21 +619,21 @@ fn opencode_entry_from_mcp(
                 if let Some(name) = workspace_root.file_name().and_then(|n| n.to_str()) {
                     if !name.trim().is_empty() {
                         merged_env
-                            .entry("OPEN_AGENT_WORKSPACE_NAME".to_string())
+                            .entry("SANDBOXED_SH_WORKSPACE_NAME".to_string())
                             .or_insert_with(|| name.to_string());
                     }
                 }
             }
-            if let Ok(runtime_workspace_file) = std::env::var("OPEN_AGENT_RUNTIME_WORKSPACE_FILE") {
+            if let Ok(runtime_workspace_file) = std::env::var("SANDBOXED_SH_RUNTIME_WORKSPACE_FILE") {
                 if !runtime_workspace_file.trim().is_empty() {
                     merged_env
-                        .entry("OPEN_AGENT_RUNTIME_WORKSPACE_FILE".to_string())
+                        .entry("SANDBOXED_SH_RUNTIME_WORKSPACE_FILE".to_string())
                         .or_insert(runtime_workspace_file);
                 }
             }
 
             let container_fallback = workspace_env
-                .get("OPEN_AGENT_CONTAINER_FALLBACK")
+                .get("SANDBOXED_SH_CONTAINER_FALLBACK")
                 .map(|v| {
                     matches!(
                         v.trim().to_lowercase().as_str(),
@@ -642,10 +642,10 @@ fn opencode_entry_from_mcp(
                 })
                 .unwrap_or(false)
                 || (workspace_type == WorkspaceType::Container && !nspawn::nspawn_available());
-            let per_workspace_runner = env_var_bool("OPEN_AGENT_PER_WORKSPACE_RUNNER", true);
+            let per_workspace_runner = env_var_bool("SANDBOXED_SH_PER_WORKSPACE_RUNNER", true);
             if container_fallback {
                 merged_env
-                    .entry("OPEN_AGENT_CONTAINER_FALLBACK".to_string())
+                    .entry("SANDBOXED_SH_CONTAINER_FALLBACK".to_string())
                     .or_insert_with(|| "1".to_string());
             }
 
@@ -666,8 +666,8 @@ fn opencode_entry_from_mcp(
                 };
 
                 let mut nspawn_env = merged_env.clone();
-                nspawn_env.insert("OPEN_AGENT_WORKSPACE".to_string(), rel_str.clone());
-                nspawn_env.insert("OPEN_AGENT_WORKSPACE_ROOT".to_string(), "/".to_string());
+                nspawn_env.insert("SANDBOXED_SH_WORKSPACE".to_string(), rel_str.clone());
+                nspawn_env.insert("SANDBOXED_SH_WORKSPACE_ROOT".to_string(), "/".to_string());
                 nspawn_env.insert("WORKING_DIR".to_string(), rel_str.clone());
 
                 let mut cmd = vec![
@@ -684,12 +684,12 @@ fn opencode_entry_from_mcp(
                 // Mission context files are stored in the global context root (e.g., /root/context/{mission_id}),
                 // NOT in a workspace-specific directory. The global context root must be bind-mounted
                 // so that the symlink inside the container (`context -> /root/context/{mission_id}`) resolves.
-                let context_dir_name = std::env::var("OPEN_AGENT_CONTEXT_DIR_NAME")
+                let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "context".to_string());
                 // Get the global context root from env var, falling back to /root/context
-                let global_context_root = std::env::var("OPEN_AGENT_CONTEXT_ROOT")
+                let global_context_root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .map(PathBuf::from)
@@ -702,10 +702,10 @@ fn opencode_entry_from_mcp(
                         global_context_root.display()
                     ));
                     nspawn_env.insert(
-                        "OPEN_AGENT_CONTEXT_ROOT".to_string(),
+                        "SANDBOXED_SH_CONTEXT_ROOT".to_string(),
                         "/root/context".to_string(),
                     );
-                    nspawn_env.insert("OPEN_AGENT_CONTEXT_DIR_NAME".to_string(), context_dir_name);
+                    nspawn_env.insert("SANDBOXED_SH_CONTEXT_DIR_NAME".to_string(), context_dir_name);
                 }
 
                 // Network configuration based on shared_network setting:
@@ -751,8 +751,8 @@ fn opencode_entry_from_mcp(
                     } else {
                         format!("/{}", rel.to_string_lossy())
                     };
-                    merged_env.insert("OPEN_AGENT_WORKSPACE".to_string(), rel_str.clone());
-                    merged_env.insert("OPEN_AGENT_WORKSPACE_ROOT".to_string(), "/".to_string());
+                    merged_env.insert("SANDBOXED_SH_WORKSPACE".to_string(), rel_str.clone());
+                    merged_env.insert("SANDBOXED_SH_WORKSPACE_ROOT".to_string(), "/".to_string());
                     merged_env.insert("WORKING_DIR".to_string(), rel_str);
                 }
 
@@ -823,9 +823,9 @@ fn claude_entry_from_mcp(
             {
                 let mut env_map = env.clone();
                 if let Some(env_file) = workspace_env_file {
-                    env_map.remove("OPEN_AGENT_WORKSPACE_ENV_VARS");
+                    env_map.remove("SANDBOXED_SH_WORKSPACE_ENV_VARS");
                     env_map.insert(
-                        "OPEN_AGENT_WORKSPACE_ENV_VARS_FILE".to_string(),
+                        "SANDBOXED_SH_WORKSPACE_ENV_VARS_FILE".to_string(),
                         json!(env_file),
                     );
                 }
@@ -968,10 +968,10 @@ async fn write_opencode_config(
     //   inside the workspace execution context (host/container).
     // - Therefore, OpenCode built-in bash MUST be enabled for all workspace types.
     // - The legacy workspace-mcp/desktop-mcp proxy tools are no longer required for core flows.
-    let enable_desktop_tools = env_var_bool("OPEN_AGENT_ENABLE_DESKTOP_TOOLS", false)
+    let enable_desktop_tools = env_var_bool("SANDBOXED_SH_ENABLE_DESKTOP_TOOLS", false)
         || env_var_bool("DESKTOP_ENABLED", false);
     let container_fallback = workspace_env
-        .get("OPEN_AGENT_CONTAINER_FALLBACK")
+        .get("SANDBOXED_SH_CONTAINER_FALLBACK")
         .map(|v| {
             matches!(
                 v.trim().to_lowercase().as_str(),
@@ -979,7 +979,7 @@ async fn write_opencode_config(
             )
         })
         .unwrap_or(false);
-    let per_workspace_runner = env_var_bool("OPEN_AGENT_PER_WORKSPACE_RUNNER", true);
+    let per_workspace_runner = env_var_bool("SANDBOXED_SH_PER_WORKSPACE_RUNNER", true);
     let mut tools = serde_json::Map::new();
     match workspace_type {
         WorkspaceType::Container => {
@@ -1176,12 +1176,12 @@ async fn write_claudecode_config(
     tokio::fs::create_dir_all(&claude_dir).await?;
 
     let workspace_env_file = if !workspace_env.is_empty() {
-        let openagent_dir = workspace_dir.join(".openagent");
-        tokio::fs::create_dir_all(&openagent_dir).await?;
-        let env_path = openagent_dir.join("workspace_env.json");
+        let sandboxed_dir = workspace_dir.join(".sandboxed");
+        tokio::fs::create_dir_all(&sandboxed_dir).await?;
+        let env_path = sandboxed_dir.join("workspace_env.json");
         let payload = serde_json::to_string_pretty(workspace_env)?;
         tokio::fs::write(&env_path, payload).await?;
-        Some(".openagent/workspace_env.json".to_string())
+        Some(".sandboxed/workspace_env.json".to_string())
     } else {
         None
     };
@@ -2424,9 +2424,9 @@ pub async fn prepare_mission_workspace_with_skills(
 fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
     // Try both possible locations for ai_providers.json
     let candidates = [
-        workspace_root.join(".openagent").join("ai_providers.json"),
+        workspace_root.join(".sandboxed").join("ai_providers.json"),
         std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
-            .join(".openagent")
+            .join(".sandboxed")
             .join("ai_providers.json"),
     ];
 
@@ -2743,7 +2743,7 @@ pub async fn write_runtime_workspace_state(
     mission_id: Option<Uuid>,
     context_dir_name: &str,
 ) -> anyhow::Result<()> {
-    let runtime_dir = working_dir_root.join(".openagent").join("runtime");
+    let runtime_dir = working_dir_root.join(".sandboxed").join("runtime");
     tokio::fs::create_dir_all(&runtime_dir).await?;
     let context_root = working_dir_root.join(context_dir_name);
     let mission_context = mission_id.map(|id| context_root.join(id.to_string()));
@@ -2830,7 +2830,7 @@ pub async fn write_runtime_workspace_state(
     let payload_str = serde_json::to_string_pretty(&payload)?;
     tokio::fs::write(&path, &payload_str).await?;
 
-    // Also write to current_workspace.json so OPEN_AGENT_RUNTIME_WORKSPACE_FILE always works
+    // Also write to current_workspace.json so SANDBOXED_SH_RUNTIME_WORKSPACE_FILE always works
     // (that env var points to current_workspace.json, and oh-my-opencode reads it for container detection)
     if mission_id.is_some() {
         let current_path = runtime_dir.join("current_workspace.json");
@@ -2846,7 +2846,7 @@ pub async fn write_runtime_workspace_state(
 
     // Also write to the working directory itself so MCPs can find it
     // This allows MCPs to discover workspace context from cwd without racing on a shared file
-    let context_file = working_dir.join(".openagent_context.json");
+    let context_file = working_dir.join(".sandboxed_context.json");
     if let Err(e) = tokio::fs::write(&context_file, &payload_str).await {
         tracing::warn!(
             workspace = %workspace.name,
@@ -2863,7 +2863,7 @@ pub async fn write_runtime_workspace_state(
 ///
 /// Per-mission files are used to avoid race conditions when running parallel missions.
 pub fn runtime_workspace_file_path(working_dir_root: &Path, mission_id: Option<Uuid>) -> PathBuf {
-    let runtime_dir = working_dir_root.join(".openagent").join("runtime");
+    let runtime_dir = working_dir_root.join(".sandboxed").join("runtime");
     let filename = match mission_id {
         Some(id) => format!("workspace-{}.json", id),
         None => "current_workspace.json".to_string(),
@@ -3018,7 +3018,7 @@ fn mark_container_fallback(workspace: &mut Workspace, reason: &str) {
     workspace.config = serde_json::Value::Object(obj);
     workspace
         .env_vars
-        .entry("OPEN_AGENT_CONTAINER_FALLBACK".to_string())
+        .entry("SANDBOXED_SH_CONTAINER_FALLBACK".to_string())
         .or_insert_with(|| "1".to_string());
 }
 
@@ -3057,7 +3057,7 @@ pub async fn build_container_workspace(
             return build_container_fallback(workspace, "systemd-nspawn not available").await;
         }
         return Err(anyhow::anyhow!(
-            "systemd-nspawn not available; install systemd-container or set OPEN_AGENT_ALLOW_CONTAINER_FALLBACK=1"
+            "systemd-nspawn not available; install systemd-container or set SANDBOXED_SH_ALLOW_CONTAINER_FALLBACK=1"
         ));
     }
 
@@ -3124,7 +3124,7 @@ pub async fn build_container_workspace(
     let _ = std::fs::write(
         &build_log,
         format!(
-            "[openagent] Building container with {} (this may take a few minutes)...\n",
+            "[sandboxed] Building container with {} (this may take a few minutes)...\n",
             distro.as_str()
         ),
     );
@@ -3132,7 +3132,7 @@ pub async fn build_container_workspace(
     // Create the container
     match nspawn::create_container(&workspace.path, distro).await {
         Ok(()) => {
-            append_to_init_log(&workspace.path, "[openagent] Base system installed\n");
+            append_to_init_log(&workspace.path, "[sandboxed] Base system installed\n");
             match seed_shard_data(&workspace.path).await {
                 Ok(true) => {
                     tracing::info!(workspace = %workspace.name, "Seeded Shard data into container workspace")
@@ -3158,19 +3158,19 @@ pub async fn build_container_workspace(
                 .as_ref()
                 .map_or(false, |s| !s.trim().is_empty());
             if has_init_scripts || has_custom_script {
-                append_to_init_log(&workspace.path, "[openagent] Running init script...\n");
+                append_to_init_log(&workspace.path, "[sandboxed] Running init script...\n");
             }
             if let Err(e) = run_workspace_init_script(workspace, library).await {
                 append_to_init_log(
                     &workspace.path,
-                    &format!("[openagent] Init script failed: {}\n", e),
+                    &format!("[sandboxed] Init script failed: {}\n", e),
                 );
                 workspace.status = WorkspaceStatus::Error;
                 workspace.error_message = Some(format!("Init script failed: {}", e));
                 tracing::error!("Init script failed: {}", e);
                 return Err(e);
             }
-            append_to_init_log(&workspace.path, "[openagent] Installing harnesses...\n");
+            append_to_init_log(&workspace.path, "[sandboxed] Installing harnesses...\n");
             if let Err(e) = bootstrap_workspace_harnesses(workspace).await {
                 tracing::warn!(
                     workspace = %workspace.name,
@@ -3197,11 +3197,11 @@ pub async fn build_container_workspace(
     }
 }
 
-/// Append a line to the container's init log (var/log/openagent-init.log).
+/// Append a line to the container's init log (var/log/sandboxed-init.log).
 /// Falls back to the build log sibling file if the container filesystem isn't ready yet.
 fn append_to_init_log(container_path: &Path, msg: &str) {
     use std::io::Write;
-    let log_path = container_path.join("var/log/openagent-init.log");
+    let log_path = container_path.join("var/log/sandboxed-init.log");
     let target = if log_path.parent().map_or(false, |p| p.exists()) {
         log_path
     } else {
@@ -3217,7 +3217,7 @@ fn append_to_init_log(container_path: &Path, msg: &str) {
 }
 
 async fn seed_shard_data(container_root: &Path) -> anyhow::Result<bool> {
-    let seed_dir = std::env::var("OPEN_AGENT_SHARD_SEED")
+    let seed_dir = std::env::var("SANDBOXED_SH_SHARD_SEED")
         .ok()
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
@@ -3290,8 +3290,8 @@ async fn bootstrap_workspace_harnesses(workspace: &Workspace) -> anyhow::Result<
         return Ok(());
     }
 
-    let install_claudecode = env_var_bool("OPEN_AGENT_BOOTSTRAP_CLAUDECODE", true);
-    let install_opencode = env_var_bool("OPEN_AGENT_BOOTSTRAP_OPENCODE", true);
+    let install_claudecode = env_var_bool("SANDBOXED_SH_BOOTSTRAP_CLAUDECODE", true);
+    let install_opencode = env_var_bool("SANDBOXED_SH_BOOTSTRAP_OPENCODE", true);
 
     if !install_claudecode && !install_opencode {
         return Ok(());
@@ -3301,21 +3301,21 @@ async fn bootstrap_workspace_harnesses(workspace: &Workspace) -> anyhow::Result<
         r#"#!/usr/bin/env bash
 set -euo pipefail
 
-LOG=/var/log/openagent-init.log
+LOG=/var/log/sandboxed-init.log
 exec >>"$LOG" 2>&1
 
-echo "[openagent] Harness bootstrap start"
+echo "[sandboxed] Harness bootstrap start"
 
 if command -v npm >/dev/null 2>&1; then
   if [ "{install_claudecode}" = "true" ] && ! command -v claude >/dev/null 2>&1; then
-    echo "[openagent] Installing Claude Code..."
+    echo "[sandboxed] Installing Claude Code..."
     if ! npm install -g @anthropic-ai/claude-code@latest; then
-      echo "[openagent] Claude Code install failed"
+      echo "[sandboxed] Claude Code install failed"
     fi
   fi
   if [ "{install_opencode}" = "true" ] && ! command -v opencode >/dev/null 2>&1; then
     if command -v curl >/dev/null 2>&1; then
-      echo "[openagent] Installing opencode..."
+      echo "[sandboxed] Installing opencode..."
       if curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path; then
         if [ -x \"$HOME/.opencode/bin/opencode\" ]; then
           if command -v install >/dev/null 2>&1; then
@@ -3325,20 +3325,20 @@ if command -v npm >/dev/null 2>&1; then
           fi
         fi
       else
-        echo "[openagent] OpenCode CLI install failed"
+        echo "[sandboxed] OpenCode CLI install failed"
       fi
     else
-      echo "[openagent] curl not found; skipping opencode install"
+      echo "[sandboxed] curl not found; skipping opencode install"
     fi
   fi
   if [ "{install_opencode}" = "true" ] && ! command -v oh-my-opencode >/dev/null 2>&1; then
-    echo "[openagent] Installing oh-my-opencode..."
+    echo "[sandboxed] Installing oh-my-opencode..."
     if ! npm install -g oh-my-opencode@latest; then
-      echo "[openagent] OpenCode plugin install failed"
+      echo "[sandboxed] OpenCode plugin install failed"
     fi
   fi
 else
-  echo "[openagent] npm not found; skipping harness install"
+  echo "[sandboxed] npm not found; skipping harness install"
 fi
 
 if [ -x /root/.bun/bin/bun ] && ! command -v bun >/dev/null 2>&1; then
@@ -3346,14 +3346,14 @@ if [ -x /root/.bun/bin/bun ] && ! command -v bun >/dev/null 2>&1; then
   if [ -x /root/.bun/bin/bunx ]; then
     ln -sf /root/.bun/bin/bunx /usr/local/bin/bunx || true
   fi
-  echo "[openagent] Linked bun into /usr/local/bin"
+  echo "[sandboxed] Linked bun into /usr/local/bin"
 fi
 
-echo "[openagent] Harness bootstrap done"
+echo "[sandboxed] Harness bootstrap done"
 "#
     );
 
-    let script_path = workspace.path.join("openagent-bootstrap.sh");
+    let script_path = workspace.path.join("sandboxed-bootstrap.sh");
     tokio::fs::write(&script_path, script).await?;
 
     #[cfg(unix)]
@@ -3372,7 +3372,7 @@ echo "[openagent] Harness bootstrap done"
     let mut config = nspawn::NspawnConfig::default();
     config.env = workspace.env_vars.clone();
 
-    let command = vec![shell.to_string(), "/openagent-bootstrap.sh".to_string()];
+    let command = vec![shell.to_string(), "/sandboxed-bootstrap.sh".to_string()];
     let output = nspawn::execute_in_container(&workspace.path, &command, &config).await?;
 
     let _ = tokio::fs::remove_file(&script_path).await;
@@ -3475,7 +3475,7 @@ async fn run_workspace_init_script(
         return Ok(());
     }
 
-    let script_path = workspace.path.join("openagent-init.sh");
+    let script_path = workspace.path.join("sandboxed-init.sh");
     tokio::fs::write(&script_path, &script).await?;
 
     #[cfg(unix)]
@@ -3494,7 +3494,7 @@ async fn run_workspace_init_script(
     let mut config = nspawn::NspawnConfig::default();
     config.env = workspace.env_vars.clone();
 
-    let command = vec![shell.to_string(), "/openagent-init.sh".to_string()];
+    let command = vec![shell.to_string(), "/sandboxed-init.sh".to_string()];
     let output = nspawn::execute_in_container(&workspace.path, &command, &config).await?;
 
     // Clean up the script file after execution.
@@ -3596,15 +3596,15 @@ pub async fn sync_opencode_settings(library: &crate::library::LibraryStore) -> a
     Ok(())
 }
 
-/// Sync openagent/config.json from Library to the working directory.
+/// Sync sandboxed/config.json from Library to the working directory.
 /// This makes Library-backed agent visibility settings available.
-pub async fn sync_openagent_config(
+pub async fn sync_sandboxed_config(
     library: &crate::library::LibraryStore,
     working_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let config = library.get_openagent_config().await?;
+    let config = library.get_sandboxed_config().await?;
 
-    let dest_dir = working_dir.join(".openagent");
+    let dest_dir = working_dir.join(".sandboxed");
     let dest_path = dest_dir.join("config.json");
 
     // Ensure directory exists
@@ -3615,19 +3615,19 @@ pub async fn sync_openagent_config(
 
     tracing::info!(
         path = %dest_path.display(),
-        "Synced openagent config from Library"
+        "Synced sandboxed config from Library"
     );
 
     Ok(())
 }
 
-/// Write openagent/config.json to the working directory.
+/// Write sandboxed/config.json to the working directory.
 /// Useful when the Library is not configured but the UI still needs local defaults.
-pub async fn write_openagent_config(
+pub async fn write_sandboxed_config(
     working_dir: &std::path::Path,
-    config: &crate::library::OpenAgentConfig,
+    config: &crate::library::SandboxedConfig,
 ) -> anyhow::Result<()> {
-    let dest_dir = working_dir.join(".openagent");
+    let dest_dir = working_dir.join(".sandboxed");
     let dest_path = dest_dir.join("config.json");
 
     tokio::fs::create_dir_all(&dest_dir).await?;
@@ -3637,26 +3637,26 @@ pub async fn write_openagent_config(
 
     tracing::info!(
         path = %dest_path.display(),
-        "Wrote openagent config to working directory"
+        "Wrote sandboxed config to working directory"
     );
 
     Ok(())
 }
 
-/// Read the OpenAgent config from the working directory.
+/// Read the Sandboxed config from the working directory.
 /// Returns default config if the file doesn't exist.
-pub async fn read_openagent_config(
+pub async fn read_sandboxed_config(
     working_dir: &std::path::Path,
-) -> crate::library::OpenAgentConfig {
-    let path = working_dir.join(".openagent/config.json");
+) -> crate::library::SandboxedConfig {
+    let path = working_dir.join(".sandboxed/config.json");
 
     if !path.exists() {
-        return crate::library::OpenAgentConfig::default();
+        return crate::library::SandboxedConfig::default();
     }
 
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => crate::library::OpenAgentConfig::default(),
+        Err(_) => crate::library::SandboxedConfig::default(),
     }
 }
 

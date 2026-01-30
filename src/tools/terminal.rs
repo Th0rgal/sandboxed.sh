@@ -34,8 +34,8 @@ struct RuntimeContext {
 /// context information, even if the context file was written after the MCP started.
 fn read_runtime_context(container_root: &Path) -> RuntimeContext {
     // First check env vars (set during MCP initialization)
-    let env_context_root = env::var("OPEN_AGENT_CONTEXT_ROOT").ok();
-    let env_mission_id = env::var("OPEN_AGENT_MISSION_ID").ok();
+    let env_context_root = env::var("SANDBOXED_SH_CONTEXT_ROOT").ok();
+    let env_mission_id = env::var("SANDBOXED_SH_MISSION_ID").ok();
 
     // If env vars are set, use them
     if env_context_root.is_some() {
@@ -47,7 +47,7 @@ fn read_runtime_context(container_root: &Path) -> RuntimeContext {
 
     // Otherwise, try to read from the local context file
     // This handles the case where the MCP started before the context file was written
-    let context_file = container_root.join(".openagent_context.json");
+    let context_file = container_root.join(".sandboxed_context.json");
     if let Ok(contents) = std::fs::read_to_string(&context_file) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
             let context_root = json
@@ -61,10 +61,10 @@ fn read_runtime_context(container_root: &Path) -> RuntimeContext {
 
             // If we found context_root in the file, update the env var for future calls
             if let Some(ref root) = context_root {
-                env::set_var("OPEN_AGENT_CONTEXT_ROOT", root);
+                env::set_var("SANDBOXED_SH_CONTEXT_ROOT", root);
             }
             if let Some(ref id) = mission_id {
-                env::set_var("OPEN_AGENT_MISSION_ID", id);
+                env::set_var("SANDBOXED_SH_MISSION_ID", id);
             }
 
             return RuntimeContext {
@@ -225,11 +225,11 @@ fn validate_command(cmd: &str) -> Result<(), String> {
 }
 
 fn container_root_from_env() -> Option<PathBuf> {
-    let workspace_type = env::var("OPEN_AGENT_WORKSPACE_TYPE").ok()?;
+    let workspace_type = env::var("SANDBOXED_SH_WORKSPACE_TYPE").ok()?;
     if workspace_type != "container" {
         return None;
     }
-    if let Ok(flag) = env::var("OPEN_AGENT_CONTAINER_FALLBACK") {
+    if let Ok(flag) = env::var("SANDBOXED_SH_CONTAINER_FALLBACK") {
         if matches!(
             flag.trim().to_lowercase().as_str(),
             "1" | "true" | "yes" | "y" | "on"
@@ -237,7 +237,7 @@ fn container_root_from_env() -> Option<PathBuf> {
             return None;
         }
     }
-    let root = env::var("OPEN_AGENT_WORKSPACE_ROOT").ok()?;
+    let root = env::var("SANDBOXED_SH_WORKSPACE_ROOT").ok()?;
     Some(PathBuf::from(root))
 }
 
@@ -257,7 +257,7 @@ const MAX_OUTPUT_CHARS_LIMIT: usize = 50_000;
 const DEFAULT_COMMAND_TIMEOUT_SECS: f64 = 300.0;
 
 fn default_timeout_from_env() -> Duration {
-    if let Ok(raw) = env::var("OPEN_AGENT_COMMAND_TIMEOUT_SECS") {
+    if let Ok(raw) = env::var("SANDBOXED_SH_COMMAND_TIMEOUT_SECS") {
         if let Ok(value) = raw.parse::<f64>() {
             if value > 0.0 {
                 return Duration::from_secs_f64(value);
@@ -297,7 +297,7 @@ fn parse_env(args: &Value) -> HashMap<String, String> {
 
 fn workspace_env_vars() -> HashMap<String, String> {
     let mut envs = HashMap::new();
-    if let Ok(raw_path) = env::var("OPEN_AGENT_WORKSPACE_ENV_VARS_FILE") {
+    if let Ok(raw_path) = env::var("SANDBOXED_SH_WORKSPACE_ENV_VARS_FILE") {
         let path = raw_path.trim();
         if !path.is_empty() {
             let mut candidates = Vec::new();
@@ -308,7 +308,7 @@ fn workspace_env_vars() -> HashMap<String, String> {
                 if let Ok(cwd) = env::current_dir() {
                     candidates.push(cwd.join(&path_buf));
                 }
-                if let Ok(workspace) = env::var("OPEN_AGENT_WORKSPACE") {
+                if let Ok(workspace) = env::var("SANDBOXED_SH_WORKSPACE") {
                     if !workspace.trim().is_empty() {
                         candidates.push(PathBuf::from(workspace).join(&path_buf));
                     }
@@ -331,7 +331,7 @@ fn workspace_env_vars() -> HashMap<String, String> {
             }
         }
     }
-    let Ok(raw) = env::var("OPEN_AGENT_WORKSPACE_ENV_VARS") else {
+    let Ok(raw) = env::var("SANDBOXED_SH_WORKSPACE_ENV_VARS") else {
         return envs;
     };
     if raw.trim().is_empty() {
@@ -472,7 +472,7 @@ async fn run_host_command(
 }
 
 fn runtime_display_path() -> Option<PathBuf> {
-    if let Ok(path) = env::var("OPEN_AGENT_RUNTIME_DISPLAY_FILE") {
+    if let Ok(path) = env::var("SANDBOXED_SH_RUNTIME_DISPLAY_FILE") {
         if !path.trim().is_empty() {
             return Some(PathBuf::from(path));
         }
@@ -480,13 +480,13 @@ fn runtime_display_path() -> Option<PathBuf> {
 
     let candidates = [
         env::var("WORKING_DIR").ok(),
-        env::var("OPEN_AGENT_WORKSPACE_ROOT").ok(),
+        env::var("SANDBOXED_SH_WORKSPACE_ROOT").ok(),
         env::var("HOME").ok(),
     ];
 
     for base in candidates.into_iter().flatten() {
         let path = PathBuf::from(base)
-            .join(".openagent")
+            .join(".sandboxed")
             .join("runtime")
             .join("current_display.json");
         if path.exists() {
@@ -548,7 +548,7 @@ async fn run_container_command(
     };
 
     // If a container is already running (e.g., MCP server), run commands via nsenter.
-    if let Ok(machine_name) = env::var("OPEN_AGENT_WORKSPACE_NAME") {
+    if let Ok(machine_name) = env::var("SANDBOXED_SH_WORKSPACE_NAME") {
         let machine_name = machine_name.trim();
         if !machine_name.is_empty() {
             if let Some(leader) = running_container_leader(machine_name, options).await {
@@ -582,12 +582,12 @@ async fn run_container_command(
         let context_root = context_root.trim();
         if !context_root.is_empty() && Path::new(context_root).exists() {
             args.push(format!("--bind={}:/root/context", context_root));
-            args.push("--setenv=OPEN_AGENT_CONTEXT_ROOT=/root/context".to_string());
+            args.push("--setenv=SANDBOXED_SH_CONTEXT_ROOT=/root/context".to_string());
             if let Some(mission_id) = runtime_ctx.mission_id.as_ref() {
                 let mission_id = mission_id.trim();
                 if !mission_id.is_empty() {
                     args.push(format!(
-                        "--setenv=OPEN_AGENT_MISSION_CONTEXT=/root/context/{}",
+                        "--setenv=SANDBOXED_SH_MISSION_CONTEXT=/root/context/{}",
                         mission_id
                     ));
                 }
@@ -631,7 +631,7 @@ async fn run_container_command(
     if is_busy {
         // If the container is already running without an active desktop, terminate it and retry.
         if read_runtime_display().is_none() {
-            if let Ok(machine_name) = env::var("OPEN_AGENT_WORKSPACE_NAME") {
+            if let Ok(machine_name) = env::var("SANDBOXED_SH_WORKSPACE_NAME") {
                 let machine_name = machine_name.trim();
                 if !machine_name.is_empty() {
                     let terminate_args = vec!["terminate".to_string(), machine_name.to_string()];
@@ -688,21 +688,21 @@ async fn running_container_leader(machine_name: &str, options: &CommandOptions) 
 
 fn nsenter_command(rel_str: &str, command: &str) -> String {
     let mut exports = Vec::new();
-    exports.push("export OPEN_AGENT_CONTEXT_ROOT=/root/context".to_string());
-    if let Ok(context_dir) = env::var("OPEN_AGENT_CONTEXT_DIR_NAME") {
+    exports.push("export SANDBOXED_SH_CONTEXT_ROOT=/root/context".to_string());
+    if let Ok(context_dir) = env::var("SANDBOXED_SH_CONTEXT_DIR_NAME") {
         if !context_dir.trim().is_empty() {
             exports.push(format!(
-                "export OPEN_AGENT_CONTEXT_DIR_NAME={}",
+                "export SANDBOXED_SH_CONTEXT_DIR_NAME={}",
                 context_dir.trim()
             ));
         }
     }
-    if let Ok(mission_id) = env::var("OPEN_AGENT_MISSION_ID") {
+    if let Ok(mission_id) = env::var("SANDBOXED_SH_MISSION_ID") {
         let mission_id = mission_id.trim();
         if !mission_id.is_empty() {
-            exports.push(format!("export OPEN_AGENT_MISSION_ID={}", mission_id));
+            exports.push(format!("export SANDBOXED_SH_MISSION_ID={}", mission_id));
             exports.push(format!(
-                "export OPEN_AGENT_MISSION_CONTEXT=/root/context/{}",
+                "export SANDBOXED_SH_MISSION_CONTEXT=/root/context/{}",
                 mission_id
             ));
         }

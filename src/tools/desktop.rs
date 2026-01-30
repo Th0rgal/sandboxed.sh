@@ -25,7 +25,7 @@ static DISPLAY_COUNTER: AtomicU32 = AtomicU32::new(99);
 
 /// Check if desktop tools are enabled
 pub(crate) fn desktop_enabled() -> bool {
-    env_var_bool("DESKTOP_ENABLED") || env_var_bool("OPEN_AGENT_ENABLE_DESKTOP_TOOLS")
+    env_var_bool("DESKTOP_ENABLED") || env_var_bool("SANDBOXED_SH_ENABLE_DESKTOP_TOOLS")
 }
 
 fn env_var_bool(name: &str) -> bool {

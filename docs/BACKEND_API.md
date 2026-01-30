@@ -84,6 +84,6 @@ Claude Code accepts `api_key` in `settings` to store it securely in the secrets 
 ```json
 {
   "ok": true,
-  "message": "Backend configuration updated. Restart Open Agent to apply runtime changes."
+  "message": "Backend configuration updated. Restart Sandboxed.sh to apply runtime changes."
 }
 ```

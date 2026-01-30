@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <em>Formerly known as "Open Agent"</em>
+  <em>Formerly known as "Sandboxed.sh"</em>
 </p>
 
 <p align="center">
@@ -159,7 +159,7 @@ After installation, follow the **[Getting Started Guide](docs/getting-started.md
 Point your coding agent at the installation guide and let it handle the
 deployment:
 
-> "Deploy Open Agent on my server at `1.2.3.4` with domain `agent.example.com`"
+> "Deploy Sandboxed.sh on my server at `1.2.3.4` with domain `agent.example.com`"
 
 ---
 

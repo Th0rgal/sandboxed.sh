@@ -45,7 +45,7 @@ impl Tool for FetchUrl {
             .ok_or_else(|| anyhow::anyhow!("Missing 'url' argument"))?;
 
         let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; OpenAgent/1.0)")
+            .user_agent("Mozilla/5.0 (compatible; Sandboxed/1.0)")
             .timeout(std::time::Duration::from_secs(60))
             .build()?;
 

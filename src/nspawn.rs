@@ -78,7 +78,7 @@ pub fn nspawn_available() -> bool {
 /// Default: enabled on non-Linux hosts, disabled on Linux unless explicitly set.
 pub fn allow_container_fallback() -> bool {
     let default = !cfg!(target_os = "linux");
-    env_var_bool("OPEN_AGENT_ALLOW_CONTAINER_FALLBACK", default)
+    env_var_bool("SANDBOXED_SH_ALLOW_CONTAINER_FALLBACK", default)
 }
 
 /// Supported Linux distributions for container environments.
@@ -222,10 +222,10 @@ pub fn tailscale_nspawn_extra_args(env: &HashMap<String, String>) -> Vec<String>
 }
 
 /// Return the cache directory for rootfs tarballs.
-/// Defaults to `{WORKING_DIR}/.openagent/cache` (sibling of `containers/`).
+/// Defaults to `{WORKING_DIR}/.sandboxed/cache` (sibling of `containers/`).
 fn rootfs_cache_dir() -> PathBuf {
     let working_dir = std::env::var("WORKING_DIR").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(working_dir).join(".openagent").join("cache")
+    PathBuf::from(working_dir).join(".sandboxed").join("cache")
 }
 
 /// Return the path for a cached rootfs tarball for the given distro.
@@ -255,7 +255,7 @@ async fn restore_from_cache(path: &Path, distro: NspawnDistro) -> NspawnResult<b
         .open(&build_log_path)
     {
         use std::io::Write;
-        let _ = writeln!(f, "[openagent] Restoring from cached rootfs...");
+        let _ = writeln!(f, "[sandboxed] Restoring from cached rootfs...");
     }
 
     let output = Command::new("tar")
@@ -366,7 +366,7 @@ pub async fn create_container(path: &Path, distro: NspawnDistro) -> NspawnResult
 
 async fn create_debootstrap_container(path: &Path, distro: NspawnDistro) -> NspawnResult<()> {
     // Stream debootstrap output to a build log file so the dashboard can show progress.
-    // The log is stored as a sibling file (e.g. /root/.openagent/containers/alex.build.log)
+    // The log is stored as a sibling file (e.g. /root/.sandboxed/containers/alex.build.log)
     // because the container filesystem doesn't exist yet during debootstrap.
     let build_log_path = build_log_path_for(path);
     let log_file = std::fs::OpenOptions::new()
@@ -464,7 +464,7 @@ async fn create_debootstrap_container(path: &Path, distro: NspawnDistro) -> Nspa
     // from the standard init-log path after debootstrap completes.
     let container_log_dir = path.join("var/log");
     if container_log_dir.exists() {
-        let container_log = container_log_dir.join("openagent-init.log");
+        let container_log = container_log_dir.join("sandboxed-init.log");
         let _ = std::fs::copy(&build_log_path, &container_log);
     }
 
@@ -480,7 +480,7 @@ pub(crate) fn build_log_path_for(container_path: &Path) -> std::path::PathBuf {
 }
 
 async fn create_arch_container(path: &Path) -> NspawnResult<()> {
-    let pacman_conf = std::env::temp_dir().join("open_agent_pacman.conf");
+    let pacman_conf = std::env::temp_dir().join("sandboxed_sh_pacman.conf");
     let pacman_conf_contents = r#"[options]
 Architecture = auto
 SigLevel = Never

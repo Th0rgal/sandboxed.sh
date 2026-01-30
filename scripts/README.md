@@ -1,4 +1,4 @@
-# Open Agent Scripts
+# Sandboxed.sh Scripts
 
 Small helper scripts for local development and packaging.
 

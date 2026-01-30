@@ -172,7 +172,7 @@ pub fn load_private_key_from_env() -> Result<Option<[u8; KEY_LENGTH]>> {
 }
 
 /// Get the path to the private key file.
-/// Uses `PRIVATE_KEY_FILE` env var, or defaults to `{WORKING_DIR}/.openagent/private_key`.
+/// Uses `PRIVATE_KEY_FILE` env var, or defaults to `{WORKING_DIR}/.sandboxed/private_key`.
 fn private_key_file_path() -> std::path::PathBuf {
     if let Ok(path) = std::env::var("PRIVATE_KEY_FILE") {
         return std::path::PathBuf::from(path);
@@ -180,13 +180,13 @@ fn private_key_file_path() -> std::path::PathBuf {
     let working_dir = std::env::var("WORKING_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("/root"));
-    working_dir.join(".openagent").join("private_key")
+    working_dir.join(".sandboxed").join("private_key")
 }
 
 /// Ensure a private key is available, generating one lazily if needed.
 ///
 /// 1. Checks `PRIVATE_KEY` env var (fast path, no I/O).
-/// 2. Reads from the key file (`{WORKING_DIR}/.openagent/private_key`).
+/// 2. Reads from the key file (`{WORKING_DIR}/.sandboxed/private_key`).
 /// 3. Generates a new key, persists it to the file, and sets the env var.
 pub async fn ensure_private_key() -> Result<[u8; KEY_LENGTH]> {
     // 1. Fast path: env var already set

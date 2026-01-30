@@ -1,6 +1,6 @@
 # Desktop Environment Setup
 
-This guide covers setting up a headless desktop environment for the Open Agent to control browsers and graphical applications.
+This guide covers setting up a headless desktop environment for the Sandboxed.sh to control browsers and graphical applications.
 
 ## Overview
 
@@ -45,7 +45,7 @@ Create a minimal, deterministic i3 config at `/root/.config/i3/config`:
 ```bash
 mkdir -p /root/.config/i3
 cat > /root/.config/i3/config << 'EOF'
-# Open Agent i3 Config - Minimal and Deterministic
+# Sandboxed.sh i3 Config - Minimal and Deterministic
 # No decorations, no animations, simple layout
 
 # Use Super (Mod4) as modifier
@@ -100,7 +100,7 @@ EOF
 
 ## Environment Variables
 
-Add these to `/etc/open_agent/open_agent.env`:
+Add these to `/etc/sandboxed_sh/sandboxed_sh.env`:
 
 ```bash
 # Enable desktop automation tools

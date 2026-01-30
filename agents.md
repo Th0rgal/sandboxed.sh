@@ -1,6 +1,6 @@
 # Agents and Execution Architecture
 
-This document describes how Open Agent executes missions after the per-workspace
+This document describes how Sandboxed.sh executes missions after the per-workspace
 harness refactor ("ralph" plan). The core change: **OpenCode and Claude Code run
 inside the target workspace**, so native bash and file effects are scoped to the
 correct environment. The host proxy bash tools are no longer required for normal
@@ -9,18 +9,18 @@ missions.
 ## High-level flow
 
 1. User creates a mission with a workspace + agent (backend).
-2. Open Agent prepares a **per-mission workspace directory** and syncs Library
+2. Sandboxed.sh prepares a **per-mission workspace directory** and syncs Library
    content (skills/tools/rules).
-3. Open Agent writes **per-workspace config files** (`opencode.json`,
+3. Sandboxed.sh writes **per-workspace config files** (`opencode.json`,
    `.opencode/opencode.json`, `.claude/settings.local.json`, `CLAUDE.md`).
 4. The mission runner launches the chosen harness **inside the workspace** using
    a workspace-aware execution layer (host or container).
-5. The harness streams JSON events; Open Agent converts these into a unified
+5. The harness streams JSON events; Sandboxed.sh converts these into a unified
    event stream for the UI.
 
 ## Execution model (per-workspace)
 
-Open Agent uses a workspace execution layer to spawn processes in the correct
+Sandboxed.sh uses a workspace execution layer to spawn processes in the correct
 execution context:
 
 - **Host workspace**: process runs directly on the host with the mission working
@@ -76,7 +76,7 @@ backend in configuration. The default is to avoid host-proxy tooling.
 
 ## Desktop streaming (X11)
 
-- The desktop stream is hosted on the **Open Agent host** (Xvfb + MJPEG).
+- The desktop stream is hosted on the **Sandboxed.sh host** (Xvfb + MJPEG).
 - Container workspaces do **not** see the host desktop by default because the
   X11 socket (`/tmp/.X11-unix`) is not bind-mounted for harness/MCP execution.
 - Interactive shells bind X11 when a runtime display is present, but harnesses
@@ -102,7 +102,7 @@ Files written per mission workspace:
 
 ## Observability
 
-Open Agent streams structured tool events and text deltas from the harnesses.
+Sandboxed.sh streams structured tool events and text deltas from the harnesses.
 The UI receives:
 
 - tool calls/results

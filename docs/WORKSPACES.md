@@ -36,7 +36,7 @@ define:
 - **Networking** --- shared (host network) or isolated (private network with
   optional Tailscale VPN).
 
-When you create a workspace from a template, Open Agent:
+When you create a workspace from a template, Sandboxed.sh:
 
 1. Creates a minimal root filesystem using `debootstrap` (Debian/Ubuntu) or
    `pacstrap` (Arch).
@@ -50,7 +50,7 @@ without recreating the base filesystem.
 
 ### Missions and Workspaces
 
-Each mission targets a specific workspace. When a mission starts, Open Agent:
+Each mission targets a specific workspace. When a mission starts, Sandboxed.sh:
 
 1. Creates a per-mission working directory inside the workspace
    (`/workspaces/mission-<id>`).
@@ -92,8 +92,8 @@ To route traffic through a home connection:
 3. Use the `tailscale-ubuntu` template (or add Tailscale to your own template).
 
 The template's init script installs Tailscale and creates helper scripts:
-- `openagent-network-up` --- brings up the virtual ethernet and DHCP.
-- `openagent-tailscale-up` --- connects to your tailnet and sets the exit node.
+- `sandboxed.sh-network-up` --- brings up the virtual ethernet and DHCP.
+- `sandboxed.sh-tailscale-up` --- connects to your tailnet and sets the exit node.
 
 **Host NAT requirement**: isolated networking needs IP forwarding and NAT rules
 on the host. See the installation guide (section 8.3) for the `iptables`
@@ -111,7 +111,7 @@ setup.
 ## Built-in Tools
 
 Every container workspace is provisioned with the standard development tooling
-that Open Agent's MCP servers need:
+that Sandboxed.sh's MCP servers need:
 
 - **Bun** (`/usr/local/bin/bun`, `/usr/local/bin/bunx`) --- JavaScript runtime
   used to spawn MCP servers (Playwright, etc). Symlinked to `/usr/local/bin/`
@@ -164,7 +164,7 @@ Templates live in `workspace-template/<name>.json` in your Library repo:
 ### Init Script Best Practices
 
 - Start with `set -euo pipefail` and error trapping.
-- Log to `/var/log/openagent-init.log` for debugging.
+- Log to `/var/log/sandboxed.sh-init.log` for debugging.
 - Use `retry()` wrappers for network operations (apt, curl) to handle transient
   failures.
 - Guard installations with `if ! command -v <tool>` so re-running the init
@@ -200,7 +200,7 @@ development but give the agent unrestricted access. Container workspaces isolate
 the agent's filesystem and can be rebuilt cleanly.
 
 **Keep secrets in encrypted env vars.** Add secret names to `encrypted_keys` and
-set `PRIVATE_KEY` in the Open Agent environment. The values are encrypted at
+set `PRIVATE_KEY` in the Sandboxed.sh environment. The values are encrypted at
 rest in the Library repo and decrypted at mission runtime.
 
 **Use `rerun-init` for fast iteration.** When developing a template's init

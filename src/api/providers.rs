@@ -64,7 +64,7 @@ pub struct ProvidersConfig {
 
 /// Load providers configuration from file.
 fn load_providers_config(working_dir: &str) -> ProvidersConfig {
-    let config_path = format!("{}/.openagent/providers.json", working_dir);
+    let config_path = format!("{}/.sandboxed/providers.json", working_dir);
 
     match std::fs::read_to_string(&config_path) {
         Ok(contents) => match serde_json::from_str(&contents) {
@@ -277,8 +277,8 @@ fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String>
         }
     }
 
-    // 3. Check Open Agent provider config (.openagent/ai_providers.json)
-    let ai_providers_path = working_dir.join(".openagent").join("ai_providers.json");
+    // 3. Check Open Agent provider config (.sandboxed/ai_providers.json)
+    let ai_providers_path = working_dir.join(".sandboxed").join("ai_providers.json");
     if let Ok(contents) = std::fs::read_to_string(&ai_providers_path) {
         if let Ok(providers) =
             serde_json::from_str::<Vec<crate::ai_providers::AIProvider>>(&contents)

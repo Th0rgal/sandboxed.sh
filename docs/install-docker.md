@@ -1,6 +1,6 @@
 # Installing sandboxed.sh with Docker
 
-Docker is the easiest way to run sandboxed.sh (formerly Open Agent). One command gets you a complete environment with the Rust backend, Next.js dashboard, and all AI harness CLIs pre-installed.
+Docker is the easiest way to run sandboxed.sh (formerly Sandboxed.sh). One command gets you a complete environment with the Rust backend, Next.js dashboard, and all AI harness CLIs pre-installed.
 
 ## Prerequisites
 
@@ -33,14 +33,14 @@ Copy `.env.example` to `.env` and configure the values below. The full file cont
 | `DASHBOARD_PASSWORD` | `change-me` | Password for dashboard login |
 | `JWT_SECRET` | `change-me-to-a-long-random-string` | Secret used to sign JWT tokens |
 | `JWT_TTL_DAYS` | `30` | How long JWT tokens remain valid |
-| `OPEN_AGENT_USERS` | _(unset)_ | Optional JSON array for multi-user auth (overrides `DASHBOARD_PASSWORD`) |
+| `SANDBOXED_SH_USERS` | _(unset)_ | Optional JSON array for multi-user auth (overrides `DASHBOARD_PASSWORD`) |
 
 #### Library
 
 | Variable | Default | Description |
 |---|---|---|
 | `LIBRARY_REMOTE` | `https://github.com/Th0rgal/sandboxed-library-template.git` | Git URL for your agent library. By default, clones the official template. Set this to your own fork or custom library (e.g. `git@github.com:your-org/agent-library.git`). Can also be changed via the dashboard Settings page. |
-| `LIBRARY_PATH` | `/root/.openagent/library` | Local path where the library is cloned |
+| `LIBRARY_PATH` | `/root/.sandboxed.sh/library` | Local path where the library is cloned |
 
 #### Server
 
@@ -58,7 +58,7 @@ By default, workspaces run in host/fallback mode — processes execute directly 
 
 ```yaml
 services:
-  openagent:
+  sandboxed.sh:
     # ...
     privileged: true
     cgroup: host
@@ -91,7 +91,7 @@ Two Docker volumes keep data across container restarts:
 
 | Volume | Mount point | Contents |
 |---|---|---|
-| `openagent-data` | `/root/.openagent` | SQLite database, library, container rootfs, settings |
+| `sandboxed.sh-data` | `/root/.sandboxed.sh` | SQLite database, library, container rootfs, settings |
 | `claude-auth` | `/root/.claude` | Claude Code OAuth credentials |
 
 To back up your data, use `docker volume inspect` to find the volume paths, or bind-mount them to host directories instead.
@@ -100,7 +100,7 @@ To back up your data, use `docker volume inspect` to find the volume paths, or b
 
 The multi-stage build produces a single image with everything pre-installed:
 
-- **Rust backend** — `open_agent`, `desktop-mcp`, `workspace-mcp` binaries
+- **Rust backend** — `sandboxed_sh`, `desktop-mcp`, `workspace-mcp` binaries
 - **Next.js dashboard** — standalone build served on port 3001 internally
 - **Caddy** — reverse proxy that unifies backend + dashboard on port 80
 - **Claude Code CLI** — installed via npm
@@ -142,7 +142,7 @@ The Docker image includes the Next.js dashboard, but you can also:
 ## Updating
 
 ```bash
-cd openagent
+cd sandboxed.sh
 git pull
 docker compose build
 docker compose up -d
@@ -156,7 +156,7 @@ docker compose up -d
 | Permission denied on SSH keys | Ensure `~/.ssh` on the host is readable by your user |
 | Port conflict on 3000 | Change the port mapping (e.g. `"8080:80"`) in `docker-compose.yml` |
 | Build takes too long | Rust compilation is the bottleneck (~5–10 min first time). Subsequent builds use Docker layer caching. |
-| Backend not starting | Check logs with `docker compose logs -f openagent` |
+| Backend not starting | Check logs with `docker compose logs -f sandboxed.sh` |
 
 ## Comparison with native installation
 

@@ -10,7 +10,7 @@
 For normal usage, simply set your Amp API key:
 
 ```bash
-# In /etc/open_agent/open_agent.env or your .env file
+# In /etc/sandboxed_sh/sandboxed_sh.env or your .env file
 AMP_API_KEY=your-access-token-from-ampcode.com
 ```
 
@@ -36,7 +36,7 @@ OpenAI/Gemini/Claude-compatible API interfaces. Potential benefits include:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      Open Agent Backend                         │
+│                      Sandboxed.sh Backend                         │
 │                                                                 │
 │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐ │
 │  │ Mission     │───►│ Amp Harness │───►│ WorkspaceExec       │ │

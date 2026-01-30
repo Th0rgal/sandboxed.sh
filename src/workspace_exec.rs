@@ -30,7 +30,7 @@ impl WorkspaceExec {
     ///
     /// For container workspaces using nspawn/nsenter, paths must be relative to the container
     /// filesystem root, not the host. This translates paths like:
-    ///   /root/.openagent/containers/minecraft/workspaces/mission-xxx/.claude/settings.json
+    ///   /root/.sandboxed/containers/minecraft/workspaces/mission-xxx/.claude/settings.json
     /// to:
     ///   /workspaces/mission-xxx/.claude/settings.json
     ///
@@ -60,13 +60,13 @@ impl WorkspaceExec {
         let mut merged = self.workspace.env_vars.clone();
         merged.extend(extra_env);
         merged
-            .entry("OPEN_AGENT_WORKSPACE_TYPE".to_string())
+            .entry("SANDBOXED_SH_WORKSPACE_TYPE".to_string())
             .or_insert_with(|| self.workspace.workspace_type.as_str().to_string());
         if self.workspace.workspace_type == WorkspaceType::Container {
             if let Some(name) = self.workspace.path.file_name().and_then(|n| n.to_str()) {
                 if !name.trim().is_empty() {
                     merged
-                        .entry("OPEN_AGENT_WORKSPACE_NAME".to_string())
+                        .entry("SANDBOXED_SH_WORKSPACE_NAME".to_string())
                         .or_insert_with(|| name.to_string());
                 }
             }
@@ -91,7 +91,7 @@ impl WorkspaceExec {
             && !use_nspawn_for_workspace(&self.workspace)
         {
             merged
-                .entry("OPEN_AGENT_CONTAINER_FALLBACK".to_string())
+                .entry("SANDBOXED_SH_CONTAINER_FALLBACK".to_string())
                 .or_insert_with(|| "1".to_string());
         }
         merged
@@ -152,7 +152,7 @@ impl WorkspaceExec {
 
     /// Build a shell command that bootstraps Tailscale networking before running the program.
     ///
-    /// This runs the openagent-tailscale-up script (which also calls openagent-network-up)
+    /// This runs the sandboxed-tailscale-up script (which also calls sandboxed-network-up)
     /// to bring up the veth interface, get an IP via DHCP, start tailscaled, and authenticate.
     /// The scripts are installed by the workspace template's init_script.
     ///
@@ -185,12 +185,12 @@ impl WorkspaceExec {
         }
 
         // Run the Tailscale bootstrap script if it exists.
-        // The script calls openagent-network-up (DHCP via udhcpc, which sets up
+        // The script calls sandboxed-network-up (DHCP via udhcpc, which sets up
         // the IP, default route, and DNS), then starts tailscaled and authenticates.
         // Errors are suppressed to allow the main program to run even if networking fails.
         cmd.push_str(
-            "if [ -x /usr/local/bin/openagent-tailscale-up ]; then \
-             /usr/local/bin/openagent-tailscale-up >/dev/null 2>&1 || true; \
+            "if [ -x /usr/local/bin/sandboxed-tailscale-up ]; then \
+             /usr/local/bin/sandboxed-tailscale-up >/dev/null 2>&1 || true; \
              fi; ",
         );
 
@@ -369,11 +369,11 @@ impl WorkspaceExec {
                 cmd.arg("--chdir").arg(&rel_cwd);
 
                 // Ensure /root/context is available if Open Agent configured it.
-                let context_dir_name = std::env::var("OPEN_AGENT_CONTEXT_DIR_NAME")
+                let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "context".to_string());
-                let global_context_root = std::env::var("OPEN_AGENT_CONTEXT_ROOT")
+                let global_context_root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .map(PathBuf::from)
@@ -383,9 +383,9 @@ impl WorkspaceExec {
                         "--bind={}:/root/context",
                         global_context_root.display()
                     ));
-                    cmd.arg("--setenv=OPEN_AGENT_CONTEXT_ROOT=/root/context");
+                    cmd.arg("--setenv=SANDBOXED_SH_CONTEXT_ROOT=/root/context");
                     cmd.arg(format!(
-                        "--setenv=OPEN_AGENT_CONTEXT_DIR_NAME={}",
+                        "--setenv=SANDBOXED_SH_CONTEXT_DIR_NAME={}",
                         context_dir_name
                     ));
                 }
@@ -455,7 +455,7 @@ impl WorkspaceExec {
                 // are installed by the workspace template's init_script.
                 if tailscale_enabled {
                     // Build a shell command that:
-                    // 1. Runs openagent-tailscale-up (which also calls openagent-network-up)
+                    // 1. Runs sandboxed-tailscale-up (which also calls sandboxed-network-up)
                     // 2. Execs the actual program to hand off control
                     let shell_cmd = Self::build_tailscale_bootstrap_command(
                         &rel_cwd, program, args, &env, false,

@@ -28,14 +28,14 @@ struct RuntimeWorkspace {
 }
 
 fn runtime_workspace_path() -> PathBuf {
-    if let Ok(path) = std::env::var("OPEN_AGENT_RUNTIME_WORKSPACE_FILE") {
+    if let Ok(path) = std::env::var("SANDBOXED_SH_RUNTIME_WORKSPACE_FILE") {
         if !path.trim().is_empty() {
             return PathBuf::from(path);
         }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home)
-        .join(".openagent")
+        .join(".sandboxed")
         .join("runtime")
         .join("current_workspace.json")
 }
@@ -84,7 +84,7 @@ fn resolve_download_path(
                     return Ok(PathBuf::from(root).join(suffix.trim_start_matches('/')));
                 }
             }
-            if let Ok(context_root) = std::env::var("OPEN_AGENT_CONTEXT_ROOT") {
+            if let Ok(context_root) = std::env::var("SANDBOXED_SH_CONTEXT_ROOT") {
                 let context_root = context_root.trim();
                 if !context_root.is_empty() {
                     let suffix = path.trim_start_matches("/root/context");
@@ -589,7 +589,7 @@ pub async fn upload(
             .map(|s| s.to_string())
             .unwrap_or_else(|| "upload.bin".to_string());
         // Stream to temp file first (avoid buffering large uploads in memory).
-        let tmp = std::env::temp_dir().join(format!("open_agent_ul_{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("sandboxed_sh_ul_{}", uuid::Uuid::new_v4()));
         let mut f = tokio::fs::File::create(&tmp)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -675,7 +675,7 @@ pub async fn upload_chunk(
     }
 
     // Store chunks in temp directory organized by upload_id
-    let chunk_dir = std::env::temp_dir().join(format!("open_agent_chunks_{}", safe_upload_id));
+    let chunk_dir = std::env::temp_dir().join(format!("sandboxed_sh_chunks_{}", safe_upload_id));
     tokio::fs::create_dir_all(&chunk_dir).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -752,9 +752,9 @@ pub async fn upload_finalize(
         return Err((StatusCode::BAD_REQUEST, "Invalid file_name".to_string()));
     }
 
-    let chunk_dir = std::env::temp_dir().join(format!("open_agent_chunks_{}", safe_upload_id));
+    let chunk_dir = std::env::temp_dir().join(format!("sandboxed_sh_chunks_{}", safe_upload_id));
     let assembled_path =
-        std::env::temp_dir().join(format!("open_agent_assembled_{}", safe_upload_id));
+        std::env::temp_dir().join(format!("sandboxed_sh_assembled_{}", safe_upload_id));
 
     // Assemble chunks into single file
     let mut assembled = tokio::fs::File::create(&assembled_path)
@@ -931,7 +931,7 @@ pub async fn download_from_url(
         file_name
     };
 
-    let tmp = std::env::temp_dir().join(format!("open_agent_url_{}", uuid::Uuid::new_v4()));
+    let tmp = std::env::temp_dir().join(format!("sandboxed_sh_url_{}", uuid::Uuid::new_v4()));
     let mut f = tokio::fs::File::create(&tmp)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

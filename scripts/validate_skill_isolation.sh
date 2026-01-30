@@ -36,7 +36,7 @@ do
   fi
 done
 
-latest=$(find /root/.openagent -type d -name 'mission-*' -path '*workspaces*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)
+latest=$(find /root/.sandboxed -type d -name 'mission-*' -path '*workspaces*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)
 if [ -n "$latest" ]; then
   echo "== Latest mission dir =="
   echo "$latest"
@@ -51,5 +51,5 @@ if [ -n "$latest" ]; then
     grep -n "permission" "$latest/.opencode/opencode.json" || true
   fi
 else
-  echo "No mission directories found under /root/.openagent"
+  echo "No mission directories found under /root/.sandboxed"
 fi

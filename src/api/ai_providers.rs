@@ -572,7 +572,7 @@ fn get_anthropic_auth_from_opencode_auth() -> Option<ClaudeCodeAuth> {
 
 /// Get Anthropic API key or OAuth access token from Open Agent's ai_providers.json.
 fn get_anthropic_auth_from_ai_providers(working_dir: &Path) -> Option<ClaudeCodeAuth> {
-    let ai_providers_path = working_dir.join(".openagent/ai_providers.json");
+    let ai_providers_path = working_dir.join(".sandboxed/ai_providers.json");
     if !ai_providers_path.exists() {
         return None;
     }
@@ -1026,7 +1026,7 @@ fn sync_to_opencode_auth(
 
     // Also write to Open Agent's canonical credential store
     if let Err(e) =
-        write_openagent_credential(provider_type, refresh_token, access_token, expires_at)
+        write_sandboxed_credential(provider_type, refresh_token, access_token, expires_at)
     {
         tracing::warn!("Failed to write Open Agent credentials: {}", e);
     }
@@ -1099,10 +1099,10 @@ struct OAuthTokenEntry {
 }
 
 /// Path to Open Agent's canonical credential store.
-fn get_openagent_credentials_path() -> PathBuf {
+fn get_sandboxed_credentials_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home)
-        .join(".openagent")
+        .join(".sandboxed")
         .join("credentials.json")
 }
 
@@ -1113,8 +1113,8 @@ fn get_openagent_credentials_path() -> PathBuf {
 ///   "anthropic": { "type": "oauth", "refresh": "...", "access": "...", "expires": 123 }
 /// }
 /// ```
-fn read_openagent_credential(provider_type: ProviderType) -> Option<OAuthTokenEntry> {
-    let path = get_openagent_credentials_path();
+fn read_sandboxed_credential(provider_type: ProviderType) -> Option<OAuthTokenEntry> {
+    let path = get_sandboxed_credentials_path();
     if !path.exists() {
         return None;
     }
@@ -1156,17 +1156,17 @@ fn read_openagent_credential(provider_type: ProviderType) -> Option<OAuthTokenEn
 
 /// Write an OAuth credential to Open Agent's canonical credential store.
 /// Read-modify-write to preserve entries for other providers.
-fn write_openagent_credential(
+fn write_sandboxed_credential(
     provider_type: ProviderType,
     refresh_token: &str,
     access_token: &str,
     expires_at: i64,
 ) -> Result<(), String> {
-    let path = get_openagent_credentials_path();
+    let path = get_sandboxed_credentials_path();
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create ~/.openagent directory: {}", e))?;
+            .map_err(|e| format!("Failed to create ~/.sandboxed directory: {}", e))?;
     }
 
     let mut auth: serde_json::Map<String, serde_json::Value> = if path.exists() {
@@ -1204,8 +1204,8 @@ fn write_openagent_credential(
 }
 
 /// Remove a provider entry from Open Agent's credential store.
-fn remove_openagent_credential(provider_type: ProviderType) -> Result<(), String> {
-    let path = get_openagent_credentials_path();
+fn remove_sandboxed_credential(provider_type: ProviderType) -> Result<(), String> {
+    let path = get_sandboxed_credentials_path();
     if !path.exists() {
         return Ok(());
     }
@@ -1294,14 +1294,14 @@ fn read_anthropic_from_claude_credentials() -> Option<OAuthTokenEntry> {
 
 fn read_oauth_token_entry(provider_type: ProviderType) -> Option<OAuthTokenEntry> {
     // Tier 1: Open Agent's canonical credential store
-    if let Some(entry) = read_openagent_credential(provider_type) {
+    if let Some(entry) = read_sandboxed_credential(provider_type) {
         return Some(entry);
     }
 
     // Tier 2: OpenCode auth.json paths (legacy / external auth flows)
     if let Some(entry) = read_from_opencode_auth_paths(provider_type) {
         // Auto-sync to Open Agent's file so future reads hit tier 1
-        let _ = write_openagent_credential(
+        let _ = write_sandboxed_credential(
             provider_type,
             &entry.refresh_token,
             &entry.access_token,
@@ -1314,7 +1314,7 @@ fn read_oauth_token_entry(provider_type: ProviderType) -> Option<OAuthTokenEntry
     if matches!(provider_type, ProviderType::Anthropic) {
         if let Some(entry) = read_anthropic_from_claude_credentials() {
             // Auto-sync to Open Agent's file
-            let _ = write_openagent_credential(
+            let _ = write_sandboxed_credential(
                 provider_type,
                 &entry.refresh_token,
                 &entry.access_token,
@@ -1779,7 +1779,7 @@ pub fn write_claudecode_credentials_for_workspace(
             if workspace.workspace_type == WorkspaceType::Container {
                 if let Some(entry) = read_oauth_entry_from_workspace_auth(&workspace.path) {
                     // Best-effort sync so future reads hit the canonical store.
-                    let _ = write_openagent_credential(
+                    let _ = write_sandboxed_credential(
                         ProviderType::Anthropic,
                         &entry.refresh_token,
                         &entry.access_token,
@@ -1895,7 +1895,7 @@ fn remove_opencode_auth_entry(provider_type: ProviderType) -> Result<(), String>
             }
         }
         // Also clean Open Agent's credential store
-        let _ = remove_openagent_credential(provider_type);
+        let _ = remove_sandboxed_credential(provider_type);
         return Ok(());
     }
 
@@ -1936,7 +1936,7 @@ fn remove_opencode_auth_entry(provider_type: ProviderType) -> Result<(), String>
     }
 
     // Also clean Open Agent's credential store
-    if let Err(e) = remove_openagent_credential(provider_type) {
+    if let Err(e) = remove_sandboxed_credential(provider_type) {
         tracing::warn!("Failed to remove Open Agent credential entry: {}", e);
     }
 
@@ -2107,9 +2107,9 @@ fn strip_jsonc_comments(input: &str) -> String {
     out
 }
 
-fn strip_openagent_key(mut value: serde_json::Value) -> serde_json::Value {
+fn strip_sandboxed_key(mut value: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = value.as_object_mut() {
-        obj.remove("openagent");
+        obj.remove("sandboxed");
     }
     value
 }
@@ -2126,11 +2126,11 @@ fn read_opencode_config(path: &Path) -> Result<serde_json::Value, String> {
         .map_err(|e| format!("Failed to read OpenCode config: {}", e))?;
 
     match serde_json::from_str::<serde_json::Value>(&contents) {
-        Ok(value) => Ok(strip_openagent_key(value)),
+        Ok(value) => Ok(strip_sandboxed_key(value)),
         Err(_) => {
             let stripped = strip_jsonc_comments(&contents);
             serde_json::from_str(&stripped)
-                .map(strip_openagent_key)
+                .map(strip_sandboxed_key)
                 .map_err(|e| format!("Failed to parse OpenCode config: {}", e))
         }
     }
@@ -2175,7 +2175,7 @@ fn get_provider_config_entry(
     } else {
         None
     };
-    // Note: use_for_backends is now stored separately in .openagent/provider_backends.json
+    // Note: use_for_backends is now stored separately in .sandboxed/provider_backends.json
     // and should be read using read_provider_backends_state() instead
     Some(ProviderConfigEntry {
         name,
@@ -2235,7 +2235,7 @@ fn set_provider_config_entry(
     entry_obj.remove("enabled");
 
     // OpenCode's config schema doesn't accept "useForBackends" under provider entries.
-    // This field is now stored separately in .openagent/provider_backends.json.
+    // This field is now stored separately in .sandboxed/provider_backends.json.
     // Remove any existing useForBackends for migration/cleanup.
     let _ = use_for_backends;
     entry_obj.remove("useForBackends");
@@ -2284,7 +2284,7 @@ fn get_default_provider(config: &serde_json::Value) -> Option<ProviderType> {
 }
 
 fn default_provider_state_path(working_dir: &Path) -> PathBuf {
-    working_dir.join(".openagent").join("default_provider.json")
+    working_dir.join(".sandboxed").join("default_provider.json")
 }
 
 fn read_default_provider_state(working_dir: &Path) -> Option<ProviderType> {
@@ -2327,7 +2327,7 @@ fn clear_default_provider_state(working_dir: &Path) -> Result<(), String> {
 /// This is stored separately from the OpenCode config because OpenCode doesn't recognize this field.
 fn provider_backends_state_path(working_dir: &Path) -> PathBuf {
     working_dir
-        .join(".openagent")
+        .join(".sandboxed")
         .join("provider_backends.json")
 }
 

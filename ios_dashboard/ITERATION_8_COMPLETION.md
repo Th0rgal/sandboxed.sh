@@ -21,9 +21,9 @@
 
 ### iOS Simulator (Criterion 4 & 6)
 - **Simulator**: iPhone 17 Pro (6EE98A5B-BBE5-4711-8CC7-B644A2C7CE6F) - Booted
-- **App Bundle**: md.thomas.openagent.dashboard
+- **App Bundle**: md.thomas.sandboxed.sh.dashboard
 - **Launch Status**: ✅ Successfully launched
-- **Screenshot**: /tmp/openagent-ios-running.png
+- **Screenshot**: /tmp/sandboxed.sh-ios-running.png
 - **API Configuration**: APIService.swift:19 → `https://agent-backend.thomas.md`
 
 ### Cross-Platform Sync (Criterion 6)
@@ -92,7 +92,7 @@ All 8 criteria have been met:
 - ✅ 50+ missions on production, 10 scenarios documented
 - ✅ All architectural issues resolved
 
-**Open Agent development is complete.**
+**Sandboxed.sh development is complete.**
 
 ---
 

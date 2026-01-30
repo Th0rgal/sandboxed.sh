@@ -257,7 +257,7 @@ pub async fn monitoring_ws(
         }
     }
 
-    ws.protocols(["openagent"])
+    ws.protocols(["sandboxed"])
         .on_upgrade(handle_monitoring_stream)
 }
 

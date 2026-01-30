@@ -502,7 +502,7 @@ fn calculate_auto_close_secs(
 async fn get_desktop_config(library: &SharedLibrary) -> crate::library::types::DesktopConfig {
     let guard = library.read().await;
     if let Some(lib) = guard.as_ref() {
-        match lib.get_openagent_config().await {
+        match lib.get_sandboxed_config().await {
             Ok(config) => config.desktop,
             Err(_) => crate::library::types::DesktopConfig::default(),
         }

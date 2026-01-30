@@ -2,7 +2,7 @@
 //!
 //! These tools exist to make "search the machine" fast without repeatedly walking very large
 //! directory trees. They build and query a simple on-disk index under:
-//! `{working_dir}/.open_agent/index/`
+//! `{working_dir}/.sandboxed_sh/index/`
 //!
 //! Note: the agent still has full system access; indexing is an optimization and a convention.
 
@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 use super::{resolve_path_simple as resolve_path, Tool};
 
 fn default_index_dir(working_dir: &Path) -> PathBuf {
-    working_dir.join(".open_agent").join("index")
+    working_dir.join(".sandboxed_sh").join("index")
 }
 
 fn default_index_file(working_dir: &Path) -> PathBuf {
@@ -31,7 +31,7 @@ fn default_meta_file(working_dir: &Path) -> PathBuf {
 fn default_ignore_dirs() -> Vec<String> {
     vec![
         ".git".into(),
-        ".open_agent".into(),
+        ".sandboxed_sh".into(),
         ".next".into(),
         "node_modules".into(),
         "target".into(),
@@ -62,7 +62,7 @@ impl Tool for IndexFiles {
     }
 
     fn description(&self) -> &str {
-        "Build or refresh a file-path index for fast machine search. Writes an index file under {working_dir}/.open_agent/index/ by default. Use this before searching huge directories repeatedly."
+        "Build or refresh a file-path index for fast machine search. Writes an index file under {working_dir}/.sandboxed_sh/index/ by default. Use this before searching huge directories repeatedly."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -75,7 +75,7 @@ impl Tool for IndexFiles {
                 },
                 "output_path": {
                     "type": "string",
-                    "description": "Optional: where to write the index file (one path per line). Defaults to {working_dir}/.open_agent/index/files.txt"
+                    "description": "Optional: where to write the index file (one path per line). Defaults to {working_dir}/.sandboxed_sh/index/files.txt"
                 },
                 "max_depth": {
                     "type": "integer",
@@ -221,7 +221,7 @@ impl Tool for SearchFileIndex {
                 },
                 "index_path": {
                     "type": "string",
-                    "description": "Optional: index file to read. Defaults to {working_dir}/.open_agent/index/files.txt"
+                    "description": "Optional: index file to read. Defaults to {working_dir}/.sandboxed_sh/index/files.txt"
                 },
                 "limit": {
                     "type": "integer",

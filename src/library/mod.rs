@@ -11,7 +11,7 @@
 //!   - `.opencode/` - OpenCode settings (settings.json, oh-my-opencode.json)
 //!   - `.claudecode/` - Claude Code settings (settings.json)
 //!   - `.ampcode/` - Amp settings (settings.json)
-//!   - `.openagent/` - OpenAgent config (config.json)
+//!   - `.sandboxed/` - Sandboxed config (config.json)
 
 pub mod env_crypto;
 mod git;
@@ -1602,18 +1602,18 @@ impl LibraryStore {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // OpenAgent Config (delegates to default profile)
+    // Sandboxed Config (delegates to default profile)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Get OpenAgent configuration from the Library (default profile).
+    /// Get Sandboxed configuration from the Library (default profile).
     /// Returns default config if the file doesn't exist.
-    pub async fn get_openagent_config(&self) -> Result<OpenAgentConfig> {
-        self.get_openagent_config_for_profile(DEFAULT_PROFILE).await
+    pub async fn get_sandboxed_config(&self) -> Result<SandboxedConfig> {
+        self.get_sandboxed_config_for_profile(DEFAULT_PROFILE).await
     }
 
-    /// Save OpenAgent configuration to the Library (default profile).
-    pub async fn save_openagent_config(&self, config: &OpenAgentConfig) -> Result<()> {
-        self.save_openagent_config_for_profile(DEFAULT_PROFILE, config)
+    /// Save Sandboxed configuration to the Library (default profile).
+    pub async fn save_sandboxed_config(&self, config: &SandboxedConfig) -> Result<()> {
+        self.save_sandboxed_config_for_profile(DEFAULT_PROFILE, config)
             .await
     }
 
@@ -1686,7 +1686,7 @@ impl LibraryStore {
     }
 
     /// Get a config profile by name with full content.
-    /// Uses new directory structure: .opencode/, .claudecode/, .ampcode/, .openagent/
+    /// Uses new directory structure: .opencode/, .claudecode/, .ampcode/, .sandboxed/
     pub async fn get_config_profile(&self, name: &str) -> Result<ConfigProfile> {
         Self::validate_name(name)?;
 
@@ -1696,11 +1696,11 @@ impl LibraryStore {
         let opencode_settings_path = profile_dir.join(".opencode").join("settings.json");
         let claudecode_settings_path = profile_dir.join(".claudecode").join("settings.json");
         let ampcode_settings_path = profile_dir.join(".ampcode").join("settings.json");
-        let openagent_config_path = profile_dir.join(".openagent").join("config.json");
+        let sandboxed_config_path = profile_dir.join(".sandboxed").join("config.json");
 
         // Legacy paths for backward compatibility
         let legacy_opencode_path = profile_dir.join("opencode").join("oh-my-opencode.json");
-        let legacy_openagent_path = profile_dir.join("openagent").join("config.json");
+        let legacy_sandboxed_path = profile_dir.join("sandboxed").join("config.json");
         let legacy_claudecode_path = profile_dir.join("claudecode").join("config.json");
 
         // Collect all files in the profile for file-based editing
@@ -1729,27 +1729,27 @@ impl LibraryStore {
             serde_json::json!({})
         };
 
-        // Load OpenAgent config (try new path first, then legacy)
-        let openagent_config = if openagent_config_path.exists() {
-            let content = fs::read_to_string(&openagent_config_path)
+        // Load Sandboxed config (try new path first, then legacy)
+        let sandboxed_config = if sandboxed_config_path.exists() {
+            let content = fs::read_to_string(&sandboxed_config_path)
                 .await
-                .context("Failed to read openagent config")?;
+                .context("Failed to read sandboxed config")?;
             files.push(ConfigProfileFile {
-                path: ".openagent/config.json".to_string(),
+                path: ".sandboxed/config.json".to_string(),
                 content: content.clone(),
             });
             serde_json::from_str(&content).unwrap_or_default()
-        } else if legacy_openagent_path.exists() {
-            let content = fs::read_to_string(&legacy_openagent_path)
+        } else if legacy_sandboxed_path.exists() {
+            let content = fs::read_to_string(&legacy_sandboxed_path)
                 .await
-                .context("Failed to read openagent config")?;
+                .context("Failed to read sandboxed config")?;
             files.push(ConfigProfileFile {
-                path: ".openagent/config.json".to_string(),
+                path: ".sandboxed/config.json".to_string(),
                 content: content.clone(),
             });
             serde_json::from_str(&content).unwrap_or_default()
         } else {
-            OpenAgentConfig::default()
+            SandboxedConfig::default()
         };
 
         // Load Claude Code config (try new path first, then legacy)
@@ -1795,14 +1795,14 @@ impl LibraryStore {
             path: format!("{}/{}", CONFIGS_DIR, name),
             files,
             opencode_settings,
-            openagent_config,
+            sandboxed_config,
             claudecode_config,
             ampcode_config,
         })
     }
 
     /// Save a config profile.
-    /// Uses new directory structure: .opencode/, .claudecode/, .ampcode/, .openagent/
+    /// Uses new directory structure: .opencode/, .claudecode/, .ampcode/, .sandboxed/
     pub async fn save_config_profile(&self, name: &str, profile: &ConfigProfile) -> Result<()> {
         Self::validate_name(name)?;
 
@@ -1810,12 +1810,12 @@ impl LibraryStore {
 
         // Create profile directories with dot-prefix (mirroring harness directories)
         let opencode_dir = profile_dir.join(".opencode");
-        let openagent_dir = profile_dir.join(".openagent");
+        let sandboxed_dir = profile_dir.join(".sandboxed");
         let claudecode_dir = profile_dir.join(".claudecode");
         let ampcode_dir = profile_dir.join(".ampcode");
 
         fs::create_dir_all(&opencode_dir).await?;
-        fs::create_dir_all(&openagent_dir).await?;
+        fs::create_dir_all(&sandboxed_dir).await?;
         fs::create_dir_all(&claudecode_dir).await?;
         fs::create_dir_all(&ampcode_dir).await?;
 
@@ -1825,11 +1825,11 @@ impl LibraryStore {
             .await
             .context("Failed to write opencode settings")?;
 
-        // Save OpenAgent config
-        let openagent_content = serde_json::to_string_pretty(&profile.openagent_config)?;
-        fs::write(openagent_dir.join("config.json"), openagent_content)
+        // Save Sandboxed config
+        let sandboxed_content = serde_json::to_string_pretty(&profile.sandboxed_config)?;
+        fs::write(sandboxed_dir.join("config.json"), sandboxed_content)
             .await
-            .context("Failed to write openagent config")?;
+            .context("Failed to write sandboxed config")?;
 
         // Save Claude Code config
         let claudecode_content = serde_json::to_string_pretty(&profile.claudecode_config)?;
@@ -1890,7 +1890,7 @@ impl LibraryStore {
                 path: format!("{}/{}", CONFIGS_DIR, name),
                 files: Vec::new(),
                 opencode_settings: serde_json::json!({}),
-                openagent_config: OpenAgentConfig::default(),
+                sandboxed_config: SandboxedConfig::default(),
                 claudecode_config: ClaudeCodeConfig::default(),
                 ampcode_config: AmpCodeConfig::default(),
             }
@@ -1902,7 +1902,7 @@ impl LibraryStore {
             path: format!("{}/{}", CONFIGS_DIR, name),
             files: Vec::new(), // Files will be populated on next get_config_profile
             opencode_settings: base.opencode_settings,
-            openagent_config: base.openagent_config,
+            sandboxed_config: base.sandboxed_config,
             claudecode_config: base.claudecode_config,
             ampcode_config: base.ampcode_config,
         };
@@ -1960,47 +1960,47 @@ impl LibraryStore {
         Ok(())
     }
 
-    /// Get OpenAgent config from a specific profile.
-    pub async fn get_openagent_config_for_profile(&self, profile: &str) -> Result<OpenAgentConfig> {
+    /// Get Sandboxed config from a specific profile.
+    pub async fn get_sandboxed_config_for_profile(&self, profile: &str) -> Result<SandboxedConfig> {
         Self::validate_name(profile)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
         // Try new path first, then legacy
-        let new_path = profile_dir.join(".openagent").join("config.json");
-        let legacy_path = profile_dir.join("openagent").join("config.json");
+        let new_path = profile_dir.join(".sandboxed").join("config.json");
+        let legacy_path = profile_dir.join("sandboxed").join("config.json");
 
         let path = if new_path.exists() {
             new_path
         } else if legacy_path.exists() {
             legacy_path
         } else {
-            return Ok(OpenAgentConfig::default());
+            return Ok(SandboxedConfig::default());
         };
 
         let content = fs::read_to_string(&path)
             .await
-            .context("Failed to read openagent config")?;
+            .context("Failed to read sandboxed config")?;
 
-        serde_json::from_str(&content).context("Failed to parse openagent config")
+        serde_json::from_str(&content).context("Failed to parse sandboxed config")
     }
 
-    /// Save OpenAgent config to a specific profile.
-    pub async fn save_openagent_config_for_profile(
+    /// Save Sandboxed config to a specific profile.
+    pub async fn save_sandboxed_config_for_profile(
         &self,
         profile: &str,
-        config: &OpenAgentConfig,
+        config: &SandboxedConfig,
     ) -> Result<()> {
         Self::validate_name(profile)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
-        let openagent_dir = profile_dir.join(".openagent");
+        let sandboxed_dir = profile_dir.join(".sandboxed");
 
-        fs::create_dir_all(&openagent_dir).await?;
+        fs::create_dir_all(&sandboxed_dir).await?;
 
         let content = serde_json::to_string_pretty(config)?;
-        fs::write(openagent_dir.join("config.json"), content)
+        fs::write(sandboxed_dir.join("config.json"), content)
             .await
-            .context("Failed to write openagent config")?;
+            .context("Failed to write sandboxed config")?;
 
         Ok(())
     }
@@ -2186,10 +2186,10 @@ impl LibraryStore {
     /// - opencode/settings.json
     /// - claudecode/config.json
     /// - ampcode/config.json
-    /// - openagent/config.json
+    /// - sandboxed/config.json
     pub async fn get_harness_default_file(&self, harness: &str, file_name: &str) -> Result<String> {
         // Validate harness name
-        let valid_harnesses = ["opencode", "claudecode", "ampcode", "openagent"];
+        let valid_harnesses = ["opencode", "claudecode", "ampcode", "sandboxed"];
         if !valid_harnesses.contains(&harness) {
             anyhow::bail!("Invalid harness: {}", harness);
         }
@@ -2208,7 +2208,7 @@ impl LibraryStore {
     /// List all default files for a harness.
     pub async fn list_harness_default_files(&self, harness: &str) -> Result<Vec<String>> {
         // Validate harness name
-        let valid_harnesses = ["opencode", "claudecode", "ampcode", "openagent"];
+        let valid_harnesses = ["opencode", "claudecode", "ampcode", "sandboxed"];
         if !valid_harnesses.contains(&harness) {
             anyhow::bail!("Invalid harness: {}", harness);
         }

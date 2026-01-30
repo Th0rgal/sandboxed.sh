@@ -300,7 +300,7 @@ async fn create_workspace(
                 state
                     .config
                     .working_dir
-                    .join(".openagent/containers")
+                    .join(".sandboxed/containers")
                     .join(&req.name)
             }
         },
@@ -1160,7 +1160,7 @@ async fn get_workspace_debug(
     let has_bash = path.join("bin/bash").exists() || path.join("usr/bin/bash").exists();
 
     // Check for init script
-    let init_script_path = path.join("openagent-init.sh");
+    let init_script_path = path.join("sandboxed-init.sh");
     let init_script_exists = init_script_path.exists();
     let init_script_modified = if init_script_exists {
         std::fs::metadata(&init_script_path)
@@ -1193,7 +1193,7 @@ async fn get_workspace_debug(
 
 /// GET /api/workspaces/:id/init-log - Get the init script log from inside the container.
 ///
-/// Reads /var/log/openagent-init.log from inside the container to show what
+/// Reads /var/log/sandboxed-init.log from inside the container to show what
 /// the init script has logged. Useful for debugging template issues.
 async fn get_init_log(
     State(state): State<Arc<super::routes::AppState>>,
@@ -1205,11 +1205,11 @@ async fn get_init_log(
         .await
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
 
-    let log_path = "/var/log/openagent-init.log";
-    let host_log_path = workspace.path.join("var/log/openagent-init.log");
+    let log_path = "/var/log/sandboxed-init.log";
+    let host_log_path = workspace.path.join("var/log/sandboxed-init.log");
 
     // During debootstrap, the container filesystem doesn't exist yet so
-    // var/log/openagent-init.log won't be there. Check the build log sibling
+    // var/log/sandboxed-init.log won't be there. Check the build log sibling
     // file that debootstrap streams output to.
     let effective_log_path = if host_log_path.exists() {
         host_log_path
@@ -1296,7 +1296,7 @@ async fn rerun_init_script(
     }
 
     // Write the init script to the container
-    let script_path = workspace.path.join("openagent-init.sh");
+    let script_path = workspace.path.join("sandboxed-init.sh");
     tokio::fs::write(&script_path, &init_script)
         .await
         .map_err(|e| {
@@ -1337,7 +1337,7 @@ async fn rerun_init_script(
     let mut config = crate::nspawn::NspawnConfig::default();
     config.env = workspace.env_vars.clone();
 
-    let command = vec![shell.to_string(), "/openagent-init.sh".to_string()];
+    let command = vec![shell.to_string(), "/sandboxed-init.sh".to_string()];
     let output_result =
         crate::nspawn::execute_in_container(&workspace.path, &command, &config).await;
 

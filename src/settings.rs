@@ -1,6 +1,6 @@
 //! Global settings storage.
 //!
-//! Persists user-configurable settings to disk at `{working_dir}/.openagent/settings.json`.
+//! Persists user-configurable settings to disk at `{working_dir}/.sandboxed/settings.json`.
 //! Environment variables are used as initial defaults when no settings file exists.
 
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ impl SettingsStore {
     /// If no settings file exists, uses environment variables as defaults:
     /// - `LIBRARY_REMOTE` - Git remote URL for the configuration library
     pub async fn new(working_dir: &PathBuf) -> Self {
-        let storage_path = working_dir.join(".openagent/settings.json");
+        let storage_path = working_dir.join(".sandboxed/settings.json");
 
         let settings = if storage_path.exists() {
             match Self::load_from_path(&storage_path) {
@@ -64,7 +64,7 @@ impl SettingsStore {
     fn defaults_from_env() -> Settings {
         Settings {
             library_remote: std::env::var("LIBRARY_REMOTE").ok().or_else(|| {
-                Some("https://github.com/Th0rgal/openagent-library-template.git".to_string())
+                Some("https://github.com/Th0rgal/sandboxed-library-template.git".to_string())
             }),
         }
     }
