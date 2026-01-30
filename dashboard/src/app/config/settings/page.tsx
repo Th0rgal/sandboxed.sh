@@ -346,7 +346,7 @@ export default function SettingsPage() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col p-6 max-w-5xl mx-auto space-y-6">
+    <div className="h-screen flex flex-col p-6 gap-4 overflow-hidden">
       {/* Git Status Bar */}
       {status && (
         <div className="p-4 rounded-xl bg-white/[0.02] border border-white/[0.06]">
