@@ -572,7 +572,7 @@ fn get_anthropic_auth_from_opencode_auth() -> Option<ClaudeCodeAuth> {
 
 /// Get Anthropic API key or OAuth access token from Open Agent's ai_providers.json.
 fn get_anthropic_auth_from_ai_providers(working_dir: &Path) -> Option<ClaudeCodeAuth> {
-    let ai_providers_path = working_dir.join(".sandboxed/ai_providers.json");
+    let ai_providers_path = working_dir.join(".sandboxed-sh/ai_providers.json");
     if !ai_providers_path.exists() {
         return None;
     }
@@ -1102,7 +1102,7 @@ struct OAuthTokenEntry {
 fn get_sandboxed_credentials_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home)
-        .join(".sandboxed")
+        .join(".sandboxed-sh")
         .join("credentials.json")
 }
 
@@ -1166,7 +1166,7 @@ fn write_sandboxed_credential(
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create ~/.sandboxed directory: {}", e))?;
+            .map_err(|e| format!("Failed to create ~/.sandboxed-sh directory: {}", e))?;
     }
 
     let mut auth: serde_json::Map<String, serde_json::Value> = if path.exists() {
@@ -2175,7 +2175,7 @@ fn get_provider_config_entry(
     } else {
         None
     };
-    // Note: use_for_backends is now stored separately in .sandboxed/provider_backends.json
+    // Note: use_for_backends is now stored separately in .sandboxed-sh/provider_backends.json
     // and should be read using read_provider_backends_state() instead
     Some(ProviderConfigEntry {
         name,
@@ -2235,7 +2235,7 @@ fn set_provider_config_entry(
     entry_obj.remove("enabled");
 
     // OpenCode's config schema doesn't accept "useForBackends" under provider entries.
-    // This field is now stored separately in .sandboxed/provider_backends.json.
+    // This field is now stored separately in .sandboxed-sh/provider_backends.json.
     // Remove any existing useForBackends for migration/cleanup.
     let _ = use_for_backends;
     entry_obj.remove("useForBackends");
@@ -2284,7 +2284,7 @@ fn get_default_provider(config: &serde_json::Value) -> Option<ProviderType> {
 }
 
 fn default_provider_state_path(working_dir: &Path) -> PathBuf {
-    working_dir.join(".sandboxed").join("default_provider.json")
+    working_dir.join(".sandboxed-sh").join("default_provider.json")
 }
 
 fn read_default_provider_state(working_dir: &Path) -> Option<ProviderType> {
@@ -2327,7 +2327,7 @@ fn clear_default_provider_state(working_dir: &Path) -> Result<(), String> {
 /// This is stored separately from the OpenCode config because OpenCode doesn't recognize this field.
 fn provider_backends_state_path(working_dir: &Path) -> PathBuf {
     working_dir
-        .join(".sandboxed")
+        .join(".sandboxed-sh")
         .join("provider_backends.json")
 }
 

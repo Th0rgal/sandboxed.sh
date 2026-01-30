@@ -5,7 +5,7 @@
 //! ## Architecture
 //!
 //! ```text
-//! .sandboxed/secrets/
+//! .sandboxed-sh/secrets/
 //! ├── config.json           # Key configuration (git-tracked)
 //! ├── keys/
 //! │   └── default.key       # Key marker file (git-tracked)

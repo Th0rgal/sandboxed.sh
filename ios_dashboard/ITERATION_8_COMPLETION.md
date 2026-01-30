@@ -21,7 +21,7 @@
 
 ### iOS Simulator (Criterion 4 & 6)
 - **Simulator**: iPhone 17 Pro (6EE98A5B-BBE5-4711-8CC7-B644A2C7CE6F) - Booted
-- **App Bundle**: md.thomas.sandboxed.sh.dashboard
+- **App Bundle**: md.thomas.sandboxed-sh.sh.dashboard
 - **Launch Status**: ✅ Successfully launched
 - **Screenshot**: /tmp/sandboxed.sh-ios-running.png
 - **API Configuration**: APIService.swift:19 → `https://agent-backend.thomas.md`

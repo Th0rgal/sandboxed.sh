@@ -223,7 +223,7 @@ pub struct Config {
     pub opencode_permissive: bool,
 
     /// Path to the configuration library git repo.
-    /// Default: {working_dir}/.sandboxed/library
+    /// Default: {working_dir}/.sandboxed-sh/library
     pub library_path: PathBuf,
 }
 
@@ -458,7 +458,7 @@ impl Config {
         // Note: library_remote is now managed via the settings module (persisted to disk)
         let library_path = std::env::var("LIBRARY_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| working_dir.join(".sandboxed/library"));
+            .unwrap_or_else(|_| working_dir.join(".sandboxed-sh/library"));
 
         Ok(Self {
             default_model,
@@ -480,7 +480,7 @@ impl Config {
 
     /// Create a config with custom values (useful for testing).
     pub fn new(working_dir: PathBuf) -> Self {
-        let library_path = working_dir.join(".sandboxed/library");
+        let library_path = working_dir.join(".sandboxed-sh/library");
         Self {
             default_model: None,
             working_dir,

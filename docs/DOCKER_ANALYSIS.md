@@ -57,7 +57,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - sandboxed.sh-data:/root/.sandboxed.sh    # SQLite, library, workspaces
+      - sandboxed.sh-data:/root/.sandboxed-sh.sh    # SQLite, library, workspaces
       - /var/run/docker.sock:/var/run/docker.sock  # optional: DinD
     env_file: .env
 
@@ -310,13 +310,13 @@ can produce multi-arch manifests. The OpenCode binary is only available for
 
 | Path | Content | Volume? |
 |------|---------|---------|
-| `~/.sandboxed.sh/` | SQLite DB, library, container rootfs, runtime state | Yes (critical) |
-| `~/.sandboxed.sh/library/` | Cloned library repo | Yes (or re-clone on start) |
-| `~/.sandboxed.sh/containers/` | nspawn rootfs (if using containers) | Yes (large, ~150 MB each) |
+| `~/.sandboxed-sh.sh/` | SQLite DB, library, container rootfs, runtime state | Yes (critical) |
+| `~/.sandboxed-sh.sh/library/` | Cloned library repo | Yes (or re-clone on start) |
+| `~/.sandboxed-sh.sh/containers/` | nspawn rootfs (if using containers) | Yes (large, ~150 MB each) |
 | `~/.claude/` | Claude Code OAuth credentials | Yes (for token persistence) |
 | `~/.config/opencode/` | OpenCode config | Yes |
 
-A single named volume at `/root/.sandboxed.sh` covers most state. Credentials
+A single named volume at `/root/.sandboxed-sh.sh` covers most state. Credentials
 should be injected via env vars or a secrets volume.
 
 ### 7.2 Configuration Injection
@@ -417,7 +417,7 @@ ENV PORT=3000
 ENV WORKING_DIR=/root
 
 EXPOSE 3000
-VOLUME ["/root/.sandboxed.sh"]
+VOLUME ["/root/.sandboxed-sh.sh"]
 
 CMD ["sandboxed_sh"]
 ```

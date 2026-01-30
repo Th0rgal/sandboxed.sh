@@ -47,7 +47,7 @@ fn read_runtime_context(container_root: &Path) -> RuntimeContext {
 
     // Otherwise, try to read from the local context file
     // This handles the case where the MCP started before the context file was written
-    let context_file = container_root.join(".sandboxed_context.json");
+    let context_file = container_root.join(".sandboxed-sh_context.json");
     if let Ok(contents) = std::fs::read_to_string(&context_file) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
             let context_root = json
@@ -486,7 +486,7 @@ fn runtime_display_path() -> Option<PathBuf> {
 
     for base in candidates.into_iter().flatten() {
         let path = PathBuf::from(base)
-            .join(".sandboxed")
+            .join(".sandboxed-sh")
             .join("runtime")
             .join("current_display.json");
         if path.exists() {

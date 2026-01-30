@@ -136,11 +136,11 @@ fn container_root_from_path(path: &Path) -> Option<PathBuf> {
 fn is_inside_container() -> bool {
     // If /workspaces exists but the typical HOST container path doesn't,
     // we're likely inside a container
-    Path::new("/workspaces").exists() && !Path::new("/root/.sandboxed/containers").exists()
+    Path::new("/workspaces").exists() && !Path::new("/root/.sandboxed-sh/containers").exists()
 }
 
 /// Translate a HOST path to a container-relative path.
-/// HOST path: /root/.sandboxed/containers/<name>/workspaces/mission-xxx
+/// HOST path: /root/.sandboxed-sh/containers/<name>/workspaces/mission-xxx
 /// Container path: /workspaces/mission-xxx
 fn translate_host_path_for_container(host_path: &str, workspace_root: Option<&str>) -> String {
     // If we have the workspace_root (container root on host), strip it from the path
@@ -157,7 +157,7 @@ fn translate_host_path_for_container(host_path: &str, workspace_root: Option<&st
     }
 
     // Fallback: try to detect and strip container path patterns
-    // Pattern: /root/.sandboxed/containers/<name>/...
+    // Pattern: /root/.sandboxed-sh/containers/<name>/...
     if let Some(idx) = host_path.find("/containers/") {
         let after_containers = &host_path[idx + "/containers/".len()..];
         if let Some(slash_idx) = after_containers.find('/') {
@@ -235,7 +235,7 @@ fn runtime_workspace_path() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home)
-        .join(".sandboxed")
+        .join(".sandboxed-sh")
         .join("runtime")
         .join("current_workspace.json")
 }
@@ -252,7 +252,7 @@ fn load_runtime_workspace() -> Option<RuntimeWorkspace> {
     // We use workspace_root (host path) instead of working_dir (which may be container-relative)
     if let Some(ref state) = global_state {
         if let Some(ref workspace_root) = state.workspace_root {
-            let local_context = PathBuf::from(workspace_root).join(".sandboxed_context.json");
+            let local_context = PathBuf::from(workspace_root).join(".sandboxed-sh_context.json");
             if local_context.exists() {
                 if let Ok(contents) = std::fs::read_to_string(&local_context) {
                     if let Ok(local_state) = serde_json::from_str::<RuntimeWorkspace>(&contents) {

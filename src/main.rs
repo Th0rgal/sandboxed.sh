@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let runtime_workspace_file = config
         .working_dir
-        .join(".sandboxed")
+        .join(".sandboxed-sh")
         .join("runtime")
         .join("current_workspace.json");
     std::env::set_var(

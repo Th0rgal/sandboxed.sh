@@ -143,7 +143,7 @@ fn get_working_dir() -> PathBuf {
 
 fn runtime_display_path() -> PathBuf {
     get_working_dir()
-        .join(".sandboxed")
+        .join(".sandboxed-sh")
         .join("runtime")
         .join("current_display.json")
 }

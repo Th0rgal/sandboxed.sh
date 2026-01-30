@@ -181,7 +181,7 @@ async fn reinitialize_library(state: &Arc<AppState>, remote: &str) -> Result<(),
 // Backup & Restore
 // ============================================
 
-/// Files included in the backup (relative to .sandboxed/)
+/// Files included in the backup (relative to .sandboxed-sh/)
 const BACKUP_FILES: &[&str] = &[
     "settings.json",
     "ai_providers.json",
@@ -191,7 +191,7 @@ const BACKUP_FILES: &[&str] = &[
     "private_key",
 ];
 
-/// Directories included in the backup (relative to .sandboxed/)
+/// Directories included in the backup (relative to .sandboxed-sh/)
 const BACKUP_DIRS: &[&str] = &["secrets"];
 
 /// Find Claude credentials file from various possible locations.
@@ -234,7 +234,7 @@ fn find_claude_credentials() -> Option<(std::path::PathBuf, &'static str)> {
 async fn download_backup(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let sandboxed_dir = state.config.working_dir.join(".sandboxed");
+    let sandboxed_dir = state.config.working_dir.join(".sandboxed-sh");
 
     // Create a zip archive in memory
     let mut zip_buffer = Vec::new();
@@ -243,12 +243,12 @@ async fn download_backup(
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
 
-        // Add individual files from .sandboxed/
+        // Add individual files from .sandboxed-sh/
         for file in BACKUP_FILES {
             let file_path = sandboxed_dir.join(file);
             if file_path.exists() {
                 if let Ok(contents) = std::fs::read_to_string(&file_path) {
-                    if let Err(e) = zip.start_file(format!(".sandboxed/{}", file), options) {
+                    if let Err(e) = zip.start_file(format!(".sandboxed-sh/{}", file), options) {
                         tracing::warn!("Failed to add {} to backup: {}", file, e);
                         continue;
                     }
@@ -263,7 +263,7 @@ async fn download_backup(
         for dir in BACKUP_DIRS {
             let dir_path = sandboxed_dir.join(dir);
             if dir_path.exists() && dir_path.is_dir() {
-                add_directory_to_zip(&mut zip, &dir_path, &format!(".sandboxed/{}", dir), options)
+                add_directory_to_zip(&mut zip, &dir_path, &format!(".sandboxed-sh/{}", dir), options)
                     .map_err(|e| {
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -354,7 +354,7 @@ async fn restore_backup(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<RestoreBackupResponse>, (StatusCode, String)> {
-    let sandboxed_dir = state.config.working_dir.join(".sandboxed");
+    let sandboxed_dir = state.config.working_dir.join(".sandboxed-sh");
 
     // Extract the uploaded file
     let mut archive_data: Option<Vec<u8>> = None;
@@ -414,9 +414,9 @@ async fn restore_backup(
         let name = file.name().to_string();
 
         // Determine target path based on archive name
-        let (target_path, display_name) = if name.starts_with(".sandboxed/") {
-            // Standard .sandboxed files
-            let relative_path = name.strip_prefix(".sandboxed/").unwrap_or(&name);
+        let (target_path, display_name) = if name.starts_with(".sandboxed-sh/") {
+            // Standard .sandboxed-sh files
+            let relative_path = name.strip_prefix(".sandboxed-sh/").unwrap_or(&name);
             if relative_path.is_empty() {
                 continue;
             }

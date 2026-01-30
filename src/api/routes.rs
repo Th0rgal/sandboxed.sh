@@ -119,7 +119,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         crate::opencode_config::OpenCodeStore::new(
             config
                 .working_dir
-                .join(".sandboxed/opencode_connections.json"),
+                .join(".sandboxed-sh/opencode_connections.json"),
         )
         .await,
     );
@@ -127,7 +127,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Initialize AI provider store
     let ai_providers = Arc::new(
         crate::ai_providers::AIProviderStore::new(
-            config.working_dir.join(".sandboxed/ai_providers.json"),
+            config.working_dir.join(".sandboxed-sh/ai_providers.json"),
         )
         .await,
     );
@@ -193,7 +193,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     ];
     let backend_configs = Arc::new(
         crate::backend_config::BackendConfigStore::new(
-            config.working_dir.join(".sandboxed/backend_config.json"),
+            config.working_dir.join(".sandboxed-sh/backend_config.json"),
             backend_defaults,
         )
         .await,

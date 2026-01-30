@@ -11,7 +11,7 @@
 //!   - `.opencode/` - OpenCode settings (settings.json, oh-my-opencode.json)
 //!   - `.claudecode/` - Claude Code settings (settings.json)
 //!   - `.ampcode/` - Amp settings (settings.json)
-//!   - `.sandboxed/` - Sandboxed config (config.json)
+//!   - `.sandboxed-sh/` - Sandboxed config (config.json)
 
 pub mod env_crypto;
 mod git;
@@ -1686,7 +1686,7 @@ impl LibraryStore {
     }
 
     /// Get a config profile by name with full content.
-    /// Uses new directory structure: .opencode/, .claudecode/, .ampcode/, .sandboxed/
+    /// Uses new directory structure: .opencode/, .claudecode/, .ampcode/, .sandboxed-sh/
     pub async fn get_config_profile(&self, name: &str) -> Result<ConfigProfile> {
         Self::validate_name(name)?;
 
@@ -1696,7 +1696,7 @@ impl LibraryStore {
         let opencode_settings_path = profile_dir.join(".opencode").join("settings.json");
         let claudecode_settings_path = profile_dir.join(".claudecode").join("settings.json");
         let ampcode_settings_path = profile_dir.join(".ampcode").join("settings.json");
-        let sandboxed_config_path = profile_dir.join(".sandboxed").join("config.json");
+        let sandboxed_config_path = profile_dir.join(".sandboxed-sh").join("config.json");
 
         // Legacy paths for backward compatibility
         let legacy_opencode_path = profile_dir.join("opencode").join("oh-my-opencode.json");
@@ -1735,7 +1735,7 @@ impl LibraryStore {
                 .await
                 .context("Failed to read sandboxed config")?;
             files.push(ConfigProfileFile {
-                path: ".sandboxed/config.json".to_string(),
+                path: ".sandboxed-sh/config.json".to_string(),
                 content: content.clone(),
             });
             serde_json::from_str(&content).unwrap_or_default()
@@ -1744,7 +1744,7 @@ impl LibraryStore {
                 .await
                 .context("Failed to read sandboxed config")?;
             files.push(ConfigProfileFile {
-                path: ".sandboxed/config.json".to_string(),
+                path: ".sandboxed-sh/config.json".to_string(),
                 content: content.clone(),
             });
             serde_json::from_str(&content).unwrap_or_default()
@@ -1802,7 +1802,7 @@ impl LibraryStore {
     }
 
     /// Save a config profile.
-    /// Uses new directory structure: .opencode/, .claudecode/, .ampcode/, .sandboxed/
+    /// Uses new directory structure: .opencode/, .claudecode/, .ampcode/, .sandboxed-sh/
     pub async fn save_config_profile(&self, name: &str, profile: &ConfigProfile) -> Result<()> {
         Self::validate_name(name)?;
 
@@ -1810,7 +1810,7 @@ impl LibraryStore {
 
         // Create profile directories with dot-prefix (mirroring harness directories)
         let opencode_dir = profile_dir.join(".opencode");
-        let sandboxed_dir = profile_dir.join(".sandboxed");
+        let sandboxed_dir = profile_dir.join(".sandboxed-sh");
         let claudecode_dir = profile_dir.join(".claudecode");
         let ampcode_dir = profile_dir.join(".ampcode");
 
@@ -1826,7 +1826,7 @@ impl LibraryStore {
             .context("Failed to write opencode settings")?;
 
         // Save Sandboxed config
-        let sandboxed_content = serde_json::to_string_pretty(&profile.sandboxed_config)?;
+        let sandboxed_content = serde_json::to_string_pretty(&profile.sandboxed-sh_config)?;
         fs::write(sandboxed_dir.join("config.json"), sandboxed_content)
             .await
             .context("Failed to write sandboxed config")?;
@@ -1902,7 +1902,7 @@ impl LibraryStore {
             path: format!("{}/{}", CONFIGS_DIR, name),
             files: Vec::new(), // Files will be populated on next get_config_profile
             opencode_settings: base.opencode_settings,
-            sandboxed_config: base.sandboxed_config,
+            sandboxed_config: base.sandboxed-sh_config,
             claudecode_config: base.claudecode_config,
             ampcode_config: base.ampcode_config,
         };
@@ -1966,7 +1966,7 @@ impl LibraryStore {
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
         // Try new path first, then legacy
-        let new_path = profile_dir.join(".sandboxed").join("config.json");
+        let new_path = profile_dir.join(".sandboxed-sh").join("config.json");
         let legacy_path = profile_dir.join("sandboxed").join("config.json");
 
         let path = if new_path.exists() {
@@ -1993,7 +1993,7 @@ impl LibraryStore {
         Self::validate_name(profile)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
-        let sandboxed_dir = profile_dir.join(".sandboxed");
+        let sandboxed_dir = profile_dir.join(".sandboxed-sh");
 
         fs::create_dir_all(&sandboxed_dir).await?;
 

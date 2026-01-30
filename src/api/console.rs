@@ -570,7 +570,7 @@ fn runtime_display_path() -> Option<PathBuf> {
 
     for base in candidates.into_iter().flatten() {
         let path = PathBuf::from(base)
-            .join(".sandboxed")
+            .join(".sandboxed-sh")
             .join("runtime")
             .join("current_display.json");
         if path.exists() {

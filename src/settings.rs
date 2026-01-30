@@ -1,6 +1,6 @@
 //! Global settings storage.
 //!
-//! Persists user-configurable settings to disk at `{working_dir}/.sandboxed/settings.json`.
+//! Persists user-configurable settings to disk at `{working_dir}/.sandboxed-sh/settings.json`.
 //! Environment variables are used as initial defaults when no settings file exists.
 
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ impl SettingsStore {
     /// If no settings file exists, uses environment variables as defaults:
     /// - `LIBRARY_REMOTE` - Git remote URL for the configuration library
     pub async fn new(working_dir: &PathBuf) -> Self {
-        let storage_path = working_dir.join(".sandboxed/settings.json");
+        let storage_path = working_dir.join(".sandboxed-sh/settings.json");
 
         let settings = if storage_path.exists() {
             match Self::load_from_path(&storage_path) {

@@ -499,7 +499,7 @@ install -m 0755 target/debug/sandboxed_sh /usr/local/bin/sandboxed_sh
 
 Sandboxed.sh expects a git-backed **Library** repo. At runtime it will:
 
-- clone it into `LIBRARY_PATH` (default: `{WORKING_DIR}/.sandboxed.sh/library`)
+- clone it into `LIBRARY_PATH` (default: `{WORKING_DIR}/.sandboxed-sh.sh/library`)
 - ensure the `origin` remote matches `LIBRARY_REMOTE`
 - pull/sync as needed
 
@@ -537,7 +537,7 @@ Set in `/etc/sandboxed_sh/sandboxed_sh.env`:
 
 - `LIBRARY_REMOTE=git@github.com:<your-org>/<your-library-repo>.git` (used as
   initial default if not configured in Settings)
-- optional: `LIBRARY_PATH=/root/.sandboxed.sh/library`
+- optional: `LIBRARY_PATH=/root/.sandboxed-sh.sh/library`
 
 ### 5.3 Library encryption key
 
@@ -549,8 +549,8 @@ dashboard and when deployed to workspaces.
 **How the key works:**
 
 - A single encryption key protects all encrypted values in the library.
-- The key is stored at `{WORKING_DIR}/.sandboxed.sh/private_key` (typically
-  `/root/.sandboxed.sh/private_key`).
+- The key is stored at `{WORKING_DIR}/.sandboxed-sh.sh/private_key` (typically
+  `/root/.sandboxed-sh.sh/private_key`).
 - On first save of any encrypted value, Sandboxed.sh **auto-generates** the key if
   none exists.
 - The key can also be set manually via the `PRIVATE_KEY` environment variable
@@ -578,7 +578,7 @@ Alternatively, copy the key file manually:
 
 ```bash
 # Copy from source to new server
-scp root@source-server:/root/.sandboxed.sh/private_key root@new-server:/root/.sandboxed.sh/private_key
+scp root@source-server:/root/.sandboxed-sh.sh/private_key root@new-server:/root/.sandboxed-sh.sh/private_key
 ```
 
 Or set it via the environment:
@@ -616,7 +616,7 @@ PORT=3000
 
 # Default filesystem root for Sandboxed.sh (agent still has full system access)
 WORKING_DIR=/root
-LIBRARY_PATH=/root/.sandboxed.sh/library
+LIBRARY_PATH=/root/.sandboxed-sh.sh/library
 # Library remote (optional, can also be set via dashboard Settings page)
 LIBRARY_REMOTE=git@github.com:<your-org>/<your-library-repo>.git
 

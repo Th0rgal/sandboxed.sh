@@ -35,7 +35,7 @@ fn runtime_workspace_path() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home)
-        .join(".sandboxed")
+        .join(".sandboxed-sh")
         .join("runtime")
         .join("current_workspace.json")
 }

@@ -222,7 +222,7 @@ impl WorkspaceStore {
     ///
     /// This also scans for orphaned container directories and restores them.
     pub async fn new(working_dir: PathBuf) -> Self {
-        let storage_path = working_dir.join(".sandboxed/workspaces.json");
+        let storage_path = working_dir.join(".sandboxed-sh/workspaces.json");
 
         let store = Self {
             workspaces: RwLock::new(HashMap::new()),
@@ -311,7 +311,7 @@ impl WorkspaceStore {
 
     /// Scan for container directories that exist on disk but aren't in the store.
     async fn scan_orphaned_containers(&self, known: &HashMap<Uuid, Workspace>) -> Vec<Workspace> {
-        let containers_dir = self.working_dir.join(".sandboxed/containers");
+        let containers_dir = self.working_dir.join(".sandboxed-sh/containers");
 
         if !containers_dir.exists() {
             return Vec::new();
@@ -512,7 +512,7 @@ fn unique_key(base: &str, used: &mut std::collections::HashSet<String>) -> Strin
 
 /// Root directory for Open Agent config data (versioned with repo).
 pub fn config_root(working_dir: &Path) -> PathBuf {
-    working_dir.join(".sandboxed")
+    working_dir.join(".sandboxed-sh")
 }
 
 /// Root directory for workspace folders.
@@ -1176,12 +1176,12 @@ async fn write_claudecode_config(
     tokio::fs::create_dir_all(&claude_dir).await?;
 
     let workspace_env_file = if !workspace_env.is_empty() {
-        let sandboxed_dir = workspace_dir.join(".sandboxed");
+        let sandboxed_dir = workspace_dir.join(".sandboxed-sh");
         tokio::fs::create_dir_all(&sandboxed_dir).await?;
         let env_path = sandboxed_dir.join("workspace_env.json");
         let payload = serde_json::to_string_pretty(workspace_env)?;
         tokio::fs::write(&env_path, payload).await?;
-        Some(".sandboxed/workspace_env.json".to_string())
+        Some(".sandboxed-sh/workspace_env.json".to_string())
     } else {
         None
     };
@@ -2424,9 +2424,9 @@ pub async fn prepare_mission_workspace_with_skills(
 fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
     // Try both possible locations for ai_providers.json
     let candidates = [
-        workspace_root.join(".sandboxed").join("ai_providers.json"),
+        workspace_root.join(".sandboxed-sh").join("ai_providers.json"),
         std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
-            .join(".sandboxed")
+            .join(".sandboxed-sh")
             .join("ai_providers.json"),
     ];
 
@@ -2743,7 +2743,7 @@ pub async fn write_runtime_workspace_state(
     mission_id: Option<Uuid>,
     context_dir_name: &str,
 ) -> anyhow::Result<()> {
-    let runtime_dir = working_dir_root.join(".sandboxed").join("runtime");
+    let runtime_dir = working_dir_root.join(".sandboxed-sh").join("runtime");
     tokio::fs::create_dir_all(&runtime_dir).await?;
     let context_root = working_dir_root.join(context_dir_name);
     let mission_context = mission_id.map(|id| context_root.join(id.to_string()));
@@ -2846,7 +2846,7 @@ pub async fn write_runtime_workspace_state(
 
     // Also write to the working directory itself so MCPs can find it
     // This allows MCPs to discover workspace context from cwd without racing on a shared file
-    let context_file = working_dir.join(".sandboxed_context.json");
+    let context_file = working_dir.join(".sandboxed-sh_context.json");
     if let Err(e) = tokio::fs::write(&context_file, &payload_str).await {
         tracing::warn!(
             workspace = %workspace.name,
@@ -2863,7 +2863,7 @@ pub async fn write_runtime_workspace_state(
 ///
 /// Per-mission files are used to avoid race conditions when running parallel missions.
 pub fn runtime_workspace_file_path(working_dir_root: &Path, mission_id: Option<Uuid>) -> PathBuf {
-    let runtime_dir = working_dir_root.join(".sandboxed").join("runtime");
+    let runtime_dir = working_dir_root.join(".sandboxed-sh").join("runtime");
     let filename = match mission_id {
         Some(id) => format!("workspace-{}.json", id),
         None => "current_workspace.json".to_string(),
@@ -3604,7 +3604,7 @@ pub async fn sync_sandboxed_config(
 ) -> anyhow::Result<()> {
     let config = library.get_sandboxed_config().await?;
 
-    let dest_dir = working_dir.join(".sandboxed");
+    let dest_dir = working_dir.join(".sandboxed-sh");
     let dest_path = dest_dir.join("config.json");
 
     // Ensure directory exists
@@ -3627,7 +3627,7 @@ pub async fn write_sandboxed_config(
     working_dir: &std::path::Path,
     config: &crate::library::SandboxedConfig,
 ) -> anyhow::Result<()> {
-    let dest_dir = working_dir.join(".sandboxed");
+    let dest_dir = working_dir.join(".sandboxed-sh");
     let dest_path = dest_dir.join("config.json");
 
     tokio::fs::create_dir_all(&dest_dir).await?;
@@ -3648,7 +3648,7 @@ pub async fn write_sandboxed_config(
 pub async fn read_sandboxed_config(
     working_dir: &std::path::Path,
 ) -> crate::library::SandboxedConfig {
-    let path = working_dir.join(".sandboxed/config.json");
+    let path = working_dir.join(".sandboxed-sh/config.json");
 
     if !path.exists() {
         return crate::library::SandboxedConfig::default();

@@ -525,7 +525,7 @@ pub struct ConfigProfileFile {
 /// - `.opencode/` - OpenCode settings (settings.json, oh-my-opencode.json)
 /// - `.claudecode/` - Claude Code settings (settings.json)
 /// - `.ampcode/` - Amp settings (settings.json)
-/// - `.sandboxed/` - Sandboxed config (config.json)
+/// - `.sandboxed-sh/` - Sandboxed config (config.json)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigProfile {
     /// Profile name

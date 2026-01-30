@@ -222,10 +222,10 @@ pub fn tailscale_nspawn_extra_args(env: &HashMap<String, String>) -> Vec<String>
 }
 
 /// Return the cache directory for rootfs tarballs.
-/// Defaults to `{WORKING_DIR}/.sandboxed/cache` (sibling of `containers/`).
+/// Defaults to `{WORKING_DIR}/.sandboxed-sh/cache` (sibling of `containers/`).
 fn rootfs_cache_dir() -> PathBuf {
     let working_dir = std::env::var("WORKING_DIR").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(working_dir).join(".sandboxed").join("cache")
+    PathBuf::from(working_dir).join(".sandboxed-sh").join("cache")
 }
 
 /// Return the path for a cached rootfs tarball for the given distro.
@@ -366,7 +366,7 @@ pub async fn create_container(path: &Path, distro: NspawnDistro) -> NspawnResult
 
 async fn create_debootstrap_container(path: &Path, distro: NspawnDistro) -> NspawnResult<()> {
     // Stream debootstrap output to a build log file so the dashboard can show progress.
-    // The log is stored as a sibling file (e.g. /root/.sandboxed/containers/alex.build.log)
+    // The log is stored as a sibling file (e.g. /root/.sandboxed-sh/containers/alex.build.log)
     // because the container filesystem doesn't exist yet during debootstrap.
     let build_log_path = build_log_path_for(path);
     let log_file = std::fs::OpenOptions::new()

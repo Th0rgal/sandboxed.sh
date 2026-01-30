@@ -30,7 +30,7 @@ impl WorkspaceExec {
     ///
     /// For container workspaces using nspawn/nsenter, paths must be relative to the container
     /// filesystem root, not the host. This translates paths like:
-    ///   /root/.sandboxed/containers/minecraft/workspaces/mission-xxx/.claude/settings.json
+    ///   /root/.sandboxed-sh/containers/minecraft/workspaces/mission-xxx/.claude/settings.json
     /// to:
     ///   /workspaces/mission-xxx/.claude/settings.json
     ///

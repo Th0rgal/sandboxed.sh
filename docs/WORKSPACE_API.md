@@ -221,7 +221,7 @@ Returns detailed information about the container state, useful for understanding
   "id": "uuid",
   "name": "minecraft",
   "status": "error",
-  "path": "/root/.sandboxed.sh/containers/minecraft",
+  "path": "/root/.sandboxed-sh.sh/containers/minecraft",
   "path_exists": true,
   "size_bytes": 1234567890,
   "directories": [

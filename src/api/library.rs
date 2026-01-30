@@ -230,9 +230,9 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/opencode/settings", get(get_opencode_settings))
         .route("/opencode/settings", put(save_opencode_settings))
         // Sandboxed Config
-        .route("/sandboxed/config", get(get_sandboxed_config))
-        .route("/sandboxed/config", put(save_sandboxed_config))
-        .route("/sandboxed/agents", get(get_visible_agents))
+        .route("/sandboxed-sh/config", get(get_sandboxed_config))
+        .route("/sandboxed-sh/config", put(save_sandboxed_config))
+        .route("/sandboxed-sh/agents", get(get_visible_agents))
         // Claude Code Config
         .route("/claudecode/config", get(get_claudecode_config))
         .route("/claudecode/config", put(save_claudecode_config))
@@ -252,11 +252,11 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
             put(save_opencode_settings_for_profile),
         )
         .route(
-            "/config-profile/:name/sandboxed/config",
+            "/config-profile/:name/sandboxed-sh/config",
             get(get_sandboxed_config_for_profile),
         )
         .route(
-            "/config-profile/:name/sandboxed/config",
+            "/config-profile/:name/sandboxed-sh/config",
             put(save_sandboxed_config_for_profile),
         )
         .route(
@@ -1452,7 +1452,7 @@ async fn save_opencode_settings(
 // Sandboxed Config
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// GET /api/library/sandboxed/config - Get Sandboxed config from Library.
+/// GET /api/library/sandboxed-sh/config - Get Sandboxed config from Library.
 async fn get_sandboxed_config(
     State(state): State<Arc<super::routes::AppState>>,
     headers: HeaderMap,
@@ -1471,7 +1471,7 @@ async fn get_sandboxed_config(
     }
 }
 
-/// PUT /api/library/sandboxed/config - Save Sandboxed config to Library.
+/// PUT /api/library/sandboxed-sh/config - Save Sandboxed config to Library.
 async fn save_sandboxed_config(
     State(state): State<Arc<super::routes::AppState>>,
     headers: HeaderMap,
@@ -1514,7 +1514,7 @@ async fn save_sandboxed_config(
     }
 }
 
-/// GET /api/library/sandboxed/agents - Get filtered list of visible agents.
+/// GET /api/library/sandboxed-sh/agents - Get filtered list of visible agents.
 /// Fetches agents from OpenCode and filters by hidden_agents config.
 async fn get_visible_agents(
     State(state): State<Arc<super::routes::AppState>>,
@@ -1995,7 +1995,7 @@ async fn save_opencode_settings_for_profile(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// GET /api/library/config-profile/:name/sandboxed/config - Get Sandboxed config for a profile.
+/// GET /api/library/config-profile/:name/sandboxed-sh/config - Get Sandboxed config for a profile.
 async fn get_sandboxed_config_for_profile(
     State(state): State<Arc<super::routes::AppState>>,
     Path(name): Path<String>,
@@ -2009,7 +2009,7 @@ async fn get_sandboxed_config_for_profile(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// PUT /api/library/config-profile/:name/sandboxed/config - Save Sandboxed config for a profile.
+/// PUT /api/library/config-profile/:name/sandboxed-sh/config - Save Sandboxed config for a profile.
 async fn save_sandboxed_config_for_profile(
     State(state): State<Arc<super::routes::AppState>>,
     Path(name): Path<String>,

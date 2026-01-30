@@ -910,7 +910,7 @@ impl ControlHub {
             .map(|s| MissionStoreType::from_str(&s))
             .unwrap_or(MissionStoreType::Sqlite);
 
-        let base_dir = self.config.working_dir.join(".sandboxed").join("missions");
+        let base_dir = self.config.working_dir.join(".sandboxed-sh").join("missions");
         let mission_store: Arc<dyn MissionStore> =
             match create_mission_store(store_type, base_dir, &user.id).await {
                 Ok(store) => Arc::from(store),
@@ -954,7 +954,7 @@ impl ControlHub {
             .map(|s| MissionStoreType::from_str(&s))
             .unwrap_or(MissionStoreType::Sqlite);
 
-        let base_dir = self.config.working_dir.join(".sandboxed").join("missions");
+        let base_dir = self.config.working_dir.join(".sandboxed-sh").join("missions");
 
         match create_mission_store(store_type, base_dir, "default").await {
             Ok(store) => Arc::from(store),
@@ -2529,7 +2529,7 @@ async fn control_actor_loop(
                         if dir_name == "venv"
                             || dir_name == ".venv"
                             || dir_name == ".sandboxed_sh"
-                            || dir_name == ".sandboxed"
+                            || dir_name == ".sandboxed-sh"
                             || dir_name == "temp"
                         {
                             continue;

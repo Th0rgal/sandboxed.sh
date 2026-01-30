@@ -1141,7 +1141,7 @@ fn read_backend_configs() -> Option<Vec<serde_json::Value>> {
     if let Some(ref wd) = working_dir {
         candidates.push(
             std::path::PathBuf::from(wd)
-                .join(".sandboxed")
+                .join(".sandboxed-sh")
                 .join("backend_config.json"),
         );
     }
@@ -1149,27 +1149,27 @@ fn read_backend_configs() -> Option<Vec<serde_json::Value>> {
     // Add HOME paths
     candidates.push(
         std::path::PathBuf::from(&home)
-            .join(".sandboxed")
+            .join(".sandboxed-sh")
             .join("backend_config.json"),
     );
     candidates.push(
         std::path::PathBuf::from(&home)
-            .join(".sandboxed")
+            .join(".sandboxed-sh")
             .join("data")
             .join("backend_configs.json"),
     );
 
-    // Always check /root/.sandboxed as fallback since the dashboard saves config there
+    // Always check /root/.sandboxed-sh as fallback since the dashboard saves config there
     // and Open Agent service may run with a different HOME (e.g., /var/lib/opencode)
     if home != "/root" {
         candidates.push(
             std::path::PathBuf::from("/root")
-                .join(".sandboxed")
+                .join(".sandboxed-sh")
                 .join("backend_config.json"),
         );
         candidates.push(
             std::path::PathBuf::from("/root")
-                .join(".sandboxed")
+                .join(".sandboxed-sh")
                 .join("data")
                 .join("backend_configs.json"),
         );
@@ -2233,20 +2233,20 @@ fn install_opencode_serve_port_wrapper(
     }
 
     // Determine the wrapper directory.
-    // For containers: use /root/.sandboxed-bin (NOT /tmp) because nspawn mounts
+    // For containers: use /root/.sandboxed-sh-bin (NOT /tmp) because nspawn mounts
     // a fresh tmpfs over /tmp, hiding anything we write to the container rootfs.
     let (wrapper_dir_host, wrapper_dir_env) = if workspace.workspace_type
         == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(workspace)
     {
         (
-            workspace.path.join("root").join(".sandboxed-bin"),
-            "/root/.sandboxed-bin".to_string(),
+            workspace.path.join("root").join(".sandboxed-sh-bin"),
+            "/root/.sandboxed-sh-bin".to_string(),
         )
     } else {
         (
-            std::path::PathBuf::from("/tmp/.sandboxed-bin"),
-            "/tmp/.sandboxed-bin".to_string(),
+            std::path::PathBuf::from("/tmp/.sandboxed-sh-bin"),
+            "/tmp/.sandboxed-sh-bin".to_string(),
         )
     };
 
@@ -3521,7 +3521,7 @@ fn workspace_opencode_provider_auth_dir(workspace: &Workspace) -> Option<std::pa
 fn build_opencode_auth_from_ai_providers(
     app_working_dir: &std::path::Path,
 ) -> Option<serde_json::Value> {
-    let path = app_working_dir.join(".sandboxed").join("ai_providers.json");
+    let path = app_working_dir.join(".sandboxed-sh").join("ai_providers.json");
     let contents = std::fs::read_to_string(&path).ok()?;
     let providers: Vec<crate::ai_providers::AIProvider> = serde_json::from_str(&contents).ok()?;
 
@@ -4706,7 +4706,7 @@ pub async fn run_opencode_turn(
     prepend_opencode_bin_to_path(&mut env, workspace);
 
     // Install the opencode serve wrapper AFTER prepend_opencode_bin_to_path so the
-    // wrapper dir (/tmp/.sandboxed-bin) is prepended last and takes priority over
+    // wrapper dir (/tmp/.sandboxed-sh-bin) is prepended last and takes priority over
     // the real binary at ~/.opencode/bin/opencode.
     // oh-my-opencode v3+ is a compiled binary that spawns `opencode serve --port=4096`;
     // the wrapper intercepts this and overrides the port.

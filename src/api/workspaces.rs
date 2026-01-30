@@ -300,7 +300,7 @@ async fn create_workspace(
                 state
                     .config
                     .working_dir
-                    .join(".sandboxed/containers")
+                    .join(".sandboxed-sh/containers")
                     .join(&req.name)
             }
         },

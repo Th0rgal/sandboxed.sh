@@ -40,7 +40,7 @@ Copy `.env.example` to `.env` and configure the values below. The full file cont
 | Variable | Default | Description |
 |---|---|---|
 | `LIBRARY_REMOTE` | `https://github.com/Th0rgal/sandboxed-library-template.git` | Git URL for your agent library. By default, clones the official template. Set this to your own fork or custom library (e.g. `git@github.com:your-org/agent-library.git`). Can also be changed via the dashboard Settings page. |
-| `LIBRARY_PATH` | `/root/.sandboxed.sh/library` | Local path where the library is cloned |
+| `LIBRARY_PATH` | `/root/.sandboxed-sh.sh/library` | Local path where the library is cloned |
 
 #### Server
 
@@ -91,7 +91,7 @@ Two Docker volumes keep data across container restarts:
 
 | Volume | Mount point | Contents |
 |---|---|---|
-| `sandboxed.sh-data` | `/root/.sandboxed.sh` | SQLite database, library, container rootfs, settings |
+| `sandboxed.sh-data` | `/root/.sandboxed-sh.sh` | SQLite database, library, container rootfs, settings |
 | `claude-auth` | `/root/.claude` | Claude Code OAuth credentials |
 
 To back up your data, use `docker volume inspect` to find the volume paths, or bind-mount them to host directories instead.
