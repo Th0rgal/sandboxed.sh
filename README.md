@@ -150,6 +150,21 @@ deployment:
 
 ---
 
+## Development
+
+### Setup git hooks
+
+Enable pre-push formatting checks to catch CI failures locally:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This runs `cargo fmt --check` before each push. If formatting issues are found,
+run `cargo fmt --all` to fix them.
+
+---
+
 ## Status
 
 **Work in Progress** — This project is under active development. Contributions

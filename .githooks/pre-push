@@ -1,0 +1,35 @@
+#!/bin/sh
+#
+# Pre-push hook: runs formatting checks before pushing to remote.
+# To enable: git config core.hooksPath .githooks
+#
+
+set -e
+
+echo "Running pre-push checks..."
+
+# Check Rust formatting
+if command -v cargo >/dev/null 2>&1; then
+    echo "Checking Rust formatting..."
+    if ! cargo fmt --all -- --check; then
+        echo ""
+        echo "ERROR: Rust formatting issues found."
+        echo "Run 'cargo fmt --all' to fix them, then commit and push again."
+        exit 1
+    fi
+    echo "Rust formatting OK"
+else
+    echo "Warning: cargo not found, skipping Rust format check"
+fi
+
+# Check TypeScript/ESLint in dashboard (optional - uncomment if desired)
+# if [ -d "dashboard" ] && command -v bun >/dev/null 2>&1; then
+#     echo "Checking dashboard lint..."
+#     (cd dashboard && bun run lint) || {
+#         echo "ERROR: Dashboard lint issues found."
+#         exit 1
+#     }
+#     echo "Dashboard lint OK"
+# fi
+
+echo "All pre-push checks passed!"
