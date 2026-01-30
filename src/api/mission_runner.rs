@@ -868,13 +868,17 @@ fn build_history_context(history: &[(String, String)], max_chars: usize) -> Stri
     result
 }
 
-async fn resolve_claudecode_default_model(library: &SharedLibrary) -> Option<String> {
+async fn resolve_claudecode_default_model(
+    library: &SharedLibrary,
+    config_profile: Option<&str>,
+) -> Option<String> {
     let lib = {
         let guard = library.read().await;
         guard.clone()
     }?;
 
-    match lib.get_claudecode_config().await {
+    let profile = config_profile.unwrap_or("default");
+    match lib.get_claudecode_config_for_profile(profile).await {
         Ok(config) => config.default_model.and_then(|model| {
             let trimmed = model.trim().to_string();
             if trimmed.is_empty() {
@@ -884,7 +888,11 @@ async fn resolve_claudecode_default_model(library: &SharedLibrary) -> Option<Str
             }
         }),
         Err(err) => {
-            tracing::warn!("Failed to load Claude Code config from library: {}", err);
+            tracing::warn!(
+                "Failed to load Claude Code config from library (profile: {}): {}",
+                profile,
+                err
+            );
             None
         }
     }
@@ -967,8 +975,16 @@ async fn run_mission_turn(
     if let Some(ref agent) = effective_agent {
         config.opencode_agent = Some(agent.clone());
     }
+    // Get workspace's config profile for Claude Code model resolution
+    let workspace_config_profile = if let Some(ws_id) = workspace_id {
+        workspaces.get(ws_id).await.and_then(|ws| ws.config_profile)
+    } else {
+        None
+    };
     if backend_id == "claudecode" && config.default_model.is_none() {
-        if let Some(default_model) = resolve_claudecode_default_model(&library).await {
+        if let Some(default_model) =
+            resolve_claudecode_default_model(&library, workspace_config_profile.as_deref()).await
+        {
             config.default_model = Some(default_model);
         }
     }

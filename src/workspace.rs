@@ -153,6 +153,10 @@ pub struct Workspace {
     /// Non-empty = allowlist of MCP names.
     #[serde(default)]
     pub mcps: Vec<String>,
+    /// Config profile to use for this workspace (from workspace template).
+    /// Defaults to "default" if not specified.
+    #[serde(default)]
+    pub config_profile: Option<String>,
 }
 
 impl Workspace {
@@ -177,6 +181,7 @@ impl Workspace {
             plugins: Vec::new(),
             shared_network: None,
             mcps: Vec::new(),
+            config_profile: None,
         }
     }
 
@@ -197,6 +202,7 @@ impl Workspace {
             init_script: None,
             created_at: Utc::now(),
             skills: Vec::new(),
+            config_profile: None,
             tools: Vec::new(),
             plugins: Vec::new(),
             shared_network: None,
@@ -391,6 +397,7 @@ impl WorkspaceStore {
                     plugins: Vec::new(),
                     shared_network: None, // Default to shared network
                     mcps: Vec::new(),
+                    config_profile: None,
                 };
 
                 orphaned.push(workspace);
