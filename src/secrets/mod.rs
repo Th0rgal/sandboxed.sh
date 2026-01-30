@@ -15,7 +15,7 @@
 //! ```
 //!
 //! The actual passphrase is provided via:
-//! - `OPENAGENT_SECRET_PASSPHRASE` environment variable
+//! - `SANDBOXED_SECRET_PASSPHRASE` (or legacy `OPENAGENT_SECRET_PASSPHRASE`) environment variable
 //! - Or via the unlock API endpoint (session-based)
 //!
 //! ## Usage

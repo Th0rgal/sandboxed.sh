@@ -42,9 +42,10 @@ impl SecretsStore {
             SecretsConfig::default()
         };
 
-        // Try to load passphrase from environment
+        // Try to load passphrase from environment (support both new and legacy names)
         let mut crypto = SecretsCrypto::new();
-        if let Ok(passphrase) = std::env::var("OPENAGENT_SECRET_PASSPHRASE") {
+        if let Ok(passphrase) = std::env::var("SANDBOXED_SECRET_PASSPHRASE")
+            .or_else(|_| std::env::var("OPENAGENT_SECRET_PASSPHRASE")) {
             if !passphrase.is_empty() {
                 crypto.set_passphrase(passphrase);
             }
@@ -167,7 +168,7 @@ impl SecretsStore {
 
         // Create a marker file for the key (just to track that it exists)
         let key_marker = keys_dir.join(format!("{}.key", key_id));
-        fs::write(&key_marker, format!("# Key: {}\n# Created: {}\n# This file marks that this key exists.\n# The actual passphrase must be provided via OPENAGENT_SECRET_PASSPHRASE env var.\n", key_id, chrono::Utc::now())).await?;
+        fs::write(&key_marker, format!("# Key: {}\n# Created: {}\n# This file marks that this key exists.\n# The actual passphrase must be provided via SANDBOXED_SECRET_PASSPHRASE (or legacy OPENAGENT_SECRET_PASSPHRASE) env var.\n", key_id, chrono::Utc::now())).await?;
 
         // Update config
         {
@@ -188,7 +189,7 @@ impl SecretsStore {
 
         Ok(InitializeKeysResult {
             key_id: key_id.to_string(),
-            message: "Secrets system initialized. Set OPENAGENT_SECRET_PASSPHRASE environment variable with your passphrase to enable encryption/decryption.".to_string(),
+            message: "Secrets system initialized. Set SANDBOXED_SECRET_PASSPHRASE environment variable with your passphrase to enable encryption/decryption.".to_string(),
         })
     }
 

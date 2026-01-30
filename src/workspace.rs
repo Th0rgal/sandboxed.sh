@@ -1244,12 +1244,12 @@ async fn write_claudecode_config(
         // Skills are now in .claude/skills/ and Claude will discover them automatically
         let claude_md_path = workspace_dir.join("CLAUDE.md");
         let mut claude_md = String::new();
-        claude_md.push_str("# Open Agent Workspace\n\n");
+        claude_md.push_str("# sandboxed.sh Workspace\n\n");
 
         match workspace_type {
             WorkspaceType::Container => {
                 claude_md.push_str(
-                    "This is an **isolated container workspace** managed by Open Agent.\n\n",
+                    "This is an **isolated container workspace** managed by sandboxed.sh.\n\n",
                 );
                 claude_md.push_str("- Shell commands execute inside the container\n");
                 claude_md.push_str("- Use the built-in `Bash` tool for shell commands\n");
@@ -1258,7 +1258,7 @@ async fn write_claudecode_config(
                 );
             }
             WorkspaceType::Host => {
-                claude_md.push_str("This is a **host workspace** managed by Open Agent.\n\n");
+                claude_md.push_str("This is a **host workspace** managed by sandboxed.sh.\n\n");
                 claude_md
                     .push_str("- Use the built-in `Bash` tool to run shell commands directly\n");
                 claude_md.push_str(
@@ -1342,17 +1342,17 @@ async fn write_amp_config(
     // Write AGENTS.md with workspace context
     let agents_md_path = workspace_dir.join("AGENTS.md");
     let mut agents_md = String::new();
-    agents_md.push_str("# Open Agent Workspace\n\n");
+    agents_md.push_str("# sandboxed.sh Workspace\n\n");
 
     match workspace_type {
         WorkspaceType::Container => {
             agents_md
-                .push_str("This is an **isolated container workspace** managed by Open Agent.\n\n");
+                .push_str("This is an **isolated container workspace** managed by sandboxed.sh.\n\n");
             agents_md.push_str("- Shell commands execute inside the container\n");
             agents_md.push_str("- Use the built-in `Bash` tool for shell commands\n");
         }
         WorkspaceType::Host => {
-            agents_md.push_str("This is a **host workspace** managed by Open Agent.\n\n");
+            agents_md.push_str("This is a **host workspace** managed by sandboxed.sh.\n\n");
             agents_md.push_str("- Use the built-in `Bash` tool to run shell commands directly\n");
         }
     }

@@ -23,7 +23,7 @@ import { cn } from '@/lib/utils';
 
 // Component display names
 const componentNames: Record<string, string> = {
-  open_agent: 'Open Agent',
+  open_agent: 'sandboxed.sh',
   opencode: 'OpenCode',
   claude_code: 'Claude Code',
   amp: 'Amp',

@@ -56,12 +56,12 @@ export function LibraryUnavailable({ message }: LibraryUnavailableProps) {
                 Create a new repository using the library template:
               </p>
               <a
-                href="https://github.com/Th0rgal/openagent-library-template"
+                href="https://github.com/Th0rgal/sandboxed-library-template"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
               >
-                openagent-library-template
+                sandboxed-library-template
                 <ExternalLink className="h-3 w-3" />
               </a>
             </div>

@@ -1,11 +1,11 @@
 services:
-  openagent:
+  sandboxed-sh:
     build: .
     restart: unless-stopped
     ports:
       - "3000:80"
     volumes:
-      - openagent-data:/root/.openagent
+      - sandboxed-data:/root/.openagent
       - claude-auth:/root/.claude
       # Uncomment to mount SSH keys for private git repos (Library):
       - ~/.ssh:/root/.ssh:ro
@@ -17,5 +17,5 @@ services:
     # cgroup: host
 
 volumes:
-  openagent-data:
+  sandboxed-data:
   claude-auth:

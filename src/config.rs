@@ -10,13 +10,13 @@
 //! - `OPENCODE_BASE_URL` - DEPRECATED. No longer used for mission execution (per-mission CLI mode).
 //! - `OPENCODE_AGENT` - Optional. Default OpenCode agent name (e.g., `Sisyphus`, `oracle`).
 //! - `OPENCODE_PERMISSIVE` - Optional. If true, auto-allows all permissions for OpenCode sessions (default: true).
-//! - `OPEN_AGENT_USERS` - Optional. JSON array of user accounts for multi-user auth.
+//! - `SANDBOXED_USERS` or `OPEN_AGENT_USERS` (legacy) - Optional. JSON array of user accounts for multi-user auth.
 //! - `LIBRARY_GIT_SSH_KEY` - Optional. SSH key path for library git operations. If set to a path, uses that key.
 //!   If set to empty string, ignores ~/.ssh/config (useful when the config specifies a non-existent key).
 //!   If unset, uses default SSH behavior.
 //! - `LIBRARY_REMOTE` - Optional. Initial library remote URL (can be changed via Settings in the dashboard).
 //!   This environment variable is used as the initial default when no settings file exists.
-//!   If not set, defaults to: https://github.com/Th0rgal/openagent-library-template.git
+//!   If not set, defaults to: https://github.com/Th0rgal/sandboxed-library-template.git
 //!
 //! Note: The agent has **full system access**. It can read/write any file, execute any command,
 //! and search anywhere on the machine. The `WORKING_DIR` is just the default for relative paths.
@@ -370,12 +370,14 @@ impl Config {
             // In debug builds, default to dev_mode=true; in release, default to false.
             .unwrap_or(cfg!(debug_assertions));
 
-        let users = std::env::var("OPEN_AGENT_USERS")
+        // Support both new (SANDBOXED_USERS) and legacy (OPEN_AGENT_USERS) env vars
+        let users = std::env::var("SANDBOXED_USERS")
+            .or_else(|_| std::env::var("OPEN_AGENT_USERS"))
             .ok()
             .filter(|raw| !raw.trim().is_empty())
             .map(|raw| {
                 serde_json::from_str::<Vec<UserAccount>>(&raw).map_err(|e| {
-                    ConfigError::InvalidValue("OPEN_AGENT_USERS".to_string(), e.to_string())
+                    ConfigError::InvalidValue("SANDBOXED_USERS/OPEN_AGENT_USERS".to_string(), e.to_string())
                 })
             })
             .transpose()?
@@ -409,7 +411,7 @@ impl Config {
             match auth.auth_mode(dev_mode) {
                 AuthMode::MultiUser => {
                     if auth.users.is_empty() {
-                        return Err(ConfigError::MissingEnvVar("OPEN_AGENT_USERS".to_string()));
+                        return Err(ConfigError::MissingEnvVar("SANDBOXED_USERS or OPEN_AGENT_USERS".to_string()));
                     }
                     if auth.jwt_secret.is_none() {
                         return Err(ConfigError::MissingEnvVar("JWT_SECRET".to_string()));
@@ -420,7 +422,7 @@ impl Config {
                         .any(|u| u.username.trim().is_empty() || u.password.trim().is_empty())
                     {
                         return Err(ConfigError::InvalidValue(
-                            "OPEN_AGENT_USERS".to_string(),
+                            "SANDBOXED_USERS/OPEN_AGENT_USERS".to_string(),
                             "username/password must be non-empty".to_string(),
                         ));
                     }
