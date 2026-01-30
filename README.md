@@ -141,6 +141,14 @@ systemd-nspawn isolation.
 
 → **[Full native installation guide](docs/install-native.md)**
 
+### First-time setup
+
+After installation, follow the **[Getting Started Guide](docs/getting-started.md)** for:
+- Configuring your backend connection
+- Setting up your library repository
+- Exploring skills and tools
+- Creating your first mission
+
 ### AI-assisted setup
 
 Point your coding agent at the installation guide and let it handle the
