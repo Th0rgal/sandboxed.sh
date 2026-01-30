@@ -791,6 +791,7 @@ impl MissionStore for SqliteMissionStore {
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_default(),
                         session_id: None, // Not needed for stale mission checks
+                        session_initiated: false,
                         terminal_reason: None,
                     })
                 })
@@ -846,6 +847,7 @@ impl MissionStore for SqliteMissionStore {
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_default(),
                         session_id: None,
+                        session_initiated: false,
                         terminal_reason: None,
                     })
                 })
