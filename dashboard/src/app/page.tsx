@@ -245,24 +245,26 @@ export default function OverviewPage() {
   );
 
   const handleNewMission = useCallback(
-    async (options?: { workspaceId?: string; agent?: string; backend?: string }) => {
+    async (options?: { workspaceId?: string; agent?: string; modelOverride?: string; backend?: string; openInNewTab?: boolean }) => {
       try {
         setCreatingMission(true);
         const mission = await createMission({
           workspaceId: options?.workspaceId,
           agent: options?.agent,
+          modelOverride: options?.modelOverride,
           backend: options?.backend,
         });
         toast.success('New mission created');
-        router.push(`/control?mission=${mission.id}`);
+        return { id: mission.id };
       } catch (err) {
         console.error('Failed to create mission:', err);
         toast.error('Failed to create new mission');
+        throw err; // Re-throw so dialog knows creation failed
       } finally {
         setCreatingMission(false);
       }
     },
-    [router]
+    []
   );
 
   return (

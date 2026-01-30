@@ -15,7 +15,10 @@ FROM rust:1.88-bookworm AS rust-builder
 WORKDIR /build
 
 # Copy manifests first for better layer caching
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
+
+# Generate Cargo.lock if it doesn't exist in the context
+RUN cargo generate-lockfile 2>/dev/null || true
 
 # Create stub source so cargo can resolve deps
 RUN mkdir -p src/bin \

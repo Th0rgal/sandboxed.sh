@@ -681,6 +681,8 @@ pub enum ControlCommand {
         mission_id: Uuid,
         /// If true, clean the mission's work directory before resuming
         clean_workspace: bool,
+        /// If true, only update status without sending the "MISSION RESUMED" message
+        skip_message: bool,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Graceful shutdown - mark running missions as interrupted
@@ -1692,6 +1694,10 @@ pub struct ResumeMissionRequest {
     /// If true, clean the mission's work directory before resuming
     #[serde(default)]
     pub clean_workspace: bool,
+    /// If true, only update the mission status without sending the "MISSION RESUMED" message.
+    /// Useful when the user is about to send their own custom message.
+    #[serde(default)]
+    pub skip_message: bool,
 }
 
 /// Resume an interrupted mission.
@@ -1702,7 +1708,9 @@ pub async fn resume_mission(
     Path(mission_id): Path<Uuid>,
     body: Option<Json<ResumeMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
-    let clean_workspace = body.map(|b| b.clean_workspace).unwrap_or(false);
+    let (clean_workspace, skip_message) = body
+        .map(|b| (b.clean_workspace, b.skip_message))
+        .unwrap_or((false, false));
     let (tx, rx) = oneshot::channel();
 
     let control = control_for_user(&state, &user).await;
@@ -1711,6 +1719,7 @@ pub async fn resume_mission(
         .send(ControlCommand::ResumeMission {
             mission_id,
             clean_workspace,
+            skip_message,
             respond: tx,
         })
         .await
@@ -3223,7 +3232,7 @@ async fn control_actor_loop(
 
                         let _ = respond.send(running_list);
                     }
-                    ControlCommand::ResumeMission { mission_id, clean_workspace, respond } => {
+                    ControlCommand::ResumeMission { mission_id, clean_workspace, skip_message, respond } => {
                         // Resume an interrupted mission by building resume context
                         match resume_mission_impl(
                             &mission_store,
@@ -3264,8 +3273,11 @@ async fn control_actor_loop(
                                 }
 
                                 // Queue the resume prompt as a message (no per-message agent override)
-                                let msg_id = Uuid::new_v4();
-                                queue.push_back((msg_id, resume_prompt, None));
+                                // Skip if the caller just wants to update the status (e.g., before sending a custom message)
+                                if !skip_message {
+                                    let msg_id = Uuid::new_v4();
+                                    queue.push_back((msg_id, resume_prompt, None));
+                                }
 
                                 // Start execution if not already running
                                 if running.is_none() {
