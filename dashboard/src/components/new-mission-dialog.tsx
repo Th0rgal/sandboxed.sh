@@ -7,7 +7,8 @@ import useSWR from 'swr';
 import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getBackendConfig, getClaudeCodeConfig, listConfigProfiles, type Backend, type BackendAgent, type ConfigProfileSummary } from '@/lib/api';
 import type { Provider, Workspace } from '@/lib/api';
 
-export interface CreateMissionOptions {
+/** Options returned by the dialog's getCreateOptions() method */
+export interface NewMissionDialogOptions {
   workspaceId?: string;
   agent?: string;
   /** @deprecated Use configProfile instead */
@@ -35,7 +36,7 @@ interface NewMissionDialogProps {
   providers?: Provider[];
   disabled?: boolean;
   /** Creates a mission and returns its ID for navigation */
-  onCreate: (options?: CreateMissionOptions) => Promise<CreatedMission>;
+  onCreate: (options?: NewMissionDialogOptions) => Promise<CreatedMission>;
   /** Path to the control page (default: '/control') */
   controlPath?: string;
   /** Initial values to pre-fill the form (from current mission) */
@@ -349,7 +350,7 @@ export function NewMissionDialog({
     resetForm();
   };
 
-  const getCreateOptions = (): CreateMissionOptions => {
+  const getCreateOptions = (): NewMissionDialogOptions => {
     const parsed = parseSelectedValue(selectedAgentValue);
     return {
       workspaceId: newMissionWorkspace || undefined,

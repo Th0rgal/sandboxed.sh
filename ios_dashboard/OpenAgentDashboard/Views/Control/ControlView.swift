@@ -1449,7 +1449,6 @@ struct ControlView: View {
                             toolData.state = .success
                         }
 
-                        messages[index].toolData = toolData
                         // Update the type to mark as not active
                         messages[index] = ChatMessage(
                             id: messages[index].id,

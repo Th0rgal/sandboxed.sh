@@ -90,7 +90,6 @@ export default function SettingsPage() {
     sync,
     forceSync,
     forcePush,
-    clearDivergedHistory,
     commit,
     push,
     syncing,
@@ -225,38 +224,7 @@ export default function SettingsPage() {
     }
   }, [fileContent]);
 
-  // Handle keyboard shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
-        e.preventDefault();
-        if (isDirty && !parseError && selectedFile) {
-          handleSave();
-        }
-      }
-      if (e.key === 'Escape') {
-        if (showProfileDropdown) setShowProfileDropdown(false);
-        if (showNewProfileDialog) setShowNewProfileDialog(false);
-      }
-    };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [isDirty, parseError, selectedFile, showProfileDropdown, showNewProfileDialog]);
-
-  // Click outside to close profile dropdown
-  useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      if (profileDropdownRef.current && !profileDropdownRef.current.contains(e.target as Node)) {
-        setShowProfileDropdown(false);
-      }
-    };
-    if (showProfileDropdown) {
-      document.addEventListener('mousedown', handleClickOutside);
-      return () => document.removeEventListener('mousedown', handleClickOutside);
-    }
-  }, [showProfileDropdown]);
-
-  const handleSave = async () => {
+  const handleSave = useCallback(async () => {
     if (parseError || !selectedFile) return;
 
     try {
@@ -273,7 +241,38 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  };
+  }, [parseError, selectedFile, selectedProfile, fileContent, refreshStatus, loadProfileFiles]);
+
+  // Handle keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+        e.preventDefault();
+        if (isDirty && !parseError && selectedFile) {
+          handleSave();
+        }
+      }
+      if (e.key === 'Escape') {
+        if (showProfileDropdown) setShowProfileDropdown(false);
+        if (showNewProfileDialog) setShowNewProfileDialog(false);
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [isDirty, parseError, selectedFile, showProfileDropdown, showNewProfileDialog, handleSave]);
+
+  // Click outside to close profile dropdown
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (profileDropdownRef.current && !profileDropdownRef.current.contains(e.target as Node)) {
+        setShowProfileDropdown(false);
+      }
+    };
+    if (showProfileDropdown) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
+    }
+  }, [showProfileDropdown]);
 
   const handleCreateProfile = async () => {
     if (!newProfileName.trim()) return;
