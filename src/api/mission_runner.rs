@@ -1826,15 +1826,27 @@ pub fn run_claudecode_turn<'a>(
                     let err_msg = if !received_any_event && auth_missing {
                         "Claude Code produced no output. No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.".to_string()
                     } else if has_network_error {
+                        let truncated_stderr = if stderr_content.len() > 500 {
+                            let end = safe_truncate_index(&stderr_content, 500);
+                            format!("{}...", &stderr_content[..end])
+                        } else {
+                            stderr_content.to_string()
+                        };
                         format!(
                             "Claude Code appears stuck due to network issues. Check workspace DNS/network configuration. Stderr: {}",
-                            if stderr_content.len() > 500 { &stderr_content[..500] } else { &stderr_content }
+                            truncated_stderr
                         )
                     } else if !received_any_event {
                         let stderr_hint = if stderr_content.is_empty() {
                             String::new()
                         } else {
-                            format!(" Stderr: {}", if stderr_content.len() > 500 { &stderr_content[..500] } else { &stderr_content })
+                            let truncated = if stderr_content.len() > 500 {
+                                let end = safe_truncate_index(&stderr_content, 500);
+                                format!("{}...", &stderr_content[..end])
+                            } else {
+                                stderr_content.to_string()
+                            };
+                            format!(" Stderr: {}", truncated)
                         };
                         format!(
                             "Claude Code produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.{}",
@@ -5034,6 +5046,10 @@ pub async fn run_opencode_turn(
                 if let Some(handle) = stderr_handle {
                     handle.abort();
                 }
+                sse_cancel.cancel();
+                if let Some(handle) = sse_handle {
+                    handle.abort();
+                }
                 return AgentResult::failure("Cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
             }
@@ -5052,6 +5068,10 @@ pub async fn run_opencode_turn(
                 tracing::warn!(mission_id = %mission_id, "{}", err_msg);
                 let _ = child.kill().await;
                 if let Some(handle) = stderr_handle {
+                    handle.abort();
+                }
+                sse_cancel.cancel();
+                if let Some(handle) = sse_handle {
                     handle.abort();
                 }
                 return AgentResult::failure(err_msg, 0)
