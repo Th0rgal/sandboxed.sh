@@ -1707,7 +1707,12 @@ export interface OpenAgentConfig {
 
 // Get OpenAgent config from Library
 export async function getOpenAgentConfig(): Promise<OpenAgentConfig> {
-  return apiGet("/api/library/openagent/config", "Failed to get OpenAgent config");
+  try {
+    return await apiGet("/api/library/openagent/config", "Failed to get OpenAgent config");
+  } catch {
+    // Return default config if endpoint doesn't exist (not yet implemented)
+    return { hidden_agents: [], default_agent: null };
+  }
 }
 
 // Save OpenAgent config to Library
@@ -1717,7 +1722,12 @@ export async function saveOpenAgentConfig(config: OpenAgentConfig): Promise<void
 
 // Get visible agents (filtered by OpenAgent config)
 export async function getVisibleAgents(): Promise<unknown> {
-  return apiGet("/api/library/openagent/agents", "Failed to get visible agents");
+  try {
+    return await apiGet("/api/library/openagent/agents", "Failed to get visible agents");
+  } catch {
+    // Return empty array if endpoint doesn't exist (not yet implemented)
+    return [];
+  }
 }
 
 // Claude Code config stored in Library
@@ -1823,10 +1833,15 @@ export async function saveLibraryOpenCodeSettingsForProfile(
 
 // Get OpenAgent config for a specific profile
 export async function getOpenAgentConfigForProfile(profile: string): Promise<OpenAgentConfig> {
-  return apiGet(
-    `/api/library/config-profile/${encodeURIComponent(profile)}/openagent/config`,
-    "Failed to get OpenAgent config for profile"
-  );
+  try {
+    return await apiGet(
+      `/api/library/config-profile/${encodeURIComponent(profile)}/openagent/config`,
+      "Failed to get OpenAgent config for profile"
+    );
+  } catch {
+    // Return default config if endpoint doesn't exist (not yet implemented)
+    return { hidden_agents: [], default_agent: null };
+  }
 }
 
 // Save OpenAgent config for a specific profile
