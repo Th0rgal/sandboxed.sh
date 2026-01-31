@@ -2432,7 +2432,14 @@ async fn control_actor_loop(
         config_profile: Option<&str>,
     ) -> Result<Mission, String> {
         mission_store
-            .create_mission(title, workspace_id, agent, model_override, backend, config_profile)
+            .create_mission(
+                title,
+                workspace_id,
+                agent,
+                model_override,
+                backend,
+                config_profile,
+            )
             .await
     }
 

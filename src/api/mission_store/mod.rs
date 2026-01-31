@@ -279,7 +279,7 @@ mod tests {
         let store = InMemoryMissionStore::new();
 
         let mission = store
-            .create_mission(Some("Test Mission"), None, None, None, None)
+            .create_mission(Some("Test Mission"), None, None, None, None, None)
             .await
             .expect("Failed to create mission");
 
@@ -299,7 +299,7 @@ mod tests {
 
         // Create a pending mission
         let mission = store
-            .create_mission(Some("Pending Mission"), None, None, None, None)
+            .create_mission(Some("Pending Mission"), None, None, None, None, None)
             .await
             .expect("Failed to create mission");
 
@@ -324,7 +324,7 @@ mod tests {
 
         // Create a pending mission
         let mission = store
-            .create_mission(Some("Test Mission"), None, None, None, None)
+            .create_mission(Some("Test Mission"), None, None, None, None, None)
             .await
             .expect("Failed to create mission");
 
@@ -371,12 +371,12 @@ mod tests {
 
         // Create two missions
         let pending_mission = store
-            .create_mission(Some("Pending"), None, None, None, None)
+            .create_mission(Some("Pending"), None, None, None, None, None)
             .await
             .expect("Failed to create pending mission");
 
         let active_mission = store
-            .create_mission(Some("Will be Active"), None, None, None, None)
+            .create_mission(Some("Will be Active"), None, None, None, None, None)
             .await
             .expect("Failed to create mission");
 
