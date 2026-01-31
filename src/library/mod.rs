@@ -1868,6 +1868,7 @@ impl LibraryStore {
 
     /// Create a new config profile.
     /// If base_profile is provided, copies settings from that profile.
+    /// Otherwise, creates an empty profile that falls back to library defaults.
     pub async fn create_config_profile(
         &self,
         name: &str,
@@ -1880,11 +1881,26 @@ impl LibraryStore {
             anyhow::bail!("Profile '{}' already exists", name);
         }
 
-        // Get base profile content (or defaults)
-        let base = if let Some(base_name) = base_profile {
-            self.get_config_profile(base_name).await?
+        // If a base profile is provided, copy its settings
+        // Otherwise, just create an empty directory (falls back to library defaults)
+        if let Some(base_name) = base_profile {
+            let base = self.get_config_profile(base_name).await?;
+            let new_profile = ConfigProfile {
+                name: name.to_string(),
+                is_default: false,
+                path: format!("{}/{}", CONFIGS_DIR, name),
+                files: Vec::new(),
+                opencode_settings: base.opencode_settings,
+                sandboxed_config: base.sandboxed_config,
+                claudecode_config: base.claudecode_config,
+                ampcode_config: base.ampcode_config,
+            };
+            self.save_config_profile(name, &new_profile).await?;
+            Ok(new_profile)
         } else {
-            ConfigProfile {
+            // Create empty profile directory (no files = uses library defaults)
+            fs::create_dir_all(&profile_dir).await?;
+            Ok(ConfigProfile {
                 name: name.to_string(),
                 is_default: false,
                 path: format!("{}/{}", CONFIGS_DIR, name),
@@ -1893,23 +1909,8 @@ impl LibraryStore {
                 sandboxed_config: SandboxedConfig::default(),
                 claudecode_config: ClaudeCodeConfig::default(),
                 ampcode_config: AmpCodeConfig::default(),
-            }
-        };
-
-        let new_profile = ConfigProfile {
-            name: name.to_string(),
-            is_default: false,
-            path: format!("{}/{}", CONFIGS_DIR, name),
-            files: Vec::new(), // Files will be populated on next get_config_profile
-            opencode_settings: base.opencode_settings,
-            sandboxed_config: base.sandboxed_config,
-            claudecode_config: base.claudecode_config,
-            ampcode_config: base.ampcode_config,
-        };
-
-        self.save_config_profile(name, &new_profile).await?;
-
-        Ok(new_profile)
+            })
+        }
     }
 
     /// Get OpenCode settings from a specific profile.
@@ -1921,14 +1922,24 @@ impl LibraryStore {
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
         // Try new path first, then legacy
-        let new_path = profile_dir.join(".opencode").join("settings.json");
+        let new_path = profile_dir.join(".opencode").join("oh-my-opencode.json");
         let legacy_path = profile_dir.join("opencode").join("oh-my-opencode.json");
+
+        tracing::debug!(
+            profile = %profile,
+            new_path = %new_path.display(),
+            new_path_exists = new_path.exists(),
+            legacy_path = %legacy_path.display(),
+            legacy_path_exists = legacy_path.exists(),
+            "Checking OpenCode settings paths"
+        );
 
         let path = if new_path.exists() {
             new_path
         } else if legacy_path.exists() {
             legacy_path
         } else {
+            tracing::debug!(profile = %profile, "No OpenCode settings found for profile");
             return Ok(serde_json::json!({}));
         };
 

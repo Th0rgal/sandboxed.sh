@@ -2419,7 +2419,7 @@ pub async fn prepare_mission_workspace_with_skills(
     mission_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
     prepare_mission_workspace_with_skills_backend(
-        workspace, mcp, library, mission_id, "opencode", None,
+        workspace, mcp, library, mission_id, "opencode", None, None,
     )
     .await
 }
@@ -2466,6 +2466,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     mission_id: Uuid,
     backend_id: &str,
     custom_providers: Option<&[AIProvider]>,
+    config_profile: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
@@ -2575,7 +2576,14 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     // Sync oh-my-opencode settings into the mission directory when using OpenCode.
     if backend_id == "opencode" {
         if let Some(lib) = library {
-            match lib.get_opencode_settings().await {
+            let profile = config_profile.unwrap_or("default");
+            tracing::info!(
+                mission = %mission_id,
+                workspace = %workspace.name,
+                profile = %profile,
+                "Loading oh-my-opencode settings from profile"
+            );
+            match lib.get_opencode_settings_for_profile(profile).await {
                 Ok(settings) => {
                     if !settings.as_object().map(|o| o.is_empty()).unwrap_or(true) {
                         let opencode_dir = dir.join(".opencode");

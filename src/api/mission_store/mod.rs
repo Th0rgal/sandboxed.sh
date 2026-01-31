@@ -41,6 +41,9 @@ pub struct Mission {
     /// Backend to use for this mission ("opencode" or "claudecode")
     #[serde(default = "default_backend")]
     pub backend: String,
+    /// Config profile to use for this mission (from library configs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_profile: Option<String>,
     pub history: Vec<MissionHistoryEntry>,
     pub created_at: String,
     pub updated_at: String,
@@ -133,6 +136,7 @@ pub trait MissionStore: Send + Sync {
         agent: Option<&str>,
         model_override: Option<&str>,
         backend: Option<&str>,
+        config_profile: Option<&str>,
     ) -> Result<Mission, String>;
 
     /// Update mission status.

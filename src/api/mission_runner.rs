@@ -555,6 +555,9 @@ pub struct MissionRunner {
     /// Session ID for conversation persistence (used by Claude Code --session-id)
     pub session_id: Option<String>,
 
+    /// Config profile from the mission (overrides workspace config_profile)
+    pub config_profile: Option<String>,
+
     /// Current state
     pub state: MissionRunState,
 
@@ -603,12 +606,14 @@ impl MissionRunner {
         agent_override: Option<String>,
         backend_id: Option<String>,
         session_id: Option<String>,
+        config_profile: Option<String>,
     ) -> Self {
         Self {
             mission_id,
             workspace_id,
             backend_id: backend_id.unwrap_or_else(|| "opencode".to_string()),
             session_id,
+            config_profile,
             state: MissionRunState::Queued,
             agent_override,
             queue: VecDeque::new(),
@@ -738,6 +743,7 @@ impl MissionRunner {
         let agent_override = self.agent_override.clone();
         let backend_id = self.backend_id.clone();
         let session_id = self.session_id.clone();
+        let config_profile = self.config_profile.clone();
         let user_message = msg.content.clone();
         let msg_id = msg.id;
         tracing::info!(
@@ -785,6 +791,7 @@ impl MissionRunner {
                 agent_override,
                 secrets,
                 session_id,
+                config_profile,
             )
             .await;
             (msg_id, user_message, result)
@@ -939,21 +946,29 @@ async fn run_mission_turn(
     agent_override: Option<String>,
     secrets: Option<Arc<SecretsStore>>,
     session_id: Option<String>,
+    mission_config_profile: Option<String>,
 ) -> AgentResult {
     let mut config = config;
     let effective_agent = agent_override.clone();
     if let Some(ref agent) = effective_agent {
         config.opencode_agent = Some(agent.clone());
     }
-    // Get workspace's config profile for Claude Code model resolution
+    // Get config profile: mission's config_profile takes priority over workspace's
     let workspace_config_profile = if let Some(ws_id) = workspace_id {
         workspaces.get(ws_id).await.and_then(|ws| ws.config_profile)
     } else {
         None
     };
+    tracing::info!(
+        mission_id = %mission_id,
+        mission_config_profile = ?mission_config_profile,
+        workspace_config_profile = ?workspace_config_profile,
+        "Resolving config profile"
+    );
+    let effective_config_profile = mission_config_profile.or(workspace_config_profile);
     if backend_id == "claudecode" && config.default_model.is_none() {
         if let Some(default_model) =
-            resolve_claudecode_default_model(&library, workspace_config_profile.as_deref()).await
+            resolve_claudecode_default_model(&library, effective_config_profile.as_deref()).await
         {
             config.default_model = Some(default_model);
         }
@@ -1036,6 +1051,7 @@ async fn run_mission_turn(
             mission_id,
             &backend_id,
             None, // custom_providers: TODO integrate with provider store
+            effective_config_profile.as_deref(),
         )
         .await
     } {

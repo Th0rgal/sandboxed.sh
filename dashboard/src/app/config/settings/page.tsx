@@ -330,7 +330,8 @@ export default function SettingsPage() {
     try {
       setCreatingProfile(true);
       setError(null);
-      await createConfigProfile(newProfileName.trim(), selectedProfile);
+      // Create empty profile (no base) so it falls back to library defaults
+      await createConfigProfile(newProfileName.trim());
       await mutateProfiles();
       setSelectedProfile(newProfileName.trim());
       setNewProfileName('');
@@ -596,7 +597,7 @@ export default function SettingsPage() {
               </button>
             </div>
             <p className="text-sm text-white/60 mb-4">
-              Create a new configuration profile. It will be initialized with a copy of the current profile&apos;s settings.
+              Create a new configuration profile. It will start empty and use library defaults until you customize specific files.
             </p>
             <div className="mb-6">
               <label className="text-xs text-white/40 block mb-2">Profile Name</label>
