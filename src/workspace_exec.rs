@@ -14,7 +14,7 @@ use anyhow::Context;
 use tokio::process::{Child, Command};
 
 use crate::nspawn;
-use crate::workspace::{use_nspawn_for_workspace, Workspace, WorkspaceType};
+use crate::workspace::{use_nspawn_for_workspace, TailscaleMode, Workspace, WorkspaceType};
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceExec {
@@ -159,12 +159,17 @@ impl WorkspaceExec {
     /// When `export_all_env` is true (nsenter path), all env vars are exported in the
     /// shell command since nsenter doesn't propagate env vars into the namespace.
     /// When false (nspawn path), only TS_* vars are exported (others use --setenv).
+    ///
+    /// `tailnet_only`: When true, set up default route via host gateway for internet
+    /// while using Tailscale only for tailnet device access. When false (exit_node mode),
+    /// all traffic goes through Tailscale's exit node.
     fn build_tailscale_bootstrap_command(
         rel_cwd: &str,
         program: &str,
         args: &[String],
         env: &HashMap<String, String>,
         export_all_env: bool,
+        tailnet_only: bool,
     ) -> String {
         let mut cmd = String::new();
 
@@ -194,19 +199,35 @@ impl WorkspaceExec {
              fi; ",
         );
 
-        // Fallback: if the DHCP-based network-up didn't set a default route
-        // (e.g., udhcpc failed or the script is missing), detect the gateway
-        // from the assigned IP and add the route manually.
-        cmd.push_str(
-            "if ! ip route show default 2>/dev/null | grep -q default; then \
-             _oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
-             _oa_gw=\"${_oa_ip%.*}.1\"; \
-             [ -n \"$_oa_ip\" ] && ip route add default via \"$_oa_gw\" 2>/dev/null || true; \
-             fi; \
-             if [ ! -s /etc/resolv.conf ]; then \
-             printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf 2>/dev/null || true; \
-             fi; ",
-        );
+        if tailnet_only {
+            // tailnet_only mode: Use Tailscale for tailnet access only, route
+            // regular internet traffic through the host gateway (not exit node).
+            // This ensures the container can reach both tailnet devices AND the internet.
+            cmd.push_str(
+                "_oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
+                 _oa_gw=\"${_oa_ip%.*}.1\"; \
+                 if [ -n \"$_oa_ip\" ]; then \
+                   ip route del default 2>/dev/null || true; \
+                   ip route add default via \"$_oa_gw\" 2>/dev/null || true; \
+                 fi; \
+                 if [ ! -s /etc/resolv.conf ]; then \
+                 printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf 2>/dev/null || true; \
+                 fi; ",
+            );
+        } else {
+            // exit_node mode: Fallback route only if DHCP/Tailscale didn't set one.
+            // All traffic should go through Tailscale's exit node when properly configured.
+            cmd.push_str(
+                "if ! ip route show default 2>/dev/null | grep -q default; then \
+                 _oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
+                 _oa_gw=\"${_oa_ip%.*}.1\"; \
+                 [ -n \"$_oa_ip\" ] && ip route add default via \"$_oa_gw\" 2>/dev/null || true; \
+                 fi; \
+                 if [ ! -s /etc/resolv.conf ]; then \
+                 printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf 2>/dev/null || true; \
+                 fi; ",
+            );
+        }
 
         // Change to the working directory and exec the main program.
         cmd.push_str("cd ");
@@ -260,6 +281,7 @@ impl WorkspaceExec {
         args: &[String],
         env: HashMap<String, String>,
         tailscale_bootstrap: bool,
+        tailnet_only: bool,
         stdin: Stdio,
         stdout: Stdio,
         stderr: Stdio,
@@ -275,9 +297,17 @@ impl WorkspaceExec {
         let shell_cmd = if tailscale_bootstrap {
             tracing::info!(
                 workspace = %self.workspace.name,
+                tailnet_only = %tailnet_only,
                 "WorkspaceExec: nsenter with Tailscale bootstrap"
             );
-            Self::build_tailscale_bootstrap_command(&rel_cwd, program, args, &env, true)
+            Self::build_tailscale_bootstrap_command(
+                &rel_cwd,
+                program,
+                args,
+                &env,
+                true,
+                tailnet_only,
+            )
         } else {
             let env_ref = if env.is_empty() { None } else { Some(&env) };
             Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
@@ -342,6 +372,14 @@ impl WorkspaceExec {
                 // check, so the nsenter path can also include the bootstrap.
                 let needs_tailscale_bootstrap = nspawn::tailscale_enabled(&env)
                     && !nspawn::tailscale_nspawn_extra_args(&env).is_empty();
+                // Calculate tailnet_only for nsenter path: TailnetOnly mode means
+                // we connect to tailnet but use host gateway for internet.
+                let nsenter_tailnet_only = needs_tailscale_bootstrap
+                    && self
+                        .workspace
+                        .tailscale_mode
+                        .unwrap_or(TailscaleMode::ExitNode)
+                        == TailscaleMode::TailnetOnly;
                 if let Some(leader) = self.running_container_leader().await {
                     return self.build_nsenter_command(
                         &leader,
@@ -350,6 +388,7 @@ impl WorkspaceExec {
                         args,
                         env,
                         needs_tailscale_bootstrap,
+                        nsenter_tailnet_only,
                         stdin,
                         stdout,
                         stderr,
@@ -399,28 +438,34 @@ impl WorkspaceExec {
                 }
 
                 // Network configuration.
-                // If Tailscale env vars are set, automatically use private networking
-                // (TS_AUTHKEY indicates the workspace wants Tailscale connectivity).
+                // Respect the user's shared_network setting directly.
+                // - shared_network=true: Use host network (and host's Tailscale if connected)
+                // - shared_network=false: Isolated network with optional Tailscale
+                //   - tailscale_mode=exit_node: All traffic via Tailscale exit node
+                //   - tailscale_mode=tailnet_only: Tailscale for tailnet, host gateway for internet
+                let use_shared_network = self.workspace.shared_network.unwrap_or(true);
+                let tailscale_mode = self
+                    .workspace
+                    .tailscale_mode
+                    .unwrap_or(TailscaleMode::ExitNode);
                 let tailscale_requested = nspawn::tailscale_enabled(&env);
-                let use_shared_network = if tailscale_requested {
-                    // Override: Tailscale requires private networking
-                    false
-                } else {
-                    self.workspace.shared_network.unwrap_or(true)
-                };
+
                 tracing::debug!(
                     workspace = %self.workspace.name,
                     shared_network = ?self.workspace.shared_network,
+                    tailscale_mode = ?tailscale_mode,
                     tailscale_requested = %tailscale_requested,
                     use_shared_network = %use_shared_network,
                     "WorkspaceExec: checking network configuration"
                 );
+
                 let tailscale_enabled = if use_shared_network {
+                    // Shared network: use host network, bind DNS
                     tracing::debug!("WorkspaceExec: shared_network=true, binding resolv.conf");
                     cmd.arg("--bind-ro=/etc/resolv.conf");
                     false
                 } else {
-                    // If Tailscale is configured, it will set up networking; otherwise bind DNS.
+                    // Isolated network: check if Tailscale is configured
                     let tailscale_args = nspawn::tailscale_nspawn_extra_args(&env);
                     tracing::debug!(
                         tailscale_args = ?tailscale_args,
@@ -433,7 +478,8 @@ impl WorkspaceExec {
                     } else {
                         tracing::info!(
                             workspace = %self.workspace.name,
-                            "WorkspaceExec: Tailscale networking enabled, will bootstrap"
+                            tailscale_mode = %tailscale_mode.as_str(),
+                            "WorkspaceExec: Tailscale networking enabled"
                         );
                         for a in tailscale_args {
                             cmd.arg(a);
@@ -441,6 +487,11 @@ impl WorkspaceExec {
                         true
                     }
                 };
+
+                // For tailnet_only mode, we need to tell the bootstrap script
+                // to set up a default route via host gateway for internet access
+                let tailnet_only =
+                    tailscale_enabled && tailscale_mode == TailscaleMode::TailnetOnly;
 
                 // Set env vars inside the container.
                 for (k, v) in &env {
@@ -458,11 +509,17 @@ impl WorkspaceExec {
                     // 1. Runs sandboxed-tailscale-up (which also calls sandboxed-network-up)
                     // 2. Execs the actual program to hand off control
                     let shell_cmd = Self::build_tailscale_bootstrap_command(
-                        &rel_cwd, program, args, &env, false,
+                        &rel_cwd,
+                        program,
+                        args,
+                        &env,
+                        false,
+                        tailnet_only,
                     );
                     tracing::info!(
                         workspace = %self.workspace.name,
                         program = %program,
+                        tailnet_only = %tailnet_only,
                         "WorkspaceExec: running with Tailscale bootstrap"
                     );
                     tracing::debug!(

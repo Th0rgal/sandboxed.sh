@@ -99,6 +99,29 @@ impl Default for WorkspaceStatus {
     }
 }
 
+/// Tailscale networking mode for containers with isolated networking.
+/// Only relevant when `shared_network` is false.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TailscaleMode {
+    /// Route all traffic through Tailscale exit node (requires TS_EXIT_NODE).
+    /// Container has no direct internet access; all traffic goes via the exit node.
+    #[default]
+    ExitNode,
+    /// Connect to tailnet for device access, but use host gateway for internet.
+    /// Container can reach tailnet devices AND has regular internet access.
+    TailnetOnly,
+}
+
+impl TailscaleMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ExitNode => "exit_node",
+            Self::TailnetOnly => "tailnet_only",
+        }
+    }
+}
+
 /// A workspace definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
@@ -145,6 +168,11 @@ pub struct Workspace {
     /// Set to false for isolated networking (e.g., Tailscale).
     #[serde(default)]
     pub shared_network: Option<bool>,
+    /// Tailscale networking mode when shared_network is false.
+    /// - `exit_node`: Route all traffic through Tailscale exit node
+    /// - `tailnet_only`: Connect to tailnet but use host gateway for internet
+    #[serde(default)]
+    pub tailscale_mode: Option<TailscaleMode>,
     /// MCP server names to enable for this workspace.
     /// Empty = use all MCPs with `default_enabled = true`.
     /// Non-empty = allowlist of MCP names.
@@ -176,6 +204,7 @@ impl Workspace {
             skills: Vec::new(),
             plugins: Vec::new(),
             shared_network: None,
+            tailscale_mode: None,
             mcps: Vec::new(),
             config_profile: None,
         }
@@ -201,6 +230,7 @@ impl Workspace {
             config_profile: None,
             plugins: Vec::new(),
             shared_network: None,
+            tailscale_mode: None,
             mcps: Vec::new(),
         }
     }
@@ -390,6 +420,7 @@ impl WorkspaceStore {
                     skills: Vec::new(),
                     plugins: Vec::new(),
                     shared_network: None, // Default to shared network
+                    tailscale_mode: None,
                     mcps: Vec::new(),
                     config_profile: None,
                 };

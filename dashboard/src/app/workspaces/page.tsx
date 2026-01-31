@@ -22,6 +22,7 @@ import {
   type SkillSummary,
   type WorkspaceDebugInfo,
   type InitLogResponse,
+  type TailscaleMode,
 } from '@/lib/api';
 import {
   Plus,
@@ -85,6 +86,7 @@ export default function WorkspacesPage() {
   const [envRows, setEnvRows] = useState<EnvRow[]>([]);
   const [initScript, setInitScript] = useState('');
   const [sharedNetwork, setSharedNetwork] = useState<boolean | null>(null);
+  const [tailscaleMode, setTailscaleMode] = useState<TailscaleMode | null>(null);
   const [savingWorkspace, setSavingWorkspace] = useState(false);
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [templateName, setTemplateName] = useState('');
@@ -164,6 +166,7 @@ export default function WorkspacesPage() {
       setEnvRows(toEnvRows(selectedWorkspace.env_vars ?? {}));
       setInitScript(selectedWorkspace.init_script ?? '');
       setSharedNetwork(selectedWorkspace.shared_network ?? null);
+      setTailscaleMode(selectedWorkspace.tailscale_mode ?? null);
       setSelectedSkills(selectedWorkspace.skills ?? []);
       setTemplateName(`${selectedWorkspace.name}-template`);
       setTemplateDescription('');
@@ -348,6 +351,7 @@ export default function WorkspacesPage() {
         init_script: initScript,
         skills: selectedSkills,
         shared_network: sharedNetwork,
+        tailscale_mode: tailscaleMode,
       });
       setSelectedWorkspace(updated);
       await mutateWorkspaces();
@@ -650,6 +654,36 @@ export default function WorkspacesPage() {
                             ? "Enabled"
                             : "Disabled (isolated)"}
                       </p>
+
+                      {/* Tailscale Mode - only show when shared_network is disabled */}
+                      {sharedNetwork === false && (
+                        <div className="mt-3 pt-3 border-t border-white/[0.05]">
+                          <p className="text-xs text-white/60 font-medium mb-1">Tailscale Mode</p>
+                          <p className="text-[10px] text-white/30 mb-2">
+                            How to route traffic when Tailscale is configured (via TS_AUTHKEY).
+                          </p>
+                          <select
+                            value={tailscaleMode || 'exit_node'}
+                            onChange={(e) => setTailscaleMode(e.target.value as TailscaleMode)}
+                            className="w-full px-2.5 py-1.5 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer"
+                            style={{
+                              backgroundImage:
+                                "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
+                              backgroundPosition: 'right 0.5rem center',
+                              backgroundRepeat: 'no-repeat',
+                              backgroundSize: '1em 1em',
+                            }}
+                          >
+                            <option value="exit_node">Exit Node (route all traffic via Tailscale)</option>
+                            <option value="tailnet_only">Tailnet Only (host internet, Tailscale for devices)</option>
+                          </select>
+                          <p className="text-[10px] text-white/25 mt-1.5">
+                            {tailscaleMode === 'tailnet_only'
+                              ? "Use host gateway for internet, Tailscale only for tailnet devices."
+                              : "Route all traffic through Tailscale exit node (requires TS_EXIT_NODE)."}
+                          </p>
+                        </div>
+                      )}
                     </div>
                   )}
 

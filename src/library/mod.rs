@@ -51,6 +51,9 @@ struct WorkspaceTemplateConfig {
     /// Whether to share the host network (default: true).
     #[serde(default)]
     shared_network: Option<bool>,
+    /// Tailscale networking mode (only relevant when shared_network is false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tailscale_mode: Option<crate::workspace::TailscaleMode>,
     /// MCP server names to enable for workspaces created from this template.
     #[serde(default)]
     mcps: Vec<String>,
@@ -1227,6 +1230,7 @@ impl LibraryStore {
             init_scripts: config.init_scripts,
             init_script: config.init_script,
             shared_network: config.shared_network,
+            tailscale_mode: config.tailscale_mode,
             mcps: config.mcps,
             config_profile: config.config_profile,
         })
@@ -1278,6 +1282,7 @@ impl LibraryStore {
             init_scripts: template.init_scripts.clone(),
             init_script: template.init_script.clone(),
             shared_network: template.shared_network,
+            tailscale_mode: template.tailscale_mode,
             mcps: template.mcps.clone(),
             config_profile: template.config_profile.clone(),
         };

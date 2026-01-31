@@ -20,6 +20,7 @@ import {
   type InitScriptSummary,
   type InitScript,
   type ConfigProfileSummary,
+  type TailscaleMode,
 } from '@/lib/api';
 import {
   GitBranch,
@@ -66,6 +67,7 @@ const buildSnapshot = (data: {
   initScripts: string[];
   initScript: string;
   sharedNetwork: boolean | null;
+  tailscaleMode: TailscaleMode | null;
   configProfile: string | null;
 }) =>
   JSON.stringify({
@@ -76,6 +78,7 @@ const buildSnapshot = (data: {
     initScripts: data.initScripts,
     initScript: data.initScript,
     sharedNetwork: data.sharedNetwork,
+    tailscaleMode: data.tailscaleMode,
     configProfile: data.configProfile,
   });
 
@@ -118,6 +121,7 @@ export default function WorkspaceTemplatesPage() {
   const [selectedInitScripts, setSelectedInitScripts] = useState<string[]>([]);
   const [initScript, setInitScript] = useState('');
   const [sharedNetwork, setSharedNetwork] = useState<boolean | null>(null);
+  const [tailscaleMode, setTailscaleMode] = useState<TailscaleMode | null>(null);
   const [configProfile, setConfigProfile] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -159,9 +163,10 @@ export default function WorkspaceTemplatesPage() {
         initScripts: selectedInitScripts,
         initScript,
         sharedNetwork,
+        tailscaleMode,
         configProfile,
       }),
-    [description, distro, selectedSkills, envRows, selectedInitScripts, initScript, sharedNetwork, configProfile]
+    [description, distro, selectedSkills, envRows, selectedInitScripts, initScript, sharedNetwork, tailscaleMode, configProfile]
   );
 
   useEffect(() => {
@@ -266,6 +271,7 @@ export default function WorkspaceTemplatesPage() {
       setSelectedInitScripts(template.init_scripts || []);
       setInitScript(template.init_script || '');
       setSharedNetwork(template.shared_network ?? null);
+      setTailscaleMode(template.tailscale_mode ?? null);
       setConfigProfile(template.config_profile ?? null);
       baselineRef.current = buildSnapshot({
         description: template.description || '',
@@ -275,6 +281,7 @@ export default function WorkspaceTemplatesPage() {
         initScripts: template.init_scripts || [],
         initScript: template.init_script || '',
         sharedNetwork: template.shared_network ?? null,
+        tailscaleMode: template.tailscale_mode ?? null,
         configProfile: template.config_profile ?? null,
       });
       setDirty(false);
@@ -314,6 +321,7 @@ export default function WorkspaceTemplatesPage() {
         init_scripts: selectedInitScripts,
         init_script: initScript,
         shared_network: sharedNetwork,
+        tailscale_mode: tailscaleMode,
         config_profile: configProfile ?? undefined,
       });
       baselineRef.current = snapshot;
@@ -364,6 +372,7 @@ export default function WorkspaceTemplatesPage() {
       setSelectedInitScripts([]);
       setInitScript('');
       setSharedNetwork(null);
+      setTailscaleMode(null);
       setConfigProfile(null);
       setDirty(false);
       await loadTemplates();
@@ -992,6 +1001,36 @@ set -e
                             ? "Enabled"
                             : "Disabled (isolated)"}
                       </p>
+
+                      {/* Tailscale Mode - only show when shared_network is disabled */}
+                      {sharedNetwork === false && (
+                        <div className="mt-4 pt-4 border-t border-white/[0.05]">
+                          <label className="text-xs text-white/40 block mb-2">Tailscale Mode</label>
+                          <p className="text-[10px] text-white/25 mb-3">
+                            How to handle networking when Tailscale is configured via TS_AUTHKEY.
+                          </p>
+                          <select
+                            value={tailscaleMode || 'exit_node'}
+                            onChange={(e) => setTailscaleMode(e.target.value as TailscaleMode)}
+                            className="w-full px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer"
+                            style={{
+                              backgroundImage:
+                                "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
+                              backgroundPosition: 'right 0.75rem center',
+                              backgroundRepeat: 'no-repeat',
+                              backgroundSize: '1.25em 1.25em',
+                            }}
+                          >
+                            <option value="exit_node">Exit Node (route all traffic via Tailscale)</option>
+                            <option value="tailnet_only">Tailnet Only (use host internet, Tailscale for device access)</option>
+                          </select>
+                          <p className="text-[10px] text-white/30 mt-2">
+                            {tailscaleMode === 'tailnet_only'
+                              ? "Internet via host gateway, Tailscale only for accessing tailnet devices."
+                              : "All traffic routed through Tailscale exit node (requires TS_EXIT_NODE)."}
+                          </p>
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}

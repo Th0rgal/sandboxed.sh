@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::workspace::TailscaleMode;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MCP Server Types (OpenCode-aligned format)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,6 +170,11 @@ pub struct WorkspaceTemplate {
     /// Set to false for isolated networking (e.g., Tailscale).
     #[serde(default)]
     pub shared_network: Option<bool>,
+    /// Tailscale networking mode when shared_network is false.
+    /// - `exit_node`: Route all traffic through Tailscale exit node
+    /// - `tailnet_only`: Connect to tailnet but use host gateway for internet
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailscale_mode: Option<TailscaleMode>,
     /// MCP server names to enable for workspaces created from this template.
     /// Empty = use default MCPs (those with `default_enabled = true`).
     #[serde(default)]

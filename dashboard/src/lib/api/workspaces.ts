@@ -10,6 +10,7 @@ import { apiGet, apiPost, apiPut, apiDel, apiFetch } from "./core";
 
 export type WorkspaceType = "host" | "container";
 export type WorkspaceStatus = "pending" | "building" | "ready" | "error";
+export type TailscaleMode = "exit_node" | "tailnet_only";
 
 export interface Workspace {
   id: string;
@@ -26,6 +27,7 @@ export interface Workspace {
   env_vars: Record<string, string>;
   init_script?: string | null;
   shared_network?: boolean | null;
+  tailscale_mode?: TailscaleMode | null;
 }
 
 export type ContainerDistro =
@@ -86,6 +88,7 @@ export async function createWorkspace(data: {
   env_vars?: Record<string, string>;
   init_script?: string;
   shared_network?: boolean | null;
+  tailscale_mode?: TailscaleMode | null;
 }): Promise<Workspace> {
   return apiPost("/api/workspaces", data, "Failed to create workspace");
 }
@@ -101,6 +104,7 @@ export async function updateWorkspace(
     env_vars?: Record<string, string>;
     init_script?: string | null;
     shared_network?: boolean | null;
+    tailscale_mode?: TailscaleMode | null;
   }
 ): Promise<Workspace> {
   return apiPut(`/api/workspaces/${id}`, data, "Failed to update workspace");

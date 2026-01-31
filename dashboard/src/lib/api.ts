@@ -1438,6 +1438,8 @@ export interface WorkspaceTemplateSummary {
   init_scripts?: string[];
 }
 
+export type TailscaleMode = "exit_node" | "tailnet_only";
+
 export interface WorkspaceTemplate {
   name: string;
   description?: string;
@@ -1449,6 +1451,7 @@ export interface WorkspaceTemplate {
   init_scripts: string[];
   init_script: string;
   shared_network?: boolean | null;
+  tailscale_mode?: TailscaleMode | null;
   config_profile?: string;
 }
 
@@ -1471,6 +1474,7 @@ export async function saveWorkspaceTemplate(
     init_scripts?: string[];
     init_script?: string;
     shared_network?: boolean | null;
+    tailscale_mode?: TailscaleMode | null;
     config_profile?: string;
   }
 ): Promise<void> {
@@ -1494,6 +1498,7 @@ export async function renameWorkspaceTemplate(oldName: string, newName: string):
     init_scripts: template.init_scripts,
     init_script: template.init_script,
     shared_network: template.shared_network,
+    tailscale_mode: template.tailscale_mode,
   });
   // Delete old template
   await deleteWorkspaceTemplate(oldName);

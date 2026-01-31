@@ -356,6 +356,8 @@ pub struct SaveWorkspaceTemplateRequest {
     /// Whether to share the host network (default: true).
     /// Set to false for isolated networking (e.g., Tailscale).
     pub shared_network: Option<bool>,
+    /// Tailscale networking mode (only relevant when shared_network is false).
+    pub tailscale_mode: Option<crate::workspace::TailscaleMode>,
     /// MCP server names to enable for workspaces created from this template.
     #[serde(default)]
     pub mcps: Option<Vec<String>>,
@@ -1284,6 +1286,7 @@ async fn save_workspace_template(
         init_scripts: req.init_scripts.unwrap_or_default(),
         init_script: req.init_script.unwrap_or_default(),
         shared_network: req.shared_network,
+        tailscale_mode: req.tailscale_mode,
         mcps: req.mcps.unwrap_or_default(),
         config_profile: req.config_profile.clone(),
     };
