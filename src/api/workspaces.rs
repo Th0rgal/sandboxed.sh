@@ -1061,11 +1061,7 @@ async fn exec_workspace_command(
                 // Export TS_* env vars for the bootstrap script
                 for (k, v) in &workspace.env_vars {
                     if k.starts_with("TS_") && !v.trim().is_empty() {
-                        bootstrap_cmd.push_str(&format!(
-                            "export {}={}; ",
-                            k,
-                            shell_escape(v)
-                        ));
+                        bootstrap_cmd.push_str(&format!("export {}={}; ", k, shell_escape(v)));
                     }
                 }
 
@@ -1073,7 +1069,7 @@ async fn exec_workspace_command(
                 bootstrap_cmd.push_str(
                     "if [ -x /usr/local/bin/sandboxed-tailscale-up ]; then \
                      /usr/local/bin/sandboxed-tailscale-up >/dev/null 2>&1 || true; \
-                     fi; "
+                     fi; ",
                 );
 
                 // For tailnet_only mode, set up host gateway routing for internet
@@ -1092,7 +1088,10 @@ async fn exec_workspace_command(
                 }
 
                 // Change to working directory and run the actual command
-                bootstrap_cmd.push_str(&format!("cd {} 2>/dev/null || true; ", shell_escape(&rel_cwd)));
+                bootstrap_cmd.push_str(&format!(
+                    "cd {} 2>/dev/null || true; ",
+                    shell_escape(&rel_cwd)
+                ));
                 bootstrap_cmd.push_str(&req.command);
 
                 bootstrap_cmd
@@ -1100,11 +1099,7 @@ async fn exec_workspace_command(
                 req.command.clone()
             };
 
-            nspawn_args.extend([
-                "/bin/bash".to_string(),
-                "-c".to_string(),
-                final_command,
-            ]);
+            nspawn_args.extend(["/bin/bash".to_string(), "-c".to_string(), final_command]);
 
             ("systemd-nspawn".to_string(), nspawn_args)
         }
