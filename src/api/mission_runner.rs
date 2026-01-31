@@ -1778,6 +1778,10 @@ pub fn run_claudecode_turn<'a>(
 
         let auth_missing = api_auth.is_none();
         let auth_timeout = std::time::Duration::from_secs(45);
+        // General inactivity timeout - if no output for 5 minutes, something is likely wrong
+        let inactivity_timeout = std::time::Duration::from_secs(300);
+        let mut received_any_event = false;
+        let mut last_activity = std::time::Instant::now();
 
         // Create a buffered reader for stdout
         let reader = BufReader::new(stdout);
@@ -1785,7 +1789,18 @@ pub fn run_claudecode_turn<'a>(
 
         // Process events until completion or cancellation
         loop {
-            let mut timeout = tokio::time::sleep(auth_timeout);
+            // Use auth timeout initially (45s), then inactivity timeout (5min) after first event
+            let timeout_duration = if received_any_event {
+                inactivity_timeout
+            } else if auth_missing {
+                auth_timeout
+            } else {
+                // Initial startup timeout - allow 2 minutes for CLI to start and connect
+                std::time::Duration::from_secs(120)
+            };
+            let time_since_activity = last_activity.elapsed();
+            let remaining = timeout_duration.saturating_sub(time_since_activity);
+            let mut timeout = tokio::time::sleep(remaining);
             tokio::pin!(timeout);
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -1798,14 +1813,47 @@ pub fn run_claudecode_turn<'a>(
                     return AgentResult::failure("Cancelled".to_string(), 0)
                         .with_terminal_reason(TerminalReason::Cancelled);
                 }
-                _ = &mut timeout, if auth_missing => {
-                    let err_msg = "Claude Code produced no output. No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
+                _ = &mut timeout => {
+                    // Timeout fired - determine the appropriate error message
+                    let stderr_content = stderr_capture.lock().await;
+                    let has_network_error = stderr_content.contains("Could not resolve host")
+                        || stderr_content.contains("Connection refused")
+                        || stderr_content.contains("Network is unreachable")
+                        || stderr_content.contains("DNS")
+                        || stderr_content.contains("ENOTFOUND")
+                        || stderr_content.contains("getaddrinfo");
+
+                    let err_msg = if !received_any_event && auth_missing {
+                        "Claude Code produced no output. No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.".to_string()
+                    } else if has_network_error {
+                        format!(
+                            "Claude Code appears stuck due to network issues. Check workspace DNS/network configuration. Stderr: {}",
+                            if stderr_content.len() > 500 { &stderr_content[..500] } else { &stderr_content }
+                        )
+                    } else if !received_any_event {
+                        let stderr_hint = if stderr_content.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" Stderr: {}", if stderr_content.len() > 500 { &stderr_content[..500] } else { &stderr_content })
+                        };
+                        format!(
+                            "Claude Code produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.{}",
+                            timeout_duration.as_secs(),
+                            stderr_hint
+                        )
+                    } else {
+                        format!(
+                            "Claude Code stopped responding after {}s of inactivity. This may indicate a network issue or API timeout.",
+                            inactivity_timeout.as_secs()
+                        )
+                    };
+
                     tracing::warn!(mission_id = %mission_id, "{}", err_msg);
                     let _ = child.kill().await;
                     if let Some(handle) = stderr_handle.take() {
                         handle.abort();
                     }
-                    return AgentResult::failure(err_msg.to_string(), 0)
+                    return AgentResult::failure(err_msg, 0)
                         .with_terminal_reason(TerminalReason::LlmError);
                 }
                 line_result = lines.next_line() => {
@@ -1832,6 +1880,10 @@ pub fn run_claudecode_turn<'a>(
                                     continue;
                                 }
                             };
+
+                            // Track activity for timeout detection
+                            received_any_event = true;
+                            last_activity = std::time::Instant::now();
 
                             match claude_event {
                                 ClaudeEvent::System(sys) => {
@@ -4957,7 +5009,24 @@ pub async fn run_opencode_turn(
     let stdout_reader = BufReader::new(stdout);
     let mut stdout_lines = stdout_reader.lines();
     let mut state = OpencodeSseState::default();
+
+    // Timeout handling for stalled missions
+    let startup_timeout = std::time::Duration::from_secs(120);
+    let inactivity_timeout = std::time::Duration::from_secs(300);
+    let mut received_any_event = false;
+    let mut last_activity = std::time::Instant::now();
+
     loop {
+        let timeout_duration = if received_any_event {
+            inactivity_timeout
+        } else {
+            startup_timeout
+        };
+        let time_since_activity = last_activity.elapsed();
+        let remaining = timeout_duration.saturating_sub(time_since_activity);
+        let mut timeout = tokio::time::sleep(remaining);
+        tokio::pin!(timeout);
+
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!(mission_id = %mission_id, "OpenCode execution cancelled, killing process");
@@ -4967,6 +5036,26 @@ pub async fn run_opencode_turn(
                 }
                 return AgentResult::failure("Cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
+            }
+            _ = &mut timeout => {
+                let err_msg = if !received_any_event {
+                    format!(
+                        "OpenCode produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.",
+                        startup_timeout.as_secs()
+                    )
+                } else {
+                    format!(
+                        "OpenCode stopped responding after {}s of inactivity. This may indicate a network issue or API timeout.",
+                        inactivity_timeout.as_secs()
+                    )
+                };
+                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
+                let _ = child.kill().await;
+                if let Some(handle) = stderr_handle {
+                    handle.abort();
+                }
+                return AgentResult::failure(err_msg, 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
             }
             line_result = stdout_lines.next_line() => {
                 match line_result {
@@ -4982,6 +5071,10 @@ pub async fn run_opencode_turn(
 
                         // Try to parse as JSON event
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                            // Track activity for timeout detection
+                            received_any_event = true;
+                            last_activity = std::time::Instant::now();
+
                             let event_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
                             tracing::debug!(
                                 mission_id = %mission_id,
@@ -5497,8 +5590,24 @@ pub async fn run_amp_turn(
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
 
+    // Timeout handling for stalled missions
+    let startup_timeout = std::time::Duration::from_secs(120);
+    let inactivity_timeout = std::time::Duration::from_secs(300);
+    let mut received_any_event = false;
+    let mut last_activity = std::time::Instant::now();
+
     // Process events until completion or cancellation
     loop {
+        let timeout_duration = if received_any_event {
+            inactivity_timeout
+        } else {
+            startup_timeout
+        };
+        let time_since_activity = last_activity.elapsed();
+        let remaining = timeout_duration.saturating_sub(time_since_activity);
+        let mut timeout = tokio::time::sleep(remaining);
+        tokio::pin!(timeout);
+
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!(mission_id = %mission_id, "Amp execution cancelled, killing process");
@@ -5508,6 +5617,26 @@ pub async fn run_amp_turn(
                 }
                 return AgentResult::failure("Cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
+            }
+            _ = &mut timeout => {
+                let err_msg = if !received_any_event {
+                    format!(
+                        "Amp produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.",
+                        startup_timeout.as_secs()
+                    )
+                } else {
+                    format!(
+                        "Amp stopped responding after {}s of inactivity. This may indicate a network issue or API timeout.",
+                        inactivity_timeout.as_secs()
+                    )
+                };
+                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
+                let _ = child.kill().await;
+                if let Some(handle) = stderr_handle {
+                    handle.abort();
+                }
+                return AgentResult::failure(err_msg, 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
             }
             line_result = lines.next_line() => {
                 match line_result {
@@ -5528,6 +5657,10 @@ pub async fn run_amp_turn(
                                 continue;
                             }
                         };
+
+                        // Track activity for timeout detection
+                        received_any_event = true;
+                        last_activity = std::time::Instant::now();
 
                         match amp_event {
                             AmpEvent::System(sys) => {
