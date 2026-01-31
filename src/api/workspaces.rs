@@ -93,6 +93,8 @@ pub struct UpdateWorkspaceRequest {
     pub env_vars: Option<HashMap<String, String>>,
     /// Init script to run when the workspace is built/rebuilt
     pub init_script: Option<String>,
+    /// Init script fragment names to include (executed in order)
+    pub init_scripts: Option<Vec<String>>,
     /// Whether to share the host network (default: true).
     /// Set to false for isolated networking (e.g., Tailscale).
     pub shared_network: Option<bool>,
@@ -565,6 +567,11 @@ async fn update_workspace(
 
     if let Some(init_script) = req.init_script {
         workspace.init_script = normalize_init_script(Some(init_script));
+    }
+
+    // Update init_scripts (fragment names) if provided
+    if let Some(init_scripts) = req.init_scripts {
+        workspace.init_scripts = init_scripts;
     }
 
     // Update shared_network if explicitly set in the request.

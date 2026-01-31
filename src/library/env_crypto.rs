@@ -158,6 +158,46 @@ pub fn decrypt_env_vars(
     Ok(decrypted)
 }
 
+/// Result of graceful decryption
+pub struct GracefulDecryptResult {
+    pub env_vars: HashMap<String, String>,
+    pub failed_keys: Vec<String>,
+}
+
+/// Decrypt all values in an env_vars HashMap, handling failures gracefully.
+/// Values that fail to decrypt are returned with a special marker prefix.
+/// Returns both the (possibly partially decrypted) env vars and a list of keys that failed.
+pub fn decrypt_env_vars_graceful(
+    key: &[u8; KEY_LENGTH],
+    env_vars: &HashMap<String, String>,
+) -> GracefulDecryptResult {
+    let mut decrypted = HashMap::with_capacity(env_vars.len());
+    let mut failed_keys = Vec::new();
+
+    for (k, v) in env_vars {
+        match decrypt_value(key, v) {
+            Ok(plaintext) => {
+                decrypted.insert(k.clone(), plaintext);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    key = %k,
+                    error = %e,
+                    "Failed to decrypt env var, marking as failed"
+                );
+                // Keep the original encrypted value with a failure marker
+                decrypted.insert(k.clone(), format!("[DECRYPTION_FAILED]{}", v));
+                failed_keys.push(k.clone());
+            }
+        }
+    }
+
+    GracefulDecryptResult {
+        env_vars: decrypted,
+        failed_keys,
+    }
+}
+
 /// Load the encryption key from environment.
 /// Returns None if PRIVATE_KEY is not set.
 pub fn load_private_key_from_env() -> Result<Option<[u8; KEY_LENGTH]>> {

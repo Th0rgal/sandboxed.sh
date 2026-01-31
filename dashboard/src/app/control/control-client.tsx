@@ -2878,6 +2878,18 @@ export default function ControlClient() {
           getQueue().catch(() => []), // Don't fail if queue unavailable
         ]);
         if (cancelled || fetchingMissionIdRef.current !== id) return;
+        // Mission not found (404) - clear state and URL param without showing error
+        if (!mission) {
+          setViewingMissionId(null);
+          setViewingMission(null);
+          setCurrentMission(null);
+          setItems([]);
+          setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
+          setHasDesktopSession(false);
+          setLastMissionId(null); // Clear stale last mission ID from localStorage
+          router.replace("/control", { scroll: false });
+          return;
+        }
         setCurrentMission(mission);
         setViewingMission(mission);
         // Use events if available, otherwise fall back to basic history
@@ -2997,6 +3009,7 @@ export default function ControlClient() {
     applyDesktopSessionState,
     applyDesktopSessionFromEvents,
     authRetryTrigger,
+    setLastMissionId,
   ]);
 
   useEffect(() => {
@@ -4300,6 +4313,10 @@ export default function ControlClient() {
       try {
         console.debug("[control] syncing mission before send", { targetMissionId });
         const mission = await loadMission(targetMissionId);
+        if (!mission) {
+          toast.error("Mission not found");
+          return;
+        }
         setCurrentMission(mission);
         setViewingMission(mission);
         setViewingMissionId(mission.id);
@@ -4387,6 +4404,12 @@ export default function ControlClient() {
     if (targetMissionId) {
       try {
         let mission = await loadMission(targetMissionId);
+
+        if (!mission) {
+          toast.error("Mission not found");
+          submittingRef.current = false;
+          return;
+        }
 
         // If the mission is in a resumable state (failed/interrupted/blocked),
         // resume it first to update the status before sending the message.

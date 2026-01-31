@@ -1193,17 +1193,46 @@ impl LibraryStore {
             .values()
             .any(|v| env_crypto::is_encrypted(v));
 
-        let env_vars = if has_encrypted {
+        let (env_vars, decryption_failed_keys) = if has_encrypted {
             // Try to load key from env var or file
-            let key = env_crypto::ensure_private_key()
-                .await
-                .context("Failed to load encryption key for decrypting template env vars")?;
-            env_crypto::decrypt_env_vars(&key, &config.env_vars)
-                .context("Failed to decrypt template env vars")?
+            match env_crypto::ensure_private_key().await {
+                Ok(key) => {
+                    // Use graceful decryption that handles individual failures
+                    let result = env_crypto::decrypt_env_vars_graceful(&key, &config.env_vars);
+                    (result.env_vars, result.failed_keys)
+                }
+                Err(e) => {
+                    // No key available - mark all encrypted values as failed
+                    tracing::warn!(
+                        error = %e,
+                        "No encryption key available, marking all encrypted env vars as failed"
+                    );
+                    let mut env_vars = HashMap::new();
+                    let mut failed_keys = Vec::new();
+                    for (k, v) in &config.env_vars {
+                        if env_crypto::is_encrypted(v) {
+                            env_vars.insert(k.clone(), format!("[DECRYPTION_FAILED]{}", v));
+                            failed_keys.push(k.clone());
+                        } else {
+                            env_vars.insert(k.clone(), v.clone());
+                        }
+                    }
+                    (env_vars, failed_keys)
+                }
+            }
         } else {
             // No encrypted values, pass through as-is
-            config.env_vars.clone()
+            (config.env_vars.clone(), Vec::new())
         };
+
+        // Log if any decryption failures occurred
+        if !decryption_failed_keys.is_empty() {
+            tracing::warn!(
+                template = %name,
+                failed_keys = ?decryption_failed_keys,
+                "Some env vars failed to decrypt - they will need to be re-entered"
+            );
+        }
 
         // Determine encrypted_keys: use stored list if available, otherwise detect from values
         // (for backwards compatibility with old templates where all vars were encrypted)
@@ -1435,9 +1464,24 @@ impl LibraryStore {
         assembled.push_str("#!/usr/bin/env bash\n");
         assembled.push_str("# Auto-assembled init script from fragments\n\n");
 
-        // Add each fragment
+        // Add each fragment (skip missing ones with a warning)
         for name in fragment_names {
-            let script = self.get_init_script(name).await?;
+            let script = match self.get_init_script(name).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        fragment = %name,
+                        error = %e,
+                        "Init script fragment not found, skipping"
+                    );
+                    // Add a comment in the assembled script noting the skip
+                    assembled.push_str(&format!(
+                        "\n# === {} === (SKIPPED: not found in library)\n",
+                        name
+                    ));
+                    continue;
+                }
+            };
 
             // Add header for this fragment
             assembled.push_str(&format!("\n# === {} ===\n", name));

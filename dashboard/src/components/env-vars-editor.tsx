@@ -1,7 +1,10 @@
 'use client';
 
-import { Eye, EyeOff, FileText, X, Lock, Unlock } from 'lucide-react';
+import { Eye, EyeOff, FileText, X, Lock, Unlock, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+
+/** Marker prefix for values that failed to decrypt */
+const DECRYPTION_FAILED_PREFIX = '[DECRYPTION_FAILED]';
 
 export type EnvRow = {
   id: string;
@@ -10,6 +13,8 @@ export type EnvRow = {
   secret: boolean;
   visible: boolean;
   encrypted: boolean;
+  /** True if this value failed to decrypt (wrong key or missing key) */
+  decryptionFailed: boolean;
 };
 
 const SENSITIVE_PATTERNS = [
@@ -25,6 +30,8 @@ export const isSensitiveKey = (key: string): boolean => {
 export const toEnvRows = (env: Record<string, string>, encryptedKeys?: string[]): EnvRow[] =>
   Object.entries(env).map(([key, value]) => {
     const secret = isSensitiveKey(key);
+    // Check if value failed to decrypt
+    const decryptionFailed = value.startsWith(DECRYPTION_FAILED_PREFIX);
     // If encryptedKeys is provided and non-empty, use it as the source of truth.
     // Otherwise fall back to auto-detection based on key name patterns (secret).
     // This ensures sensitive keys show as "will be encrypted" by default.
@@ -34,10 +41,12 @@ export const toEnvRows = (env: Record<string, string>, encryptedKeys?: string[])
     return {
       id: `${key}-${Math.random().toString(36).slice(2, 8)}`,
       key,
-      value,
+      // Strip the failed prefix from display - user needs to re-enter the value
+      value: decryptionFailed ? '' : value,
       secret,
       visible: !(secret || encrypted), // Hide if secret OR encrypted
       encrypted,
+      decryptionFailed,
     };
   });
 
@@ -54,6 +63,10 @@ export const envRowsToMap = (rows: EnvRow[]): Record<string, string> => {
 export const getEncryptedKeys = (rows: EnvRow[]): string[] =>
   rows.filter((row) => row.encrypted && row.key.trim()).map((row) => row.key.trim());
 
+/** Check if any rows have decryption failures */
+export const hasDecryptionFailures = (rows: EnvRow[]): boolean =>
+  rows.some((row) => row.decryptionFailed);
+
 export const createEmptyEnvRow = (): EnvRow => ({
   id: Math.random().toString(36).slice(2),
   key: '',
@@ -61,6 +74,7 @@ export const createEmptyEnvRow = (): EnvRow => ({
   secret: false,
   visible: true,
   encrypted: false,
+  decryptionFailed: false,
 });
 
 interface EnvVarsEditorProps {
@@ -88,7 +102,7 @@ export function EnvVarsEditor({ rows, onChange, className, description, showEncr
         if (r.id !== id) return r;
         // When key changes and becomes sensitive, auto-enable encryption
         const newEncrypted = newSecret ? true : r.encrypted;
-        return { ...r, key: newKey, secret: newSecret, visible: newSecret ? r.visible : true, encrypted: newEncrypted };
+        return { ...r, key: newKey, secret: newSecret, visible: newSecret ? r.visible : true, encrypted: newEncrypted, decryptionFailed: false };
       })
     );
   };
@@ -103,7 +117,7 @@ export function EnvVarsEditor({ rows, onChange, className, description, showEncr
   };
 
   const handleValueChange = (id: string, newValue: string) => {
-    onChange(rows.map((r) => (r.id === id ? { ...r, value: newValue } : r)));
+    onChange(rows.map((r) => (r.id === id ? { ...r, value: newValue, decryptionFailed: false } : r)));
   };
 
   const handleToggleVisibility = (id: string) => {
@@ -158,11 +172,24 @@ export function EnvVarsEditor({ rows, onChange, className, description, showEncr
                     )}
                   </button>
                 )}
+                {row.decryptionFailed && (
+                  <div
+                    className="p-2 text-red-400"
+                    title="Decryption failed - please re-enter this value"
+                  >
+                    <AlertTriangle className="h-3.5 w-3.5" />
+                  </div>
+                )}
                 <input
                   value={row.key}
                   onChange={(e) => handleKeyChange(row.id, e.target.value)}
                   placeholder="KEY"
-                  className="flex-1 px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50"
+                  className={cn(
+                    "flex-1 px-3 py-2 rounded-lg bg-black/20 border text-xs text-white placeholder:text-white/30 focus:outline-none",
+                    row.decryptionFailed
+                      ? "border-red-500/50 focus:border-red-500"
+                      : "border-white/[0.06] focus:border-indigo-500/50"
+                  )}
                 />
                 <span className="text-white/20">=</span>
                 <div className="flex-1 relative">
@@ -170,9 +197,12 @@ export function EnvVarsEditor({ rows, onChange, className, description, showEncr
                     type={(row.encrypted || row.secret) && !row.visible ? 'password' : 'text'}
                     value={row.value}
                     onChange={(e) => handleValueChange(row.id, e.target.value)}
-                    placeholder="value"
+                    placeholder={row.decryptionFailed ? "Re-enter value (decryption failed)" : "value"}
                     className={cn(
-                      "w-full px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50",
+                      "w-full px-3 py-2 rounded-lg bg-black/20 border text-xs text-white placeholder:text-white/30 focus:outline-none",
+                      row.decryptionFailed
+                        ? "border-red-500/50 focus:border-red-500 placeholder:text-red-400/50"
+                        : "border-white/[0.06] focus:border-indigo-500/50",
                       (row.encrypted || row.secret) && "pr-8"
                     )}
                   />

@@ -4,6 +4,7 @@ import "./globals.css";
 import { Sidebar } from "@/components/sidebar";
 import { AuthGate } from "@/components/auth-gate";
 import { LibraryProvider } from "@/contexts/library-context";
+import { MissionSwitcherProvider } from "@/contexts/mission-switcher-context";
 import { ToastProvider } from "@/components/toast";
 
 const geistSans = Geist({
@@ -37,8 +38,10 @@ export default function RootLayout({
         <AuthGate>
           <ToastProvider>
             <LibraryProvider>
-              <Sidebar />
-              <main className="ml-56 min-h-screen">{children}</main>
+              <MissionSwitcherProvider>
+                <Sidebar />
+                <main className="ml-56 min-h-screen">{children}</main>
+              </MissionSwitcherProvider>
             </LibraryProvider>
           </ToastProvider>
         </AuthGate>

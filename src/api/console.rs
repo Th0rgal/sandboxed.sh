@@ -789,12 +789,28 @@ async fn handle_new_workspace_shell(
 
             // Try to use bash if available, fallback to sh
             let bash_path = workspace.path.join("bin/bash");
-            if bash_path.exists() {
-                cmd.arg("/bin/bash");
+            let shell = if bash_path.exists() {
+                "/bin/bash"
+            } else {
+                "/bin/sh"
+            };
+
+            // When tailscale networking is enabled, run the bootstrap script first
+            // to set up DNS and tailscale connection before the interactive shell
+            if nspawn::tailscale_enabled(&workspace.env_vars) {
+                cmd.arg(shell);
+                cmd.arg("-c");
+                // Run tailscale bootstrap, then exec to interactive shell
+                cmd.arg(format!(
+                    "/usr/local/bin/openagent-tailscale-up 2>/dev/null; exec {} --login -i",
+                    shell
+                ));
+            } else if shell == "/bin/bash" {
+                cmd.arg(shell);
                 cmd.arg("--login");
                 cmd.arg("-i");
             } else {
-                cmd.arg("/bin/sh");
+                cmd.arg(shell);
                 cmd.arg("-i");
             }
             cmd

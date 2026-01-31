@@ -1422,7 +1422,14 @@ pub async fn load_mission(
             )
         })?
         .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(|e| {
+            // Return 404 if mission was not found
+            if e.contains("not found") {
+                (StatusCode::NOT_FOUND, e)
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e)
+            }
+        })
 }
 
 /// Set mission status (completed/failed).

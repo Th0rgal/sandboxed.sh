@@ -128,8 +128,11 @@ export async function createMission(
   return res.json();
 }
 
-export async function loadMission(id: string): Promise<Mission> {
-  return apiPost(`/api/control/missions/${id}/load`, undefined, "Failed to load mission");
+export async function loadMission(id: string): Promise<Mission | null> {
+  const res = await apiFetch(`/api/control/missions/${id}/load`, { method: "POST" });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error("Failed to load mission");
+  return res.json();
 }
 
 export async function getRunningMissions(): Promise<RunningMissionInfo[]> {
