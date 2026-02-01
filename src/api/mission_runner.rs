@@ -2132,8 +2132,8 @@ pub fn run_claudecode_turn<'a>(
                                             let result_value = if let Some(ref extra) = evt.tool_use_result {
                                                 serde_json::json!({
                                                     "content": content_str,
-                                                    "stdout": extra.stdout,
-                                                    "stderr": extra.stderr,
+                                                    "stdout": extra.stdout(),
+                                                    "stderr": extra.stderr(),
                                                     "is_error": is_error,
                                                 })
                                             } else {
@@ -6213,10 +6213,10 @@ pub async fn run_amp_turn(
                                         let result_value = if let Some(ref extra) = evt.tool_use_result {
                                             serde_json::json!({
                                                 "content": content_str,
-                                                "stdout": extra.stdout,
-                                                "stderr": extra.stderr,
+                                                "stdout": extra.stdout(),
+                                                "stderr": extra.stderr(),
                                                 "is_error": is_error,
-                                                "interrupted": extra.interrupted,
+                                                "interrupted": extra.interrupted(),
                                             })
                                         } else {
                                             serde_json::json!(content_str)

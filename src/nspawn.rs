@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 #[derive(Debug, Error)]
@@ -629,6 +631,145 @@ pub async fn execute_in_container(
     })?;
 
     Ok(output)
+}
+
+/// Execute a command inside a container, streaming stdout/stderr to a log file in real-time.
+/// Returns the exit status after the command completes.
+pub async fn execute_in_container_streaming(
+    path: &Path,
+    command: &[String],
+    config: &NspawnConfig,
+    log_file: &Path,
+) -> NspawnResult<std::process::ExitStatus> {
+    use std::io::Write;
+
+    if command.is_empty() {
+        return Err(NspawnError::NspawnExecution("Empty command".to_string()));
+    }
+
+    let mut cmd = Command::new("systemd-nspawn");
+    cmd.arg("-D").arg(path);
+    cmd.arg("--quiet");
+    cmd.arg("--timezone=off");
+
+    match config.network_mode {
+        NetworkMode::Host => {}
+        NetworkMode::Private => {
+            cmd.arg("--network-veth");
+        }
+        NetworkMode::None => {
+            cmd.arg("--private-network");
+        }
+    }
+
+    let tailscale_active = tailscale_enabled(&config.env);
+    let should_bind_dns = matches!(config.network_mode, NetworkMode::Host)
+        || (matches!(config.network_mode, NetworkMode::Private) && !tailscale_active);
+    if should_bind_dns && Path::new("/etc/resolv.conf").exists() {
+        cmd.arg("--bind-ro=/etc/resolv.conf");
+    }
+
+    if config.ephemeral {
+        cmd.arg("--ephemeral");
+    }
+
+    for capability in &config.capabilities {
+        if capability.trim().is_empty() {
+            continue;
+        }
+        cmd.arg(format!("--capability={}", capability));
+    }
+
+    for bind in &config.binds {
+        if bind.trim().is_empty() {
+            continue;
+        }
+        let has_dest = bind.contains(':');
+        if has_dest || Path::new(bind).exists() {
+            cmd.arg(format!("--bind={}", bind));
+        }
+    }
+
+    if config.bind_x11 && Path::new("/tmp/.X11-unix").exists() {
+        cmd.arg("--bind=/tmp/.X11-unix");
+    }
+
+    if let Some(display) = config.display.as_ref() {
+        cmd.arg(format!("--setenv=DISPLAY={}", display));
+    }
+
+    if !config.env.is_empty() {
+        for (key, value) in &config.env {
+            if key.trim().is_empty() {
+                continue;
+            }
+            cmd.arg(format!("--setenv={}={}", key, value));
+        }
+    }
+
+    cmd.args(command);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            NspawnError::NspawnExecution(
+                "systemd-nspawn not found. Install systemd-container on the host.".to_string(),
+            )
+        } else {
+            NspawnError::NspawnExecution(e.to_string())
+        }
+    })?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let log_file = log_file.to_path_buf();
+
+    // Spawn tasks to read stdout and stderr and append to log file
+    let log_file_stdout = log_file.clone();
+    let stdout_task = tokio::spawn(async move {
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_file_stdout)
+                {
+                    let _ = writeln!(f, "{}", line);
+                }
+            }
+        }
+    });
+
+    let log_file_stderr = log_file.clone();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_file_stderr)
+                {
+                    let _ = writeln!(f, "{}", line);
+                }
+            }
+        }
+    });
+
+    // Wait for the child process to complete
+    let status = child.wait().await.map_err(|e| {
+        NspawnError::NspawnExecution(format!("Failed to wait for process: {}", e))
+    })?;
+
+    // Wait for the reader tasks to finish
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    Ok(status)
 }
 
 /// Check if a container environment is already created and functional.

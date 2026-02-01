@@ -3540,36 +3540,28 @@ async fn run_workspace_init_script(
     config.env = workspace.env_vars.clone();
 
     let command = vec![shell.to_string(), "/sandboxed-init.sh".to_string()];
-    let output = nspawn::execute_in_container(&workspace.path, &command, &config).await?;
+
+    // Determine log file path for streaming output
+    let log_path = workspace.path.join("var/log/sandboxed-init.log");
+    let log_file = if log_path.parent().map_or(false, |p| p.exists()) {
+        log_path
+    } else {
+        nspawn::build_log_path_for(&workspace.path)
+    };
+
+    // Use streaming execution to show logs in real-time
+    let status =
+        nspawn::execute_in_container_streaming(&workspace.path, &command, &config, &log_file)
+            .await?;
 
     // Clean up the script file after execution.
     let _ = tokio::fs::remove_file(&script_path).await;
 
-    // Append init script output to the build log so the dashboard can show it.
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let stderr_str = String::from_utf8_lossy(&output.stderr);
-    if !stdout_str.trim().is_empty() {
-        append_to_init_log(&workspace.path, &stdout_str);
-    }
-    if !stderr_str.trim().is_empty() {
-        append_to_init_log(&workspace.path, &stderr_str);
-    }
-
-    if !output.status.success() {
-        let mut message = String::new();
-        if !stderr_str.trim().is_empty() {
-            message.push_str(stderr_str.trim());
-        }
-        if !stdout_str.trim().is_empty() {
-            if !message.is_empty() {
-                message.push_str(" | ");
-            }
-            message.push_str(stdout_str.trim());
-        }
-        if message.is_empty() {
-            message = "Init script failed with no output".to_string();
-        }
-        return Err(anyhow::anyhow!(message));
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "Init script failed with exit code {}",
+            status.code().unwrap_or(-1)
+        ));
     }
 
     Ok(())

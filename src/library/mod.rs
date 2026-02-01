@@ -1688,35 +1688,50 @@ impl LibraryStore {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// List all config profiles.
+    /// Always includes "default" profile (even if directory doesn't exist) as it
+    /// serves as the virtual profile that falls back to library defaults.
     pub async fn list_config_profiles(&self) -> Result<Vec<ConfigProfileSummary>> {
         let configs_dir = self.path.join(CONFIGS_DIR);
+        let mut profiles = Vec::new();
+        let mut has_default = false;
 
-        if !configs_dir.exists() {
-            return Ok(Vec::new());
+        if configs_dir.exists() {
+            let mut entries = fs::read_dir(&configs_dir).await?;
+
+            while let Some(entry) = entries.next_entry().await? {
+                let entry_path = entry.path();
+
+                // Only process directories
+                if !entry_path.is_dir() {
+                    continue;
+                }
+
+                let name = entry.file_name().to_string_lossy().to_string();
+
+                // Skip hidden directories
+                if name.starts_with('.') {
+                    continue;
+                }
+
+                if name == DEFAULT_PROFILE {
+                    has_default = true;
+                }
+
+                profiles.push(ConfigProfileSummary {
+                    name: name.clone(),
+                    is_default: name == DEFAULT_PROFILE,
+                    path: format!("{}/{}", CONFIGS_DIR, name),
+                });
+            }
         }
 
-        let mut profiles = Vec::new();
-        let mut entries = fs::read_dir(&configs_dir).await?;
-
-        while let Some(entry) = entries.next_entry().await? {
-            let entry_path = entry.path();
-
-            // Only process directories
-            if !entry_path.is_dir() {
-                continue;
-            }
-
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            // Skip hidden directories
-            if name.starts_with('.') {
-                continue;
-            }
-
+        // Always include "default" profile - it serves as the baseline that
+        // falls back to library defaults for any files not explicitly overridden
+        if !has_default {
             profiles.push(ConfigProfileSummary {
-                name: name.clone(),
-                is_default: name == DEFAULT_PROFILE,
-                path: format!("{}/{}", CONFIGS_DIR, name),
+                name: DEFAULT_PROFILE.to_string(),
+                is_default: true,
+                path: format!("{}/{}", CONFIGS_DIR, DEFAULT_PROFILE),
             });
         }
 

@@ -99,6 +99,26 @@ pub struct BackendConfig {
     pub name: String,
     pub enabled: bool,
     pub settings: serde_json::Value,
+    /// Whether the CLI for this backend is available on the system
+    #[serde(default)]
+    pub cli_available: bool,
+}
+
+/// Check if a CLI command is available on the system
+fn check_cli_available(cli_name: &str) -> bool {
+    use std::process::Command;
+
+    // Check if it's an absolute path
+    if cli_name.starts_with('/') {
+        return std::path::Path::new(cli_name).exists();
+    }
+
+    // Check using `which` command
+    Command::new("which")
+        .arg(cli_name)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 /// Get backend configuration
@@ -165,11 +185,38 @@ pub async fn get_backend_config(
         settings = serde_json::Value::Object(obj);
     }
 
+    // Check CLI availability based on backend type
+    let cli_available = match id.as_str() {
+        "claudecode" => {
+            // Check for custom cli_path first, then default 'claude'
+            let cli_path = settings
+                .get("cli_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("claude");
+            check_cli_available(cli_path)
+        }
+        "amp" => {
+            let cli_path = settings
+                .get("cli_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("amp");
+            check_cli_available(cli_path)
+        }
+        "opencode" => {
+            // OpenCode uses oh-my-opencode or opencode CLI
+            check_cli_available("oh-my-opencode") || check_cli_available("opencode")
+        }
+        _ => true,
+    };
+
     Ok(Json(BackendConfig {
         id: backend.id().to_string(),
         name: backend.name().to_string(),
         enabled: config_entry.enabled,
         settings,
+        cli_available,
     }))
 }
 

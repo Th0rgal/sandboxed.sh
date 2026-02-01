@@ -2,7 +2,7 @@
 
 import { useCallback, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import { StatsCard } from '@/components/stats-card';
@@ -130,8 +130,20 @@ function CompactMissionCard({
 
 export default function OverviewPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [creatingMission, setCreatingMission] = useState(false);
   const hasShownErrorRef = useRef(false);
+
+  // Check if we should auto-open the new mission dialog (e.g., from workspaces page)
+  const initialWorkspaceId = searchParams.get('workspace');
+  const shouldAutoOpen = Boolean(initialWorkspaceId);
+
+  // Clear URL params when dialog closes
+  const handleDialogClose = useCallback(() => {
+    if (initialWorkspaceId) {
+      router.replace('/', { scroll: false });
+    }
+  }, [initialWorkspaceId, router]);
 
   // SWR: poll stats every 3 seconds
   const { data: stats, isLoading: statsLoading, error: statsError } = useSWR(
@@ -296,6 +308,9 @@ export default function OverviewPage() {
             workspaces={workspaces}
             disabled={creatingMission}
             onCreate={handleNewMission}
+            autoOpen={shouldAutoOpen}
+            initialValues={initialWorkspaceId ? { workspaceId: initialWorkspaceId } : undefined}
+            onClose={handleDialogClose}
           />
         </div>
 

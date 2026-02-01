@@ -271,16 +271,46 @@ pub struct UserMessage {
     pub role: Option<String>,
 }
 
+/// Tool use result info — can be a structured object or a simple string (error message).
 #[derive(Debug, Clone, Deserialize)]
-pub struct ToolUseResultInfo {
-    #[serde(default)]
-    pub stdout: Option<String>,
-    #[serde(default)]
-    pub stderr: Option<String>,
-    #[serde(default)]
-    pub interrupted: Option<bool>,
-    #[serde(default, rename = "isImage")]
-    pub is_image: Option<bool>,
+#[serde(untagged)]
+pub enum ToolUseResultInfo {
+    /// Structured result with stdout/stderr/etc
+    Structured {
+        #[serde(default)]
+        stdout: Option<String>,
+        #[serde(default)]
+        stderr: Option<String>,
+        #[serde(default)]
+        interrupted: Option<bool>,
+        #[serde(default, rename = "isImage")]
+        is_image: Option<bool>,
+    },
+    /// Simple string result (often an error message)
+    Text(String),
+}
+
+impl ToolUseResultInfo {
+    pub fn stdout(&self) -> Option<&str> {
+        match self {
+            ToolUseResultInfo::Structured { stdout, .. } => stdout.as_deref(),
+            ToolUseResultInfo::Text(_) => None,
+        }
+    }
+
+    pub fn stderr(&self) -> Option<&str> {
+        match self {
+            ToolUseResultInfo::Structured { stderr, .. } => stderr.as_deref(),
+            ToolUseResultInfo::Text(s) => Some(s.as_str()),
+        }
+    }
+
+    pub fn interrupted(&self) -> Option<bool> {
+        match self {
+            ToolUseResultInfo::Structured { interrupted, .. } => *interrupted,
+            ToolUseResultInfo::Text(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -422,10 +452,10 @@ pub fn convert_cli_event(
                     let result_value = if let Some(ref extra) = evt.tool_use_result {
                         serde_json::json!({
                             "content": content_str,
-                            "stdout": extra.stdout,
-                            "stderr": extra.stderr,
+                            "stdout": extra.stdout(),
+                            "stderr": extra.stderr(),
                             "is_error": is_error,
-                            "interrupted": extra.interrupted,
+                            "interrupted": extra.interrupted(),
                         })
                     } else {
                         Value::String(content_str)

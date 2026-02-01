@@ -368,10 +368,31 @@ impl WorkspaceExec {
                 if !env.contains_key("HOME") {
                     env.insert("HOME".to_string(), "/root".to_string());
                 }
+
+                // Debug: log env vars relevant to Tailscale
+                let has_ts_authkey = env.contains_key("TS_AUTHKEY");
+                let has_ts_exit_node = env.contains_key("TS_EXIT_NODE");
+                tracing::debug!(
+                    workspace = %self.workspace.name,
+                    has_ts_authkey = %has_ts_authkey,
+                    has_ts_exit_node = %has_ts_exit_node,
+                    env_keys = ?env.keys().collect::<Vec<_>>(),
+                    "WorkspaceExec: checking Tailscale env vars"
+                );
+
                 // Determine if Tailscale bootstrap is needed before the nsenter
                 // check, so the nsenter path can also include the bootstrap.
-                let needs_tailscale_bootstrap = nspawn::tailscale_enabled(&env)
-                    && !nspawn::tailscale_nspawn_extra_args(&env).is_empty();
+                let tailscale_enabled_check = nspawn::tailscale_enabled(&env);
+                let tailscale_args = nspawn::tailscale_nspawn_extra_args(&env);
+                let needs_tailscale_bootstrap = tailscale_enabled_check && !tailscale_args.is_empty();
+
+                tracing::info!(
+                    workspace = %self.workspace.name,
+                    tailscale_enabled_check = %tailscale_enabled_check,
+                    tailscale_args_count = tailscale_args.len(),
+                    needs_tailscale_bootstrap = %needs_tailscale_bootstrap,
+                    "WorkspaceExec: Tailscale bootstrap decision"
+                );
                 // Calculate tailnet_only for nsenter path: TailnetOnly mode means
                 // we connect to tailnet but use host gateway for internet.
                 let nsenter_tailnet_only = needs_tailscale_bootstrap

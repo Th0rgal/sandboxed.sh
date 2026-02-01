@@ -19,6 +19,17 @@ import { cn } from '@/lib/utils';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
 import { useLibrary } from '@/contexts/library-context';
 
+// Parse JSONC (JSON with Comments) - strips comments and trailing commas before parsing
+function parseJsonc(text: string): unknown {
+  // Remove single-line comments (// ...)
+  let stripped = text.replace(/\/\/[^\n\r]*/g, '');
+  // Remove multi-line comments (/* ... */)
+  stripped = stripped.replace(/\/\*[\s\S]*?\*\//g, '');
+  // Remove trailing commas before } or ]
+  stripped = stripped.replace(/,(\s*[}\]])/g, '$1');
+  return JSON.parse(stripped);
+}
+
 // Harness configuration metadata
 // Maps harness IDs to their profile directory and library directory
 const HARNESS_CONFIG = {
@@ -57,22 +68,26 @@ const HARNESS_CONFIG = {
   },
 };
 
-// Fallback defaults when library file doesn't exist
-const FALLBACK_DEFAULTS: Record<string, Record<string, string>> = {
+// Minimal fallback only used when library harness default file doesn't exist
+// In practice, the library should always have these files
+const EMPTY_FALLBACKS: Record<string, Record<string, string>> = {
   opencode: {
-    'settings.json': JSON.stringify({ agents: {} }, null, 2),
-    'oh-my-opencode.json': JSON.stringify({ agents: {}, categories: {} }, null, 2),
+    'settings.json': '{}',
+    'oh-my-opencode.json': '{}',
   },
   claudecode: {
-    'settings.json': JSON.stringify({ default_model: null, hidden_agents: [] }, null, 2),
+    'settings.json': '{}',
   },
   ampcode: {
-    'settings.json': JSON.stringify({ default_mode: 'smart' }, null, 2),
+    'settings.json': '{}',
   },
   openagent: {
-    'config.json': JSON.stringify({ hidden_agents: [], default_agent: null }, null, 2),
+    'config.json': '{}',
   },
 };
+
+// "default" profile means use library harness defaults directly
+const DEFAULT_PROFILE = 'default';
 
 type HarnessId = keyof typeof HARNESS_CONFIG;
 
@@ -120,7 +135,21 @@ export default function SettingsPage() {
     listConfigProfiles,
     { revalidateOnFocus: false }
   );
+  // Initialize to 'default', but will be updated by useEffect if profile doesn't exist
   const [selectedProfile, setSelectedProfile] = useState<string>('default');
+
+  // Sync selectedProfile with available profiles - if current selection doesn't exist,
+  // use the first available profile (preferring 'default' if it exists)
+  useEffect(() => {
+    if (profiles.length > 0) {
+      const currentExists = profiles.some(p => p.name === selectedProfile);
+      if (!currentExists) {
+        // Profile doesn't exist - select the default profile if available, otherwise first profile
+        const defaultProfile = profiles.find(p => p.is_default || p.name === 'default');
+        setSelectedProfile(defaultProfile?.name || profiles[0].name);
+      }
+    }
+  }, [profiles, selectedProfile]);
   const [showProfileDropdown, setShowProfileDropdown] = useState(false);
   const [showNewProfileDialog, setShowNewProfileDialog] = useState(false);
   const [newProfileName, setNewProfileName] = useState('');
@@ -169,56 +198,85 @@ export default function SettingsPage() {
     // Helper to check if this request is still the current one
     const isStale = () => currentLoadRequestRef.current !== requestId;
 
+    // Extract harness info from file path
+    const harness = Object.entries(HARNESS_CONFIG).find(([, cfg]) =>
+      filePath.startsWith(cfg.dir)
+    );
+    if (!harness) {
+      setError('Unknown harness for file path');
+      return;
+    }
+    const [harnessId, harnessConfig] = harness;
+    const fileName = filePath.split('/').pop() || '';
+    const fileConfig = harnessConfig.files.find(f => f.name === fileName);
+    const libraryFileName = fileConfig?.libraryName || fileName;
+
+    // Helper to load from library harness defaults
+    const loadFromLibrary = async (): Promise<{ content: string; isDefault: true } | null> => {
+      try {
+        const content = await getHarnessDefaultFile(harnessConfig.libraryDir, libraryFileName);
+        return { content, isDefault: true };
+      } catch (err) {
+        console.warn(
+          `Failed to load library default for ${harnessConfig.libraryDir}/${libraryFileName}:`,
+          err instanceof Error ? err.message : err
+        );
+        return null;
+      }
+    };
+
     try {
       setLoading(true);
       setError(null);
-      setIsLibraryDefault(false);
-      const content = await getConfigProfileFile(selectedProfile, filePath);
 
-      // Discard stale responses to prevent race conditions
-      if (isStale()) return;
+      // "default" profile = load directly from library harness defaults
+      // Other profiles = try profile file first, fall back to library defaults
+      if (selectedProfile === DEFAULT_PROFILE) {
+        // Load directly from library (e.g., library/opencode/oh-my-opencode.json)
+        const result = await loadFromLibrary();
+        if (isStale()) return;
 
-      setFileContent(content);
-      setOriginalFileContent(content);
-      setSelectedFile(filePath);
-    } catch {
-      // Discard stale responses
-      if (isStale()) return;
-
-      // File doesn't exist in profile, try to load library default
-      const harness = Object.entries(HARNESS_CONFIG).find(([, cfg]) =>
-        filePath.startsWith(cfg.dir)
-      );
-      if (harness) {
-        const [harnessId, harnessConfig] = harness;
-        const fileName = filePath.split('/').pop() || '';
-        const fileConfig = harnessConfig.files.find(f => f.name === fileName);
-        const libraryFileName = fileConfig?.libraryName || fileName;
-
-        try {
-          // Try to fetch from library defaults
-          const libraryContent = await getHarnessDefaultFile(harnessConfig.libraryDir, libraryFileName);
-
-          // Discard stale responses
-          if (isStale()) return;
-
-          setFileContent(libraryContent);
-          setOriginalFileContent(libraryContent);
+        if (result) {
+          setFileContent(result.content);
+          setOriginalFileContent(result.content);
           setIsLibraryDefault(true);
-          setSelectedFile(filePath);
-        } catch {
-          // Discard stale responses
+        } else {
+          // Library file doesn't exist - use empty fallback
+          const fallback = EMPTY_FALLBACKS[harnessId]?.[fileName] || '{}';
+          setFileContent(fallback);
+          setOriginalFileContent(fallback);
+          setIsLibraryDefault(true);
+        }
+        setSelectedFile(filePath);
+      } else {
+        // Try to load from profile first
+        try {
+          const content = await getConfigProfileFile(selectedProfile, filePath);
           if (isStale()) return;
 
-          // Library default doesn't exist either, use fallback
-          const fallback = FALLBACK_DEFAULTS[harnessId]?.[fileName] || '{}';
-          setFileContent(fallback);
-          setOriginalFileContent(''); // Mark as new file
+          setFileContent(content);
+          setOriginalFileContent(content);
           setIsLibraryDefault(false);
           setSelectedFile(filePath);
+        } catch {
+          // Profile file doesn't exist, fall back to library defaults
+          if (isStale()) return;
+
+          const result = await loadFromLibrary();
+          if (isStale()) return;
+
+          if (result) {
+            setFileContent(result.content);
+            setOriginalFileContent(result.content);
+            setIsLibraryDefault(true);
+          } else {
+            const fallback = EMPTY_FALLBACKS[harnessId]?.[fileName] || '{}';
+            setFileContent(fallback);
+            setOriginalFileContent(fallback);
+            setIsLibraryDefault(true);
+          }
+          setSelectedFile(filePath);
         }
-      } else {
-        setError('Unknown harness for file path');
       }
     } finally {
       // Only clear loading if this is still the current request
@@ -244,7 +302,8 @@ export default function SettingsPage() {
       return;
     }
     try {
-      JSON.parse(fileContent);
+      // Use JSONC parser to support comments (oh-my-opencode.json supports comments)
+      parseJsonc(fileContent);
       setParseError(null);
     } catch (err) {
       setParseError(err instanceof Error ? err.message : 'Invalid JSON');

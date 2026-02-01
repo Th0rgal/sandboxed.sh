@@ -2417,6 +2417,8 @@ export interface BackendConfig {
   name: string;
   enabled: boolean;
   settings: Record<string, unknown>;
+  /** Whether the CLI for this backend is available on the system */
+  cli_available?: boolean;
 }
 
 // List all available backends
