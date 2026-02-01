@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { Suspense, useCallback, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import useSWR from 'swr';
@@ -128,7 +128,7 @@ function CompactMissionCard({
   );
 }
 
-export default function OverviewPage() {
+function OverviewPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [creatingMission, setCreatingMission] = useState(false);
@@ -403,5 +403,13 @@ export default function OverviewPage() {
         <RecentTasks />
       </div>
     </div>
+  );
+}
+
+export default function OverviewPage() {
+  return (
+    <Suspense fallback={<div className="flex h-screen items-center justify-center"><Loader className="h-6 w-6 animate-spin text-white/50" /></div>}>
+      <OverviewPageContent />
+    </Suspense>
   );
 }
