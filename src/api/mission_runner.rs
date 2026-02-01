@@ -5565,12 +5565,6 @@ pub async fn run_opencode_turn(
                                     if matches!(event, AgentEvent::Thinking { .. }) {
                                         sse_emitted_thinking.store(true, std::sync::atomic::Ordering::SeqCst);
                                     }
-                                    // Update tool_executing flag based on tool events
-                                    if matches!(event, AgentEvent::ToolCall { .. }) {
-                                        tool_executing = true;
-                                    } else if matches!(event, AgentEvent::ToolResult { .. }) {
-                                        tool_executing = false;
-                                    }
                                     let _ = events_tx.send(event);
                                 }
                                 if parsed.message_complete {
