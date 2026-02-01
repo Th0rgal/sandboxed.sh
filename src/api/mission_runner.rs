@@ -1843,6 +1843,9 @@ pub fn run_claudecode_turn<'a>(
         let auth_timeout = std::time::Duration::from_secs(45);
         // General inactivity timeout - if no output for 5 minutes, something is likely wrong
         let inactivity_timeout = std::time::Duration::from_secs(300);
+        // Much longer timeout when tools are in progress (30 minutes) - some bash commands
+        // or web fetches can take a very long time
+        let tool_in_progress_timeout = std::time::Duration::from_secs(1800);
         let mut received_any_event = false;
         let mut last_activity = std::time::Instant::now();
 
@@ -1853,7 +1856,10 @@ pub fn run_claudecode_turn<'a>(
         // Process events until completion or cancellation
         loop {
             // Use auth timeout initially (45s), then inactivity timeout (5min) after first event
-            let timeout_duration = if received_any_event {
+            // Exception: if tools are in progress, use a much longer timeout (30min)
+            let timeout_duration = if !pending_tools.is_empty() {
+                tool_in_progress_timeout
+            } else if received_any_event {
                 inactivity_timeout
             } else if auth_missing {
                 auth_timeout
@@ -1911,6 +1917,13 @@ pub fn run_claudecode_turn<'a>(
                             "Claude Code produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.{}",
                             timeout_duration.as_secs(),
                             stderr_hint
+                        )
+                    } else if !pending_tools.is_empty() {
+                        let tool_names: Vec<_> = pending_tools.values().cloned().collect();
+                        format!(
+                            "Claude Code stopped responding after {}s while waiting for tool(s): {}. The tool(s) may be stuck or taking too long.",
+                            tool_in_progress_timeout.as_secs(),
+                            tool_names.join(", ")
                         )
                     } else {
                         format!(
@@ -2121,9 +2134,9 @@ pub fn run_claudecode_turn<'a>(
                                 ClaudeEvent::User(evt) => {
                                     for block in evt.message.content {
                                         if let ContentBlock::ToolResult { tool_use_id, content, is_error } = block {
+                                            // Get tool name and remove from pending (tool is now complete)
                                             let name = pending_tools
-                                                .get(&tool_use_id)
-                                                .cloned()
+                                                .remove(&tool_use_id)
                                                 .unwrap_or_else(|| "unknown".to_string());
 
                                             // Convert content to string representation (handles both text and image results)
@@ -5413,11 +5426,18 @@ pub async fn run_opencode_turn(
     // Timeout handling for stalled missions
     let startup_timeout = std::time::Duration::from_secs(120);
     let inactivity_timeout = std::time::Duration::from_secs(300);
+    // Much longer timeout when tools are in progress (30 minutes) - some bash commands
+    // or web fetches can take a very long time
+    let tool_in_progress_timeout = std::time::Duration::from_secs(1800);
     let mut received_any_event = false;
     let mut last_activity = std::time::Instant::now();
 
     loop {
-        let timeout_duration = if received_any_event {
+        // Check if any tools are pending (started but not completed)
+        let has_pending_tools = state.emitted_tool_calls.len() > state.emitted_tool_results.len();
+        let timeout_duration = if has_pending_tools {
+            tool_in_progress_timeout
+        } else if received_any_event {
             inactivity_timeout
         } else {
             startup_timeout
@@ -5446,6 +5466,11 @@ pub async fn run_opencode_turn(
                     format!(
                         "OpenCode produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.",
                         startup_timeout.as_secs()
+                    )
+                } else if has_pending_tools {
+                    format!(
+                        "OpenCode stopped responding after {}s while waiting for tool(s) to complete. The tool(s) may be stuck or taking too long.",
+                        tool_in_progress_timeout.as_secs()
                     )
                 } else {
                     format!(
@@ -6005,12 +6030,18 @@ pub async fn run_amp_turn(
     // Timeout handling for stalled missions
     let startup_timeout = std::time::Duration::from_secs(120);
     let inactivity_timeout = std::time::Duration::from_secs(300);
+    // Much longer timeout when tools are in progress (30 minutes) - some bash commands
+    // or web fetches can take a very long time
+    let tool_in_progress_timeout = std::time::Duration::from_secs(1800);
     let mut received_any_event = false;
     let mut last_activity = std::time::Instant::now();
 
     // Process events until completion or cancellation
     loop {
-        let timeout_duration = if received_any_event {
+        // Use longer timeout when tools are in progress
+        let timeout_duration = if !pending_tools.is_empty() {
+            tool_in_progress_timeout
+        } else if received_any_event {
             inactivity_timeout
         } else {
             startup_timeout
@@ -6035,6 +6066,13 @@ pub async fn run_amp_turn(
                     format!(
                         "Amp produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.",
                         startup_timeout.as_secs()
+                    )
+                } else if !pending_tools.is_empty() {
+                    let tool_names: Vec<_> = pending_tools.values().cloned().collect();
+                    format!(
+                        "Amp stopped responding after {}s while waiting for tool(s): {}. The tool(s) may be stuck or taking too long.",
+                        tool_in_progress_timeout.as_secs(),
+                        tool_names.join(", ")
                     )
                 } else {
                     format!(
@@ -6203,9 +6241,9 @@ pub async fn run_amp_turn(
                             AmpEvent::User(evt) => {
                                 for block in evt.message.content {
                                     if let ContentBlock::ToolResult { tool_use_id, content, is_error } = block {
+                                        // Get tool name and remove from pending (tool is now complete)
                                         let name = pending_tools
-                                            .get(&tool_use_id)
-                                            .cloned()
+                                            .remove(&tool_use_id)
                                             .unwrap_or_else(|| "unknown".to_string());
 
                                         let content_str = content.to_string_lossy();
