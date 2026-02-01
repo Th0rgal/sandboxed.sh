@@ -8,7 +8,7 @@ interface BrainLogoProps {
 }
 
 /**
- * Brain logo icon - the OpenAgent branding icon.
+ * Brain logo icon - the Sandboxed.sh branding icon.
  * Uses the same path as favicon.svg.
  */
 export function BrainLogo({ className, size = 24 }: BrainLogoProps) {

@@ -48,7 +48,7 @@ const HARNESS_CONFIG = {
     ],
   },
   openagent: {
-    name: 'OpenAgent',
+    name: 'Sandboxed.sh',
     dir: '.openagent',
     libraryDir: 'openagent',
     files: [

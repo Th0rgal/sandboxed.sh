@@ -18,8 +18,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "OpenAgent Dashboard",
-  description: "Monitor and control your OpenCode agents",
+  title: "Sandboxed.sh",
+  description: "Autonomous coding agents in isolated environments",
   icons: {
     icon: "/favicon.svg",
   },

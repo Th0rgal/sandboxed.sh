@@ -1,6 +1,6 @@
-# OpenAgent Dashboard
+# Sandboxed.sh Dashboard
 
-Developer-focused UI for monitoring and controlling the OpenAgent backend.
+Developer-focused UI for monitoring and controlling the Sandboxed.sh backend.
 
 ## Prerequisites
 - **Bun** (required): `bun@1.x`

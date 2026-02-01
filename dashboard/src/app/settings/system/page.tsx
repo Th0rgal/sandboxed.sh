@@ -106,7 +106,7 @@ export default function SystemSettingsPage() {
         <div className="mb-8">
           <h1 className="text-2xl font-semibold text-white">System</h1>
           <p className="mt-1 text-sm text-white/50">
-            OpenAgent server connection settings
+            Server connection settings
           </p>
         </div>
 
