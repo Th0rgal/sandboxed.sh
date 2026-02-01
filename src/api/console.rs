@@ -802,7 +802,7 @@ async fn handle_new_workspace_shell(
                 cmd.arg("-c");
                 // Run tailscale bootstrap, then exec to interactive shell
                 cmd.arg(format!(
-                    "/usr/local/bin/openagent-tailscale-up 2>/dev/null; exec {} --login -i",
+                    "/usr/local/bin/sandboxed-tailscale-up 2>/dev/null; exec {} --login -i",
                     shell
                 ));
             } else if shell == "/bin/bash" {
