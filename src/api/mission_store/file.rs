@@ -114,7 +114,7 @@ impl MissionStore for FileMissionStore {
             workspace_name: None,
             agent: agent.map(|s| s.to_string()),
             model_override: model_override.map(|s| s.to_string()),
-            backend: backend.unwrap_or("opencode").to_string(),
+            backend: backend.unwrap_or("claudecode").to_string(),
             config_profile: config_profile.map(|s| s.to_string()),
             history: vec![],
             created_at: now.clone(),

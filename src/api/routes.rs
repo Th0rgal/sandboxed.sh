@@ -226,7 +226,32 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let opencode_default_agent = config.opencode_agent.clone();
     let opencode_permissive = config.opencode_permissive;
 
-    let mut backend_registry = BackendRegistry::new("opencode");
+    // Determine default backend: env var, or first available with priority claudecode → opencode → amp
+    let default_backend = config.default_backend.clone().unwrap_or_else(|| {
+        if claude_detected {
+            "claudecode".to_string()
+        } else if opencode_detected {
+            "opencode".to_string()
+        } else if amp_detected {
+            "amp".to_string()
+        } else {
+            // Fallback to claudecode even if not detected (will show warning in UI)
+            tracing::warn!(
+                "No backend CLIs detected. Defaulting to claudecode. Please install at least one backend."
+            );
+            "claudecode".to_string()
+        }
+    });
+
+    tracing::info!(
+        "Default backend: {} (claudecode={}, opencode={}, amp={})",
+        default_backend,
+        claude_detected,
+        opencode_detected,
+        amp_detected
+    );
+
+    let mut backend_registry = BackendRegistry::new(default_backend);
     backend_registry.register(crate::backend::opencode::registry_entry(
         opencode_base_url.clone(),
         opencode_default_agent,
@@ -423,6 +448,27 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/cleanup",
             post(control::cleanup_empty_missions),
+        )
+        // Automation endpoints
+        .route(
+            "/api/control/missions/:id/automations",
+            get(control::list_mission_automations),
+        )
+        .route(
+            "/api/control/missions/:id/automations",
+            post(control::create_automation),
+        )
+        .route(
+            "/api/control/automations/:id",
+            get(control::get_automation),
+        )
+        .route(
+            "/api/control/automations/:id",
+            axum::routing::patch(control::update_automation),
+        )
+        .route(
+            "/api/control/automations/:id",
+            axum::routing::delete(control::delete_automation),
         )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))

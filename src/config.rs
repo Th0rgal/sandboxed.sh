@@ -17,6 +17,8 @@
 //! - `LIBRARY_REMOTE` - Optional. Initial library remote URL (can be changed via Settings in the dashboard).
 //!   This environment variable is used as the initial default when no settings file exists.
 //!   If not set, defaults to: https://github.com/Th0rgal/sandboxed-library-template.git
+//! - `DEFAULT_BACKEND` - Optional. Default backend to use (claudecode, opencode, or amp).
+//!   If not set, defaults to the first available backend with priority: claudecode → opencode → amp.
 //!
 //! Note: The agent has **full system access**. It can read/write any file, execute any command,
 //! and search anywhere on the machine. The `WORKING_DIR` is just the default for relative paths.
@@ -225,6 +227,9 @@ pub struct Config {
     /// Path to the configuration library git repo.
     /// Default: {working_dir}/.sandboxed-sh/library
     pub library_path: PathBuf,
+
+    /// Default backend to use (if specified in environment)
+    pub default_backend: Option<String>,
 }
 
 /// API auth configuration.
@@ -460,6 +465,21 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| working_dir.join(".sandboxed-sh/library"));
 
+        // Default backend configuration
+        let default_backend = std::env::var("DEFAULT_BACKEND").ok().and_then(|v| {
+            let backend = v.trim().to_lowercase();
+            if backend.is_empty() || !["claudecode", "opencode", "amp"].contains(&backend.as_str())
+            {
+                tracing::warn!(
+                    "Invalid DEFAULT_BACKEND '{}'. Expected one of: claudecode, opencode, amp",
+                    v
+                );
+                None
+            } else {
+                Some(backend)
+            }
+        });
+
         Ok(Self {
             default_model,
             working_dir,
@@ -475,6 +495,7 @@ impl Config {
             opencode_agent,
             opencode_permissive,
             library_path,
+            default_backend,
         })
     }
 
@@ -496,6 +517,7 @@ impl Config {
             opencode_agent: None,
             opencode_permissive: true,
             library_path,
+            default_backend: None,
         }
     }
 }

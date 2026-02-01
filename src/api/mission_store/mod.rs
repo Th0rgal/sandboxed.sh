@@ -65,7 +65,7 @@ pub struct Mission {
 }
 
 fn default_backend() -> String {
-    "opencode".to_string()
+    "claudecode".to_string()
 }
 
 fn default_workspace_id() -> Uuid {
@@ -92,6 +92,24 @@ pub struct StoredEvent {
     pub tool_name: Option<String>,
     pub content: String,
     pub metadata: serde_json::Value,
+}
+
+/// An automation that triggers commands at intervals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Automation {
+    pub id: Uuid,
+    pub mission_id: Uuid,
+    /// Command name from library to execute
+    pub command_name: String,
+    /// Interval in seconds between executions
+    pub interval_seconds: u64,
+    /// Whether this automation is currently active
+    pub active: bool,
+    /// When this automation was created
+    pub created_at: String,
+    /// When this automation was last triggered
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_triggered_at: Option<String>,
 }
 
 /// Get current timestamp as RFC3339 string.
@@ -224,6 +242,49 @@ pub trait MissionStore: Send + Sync {
     /// Aggregates cost_cents from all assistant_message events.
     async fn get_total_cost_cents(&self) -> Result<u64, String> {
         Ok(0)
+    }
+
+    // === Automation methods (default no-op for backward compatibility) ===
+
+    /// Create an automation for a mission.
+    async fn create_automation(
+        &self,
+        mission_id: Uuid,
+        command_name: &str,
+        interval_seconds: u64,
+    ) -> Result<Automation, String> {
+        let _ = (mission_id, command_name, interval_seconds);
+        Err("Automations not supported by this store".to_string())
+    }
+
+    /// Get all automations for a mission.
+    async fn get_mission_automations(&self, mission_id: Uuid) -> Result<Vec<Automation>, String> {
+        let _ = mission_id;
+        Ok(vec![])
+    }
+
+    /// Get an automation by ID.
+    async fn get_automation(&self, id: Uuid) -> Result<Option<Automation>, String> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Update automation active status.
+    async fn update_automation_active(&self, id: Uuid, active: bool) -> Result<(), String> {
+        let _ = (id, active);
+        Err("Automations not supported by this store".to_string())
+    }
+
+    /// Update automation last triggered time.
+    async fn update_automation_last_triggered(&self, id: Uuid) -> Result<(), String> {
+        let _ = id;
+        Err("Automations not supported by this store".to_string())
+    }
+
+    /// Delete an automation.
+    async fn delete_automation(&self, id: Uuid) -> Result<bool, String> {
+        let _ = id;
+        Ok(false)
     }
 }
 

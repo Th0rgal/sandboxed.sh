@@ -316,15 +316,38 @@ export function NewMissionDialog({
       }
     }
 
-    // Fallback: try Sisyphus in OpenCode
+    // Fallback: use first available backend with priority claudecode → opencode → amp
+    // Try Claude Code first
+    const claudeCodeAgent = allAgents.find(a => a.backend === 'claudecode');
+    if (claudeCodeAgent) {
+      setSelectedAgentValue(claudeCodeAgent.value);
+      setDefaultSet(true);
+      return;
+    }
+
+    // Try OpenCode second (prefer Sisyphus if available)
     const sisyphus = allAgents.find(a => a.backend === 'opencode' && a.agent === 'Sisyphus');
     if (sisyphus) {
       setSelectedAgentValue(sisyphus.value);
       setDefaultSet(true);
       return;
     }
+    const openCodeAgent = allAgents.find(a => a.backend === 'opencode');
+    if (openCodeAgent) {
+      setSelectedAgentValue(openCodeAgent.value);
+      setDefaultSet(true);
+      return;
+    }
 
-    // Fallback: use first available agent
+    // Try Amp third
+    const ampAgent = allAgents.find(a => a.backend === 'amp');
+    if (ampAgent) {
+      setSelectedAgentValue(ampAgent.value);
+      setDefaultSet(true);
+      return;
+    }
+
+    // Final fallback: use first available agent (shouldn't reach here)
     if (allAgents.length > 0) {
       setSelectedAgentValue(allAgents[0].value);
     }
@@ -350,7 +373,7 @@ export function NewMissionDialog({
       workspaceId: newMissionWorkspace || undefined,
       agent: parsed?.agent || undefined,
       configProfile: selectedConfigProfile || undefined,
-      backend: parsed?.backend || 'opencode',
+      backend: parsed?.backend || 'claudecode',
     };
   };
 

@@ -1983,12 +1983,14 @@ pub fn run_claudecode_turn<'a>(
                                             // "thinking_delta" -> thinking panel (uses delta.thinking field)
                                             // "text_delta" -> text output (uses delta.text field)
                                             if delta.delta_type == "thinking_delta" {
-                                                // For thinking deltas, content is in the `thinking` field, not `text`
-                                                if let Some(thinking_text) = delta.thinking {
-                                                    if !thinking_text.is_empty() {
+                                                // For thinking deltas, check both `thinking` and `text` fields
+                                                // Extended thinking uses `thinking`, but some versions use `text`
+                                                let thinking_text = delta.thinking.or(delta.text.clone());
+                                                if let Some(thinking_content) = thinking_text {
+                                                    if !thinking_content.is_empty() {
                                                         // Accumulate thinking content
                                                         let buffer = thinking_buffer.entry(index).or_default();
-                                                        buffer.push_str(&thinking_text);
+                                                        buffer.push_str(&thinking_content);
 
                                                         // Send accumulated thinking content (cumulative, like OpenCode)
                                                         // Only send if we have new content since last emit

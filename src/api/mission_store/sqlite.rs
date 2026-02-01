@@ -1,8 +1,8 @@
 //! SQLite-based mission store with full event logging.
 
 use super::{
-    now_string, sanitize_filename, Mission, MissionHistoryEntry, MissionStatus, MissionStore,
-    StoredEvent,
+    now_string, sanitize_filename, Automation, Mission, MissionHistoryEntry, MissionStatus,
+    MissionStore, StoredEvent,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
@@ -77,6 +77,20 @@ CREATE TABLE IF NOT EXISTS mission_summaries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_summaries_mission ON mission_summaries(mission_id);
+
+CREATE TABLE IF NOT EXISTS automations (
+    id TEXT PRIMARY KEY NOT NULL,
+    mission_id TEXT NOT NULL,
+    command_name TEXT NOT NULL,
+    interval_seconds INTEGER NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    last_triggered_at TEXT,
+    FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_automations_mission ON automations(mission_id);
+CREATE INDEX IF NOT EXISTS idx_automations_active ON automations(mission_id, active);
 "#;
 
 /// Content size threshold for inline storage (64KB).
@@ -437,7 +451,7 @@ impl MissionStore for SqliteMissionStore {
         let now = now_string();
         let id = Uuid::new_v4();
         let workspace_id = workspace_id.unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID);
-        let backend = backend.unwrap_or("opencode").to_string();
+        let backend = backend.unwrap_or("claudecode").to_string();
         // Generate session_id for conversation persistence (used by Claude Code --session-id)
         let session_id = Uuid::new_v4().to_string();
 
@@ -1159,5 +1173,180 @@ impl MissionStore for SqliteMissionStore {
             .map_err(|e| e.to_string())?;
 
         Ok(total as u64)
+    }
+
+    async fn create_automation(
+        &self,
+        mission_id: Uuid,
+        command_name: &str,
+        interval_seconds: u64,
+    ) -> Result<Automation, String> {
+        let conn = self.conn.clone();
+        let now = now_string();
+        let id = Uuid::new_v4();
+        let command_name = command_name.to_string();
+
+        let automation = Automation {
+            id,
+            mission_id,
+            command_name: command_name.clone(),
+            interval_seconds,
+            active: true,
+            created_at: now.clone(),
+            last_triggered_at: None,
+        };
+
+        let a = automation.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO automations (id, mission_id, command_name, interval_seconds, active, created_at)
+                 VALUES (?, ?, ?, ?, 1, ?)",
+                params![
+                    id.to_string(),
+                    mission_id.to_string(),
+                    command_name,
+                    interval_seconds as i64,
+                    now,
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| e.to_string())?;
+
+        Ok(a)
+    }
+
+    async fn get_mission_automations(&self, mission_id: Uuid) -> Result<Vec<Automation>, String> {
+        let conn = self.conn.clone();
+        let mission_id_str = mission_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT id, mission_id, command_name, interval_seconds, active, created_at, last_triggered_at
+                         FROM automations WHERE mission_id = ? ORDER BY created_at DESC")
+                .map_err(|e| e.to_string())?;
+
+            let automations = stmt
+                .query_map([mission_id_str], |row| {
+                    let id: String = row.get(0)?;
+                    let mission_id: String = row.get(1)?;
+                    let command_name: String = row.get(2)?;
+                    let interval_seconds: i64 = row.get(3)?;
+                    let active: i64 = row.get(4)?;
+                    let created_at: String = row.get(5)?;
+                    let last_triggered_at: Option<String> = row.get(6)?;
+
+                    Ok(Automation {
+                        id: Uuid::parse_str(&id).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                        mission_id: Uuid::parse_str(&mission_id).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                        command_name,
+                        interval_seconds: interval_seconds as u64,
+                        active: active != 0,
+                        created_at,
+                        last_triggered_at,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            Ok(automations)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn get_automation(&self, id: Uuid) -> Result<Option<Automation>, String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let result = conn
+                .query_row(
+                    "SELECT id, mission_id, command_name, interval_seconds, active, created_at, last_triggered_at
+                     FROM automations WHERE id = ?",
+                    [id_str],
+                    |row| {
+                        let id: String = row.get(0)?;
+                        let mission_id: String = row.get(1)?;
+                        let command_name: String = row.get(2)?;
+                        let interval_seconds: i64 = row.get(3)?;
+                        let active: i64 = row.get(4)?;
+                        let created_at: String = row.get(5)?;
+                        let last_triggered_at: Option<String> = row.get(6)?;
+
+                        Ok(Automation {
+                            id: Uuid::parse_str(&id).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                            mission_id: Uuid::parse_str(&mission_id).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                            command_name,
+                            interval_seconds: interval_seconds as u64,
+                            active: active != 0,
+                            created_at,
+                            last_triggered_at,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+
+            Ok(result)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn update_automation_active(&self, id: Uuid, active: bool) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE automations SET active = ? WHERE id = ?",
+                params![if active { 1 } else { 0 }, id_str],
+            )
+            .map(|_| ())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| e.to_string())
+    }
+
+    async fn update_automation_last_triggered(&self, id: Uuid) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let now = now_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE automations SET last_triggered_at = ? WHERE id = ?",
+                params![now, id_str],
+            )
+            .map(|_| ())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| e.to_string())
+    }
+
+    async fn delete_automation(&self, id: Uuid) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let rows = conn
+                .execute("DELETE FROM automations WHERE id = ?", params![id_str])
+                .map_err(|e| e.to_string())?;
+            Ok(rows > 0)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
     }
 }

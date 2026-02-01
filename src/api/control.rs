@@ -1315,6 +1315,13 @@ pub async fn create_mission(
         }
     }
 
+    // If no backend specified, use the default from registry
+    // This needs to happen BEFORE agent validation so we validate against the correct backend
+    if backend.is_none() {
+        let registry = state.backend_registry.read().await;
+        backend = Some(registry.default_id().to_string());
+    }
+
     // Validate agent exists before creating mission (fail fast with clear error)
     // Skip validation for Claude Code and Amp - they have their own built-in agents
     if let Some(ref agent_name) = agent {
@@ -1327,6 +1334,7 @@ pub async fn create_mission(
         }
     }
 
+    // Validate backend exists
     if let Some(ref backend_id) = backend {
         let registry = state.backend_registry.read().await;
         if registry.get(backend_id).is_none() {
@@ -2076,7 +2084,7 @@ fn spawn_control_session(
         root_agent,
         mcp,
         workspaces,
-        library,
+        library.clone(),
         cmd_rx,
         mission_cmd_rx,
         mission_cmd_tx,
@@ -2180,6 +2188,16 @@ fn spawn_control_session(
         });
     }
 
+    // Spawn automation scheduler task
+    if state.mission_store.is_persistent() {
+        tokio::spawn(automation_scheduler_loop(
+            Arc::clone(&state.mission_store),
+            library.clone(),
+            state.cmd_tx.clone(),
+            Arc::clone(&running_missions),
+        ));
+    }
+
     state
 }
 
@@ -2281,6 +2299,128 @@ async fn stale_mission_cleanup_loop(
             }
             Err(e) => {
                 tracing::warn!("Failed to check for stale missions: {}", e);
+            }
+        }
+    }
+}
+
+/// Background task that checks for automations and triggers them at their intervals.
+async fn automation_scheduler_loop(
+    mission_store: Arc<dyn MissionStore>,
+    library: SharedLibrary,
+    cmd_tx: mpsc::Sender<ControlCommand>,
+    running_missions: Arc<RwLock<Vec<super::mission_runner::RunningMissionInfo>>>,
+) {
+    // Check every 5 seconds for automations that need to run
+    let check_interval = std::time::Duration::from_secs(5);
+
+    tracing::info!("Automation scheduler task started");
+
+    loop {
+        tokio::time::sleep(check_interval).await;
+
+        // Get all active missions
+        let active_missions = match mission_store.get_all_active_missions().await {
+            Ok(missions) => missions,
+            Err(e) => {
+                tracing::warn!("Failed to get active missions for automation: {}", e);
+                continue;
+            }
+        };
+
+        // For each active mission, check its automations
+        for mission in active_missions {
+            let automations = match mission_store.get_mission_automations(mission.id).await {
+                Ok(automations) => automations,
+                Err(e) => {
+                    tracing::debug!("Failed to get automations for mission {}: {}", mission.id, e);
+                    continue;
+                }
+            };
+
+            // Filter to active automations only
+            for automation in automations.into_iter().filter(|a| a.active) {
+                // Check if enough time has passed since last trigger
+                let should_trigger = if let Some(ref last_triggered) = automation.last_triggered_at {
+                    match chrono::DateTime::parse_from_rfc3339(last_triggered) {
+                        Ok(last_time) => {
+                            let elapsed = chrono::Utc::now().signed_duration_since(last_time.with_timezone(&chrono::Utc));
+                            elapsed.num_seconds() >= automation.interval_seconds as i64
+                        }
+                        Err(_) => true, // If we can't parse, trigger anyway
+                    }
+                } else {
+                    // Never triggered before, should trigger now
+                    true
+                };
+
+                if !should_trigger {
+                    continue;
+                }
+
+                // Check if the mission is currently busy (has a running task or queued messages)
+                let is_busy = {
+                    let running = running_missions.read().await;
+                    running.iter().any(|r| r.mission_id == mission.id && (r.queue_len > 0 || r.state != "idle"))
+                };
+
+                if is_busy {
+                    tracing::debug!(
+                        "Mission {} is busy, skipping automation trigger for command '{}'",
+                        mission.id,
+                        automation.command_name
+                    );
+                    continue;
+                }
+
+                // Fetch the command content from the library
+                let command_content = if let Some(lib) = library.read().await.as_ref() {
+                    match lib.get_command(&automation.command_name).await {
+                        Ok(command) => command.content,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to fetch command '{}' for automation {}: {}",
+                                automation.command_name,
+                                automation.id,
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    tracing::debug!("Library not initialized, skipping automation trigger");
+                    continue;
+                };
+
+                tracing::info!(
+                    "Triggering automation {} for mission {}: command '{}'",
+                    automation.id,
+                    mission.id,
+                    automation.command_name
+                );
+
+                // Send the message to the mission
+                let message_id = Uuid::new_v4();
+                let (respond_tx, _respond_rx) = tokio::sync::oneshot::channel();
+                if let Err(e) = cmd_tx
+                    .send(ControlCommand::UserMessage {
+                        id: message_id,
+                        content: command_content,
+                        agent: None,
+                        target_mission_id: Some(mission.id),
+                        respond: respond_tx,
+                    })
+                    .await
+                {
+                    tracing::warn!("Failed to send automation message: {}", e);
+                    continue;
+                }
+
+                // Update last triggered time
+                if let Err(e) = mission_store.update_automation_last_triggered(automation.id).await
+                {
+                    tracing::warn!("Failed to update automation last triggered time: {}", e);
+                }
             }
         }
     }
@@ -4586,4 +4726,167 @@ async fn run_single_control_turn(
         }
     };
     result
+}
+
+// === Automation API handlers ===
+
+#[derive(Debug, Deserialize)]
+pub struct CreateAutomationRequest {
+    pub command_name: String,
+    pub interval_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateAutomationRequest {
+    pub active: Option<bool>,
+}
+
+/// List all automations for a mission.
+pub async fn list_mission_automations(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+) -> Result<Json<Vec<mission_store::Automation>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let automations = control
+        .mission_store
+        .get_mission_automations(mission_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(automations))
+}
+
+/// Create an automation for a mission.
+pub async fn create_automation(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    Json(req): Json<CreateAutomationRequest>,
+) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    // Validate the command exists in the library
+    if let Some(lib) = state.library.read().await.as_ref() {
+        match lib.get_command(&req.command_name).await {
+            Ok(_) => {}, // Command exists, continue
+            Err(e) => {
+                // Check if it's a "not found" error
+                let error_msg = e.to_string();
+                if error_msg.contains("not found") || error_msg.contains("does not exist") {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("Command '{}' not found in library", req.command_name),
+                    ));
+                } else {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to validate command: {}", e),
+                    ));
+                }
+            }
+        }
+    } else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Library not initialized".to_string(),
+        ));
+    }
+
+    let automation = control
+        .mission_store
+        .create_automation(mission_id, &req.command_name, req.interval_seconds)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(automation))
+}
+
+/// Get an automation by ID.
+pub async fn get_automation(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(automation_id): Path<Uuid>,
+) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let automation = control
+        .mission_store
+        .get_automation(automation_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Automation {} not found", automation_id),
+        ))?;
+
+    Ok(Json(automation))
+}
+
+/// Update an automation (currently only supports changing active status).
+pub async fn update_automation(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(automation_id): Path<Uuid>,
+    Json(req): Json<UpdateAutomationRequest>,
+) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    // Verify automation exists
+    let automation = control
+        .mission_store
+        .get_automation(automation_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Automation {} not found", automation_id),
+        ))?;
+
+    // Update active status if provided
+    if let Some(active) = req.active {
+        control
+            .mission_store
+            .update_automation_active(automation_id, active)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
+
+    // Return updated automation
+    let updated = control
+        .mission_store
+        .get_automation(automation_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Automation {} not found", automation_id),
+        ))?;
+
+    Ok(Json(updated))
+}
+
+/// Delete an automation.
+pub async fn delete_automation(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(automation_id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let deleted = control
+        .mission_store
+        .delete_automation(automation_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("Automation {} not found", automation_id),
+        ))
+    }
 }
