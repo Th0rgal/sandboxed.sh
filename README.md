@@ -125,7 +125,7 @@ isolation, and Library-based configuration management.
 ### Docker (recommended for most users)
 
 ```bash
-git clone https://github.com/Th0rgal/sandboxed-sh.git
+git clone https://github.com/Th0rgal/sandboxed.sh.git
 cd sandboxed-sh
 cp .env.example .env
 # Edit .env with your settings
