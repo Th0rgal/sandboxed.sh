@@ -449,6 +449,27 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/cleanup",
             post(control::cleanup_empty_missions),
         )
+        // Automation endpoints
+        .route(
+            "/api/control/missions/:id/automations",
+            get(control::list_mission_automations),
+        )
+        .route(
+            "/api/control/missions/:id/automations",
+            post(control::create_automation),
+        )
+        .route(
+            "/api/control/automations/:id",
+            get(control::get_automation),
+        )
+        .route(
+            "/api/control/automations/:id",
+            axum::routing::patch(control::update_automation),
+        )
+        .route(
+            "/api/control/automations/:id",
+            axum::routing::delete(control::delete_automation),
+        )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))
         .route(
