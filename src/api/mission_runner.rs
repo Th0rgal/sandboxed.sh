@@ -1544,6 +1544,14 @@ pub fn run_claudecode_turn<'a>(
                 }
             };
 
+        // Proactive network connectivity check - fail fast if API is unreachable
+        // This catches DNS/network issues immediately instead of waiting for a timeout
+        if let Err(err_msg) = check_api_connectivity(&workspace_exec, work_dir).await {
+            tracing::error!(mission_id = %mission_id, "{}", err_msg);
+            return AgentResult::failure(err_msg, 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+
         tracing::info!(
             mission_id = %mission_id,
             session_id = %session_id,
@@ -4141,6 +4149,90 @@ async fn command_available(
     }
 
     false
+}
+
+/// Proactive API connectivity check.
+/// Tests if the workspace can reach the Anthropic API before starting Claude Code.
+/// Returns an error message if connectivity fails, allowing immediate user feedback.
+async fn check_api_connectivity(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Result<(), String> {
+    // Use curl to test DNS resolution and HTTPS connectivity to Anthropic API
+    // We use a short timeout (10s) and only check headers to minimize latency
+    let test_cmd = "curl -sI --max-time 10 https://api.anthropic.com/v1/messages 2>&1 | head -1";
+
+    let output = match workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &["-c".to_string(), test_cmd.to_string()],
+            std::collections::HashMap::new(),
+        )
+        .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(format!(
+                "Network connectivity check failed: {}. The workspace may have networking issues.",
+                e
+            ));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+
+    // Check for common DNS/network error patterns
+    if combined.contains("Could not resolve host") {
+        return Err(
+            "Cannot connect to Anthropic API: DNS resolution failed. \
+             The workspace network is not properly configured. \
+             For Tailscale workspaces, ensure the VPN connection is established."
+                .to_string(),
+        );
+    }
+    if combined.contains("Connection refused") {
+        return Err(
+            "Cannot connect to Anthropic API: Connection refused. \
+             Check if network access is blocked or if a proxy is required."
+                .to_string(),
+        );
+    }
+    if combined.contains("Network is unreachable") {
+        return Err(
+            "Cannot connect to Anthropic API: Network is unreachable. \
+             The workspace has no network connectivity."
+                .to_string(),
+        );
+    }
+    if combined.contains("Connection timed out") || combined.contains("Operation timed out") {
+        return Err(
+            "Cannot connect to Anthropic API: Connection timed out. \
+             The network may be slow or firewalled."
+                .to_string(),
+        );
+    }
+
+    // Check for successful HTTP response (any HTTP response means connectivity works)
+    if stdout.starts_with("HTTP/") || combined.contains("HTTP/") {
+        tracing::debug!("API connectivity check passed");
+        return Ok(());
+    }
+
+    // If we got here with no clear error and no HTTP response, curl might have failed silently
+    if !output.status.success() {
+        return Err(format!(
+            "Cannot connect to Anthropic API: Network check failed (exit code {}). \
+             Output: {}",
+            output.status.code().unwrap_or(-1),
+            combined.trim()
+        ));
+    }
+
+    // Assume success if no errors detected
+    Ok(())
 }
 
 /// Returns the path to the Claude Code CLI that should be used.
