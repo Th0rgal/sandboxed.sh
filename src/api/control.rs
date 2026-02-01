@@ -1315,6 +1315,13 @@ pub async fn create_mission(
         }
     }
 
+    // If no backend specified, use the default from registry
+    // This needs to happen BEFORE agent validation so we validate against the correct backend
+    if backend.is_none() {
+        let registry = state.backend_registry.read().await;
+        backend = Some(registry.default_id().to_string());
+    }
+
     // Validate agent exists before creating mission (fail fast with clear error)
     // Skip validation for Claude Code and Amp - they have their own built-in agents
     if let Some(ref agent_name) = agent {
@@ -1325,12 +1332,6 @@ pub async fn create_mission(
                 .await
                 .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         }
-    }
-
-    // If no backend specified, use the default from registry
-    if backend.is_none() {
-        let registry = state.backend_registry.read().await;
-        backend = Some(registry.default_id().to_string());
     }
 
     // Validate backend exists
