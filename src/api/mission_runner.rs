@@ -1548,8 +1548,7 @@ pub fn run_claudecode_turn<'a>(
         // This catches DNS/network issues immediately instead of waiting for a timeout
         if let Err(err_msg) = check_api_connectivity(&workspace_exec, work_dir).await {
             tracing::error!(mission_id = %mission_id, "{}", err_msg);
-            return AgentResult::failure(err_msg, 0)
-                .with_terminal_reason(TerminalReason::LlmError);
+            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
 
         tracing::info!(
@@ -4186,33 +4185,25 @@ async fn check_api_connectivity(
 
     // Check for common DNS/network error patterns
     if combined.contains("Could not resolve host") {
-        return Err(
-            "Cannot connect to Anthropic API: DNS resolution failed. \
+        return Err("Cannot connect to Anthropic API: DNS resolution failed. \
              The workspace network is not properly configured. \
              For Tailscale workspaces, ensure the VPN connection is established."
-                .to_string(),
-        );
+            .to_string());
     }
     if combined.contains("Connection refused") {
-        return Err(
-            "Cannot connect to Anthropic API: Connection refused. \
+        return Err("Cannot connect to Anthropic API: Connection refused. \
              Check if network access is blocked or if a proxy is required."
-                .to_string(),
-        );
+            .to_string());
     }
     if combined.contains("Network is unreachable") {
-        return Err(
-            "Cannot connect to Anthropic API: Network is unreachable. \
+        return Err("Cannot connect to Anthropic API: Network is unreachable. \
              The workspace has no network connectivity."
-                .to_string(),
-        );
+            .to_string());
     }
     if combined.contains("Connection timed out") || combined.contains("Operation timed out") {
-        return Err(
-            "Cannot connect to Anthropic API: Connection timed out. \
+        return Err("Cannot connect to Anthropic API: Connection timed out. \
              The network may be slow or firewalled."
-                .to_string(),
-        );
+            .to_string());
     }
 
     // Check for successful HTTP response (any HTTP response means connectivity works)
