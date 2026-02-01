@@ -107,6 +107,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/components", get(get_components))
         .route("/components/:name/update", post(update_component))
+        .route("/components/:name/uninstall", post(uninstall_component))
         .route("/plugins/installed", get(get_installed_plugins))
         .route("/plugins/:package/update", get(update_plugin))
 }
@@ -651,6 +652,27 @@ async fn update_component(
     }
 }
 
+/// Uninstall a system component.
+async fn uninstall_component(
+    State(_state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Sse<UpdateStream>, (StatusCode, String)> {
+    match name.as_str() {
+        "sandboxed_sh" => Err((
+            StatusCode::BAD_REQUEST,
+            "Cannot uninstall sandboxed.sh - it is the main application".to_string(),
+        )),
+        "opencode" => Ok(Sse::new(Box::pin(stream_opencode_uninstall()))),
+        "claude_code" => Ok(Sse::new(Box::pin(stream_claude_code_uninstall()))),
+        "amp" => Ok(Sse::new(Box::pin(stream_amp_uninstall()))),
+        "oh_my_opencode" => Ok(Sse::new(Box::pin(stream_oh_my_opencode_uninstall()))),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            format!("Unknown component: {}", name),
+        )),
+    }
+}
+
 /// Stream the Open Agent update process.
 /// Builds from source using git tags (no pre-built binaries needed).
 fn stream_sandboxed_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
@@ -1060,6 +1082,251 @@ fn stream_oh_my_opencode_update() -> impl Stream<Item = Result<Event, std::conve
                 yield sse("error", format!("Failed to run update: {}", e), None);
             }
         }
+    }
+}
+
+/// Stream the OpenCode uninstall process.
+fn stream_opencode_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    async_stream::stream! {
+        yield sse("log", "Starting OpenCode uninstall...", Some(0));
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let is_root = unsafe { libc::geteuid() } == 0;
+
+        // Stop the service first if running as root
+        if is_root {
+            yield sse("log", "Stopping opencode service...", Some(10));
+            let _ = Command::new("systemctl")
+                .args(["stop", "opencode.service"])
+                .output()
+                .await;
+        }
+
+        // Remove the binary from system location
+        yield sse("log", "Removing OpenCode binary...", Some(30));
+
+        let mut removed = false;
+
+        // Remove from /usr/local/bin if exists
+        if std::path::Path::new("/usr/local/bin/opencode").exists() {
+            match Command::new("rm")
+                .args(["-f", "/usr/local/bin/opencode"])
+                .output()
+                .await
+            {
+                Ok(o) if o.status.success() => {
+                    yield sse("log", "Removed /usr/local/bin/opencode", Some(50));
+                    removed = true;
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    yield sse("log", format!("Warning: Failed to remove /usr/local/bin/opencode: {}", stderr), Some(50));
+                }
+                Err(e) => {
+                    yield sse("log", format!("Warning: Failed to remove /usr/local/bin/opencode: {}", e), Some(50));
+                }
+            }
+        }
+
+        // Remove from user-local location
+        let user_bin = format!("{}/.opencode/bin/opencode", home);
+        if std::path::Path::new(&user_bin).exists() {
+            match Command::new("rm")
+                .args(["-f", &user_bin])
+                .output()
+                .await
+            {
+                Ok(o) if o.status.success() => {
+                    yield sse("log", format!("Removed {}", user_bin), Some(60));
+                    removed = true;
+                }
+                _ => {}
+            }
+        }
+
+        // Optionally remove the entire .opencode directory
+        let opencode_dir = format!("{}/.opencode", home);
+        if std::path::Path::new(&opencode_dir).exists() {
+            yield sse("log", "Removing OpenCode configuration directory...", Some(70));
+            match Command::new("rm")
+                .args(["-rf", &opencode_dir])
+                .output()
+                .await
+            {
+                Ok(o) if o.status.success() => {
+                    yield sse("log", format!("Removed {}", opencode_dir), Some(80));
+                }
+                _ => {}
+            }
+        }
+
+        // Disable the systemd service if root
+        if is_root {
+            yield sse("log", "Disabling opencode service...", Some(90));
+            let _ = Command::new("systemctl")
+                .args(["disable", "opencode.service"])
+                .output()
+                .await;
+        }
+
+        if removed {
+            yield sse("complete", "OpenCode uninstalled successfully!", Some(100));
+        } else {
+            yield sse("complete", "OpenCode was not installed or already removed.", Some(100));
+        }
+    }
+}
+
+/// Stream the Claude Code uninstall process.
+fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    async_stream::stream! {
+        yield sse("log", "Starting Claude Code uninstall...", Some(0));
+
+        // Check if npm is available
+        let npm_check = Command::new("npm").arg("--version").output().await;
+        if npm_check.is_err() || !npm_check.unwrap().status.success() {
+            yield sse("error", "npm is required to uninstall Claude Code.", None);
+            return;
+        }
+
+        yield sse("log", "Uninstalling @anthropic-ai/claude-code globally...", Some(20));
+
+        match Command::new("npm")
+            .args(["uninstall", "-g", "@anthropic-ai/claude-code"])
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {
+                yield sse("log", "Package removed from npm", Some(60));
+
+                // Remove Claude Code configuration
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                let claude_config = format!("{}/.claude", home);
+                if std::path::Path::new(&claude_config).exists() {
+                    yield sse("log", "Removing Claude Code configuration...", Some(80));
+                    let _ = Command::new("rm")
+                        .args(["-rf", &claude_config])
+                        .output()
+                        .await;
+                }
+
+                yield sse("complete", "Claude Code uninstalled successfully!", Some(100));
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // npm uninstall returns success even if package wasn't installed
+                if stderr.contains("not installed") || stdout.contains("not installed") {
+                    yield sse("complete", "Claude Code was not installed.", Some(100));
+                } else {
+                    yield sse("error", format!("Failed to uninstall Claude Code: {} {}", stderr, stdout), None);
+                }
+            }
+            Err(e) => {
+                yield sse("error", format!("Failed to run npm uninstall: {}", e), None);
+            }
+        }
+    }
+}
+
+/// Stream the Amp uninstall process.
+fn stream_amp_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    async_stream::stream! {
+        yield sse("log", "Starting Amp uninstall...", Some(0));
+
+        // Check if npm is available
+        let npm_check = Command::new("npm").arg("--version").output().await;
+        if npm_check.is_err() || !npm_check.unwrap().status.success() {
+            yield sse("error", "npm is required to uninstall Amp.", None);
+            return;
+        }
+
+        yield sse("log", "Uninstalling @sourcegraph/amp globally...", Some(20));
+
+        match Command::new("npm")
+            .args(["uninstall", "-g", "@sourcegraph/amp"])
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {
+                yield sse("log", "Package removed from npm", Some(60));
+
+                // Remove Amp configuration
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                let amp_config = format!("{}/.agents", home);
+                if std::path::Path::new(&amp_config).exists() {
+                    yield sse("log", "Removing Amp configuration...", Some(80));
+                    let _ = Command::new("rm")
+                        .args(["-rf", &amp_config])
+                        .output()
+                        .await;
+                }
+
+                yield sse("complete", "Amp uninstalled successfully!", Some(100));
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stderr.contains("not installed") || stdout.contains("not installed") {
+                    yield sse("complete", "Amp was not installed.", Some(100));
+                } else {
+                    yield sse("error", format!("Failed to uninstall Amp: {} {}", stderr, stdout), None);
+                }
+            }
+            Err(e) => {
+                yield sse("error", format!("Failed to run npm uninstall: {}", e), None);
+            }
+        }
+    }
+}
+
+/// Stream the oh-my-opencode uninstall process.
+fn stream_oh_my_opencode_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>>
+{
+    async_stream::stream! {
+        yield sse("log", "Starting oh-my-opencode uninstall...", Some(0));
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+
+        // Remove npm global install if exists
+        yield sse("log", "Removing npm global install...", Some(10));
+        let _ = Command::new("npm")
+            .args(["uninstall", "-g", "oh-my-opencode"])
+            .output()
+            .await;
+
+        // Clear bun cache for oh-my-opencode
+        yield sse("log", "Clearing oh-my-opencode caches...", Some(30));
+        let cache_clear_script = format!(
+            r#"
+            rm -rf {home}/.bun/install/cache/oh-my-opencode* 2>/dev/null
+            rm -rf {home}/.cache/.bun/install/cache/oh-my-opencode* 2>/dev/null
+            rm -rf {home}/.npm/_npx/*/node_modules/oh-my-opencode* 2>/dev/null
+            "#,
+            home = home
+        );
+        let _ = Command::new("bash")
+            .args(["-c", &cache_clear_script])
+            .output()
+            .await;
+
+        // Remove the oh-my-opencode config file
+        yield sse("log", "Removing oh-my-opencode configuration...", Some(60));
+        let config_path = format!("{}/.config/opencode/oh-my-opencode.json", home);
+        if std::path::Path::new(&config_path).exists() {
+            match Command::new("rm")
+                .args(["-f", &config_path])
+                .output()
+                .await
+            {
+                Ok(o) if o.status.success() => {
+                    yield sse("log", "Removed oh-my-opencode.json", Some(80));
+                }
+                _ => {}
+            }
+        }
+
+        yield sse("complete", "oh-my-opencode uninstalled successfully!", Some(100));
     }
 }
 

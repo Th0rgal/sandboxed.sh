@@ -6,6 +6,7 @@ import { toast } from '@/components/toast';
 import {
   getSystemComponents,
   updateSystemComponent,
+  uninstallSystemComponent,
   ComponentInfo,
   UpdateProgressEvent,
 } from '@/lib/api';
@@ -18,6 +19,7 @@ import {
   Loader,
   ChevronDown,
   ChevronUp,
+  Trash2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -68,6 +70,7 @@ export function ServerConnectionCard({
 }: ServerConnectionCardProps) {
   const [componentsExpanded, setComponentsExpanded] = useState(true);
   const [updatingComponent, setUpdatingComponent] = useState<string | null>(null);
+  const [uninstallingComponent, setUninstallingComponent] = useState<string | null>(null);
   const [updateLogs, setUpdateLogs] = useState<UpdateLog[]>([]);
 
   // SWR: fetch system components
@@ -82,7 +85,7 @@ export function ServerConnectionCard({
   const components = data ?? [];
 
   const handleUpdate = async (component: ComponentInfo) => {
-    if (updatingComponent) return;
+    if (updatingComponent || uninstallingComponent) return;
 
     setUpdatingComponent(component.name);
     setUpdateLogs([]);
@@ -118,8 +121,51 @@ export function ServerConnectionCard({
     );
   };
 
+  const handleUninstall = async (component: ComponentInfo) => {
+    if (updatingComponent || uninstallingComponent) return;
+
+    // Don't allow uninstalling sandboxed_sh
+    if (component.name === 'sandboxed_sh') {
+      toast.error('Cannot uninstall sandboxed.sh - it is the main application');
+      return;
+    }
+
+    setUninstallingComponent(component.name);
+    setUpdateLogs([]);
+
+    await uninstallSystemComponent(
+      component.name,
+      (event: UpdateProgressEvent) => {
+        setUpdateLogs((prev) => [
+          ...prev,
+          {
+            message: event.message,
+            progress: event.progress ?? undefined,
+            type: event.event_type === 'complete'
+              ? 'complete'
+              : event.event_type === 'error'
+              ? 'error'
+              : 'log',
+          },
+        ]);
+      },
+      async () => {
+        toast.success(
+          `${componentNames[component.name] || component.name} uninstalled successfully!`
+        );
+        setUninstallingComponent(null);
+        // Force SWR to refetch fresh data (bypass cache).
+        await mutate(undefined, { revalidate: true });
+      },
+      (error: string) => {
+        toast.error(`Uninstall failed: ${error}`);
+        setUninstallingComponent(null);
+      }
+    );
+  };
+
   const getStatusIcon = (component: ComponentInfo) => {
-    if (updatingComponent === component.name) {
+    if (updatingComponent === component.name || uninstallingComponent === component.name) {
       return <Loader className="h-3.5 w-3.5 animate-spin text-indigo-400" />;
     }
     if (component.status === 'update_available') {
@@ -305,7 +351,7 @@ export function ServerConnectionCard({
                     {component.status === 'update_available' && (
                       <button
                         onClick={() => handleUpdate(component)}
-                        disabled={updatingComponent !== null}
+                        disabled={updatingComponent !== null || uninstallingComponent !== null}
                         className="flex items-center gap-1.5 rounded-lg bg-indigo-500/20 border border-indigo-500/30 px-2.5 py-1 text-xs text-indigo-300 hover:bg-indigo-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <ArrowUp className="h-3 w-3" />
@@ -317,17 +363,30 @@ export function ServerConnectionCard({
                     {component.status === 'not_installed' && (
                       <button
                         onClick={() => handleUpdate(component)}
-                        disabled={updatingComponent !== null}
+                        disabled={updatingComponent !== null || uninstallingComponent !== null}
                         className="flex items-center gap-1.5 rounded-lg bg-emerald-500/20 border border-emerald-500/30 px-2.5 py-1 text-xs text-emerald-300 hover:bg-emerald-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <ArrowUp className="h-3 w-3" />
                         Install
                       </button>
                     )}
+
+                    {/* Uninstall button for installed components (except sandboxed_sh) */}
+                    {component.installed && component.name !== 'sandboxed_sh' && (
+                      <button
+                        onClick={() => handleUninstall(component)}
+                        disabled={updatingComponent !== null || uninstallingComponent !== null}
+                        className="flex items-center gap-1.5 rounded-lg bg-red-500/10 border border-red-500/20 px-2.5 py-1 text-xs text-red-300 hover:bg-red-500/20 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                        title={`Uninstall ${componentNames[component.name] || component.name}`}
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        Uninstall
+                      </button>
+                    )}
                   </div>
 
-                  {/* Update logs */}
-                  {updatingComponent === component.name && updateLogs.length > 0 && (
+                  {/* Update/Uninstall logs */}
+                  {(updatingComponent === component.name || uninstallingComponent === component.name) && updateLogs.length > 0 && (
                     <div className="border-t border-white/[0.06] px-3 py-2">
                       <div className="max-h-32 overflow-y-auto text-xs space-y-1 font-mono">
                         {updateLogs.map((log, i) => (
