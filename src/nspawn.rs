@@ -761,9 +761,10 @@ pub async fn execute_in_container_streaming(
     });
 
     // Wait for the child process to complete
-    let status = child.wait().await.map_err(|e| {
-        NspawnError::NspawnExecution(format!("Failed to wait for process: {}", e))
-    })?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| NspawnError::NspawnExecution(format!("Failed to wait for process: {}", e)))?;
 
     // Wait for the reader tasks to finish
     let _ = stdout_task.await;

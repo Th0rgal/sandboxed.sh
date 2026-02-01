@@ -384,7 +384,8 @@ impl WorkspaceExec {
                 // check, so the nsenter path can also include the bootstrap.
                 let tailscale_enabled_check = nspawn::tailscale_enabled(&env);
                 let tailscale_args = nspawn::tailscale_nspawn_extra_args(&env);
-                let needs_tailscale_bootstrap = tailscale_enabled_check && !tailscale_args.is_empty();
+                let needs_tailscale_bootstrap =
+                    tailscale_enabled_check && !tailscale_args.is_empty();
 
                 tracing::info!(
                     workspace = %self.workspace.name,
