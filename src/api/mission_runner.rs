@@ -1546,7 +1546,7 @@ pub fn run_claudecode_turn<'a>(
 
         // Proactive network connectivity check - fail fast if API is unreachable
         // This catches DNS/network issues immediately instead of waiting for a timeout
-        if let Err(err_msg) = check_api_connectivity(&workspace_exec, work_dir).await {
+        if let Err(err_msg) = check_claudecode_connectivity(&workspace_exec, work_dir).await {
             tracing::error!(mission_id = %mission_id, "{}", err_msg);
             return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
@@ -4150,16 +4150,14 @@ async fn command_available(
     false
 }
 
-/// Proactive API connectivity check.
-/// Tests if the workspace can reach the Anthropic API before starting Claude Code.
-/// Returns an error message if connectivity fails, allowing immediate user feedback.
-async fn check_api_connectivity(
+/// Check basic internet connectivity using a reliable public endpoint.
+/// This verifies the workspace has any network access at all.
+async fn check_basic_internet_connectivity(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
 ) -> Result<(), String> {
-    // Use curl to test DNS resolution and HTTPS connectivity to Anthropic API
-    // We use a short timeout (10s) and only check headers to minimize latency
-    let test_cmd = "curl -sI --max-time 10 https://api.anthropic.com/v1/messages 2>&1 | head -1";
+    // Use Cloudflare's 1.1.1.1 which is highly reliable and fast
+    let test_cmd = "curl -sI --max-time 5 https://1.1.1.1 2>&1 | head -1";
 
     let output = match workspace_exec
         .output(
@@ -4183,47 +4181,285 @@ async fn check_api_connectivity(
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}{}", stdout, stderr);
 
-    // Check for common DNS/network error patterns
-    if combined.contains("Could not resolve host") {
-        return Err("Cannot connect to Anthropic API: DNS resolution failed. \
-             The workspace network is not properly configured. \
-             For Tailscale workspaces, ensure the VPN connection is established."
-            .to_string());
-    }
-    if combined.contains("Connection refused") {
-        return Err("Cannot connect to Anthropic API: Connection refused. \
-             Check if network access is blocked or if a proxy is required."
-            .to_string());
-    }
+    // Check for network-level errors
     if combined.contains("Network is unreachable") {
-        return Err("Cannot connect to Anthropic API: Network is unreachable. \
-             The workspace has no network connectivity."
-            .to_string());
+        return Err(
+            "No internet connectivity: Network is unreachable. \
+             The workspace has no network access."
+                .to_string(),
+        );
     }
     if combined.contains("Connection timed out") || combined.contains("Operation timed out") {
-        return Err("Cannot connect to Anthropic API: Connection timed out. \
-             The network may be slow or firewalled."
-            .to_string());
+        return Err(
+            "No internet connectivity: Connection timed out. \
+             The workspace cannot reach the internet."
+                .to_string(),
+        );
+    }
+
+    // Check for successful HTTP response
+    if stdout.starts_with("HTTP/") || combined.contains("HTTP/") {
+        tracing::debug!("Basic internet connectivity check passed");
+        return Ok(());
+    }
+
+    // If curl failed completely
+    if !output.status.success() {
+        return Err(format!(
+            "No internet connectivity: Network check failed (exit code {}). \
+             The workspace may not have network access configured.",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check DNS resolution for a specific hostname.
+async fn check_dns_resolution(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    hostname: &str,
+) -> Result<(), String> {
+    // Use getent or nslookup to test DNS resolution
+    let test_cmd = format!(
+        "getent hosts {} 2>&1 || nslookup {} 2>&1 | head -3",
+        hostname, hostname
+    );
+
+    let output = match workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &["-c".to_string(), test_cmd],
+            std::collections::HashMap::new(),
+        )
+        .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(format!("DNS resolution check failed: {}", e));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+
+    // Check for DNS failure indicators
+    if combined.contains("not found")
+        || combined.contains("NXDOMAIN")
+        || combined.contains("no address")
+        || combined.contains("Name or service not known")
+    {
+        return Err(format!(
+            "DNS resolution failed for '{}'. \
+             The workspace DNS is not properly configured. \
+             For Tailscale workspaces, ensure the VPN connection is established.",
+            hostname
+        ));
+    }
+
+    // If getent succeeded (exit code 0), DNS works
+    if output.status.success() {
+        tracing::debug!("DNS resolution check passed for {}", hostname);
+        return Ok(());
+    }
+
+    // Check if we got any IP address in the output (nslookup format)
+    let has_ip = combined
+        .lines()
+        .any(|line| line.contains("Address:") || line.split_whitespace().any(|w| w.parse::<std::net::IpAddr>().is_ok()));
+
+    if has_ip {
+        tracing::debug!("DNS resolution check passed for {} (found IP)", hostname);
+        return Ok(());
+    }
+
+    Err(format!(
+        "DNS resolution failed for '{}'. Check network configuration.",
+        hostname
+    ))
+}
+
+/// Check if a specific API endpoint is reachable.
+/// Returns detailed error messages for different failure modes.
+async fn check_api_reachability(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    api_name: &str,
+    api_url: &str,
+) -> Result<(), String> {
+    // Use curl to test HTTPS connectivity to the API
+    let test_cmd = format!(
+        "curl -sI --max-time 10 {} 2>&1 | head -1",
+        api_url
+    );
+
+    let output = match workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &["-c".to_string(), test_cmd],
+            std::collections::HashMap::new(),
+        )
+        .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(format!(
+                "Cannot connect to {} API: {}",
+                api_name, e
+            ));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+
+    // Check for common error patterns
+    if combined.contains("Could not resolve host") {
+        return Err(format!(
+            "Cannot connect to {} API: DNS resolution failed. \
+             The workspace network is not properly configured.",
+            api_name
+        ));
+    }
+    if combined.contains("Connection refused") {
+        return Err(format!(
+            "Cannot connect to {} API: Connection refused. \
+             Check if network access is blocked or if a proxy is required.",
+            api_name
+        ));
+    }
+    if combined.contains("Network is unreachable") {
+        return Err(format!(
+            "Cannot connect to {} API: Network is unreachable.",
+            api_name
+        ));
+    }
+    if combined.contains("Connection timed out") || combined.contains("Operation timed out") {
+        return Err(format!(
+            "Cannot connect to {} API: Connection timed out. \
+             The network may be slow or firewalled.",
+            api_name
+        ));
+    }
+    if combined.contains("SSL") || combined.contains("certificate") {
+        return Err(format!(
+            "Cannot connect to {} API: SSL/TLS error. \
+             Check if there's a proxy intercepting HTTPS traffic.",
+            api_name
+        ));
     }
 
     // Check for successful HTTP response (any HTTP response means connectivity works)
     if stdout.starts_with("HTTP/") || combined.contains("HTTP/") {
-        tracing::debug!("API connectivity check passed");
+        tracing::debug!("{} API connectivity check passed", api_name);
         return Ok(());
     }
 
-    // If we got here with no clear error and no HTTP response, curl might have failed silently
+    // If curl failed with no clear error
     if !output.status.success() {
         return Err(format!(
-            "Cannot connect to Anthropic API: Network check failed (exit code {}). \
+            "Cannot connect to {} API: Network check failed (exit code {}). \
              Output: {}",
+            api_name,
             output.status.code().unwrap_or(-1),
             combined.trim()
         ));
     }
 
-    // Assume success if no errors detected
     Ok(())
+}
+
+/// API endpoint configurations for different providers
+struct ApiEndpoint {
+    name: &'static str,
+    url: &'static str,
+    hostname: &'static str,
+}
+
+const ANTHROPIC_API: ApiEndpoint = ApiEndpoint {
+    name: "Anthropic",
+    url: "https://api.anthropic.com/v1/messages",
+    hostname: "api.anthropic.com",
+};
+
+const OPENAI_API: ApiEndpoint = ApiEndpoint {
+    name: "OpenAI",
+    url: "https://api.openai.com/v1/models",
+    hostname: "api.openai.com",
+};
+
+const GOOGLE_AI_API: ApiEndpoint = ApiEndpoint {
+    name: "Google AI",
+    url: "https://generativelanguage.googleapis.com/",
+    hostname: "generativelanguage.googleapis.com",
+};
+
+/// Proactive API connectivity check for Claude Code.
+/// Tests basic internet, then DNS, then Anthropic API reachability.
+async fn check_claudecode_connectivity(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Result<(), String> {
+    // First check basic internet connectivity
+    if let Err(e) = check_basic_internet_connectivity(workspace_exec, cwd).await {
+        return Err(e);
+    }
+
+    // Then check DNS for Anthropic
+    if let Err(e) = check_dns_resolution(workspace_exec, cwd, ANTHROPIC_API.hostname).await {
+        return Err(e);
+    }
+
+    // Finally check Anthropic API reachability
+    check_api_reachability(workspace_exec, cwd, ANTHROPIC_API.name, ANTHROPIC_API.url).await
+}
+
+/// Proactive API connectivity check for OpenCode.
+/// Tests basic internet, then checks the appropriate API based on configured providers.
+async fn check_opencode_connectivity(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    has_openai: bool,
+    has_anthropic: bool,
+    has_google: bool,
+) -> Result<(), String> {
+    // First check basic internet connectivity
+    if let Err(e) = check_basic_internet_connectivity(workspace_exec, cwd).await {
+        return Err(e);
+    }
+
+    // Determine which API to check based on configured providers
+    // Priority: OpenAI > Anthropic > Google (most common first)
+    // If none are explicitly configured, we already verified internet works
+    let api = if has_openai {
+        Some(&OPENAI_API)
+    } else if has_anthropic {
+        Some(&ANTHROPIC_API)
+    } else if has_google {
+        Some(&GOOGLE_AI_API)
+    } else {
+        // No specific provider detected - basic internet check is sufficient
+        // The actual API will be determined by OpenCode's config
+        None
+    };
+
+    if let Some(api) = api {
+        // Check DNS for the selected API
+        if let Err(e) = check_dns_resolution(workspace_exec, cwd, api.hostname).await {
+            return Err(e);
+        }
+
+        // Check API reachability
+        check_api_reachability(workspace_exec, cwd, api.name, api.url).await
+    } else {
+        tracing::debug!("No specific provider detected, skipping API-specific connectivity check");
+        Ok(())
+    }
 }
 
 /// Returns the path to the Claude Code CLI that should be used.
@@ -4658,6 +4894,15 @@ pub async fn run_opencode_turn(
             return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
     };
+
+    // Proactive network connectivity check - fail fast if API is unreachable
+    // This catches DNS/network issues immediately instead of waiting for a timeout
+    if let Err(err_msg) =
+        check_opencode_connectivity(&workspace_exec, work_dir, has_openai, has_anthropic, has_google).await
+    {
+        tracing::error!(mission_id = %mission_id, "{}", err_msg);
+        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+    }
 
     tracing::info!(
         mission_id = %mission_id,
