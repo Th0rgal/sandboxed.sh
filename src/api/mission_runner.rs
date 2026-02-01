@@ -4183,18 +4183,14 @@ async fn check_basic_internet_connectivity(
 
     // Check for network-level errors
     if combined.contains("Network is unreachable") {
-        return Err(
-            "No internet connectivity: Network is unreachable. \
+        return Err("No internet connectivity: Network is unreachable. \
              The workspace has no network access."
-                .to_string(),
-        );
+            .to_string());
     }
     if combined.contains("Connection timed out") || combined.contains("Operation timed out") {
-        return Err(
-            "No internet connectivity: Connection timed out. \
+        return Err("No internet connectivity: Connection timed out. \
              The workspace cannot reach the internet."
-                .to_string(),
-        );
+            .to_string());
     }
 
     // Check for successful HTTP response
@@ -4267,9 +4263,12 @@ async fn check_dns_resolution(
     }
 
     // Check if we got any IP address in the output (nslookup format)
-    let has_ip = combined
-        .lines()
-        .any(|line| line.contains("Address:") || line.split_whitespace().any(|w| w.parse::<std::net::IpAddr>().is_ok()));
+    let has_ip = combined.lines().any(|line| {
+        line.contains("Address:")
+            || line
+                .split_whitespace()
+                .any(|w| w.parse::<std::net::IpAddr>().is_ok())
+    });
 
     if has_ip {
         tracing::debug!("DNS resolution check passed for {} (found IP)", hostname);
@@ -4291,10 +4290,7 @@ async fn check_api_reachability(
     api_url: &str,
 ) -> Result<(), String> {
     // Use curl to test HTTPS connectivity to the API
-    let test_cmd = format!(
-        "curl -sI --max-time 10 {} 2>&1 | head -1",
-        api_url
-    );
+    let test_cmd = format!("curl -sI --max-time 10 {} 2>&1 | head -1", api_url);
 
     let output = match workspace_exec
         .output(
@@ -4307,10 +4303,7 @@ async fn check_api_reachability(
     {
         Ok(out) => out,
         Err(e) => {
-            return Err(format!(
-                "Cannot connect to {} API: {}",
-                api_name, e
-            ));
+            return Err(format!("Cannot connect to {} API: {}", api_name, e));
         }
     };
 
@@ -4897,8 +4890,14 @@ pub async fn run_opencode_turn(
 
     // Proactive network connectivity check - fail fast if API is unreachable
     // This catches DNS/network issues immediately instead of waiting for a timeout
-    if let Err(err_msg) =
-        check_opencode_connectivity(&workspace_exec, work_dir, has_openai, has_anthropic, has_google).await
+    if let Err(err_msg) = check_opencode_connectivity(
+        &workspace_exec,
+        work_dir,
+        has_openai,
+        has_anthropic,
+        has_google,
+    )
+    .await
     {
         tracing::error!(mission_id = %mission_id, "{}", err_msg);
         return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
