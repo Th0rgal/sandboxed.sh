@@ -373,7 +373,7 @@ export function NewMissionDialog({
       workspaceId: newMissionWorkspace || undefined,
       agent: parsed?.agent || undefined,
       configProfile: selectedConfigProfile || undefined,
-      backend: parsed?.backend || 'opencode',
+      backend: parsed?.backend || 'claudecode',
     };
   };
 
