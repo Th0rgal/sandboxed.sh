@@ -457,15 +457,15 @@ export default function WorkspacesPage() {
         </button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {workspaces.length === 0 ? (
-          <div className="col-span-full p-12 text-center">
-            <Server className="h-12 w-12 text-white/20 mx-auto mb-4" />
-            <p className="text-white/40">No workspaces yet</p>
-            <p className="text-sm text-white/30 mt-1">Create a workspace to get started</p>
-          </div>
-        ) : (
-          workspaces.map((workspace) => (
+      {workspaces.length === 0 ? (
+        <div className="flex flex-col items-center justify-center min-h-[calc(100vh-12rem)]">
+          <Server className="h-12 w-12 text-white/20 mb-4" />
+          <p className="text-white/40">No workspaces yet</p>
+          <p className="text-sm text-white/30 mt-1">Create a workspace to get started</p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {workspaces.map((workspace) => (
             <div
               key={workspace.id}
               className="p-4 rounded-xl bg-white/[0.02] border border-white/[0.06] hover:border-white/[0.12] transition-colors cursor-pointer"
@@ -520,9 +520,9 @@ export default function WorkspacesPage() {
                 </div>
               </div>
             </div>
-          ))
-        )}
-      </div>
+          ))}
+        </div>
+      )}
 
       {/* Workspace Details Modal */}
       {selectedWorkspace && (
