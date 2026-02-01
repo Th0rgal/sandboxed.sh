@@ -312,11 +312,20 @@ export default function WorkspacesPage() {
 
   const handleDeleteWorkspace = async (id: string, name: string) => {
     if (!confirm(`Delete workspace "${name}"?`)) return;
+
+    // Optimistically remove from UI immediately
+    mutateWorkspaces(
+      (current) => current?.filter((w) => w.id !== id),
+      { revalidate: false }
+    );
+    setSelectedWorkspace(null);
+
     try {
       await deleteWorkspace(id);
-      setSelectedWorkspace(null);
-      await mutateWorkspaces();
+      showInfo(`Workspace "${name}" deleted`);
     } catch (err) {
+      // Rollback: refetch to restore the workspace
+      mutateWorkspaces();
       showError(err instanceof Error ? err.message : 'Failed to delete workspace');
     }
   };
