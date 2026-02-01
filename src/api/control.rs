@@ -3978,6 +3978,28 @@ async fn control_actor_loop(
                                 );
                             }
 
+                            // Update mission status based on result
+                            let new_status = if result.success {
+                                MissionStatus::Completed
+                            } else {
+                                MissionStatus::Failed
+                            };
+                            if let Err(e) = mission_store
+                                .update_mission_status(*mission_id, new_status)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to update parallel mission status: {}",
+                                    e
+                                );
+                            } else {
+                                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    mission_id: *mission_id,
+                                    status: new_status,
+                                    summary: None,
+                                });
+                            }
+
                             // If runner has no more queued messages, mark for cleanup
                             if runner.queue.is_empty() && !runner.is_running() {
                                 completed_missions.push(*mission_id);
