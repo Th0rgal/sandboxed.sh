@@ -21,13 +21,70 @@ import { useLibrary } from '@/contexts/library-context';
 
 // Parse JSONC (JSON with Comments) - strips comments and trailing commas before parsing
 function parseJsonc(text: string): unknown {
-  // Remove single-line comments (// ...)
-  let stripped = text.replace(/\/\/[^\n\r]*/g, '');
-  // Remove multi-line comments (/* ... */)
-  stripped = stripped.replace(/\/\*[\s\S]*?\*\//g, '');
+  // State machine to track if we're inside a string
+  let result = '';
+  let inString = false;
+  let escapeNext = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    const nextChar = text[i + 1];
+
+    // Handle escape sequences inside strings
+    if (inString && escapeNext) {
+      result += char;
+      escapeNext = false;
+      continue;
+    }
+
+    if (inString && char === '\\') {
+      result += char;
+      escapeNext = true;
+      continue;
+    }
+
+    // Toggle string state on unescaped quotes
+    if (char === '"') {
+      inString = !inString;
+      result += char;
+      continue;
+    }
+
+    // Skip comments only when NOT inside strings
+    if (!inString) {
+      // Skip single-line comments
+      if (char === '/' && nextChar === '/') {
+        // Skip until end of line
+        while (i < text.length && text[i] !== '\n' && text[i] !== '\r') {
+          i++;
+        }
+        if (i < text.length) {
+          result += text[i]; // Keep the newline
+        }
+        continue;
+      }
+
+      // Skip multi-line comments
+      if (char === '/' && nextChar === '*') {
+        i += 2;
+        while (i < text.length - 1) {
+          if (text[i] === '*' && text[i + 1] === '/') {
+            i += 2;
+            break;
+          }
+          i++;
+        }
+        i--; // Adjust for loop increment
+        continue;
+      }
+    }
+
+    result += char;
+  }
+
   // Remove trailing commas before } or ]
-  stripped = stripped.replace(/,(\s*[}\]])/g, '$1');
-  return JSON.parse(stripped);
+  result = result.replace(/,(\s*[}\]])/g, '$1');
+  return JSON.parse(result);
 }
 
 // Harness configuration metadata

@@ -1763,6 +1763,7 @@ pub fn run_claudecode_turn<'a>(
                 // Flush to ensure data is sent
                 if let Err(e) = stdin.flush().await {
                     tracing::error!(mission_id = %mission_id_for_stdin, "Failed to flush Claude stdin: {}", e);
+                    return false;
                 }
                 // Close stdin to signal end of input
                 drop(stdin);
@@ -1781,6 +1782,7 @@ pub fn run_claudecode_turn<'a>(
                 }
                 Ok(Ok(false)) => {
                     tracing::error!(mission_id = %mission_id, "Stdin write failed");
+                    let _ = child.kill().await;
                     return AgentResult::failure(
                         "Failed to write prompt to Claude CLI".to_string(),
                         0,
@@ -1789,6 +1791,7 @@ pub fn run_claudecode_turn<'a>(
                 }
                 Ok(Err(e)) => {
                     tracing::error!(mission_id = %mission_id, "Stdin task panicked: {:?}", e);
+                    let _ = child.kill().await;
                     return AgentResult::failure(
                         "Failed to write prompt to Claude CLI (task panic)".to_string(),
                         0,
@@ -1797,6 +1800,7 @@ pub fn run_claudecode_turn<'a>(
                 }
                 Err(_) => {
                     tracing::error!(mission_id = %mission_id, "Stdin write timed out after 5s");
+                    let _ = child.kill().await;
                     return AgentResult::failure(
                         "Timed out writing prompt to Claude CLI".to_string(),
                         0,

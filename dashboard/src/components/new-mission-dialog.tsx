@@ -279,7 +279,7 @@ export function NewMissionDialog({
       document.removeEventListener('mousedown', handleClickOutside);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [open]);
+  }, [open, onClose]);
 
   // Set initial values when dialog opens (only once per open)
   useEffect(() => {
