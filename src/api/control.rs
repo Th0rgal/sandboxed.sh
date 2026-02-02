@@ -2194,7 +2194,6 @@ fn spawn_control_session(
             Arc::clone(&state.mission_store),
             library.clone(),
             state.cmd_tx.clone(),
-            Arc::clone(&running_missions),
         ));
     }
 
@@ -2309,7 +2308,6 @@ async fn automation_scheduler_loop(
     mission_store: Arc<dyn MissionStore>,
     library: SharedLibrary,
     cmd_tx: mpsc::Sender<ControlCommand>,
-    running_missions: Arc<RwLock<Vec<super::mission_runner::RunningMissionInfo>>>,
 ) {
     // Check every 5 seconds for automations that need to run
     let check_interval = std::time::Duration::from_secs(5);
@@ -2360,11 +2358,21 @@ async fn automation_scheduler_loop(
 
                 // Check if the mission is currently busy (has a running task or queued messages)
                 let is_busy = {
-                    let running = running_missions.read().await;
-                    running.iter().any(|r| {
-                        r.mission_id == mission.id
-                            && (r.queue_len > 0 || r.state == "running" || r.state == "waiting_for_tool")
-                    })
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    if cmd_tx.send(ControlCommand::ListRunning { respond: tx }).await.is_err() {
+                        tracing::warn!("Failed to send ListRunning command for automation busy check");
+                        continue;
+                    }
+                    match rx.await {
+                        Ok(running) => running.iter().any(|r| {
+                            r.mission_id == mission.id
+                                && (r.queue_len > 0 || r.state == "running" || r.state == "waiting_for_tool")
+                        }),
+                        Err(_) => {
+                            tracing::warn!("Failed to receive ListRunning response for automation busy check");
+                            continue;
+                        }
+                    }
                 };
 
                 if is_busy {
