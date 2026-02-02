@@ -2361,7 +2361,10 @@ async fn automation_scheduler_loop(
                 // Check if the mission is currently busy (has a running task or queued messages)
                 let is_busy = {
                     let running = running_missions.read().await;
-                    running.iter().any(|r| r.mission_id == mission.id && (r.queue_len > 0 || r.state != "idle"))
+                    running.iter().any(|r| {
+                        r.mission_id == mission.id
+                            && (r.queue_len > 0 || r.state == "running" || r.state == "waiting_for_tool")
+                    })
                 };
 
                 if is_busy {
@@ -4152,26 +4155,34 @@ async fn control_actor_loop(
 
                             // If runner has no more queued messages, update status and mark for cleanup
                             if runner.queue.is_empty() && !runner.is_running() {
-                                // Update mission status based on result
-                                let new_status = if result.success {
-                                    MissionStatus::Completed
-                                } else {
-                                    MissionStatus::Failed
-                                };
-                                if let Err(e) = mission_store
-                                    .update_mission_status(*mission_id, new_status)
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "Failed to update parallel mission status: {}",
-                                        e
+                                // Only update status if agent hasn't already set a terminal status
+                                if let Ok(mission) = mission_store.get_mission(*mission_id).await {
+                                    let should_update = matches!(
+                                        mission.status,
+                                        MissionStatus::Pending | MissionStatus::Active
                                     );
-                                } else {
-                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                        mission_id: *mission_id,
-                                        status: new_status,
-                                        summary: None,
-                                    });
+                                    if should_update {
+                                        let new_status = if result.success {
+                                            MissionStatus::Completed
+                                        } else {
+                                            MissionStatus::Failed
+                                        };
+                                        if let Err(e) = mission_store
+                                            .update_mission_status(*mission_id, new_status)
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                "Failed to update parallel mission status: {}",
+                                                e
+                                            );
+                                        } else {
+                                            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                                mission_id: *mission_id,
+                                                status: new_status,
+                                                summary: None,
+                                            });
+                                        }
+                                    }
                                 }
                                 completed_missions.push(*mission_id);
                             }

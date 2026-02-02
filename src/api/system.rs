@@ -1177,49 +1177,52 @@ fn stream_opencode_uninstall() -> impl Stream<Item = Result<Event, std::convert:
     }
 }
 
-/// Stream the Claude Code uninstall process.
-fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+/// Helper function to stream npm package uninstall process.
+fn stream_npm_package_uninstall(
+    package_name: &'static str,
+    config_dir: &'static str,
+    display_name: &'static str,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
-        yield sse("log", "Starting Claude Code uninstall...", Some(0));
+        yield sse("log", format!("Starting {} uninstall...", display_name), Some(0));
 
         // Check if npm is available
         let npm_check = Command::new("npm").arg("--version").output().await;
         if npm_check.is_err() || !npm_check.unwrap().status.success() {
-            yield sse("error", "npm is required to uninstall Claude Code.", None);
+            yield sse("error", format!("npm is required to uninstall {}.", display_name), None);
             return;
         }
 
-        yield sse("log", "Uninstalling @anthropic-ai/claude-code globally...", Some(20));
+        yield sse("log", format!("Uninstalling {} globally...", package_name), Some(20));
 
         match Command::new("npm")
-            .args(["uninstall", "-g", "@anthropic-ai/claude-code"])
+            .args(["uninstall", "-g", package_name])
             .output()
             .await
         {
             Ok(output) if output.status.success() => {
                 yield sse("log", "Package removed from npm", Some(60));
 
-                // Remove Claude Code configuration
+                // Remove configuration directory
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-                let claude_config = format!("{}/.claude", home);
-                if std::path::Path::new(&claude_config).exists() {
-                    yield sse("log", "Removing Claude Code configuration...", Some(80));
+                let config_path = format!("{}/{}", home, config_dir);
+                if std::path::Path::new(&config_path).exists() {
+                    yield sse("log", format!("Removing {} configuration...", display_name), Some(80));
                     let _ = Command::new("rm")
-                        .args(["-rf", &claude_config])
+                        .args(["-rf", &config_path])
                         .output()
                         .await;
                 }
 
-                yield sse("complete", "Claude Code uninstalled successfully!", Some(100));
+                yield sse("complete", format!("{} uninstalled successfully!", display_name), Some(100));
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                // npm uninstall returns success even if package wasn't installed
                 if stderr.contains("not installed") || stdout.contains("not installed") {
-                    yield sse("complete", "Claude Code was not installed.", Some(100));
+                    yield sse("complete", format!("{} was not installed.", display_name), Some(100));
                 } else {
-                    yield sse("error", format!("Failed to uninstall Claude Code: {} {}", stderr, stdout), None);
+                    yield sse("error", format!("Failed to uninstall {}: {} {}", display_name, stderr, stdout), None);
                 }
             }
             Err(e) => {
@@ -1229,55 +1232,14 @@ fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::conve
     }
 }
 
+/// Stream the Claude Code uninstall process.
+fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    stream_npm_package_uninstall("@anthropic-ai/claude-code", ".claude", "Claude Code")
+}
+
 /// Stream the Amp uninstall process.
 fn stream_amp_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    async_stream::stream! {
-        yield sse("log", "Starting Amp uninstall...", Some(0));
-
-        // Check if npm is available
-        let npm_check = Command::new("npm").arg("--version").output().await;
-        if npm_check.is_err() || !npm_check.unwrap().status.success() {
-            yield sse("error", "npm is required to uninstall Amp.", None);
-            return;
-        }
-
-        yield sse("log", "Uninstalling @sourcegraph/amp globally...", Some(20));
-
-        match Command::new("npm")
-            .args(["uninstall", "-g", "@sourcegraph/amp"])
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => {
-                yield sse("log", "Package removed from npm", Some(60));
-
-                // Remove Amp configuration
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-                let amp_config = format!("{}/.agents", home);
-                if std::path::Path::new(&amp_config).exists() {
-                    yield sse("log", "Removing Amp configuration...", Some(80));
-                    let _ = Command::new("rm")
-                        .args(["-rf", &amp_config])
-                        .output()
-                        .await;
-                }
-
-                yield sse("complete", "Amp uninstalled successfully!", Some(100));
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if stderr.contains("not installed") || stdout.contains("not installed") {
-                    yield sse("complete", "Amp was not installed.", Some(100));
-                } else {
-                    yield sse("error", format!("Failed to uninstall Amp: {} {}", stderr, stdout), None);
-                }
-            }
-            Err(e) => {
-                yield sse("error", format!("Failed to run npm uninstall: {}", e), None);
-            }
-        }
-    }
+    stream_npm_package_uninstall("@sourcegraph/amp", ".agents", "Amp")
 }
 
 /// Stream the oh-my-opencode uninstall process.
