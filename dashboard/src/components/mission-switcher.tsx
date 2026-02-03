@@ -14,14 +14,31 @@ interface MissionSwitcherProps {
   runningMissions: RunningMissionInfo[];
   currentMissionId?: string | null;
   viewingMissionId?: string | null;
+  workspaceNameById?: Record<string, string>;
   onSelectMission: (missionId: string) => Promise<void> | void;
   onCancelMission: (missionId: string) => void;
   onRefresh?: () => void;
 }
 
-function getMissionDisplayName(mission: Mission): string {
+function getWorkspaceLabel(
+  mission: Mission,
+  workspaceNameById?: Record<string, string>
+): string | null {
+  if (mission.workspace_name) {
+    return mission.workspace_name;
+  }
+  if (mission.workspace_id && workspaceNameById?.[mission.workspace_id]) {
+    return workspaceNameById[mission.workspace_id];
+  }
+  return null;
+}
+
+function getMissionDisplayName(
+  mission: Mission,
+  workspaceNameById?: Record<string, string>
+): string {
   const parts: string[] = [];
-  const workspaceLabel = mission.workspace_name || mission.workspace_id;
+  const workspaceLabel = getWorkspaceLabel(mission, workspaceNameById);
   if (workspaceLabel) {
     parts.push(workspaceLabel);
   }
@@ -40,6 +57,7 @@ export function MissionSwitcher({
   runningMissions,
   currentMissionId,
   viewingMissionId,
+  workspaceNameById,
   onSelectMission,
   onCancelMission,
   onRefresh,
@@ -121,11 +139,11 @@ export function MissionSwitcher({
     const query = searchQuery.toLowerCase();
     return allItems.filter((item) => {
       if (!item.mission) return false;
-      const name = getMissionDisplayName(item.mission).toLowerCase();
+      const name = getMissionDisplayName(item.mission, workspaceNameById).toLowerCase();
       const desc = getMissionDescription(item.mission).toLowerCase();
       return name.includes(query) || desc.includes(query);
     });
-  }, [allItems, searchQuery]);
+  }, [allItems, searchQuery, workspaceNameById]);
 
   // Reset state on open/close
   useEffect(() => {
@@ -351,7 +369,7 @@ export function MissionSwitcher({
                         <div className="flex items-center gap-2">
                           <span className="font-medium text-sm truncate">
                             {mission
-                              ? getMissionDisplayName(mission)
+                              ? getMissionDisplayName(mission, workspaceNameById)
                               : getMissionShortName(item.id)}
                           </span>
                           {isStalled && (

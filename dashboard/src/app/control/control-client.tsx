@@ -4543,7 +4543,11 @@ export default function ControlClient() {
   };
 
   const activeMission = viewingMission ?? currentMission;
-  const activeWorkspaceLabel = activeMission?.workspace_name || activeMission?.workspace_id;
+  const workspaceNameById = useMemo(() => {
+    return Object.fromEntries(workspaces.map((ws) => [ws.id, ws.name]));
+  }, [workspaces]);
+  const activeWorkspaceLabel = activeMission?.workspace_name
+    || (activeMission?.workspace_id ? workspaceNameById[activeMission.workspace_id] : undefined);
   const missionStatus = activeMission
     ? missionStatusLabel(activeMission.status)
     : null;
@@ -4588,6 +4592,7 @@ export default function ControlClient() {
         runningMissions={runningMissions}
         currentMissionId={currentMission?.id}
         viewingMissionId={viewingMissionId}
+        workspaceNameById={workspaceNameById}
         onSelectMission={handleViewMission}
         onCancelMission={handleCancelMission}
         onRefresh={refreshRecentMissions}
