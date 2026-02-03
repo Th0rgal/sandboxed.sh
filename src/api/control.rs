@@ -2516,13 +2516,12 @@ async fn control_actor_loop(
         paths
     }
 
-    // Helper to persist history to current mission
-    async fn persist_mission_history(
+    // Helper to persist history to a specific mission ID
+    async fn persist_mission_history_to(
         mission_store: &Arc<dyn MissionStore>,
-        current_mission: &Arc<RwLock<Option<Uuid>>>,
+        mission_id: Option<Uuid>,
         history: &[(String, String)],
     ) {
-        let mission_id = current_mission.read().await.clone();
         if let Some(mid) = mission_id {
             let entries: Vec<MissionHistoryEntry> = history
                 .iter()
@@ -2568,6 +2567,16 @@ async fn control_actor_loop(
                 }
             }
         }
+    }
+
+    // Helper to persist history to current mission (wrapper for backwards compatibility)
+    async fn persist_mission_history(
+        mission_store: &Arc<dyn MissionStore>,
+        current_mission: &Arc<RwLock<Option<Uuid>>>,
+        history: &[(String, String)],
+    ) {
+        let mission_id = current_mission.read().await.clone();
+        persist_mission_history_to(mission_store, mission_id, history).await;
     }
 
     fn parse_tool_result_object(result: &serde_json::Value) -> Option<serde_json::Value> {
@@ -3078,7 +3087,7 @@ async fn control_actor_loop(
 
                                 // Immediately persist user message so it's visible when loading mission
                                 history.push(("user".to_string(), msg.clone()));
-                                persist_mission_history(&mission_store, &current_mission, &history)
+                                persist_mission_history_to(&mission_store, msg_target_mid, &history)
                                     .await;
 
                                 let cfg = config.clone();
@@ -4043,7 +4052,7 @@ async fn control_actor_loop(
 
                     // Immediately persist user message so it's visible when loading mission
                     history.push(("user".to_string(), msg.clone()));
-                    persist_mission_history(&mission_store, &current_mission, &history)
+                    persist_mission_history_to(&mission_store, msg_target_mid, &history)
                         .await;
 
                     let cfg = config.clone();
