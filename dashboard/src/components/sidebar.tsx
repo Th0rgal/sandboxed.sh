@@ -153,7 +153,7 @@ export function Sidebar() {
         <BrainLogo size={32} />
         <div className="flex flex-col">
           <span className="text-sm font-medium text-white">Sandboxed.sh</span>
-          <span className="tag">v0.1.0</span>
+          <span className="tag">v0.6.0</span>
         </div>
       </div>
 
