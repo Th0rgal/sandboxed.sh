@@ -715,67 +715,6 @@ pub type CodexAuth = ClaudeCodeAuth;
 /// - Any error occurs reading the config
 
 /// Get OpenAI auth from OpenCode auth.json (shared with OpenCode).
-fn get_openai_auth_from_opencode_auth() -> Option<CodexAuth> {
-    let auth_path = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .map(|xdg| std::path::PathBuf::from(xdg).join("opencode").join("auth.json"))
-        .or_else(|| {
-            dirs::home_dir().map(|home| {
-                home.join(".local").join("share").join("opencode").join("auth.json")
-            })
-        })?;
-
-    if !auth_path.exists() {
-        return None;
-    }
-
-    let contents = std::fs::read_to_string(&auth_path).ok()?;
-    let auth_json: serde_json::Value = serde_json::from_str(&contents).ok()?;
-
-    // Check both "openai" and "codex" keys
-    for key in &["openai", "codex"] {
-        if let Some(openai_auth) = auth_json.get(key) {
-            let auth_type = openai_auth.get("type").and_then(|v| v.as_str());
-
-            if auth_type == Some("oauth") {
-                if let Some(access_token) = openai_auth.get("access").and_then(|v| v.as_str()) {
-                    return Some(CodexAuth::OAuthToken(access_token.to_string()));
-                }
-            } else if auth_type == Some("api_key") {
-                if let Some(api_key) = openai_auth.get("key").and_then(|v| v.as_str()) {
-                    return Some(CodexAuth::ApiKey(api_key.to_string()));
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Get OpenAI auth from ai_providers.json.
-fn get_openai_auth_from_ai_providers(working_dir: &Path) -> Option<CodexAuth> {
-    let path = working_dir.join(".sandboxed-sh").join("ai_providers.json");
-    if !path.exists() {
-        return None;
-    }
-
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let providers: Vec<crate::ai_providers::AIProvider> = serde_json::from_str(&contents).ok()?;
-
-    for provider in providers {
-        if provider.provider_type == ProviderType::OpenAI && provider.enabled {
-            if let Some(api_key) = provider.api_key {
-                return Some(CodexAuth::ApiKey(api_key));
-            } else if let Some(oauth) = provider.oauth {
-                return Some(CodexAuth::OAuthToken(oauth.access_token));
-            }
-        }
-    }
-
-    None
-}
-
-/// Check if OpenAI is configured for Codex backend.
 
 /// Write Codex config.toml from explicit OAuth values.
 fn write_codex_config_from_entry(
