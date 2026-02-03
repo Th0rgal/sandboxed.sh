@@ -6605,12 +6605,32 @@ pub async fn run_codex_turn(
         }
     };
 
-    // Process events
+    // Process events with timeout handling
     let mut assistant_message = String::new();
     let mut success = false;
     let mut error_message: Option<String> = None;
+    let mut received_any_event = false;
+    let mut last_activity = std::time::Instant::now();
+    let mut pending_tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    // Timeout configuration (similar to Amp)
+    let startup_timeout = std::time::Duration::from_secs(30);
+    let inactivity_timeout = std::time::Duration::from_secs(120);
+    let tool_in_progress_timeout = std::time::Duration::from_secs(180);
 
     loop {
+        let timeout_duration = if !pending_tools.is_empty() {
+            tool_in_progress_timeout
+        } else if !received_any_event {
+            startup_timeout
+        } else {
+            inactivity_timeout
+        };
+        let time_since_activity = last_activity.elapsed();
+        let remaining = timeout_duration.saturating_sub(time_since_activity);
+        let mut timeout = tokio::time::sleep(remaining);
+        tokio::pin!(timeout);
+
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("Codex turn cancelled for mission {}", mission_id);
@@ -6618,7 +6638,32 @@ pub async fn run_codex_turn(
                 return AgentResult::failure("Mission cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
             }
+            _ = &mut timeout => {
+                let err_msg = if !received_any_event {
+                    format!(
+                        "Codex produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.",
+                        startup_timeout.as_secs()
+                    )
+                } else if !pending_tools.is_empty() {
+                    let tool_names: Vec<_> = pending_tools.values().cloned().collect();
+                    format!(
+                        "Codex stopped responding after {}s while waiting for tool(s): {}. The tool(s) may be stuck or taking too long.",
+                        tool_in_progress_timeout.as_secs(),
+                        tool_names.join(", ")
+                    )
+                } else {
+                    format!(
+                        "Codex stopped responding after {}s of inactivity. This may indicate a network issue or API timeout.",
+                        inactivity_timeout.as_secs()
+                    )
+                };
+                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
+                return AgentResult::failure(err_msg, 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
+            }
             Some(event) = event_rx.recv() => {
+                received_any_event = true;
+                last_activity = std::time::Instant::now();
                 match event {
                     ExecutionEvent::TextDelta { content } => {
                         assistant_message.push_str(&content);
@@ -6635,6 +6680,7 @@ pub async fn run_codex_turn(
                         });
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
+                        pending_tools.insert(id.clone(), name.clone());
                         let _ = events_tx.send(AgentEvent::ToolCall {
                             tool_call_id: id,
                             name,
@@ -6643,6 +6689,7 @@ pub async fn run_codex_turn(
                         });
                     }
                     ExecutionEvent::ToolResult { id, name, result } => {
+                        pending_tools.remove(&id);
                         let _ = events_tx.send(AgentEvent::ToolResult {
                             tool_call_id: id,
                             name,
