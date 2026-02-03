@@ -1419,6 +1419,31 @@ async fn write_amp_config(
     Ok(())
 }
 
+async fn write_codex_config(
+    workspace_dir: &Path,
+    _mcp_configs: Vec<McpServerConfig>,
+    _workspace_root: &Path,
+    _workspace_type: WorkspaceType,
+    _workspace_env: &HashMap<String, String>,
+    _skill_contents: Option<&[SkillContent]>,
+    _shared_network: Option<bool>,
+) -> anyhow::Result<()> {
+    // Codex doesn't require workspace-specific config files
+    // OAuth tokens are written to ~/.codex/config.toml by the credential sync function
+    // just before mission execution.
+    //
+    // We only need to ensure the .codex directory exists
+    let codex_dir = workspace_dir.join(".codex");
+    tokio::fs::create_dir_all(&codex_dir).await?;
+
+    tracing::debug!(
+        "Created Codex config directory at {}",
+        codex_dir.display()
+    );
+
+    Ok(())
+}
+
 /// Convert an MCP config to Amp settings.json format.
 fn amp_entry_from_mcp(
     config: &McpServerConfig,
@@ -1607,6 +1632,18 @@ pub async fn write_backend_config(
         }
         "amp" => {
             write_amp_config(
+                workspace_dir,
+                mcp_configs,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                skill_contents,
+                shared_network,
+            )
+            .await
+        }
+        "codex" => {
+            write_codex_config(
                 workspace_dir,
                 mcp_configs,
                 workspace_root,
