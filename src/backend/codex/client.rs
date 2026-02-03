@@ -140,7 +140,7 @@ impl CodexClient {
                             "Failed to parse Codex event: {} - line: {}",
                             e,
                             if line.len() > 200 {
-                                format!("{}...", &line[..200])
+                                format!("{}...", line.chars().take(200).collect::<String>())
                             } else {
                                 line.clone()
                             }
@@ -246,7 +246,10 @@ mod tests {
     fn test_parse_turn_started() {
         let json = r#"{"type":"turn.started"}"#;
         let event: CodexEvent = serde_json::from_str(json).unwrap();
-        matches!(event, CodexEvent::TurnStarted);
+        match event {
+            CodexEvent::TurnStarted => {}
+            _ => panic!("Expected TurnStarted event"),
+        }
     }
 
     #[test]

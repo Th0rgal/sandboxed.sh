@@ -713,55 +713,6 @@ pub type CodexAuth = ClaudeCodeAuth;
 /// - OpenAI provider is not configured for codex
 /// - No credentials are available (neither API key nor OAuth)
 /// - Any error occurs reading the config
-pub fn get_openai_auth_for_codex(working_dir: &Path) -> Option<CodexAuth> {
-    // Read the provider backends state to check use_for_backends
-    let backends_state = read_provider_backends_state(working_dir);
-    tracing::debug!(
-        working_dir = %working_dir.display(),
-        backends_state = ?backends_state,
-        "Codex auth lookup: read provider backends state"
-    );
-
-    // Check if OpenAI provider has codex in use_for_backends
-    let openai_backends = backends_state.get(ProviderType::OpenAI.id());
-    let use_for_codex = openai_backends
-        .map(|backends| backends.iter().any(|b| b == "codex"))
-        .unwrap_or(false);
-    tracing::debug!(
-        openai_backends = ?openai_backends,
-        use_for_codex = use_for_codex,
-        "Codex auth lookup: checked backends"
-    );
-
-    if !use_for_codex {
-        tracing::debug!("Codex not in OpenAI backends, trying fallback auth sources");
-        if let Some(auth) = get_openai_auth_from_opencode_auth()
-            .or_else(|| get_openai_auth_from_ai_providers(working_dir))
-        {
-            tracing::warn!(
-                "OpenAI credentials found but not marked for Codex; using them anyway"
-            );
-            return Some(auth);
-        }
-        tracing::debug!("No OpenAI credentials found in fallback sources");
-        return None;
-    }
-
-    // Try to get credentials from OpenCode auth.json first
-    if let Some(auth) = get_openai_auth_from_opencode_auth() {
-        tracing::debug!("Found OpenAI credentials in OpenCode auth.json");
-        return Some(auth);
-    }
-    tracing::debug!("No OpenAI credentials in OpenCode auth.json, trying ai_providers.json");
-
-    // Fall back to ai_providers.json
-    if let Some(auth) = get_openai_auth_from_ai_providers(working_dir) {
-        return Some(auth);
-    }
-    tracing::debug!("No OpenAI credentials found in ai_providers.json");
-
-    None
-}
 
 /// Get OpenAI auth from OpenCode auth.json (shared with OpenCode).
 fn get_openai_auth_from_opencode_auth() -> Option<CodexAuth> {
@@ -825,13 +776,6 @@ fn get_openai_auth_from_ai_providers(working_dir: &Path) -> Option<CodexAuth> {
 }
 
 /// Check if OpenAI is configured for Codex backend.
-pub fn is_openai_configured_for_codex(working_dir: &Path) -> bool {
-    let backends_state = read_provider_backends_state(working_dir);
-    backends_state
-        .get(ProviderType::OpenAI.id())
-        .map(|backends| backends.iter().any(|b| b == "codex"))
-        .unwrap_or(false)
-}
 
 /// Write Codex config.toml from explicit OAuth values.
 fn write_codex_config_from_entry(
