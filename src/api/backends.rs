@@ -204,6 +204,14 @@ pub async fn get_backend_config(
                 .unwrap_or("amp");
             check_cli_available(cli_path)
         }
+        "codex" => {
+            let cli_path = settings
+                .get("cli_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("codex");
+            check_cli_available(cli_path)
+        }
         "opencode" => {
             // OpenCode uses oh-my-opencode or opencode CLI
             check_cli_available("oh-my-opencode") || check_cli_available("opencode")

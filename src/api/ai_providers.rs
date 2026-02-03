@@ -694,6 +694,214 @@ pub fn is_anthropic_configured_for_claudecode(working_dir: &Path) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OpenAI/Codex Backend Access
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Codex authentication material (same as Claude Code auth).
+pub type CodexAuth = ClaudeCodeAuth;
+
+/// Get the OpenAI API key or OAuth access token for the Codex backend.
+///
+/// This checks if the OpenAI provider has "codex" in its use_for_backends
+/// configuration and returns the API key or OAuth access token if available.
+///
+/// Credential sources checked (in order):
+/// 1. OpenCode auth.json (API key or OAuth)
+/// 2. Open Agent ai_providers.json (API key or OAuth)
+///
+/// Returns None if:
+/// - OpenAI provider is not configured for codex
+/// - No credentials are available (neither API key nor OAuth)
+/// - Any error occurs reading the config
+pub fn get_openai_auth_for_codex(working_dir: &Path) -> Option<CodexAuth> {
+    // Read the provider backends state to check use_for_backends
+    let backends_state = read_provider_backends_state(working_dir);
+    tracing::debug!(
+        working_dir = %working_dir.display(),
+        backends_state = ?backends_state,
+        "Codex auth lookup: read provider backends state"
+    );
+
+    // Check if OpenAI provider has codex in use_for_backends
+    let openai_backends = backends_state.get(ProviderType::OpenAI.id());
+    let use_for_codex = openai_backends
+        .map(|backends| backends.iter().any(|b| b == "codex"))
+        .unwrap_or(false);
+    tracing::debug!(
+        openai_backends = ?openai_backends,
+        use_for_codex = use_for_codex,
+        "Codex auth lookup: checked backends"
+    );
+
+    if !use_for_codex {
+        tracing::debug!("Codex not in OpenAI backends, trying fallback auth sources");
+        if let Some(auth) = get_openai_auth_from_opencode_auth()
+            .or_else(|| get_openai_auth_from_ai_providers(working_dir))
+        {
+            tracing::warn!(
+                "OpenAI credentials found but not marked for Codex; using them anyway"
+            );
+            return Some(auth);
+        }
+        tracing::debug!("No OpenAI credentials found in fallback sources");
+        return None;
+    }
+
+    // Try to get credentials from OpenCode auth.json first
+    if let Some(auth) = get_openai_auth_from_opencode_auth() {
+        tracing::debug!("Found OpenAI credentials in OpenCode auth.json");
+        return Some(auth);
+    }
+    tracing::debug!("No OpenAI credentials in OpenCode auth.json, trying ai_providers.json");
+
+    // Fall back to ai_providers.json
+    if let Some(auth) = get_openai_auth_from_ai_providers(working_dir) {
+        return Some(auth);
+    }
+    tracing::debug!("No OpenAI credentials found in ai_providers.json");
+
+    None
+}
+
+/// Get OpenAI auth from OpenCode auth.json (shared with OpenCode).
+fn get_openai_auth_from_opencode_auth() -> Option<CodexAuth> {
+    let auth_path = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .map(|xdg| std::path::PathBuf::from(xdg).join("opencode").join("auth.json"))
+        .or_else(|| {
+            dirs::home_dir().map(|home| {
+                home.join(".local").join("share").join("opencode").join("auth.json")
+            })
+        })?;
+
+    if !auth_path.exists() {
+        return None;
+    }
+
+    let contents = std::fs::read_to_string(&auth_path).ok()?;
+    let auth_json: serde_json::Value = serde_json::from_str(&contents).ok()?;
+
+    // Check both "openai" and "codex" keys
+    for key in &["openai", "codex"] {
+        if let Some(openai_auth) = auth_json.get(key) {
+            let auth_type = openai_auth.get("type").and_then(|v| v.as_str());
+
+            if auth_type == Some("oauth") {
+                if let Some(access_token) = openai_auth.get("access").and_then(|v| v.as_str()) {
+                    return Some(CodexAuth::OAuthToken(access_token.to_string()));
+                }
+            } else if auth_type == Some("api_key") {
+                if let Some(api_key) = openai_auth.get("key").and_then(|v| v.as_str()) {
+                    return Some(CodexAuth::ApiKey(api_key.to_string()));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Get OpenAI auth from ai_providers.json.
+fn get_openai_auth_from_ai_providers(working_dir: &Path) -> Option<CodexAuth> {
+    let path = working_dir.join(".sandboxed-sh").join("ai_providers.json");
+    if !path.exists() {
+        return None;
+    }
+
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let providers: Vec<crate::ai_providers::AIProvider> = serde_json::from_str(&contents).ok()?;
+
+    for provider in providers {
+        if provider.provider_type == ProviderType::OpenAI && provider.enabled {
+            if let Some(api_key) = provider.api_key {
+                return Some(CodexAuth::ApiKey(api_key));
+            } else if let Some(oauth) = provider.oauth {
+                return Some(CodexAuth::OAuthToken(oauth.access_token));
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if OpenAI is configured for Codex backend.
+pub fn is_openai_configured_for_codex(working_dir: &Path) -> bool {
+    let backends_state = read_provider_backends_state(working_dir);
+    backends_state
+        .get(ProviderType::OpenAI.id())
+        .map(|backends| backends.iter().any(|b| b == "codex"))
+        .unwrap_or(false)
+}
+
+/// Write Codex config.toml from explicit OAuth values.
+fn write_codex_config_from_entry(
+    config_dir: &std::path::Path,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    if let Err(e) = std::fs::create_dir_all(config_dir) {
+        return Err(format!("Failed to create Codex config dir: {}", e));
+    }
+
+    let config_path = config_dir.join("config.toml");
+    let contents = format!(
+        "[auth]\ntype = \"oauth\"\naccess_token = \"{}\"\nrefresh_token = \"{}\"\n",
+        access_token, refresh_token
+    );
+
+    let mut file = std::fs::File::create(&config_path)
+        .map_err(|e| format!("Failed to create Codex config.toml: {}", e))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|e| format!("Failed to write Codex config.toml: {}", e))?;
+
+    tracing::debug!(
+        "Wrote Codex config.toml to {}",
+        config_path.display()
+    );
+    Ok(())
+}
+
+/// Write Codex credentials to a workspace.
+///
+/// For container workspaces, writes to the container's root home directory.
+/// For host workspaces, writes to the host's home directory.
+pub fn write_codex_credentials_for_workspace(
+    workspace: &crate::workspace::Workspace,
+) -> Result<(), String> {
+    use crate::workspace::WorkspaceType;
+
+    let entry = read_oauth_token_entry(ProviderType::OpenAI)
+        .ok_or_else(|| "No OpenAI OAuth entry found".to_string())?;
+
+    let codex_dir = match workspace.workspace_type {
+        WorkspaceType::Container => {
+            // For container workspaces, write to <workspace_root>/root/.codex
+            workspace.path.join("root").join(".codex")
+        }
+        WorkspaceType::Host => {
+            // For host workspaces, use host home directory
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            std::path::PathBuf::from(home).join(".codex")
+        }
+    };
+
+    write_codex_config_from_entry(
+        &codex_dir,
+        &entry.access_token,
+        &entry.refresh_token,
+    )?;
+
+    tracing::info!(
+        workspace_id = %workspace.id,
+        workspace_type = ?workspace.workspace_type,
+        "Wrote Codex credentials for workspace"
+    );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Request/Response Types
 // ─────────────────────────────────────────────────────────────────────────────
 
