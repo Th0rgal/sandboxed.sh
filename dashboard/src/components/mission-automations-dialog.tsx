@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { AlertTriangle, Clock, Plus, RefreshCw, Trash2, X } from 'lucide-react';
 import { cn, formatRelativeTime } from '@/lib/utils';
 import { useLibrary } from '@/contexts/library-context';
+import { ShimmerCard } from '@/components/ui/shimmer';
 import {
   type Automation,
   listMissionAutomations,
@@ -432,8 +433,9 @@ export function MissionAutomationsDialog({
                 )}
 
                 {showLoadingPlaceholder && (
-                  <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6 text-center text-sm text-white/40">
-                    Loading automations…
+                  <div className="space-y-3">
+                    <ShimmerCard />
+                    <ShimmerCard />
                   </div>
                 )}
 
