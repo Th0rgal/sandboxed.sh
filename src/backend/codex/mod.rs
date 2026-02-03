@@ -106,13 +106,13 @@ impl Backend for CodexBackend {
 
         // Spawn event conversion task
         let handle = tokio::spawn(async move {
-            while let Some(event) = codex_rx.recv().await {
+            'outer: while let Some(event) = codex_rx.recv().await {
                 let exec_events = convert_codex_event(event);
 
                 for exec_event in exec_events {
                     if tx.send(exec_event).await.is_err() {
                         debug!("ExecutionEvent receiver dropped");
-                        break;
+                        break 'outer;
                     }
                 }
             }
