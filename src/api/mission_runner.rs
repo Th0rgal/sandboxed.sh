@@ -6611,7 +6611,8 @@ pub async fn run_codex_turn(
     let mut error_message: Option<String> = None;
     let mut received_any_event = false;
     let mut last_activity = std::time::Instant::now();
-    let mut pending_tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut pending_tools: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     // Timeout configuration (similar to Amp)
     let startup_timeout = std::time::Duration::from_secs(30);
