@@ -158,10 +158,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let opencode_detected = cli_available("opencode");
     let claude_detected = cli_available("claude");
     let amp_detected = cli_available("amp");
+    let codex_detected = cli_available("codex");
     tracing::info!(
         opencode = opencode_detected,
         claude = claude_detected,
         amp = amp_detected,
+        codex = codex_detected,
         "CLI detection for backend defaults"
     );
 
@@ -188,6 +190,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         {
             let mut entry = BackendConfigEntry::new("amp", "Amp", serde_json::json!({}));
             entry.enabled = amp_detected;
+            entry
+        },
+        {
+            let mut entry = BackendConfigEntry::new("codex", "Codex", serde_json::json!({}));
+            entry.enabled = codex_detected;
             entry
         },
     ];
@@ -226,7 +233,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let opencode_default_agent = config.opencode_agent.clone();
     let opencode_permissive = config.opencode_permissive;
 
-    // Determine default backend: env var, or first available with priority claudecode → opencode → amp
+    // Determine default backend: env var, or first available with priority claudecode → opencode → amp → codex
     let default_backend = config.default_backend.clone().unwrap_or_else(|| {
         if claude_detected {
             "claudecode".to_string()
@@ -234,6 +241,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "opencode".to_string()
         } else if amp_detected {
             "amp".to_string()
+        } else if codex_detected {
+            "codex".to_string()
         } else {
             // Fallback to claudecode even if not detected (will show warning in UI)
             tracing::warn!(
@@ -244,11 +253,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     });
 
     tracing::info!(
-        "Default backend: {} (claudecode={}, opencode={}, amp={})",
+        "Default backend: {} (claudecode={}, opencode={}, amp={}, codex={})",
         default_backend,
         claude_detected,
         opencode_detected,
-        amp_detected
+        amp_detected,
+        codex_detected
     );
 
     let mut backend_registry = BackendRegistry::new(default_backend);
@@ -259,8 +269,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     ));
     backend_registry.register(crate::backend::claudecode::registry_entry());
     backend_registry.register(crate::backend::amp::registry_entry());
+    backend_registry.register(crate::backend::codex::registry_entry());
     let backend_registry = Arc::new(RwLock::new(backend_registry));
-    tracing::info!("Backend registry initialized with {} backends", 3);
+    tracing::info!("Backend registry initialized with {} backends", 4);
 
     // Note: No central OpenCode server cleanup needed - missions use per-workspace CLI execution
 

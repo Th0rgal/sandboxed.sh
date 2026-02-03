@@ -4164,7 +4164,7 @@ async fn control_actor_loop(
                             // If runner has no more queued messages, update status and mark for cleanup
                             if runner.queue.is_empty() && !runner.is_running() {
                                 // Only update status if agent hasn't already set a terminal status
-                                if let Ok(mission) = mission_store.get_mission(*mission_id).await {
+                                if let Ok(Some(mission)) = mission_store.get_mission(*mission_id).await {
                                     let should_update = matches!(
                                         mission.status,
                                         MissionStatus::Pending | MissionStatus::Active
