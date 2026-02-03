@@ -6615,9 +6615,7 @@ pub async fn run_codex_turn(
             _ = cancel.cancelled() => {
                 tracing::info!("Codex turn cancelled for mission {}", mission_id);
                 // Kill the Codex process to prevent resource waste
-                if let Err(e) = handle.kill().await {
-                    tracing::warn!("Failed to kill Codex process: {}", e);
-                }
+                handle.kill().await;
                 return AgentResult::failure("Mission cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
             }
