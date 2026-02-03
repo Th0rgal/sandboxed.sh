@@ -304,11 +304,19 @@ export function MissionSwitcher({
                         </span>
                       </div>
                     )}
-                    <div
+                    <a
+                      href={`/control?mission=${item.id}`}
                       data-selected={isSelected}
-                      onClick={() => handleSelect(item.id)}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        handleSelect(item.id);
+                      }}
+                      onContextMenu={(e) => {
+                        // Allow default right-click behavior for "Open in new tab"
+                        // Don't prevent default - let browser handle right-click menu
+                      }}
                       className={cn(
-                        'group flex items-center gap-3 px-3 py-2 mx-2 rounded-lg cursor-pointer transition-colors',
+                        'group flex items-center gap-3 px-3 py-2 mx-2 rounded-lg cursor-pointer transition-colors no-underline',
                         isSelected
                           ? 'bg-indigo-500/15 text-white'
                           : 'text-white/70 hover:bg-white/[0.04]',
@@ -385,7 +393,7 @@ export function MissionSwitcher({
                           <XCircle className="h-4 w-4" />
                         </button>
                       )}
-                    </div>
+                    </a>
                   </div>
                 );
               })}

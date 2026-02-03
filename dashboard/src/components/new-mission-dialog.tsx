@@ -118,6 +118,10 @@ export function NewMissionDialog({
     revalidateOnFocus: false,
     dedupingInterval: 30000,
   });
+  const { data: codexConfig } = useSWR('backend-codex-config', () => getBackendConfig('codex'), {
+    revalidateOnFocus: false,
+    dedupingInterval: 30000,
+  });
 
   // Filter to only enabled backends with CLI available
   const enabledBackends = useMemo(() => {
@@ -131,9 +135,12 @@ export function NewMissionDialog({
       if (b.id === 'amp') {
         return ampConfig?.enabled !== false && ampConfig?.cli_available !== false;
       }
+      if (b.id === 'codex') {
+        return codexConfig?.enabled !== false && codexConfig?.cli_available !== false;
+      }
       return true;
     }) || [];
-  }, [backends, opencodeConfig, claudecodeConfig, ampConfig]);
+  }, [backends, opencodeConfig, claudecodeConfig, ampConfig, codexConfig]);
 
   // SWR: fetch agents for each enabled backend
   const { data: opencodeAgents } = useSWR<BackendAgent[]>(
@@ -149,6 +156,11 @@ export function NewMissionDialog({
   const { data: ampAgents } = useSWR<BackendAgent[]>(
     enabledBackends.some(b => b.id === 'amp') ? 'backend-amp-agents' : null,
     () => listBackendAgents('amp'),
+    { revalidateOnFocus: false, dedupingInterval: 30000 }
+  );
+  const { data: codexAgents } = useSWR<BackendAgent[]>(
+    enabledBackends.some(b => b.id === 'codex') ? 'backend-codex-agents' : null,
+    () => listBackendAgents('codex'),
     { revalidateOnFocus: false, dedupingInterval: 30000 }
   );
 
@@ -213,6 +225,11 @@ export function NewMissionDialog({
           { id: 'smart', name: 'Smart Mode' },
           { id: 'rush', name: 'Rush Mode' },
         ];
+      } else if (backend.id === 'codex') {
+        // Codex agents
+        agents = codexAgents || [
+          { id: 'default', name: 'Codex Agent' },
+        ];
       }
 
       // Use agent.id for CLI value, agent.name for display (consistent across all backends)
@@ -228,7 +245,7 @@ export function NewMissionDialog({
     }
 
     return result;
-  }, [enabledBackends, opencodeAgents, claudecodeAgents, ampAgents, agentsPayload, config, claudeCodeLibConfig]);
+  }, [enabledBackends, opencodeAgents, claudecodeAgents, ampAgents, codexAgents, agentsPayload, config, claudeCodeLibConfig]);
 
   // Group agents by backend for display
   const agentsByBackend = useMemo(() => {
