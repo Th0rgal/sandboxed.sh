@@ -4799,7 +4799,7 @@ async fn run_single_control_turn(
                 &ctx.working_dir,
                 &user_message,
                 config.default_model.as_deref(),
-                agent_override.as_deref(),
+                config.opencode_agent.as_deref(),
                 mid,
                 events_tx.clone(),
                 cancel,
