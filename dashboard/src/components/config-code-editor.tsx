@@ -241,9 +241,13 @@ export function ConfigCodeEditor({
         textareaClassName="focus:outline-none"
         style={{
           fontFamily:
-            'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+            '"JetBrainsMono Nerd Font Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
           fontSize: 14,
           lineHeight: 1.5,
+          fontVariantLigatures: 'none',
+          fontFeatureSettings: '"liga" 0, "calt" 0',
+          fontKerning: 'none',
+          letterSpacing: '0',
           color: 'rgba(255, 255, 255, 0.9)',
           minHeight,
         }}

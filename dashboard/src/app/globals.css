@@ -589,6 +589,16 @@ textarea.config-code-editor::placeholder {
   color: rgba(255, 255, 255, 0.25);
 }
 
+/* Keep editor text metrics stable between textarea + highlight layers */
+.config-code-editor .token.important,
+.config-code-editor .token.bold {
+  font-weight: normal;
+}
+
+.config-code-editor .token.italic {
+  font-style: normal;
+}
+
 /* Encrypted tag highlighting */
 .token-encrypted-tag {
   color: #fbbf24;
