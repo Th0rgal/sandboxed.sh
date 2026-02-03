@@ -6595,7 +6595,7 @@ pub async fn run_codex_turn(
     };
 
     // Send message streaming
-    let (mut event_rx, mut handle) = match backend.send_message_streaming(&session, user_message).await
+    let (mut event_rx, _handle) = match backend.send_message_streaming(&session, user_message).await
     {
         Ok(result) => result,
         Err(e) => {
@@ -6614,8 +6614,7 @@ pub async fn run_codex_turn(
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("Codex turn cancelled for mission {}", mission_id);
-                // Kill the Codex process to prevent resource waste
-                handle.kill().await;
+                // Note: Codex process will be cleaned up automatically when the event stream task ends
                 return AgentResult::failure("Mission cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
             }
