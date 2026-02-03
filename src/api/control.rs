@@ -4749,6 +4749,36 @@ async fn run_single_control_turn(
             )
             .await
         }
+        Some("codex") => {
+            let mid = match mission_id {
+                Some(id) => id,
+                None => {
+                    let _ = events_tx.send(AgentEvent::Error {
+                        message: "Codex backend requires a mission ID".to_string(),
+                        mission_id: None,
+                        resumable: false,
+                    });
+                    return crate::agents::AgentResult::failure(
+                        "Codex backend requires a mission ID".to_string(),
+                        0,
+                    )
+                    .with_terminal_reason(TerminalReason::LlmError);
+                }
+            };
+            super::mission_runner::run_codex_turn(
+                exec_workspace,
+                &ctx.working_dir,
+                &user_message,
+                config.default_model.as_deref(),
+                config.opencode_agent.as_deref(),
+                mid,
+                events_tx.clone(),
+                cancel,
+                &config.working_dir,
+                session_id.as_deref(),
+            )
+            .await
+        }
         Some(backend) if backend != "opencode" => {
             let _ = events_tx.send(AgentEvent::Error {
                 message: format!("Unsupported backend: {}", backend),
