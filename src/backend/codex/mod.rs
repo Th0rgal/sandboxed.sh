@@ -106,8 +106,12 @@ impl Backend for CodexBackend {
 
         // Spawn event conversion task
         let handle = tokio::spawn(async move {
+            // Track last seen content for each item to avoid duplication on ItemUpdated
+            let mut item_content_cache: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+
             'outer: while let Some(event) = codex_rx.recv().await {
-                let exec_events = convert_codex_event(event);
+                let exec_events = convert_codex_event(event, &mut item_content_cache);
 
                 for exec_event in exec_events {
                     if tx.send(exec_event).await.is_err() {
@@ -133,7 +137,11 @@ impl Backend for CodexBackend {
 }
 
 /// Convert a Codex event to backend-agnostic ExecutionEvents.
-fn convert_codex_event(event: CodexEvent) -> Vec<ExecutionEvent> {
+/// The cache parameter tracks last seen content for each item to avoid duplication on ItemUpdated.
+fn convert_codex_event(
+    event: CodexEvent,
+    item_content_cache: &mut std::collections::HashMap<String, String>,
+) -> Vec<ExecutionEvent> {
     let mut results = vec![];
 
     match event {
@@ -167,9 +175,29 @@ fn convert_codex_event(event: CodexEvent) -> Vec<ExecutionEvent> {
                     if let Some(content) = item.data.get("content") {
                         if let Some(text) = content.as_str() {
                             if !text.is_empty() {
-                                results.push(ExecutionEvent::TextDelta {
-                                    content: text.to_string(),
-                                });
+                                // Check if this is new content or an update
+                                let last_content = item_content_cache.get(&item.id);
+                                let new_content = if let Some(last) = last_content {
+                                    // ItemUpdated: only emit the delta (new text)
+                                    if text.starts_with(last) {
+                                        text[last.len()..].to_string()
+                                    } else {
+                                        // Content was replaced, emit full text
+                                        text.to_string()
+                                    }
+                                } else {
+                                    // ItemCreated: emit full text
+                                    text.to_string()
+                                };
+
+                                if !new_content.is_empty() {
+                                    results.push(ExecutionEvent::TextDelta {
+                                        content: new_content,
+                                    });
+                                }
+
+                                // Update cache with current full content
+                                item_content_cache.insert(item.id.clone(), text.to_string());
                             }
                         }
                     }
