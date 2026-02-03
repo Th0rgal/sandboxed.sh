@@ -142,9 +142,12 @@ fn convert_codex_event(
     event: CodexEvent,
     item_content_cache: &mut std::collections::HashMap<String, String>,
 ) -> Vec<ExecutionEvent> {
-    let mut results = vec![];
-
-    let mut emit_text_delta = |item_id: &str, text: &str| {
+    fn emit_text_delta(
+        results: &mut Vec<ExecutionEvent>,
+        item_content_cache: &mut std::collections::HashMap<String, String>,
+        item_id: &str,
+        text: &str,
+    ) {
         let last_content = item_content_cache.get(item_id);
         let new_content = if let Some(last) = last_content {
             if text.starts_with(last) {
@@ -163,9 +166,14 @@ fn convert_codex_event(
         }
 
         item_content_cache.insert(item_id.to_string(), text.to_string());
-    };
+    }
 
-    let mut emit_thinking_if_changed = |item_id: &str, text: &str| {
+    fn emit_thinking_if_changed(
+        results: &mut Vec<ExecutionEvent>,
+        item_content_cache: &mut std::collections::HashMap<String, String>,
+        item_id: &str,
+        text: &str,
+    ) {
         if item_content_cache.get(item_id).map(|v| v.as_str()) == Some(text) {
             return;
         }
@@ -174,7 +182,9 @@ fn convert_codex_event(
             content: text.to_string(),
         });
         item_content_cache.insert(item_id.to_string(), text.to_string());
-    };
+    }
+
+    let mut results = vec![];
 
     match event {
         CodexEvent::ThreadStarted { thread_id } => {
@@ -205,13 +215,13 @@ fn convert_codex_event(
                 "message" | "agent_message" | "assistant_message" => {
                     // Extract message content
                     if let Some(text) = extract_text_field(&item.data) {
-                        emit_text_delta(&item.id, text);
+                        emit_text_delta(&mut results, item_content_cache, &item.id, text);
                     }
                 }
                 "reasoning" | "thinking" => {
                     // Extract thinking/reasoning content
                     if let Some(text) = extract_text_field(&item.data) {
-                        emit_thinking_if_changed(&item.id, text);
+                        emit_thinking_if_changed(&mut results, item_content_cache, &item.id, text);
                     }
                 }
                 "command" | "tool" => {
@@ -248,12 +258,12 @@ fn convert_codex_event(
                 }
                 "message" | "agent_message" | "assistant_message" => {
                     if let Some(text) = extract_text_field(&item.data) {
-                        emit_text_delta(&item.id, text);
+                        emit_text_delta(&mut results, item_content_cache, &item.id, text);
                     }
                 }
                 "reasoning" | "thinking" => {
                     if let Some(text) = extract_text_field(&item.data) {
-                        emit_thinking_if_changed(&item.id, text);
+                        emit_thinking_if_changed(&mut results, item_content_cache, &item.id, text);
                     }
                 }
                 _ => {}
