@@ -2331,7 +2331,11 @@ async fn automation_scheduler_loop(
             let automations = match mission_store.get_mission_automations(mission.id).await {
                 Ok(automations) => automations,
                 Err(e) => {
-                    tracing::debug!("Failed to get automations for mission {}: {}", mission.id, e);
+                    tracing::debug!(
+                        "Failed to get automations for mission {}: {}",
+                        mission.id,
+                        e
+                    );
                     continue;
                 }
             };
@@ -2339,10 +2343,12 @@ async fn automation_scheduler_loop(
             // Filter to active automations only
             for automation in automations.into_iter().filter(|a| a.active) {
                 // Check if enough time has passed since last trigger
-                let should_trigger = if let Some(ref last_triggered) = automation.last_triggered_at {
+                let should_trigger = if let Some(ref last_triggered) = automation.last_triggered_at
+                {
                     match chrono::DateTime::parse_from_rfc3339(last_triggered) {
                         Ok(last_time) => {
-                            let elapsed = chrono::Utc::now().signed_duration_since(last_time.with_timezone(&chrono::Utc));
+                            let elapsed = chrono::Utc::now()
+                                .signed_duration_since(last_time.with_timezone(&chrono::Utc));
                             elapsed.num_seconds() >= automation.interval_seconds as i64
                         }
                         Err(_) => true, // If we can't parse, trigger anyway
@@ -2359,17 +2365,27 @@ async fn automation_scheduler_loop(
                 // Check if the mission is currently busy (has a running task or queued messages)
                 let is_busy = {
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    if cmd_tx.send(ControlCommand::ListRunning { respond: tx }).await.is_err() {
-                        tracing::warn!("Failed to send ListRunning command for automation busy check");
+                    if cmd_tx
+                        .send(ControlCommand::ListRunning { respond: tx })
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "Failed to send ListRunning command for automation busy check"
+                        );
                         continue;
                     }
                     match rx.await {
                         Ok(running) => running.iter().any(|r| {
                             r.mission_id == mission.id
-                                && (r.queue_len > 0 || r.state == "running" || r.state == "waiting_for_tool")
+                                && (r.queue_len > 0
+                                    || r.state == "running"
+                                    || r.state == "waiting_for_tool")
                         }),
                         Err(_) => {
-                            tracing::warn!("Failed to receive ListRunning response for automation busy check");
+                            tracing::warn!(
+                                "Failed to receive ListRunning response for automation busy check"
+                            );
                             continue;
                         }
                     }
@@ -2428,7 +2444,9 @@ async fn automation_scheduler_loop(
                 }
 
                 // Update last triggered time
-                if let Err(e) = mission_store.update_automation_last_triggered(automation.id).await
+                if let Err(e) = mission_store
+                    .update_automation_last_triggered(automation.id)
+                    .await
                 {
                     tracing::warn!("Failed to update automation last triggered time: {}", e);
                 }
@@ -4850,7 +4868,7 @@ pub async fn create_automation(
     // Validate the command exists in the library
     if let Some(lib) = state.library.read().await.as_ref() {
         match lib.get_command(&req.command_name).await {
-            Ok(_) => {}, // Command exists, continue
+            Ok(_) => {} // Command exists, continue
             Err(e) => {
                 // Check if it's a "not found" error
                 let error_msg = e.to_string();

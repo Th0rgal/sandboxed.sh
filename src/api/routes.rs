@@ -469,10 +469,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/:id/automations",
             post(control::create_automation),
         )
-        .route(
-            "/api/control/automations/:id",
-            get(control::get_automation),
-        )
+        .route("/api/control/automations/:id", get(control::get_automation))
         .route(
             "/api/control/automations/:id",
             axum::routing::patch(control::update_automation),

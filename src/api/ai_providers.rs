@@ -739,10 +739,7 @@ fn write_codex_config_from_entry(
     file.write_all(contents.as_bytes())
         .map_err(|e| format!("Failed to write Codex config.toml: {}", e))?;
 
-    tracing::debug!(
-        "Wrote Codex config.toml to {}",
-        config_path.display()
-    );
+    tracing::debug!("Wrote Codex config.toml to {}", config_path.display());
     Ok(())
 }
 
@@ -770,11 +767,7 @@ pub fn write_codex_credentials_for_workspace(
         }
     };
 
-    write_codex_config_from_entry(
-        &codex_dir,
-        &entry.access_token,
-        &entry.refresh_token,
-    )?;
+    write_codex_config_from_entry(&codex_dir, &entry.access_token, &entry.refresh_token)?;
 
     tracing::info!(
         workspace_id = %workspace.id,

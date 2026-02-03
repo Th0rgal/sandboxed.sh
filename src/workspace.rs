@@ -1436,10 +1436,7 @@ async fn write_codex_config(
     let codex_dir = workspace_dir.join(".codex");
     tokio::fs::create_dir_all(&codex_dir).await?;
 
-    tracing::debug!(
-        "Created Codex config directory at {}",
-        codex_dir.display()
-    );
+    tracing::debug!("Created Codex config directory at {}", codex_dir.display());
 
     Ok(())
 }

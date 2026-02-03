@@ -58,7 +58,7 @@ impl CodexClient {
         message: &str,
         model: Option<&str>,
         _session_id: Option<&str>, // Codex doesn't support session IDs like Claude
-        _agent: Option<&str>,       // Codex doesn't have agent types like Claude
+        _agent: Option<&str>,      // Codex doesn't have agent types like Claude
     ) -> Result<(mpsc::Receiver<CodexEvent>, ProcessHandle)> {
         let (tx, rx) = mpsc::channel(256);
 
@@ -232,7 +232,8 @@ mod tests {
 
     #[test]
     fn test_parse_thread_started() {
-        let json = r#"{"type":"thread.started","thread_id":"019c21ae-c46c-7a40-a5f5-36ab53521a27"}"#;
+        let json =
+            r#"{"type":"thread.started","thread_id":"019c21ae-c46c-7a40-a5f5-36ab53521a27"}"#;
         let event: CodexEvent = serde_json::from_str(json).unwrap();
         match event {
             CodexEvent::ThreadStarted { thread_id } => {
@@ -266,7 +267,8 @@ mod tests {
 
     #[test]
     fn test_parse_turn_failed() {
-        let json = r#"{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: "}}"#;
+        let json =
+            r#"{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: "}}"#;
         let event: CodexEvent = serde_json::from_str(json).unwrap();
         match event {
             CodexEvent::TurnFailed { error } => {
