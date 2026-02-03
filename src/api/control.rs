@@ -4615,8 +4615,8 @@ async fn run_single_control_turn(
             config.default_model = Some(default_model);
         }
     }
-    if let Some(agent) = agent_override {
-        config.opencode_agent = Some(agent);
+    if let Some(ref agent) = agent_override {
+        config.opencode_agent = Some(agent.clone());
     }
     // Ensure a workspace directory for this mission (if applicable).
     let (working_dir_path, runtime_workspace) = if let Some(mid) = mission_id {
