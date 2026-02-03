@@ -5,6 +5,15 @@ on:
     branches: [master, main, "release/*"]
   pull_request:
     branches: [master, main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Run CI on a schedule to catch issues even without new commits
+  schedule:
+    - cron: '0 */6 * * *' # Every 6 hours
+
+# Cancel in-progress runs when new commits are pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +23,8 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # Skip CI on draft PRs unless explicitly requested
+    if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +48,8 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    # Skip CI on draft PRs unless explicitly requested
+    if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +75,8 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    # Skip CI on draft PRs unless explicitly requested
+    if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v4
 
@@ -76,6 +91,8 @@ jobs:
   dashboard-test:
     name: Dashboard Unit Tests
     runs-on: ubuntu-latest
+    # Skip CI on draft PRs unless explicitly requested
+    if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     defaults:
       run:
         working-directory: dashboard
