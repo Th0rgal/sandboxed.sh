@@ -6550,7 +6550,7 @@ pub async fn run_codex_turn(
     events_tx: broadcast::Sender<AgentEvent>,
     cancel: CancellationToken,
     _working_dir: &std::path::Path,
-    session_id: Option<&str>,
+    _session_id: Option<&str>,
 ) -> AgentResult {
     use crate::backend::codex::CodexBackend;
     use crate::backend::events::ExecutionEvent;
@@ -6595,7 +6595,7 @@ pub async fn run_codex_turn(
     };
 
     // Send message streaming
-    let (mut event_rx, _handle) = match backend.send_message_streaming(&session, user_message).await
+    let (mut event_rx, mut handle) = match backend.send_message_streaming(&session, user_message).await
     {
         Ok(result) => result,
         Err(e) => {
@@ -6614,6 +6614,10 @@ pub async fn run_codex_turn(
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("Codex turn cancelled for mission {}", mission_id);
+                // Kill the Codex process to prevent resource waste
+                if let Err(e) = handle.kill().await {
+                    tracing::warn!("Failed to kill Codex process: {}", e);
+                }
                 return AgentResult::failure("Mission cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
             }

@@ -101,11 +101,32 @@ impl CodexClient {
             )
         })?;
 
+        // Close stdin immediately since we don't need to write to it
+        // (message is passed as CLI argument)
+        drop(child.stdin.take());
+
         // Spawn task to read stdout and parse events
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| anyhow!("Failed to capture Codex stdout"))?;
+
+        // Spawn task to consume stderr to prevent deadlock
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("Failed to capture Codex stderr"))?;
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !line.is_empty() {
+                    debug!("Codex stderr: {}", line);
+                }
+            }
+        });
 
         // Wrap child in Arc<Mutex> so it can be killed from outside the task
         let child_handle = Arc::new(Mutex::new(Some(child)));
