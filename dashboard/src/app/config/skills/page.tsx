@@ -156,10 +156,23 @@ function validateFrontmatterBlock(content: string): string | null {
   const yamlStr = content.substring(4, endIndex);
   const lines = yamlStr.split('\n');
   let expectingListItem = false;
+  let inMultilineBlock = false;
+  let multilineIndent = 0;
 
   for (let i = 0; i < lines.length; i += 1) {
     const rawLine = lines[i];
     const line = rawLine.trim();
+    const leadingWhitespace = rawLine.length - rawLine.trimStart().length;
+
+    if (inMultilineBlock) {
+      if (!line) {
+        continue;
+      }
+      if (leadingWhitespace > multilineIndent) {
+        continue;
+      }
+      inMultilineBlock = false;
+    }
 
     if (!line || line.startsWith('#')) {
       continue;
@@ -178,8 +191,12 @@ function validateFrontmatterBlock(content: string): string | null {
       return `Invalid frontmatter at line ${i + 1}: "${rawLine}"`;
     }
 
-    if (match[2].trim() === '') {
+    const value = match[2].trim();
+    if (value === '') {
       expectingListItem = true;
+    } else if (value.startsWith('|') || value.startsWith('>')) {
+      inMultilineBlock = true;
+      multilineIndent = leadingWhitespace;
     }
   }
 
