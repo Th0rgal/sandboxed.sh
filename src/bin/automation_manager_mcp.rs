@@ -347,10 +347,7 @@ impl AutomationManagerMcp {
         Ok(serde_json::to_value(automations).unwrap())
     }
 
-    async fn create_automation(
-        &self,
-        params: CreateAutomationParams,
-    ) -> Result<Value, String> {
+    async fn create_automation(&self, params: CreateAutomationParams) -> Result<Value, String> {
         let client = reqwest::Client::new();
         let url = format!(
             "{}/api/control/missions/{}/automations",
@@ -387,14 +384,11 @@ impl AutomationManagerMcp {
     }
 
     async fn update_automation(&self, params: UpdateAutomationParams) -> Result<Value, String> {
-        let automation_id = Uuid::parse_str(&params.id)
-            .map_err(|_| "Invalid automation ID format".to_string())?;
+        let automation_id =
+            Uuid::parse_str(&params.id).map_err(|_| "Invalid automation ID format".to_string())?;
 
         let client = reqwest::Client::new();
-        let url = format!(
-            "{}/api/control/automations/{}",
-            self.api_url, automation_id
-        );
+        let url = format!("{}/api/control/automations/{}", self.api_url, automation_id);
 
         let mut request = client.patch(&url).json(&json!({
             "command_source": params.command_source,
@@ -422,14 +416,11 @@ impl AutomationManagerMcp {
     }
 
     async fn delete_automation(&self, params: DeleteAutomationParams) -> Result<Value, String> {
-        let automation_id = Uuid::parse_str(&params.id)
-            .map_err(|_| "Invalid automation ID format".to_string())?;
+        let automation_id =
+            Uuid::parse_str(&params.id).map_err(|_| "Invalid automation ID format".to_string())?;
 
         let client = reqwest::Client::new();
-        let url = format!(
-            "{}/api/control/automations/{}",
-            self.api_url, automation_id
-        );
+        let url = format!("{}/api/control/automations/{}", self.api_url, automation_id);
 
         let mut request = client.delete(&url);
         if let Some(ref token) = self.api_token {
@@ -494,28 +485,28 @@ impl AutomationManagerMcp {
     async fn handle_call(&self, method: &str, params: Value) -> Result<Value, String> {
         match method {
             "list_automations" => {
-                let params: ListAutomationsParams = serde_json::from_value(params)
-                    .map_err(|e| format!("Invalid params: {}", e))?;
+                let params: ListAutomationsParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.list_automations(params).await
             }
             "create_automation" => {
-                let params: CreateAutomationParams = serde_json::from_value(params)
-                    .map_err(|e| format!("Invalid params: {}", e))?;
+                let params: CreateAutomationParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.create_automation(params).await
             }
             "update_automation" => {
-                let params: UpdateAutomationParams = serde_json::from_value(params)
-                    .map_err(|e| format!("Invalid params: {}", e))?;
+                let params: UpdateAutomationParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.update_automation(params).await
             }
             "delete_automation" => {
-                let params: DeleteAutomationParams = serde_json::from_value(params)
-                    .map_err(|e| format!("Invalid params: {}", e))?;
+                let params: DeleteAutomationParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.delete_automation(params).await
             }
             "get_execution_history" => {
-                let params: GetExecutionHistoryParams = serde_json::from_value(params)
-                    .map_err(|e| format!("Invalid params: {}", e))?;
+                let params: GetExecutionHistoryParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.get_execution_history(params).await
             }
             _ => Err(format!("Unknown method: {}", method)),
@@ -545,30 +536,39 @@ impl AutomationManagerMcp {
                 JsonRpcResponse::success(req.id, json!({ "tools": tools }))
             }
             "tools/call" => {
-                let params = req.params.as_object().ok_or("Invalid params");
-                let method = params
-                    .and_then(|p| p.get("name"))
-                    .and_then(|n| n.as_str())
-                    .ok_or("Missing tool name");
-                let arguments = params
-                    .and_then(|p| p.get("arguments"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-
-                match method {
-                    Ok(m) => match self.handle_call(m, arguments).await {
-                        Ok(result) => JsonRpcResponse::success(
+                let params = match req.params.as_object() {
+                    Some(p) => p,
+                    None => {
+                        return JsonRpcResponse::error(
                             req.id,
-                            json!({
-                                "content": [{
-                                    "type": "text",
-                                    "text": serde_json::to_string_pretty(&result).unwrap()
-                                }]
-                            }),
-                        ),
-                        Err(e) => JsonRpcResponse::error(req.id, -32000, e),
-                    },
-                    Err(e) => JsonRpcResponse::error(req.id, -32602, e),
+                            -32602,
+                            "Invalid params".to_string(),
+                        );
+                    }
+                };
+                let method = match params.get("name").and_then(|n| n.as_str()) {
+                    Some(m) => m,
+                    None => {
+                        return JsonRpcResponse::error(
+                            req.id,
+                            -32602,
+                            "Missing tool name".to_string(),
+                        );
+                    }
+                };
+                let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+
+                match self.handle_call(method, arguments).await {
+                    Ok(result) => JsonRpcResponse::success(
+                        req.id,
+                        json!({
+                            "content": [{
+                                "type": "text",
+                                "text": serde_json::to_string_pretty(&result).unwrap()
+                            }]
+                        }),
+                    ),
+                    Err(e) => JsonRpcResponse::error(req.id, -32000, e),
                 }
             }
             _ => JsonRpcResponse::error(req.id, -32601, format!("Unknown method: {}", req.method)),
@@ -588,8 +588,7 @@ async fn main() {
         .and_then(|id| Uuid::parse_str(&id).ok())
         .expect("MISSION_ID environment variable not set or invalid");
 
-    let api_url = std::env::var("API_URL")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
 
     let api_token = std::env::var("API_TOKEN").ok();
 
@@ -612,11 +611,8 @@ async fn main() {
         let request: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(req) => req,
             Err(e) => {
-                let error_resp = JsonRpcResponse::error(
-                    Value::Null,
-                    -32700,
-                    format!("Parse error: {}", e),
-                );
+                let error_resp =
+                    JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {}", e));
                 let response_json = serde_json::to_string(&error_resp).unwrap();
                 writeln!(stdout, "{}", response_json).ok();
                 stdout.flush().ok();
