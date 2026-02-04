@@ -82,6 +82,29 @@ export function MissionAutomationsDialog({
     return Math.round(value * unitMultiplier);
   }, [intervalValue, intervalUnit]);
 
+  const getAutomationLabel = useCallback((automation: Automation) => {
+    if (automation.command_source?.type === 'library') {
+      return automation.command_source.name;
+    }
+    if (automation.command_source?.type === 'local_file') {
+      return automation.command_source.path;
+    }
+    if (automation.command_source?.type === 'inline') {
+      return 'Inline command';
+    }
+    return 'Command';
+  }, []);
+
+  const getAutomationScheduleLabel = useCallback((automation: Automation) => {
+    if (automation.trigger?.type === 'interval') {
+      return `Every ${formatInterval(automation.trigger.seconds)}`;
+    }
+    if (automation.trigger?.type === 'webhook') {
+      return 'Webhook trigger';
+    }
+    return 'Schedule unknown';
+  }, []);
+
   const setAutomationsForMission = useCallback(
     (targetMissionId: string, nextAutomations: Automation[]) => {
       cacheRef.current.set(targetMissionId, nextAutomations);
@@ -468,7 +491,12 @@ export function MissionAutomationsDialog({
 
                 <div className="space-y-2">
                   {visibleAutomations.map((automation) => {
-                    const command = commandsByName.get(automation.command_name);
+                    const commandName = getAutomationLabel(automation);
+                    const command =
+                      automation.command_source?.type === 'library'
+                        ? commandsByName.get(automation.command_source.name)
+                        : undefined;
+                    const scheduleLabel = getAutomationScheduleLabel(automation);
                     const lastRunLabel = automation.last_triggered_at
                       ? formatRelativeTime(new Date(automation.last_triggered_at))
                       : 'never';
@@ -480,8 +508,8 @@ export function MissionAutomationsDialog({
                       >
                         <div className="space-y-1">
                           <div className="flex items-center gap-2">
-                            <span className="text-sm font-medium text-white">{automation.command_name}</span>
-                            {!command && (
+                            <span className="text-sm font-medium text-white">{commandName}</span>
+                            {automation.command_source?.type === 'library' && !command && (
                               <span className="flex items-center gap-1 text-[11px] text-amber-300">
                                 <AlertTriangle className="h-3 w-3" />
                                 Missing command
@@ -492,7 +520,7 @@ export function MissionAutomationsDialog({
                             <div className="text-xs text-white/40">{command.description}</div>
                           )}
                           <div className="text-xs text-white/40">
-                            Every {formatInterval(automation.interval_seconds)} · Last run {lastRunLabel}
+                            {scheduleLabel} · Last run {lastRunLabel}
                           </div>
                         </div>
 
@@ -527,7 +555,7 @@ export function MissionAutomationsDialog({
 
       <ConfirmDialog
         open={!!pendingDelete}
-        title={`Delete automation “${pendingDelete?.command_name ?? ''}”?`}
+        title={`Delete automation “${pendingDelete ? getAutomationLabel(pendingDelete) : ''}”?`}
         description="This will permanently remove the automation and stop scheduled runs."
         confirmLabel={deleting ? 'Deleting…' : 'Delete'}
         variant="danger"

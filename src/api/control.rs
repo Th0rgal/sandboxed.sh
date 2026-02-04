@@ -12,6 +12,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode},
     response::sse::{Event, Sse},
@@ -5329,13 +5330,21 @@ pub async fn webhook_receiver(
     State(state): State<Arc<AppState>>,
     Path((mission_id, webhook_id)): Path<(Uuid, String)>,
     headers: HeaderMap,
-    Json(payload): Json<serde_json::Value>,
+    body: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
     use super::automation_variables::{
         apply_webhook_mappings, substitute_variables, SubstitutionContext,
     };
     use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus, TriggerType};
-    use sha2::{Digest, Sha256};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let payload: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid JSON payload: {}", e),
+        )
+    })?;
 
     // Access control directly (no auth required for webhooks)
     let webhook_user = AuthUser {
@@ -5394,22 +5403,24 @@ pub async fn webhook_receiver(
             .and_then(|v| v.to_str().ok());
 
         if let Some(signature) = signature_header {
-            // Compute expected signature
-            let payload_bytes = serde_json::to_vec(&payload).map_err(|e| {
+            let signature = signature.trim();
+            let signature = signature.strip_prefix("sha256=").unwrap_or(signature);
+            let signature_bytes = hex::decode(signature).map_err(|_| {
                 (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to serialize payload: {}", e),
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid webhook signature".to_string(),
                 )
             })?;
 
-            let mut mac = Sha256::new();
-            mac.update(secret.as_bytes());
-            mac.update(&payload_bytes);
-            let expected_hash = mac.finalize();
-            let expected_signature = format!("sha256={}", hex::encode(expected_hash));
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid webhook secret".to_string(),
+                )
+            })?;
+            mac.update(&body);
 
-            // Compare signatures (constant-time comparison would be better in production)
-            if signature != expected_signature {
+            if mac.verify_slice(&signature_bytes).is_err() {
                 return Err((
                     StatusCode::UNAUTHORIZED,
                     "Invalid webhook signature".to_string(),
