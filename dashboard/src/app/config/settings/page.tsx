@@ -144,7 +144,7 @@ const HARNESS_CONFIG = {
   openagent: {
     name: 'Sandboxed.sh',
     dir: '.openagent',
-    libraryDir: 'openagent',
+    libraryDir: 'sandboxed',
     files: [
       { name: 'config.json', description: 'Agent visibility and defaults for mission dialog', libraryName: 'config.json' },
     ],
