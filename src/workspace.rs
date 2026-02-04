@@ -2199,7 +2199,11 @@ fn ensure_claudecode_skill_frontmatter(
             }
         }
 
-        return format!("---\n{}{}", new_frontmatter.trim_end(), rest);
+        return format!(
+            "---\n{}\n{}",
+            new_frontmatter.trim_end(),
+            rest.trim_start_matches('\n')
+        );
     }
 
     // Malformed frontmatter, return as-is
