@@ -43,6 +43,7 @@ struct OpencodeSseState {
     response_tool_args: HashMap<String, String>,
     response_tool_names: HashMap<String, String>,
     last_emitted_thinking: Option<String>,
+    last_emitted_text: Option<String>,
 }
 
 struct OpencodeSseParseResult {
@@ -234,7 +235,10 @@ fn handle_part_update(
         return handle_tool_part_update(part, state, mission_id);
     }
 
-    if !matches!(part_type, "thinking" | "reasoning") {
+    let is_thinking = matches!(part_type, "thinking" | "reasoning");
+    let is_text = matches!(part_type, "text" | "output_text");
+
+    if !is_thinking && !is_text {
         return None;
     }
 
@@ -251,7 +255,11 @@ fn handle_part_update(
 
     let delta = props.get("delta").and_then(|v| v.as_str());
     let full_text = extract_part_text(part, part_type);
-    let buffer_key = part_id.or(message_id).unwrap_or(part_type).to_string();
+    let buffer_key = format!(
+        "{}:{}",
+        part_type,
+        part_id.or(message_id).unwrap_or(part_type)
+    );
     let buffer = state.part_buffers.entry(buffer_key).or_default();
 
     let content = if let Some(delta) = delta {
@@ -281,14 +289,24 @@ fn handle_part_update(
         return None;
     }
 
-    if state.last_emitted_thinking.as_ref() == Some(&content) {
+    if is_thinking {
+        if state.last_emitted_thinking.as_ref() == Some(&content) {
+            return None;
+        }
+        state.last_emitted_thinking = Some(content.clone());
+        return Some(AgentEvent::Thinking {
+            content,
+            done: false,
+            mission_id: Some(mission_id),
+        });
+    }
+
+    if state.last_emitted_text.as_ref() == Some(&content) {
         return None;
     }
-    state.last_emitted_thinking = Some(content.clone());
-
-    Some(AgentEvent::Thinking {
+    state.last_emitted_text = Some(content.clone());
+    Some(AgentEvent::TextDelta {
         content,
-        done: false,
         mission_id: Some(mission_id),
     })
 }
@@ -5342,6 +5360,7 @@ pub async fn run_opencode_turn(
     let mut had_error = false;
     let session_id_capture: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let sse_emitted_thinking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sse_emitted_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
 
@@ -5354,6 +5373,7 @@ pub async fn run_opencode_turn(
             let work_dir_arg = work_dir_arg.clone();
             let session_id_capture = session_id_capture.clone();
             let sse_emitted_thinking = sse_emitted_thinking.clone();
+            let sse_emitted_text = sse_emitted_text.clone();
             let sse_done_sent = sse_done_sent.clone();
             let sse_cancel = sse_cancel.clone();
             let events_tx = events_tx.clone();
@@ -5451,6 +5471,12 @@ pub async fn run_opencode_turn(
                                             if let Some(event) = parsed.event {
                                                 if matches!(event, AgentEvent::Thinking { .. }) {
                                                     sse_emitted_thinking.store(
+                                                        true,
+                                                        std::sync::atomic::Ordering::SeqCst,
+                                                    );
+                                                }
+                                                if matches!(event, AgentEvent::TextDelta { .. }) {
+                                                    sse_emitted_text.store(
                                                         true,
                                                         std::sync::atomic::Ordering::SeqCst,
                                                     );
@@ -5673,6 +5699,9 @@ pub async fn run_opencode_turn(
                                     if matches!(event, AgentEvent::Thinking { .. }) {
                                         sse_emitted_thinking.store(true, std::sync::atomic::Ordering::SeqCst);
                                     }
+                                    if matches!(event, AgentEvent::TextDelta { .. }) {
+                                        sse_emitted_text.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    }
                                     let _ = events_tx.send(event);
                                 }
                                 if parsed.message_complete {
@@ -5812,6 +5841,15 @@ pub async fn run_opencode_turn(
         let _ = events_tx.send(AgentEvent::Thinking {
             content: String::new(),
             done: true,
+            mission_id: Some(mission_id),
+        });
+    }
+
+    if !sse_emitted_text.load(std::sync::atomic::Ordering::SeqCst)
+        && !final_result.trim().is_empty()
+    {
+        let _ = events_tx.send(AgentEvent::TextDelta {
+            content: final_result.clone(),
             mission_id: Some(mission_id),
         });
     }
