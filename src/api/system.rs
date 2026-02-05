@@ -141,6 +141,10 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
     let claudecode_info = get_claude_code_info().await;
     components.push(claudecode_info);
 
+    // Codex
+    let codex_info = get_codex_info().await;
+    components.push(codex_info);
+
     // Amp
     let amp_info = get_amp_info().await;
     components.push(amp_info);
@@ -244,6 +248,42 @@ async fn get_claude_code_info() -> ComponentInfo {
     }
 }
 
+/// Get Codex CLI version and status.
+async fn get_codex_info() -> ComponentInfo {
+    // Try to run codex --version to check if it's installed
+    match Command::new("codex").arg("--version").output().await {
+        Ok(output) if output.status.success() => {
+            let mut version_str = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                if !version_str.is_empty() {
+                    version_str.push(' ');
+                }
+                version_str.push_str(stderr.trim());
+            }
+            // Parse version from output like "codex-cli 0.94.0"
+            let version = extract_version_token(&version_str);
+
+            ComponentInfo {
+                name: "codex".to_string(),
+                version,
+                installed: true,
+                update_available: None,
+                path: which_codex().await,
+                status: ComponentStatus::Ok,
+            }
+        }
+        _ => ComponentInfo {
+            name: "codex".to_string(),
+            version: None,
+            installed: false,
+            update_available: None,
+            path: None,
+            status: ComponentStatus::NotInstalled,
+        },
+    }
+}
+
 /// Find the path to a CLI binary.
 /// Checks `which` first (respects the user's PATH), then explicit fallback paths.
 async fn which_binary(name: &str, fallback_paths: &[&str]) -> Option<String> {
@@ -266,6 +306,11 @@ async fn which_binary(name: &str, fallback_paths: &[&str]) -> Option<String> {
 /// Find the path to the Claude Code binary.
 async fn which_claude_code() -> Option<String> {
     which_binary("claude", &[]).await
+}
+
+/// Find the path to the Codex binary.
+async fn which_codex() -> Option<String> {
+    which_binary("codex", &["/usr/local/bin/codex"]).await
 }
 
 /// Find the path to the OpenCode binary.

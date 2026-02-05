@@ -28,6 +28,7 @@ const componentNames: Record<string, string> = {
   open_agent: 'sandboxed.sh',
   opencode: 'OpenCode',
   claude_code: 'Claude Code',
+  codex: 'Codex',
   amp: 'Amp',
   oh_my_opencode: 'oh-my-opencode',
 };
@@ -37,6 +38,7 @@ const componentIcons: Record<string, string> = {
   open_agent: '🚀',
   opencode: '⚡',
   claude_code: '🤖',
+  codex: '🧠',
   amp: '⚡',
   oh_my_opencode: '🎭',
 };
@@ -263,6 +265,7 @@ export function ServerConnectionCard({
                   const backends = [];
                   if (components.some(c => c.name === 'opencode' && c.installed)) backends.push('OpenCode');
                   if (components.some(c => c.name === 'claude_code' && c.installed)) backends.push('Claude Code');
+                  if (components.some(c => c.name === 'codex' && c.installed)) backends.push('Codex');
                   return backends.length > 0 ? `${backends.join(' + ')} stack` : 'No backends';
                 })()
               ) : 'Loading...'}

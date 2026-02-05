@@ -24,6 +24,7 @@ import { cn } from '@/lib/utils';
 const componentNames: Record<string, string> = {
   open_agent: 'sandboxed.sh',
   opencode: 'OpenCode',
+  codex: 'Codex',
   oh_my_opencode: 'oh-my-opencode',
 };
 
@@ -31,6 +32,7 @@ const componentNames: Record<string, string> = {
 const componentIcons: Record<string, string> = {
   open_agent: '🚀',
   opencode: '⚡',
+  codex: '🧠',
   oh_my_opencode: '🎭',
 };
 
