@@ -7,6 +7,7 @@
 //! This is used for per-workspace Claude Code and OpenCode execution.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -15,6 +16,58 @@ use tokio::process::{Child, Command};
 
 use crate::nspawn;
 use crate::workspace::{use_nspawn_for_workspace, TailscaleMode, Workspace, WorkspaceType};
+
+fn select_container_resolv_conf() -> Option<PathBuf> {
+    let default_path = PathBuf::from("/etc/resolv.conf");
+    let content = fs::read_to_string(&default_path).ok()?;
+    let is_stub = content.contains("127.0.0.53") || content.contains("127.0.0.1");
+    if !is_stub {
+        return Some(default_path);
+    }
+
+    let search_line = content
+        .lines()
+        .find(|line| line.starts_with("search ") || line.starts_with("domain "))
+        .map(str::to_string);
+    let include_tailnet = content.contains(".ts.net") || content.contains("tailscale");
+
+    let mut resolved = String::new();
+    if let Some(line) = search_line {
+        resolved.push_str(&line);
+        resolved.push('\n');
+    }
+    if include_tailnet {
+        resolved.push_str("nameserver 100.100.100.100\n");
+    }
+    resolved.push_str("nameserver 1.1.1.1\n");
+    resolved.push_str("nameserver 8.8.8.8\n");
+
+    let custom_path = PathBuf::from("/var/lib/opencode/.sandboxed-sh/resolv.conf");
+    if let Some(parent) = custom_path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return Some(default_path);
+        }
+    }
+    if fs::write(&custom_path, resolved).is_err() {
+        return Some(default_path);
+    }
+
+    Some(custom_path)
+}
+
+fn bind_resolv_conf(cmd: &mut Command) {
+    if let Some(path) = select_container_resolv_conf() {
+        if path == Path::new("/etc/resolv.conf") {
+            cmd.arg("--bind-ro=/etc/resolv.conf");
+        } else {
+            cmd.arg(format!(
+                "--bind-ro={}:{}",
+                path.display(),
+                "/etc/resolv.conf"
+            ));
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceExec {
@@ -484,7 +537,7 @@ impl WorkspaceExec {
                 let tailscale_enabled = if use_shared_network {
                     // Shared network: use host network, bind DNS
                     tracing::debug!("WorkspaceExec: shared_network=true, binding resolv.conf");
-                    cmd.arg("--bind-ro=/etc/resolv.conf");
+                    bind_resolv_conf(&mut cmd);
                     false
                 } else {
                     // Isolated network: check if Tailscale is configured
@@ -495,7 +548,7 @@ impl WorkspaceExec {
                     );
                     if tailscale_args.is_empty() {
                         tracing::debug!("WorkspaceExec: no Tailscale args, binding resolv.conf");
-                        cmd.arg("--bind-ro=/etc/resolv.conf");
+                        bind_resolv_conf(&mut cmd);
                         false
                     } else {
                         tracing::info!(
