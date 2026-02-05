@@ -2644,8 +2644,8 @@ export default function ControlClient() {
       for (let i = mission.desktop_sessions.length - 1; i >= 0; i--) {
         const session = mission.desktop_sessions[i];
         if (session?.screenshots_dir) {
-          // screenshots_dir is like /path/to/workspaces/mission-xxx/screenshots/
-          // We want the parent: /path/to/workspaces/mission-xxx/
+          // screenshots_dir is like /path/to/workspace/screenshots/
+          // We want the parent: /path/to/workspace/
           const dir = session.screenshots_dir.replace(/\/?$/, ""); // remove trailing slash
           const parent = dir.substring(0, dir.lastIndexOf("/"));
           if (parent) return parent;
@@ -2653,16 +2653,13 @@ export default function ControlClient() {
       }
     }
 
-    const shortId = mission.id?.slice(0, 8);
-    if (!shortId) return undefined;
-
     const workspace =
       workspaces.find((ws) => ws.id === mission.workspace_id) ??
       workspaces.find((ws) => ws.workspace_type === "host");
 
     if (!workspace?.path) return undefined;
     const cleanRoot = workspace.path.replace(/\/+$/, "");
-    return `${cleanRoot}/workspaces/mission-${shortId}`;
+    return cleanRoot;
   }, [viewingMission, currentMission, workspaces]);
 
   const missionHistoryToItems = useCallback((mission: Mission): ChatItem[] => {
@@ -3569,7 +3566,6 @@ export default function ControlClient() {
     workspaceId?: string;
     agent?: string;
     modelOverride?: string;
-    configProfile?: string;
     backend?: string;
     openInNewTab?: boolean;
   }) => {
@@ -3579,7 +3575,6 @@ export default function ControlClient() {
         workspaceId: options?.workspaceId,
         agent: options?.agent,
         modelOverride: options?.modelOverride,
-        configProfile: options?.configProfile,
         backend: options?.backend,
       });
 

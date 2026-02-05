@@ -48,8 +48,7 @@ test('opencode mission generates correct config', async ({ page }) => {
     test.skip(true, 'Mission execution not available');
   }
 
-  const shortId = mission.id.slice(0, 8);
-  const missionDir = path.join(hostWorkspace.path, 'workspaces', `mission-${shortId}`);
+  const missionDir = hostWorkspace.path;
   const opencodeConfig = path.join(missionDir, '.opencode', 'opencode.json');
   const rootConfig = path.join(missionDir, 'opencode.json');
 

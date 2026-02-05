@@ -1620,9 +1620,15 @@ fn filter_agents_by_config(
 pub async fn validate_agent_exists(
     state: &super::routes::AppState,
     agent_name: &str,
+    config_profile: Option<&str>,
 ) -> Result<(), String> {
-    // Fetch all agents from OpenCode
-    let all_agents = match crate::api::opencode::fetch_opencode_agents(state).await {
+    // Fetch all agents from OpenCode (profile-aware when provided)
+    let all_agents = match crate::api::opencode::fetch_opencode_agents_for_profile(
+        state,
+        config_profile,
+    )
+    .await
+    {
         Ok(agents) => agents,
         Err(e) => {
             // If we can't fetch agents, log warning but allow the request
@@ -1632,8 +1638,27 @@ pub async fn validate_agent_exists(
         }
     };
 
-    // Read config to get hidden agents list
-    let config = crate::workspace::read_sandboxed_config(&state.config.working_dir).await;
+    // Read config to get hidden agents list (profile-aware when provided)
+    let config = if let Some(profile) = config_profile {
+        let library_guard = state.library.read().await;
+        if let Some(lib) = library_guard.as_ref() {
+            match lib.get_sandboxed_config_for_profile(profile).await {
+                Ok(profile_config) => profile_config,
+                Err(e) => {
+                    tracing::warn!(
+                        profile = %profile,
+                        "Failed to read sandboxed config for profile: {}",
+                        e
+                    );
+                    crate::workspace::read_sandboxed_config(&state.config.working_dir).await
+                }
+            }
+        } else {
+            crate::workspace::read_sandboxed_config(&state.config.working_dir).await
+        }
+    } else {
+        crate::workspace::read_sandboxed_config(&state.config.working_dir).await
+    };
     let visible_agents = filter_visible_agents_with_fallback(all_agents.clone(), &config);
 
     // Extract agent names from the visible agents list.

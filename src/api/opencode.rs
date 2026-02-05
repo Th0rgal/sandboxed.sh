@@ -369,36 +369,74 @@ pub struct TestConnectionResponse {
 // Public Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn extract_agents_from_settings(settings: &Value) -> Option<Value> {
+    let agents = settings.get("agents")?;
+    if let Some(obj) = agents.as_object() {
+        if obj.is_empty() {
+            return None;
+        }
+        let agent_names: Vec<Value> = obj.keys().cloned().map(Value::String).collect();
+        return Some(Value::Array(agent_names));
+    }
+    if let Some(arr) = agents.as_array() {
+        if arr.is_empty() {
+            return None;
+        }
+        return Some(Value::Array(arr.clone()));
+    }
+    None
+}
+
 /// Fetch agents from Library configuration (no central server needed).
 /// Reads agents from Library's oh-my-opencode.json, falling back to defaults.
 pub async fn fetch_opencode_agents(state: &super::routes::AppState) -> Result<Value, String> {
-    // Try to read agents from Library's oh-my-opencode.json
+    fetch_opencode_agents_for_profile(state, None).await
+}
+
+/// Fetch agents from Library configuration for a specific config profile.
+/// Falls back to the default profile if the profile has no agent list.
+pub async fn fetch_opencode_agents_for_profile(
+    state: &super::routes::AppState,
+    profile: Option<&str>,
+) -> Result<Value, String> {
     let library_guard = state.library.read().await;
-    if let Some(lib) = library_guard.as_ref() {
-        match lib.get_opencode_settings().await {
+    let Some(lib) = library_guard.as_ref() else {
+        tracing::debug!("Library not configured, no agents available");
+        return Ok(Value::Array(vec![]));
+    };
+
+    if let Some(profile_name) = profile {
+        match lib.get_opencode_settings_for_profile(profile_name).await {
             Ok(settings) => {
-                // Extract agents from the settings
-                if let Some(agents) = settings.get("agents") {
-                    if agents.is_object() && !agents.as_object().unwrap().is_empty() {
-                        // Return agent names as array
-                        let agent_names: Vec<Value> = agents
-                            .as_object()
-                            .unwrap()
-                            .keys()
-                            .map(|k| Value::String(k.clone()))
-                            .collect();
-                        tracing::debug!("Loaded {} agents from Library", agent_names.len());
-                        return Ok(Value::Array(agent_names));
-                    }
+                if let Some(agents) = extract_agents_from_settings(&settings) {
+                    tracing::debug!(
+                        profile = %profile_name,
+                        "Loaded agents from Library profile"
+                    );
+                    return Ok(agents);
                 }
-                tracing::debug!("No agents in Library oh-my-opencode.json");
             }
             Err(e) => {
-                tracing::warn!("Failed to read Library opencode settings: {}", e);
+                tracing::warn!(
+                    profile = %profile_name,
+                    "Failed to read Library opencode settings: {}",
+                    e
+                );
             }
         }
-    } else {
-        tracing::debug!("Library not configured, no agents available");
+    }
+
+    match lib.get_opencode_settings().await {
+        Ok(settings) => {
+            if let Some(agents) = extract_agents_from_settings(&settings) {
+                tracing::debug!("Loaded agents from Library default profile");
+                return Ok(agents);
+            }
+            tracing::debug!("No agents in Library oh-my-opencode.json");
+        }
+        Err(e) => {
+            tracing::warn!("Failed to read Library opencode settings: {}", e);
+        }
     }
 
     // No hardcoded fallback — Library is the source of truth

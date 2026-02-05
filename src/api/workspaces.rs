@@ -494,7 +494,16 @@ async fn create_workspace(
                 );
             }
 
-            workspaces_store.update(workspace_for_build).await;
+            // Preserve any workspace updates made while the build was running (env vars, init script, etc.)
+            // by only applying build-related fields to the latest stored workspace.
+            if let Some(mut latest) = workspaces_store.get(workspace_for_build.id).await {
+                latest.status = workspace_for_build.status;
+                latest.error_message = workspace_for_build.error_message;
+                latest.distro = workspace_for_build.distro;
+                workspaces_store.update(latest).await;
+            } else {
+                workspaces_store.update(workspace_for_build).await;
+            }
         });
 
         tracing::info!(
@@ -867,7 +876,16 @@ async fn build_workspace(
             );
         }
 
-        workspaces_store.update(workspace_for_build).await;
+        // Preserve any workspace updates made while the build was running (env vars, init script, etc.)
+        // by only applying build-related fields to the latest stored workspace.
+        if let Some(mut latest) = workspaces_store.get(workspace_for_build.id).await {
+            latest.status = workspace_for_build.status;
+            latest.error_message = workspace_for_build.error_message;
+            latest.distro = workspace_for_build.distro;
+            workspaces_store.update(latest).await;
+        } else {
+            workspaces_store.update(workspace_for_build).await;
+        }
     });
 
     Ok(Json(workspace.into()))

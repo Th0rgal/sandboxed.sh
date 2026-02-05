@@ -283,14 +283,13 @@ function OverviewPageContent() {
   );
 
   const handleNewMission = useCallback(
-    async (options?: { workspaceId?: string; agent?: string; modelOverride?: string; configProfile?: string; backend?: string; openInNewTab?: boolean }) => {
+    async (options?: { workspaceId?: string; agent?: string; modelOverride?: string; backend?: string; openInNewTab?: boolean }) => {
       try {
         setCreatingMission(true);
         const mission = await createMission({
           workspaceId: options?.workspaceId,
           agent: options?.agent,
           modelOverride: options?.modelOverride,
-          configProfile: options?.configProfile,
           backend: options?.backend,
         });
         toast.success('New mission created');

@@ -30,9 +30,9 @@ impl WorkspaceExec {
     ///
     /// For container workspaces using nspawn/nsenter, paths must be relative to the container
     /// filesystem root, not the host. This translates paths like:
-    ///   /root/.sandboxed-sh/containers/minecraft/workspaces/mission-xxx/.claude/settings.json
+    ///   /root/.sandboxed-sh/containers/minecraft/<workspace>/.claude/settings.json
     /// to:
-    ///   /workspaces/mission-xxx/.claude/settings.json
+    ///   /workspaces/<workspace>/.claude/settings.json
     ///
     /// For host workspaces or fallback mode, returns the original path unchanged.
     pub fn translate_path_for_container(&self, path: &Path) -> String {

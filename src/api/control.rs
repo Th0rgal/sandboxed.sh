@@ -1340,31 +1340,6 @@ pub async fn create_mission(
         backend = Some(registry.default_id().to_string());
     }
 
-    // Validate agent exists before creating mission (fail fast with clear error)
-    // Skip validation for Claude Code, Amp, and Codex - they have their own built-in agents
-    if let Some(ref agent_name) = agent {
-        let backend_id = backend.as_deref();
-        let skip_validation = backend_id == Some("claudecode")
-            || backend_id == Some("amp")
-            || backend_id == Some("codex");
-        if !skip_validation {
-            super::library::validate_agent_exists(&state, agent_name)
-                .await
-                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-        }
-    }
-
-    // Validate backend exists
-    if let Some(ref backend_id) = backend {
-        let registry = state.backend_registry.read().await;
-        if registry.get(backend_id).is_none() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Unknown backend: {}", backend_id),
-            ));
-        }
-    }
-
     // Resolve the effective config profile:
     // 1. Use explicit config_profile from request if provided
     // 2. Otherwise use workspace's config_profile
@@ -1380,6 +1355,35 @@ pub async fn create_mission(
     } else {
         None
     };
+
+    // Validate agent exists before creating mission (fail fast with clear error)
+    // Skip validation for Claude Code, Amp, and Codex - they have their own built-in agents
+    if let Some(ref agent_name) = agent {
+        let backend_id = backend.as_deref();
+        let skip_validation = backend_id == Some("claudecode")
+            || backend_id == Some("amp")
+            || backend_id == Some("codex");
+        if !skip_validation {
+            super::library::validate_agent_exists(
+                &state,
+                agent_name,
+                effective_config_profile.as_deref(),
+            )
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        }
+    }
+
+    // Validate backend exists
+    if let Some(ref backend_id) = backend {
+        let registry = state.backend_registry.read().await;
+        if registry.get(backend_id).is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Unknown backend: {}", backend_id),
+            ));
+        }
+    }
 
     // If no model_override specified, resolve from config profile for Claude Code
     if backend.as_deref() == Some("claudecode") && model_override.is_none() {
@@ -2850,22 +2854,26 @@ async fn control_actor_loop(
             ));
         }
 
-        // Clean workspace if requested
-        let workspace_root =
-            workspace::resolve_workspace_root(workspaces, config, Some(mission.workspace_id)).await;
-        let mission_dir = workspace::mission_workspace_dir_for_root(&workspace_root, mission_id);
-
-        if clean_workspace && mission_dir.exists() {
+        // Clean mission context if requested.
+        // Missions share the workspace directory, so we avoid deleting project files.
+        if clean_workspace {
+            let context_root = config.working_dir.join(&config.context.context_dir_name);
+            let mission_context_dir = context_root.join(mission_id.to_string());
             tracing::info!(
-                "Cleaning workspace for mission {} at {:?}",
-                mission_id,
-                mission_dir
+                mission_id = %mission_id,
+                path = %mission_context_dir.display(),
+                "Cleaning mission context directory (shared workspace mode)"
             );
-            if let Err(e) = std::fs::remove_dir_all(&mission_dir) {
-                tracing::warn!("Failed to clean workspace: {}", e);
+            if mission_context_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&mission_context_dir) {
+                    tracing::warn!("Failed to clean mission context: {}", e);
+                }
             }
-            // Recreate the directory
-            let _ = std::fs::create_dir_all(&mission_dir);
+            let _ = std::fs::create_dir_all(&mission_context_dir);
+
+            let runtime_file =
+                workspace::runtime_workspace_file_path(&config.working_dir, Some(mission_id));
+            let _ = std::fs::remove_file(runtime_file);
         }
 
         // Build resume context
@@ -2879,7 +2887,7 @@ async fn control_actor_loop(
         };
 
         let workspace_note = if clean_workspace {
-            " (workspace cleaned)"
+            " (context cleaned)"
         } else {
             ""
         };

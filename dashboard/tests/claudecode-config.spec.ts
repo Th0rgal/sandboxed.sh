@@ -48,8 +48,7 @@ test('claude code mission generates correct config', async ({ page }) => {
     test.skip(true, 'Mission execution not available');
   }
 
-  const shortId = mission.id.slice(0, 8);
-  const missionDir = path.join(hostWorkspace.path, 'workspaces', `mission-${shortId}`);
+  const missionDir = hostWorkspace.path;
   const claudeSettings = path.join(missionDir, '.claude', 'settings.local.json');
 
   await waitForFile(claudeSettings);

@@ -1,7 +1,7 @@
 //! Workspace management for OpenCode sessions.
 //!
-//! Open Agent acts as a workspace host for OpenCode. This module creates
-//! per-task/mission workspace directories and writes `opencode.json`
+//! Open Agent acts as a workspace host for OpenCode. This module prepares
+//! per-workspace directories (shared across missions) and writes `opencode.json`
 //! with the currently configured MCP servers.
 //!
 //! ## Workspace Types
@@ -2521,7 +2521,7 @@ pub async fn prepare_custom_workspace(
     Ok(workspace_dir)
 }
 
-/// Prepare a workspace directory for a mission and write `opencode.json`.
+/// Prepare the workspace directory for a mission and write `opencode.json`.
 pub async fn prepare_mission_workspace(
     config: &Config,
     mcp: &McpRegistry,
@@ -2532,12 +2532,13 @@ pub async fn prepare_mission_workspace(
 }
 
 /// Prepare a workspace directory for a mission under a specific workspace root.
+/// Missions share the workspace root directory (no per-mission isolation).
 pub async fn prepare_mission_workspace_in(
     workspace: &Workspace,
     mcp: &McpRegistry,
-    mission_id: Uuid,
+    _mission_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
-    let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
+    let dir = workspace.path.clone();
     prepare_workspace_dir(&dir).await?;
     let mcp_configs = filter_mcp_configs_for_workspace(mcp.list_configs().await, &workspace.mcps);
     let skill_allowlist = if workspace.skills.is_empty() {
@@ -2618,7 +2619,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     custom_providers: Option<&[AIProvider]>,
     config_profile: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
-    let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
+    let dir = workspace.path.clone();
     prepare_workspace_dir(&dir).await?;
 
     // Get custom providers: use provided list or read from file
@@ -2917,38 +2918,48 @@ pub async fn write_runtime_workspace_state(
     }
     let context_link = working_dir.join(context_dir_name);
     if let Some(target) = mission_context.as_ref() {
-        if !context_link.exists() {
-            #[cfg(unix)]
-            {
-                // For container workspaces, the symlink must point to the container path
-                // since /root/context is bind-mounted, not the host path
-                let symlink_target = if workspace.workspace_type == WorkspaceType::Container {
-                    PathBuf::from("/root")
-                        .join(context_dir_name)
-                        .join(mission_id.unwrap().to_string())
-                } else {
-                    target.clone()
-                };
-                if let Err(e) = std::os::unix::fs::symlink(&symlink_target, &context_link) {
+        if context_link.exists() {
+            if tokio::fs::remove_file(&context_link).await.is_err() {
+                if let Err(e) = tokio::fs::remove_dir_all(&context_link).await {
                     tracing::warn!(
                         workspace = %workspace.name,
                         mission = ?mission_id,
                         error = %e,
-                        "Failed to create context symlink; falling back to directory"
+                        "Failed to clear existing context link"
                     );
-                    let _ = tokio::fs::create_dir_all(&context_link).await;
                 }
             }
-            #[cfg(not(unix))]
-            {
+        }
+        #[cfg(unix)]
+        {
+            // For container workspaces, the symlink must point to the container path
+            // since /root/context is bind-mounted, not the host path
+            let symlink_target = if workspace.workspace_type == WorkspaceType::Container {
+                PathBuf::from("/root")
+                    .join(context_dir_name)
+                    .join(mission_id.unwrap().to_string())
+            } else {
+                target.clone()
+            };
+            if let Err(e) = std::os::unix::fs::symlink(&symlink_target, &context_link) {
+                tracing::warn!(
+                    workspace = %workspace.name,
+                    mission = ?mission_id,
+                    error = %e,
+                    "Failed to create context symlink; falling back to directory"
+                );
                 let _ = tokio::fs::create_dir_all(&context_link).await;
             }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::fs::create_dir_all(&context_link).await;
         }
     }
 
     // For container workspaces, translate paths to container-relative paths.
     // Inside the container:
-    // - working_dir becomes relative to container root (e.g., /workspaces/mission-xxx)
+    // - working_dir becomes relative to container root (e.g., /workspaces/<workspace>)
     // - context is bind-mounted at /root/context
     let (effective_working_dir, effective_context_root, effective_mission_context): (
         PathBuf,
