@@ -535,15 +535,22 @@ export default function SettingsPage() {
     normalizedHost !== null &&
     normalizedLibrary !== null &&
     normalizedHost !== normalizedLibrary;
-  const hostComparisonInvalid = hostSyncAvailable && normalizedLibrary === null;
-  const showHostBanner =
+  const hostMatches =
     hostSyncAvailable &&
-    (hostLoading || !!hostError || hostDiff || hostComparisonInvalid || !!hostSyncSuccess);
+    normalizedHost !== null &&
+    normalizedLibrary !== null &&
+    normalizedHost === normalizedLibrary;
+  const hostComparisonInvalid = hostSyncAvailable && normalizedLibrary === null;
+  // Always show host sync status when available so it's obvious what the app is comparing against.
+  const showHostBanner = hostSyncAvailable;
 
   const handleApplyToHost = useCallback(async () => {
     if (!hostHandler || !selectedFile) return;
     if (parseError) {
       setError('Fix JSON before applying to host.');
+      return;
+    }
+    if (hostMatches && !confirm('Host already matches the library default. Re-apply anyway?')) {
       return;
     }
 
@@ -571,7 +578,7 @@ export default function SettingsPage() {
     } finally {
       setHostSyncing(false);
     }
-  }, [hostHandler, selectedFile, parseError, fileContent, loadHostFile]);
+  }, [hostHandler, selectedFile, parseError, hostMatches, fileContent, loadHostFile]);
 
   const handlePullFromHost = useCallback(async () => {
     if (!hostHandler || !selectedFile) return;
@@ -580,6 +587,14 @@ export default function SettingsPage() {
       return;
     }
     if (isDirty && !confirm('Replace your current edits with the host configuration?')) {
+      return;
+    }
+    if (
+      hostMatches &&
+      !confirm(
+        'Host already matches the library default. Pull anyway? This may rewrite formatting/comments.'
+      )
+    ) {
       return;
     }
 
@@ -620,7 +635,7 @@ export default function SettingsPage() {
     } finally {
       setHostSyncing(false);
     }
-  }, [hostHandler, selectedFile, hostFileJson, isDirty, refreshStatus]);
+  }, [hostHandler, selectedFile, hostFileJson, hostMatches, isDirty, refreshStatus]);
 
   const handleSave = useCallback(async () => {
     if (parseError || !selectedFile) return;
@@ -1246,6 +1261,38 @@ export default function SettingsPage() {
                   </div>
                 </div>
               )}
+
+              {!hostLoading &&
+                !hostError &&
+                !hostComparisonInvalid &&
+                hostMatches &&
+                !hostSyncSuccess && (
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-medium text-emerald-400">Host matches</p>
+                      <p className="text-[11px] text-white/50">
+                        Host {hostHandler?.label} matches the library default
+                        {hostFileJson && Object.keys(hostFileJson).length === 0 ? ' (empty)' : ''}.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={handleApplyToHost}
+                        disabled={hostSyncing || !!parseError}
+                        className="px-3 py-1.5 text-xs font-medium text-white/80 bg-white/[0.06] hover:bg-white/[0.1] rounded-lg transition-colors disabled:opacity-50"
+                      >
+                        Apply to Host
+                      </button>
+                      <button
+                        onClick={handlePullFromHost}
+                        disabled={hostSyncing || !hostFileJson}
+                        className="px-3 py-1.5 text-xs font-medium text-white/80 bg-white/[0.06] hover:bg-white/[0.1] rounded-lg transition-colors disabled:opacity-50"
+                      >
+                        Pull from Host
+                      </button>
+                    </div>
+                  </div>
+                )}
 
               {!hostLoading && !hostError && !hostComparisonInvalid && !hostDiff && hostSyncSuccess && (
                 <div className="flex items-center gap-2 text-xs text-emerald-400">
