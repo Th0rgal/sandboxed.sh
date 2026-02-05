@@ -1346,6 +1346,25 @@ fn get_claudecode_cli_path_from_config(_app_working_dir: &std::path::Path) -> Op
     None
 }
 
+/// Read CLI path from Codex backend config file if available.
+fn get_codex_cli_path_from_config(_app_working_dir: &std::path::Path) -> Option<String> {
+    let configs = read_backend_configs()?;
+
+    for config in configs {
+        if config.get("id")?.as_str()? == "codex" {
+            if let Some(settings) = config.get("settings") {
+                if let Some(cli_path) = settings.get("cli_path").and_then(|v| v.as_str()) {
+                    if !cli_path.is_empty() {
+                        tracing::info!("Using Codex CLI path from backend config: {}", cli_path);
+                        return Some(cli_path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Read API key from Amp backend config file if available.
 pub fn get_amp_api_key_from_config() -> Option<String> {
     let configs = read_backend_configs()?;
@@ -4755,6 +4774,23 @@ async fn ensure_claudecode_cli_available(
     ))
 }
 
+/// Returns the path to the Codex CLI that should be used.
+async fn ensure_codex_cli_available(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> Result<String, String> {
+    let program = cli_path.splitn(2, ' ').next().unwrap_or(cli_path);
+    if command_available(workspace_exec, cwd, program).await {
+        return Ok(cli_path.to_string());
+    }
+
+    Err(format!(
+        "Codex CLI '{}' not found in workspace. Install it or set CODEX_CLI_PATH.",
+        cli_path
+    ))
+}
+
 fn runner_is_oh_my_opencode(path: &str) -> bool {
     std::path::Path::new(path)
         .file_name()
@@ -6536,7 +6572,7 @@ pub async fn run_codex_turn(
     mission_id: Uuid,
     events_tx: broadcast::Sender<AgentEvent>,
     cancel: CancellationToken,
-    _working_dir: &std::path::Path,
+    app_working_dir: &std::path::Path,
     _session_id: Option<&str>,
 ) -> AgentResult {
     use crate::backend::codex::CodexBackend;
@@ -6560,8 +6596,32 @@ pub async fn run_codex_turn(
         .with_terminal_reason(TerminalReason::LlmError);
     }
 
+    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let cli_path = get_codex_cli_path_from_config(app_working_dir)
+        .or_else(|| std::env::var("CODEX_CLI_PATH").ok())
+        .unwrap_or_else(|| "codex".to_string());
+    let cli_path = match ensure_codex_cli_available(&workspace_exec, mission_work_dir, &cli_path)
+        .await
+    {
+        Ok(path) => path,
+        Err(err_msg) => {
+            tracing::error!("{}", err_msg);
+            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+
+    tracing::info!(
+        mission_id = %mission_id,
+        workspace_type = ?workspace.workspace_type,
+        cli_path = %cli_path,
+        "Starting Codex execution via WorkspaceExec"
+    );
+
+    let mut codex_config = crate::backend::codex::client::CodexConfig::default();
+    codex_config.cli_path = cli_path;
+
     // Create Codex backend
-    let backend = CodexBackend::new();
+    let backend = CodexBackend::with_config_and_workspace(codex_config, workspace_exec);
 
     // Create session
     let session = match backend

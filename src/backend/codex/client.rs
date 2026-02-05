@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -11,6 +12,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::backend::shared::ProcessHandle;
+use crate::workspace_exec::WorkspaceExec;
 
 /// Configuration for the Codex client.
 #[derive(Debug, Clone)]
@@ -59,47 +61,80 @@ impl CodexClient {
         model: Option<&str>,
         _session_id: Option<&str>, // Codex doesn't support session IDs like Claude
         _agent: Option<&str>,      // Codex doesn't have agent types like Claude
+        workspace_exec: Option<&WorkspaceExec>,
     ) -> Result<(mpsc::Receiver<CodexEvent>, ProcessHandle)> {
         let (tx, rx) = mpsc::channel(256);
 
-        let mut cmd = Command::new(&self.config.cli_path);
-        cmd.current_dir(directory)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .arg("exec")
-            .arg("--json")
-            .arg("--skip-git-repo-check")
-            .arg("--dangerously-bypass-approvals-and-sandbox");
+        let mut args = vec![
+            "exec".to_string(),
+            "--json".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
+        ];
 
+        let mut env: HashMap<String, String> = HashMap::new();
         // Set OAuth token if configured
         if let Some(ref token) = self.config.oauth_token {
-            cmd.env("OPENAI_OAUTH_TOKEN", token);
+            env.insert("OPENAI_OAUTH_TOKEN".to_string(), token.clone());
             debug!("Using OAuth token for Codex CLI authentication");
         }
 
         // Model selection
         let effective_model = model.or(self.config.default_model.as_deref());
         if let Some(m) = effective_model {
-            cmd.arg("--model").arg(m);
+            args.push("--model".to_string());
+            args.push(m.to_string());
         }
 
         // Add the message as a positional arg (guard prompts starting with '-')
-        cmd.arg("--").arg(message);
+        args.push("--".to_string());
+        args.push(message.to_string());
 
         info!(
             "Spawning Codex CLI: directory={}, model={:?}",
             directory, effective_model
         );
 
-        let mut child = cmd.spawn().map_err(|e| {
-            error!("Failed to spawn Codex CLI: {}", e);
-            anyhow!(
-                "Failed to spawn Codex CLI: {}. Is it installed at '{}'?",
-                e,
-                self.config.cli_path
-            )
-        })?;
+        let (program, mut full_args) = if self.config.cli_path.contains(' ') {
+            let parts: Vec<&str> = self.config.cli_path.splitn(2, ' ').collect();
+            let program = parts[0].to_string();
+            let mut full_args = if parts.len() > 1 {
+                vec![parts[1].to_string()]
+            } else {
+                vec![]
+            };
+            full_args.extend(args.clone());
+            (program, full_args)
+        } else {
+            (self.config.cli_path.clone(), args.clone())
+        };
+
+        let mut child = if let Some(exec) = workspace_exec {
+            exec.spawn_streaming(Path::new(directory), &program, &full_args, env)
+                .await
+                .map_err(|e| {
+                    error!("Failed to spawn Codex CLI in workspace: {}", e);
+                    anyhow!("Failed to spawn Codex CLI in workspace: {}", e)
+                })?
+        } else {
+            let mut cmd = Command::new(&program);
+            cmd.current_dir(directory)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .args(&full_args);
+            if !env.is_empty() {
+                cmd.envs(env);
+            }
+            cmd.spawn().map_err(|e| {
+                error!("Failed to spawn Codex CLI: {}", e);
+                anyhow!(
+                    "Failed to spawn Codex CLI: {}. Is it installed at '{}'?",
+                    e,
+                    self.config.cli_path
+                )
+            })?
+        };
 
         // Close stdin immediately since we don't need to write to it
         // (message is passed as CLI argument)

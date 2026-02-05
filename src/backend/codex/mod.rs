@@ -17,6 +17,7 @@ pub struct CodexBackend {
     id: String,
     name: String,
     config: Arc<RwLock<CodexConfig>>,
+    workspace_exec: Option<crate::workspace_exec::WorkspaceExec>,
 }
 
 impl CodexBackend {
@@ -25,6 +26,7 @@ impl CodexBackend {
             id: "codex".to_string(),
             name: "Codex".to_string(),
             config: Arc::new(RwLock::new(CodexConfig::default())),
+            workspace_exec: None,
         }
     }
 
@@ -33,6 +35,19 @@ impl CodexBackend {
             id: "codex".to_string(),
             name: "Codex".to_string(),
             config: Arc::new(RwLock::new(config)),
+            workspace_exec: None,
+        }
+    }
+
+    pub fn with_config_and_workspace(
+        config: CodexConfig,
+        workspace_exec: crate::workspace_exec::WorkspaceExec,
+    ) -> Self {
+        Self {
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
+            config: Arc::new(RwLock::new(config)),
+            workspace_exec: Some(workspace_exec),
         }
     }
 
@@ -90,6 +105,7 @@ impl Backend for CodexBackend {
     ) -> Result<(mpsc::Receiver<ExecutionEvent>, JoinHandle<()>), Error> {
         let config = self.config.read().await.clone();
         let client = CodexClient::with_config(config);
+        let workspace_exec = self.workspace_exec.as_ref();
 
         let (mut codex_rx, codex_handle) = client
             .execute_message(
@@ -98,6 +114,7 @@ impl Backend for CodexBackend {
                 session.model.as_deref(),
                 Some(&session.id),
                 session.agent.as_deref(),
+                workspace_exec,
             )
             .await?;
 
