@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import useSWR from 'swr';
 import {
   getBackendConfig,
@@ -319,11 +319,11 @@ export default function SettingsPage() {
   const currentHostRequestRef = useRef<number>(0);
 
   const isDirty = fileContent !== originalFileContent;
-  const hostHandler = (() => {
+  const hostHandler = useMemo(() => {
     if (selectedProfile !== DEFAULT_PROFILE || !selectedFile) return null;
     const fileName = selectedFile.split('/').pop() || '';
     return HOST_SYNC_MAP[activeHarness]?.[fileName] || null;
-  })();
+  }, [selectedProfile, selectedFile, activeHarness]);
 
   // Load profile files when profile or harness changes
   const loadProfileFiles = useCallback(async () => {

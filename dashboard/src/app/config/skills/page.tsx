@@ -188,7 +188,7 @@ function validateFrontmatterBlock(content: string): string | null {
 
     if (line.startsWith('-')) {
       if (!expectingListItem) {
-        return `Invalid frontmatter at line ${i + 1}: list item without a key`;
+        return `Invalid frontmatter at line ${i + 2}: list item without a key`;
       }
       continue;
     }
@@ -196,7 +196,7 @@ function validateFrontmatterBlock(content: string): string | null {
     expectingListItem = false;
     const match = line.match(/^([A-Za-z0-9_-]+):(.*)$/);
     if (!match) {
-      return `Invalid frontmatter at line ${i + 1}: "${rawLine}"`;
+      return `Invalid frontmatter at line ${i + 2}: "${rawLine}"`;
     }
 
     const value = match[2].trim();
