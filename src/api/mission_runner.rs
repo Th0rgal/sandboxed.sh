@@ -1432,7 +1432,7 @@ pub fn run_claudecode_turn<'a>(
             write_claudecode_credentials_for_workspace, ClaudeCodeAuth,
         };
         use std::collections::HashMap;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::{AsyncBufReadExt, BufReader};
 
         fn classify_claudecode_secret(value: String) -> ClaudeCodeAuth {
             if value.starts_with("sk-ant-oat") {
@@ -1809,6 +1809,14 @@ pub fn run_claudecode_turn<'a>(
             args.push(a.to_string());
         }
 
+        // Provide the prompt as a positional argument (instead of stdin).
+        //
+        // In production we have observed cases where piping stdin from the backend results in
+        // Claude Code producing no stdout events (even though it creates the session files),
+        // leaving missions stuck "Agent is working..." indefinitely.
+        args.push("--".to_string());
+        args.push(effective_message.clone());
+
         // Build environment variables
         let mut env: HashMap<String, String> = HashMap::new();
         // Allow --dangerously-skip-permissions when running as root inside containers.
@@ -1894,77 +1902,8 @@ pub fn run_claudecode_turn<'a>(
             }
         };
 
-        // Write message to stdin (use effective_message which may have been transformed from slash commands)
-        // Important: We spawn a task but also track it to ensure stdin is written
-        let stdin_task = if let Some(mut stdin) = child.stdin.take() {
-            let msg = effective_message.clone();
-            let mission_id_for_stdin = mission_id;
-            Some(tokio::spawn(async move {
-                // Ensure message ends with a newline (some CLIs require this)
-                let msg_with_newline = if msg.ends_with('\n') {
-                    msg
-                } else {
-                    format!("{}\n", msg)
-                };
-                tracing::debug!(
-                    mission_id = %mission_id_for_stdin,
-                    msg_len = msg_with_newline.len(),
-                    "Writing message to Claude stdin"
-                );
-                if let Err(e) = stdin.write_all(msg_with_newline.as_bytes()).await {
-                    tracing::error!(mission_id = %mission_id_for_stdin, "Failed to write to Claude stdin: {}", e);
-                    return false;
-                }
-                tracing::debug!(mission_id = %mission_id_for_stdin, "Successfully wrote message to Claude stdin");
-                // Flush to ensure data is sent
-                if let Err(e) = stdin.flush().await {
-                    tracing::error!(mission_id = %mission_id_for_stdin, "Failed to flush Claude stdin: {}", e);
-                    return false;
-                }
-                // Close stdin to signal end of input
-                drop(stdin);
-                tracing::debug!(mission_id = %mission_id_for_stdin, "Closed Claude stdin (EOF signaled)");
-                true
-            }))
-        } else {
-            None
-        };
-
-        // Wait for stdin to be written before proceeding (with timeout)
-        if let Some(task) = stdin_task {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
-                Ok(Ok(true)) => {
-                    tracing::debug!(mission_id = %mission_id, "Stdin write completed successfully");
-                }
-                Ok(Ok(false)) => {
-                    tracing::error!(mission_id = %mission_id, "Stdin write failed");
-                    let _ = child.kill().await;
-                    return AgentResult::failure(
-                        "Failed to write prompt to Claude CLI".to_string(),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError);
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(mission_id = %mission_id, "Stdin task panicked: {:?}", e);
-                    let _ = child.kill().await;
-                    return AgentResult::failure(
-                        "Failed to write prompt to Claude CLI (task panic)".to_string(),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError);
-                }
-                Err(_) => {
-                    tracing::error!(mission_id = %mission_id, "Stdin write timed out after 5s");
-                    let _ = child.kill().await;
-                    return AgentResult::failure(
-                        "Timed out writing prompt to Claude CLI".to_string(),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError);
-                }
-            }
-        }
+        // Close stdin since we pass the prompt via argv.
+        drop(child.stdin.take());
 
         // Get stdout for reading events
         let stdout = match child.stdout.take() {
