@@ -5508,179 +5508,188 @@ pub async fn run_opencode_turn(
     let sse_emitted_thinking = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_emitted_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sse_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let sse_cancel = CancellationToken::new();
 
     // oh-my-opencode doesn't support --format json, so use SSE curl for events.
     let use_json_stdout = false;
-    let sse_handle =
-        if !use_json_stdout && command_available(&workspace_exec, work_dir, "curl").await {
-            let workspace_exec = workspace_exec.clone();
-            let work_dir = work_dir.to_path_buf();
-            let work_dir_arg = work_dir_arg.clone();
-            let session_id_capture = session_id_capture.clone();
-            let sse_emitted_thinking = sse_emitted_thinking.clone();
-            let sse_emitted_text = sse_emitted_text.clone();
-            let sse_done_sent = sse_done_sent.clone();
-            let sse_cancel = sse_cancel.clone();
-            let events_tx = events_tx.clone();
-            let opencode_port = opencode_port.clone();
-            let mission_id = mission_id;
-            let sse_host = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "127.0.0.1".to_string());
+    let sse_handle = if !use_json_stdout
+        && command_available(&workspace_exec, work_dir, "curl").await
+    {
+        let workspace_exec = workspace_exec.clone();
+        let work_dir = work_dir.to_path_buf();
+        let work_dir_arg = work_dir_arg.clone();
+        let session_id_capture = session_id_capture.clone();
+        let sse_emitted_thinking = sse_emitted_thinking.clone();
+        let sse_emitted_text = sse_emitted_text.clone();
+        let sse_done_sent = sse_done_sent.clone();
+        let sse_error_message = sse_error_message.clone();
+        let sse_cancel = sse_cancel.clone();
+        let events_tx = events_tx.clone();
+        let opencode_port = opencode_port.clone();
+        let mission_id = mission_id;
+        let sse_host = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
 
-            Some(tokio::spawn(async move {
-                let event_url = format!(
-                    "http://{}:{}/event?directory={}",
-                    sse_host,
-                    opencode_port,
-                    urlencoding::encode(&work_dir_arg)
-                );
+        Some(tokio::spawn(async move {
+            let event_url = format!(
+                "http://{}:{}/event?directory={}",
+                sse_host,
+                opencode_port,
+                urlencoding::encode(&work_dir_arg)
+            );
 
-                let mut attempts = 0u32;
+            let mut attempts = 0u32;
+            loop {
+                if sse_cancel.is_cancelled() {
+                    break;
+                }
+                if attempts > 5 {
+                    break;
+                }
+                attempts += 1;
+
+                let args = vec![
+                    "-N".to_string(),
+                    "-s".to_string(),
+                    "-H".to_string(),
+                    "Accept: text/event-stream".to_string(),
+                    "-H".to_string(),
+                    "Cache-Control: no-cache".to_string(),
+                    event_url.clone(),
+                ];
+
+                let child = workspace_exec
+                    .spawn_streaming(&work_dir, "curl", &args, HashMap::new())
+                    .await;
+
+                let mut child = match child {
+                    Ok(child) => child,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        continue;
+                    }
+                };
+
+                let stdout = match child.stdout.take() {
+                    Some(stdout) => stdout,
+                    None => {
+                        let _ = child.kill().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        continue;
+                    }
+                };
+
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                let mut current_event: Option<String> = None;
+                let mut data_lines: Vec<String> = Vec::new();
+                let mut state = OpencodeSseState::default();
+                let mut saw_complete = false;
+
                 loop {
                     if sse_cancel.is_cancelled() {
-                        break;
+                        let _ = child.kill().await;
+                        return;
                     }
-                    if attempts > 5 {
-                        break;
-                    }
-                    attempts += 1;
-
-                    let args = vec![
-                        "-N".to_string(),
-                        "-s".to_string(),
-                        "-H".to_string(),
-                        "Accept: text/event-stream".to_string(),
-                        "-H".to_string(),
-                        "Cache-Control: no-cache".to_string(),
-                        event_url.clone(),
-                    ];
-
-                    let child = workspace_exec
-                        .spawn_streaming(&work_dir, "curl", &args, HashMap::new())
-                        .await;
-
-                    let mut child = match child {
-                        Ok(child) => child,
-                        Err(_) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                            continue;
-                        }
-                    };
-
-                    let stdout = match child.stdout.take() {
-                        Some(stdout) => stdout,
-                        None => {
-                            let _ = child.kill().await;
-                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                            continue;
-                        }
-                    };
-
-                    let mut reader = BufReader::new(stdout);
-                    let mut line = String::new();
-                    let mut current_event: Option<String> = None;
-                    let mut data_lines: Vec<String> = Vec::new();
-                    let mut state = OpencodeSseState::default();
-                    let mut saw_complete = false;
-
-                    loop {
-                        if sse_cancel.is_cancelled() {
-                            let _ = child.kill().await;
-                            return;
-                        }
-                        line.clear();
-                        match reader.read_line(&mut line).await {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                let trimmed = line.trim_end();
-                                if trimmed.is_empty() {
-                                    if !data_lines.is_empty() {
-                                        let data = data_lines.join("\n");
-                                        let current_session =
-                                            session_id_capture.lock().unwrap().clone();
-                                        if let Some(parsed) = parse_opencode_sse_event(
-                                            &data,
-                                            current_event.as_deref(),
-                                            current_session.as_deref(),
-                                            &mut state,
-                                            mission_id,
-                                        ) {
-                                            if let Some(session_id) = parsed.session_id {
-                                                let mut guard = session_id_capture.lock().unwrap();
-                                                if guard.is_none() {
-                                                    *guard = Some(session_id);
-                                                }
-                                            }
-                                            if let Some(event) = parsed.event {
-                                                if matches!(event, AgentEvent::Thinking { .. }) {
-                                                    sse_emitted_thinking.store(
-                                                        true,
-                                                        std::sync::atomic::Ordering::SeqCst,
-                                                    );
-                                                }
-                                                if matches!(event, AgentEvent::TextDelta { .. }) {
-                                                    sse_emitted_text.store(
-                                                        true,
-                                                        std::sync::atomic::Ordering::SeqCst,
-                                                    );
-                                                }
-                                                let _ = events_tx.send(event);
-                                            }
-                                            if parsed.message_complete {
-                                                saw_complete = true;
-                                                if sse_emitted_thinking
-                                                    .load(std::sync::atomic::Ordering::SeqCst)
-                                                    && !sse_done_sent
-                                                        .load(std::sync::atomic::Ordering::SeqCst)
-                                                {
-                                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                                        content: String::new(),
-                                                        done: true,
-                                                        mission_id: Some(mission_id),
-                                                    });
-                                                    sse_done_sent.store(
-                                                        true,
-                                                        std::sync::atomic::Ordering::SeqCst,
-                                                    );
-                                                }
-                                                let _ = child.kill().await;
-                                                break;
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim_end();
+                            if trimmed.is_empty() {
+                                if !data_lines.is_empty() {
+                                    let data = data_lines.join("\n");
+                                    let current_session =
+                                        session_id_capture.lock().unwrap().clone();
+                                    if let Some(parsed) = parse_opencode_sse_event(
+                                        &data,
+                                        current_event.as_deref(),
+                                        current_session.as_deref(),
+                                        &mut state,
+                                        mission_id,
+                                    ) {
+                                        if let Some(session_id) = parsed.session_id {
+                                            let mut guard = session_id_capture.lock().unwrap();
+                                            if guard.is_none() {
+                                                *guard = Some(session_id);
                                             }
                                         }
+                                        if let Some(event) = parsed.event {
+                                            if let AgentEvent::Error { ref message, .. } = event {
+                                                let mut guard = sse_error_message.lock().unwrap();
+                                                if guard.is_none() {
+                                                    *guard = Some(message.clone());
+                                                }
+                                            }
+                                            if matches!(event, AgentEvent::Thinking { .. }) {
+                                                sse_emitted_thinking.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                            }
+                                            if matches!(event, AgentEvent::TextDelta { .. }) {
+                                                sse_emitted_text.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                            }
+                                            let _ = events_tx.send(event);
+                                        }
+                                        if parsed.message_complete {
+                                            saw_complete = true;
+                                            if sse_emitted_thinking
+                                                .load(std::sync::atomic::Ordering::SeqCst)
+                                                && !sse_done_sent
+                                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                            {
+                                                let _ = events_tx.send(AgentEvent::Thinking {
+                                                    content: String::new(),
+                                                    done: true,
+                                                    mission_id: Some(mission_id),
+                                                });
+                                                sse_done_sent.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                            }
+                                            let _ = child.kill().await;
+                                            break;
+                                        }
                                     }
-
-                                    current_event = None;
-                                    data_lines.clear();
-                                    continue;
                                 }
 
-                                if let Some(rest) = trimmed.strip_prefix("event:") {
-                                    current_event = Some(rest.trim_start().to_string());
-                                    continue;
-                                }
-
-                                if let Some(rest) = trimmed.strip_prefix("data:") {
-                                    data_lines.push(rest.trim_start().to_string());
-                                    continue;
-                                }
+                                current_event = None;
+                                data_lines.clear();
+                                continue;
                             }
-                            Err(_) => break,
-                        }
-                    }
 
-                    let _ = child.kill().await;
-                    if saw_complete {
-                        break;
+                            if let Some(rest) = trimmed.strip_prefix("event:") {
+                                current_event = Some(rest.trim_start().to_string());
+                                continue;
+                            }
+
+                            if let Some(rest) = trimmed.strip_prefix("data:") {
+                                data_lines.push(rest.trim_start().to_string());
+                                continue;
+                            }
+                        }
+                        Err(_) => break,
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
-            }))
-        } else {
-            None
-        };
+
+                let _ = child.kill().await;
+                if saw_complete {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }))
+    } else {
+        None
+    };
 
     // Spawn a task to read stderr (just log in JSON mode, events come on stdout)
     let mission_id_clone = mission_id;
@@ -5786,6 +5795,12 @@ pub async fn run_opencode_turn(
                                     }
                                 }
                                 if let Some(event) = parsed.event {
+                                    if let AgentEvent::Error { ref message, .. } = event {
+                                        let mut guard = sse_error_message.lock().unwrap();
+                                        if guard.is_none() {
+                                            *guard = Some(message.clone());
+                                        }
+                                    }
                                     if matches!(event, AgentEvent::Thinking { .. }) {
                                         sse_emitted_thinking.store(true, std::sync::atomic::Ordering::SeqCst);
                                     }
@@ -5811,6 +5826,24 @@ pub async fn run_opencode_turn(
                         } else {
                             // Non-JSON line - this is the expected output format without --format json
                             tracing::debug!(mission_id = %mission_id, line = %trimmed, "OpenCode stdout");
+
+                            // Detect error lines from CLI stdout
+                            let lower = trimmed.to_lowercase();
+                            if lower.contains("session ended with error")
+                                || lower.contains("session.error")
+                            {
+                                had_error = true;
+                                if let Some(pos) = trimmed.find(": ") {
+                                    let err_part = trimmed[pos + 2..].trim();
+                                    if !err_part.is_empty() {
+                                        let mut guard = sse_error_message.lock().unwrap();
+                                        if guard.is_none() {
+                                            *guard = Some(err_part.to_string());
+                                        }
+                                    }
+                                }
+                            }
+
                             final_result.push_str(trimmed);
                             final_result.push('\n');
                         }
@@ -5844,6 +5877,14 @@ pub async fn run_opencode_turn(
             if final_result.is_empty() {
                 final_result = format!("OpenCode CLI exited with status: {}", status);
             }
+        }
+    }
+
+    // Surface SSE error messages (e.g. session.error) that were captured during streaming
+    if let Some(err_msg) = sse_error_message.lock().unwrap().clone() {
+        had_error = true;
+        if opencode_output_needs_fallback(&final_result) {
+            final_result = err_msg;
         }
     }
 
