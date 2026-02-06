@@ -1457,12 +1457,42 @@ pub fn run_claudecode_turn<'a>(
                 Ok(v) => v,
                 Err(_) => return false,
             };
-            creds
-                .get("claudeAiOauth")
-                .and_then(|o| o.get("accessToken"))
+            let oauth = match creds.get("claudeAiOauth") {
+                Some(o) => o,
+                None => return false,
+            };
+            let has_access_token = oauth
+                .get("accessToken")
                 .and_then(|v| v.as_str())
                 .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
+                .unwrap_or(false);
+            if !has_access_token {
+                return false;
+            }
+            // Check if the access token is expired.
+            // Claude Code in --print mode does not auto-refresh OAuth tokens,
+            // so we must ensure the token is valid before launching.
+            let expires_at = oauth
+                .get("expiresAt")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(i64::MAX);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            // Add 60s buffer to avoid race conditions with near-expiry tokens
+            if expires_at < now_ms + 60_000 {
+                let has_refresh = oauth
+                    .get("refreshToken")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                tracing::warn!(
+                    path = %path.display(),
+                    expires_at = expires_at,
+                    has_refresh = has_refresh,
+                    "Claude CLI credentials expired or near-expiry, will use OAuth refresh flow"
+                );
+                return false;
+            }
+            true
         }
 
         fn find_host_claude_cli_credentials() -> Option<std::path::PathBuf> {
@@ -1815,9 +1845,19 @@ pub fn run_claudecode_turn<'a>(
                 .unwrap_or(false);
 
         // Determine if we should use --resume:
-        // - If we have assistant messages in history (normal continuation)
-        // - OR if the session was previously initiated for THIS mission (handles crash/cancel case)
-        let use_resume = is_continuation || session_was_initiated;
+        // We can only resume if the session was actually initiated at THIS work_dir
+        // (confirmed by the marker file containing the matching session ID).
+        //
+        // Having assistant messages in history (is_continuation) is NOT sufficient on its own,
+        // because:
+        // - Error messages from failed attempts are recorded as assistant messages
+        // - The session may have been created at a different HOME (e.g., container root
+        //   before per-mission HOME isolation was added)
+        // - The session_id may have been reset (e.g., database update after stuck session)
+        //
+        // Using --resume with a non-existent session causes Claude Code to exit with
+        // "No conversation found with session ID: ..." and code 1.
+        let use_resume = session_was_initiated;
 
         if use_resume {
             args.push("--resume".to_string());
@@ -1848,9 +1888,16 @@ pub fn run_claudecode_turn<'a>(
             );
         }
 
+        // Skip `--agent general-purpose` because it's the default behaviour in
+        // `--print` mode and causes the CLI to hang during "Loading commands and
+        // agents" when spawned from a systemd service (missing interactive
+        // environment).  Non-default agents (e.g. Bash, Explore, Plan) are still
+        // passed through.
         if let Some(a) = agent {
-            args.push("--agent".to_string());
-            args.push(a.to_string());
+            if a != "general-purpose" {
+                args.push("--agent".to_string());
+                args.push(a.to_string());
+            }
         }
 
         // Provide the prompt as a positional argument (instead of stdin).
@@ -1991,13 +2038,19 @@ pub fn run_claudecode_turn<'a>(
             }
         };
 
-        // Close stdin since we pass the prompt via argv.
-        let _ = pty.master.take_writer();
+        // Keep stdin open - dropping the writer (closing stdin) can cause some Claude CLI
+        // agent modes to hang. We pass the prompt via argv so stdin is not needed, but the
+        // CLI may check if stdin is open during initialization.
+        let _stdin_writer = pty.take_writer();
+        tracing::debug!(mission_id = %mission_id, "PTY writer taken (kept alive)");
 
-        let reader = match pty.master.try_clone_reader() {
-            Ok(r) => r,
+        let reader = match pty.try_clone_reader() {
+            Ok(r) => {
+                tracing::debug!(mission_id = %mission_id, "PTY reader cloned successfully");
+                r
+            }
             Err(e) => {
-                let _ = pty.child.kill();
+                pty.kill();
                 let err_msg = format!("Failed to capture Claude PTY output: {}", e);
                 tracing::error!("{}", err_msg);
                 return AgentResult::failure(err_msg, 0)
@@ -2006,21 +2059,52 @@ pub fn run_claudecode_turn<'a>(
         };
 
         let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let reader_mission_id = mission_id.to_string();
         let reader_handle = tokio::task::spawn_blocking(move || {
             use std::io::BufRead;
+            tracing::debug!(mission_id = %reader_mission_id, "PTY reader task started, waiting for first read");
             let mut buf_reader = std::io::BufReader::new(reader);
             let mut buf: Vec<u8> = Vec::with_capacity(8192);
+            let mut line_count = 0u64;
             loop {
                 buf.clear();
                 match buf_reader.read_until(b'\n', &mut buf) {
-                    Ok(0) => break,
-                    Ok(_) => {
+                    Ok(0) => {
+                        tracing::debug!(
+                            mission_id = %reader_mission_id,
+                            total_lines = line_count,
+                            "PTY reader got EOF"
+                        );
+                        break;
+                    }
+                    Ok(n) => {
+                        line_count += 1;
+                        if line_count <= 3 {
+                            tracing::debug!(
+                                mission_id = %reader_mission_id,
+                                bytes = n,
+                                line_num = line_count,
+                                "PTY reader got line"
+                            );
+                        }
                         let s = String::from_utf8_lossy(&buf).to_string();
                         if line_tx.send(s).is_err() {
+                            tracing::debug!(
+                                mission_id = %reader_mission_id,
+                                "PTY reader: channel closed"
+                            );
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            mission_id = %reader_mission_id,
+                            error = %e,
+                            total_lines = line_count,
+                            "PTY reader error"
+                        );
+                        break;
+                    }
                 }
             }
         });
@@ -2064,22 +2148,33 @@ pub fn run_claudecode_turn<'a>(
                 _ = cancel.cancelled() => {
                     tracing::info!(mission_id = %mission_id, "Claude Code execution cancelled, killing process");
                     // Kill the process to stop consuming API resources
-                    let _ = pty.child.kill();
+                    pty.kill();
                     reader_handle.abort();
                     return AgentResult::failure("Cancelled".to_string(), 0)
                         .with_terminal_reason(TerminalReason::Cancelled);
                 }
                 _ = tokio::time::sleep_until(startup_deadline), if !saw_non_init_event => {
-                    let _ = pty.child.kill();
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        non_json_lines = non_json_output.len(),
+                        non_json_sample = ?non_json_output.first(),
+                        "Claude Code startup timeout - no stream events received"
+                    );
+                    pty.kill();
                     reader_handle.abort();
-                    return AgentResult::failure(
-                        "Claude Code produced no stream events after startup timeout. This is typically caused by the Claude CLI hanging when run without a TTY.".to_string(),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError);
+                    let mut msg = "Claude Code produced no stream events after startup timeout. This is typically caused by the Claude CLI hanging when run without a TTY.".to_string();
+                    if !non_json_output.is_empty() {
+                        msg.push_str(&format!(
+                            "\n\nNon-JSON output captured ({} lines):\n{}",
+                            non_json_output.len(),
+                            non_json_output.join("\n")
+                        ));
+                    }
+                    return AgentResult::failure(msg, 0)
+                        .with_terminal_reason(TerminalReason::LlmError);
                 }
                 _ = tokio::time::sleep_until(idle_deadline), if saw_non_init_event => {
-                    let _ = pty.child.kill();
+                    pty.kill();
                     reader_handle.abort();
                     return AgentResult::failure(
                         "Claude Code produced no output for an extended period and was terminated (idle timeout).".to_string(),
@@ -2274,7 +2369,7 @@ pub fn run_claudecode_turn<'a>(
                                                         let hub = Arc::clone(hub);
                                                         let rx = hub.register(id.clone()).await;
 
-                                                        let _ = pty.child.kill();
+                                                        pty.kill();
                                                         reader_handle.abort();
 
                                                         let answer = tokio::select! {
@@ -2415,10 +2510,9 @@ pub fn run_claudecode_turn<'a>(
             mission_id = %mission_id,
             "Event loop completed, waiting for Claude Code process"
         );
-        let child = pty.child;
         let exit_status = tokio::task::spawn_blocking(move || {
-            let mut child = child;
-            child.wait()
+            let mut pty = pty;
+            pty.wait()
         })
         .await;
         tracing::debug!(
@@ -7049,13 +7143,15 @@ pub async fn run_codex_turn(
         "Starting Codex turn"
     );
 
-    // If the user connected OpenAI via OAuth, Codex still needs an API key.
-    // We mint it from the OAuth refresh token when missing (Codex CLI behavior).
+    // Best-effort: try to mint an OpenAI API key from the OAuth refresh token.
+    // If this fails (e.g. no API platform org), write_codex_credentials_for_workspace
+    // will fall back to auth_mode: "chatgpt" using the access_token directly.
     if let Err(e) = crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
     {
-        tracing::error!("Failed to ensure OpenAI API key for Codex: {}", e);
-        return AgentResult::failure(format!("Failed to configure OpenAI for Codex: {}", e), 0)
-            .with_terminal_reason(TerminalReason::LlmError);
+        tracing::warn!(
+            "Could not ensure OpenAI API key for Codex (will try chatgpt auth mode): {}",
+            e
+        );
     }
 
     // Ensure Codex auth.json is present in the workspace context (host or container).

@@ -89,9 +89,97 @@ pub struct WorkspaceExec {
     pub workspace: Workspace,
 }
 
+/// Child process spawned inside a PTY.
+///
+/// On Unix, Host workspaces use raw `openpty()` for better compatibility with
+/// CLI tools (e.g. Claude Code's `--agent` flag hangs under portable-pty but
+/// works fine with a standard Unix PTY). Container workspaces still use
+/// portable-pty since the command is wrapped in nsenter/nspawn.
 pub struct PtyChild {
-    pub child: Box<dyn portable_pty::Child + Send + Sync>,
-    pub master: Box<dyn portable_pty::MasterPty + Send>,
+    child: PtyChildProcess,
+    master: PtyMasterHandle,
+}
+
+enum PtyChildProcess {
+    PortablePty(Box<dyn portable_pty::Child + Send + Sync>),
+    #[cfg(unix)]
+    Std(std::process::Child),
+}
+
+enum PtyMasterHandle {
+    PortablePty(Box<dyn portable_pty::MasterPty + Send>),
+    #[cfg(unix)]
+    Unix(std::os::unix::io::OwnedFd),
+}
+
+impl PtyChild {
+    pub fn kill(&mut self) {
+        match &mut self.child {
+            PtyChildProcess::PortablePty(c) => {
+                let _ = c.kill();
+            }
+            #[cfg(unix)]
+            PtyChildProcess::Std(c) => {
+                let _ = c.kill();
+            }
+        }
+    }
+
+    pub fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>> {
+        match &self.master {
+            PtyMasterHandle::PortablePty(m) => Ok(m.take_writer()?),
+            #[cfg(unix)]
+            PtyMasterHandle::Unix(fd) => {
+                use std::os::unix::io::{AsRawFd, FromRawFd};
+                let duped = unsafe { libc::dup(fd.as_raw_fd()) };
+                if duped < 0 {
+                    anyhow::bail!(
+                        "dup() for PTY writer failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                Ok(Box::new(unsafe { std::fs::File::from_raw_fd(duped) }))
+            }
+        }
+    }
+
+    pub fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+        match &self.master {
+            PtyMasterHandle::PortablePty(m) => Ok(m.try_clone_reader()?),
+            #[cfg(unix)]
+            PtyMasterHandle::Unix(fd) => {
+                use std::os::unix::io::{AsRawFd, FromRawFd};
+                let duped = unsafe { libc::dup(fd.as_raw_fd()) };
+                if duped < 0 {
+                    anyhow::bail!(
+                        "dup() for PTY reader failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                Ok(Box::new(unsafe { std::fs::File::from_raw_fd(duped) }))
+            }
+        }
+    }
+
+    /// Wait for the child process to exit. Must be called from a blocking context.
+    pub fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        match &mut self.child {
+            PtyChildProcess::PortablePty(c) => c.wait(),
+            #[cfg(unix)]
+            PtyChildProcess::Std(c) => Ok(c.wait()?.into()),
+        }
+    }
+}
+
+impl Drop for PtyChild {
+    fn drop(&mut self) {
+        // Kill the child if still running, then reap to avoid zombies.
+        self.kill();
+        #[cfg(unix)]
+        if let PtyChildProcess::Std(ref mut c) = self.child {
+            let _ = c.wait();
+        }
+    }
 }
 
 impl WorkspaceExec {
@@ -705,6 +793,16 @@ impl WorkspaceExec {
         env.entry("TERM".to_string())
             .or_insert_with(|| "xterm-256color".to_string());
 
+        // On Unix, use raw openpty() for Host workspaces. This fixes an
+        // incompatibility between portable-pty 0.9 and Claude Code's --agent
+        // flag where the CLI hangs and produces no PTY output. Raw Unix PTY
+        // (verified via Python pty.openpty()) works correctly.
+        #[cfg(unix)]
+        if matches!(self.workspace.workspace_type, WorkspaceType::Host) {
+            return self.spawn_host_unix_pty(cwd, program, args, &env);
+        }
+
+        // For Container workspaces (or non-Unix), use portable-pty.
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -715,8 +813,9 @@ impl WorkspaceExec {
             })
             .context("Failed to open PTY")?;
 
-        let mut cmd = match self.workspace.workspace_type {
+        let cmd = match self.workspace.workspace_type {
             WorkspaceType::Host => {
+                // Non-Unix fallback (portable-pty)
                 let mut cmd = CommandBuilder::new(program);
                 cmd.cwd(cwd);
                 if !args.is_empty() {
@@ -896,8 +995,120 @@ impl WorkspaceExec {
         drop(pair.slave);
 
         Ok(PtyChild {
-            child,
-            master: pair.master,
+            child: PtyChildProcess::PortablePty(child),
+            master: PtyMasterHandle::PortablePty(pair.master),
+        })
+    }
+
+    /// Spawn a process in a raw Unix PTY (Host workspaces only).
+    #[cfg(unix)]
+    fn spawn_host_unix_pty(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> anyhow::Result<PtyChild> {
+        use std::os::unix::io::{FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+
+        let mut master_raw: libc::c_int = 0;
+        let mut slave_raw: libc::c_int = 0;
+
+        let ret = unsafe {
+            libc::openpty(
+                &mut master_raw,
+                &mut slave_raw,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ret != 0 {
+            anyhow::bail!("openpty() failed: {}", std::io::Error::last_os_error());
+        }
+
+        // Set terminal size (24x80).
+        let ws = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe {
+            libc::ioctl(master_raw, libc::TIOCSWINSZ, &ws);
+        }
+
+        let mut cmd = std::process::Command::new(program);
+        cmd.current_dir(cwd);
+        if !args.is_empty() {
+            cmd.args(args);
+        }
+        // Inherit parent env, then apply workspace/mission overrides.
+        for (k, v) in env {
+            if k.trim().is_empty() {
+                continue;
+            }
+            cmd.env(k, v);
+        }
+
+        // Wire the PTY slave as stdin/stdout/stderr.
+        unsafe {
+            let slave_in = libc::dup(slave_raw);
+            let slave_out = libc::dup(slave_raw);
+            let slave_err = libc::dup(slave_raw);
+            if slave_in < 0 || slave_out < 0 || slave_err < 0 {
+                libc::close(master_raw);
+                libc::close(slave_raw);
+                if slave_in >= 0 {
+                    libc::close(slave_in);
+                }
+                if slave_out >= 0 {
+                    libc::close(slave_out);
+                }
+                if slave_err >= 0 {
+                    libc::close(slave_err);
+                }
+                anyhow::bail!(
+                    "dup() for PTY slave failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            cmd.stdin(std::process::Stdio::from_raw_fd(slave_in));
+            cmd.stdout(std::process::Stdio::from_raw_fd(slave_out));
+            cmd.stderr(std::process::Stdio::from_raw_fd(slave_err));
+
+            let m = master_raw;
+            let s = slave_raw;
+            cmd.pre_exec(move || {
+                // Close inherited parent-side fds.
+                libc::close(m);
+                libc::close(s);
+                // New session so the child gets its own process group.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Set the PTY slave (now fd 0) as the controlling terminal.
+                if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0 as libc::c_int) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let child = cmd.spawn().context("Failed to spawn Host PTY command")?;
+
+        // Close slave in parent - child owns it now.
+        unsafe {
+            libc::close(slave_raw);
+        }
+
+        let master_fd = unsafe { OwnedFd::from_raw_fd(master_raw) };
+
+        Ok(PtyChild {
+            child: PtyChildProcess::Std(child),
+            master: PtyMasterHandle::Unix(master_fd),
         })
     }
 }

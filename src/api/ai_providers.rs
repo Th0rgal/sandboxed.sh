@@ -63,6 +63,15 @@ async fn exchange_openai_id_token_for_api_key(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        // Provide actionable guidance for the most common failure.
+        if text.contains("missing organization_id") {
+            return Err(
+                "Your OpenAI account does not have an API platform organization. \
+                 Visit https://platform.openai.com to create one (you may need to add a payment method), \
+                 then reconnect the OpenAI provider."
+                    .to_string(),
+            );
+        }
         return Err(format!(
             "OpenAI API key exchange failed ({}): {}",
             status, text
@@ -143,7 +152,7 @@ async fn refresh_openai_oauth_tokens(
     ))
 }
 
-/// Ensure we have an OpenAI API key available for the Codex CLI.
+/// Try to ensure we have an OpenAI API key available for the Codex CLI.
 ///
 /// If an API key is already configured (env, OpenCode auth.json, or ai_providers.json),
 /// this is a no-op.
@@ -152,6 +161,11 @@ async fn refresh_openai_oauth_tokens(
 /// 1. refresh the OAuth token to obtain an id_token
 /// 2. exchange the id_token for an OpenAI API key (Codex CLI behavior)
 /// 3. store the API key into `.sandboxed-sh/ai_providers.json`
+///
+/// **This function is best-effort.** If the API key exchange fails (e.g. because
+/// the user has no API platform organization), it logs a warning but does NOT
+/// return an error.  The caller should fall back to `auth_mode: "chatgpt"` using
+/// the OAuth access_token directly.
 pub async fn ensure_openai_api_key_for_codex(working_dir: &Path) -> Result<(), String> {
     if get_openai_api_key_for_codex(working_dir).is_some() {
         return Ok(());
@@ -171,13 +185,36 @@ pub async fn ensure_openai_api_key_for_codex(working_dir: &Path) -> Result<(), S
     // Sync refreshed OAuth tokens so OpenCode and the canonical store stay up to date.
     let _ = sync_to_opencode_auth(ProviderType::OpenAI, &refresh, &access, expires_at);
 
-    let id_token = id_token.ok_or_else(|| {
-        "OpenAI OAuth refresh did not return id_token; reconnect OpenAI provider and try again."
-            .to_string()
-    })?;
+    // Also sync to the canonical credential store so write_codex_auth_json_chatgpt can
+    // use the freshly-refreshed tokens.
+    if let Err(e) = write_sandboxed_credential(ProviderType::OpenAI, &refresh, &access, expires_at)
+    {
+        tracing::warn!(
+            "Failed to sync refreshed OpenAI token to credential store: {}",
+            e
+        );
+    }
 
-    let api_key = exchange_openai_id_token_for_api_key(&client, &id_token).await?;
-    upsert_openai_api_key_in_ai_providers(working_dir, &api_key)?;
+    let Some(id_token) = id_token else {
+        tracing::warn!(
+            "OpenAI OAuth refresh did not return id_token; will fall back to chatgpt auth mode"
+        );
+        return Ok(());
+    };
+
+    match exchange_openai_id_token_for_api_key(&client, &id_token).await {
+        Ok(api_key) => {
+            upsert_openai_api_key_in_ai_providers(working_dir, &api_key)?;
+        }
+        Err(e) => {
+            // Not fatal – the Codex CLI can run in `auth_mode: "chatgpt"` using
+            // the OAuth access_token directly (no sk-... API key needed).
+            tracing::warn!(
+                "Could not mint OpenAI API key (will use chatgpt auth mode): {}",
+                e
+            );
+        }
+    }
 
     Ok(())
 }
@@ -1033,6 +1070,84 @@ fn write_codex_auth_json_apikey(config_dir: &std::path::Path, api_key: &str) -> 
     Ok(())
 }
 
+/// Write a Codex `auth.json` in ChatGPT OAuth mode.
+///
+/// The Codex CLI can authenticate using the OAuth access_token directly
+/// (without an sk-... API key).  It sends:
+///   - `Authorization: Bearer <access_token>`
+///   - `ChatGPT-Account-ID: <account_id>`
+///
+/// This is the standard auth mode for ChatGPT Plus/Pro users who do not have
+/// an OpenAI API platform organization.
+fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), String> {
+    let entry = read_oauth_token_entry(ProviderType::OpenAI)
+        .ok_or_else(|| "No OpenAI OAuth credentials found in credential store".to_string())?;
+    if entry.access_token.trim().is_empty() {
+        return Err("OpenAI OAuth access token is empty".to_string());
+    }
+
+    // Extract chatgpt_account_id from the access_token JWT claims.
+    let account_id = extract_chatgpt_account_id(&entry.access_token);
+
+    // The Codex CLI stores an id_token in its tokens object.  We use the
+    // access_token as the id_token since both are JWTs from the same issuer
+    // and the CLI only reads claims from the id_token (chatgpt_account_id etc).
+    let id_token_value = entry.access_token.clone();
+
+    std::fs::create_dir_all(config_dir)
+        .map_err(|e| format!("Failed to create Codex config dir: {}", e))?;
+
+    let auth_path = config_dir.join("auth.json");
+    let tmp_path = config_dir.join("auth.json.tmp");
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let payload = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": id_token_value,
+            "access_token": entry.access_token,
+            "refresh_token": entry.refresh_token,
+            "account_id": account_id,
+        },
+        "last_refresh": now,
+    });
+    let contents = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("Failed to serialize auth.json: {}", e))?;
+    std::fs::write(&tmp_path, contents)
+        .map_err(|e| format!("Failed to write Codex auth.json: {}", e))?;
+    std::fs::rename(&tmp_path, &auth_path)
+        .map_err(|e| format!("Failed to finalize Codex auth.json: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    tracing::info!(
+        path = %auth_path.display(),
+        account_id = ?account_id,
+        "Wrote Codex auth.json (chatgpt mode)"
+    );
+    Ok(())
+}
+
+/// Extract `chatgpt_account_id` from an OpenAI JWT access token.
+fn extract_chatgpt_account_id(jwt: &str) -> Option<String> {
+    let parts: Vec<&str> = jwt.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 fn ensure_codex_auth_json(config_dir: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(config_dir)
         .map_err(|e| format!("Failed to create Codex config dir: {}", e))?;
@@ -1125,6 +1240,7 @@ pub fn write_codex_credentials_for_workspace(
         }
     };
 
+    // Priority 1: Use a minted API key if available.
     if let Some(api_key) = get_openai_api_key_for_codex(working_dir) {
         write_codex_auth_json_apikey(&codex_dir, &api_key)?;
         tracing::info!(
@@ -1135,6 +1251,19 @@ pub fn write_codex_credentials_for_workspace(
         return Ok(());
     }
 
+    // Priority 2: Use ChatGPT OAuth mode (access_token as Bearer).
+    // This works for ChatGPT Plus/Pro users without an API platform org.
+    if read_oauth_token_entry(ProviderType::OpenAI).is_some() {
+        write_codex_auth_json_chatgpt(&codex_dir)?;
+        tracing::info!(
+            workspace_id = %workspace.id,
+            workspace_type = ?workspace.workspace_type,
+            "Wrote Codex auth.json for workspace (chatgpt mode)"
+        );
+        return Ok(());
+    }
+
+    // Priority 3: Copy existing host auth.json verbatim.
     ensure_codex_auth_json(&codex_dir)?;
     tracing::info!(
         workspace_id = %workspace.id,
@@ -1937,6 +2066,31 @@ pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
         new_access_token,
         expires_at,
     )?;
+
+    // Also update the canonical credential store so mission runner can find fresh tokens
+    if let Err(e) = write_sandboxed_credential(
+        ProviderType::Anthropic,
+        new_refresh_token,
+        new_access_token,
+        expires_at,
+    ) {
+        tracing::warn!("Failed to sync refreshed token to credential store: {}", e);
+    }
+
+    // Update Claude CLI credentials so find_host_claude_cli_credentials() finds fresh tokens.
+    // Claude Code in --print mode does not auto-refresh, so the backend must keep these current.
+    for dir_path in &[
+        std::path::PathBuf::from("/var/lib/opencode/.claude"),
+        std::path::PathBuf::from("/root/.claude"),
+    ] {
+        if let Err(e) = write_claudecode_credentials_to_path(dir_path) {
+            tracing::warn!(
+                path = %dir_path.display(),
+                error = %e,
+                "Failed to sync refreshed token to Claude CLI credentials"
+            );
+        }
+    }
 
     tracing::info!(
         "Successfully refreshed Anthropic OAuth token, expires in {} seconds",
@@ -4292,8 +4446,10 @@ async fn oauth_callback_inner(
                         tracing::info!("Minted and stored OpenAI API key for Codex via OAuth");
                     }
                     Err(e) => {
-                        tracing::error!("Failed to mint OpenAI API key for Codex: {}", e);
-                        return Err((StatusCode::BAD_GATEWAY, e));
+                        // Don't fail the entire OAuth callback – the OAuth credentials
+                        // are already saved and usable for OpenCode.  The API-key
+                        // minting can be retried later (e.g. on the next Codex mission).
+                        tracing::warn!("Failed to mint OpenAI API key for Codex (credentials saved, Codex may not work until platform org is set up): {}", e);
                     }
                 }
             }
