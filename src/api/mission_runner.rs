@@ -5062,7 +5062,9 @@ async fn ensure_codex_cli_available(
     ))
 }
 
-fn resolve_openai_codex_native_binary(wrapper_path: &std::path::Path) -> Option<std::path::PathBuf> {
+fn resolve_openai_codex_native_binary(
+    wrapper_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
     // If `codex` was installed via npm/bun (@openai/codex), the entrypoint is a Node
     // wrapper script that expects its surrounding package layout (package.json, vendor/).
     //
@@ -7009,6 +7011,15 @@ pub async fn run_codex_turn(
         agent = ?agent,
         "Starting Codex turn"
     );
+
+    // If the user connected OpenAI via OAuth, Codex still needs an API key.
+    // We mint it from the OAuth refresh token when missing (Codex CLI behavior).
+    if let Err(e) = crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
+    {
+        tracing::error!("Failed to ensure OpenAI API key for Codex: {}", e);
+        return AgentResult::failure(format!("Failed to configure OpenAI for Codex: {}", e), 0)
+            .with_terminal_reason(TerminalReason::LlmError);
+    }
 
     // Ensure Codex auth.json is present in the workspace context (host or container).
     if let Err(e) =

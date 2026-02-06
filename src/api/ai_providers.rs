@@ -82,6 +82,106 @@ async fn exchange_openai_id_token_for_api_key(
     Ok(api_key.to_string())
 }
 
+async fn refresh_openai_oauth_tokens(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<(String, String, i64, Option<String>), String> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("client_id", OPENAI_CLIENT_ID)
+        .append_pair("refresh_token", refresh_token)
+        .finish();
+
+    let resp = client
+        .post(OPENAI_TOKEN_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to refresh OpenAI OAuth token: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "OpenAI OAuth refresh failed ({}): {}",
+            status, text
+        ));
+    }
+
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse OpenAI refresh response: {}", e))?;
+
+    let access_token = data
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "No access_token in OpenAI refresh response".to_string())?;
+
+    let new_refresh = data
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or(refresh_token);
+
+    let expires_in = data
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3600);
+    let expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
+
+    let id_token = data
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    Ok((
+        access_token.to_string(),
+        new_refresh.to_string(),
+        expires_at,
+        id_token,
+    ))
+}
+
+/// Ensure we have an OpenAI API key available for the Codex CLI.
+///
+/// If an API key is already configured (env, OpenCode auth.json, or ai_providers.json),
+/// this is a no-op.
+///
+/// Otherwise, if OpenAI OAuth credentials exist (refresh token), attempt to:
+/// 1. refresh the OAuth token to obtain an id_token
+/// 2. exchange the id_token for an OpenAI API key (Codex CLI behavior)
+/// 3. store the API key into `.sandboxed-sh/ai_providers.json`
+pub async fn ensure_openai_api_key_for_codex(working_dir: &Path) -> Result<(), String> {
+    if get_openai_api_key_for_codex(working_dir).is_some() {
+        return Ok(());
+    }
+
+    let Some(entry) = read_oauth_token_entry(ProviderType::OpenAI) else {
+        return Ok(());
+    };
+    if entry.refresh_token.trim().is_empty() {
+        return Ok(());
+    }
+
+    let client = reqwest::Client::new();
+    let (access, refresh, expires_at, id_token) =
+        refresh_openai_oauth_tokens(&client, &entry.refresh_token).await?;
+
+    // Sync refreshed OAuth tokens so OpenCode and the canonical store stay up to date.
+    let _ = sync_to_opencode_auth(ProviderType::OpenAI, &refresh, &access, expires_at);
+
+    let id_token = id_token.ok_or_else(|| {
+        "OpenAI OAuth refresh did not return id_token; reconnect OpenAI provider and try again."
+            .to_string()
+    })?;
+
+    let api_key = exchange_openai_id_token_for_api_key(&client, &id_token).await?;
+    upsert_openai_api_key_in_ai_providers(working_dir, &api_key)?;
+
+    Ok(())
+}
+
 /// Google/Gemini OAuth constants (from opencode-gemini-auth plugin / Gemini CLI)
 const GOOGLE_CLIENT_ID: &str =
     "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
