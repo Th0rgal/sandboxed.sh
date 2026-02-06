@@ -2096,7 +2096,10 @@ pub fn run_claudecode_turn<'a>(
                     idle_deadline = Instant::now() + idle_timeout;
 
                     let raw_line = raw_line.trim_end_matches(&['\r', '\n'][..]);
-                    let cleaned = strip_ansi_codes(raw_line);
+                    let mut cleaned = strip_ansi_codes(raw_line);
+                    // The Claude CLI can occasionally emit NUL/control characters on PTY streams
+                    // (e.g. leading '^@') which breaks JSON parsing. Remove them before parsing.
+                    cleaned.retain(|ch| !ch.is_control());
                     let line = cleaned.trim();
                     if line.is_empty() {
                         continue;
