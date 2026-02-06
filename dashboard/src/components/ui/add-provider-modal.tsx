@@ -49,14 +49,14 @@ const getProviderAuthMethods = (providerType: AIProviderType): AIProviderAuthMet
   if (providerType === 'openai') {
     return [
       {
-        label: 'ChatGPT Plus/Pro (Codex Subscription)',
+        label: 'ChatGPT Plus/Pro (OAuth, OpenCode only)',
         type: 'oauth',
-        description: 'Use your ChatGPT Plus/Pro subscription via official OAuth',
+        description: 'Use your ChatGPT subscription via OAuth (does not work for Codex)',
       },
       {
-        label: 'ChatGPT Plus/Pro (Manual URL Paste)',
+        label: 'ChatGPT Plus/Pro (OAuth manual paste, OpenCode only)',
         type: 'oauth',
-        description: 'Paste the full redirect URL if the callback fails',
+        description: 'Paste the full redirect URL if the callback fails (does not work for Codex)',
       },
       { label: 'Enter API Key', type: 'api', description: 'Use an existing API key' },
     ];
@@ -508,6 +508,18 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
               <p className="text-sm text-white/60">
                 Choose which backends should use this {selectedTypeInfo?.name} provider:
               </p>
+              {selectedProvider === 'openai' &&
+                (() => {
+                  const method =
+                    selectedMethodIndex !== null ? authMethods[selectedMethodIndex] : null;
+                  const isOAuth = method?.type === 'oauth';
+                  if (!isOAuth) return null;
+                  return (
+                    <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200/80">
+                      Codex requires an OpenAI API key. Go back and choose <span className="font-medium">Enter API Key</span> to enable Codex.
+                    </div>
+                  );
+                })()}
               <div className="space-y-2">
                 {selectedProvider === 'anthropic' && (
                   <>
