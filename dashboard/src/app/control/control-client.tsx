@@ -208,6 +208,15 @@ type ChatItem =
       endTime?: number;
     }
   | {
+      // Streaming text delta (draft assistant output).
+      kind: "stream";
+      id: string;
+      content: string;
+      done: boolean;
+      startTime: number;
+      endTime?: number;
+    }
+  | {
       kind: "tool";
       id: string;
       toolCallId: string;
@@ -235,6 +244,7 @@ type ChatItem =
     };
 
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
+type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
 
 type QuestionOption = {
   label: string;
@@ -724,7 +734,7 @@ function ThinkingGroupItem({
   items,
   basePath,
 }: {
-  items: Extract<ChatItem, { kind: "thinking" }>[];
+  items: SidePanelItem[];
   basePath?: string;
 }) {
   // Filter out empty items for display
@@ -786,7 +796,24 @@ function ThinkingGroupItem({
     return null;
   }
 
-  const label = nonEmptyItems.length === 1 ? "Thought" : "Thoughts";
+  const label = (() => {
+    const hasStream = nonEmptyItems.some((item) => item.kind === "stream");
+    const hasThinking = nonEmptyItems.some((item) => item.kind === "thinking");
+    if (hasStream && !hasThinking) {
+      return nonEmptyItems.length === 1 ? "Draft" : "Drafts";
+    }
+    return nonEmptyItems.length === 1 ? "Thought" : "Thoughts";
+  })();
+
+  const activeLabel = (() => {
+    if (items.some((item) => !item.done && item.kind === "thinking")) {
+      return "Thinking";
+    }
+    if (items.some((item) => !item.done && item.kind === "stream")) {
+      return "Streaming";
+    }
+    return "Thinking";
+  })();
 
   return (
     <div className="my-2">
@@ -807,7 +834,9 @@ function ThinkingGroupItem({
           )}
         />
         <span className="text-xs">
-          {hasActiveItem ? `Thinking for ${duration}` : `${label} for ${duration}`}
+          {hasActiveItem
+            ? `${activeLabel} for ${duration}`
+            : `${label} for ${duration}`}
         </span>
         {nonEmptyItems.length > 1 && (
           <span className="text-xs text-white/30">({nonEmptyItems.length})</span>
@@ -862,7 +891,7 @@ function ThinkingPanelItem({
   isActive,
   basePath,
 }: {
-  item: Extract<ChatItem, { kind: "thinking" }>;
+  item: SidePanelItem;
   isActive: boolean;
   basePath?: string;
 }) {
@@ -888,6 +917,9 @@ function ThinkingPanelItem({
   const duration = item.done && item.endTime
     ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
     : formatDuration(elapsedSeconds);
+
+  const activeLabel = item.kind === "stream" ? "Streaming" : "Thinking";
+  const pastLabel = item.kind === "stream" ? "Draft" : "Thought";
 
   // For completed items, check if content is long enough to collapse
   const isLongContent = !isActive && item.content.length > THOUGHT_COLLAPSE_THRESHOLD;
@@ -917,7 +949,9 @@ function ThinkingPanelItem({
           "text-xs font-medium",
           isActive ? "text-indigo-400" : "text-white/50"
         )}>
-          {isActive ? `Thinking for ${duration}` : `Thought for ${duration}`}
+          {isActive
+            ? `${activeLabel} for ${duration}`
+            : `${pastLabel} for ${duration}`}
         </span>
       </div>
       {/* Content area - no internal scroll, unified text color */}
@@ -966,13 +1000,18 @@ function ThinkingPanel({
   basePath,
   missionId,
 }: {
-  items: Extract<ChatItem, { kind: "thinking" }>[];
+  items: SidePanelItem[];
   onClose: () => void;
   className?: string;
   basePath?: string;
   missionId?: string | null;
 }) {
-  const activeItem = items.find(t => !t.done);
+  const activeItems = useMemo(
+    () => items.filter((t) => !t.done),
+    [items]
+  );
+  const hasActiveThinking = activeItems.some((i) => i.kind === "thinking");
+  const hasActiveStream = activeItems.some((i) => i.kind === "stream");
 
   // Deduplicate completed items by content - keep first occurrence
   const completedItems = useMemo(() => {
@@ -1002,10 +1041,10 @@ function ThinkingPanel({
 
   // Auto-scroll to bottom when active thought content changes
   useEffect(() => {
-    if (scrollRef.current && activeItem) {
+    if (scrollRef.current && activeItems.length > 0) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [activeItem?.content, activeItem?.id]);
+  }, [activeItems.map((i) => `${i.id}:${i.content.length}`).join("|")]);
 
   // Handle Escape key
   useEffect(() => {
@@ -1025,13 +1064,15 @@ function ThinkingPanel({
         <div className="flex items-center gap-2">
           <Brain className={cn(
             "h-4 w-4",
-            activeItem ? "animate-pulse text-indigo-400" : "text-white/40"
+            activeItems.length > 0 ? "animate-pulse text-indigo-400" : "text-white/40"
           )} />
           <span className="text-sm font-medium text-white">
-            {activeItem ? "Thinking" : "Thoughts"}
+            {hasActiveThinking ? "Thinking" : hasActiveStream ? "Streaming" : "Thoughts"}
           </span>
-          {(completedItems.length > 0 || activeItem) && (
-            <span className="text-xs text-white/30">({completedItems.length + (activeItem ? 1 : 0)})</span>
+          {(completedItems.length > 0 || activeItems.length > 0) && (
+            <span className="text-xs text-white/30">
+              ({completedItems.length + activeItems.length})
+            </span>
           )}
         </div>
         <button
@@ -1076,7 +1117,7 @@ function ThinkingPanel({
                 {completedItems.slice(-visibleThoughtsLimit).map((item) => (
                   <ThinkingPanelItem key={item.id} item={item} isActive={false} basePath={basePath} />
                 ))}
-                {activeItem && (
+                {activeItems.length > 0 && (
                   <div className="text-[10px] uppercase tracking-wider text-white/30 px-1">
                     Current
                   </div>
@@ -1084,10 +1125,15 @@ function ThinkingPanel({
               </>
             )}
 
-            {/* Active thinking at the bottom (sticky) */}
-            {activeItem && (
-              <ThinkingPanelItem item={activeItem} isActive={true} basePath={basePath} />
-            )}
+            {/* Active items at the bottom (sticky) */}
+            {activeItems.map((item) => (
+              <ThinkingPanelItem
+                key={item.id}
+                item={item}
+                isActive={true}
+                basePath={basePath}
+              />
+            ))}
           </>
         )}
       </div>
@@ -2110,15 +2156,19 @@ export default function ControlClient() {
     return out.reverse();
   }, [items]);
 
-  // Extract thinking items for the side panel
-  const thinkingItems = useMemo(() =>
-    dedupedItems.filter((it): it is Extract<ChatItem, { kind: "thinking" }> => it.kind === "thinking"),
+  // Extract thinking + streaming items for the side panel.
+  const thinkingItems = useMemo(
+    () =>
+      dedupedItems.filter(
+        (it): it is SidePanelItem =>
+          it.kind === "thinking" || it.kind === "stream"
+      ),
     [dedupedItems]
   );
 
   // Deduplicated count for display (same logic as ThinkingPanel)
   const thinkingItemsCount = useMemo(() => {
-    const activeItem = thinkingItems.find(t => !t.done);
+    const activeCount = thinkingItems.filter((t) => !t.done).length;
     const seen = new Set<string>();
     let completedCount = 0;
     for (const t of thinkingItems) {
@@ -2128,7 +2178,7 @@ export default function ControlClient() {
       seen.add(trimmed);
       completedCount++;
     }
-    return completedCount + (activeItem ? 1 : 0);
+    return completedCount + activeCount;
   }, [thinkingItems]);
 
   // Check if there's active thinking happening
@@ -2157,14 +2207,14 @@ export default function ControlClient() {
   type ThinkingGroup = {
     kind: "thinking_group";
     groupId: string;
-    thoughts: Extract<ChatItem, { kind: "thinking" }>[];
+    thoughts: SidePanelItem[];
   };
   type GroupedItem = ChatItem | ToolGroup | ThinkingGroup;
 
   const groupedItems = useMemo((): GroupedItem[] => {
     const result: GroupedItem[] = [];
     let currentToolGroup: Extract<ChatItem, { kind: "tool" }>[] = [];
-    let currentThinkingGroup: Extract<ChatItem, { kind: "thinking" }>[] = [];
+    let currentThinkingGroup: SidePanelItem[] = [];
 
     const flushToolGroup = () => {
       if (currentToolGroup.length === 0) return;
@@ -2197,7 +2247,7 @@ export default function ControlClient() {
         // Non-UI tool - flush thinking first, then add to tool group
         flushThinkingGroup();
         currentToolGroup.push(item);
-      } else if (item.kind === "thinking") {
+      } else if (item.kind === "thinking" || item.kind === "stream") {
         if (showThinkingPanel) {
           // When thinking panel is open, skip all thinking items entirely
           // (they're shown in the side panel)
@@ -2742,7 +2792,7 @@ export default function ControlClient() {
 
   // Convert stored events (from SQLite) to ChatItems for display
   // This enables full history replay including tool calls on page refresh
-  const eventsToItems = useCallback((events: StoredEvent[]): ChatItem[] => {
+  const eventsToItems = useCallback((events: StoredEvent[], mission?: Mission | null): ChatItem[] => {
     const items: ChatItem[] = [];
     const toolCallMap = new Map<string, number>(); // tool_call_id -> index in items
     // Track seen event IDs to prevent duplicate items (backend may store duplicates)
@@ -2754,6 +2804,7 @@ export default function ControlClient() {
       | { id: string; content: string; timestamp: number }
       | null = null;
     let lastAssistantTimestamp = 0;
+    const missionActive = mission?.status === "active";
 
     // Helper to finalize pending thinking item
     const finalizePendingThinking = (endTime: number) => {
@@ -2960,18 +3011,20 @@ export default function ControlClient() {
       }
     }
 
-    // Finalize any pending thinking item (e.g., if done event wasn't stored)
-    finalizePendingThinking(Date.now());
+    // Finalize any pending thinking item (e.g., if done event wasn't stored).
+    // For active missions, keep the last item "open" so the side panel can show ongoing progress.
+    if (!missionActive) {
+      finalizePendingThinking(Date.now());
+    }
 
-    if (lastTextDelta && lastTextDelta.timestamp >= lastAssistantTimestamp) {
+    if (lastTextDelta && lastTextDelta.timestamp > lastAssistantTimestamp) {
       items.push({
-        kind: "assistant" as const,
+        kind: "stream" as const,
         id: lastTextDelta.id,
         content: lastTextDelta.content,
-        success: true,
-        costCents: 0,
-        model: null,
-        timestamp: lastTextDelta.timestamp,
+        done: !missionActive,
+        startTime: lastTextDelta.timestamp,
+        endTime: missionActive ? undefined : lastTextDelta.timestamp,
       });
     }
 
@@ -3035,7 +3088,7 @@ export default function ControlClient() {
         setCurrentMission(mission);
         setViewingMission(mission);
         // Use events if available, otherwise fall back to basic history
-        let historyItems = events ? eventsToItems(events) : missionHistoryToItems(mission);
+        let historyItems = events ? eventsToItems(events, mission) : missionHistoryToItems(mission);
         if (events && !historyItems.some((item) => item.kind === "assistant")) {
           const historyHasAssistant = mission.history.some(
             (entry) => entry.role === "assistant"
@@ -3114,7 +3167,7 @@ export default function ControlClient() {
           Promise.all([loadHistoryEvents(mission.id), getQueue().catch(() => [])])
             .then(([events, queuedMessages]) => {
               if (cancelled) return;
-              let historyItems = eventsToItems(events);
+              let historyItems = eventsToItems(events, mission);
               if (!historyItems.some((item) => item.kind === "assistant")) {
                 const historyHasAssistant = mission.history.some(
                   (entry) => entry.role === "assistant"
@@ -3476,6 +3529,11 @@ export default function ControlClient() {
         thinkingFlushTimeoutRef.current = null;
       }
       pendingThinkingRef.current = null;
+      if (streamFlushTimeoutRef.current) {
+        clearTimeout(streamFlushTimeoutRef.current);
+        streamFlushTimeoutRef.current = null;
+      }
+      pendingStreamRef.current = null;
 
       setViewingMissionId(missionId);
       fetchingMissionIdRef.current = missionId;
@@ -3499,7 +3557,7 @@ export default function ControlClient() {
         }
 
         // Use events if available, otherwise fall back to basic history
-        let historyItems = events ? eventsToItems(events) : missionHistoryToItems(mission);
+        let historyItems = events ? eventsToItems(events, mission) : missionHistoryToItems(mission);
         if (events && !historyItems.some((item) => item.kind === "assistant")) {
           const historyHasAssistant = mission.history.some(
             (entry) => entry.role === "assistant"
@@ -3691,7 +3749,7 @@ export default function ControlClient() {
       // Load full events in background (including tool calls)
       loadHistoryEvents(resumed.id)
         .then((events) => {
-          let fullItems = eventsToItems(events);
+          let fullItems = eventsToItems(events, resumed);
           if (!fullItems.some((item) => item.kind === "assistant")) {
             const historyHasAssistant = resumed.history.some(
               (entry) => entry.role === "assistant"
@@ -3724,6 +3782,12 @@ export default function ControlClient() {
   } | null>(null);
   const thinkingFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const thinkingIdCounterRef = useRef(0);
+
+  const pendingStreamRef = useRef<{
+    content: string;
+    startTime: number;
+  } | null>(null);
+  const streamFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Auto-reconnecting stream with exponential backoff
   useEffect(() => {
@@ -3818,7 +3882,7 @@ export default function ControlClient() {
           Promise.all([getMission(viewingId), loadHistoryEvents(viewingId), getQueue().catch(() => [])])
             .then(([mission, events, queuedMessages]) => {
               if (!mounted) return;
-              let historyItems = eventsToItems(events);
+              let historyItems = eventsToItems(events, mission);
               if (!historyItems.some((item) => item.kind === "assistant")) {
                 const historyHasAssistant = mission.history.some(
                   (entry) => entry.role === "assistant"
@@ -3902,7 +3966,9 @@ export default function ControlClient() {
             setItems((prevItems) => {
               const hasActiveThinking = prevItems.some(
                 (it) =>
-                  (it.kind === "thinking" && !it.done) || it.kind === "phase"
+                  ((it.kind === "thinking" || it.kind === "stream") &&
+                    !it.done) ||
+                  it.kind === "phase"
               );
               // If there's no active streaming item, the user is seeing stale state
               // The "Agent is working..." indicator will show via the render logic
@@ -4024,12 +4090,17 @@ export default function ControlClient() {
           thinkingFlushTimeoutRef.current = null;
         }
         pendingThinkingRef.current = null;
+        if (streamFlushTimeoutRef.current) {
+          clearTimeout(streamFlushTimeoutRef.current);
+          streamFlushTimeoutRef.current = null;
+        }
+        pendingStreamRef.current = null;
 
         setItems((prev) => {
           // Mark any in-progress thinking as done instead of dropping it,
           // so the Thinking panel can show a scrollable history.
           let filtered = prev.map((it) => {
-            if (it.kind === "thinking" && !it.done) {
+            if ((it.kind === "thinking" || it.kind === "stream") && !it.done) {
               return { ...it, done: true, endTime: now };
             }
             return it;
@@ -4220,6 +4291,84 @@ export default function ControlClient() {
         } else {
           thinkingFlushTimeoutRef.current = setTimeout(flushThinking, 100);
         }
+        return;
+      }
+
+      if (event.type === "text_delta" && isRecord(data)) {
+        const content = String(data["content"] ?? "");
+        const now = Date.now();
+        if (!content.trim()) return;
+
+        // Debounced stream updates to reduce re-renders during rapid delta streaming.
+        const flushStream = () => {
+          const pending = pendingStreamRef.current;
+          if (!pending) return;
+
+          setItems((prev) => {
+            // Remove phase items when streaming starts
+            const filtered = prev.filter((it) => it.kind !== "phase");
+            const streamId = "text_delta_latest";
+            const existingIdx = filtered.findIndex(
+              (it) => it.kind === "stream" && it.id === streamId
+            );
+            if (existingIdx >= 0) {
+              const updated = [...filtered];
+              const existing = updated[existingIdx] as Extract<
+                ChatItem,
+                { kind: "stream" }
+              >;
+              const existingContent = existing.content ?? "";
+              const isContinuation =
+                !pending.content ||
+                !existingContent ||
+                pending.content.startsWith(existingContent) ||
+                existingContent.startsWith(pending.content);
+              updated[existingIdx] = {
+                ...existing,
+                content: pending.content || existing.content,
+                done: false,
+                startTime:
+                  isContinuation && !existing.done
+                    ? existing.startTime
+                    : pending.startTime,
+                endTime: undefined,
+              };
+              return updated;
+            }
+
+            // No active stream item yet - create one.
+            return [
+              ...filtered,
+              {
+                kind: "stream" as const,
+                id: "text_delta_latest",
+                content: pending.content,
+                done: false,
+                startTime: pending.startTime,
+                endTime: undefined,
+              },
+            ];
+          });
+        };
+
+        const existingPending = pendingStreamRef.current;
+        const existingContent = existingPending?.content ?? "";
+        const isContinuation =
+          !content ||
+          !existingContent ||
+          content.startsWith(existingContent) ||
+          existingContent.startsWith(content);
+
+        pendingStreamRef.current = {
+          content: content || existingPending?.content || "",
+          startTime: isContinuation ? existingPending?.startTime ?? now : now,
+        };
+
+        if (streamFlushTimeoutRef.current) {
+          clearTimeout(streamFlushTimeoutRef.current);
+          streamFlushTimeoutRef.current = null;
+        }
+        streamFlushTimeoutRef.current = setTimeout(flushStream, 100);
         return;
       }
 
@@ -4430,6 +4579,9 @@ export default function ControlClient() {
           const now = Date.now();
           setItems((prev) =>
             prev.map((item) => {
+              if ((item.kind === "thinking" || item.kind === "stream") && !item.done) {
+                return { ...item, done: true, endTime: now };
+              }
               if (item.kind === "tool" && item.result === undefined) {
                 return {
                   ...item,
@@ -4440,6 +4592,16 @@ export default function ControlClient() {
               return item;
             })
           );
+          if (thinkingFlushTimeoutRef.current) {
+            clearTimeout(thinkingFlushTimeoutRef.current);
+            thinkingFlushTimeoutRef.current = null;
+          }
+          pendingThinkingRef.current = null;
+          if (streamFlushTimeoutRef.current) {
+            clearTimeout(streamFlushTimeoutRef.current);
+            streamFlushTimeoutRef.current = null;
+          }
+          pendingStreamRef.current = null;
 
           // Reset stream phase to idle when mission completes
           // (The SSE connection stays open for the control session, but the mission is done)
@@ -4508,6 +4670,11 @@ export default function ControlClient() {
         clearTimeout(thinkingFlushTimeoutRef.current);
         thinkingFlushTimeoutRef.current = null;
       }
+      if (streamFlushTimeoutRef.current) {
+        clearTimeout(streamFlushTimeoutRef.current);
+        streamFlushTimeoutRef.current = null;
+      }
+      pendingStreamRef.current = null;
     };
   }, []);
 
@@ -5592,6 +5759,11 @@ export default function ControlClient() {
                   return <ThinkingGroupItem key={item.id} items={[item]} basePath={missionWorkingDirectory} />;
                 }
 
+                if (item.kind === "stream") {
+                  // Fallback for individual stream items (should be rare with grouping)
+                  return <ThinkingGroupItem key={item.id} items={[item]} basePath={missionWorkingDirectory} />;
+                }
+
                 if (item.kind === "tool") {
                   // UI tools get special interactive rendering
                   if (item.isUiTool) {
@@ -5787,7 +5959,9 @@ export default function ControlClient() {
                 !items.some(
                   (it) =>
                     // Only block for undone thinking if it's visible inline (panel closed)
-                    (it.kind === "thinking" && !it.done && !showThinkingPanel) ||
+                    ((it.kind === "thinking" || it.kind === "stream") &&
+                      !it.done &&
+                      !showThinkingPanel) ||
                     it.kind === "phase"
                 ) &&
                 // Hide if the last item is an assistant message (response complete, waiting for state change)
