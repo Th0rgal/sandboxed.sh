@@ -4931,20 +4931,26 @@ async fn ensure_codex_cli_available(
     cli_path: &str,
 ) -> Result<String, String> {
     let program = cli_path.splitn(2, ' ').next().unwrap_or(cli_path);
-    if command_available(workspace_exec, cwd, program).await {
-        return Ok(cli_path.to_string());
-    }
 
-    // Container workspaces run the harness inside the container, so host-installed CLIs
-    // (like `codex`) are not visible unless they are installed in the container filesystem.
+    // For container workspaces, the Codex npm package ships a Node.js ESM wrapper
+    // that requires Node 20+. Containers often only have Node 18, which fails with
+    // "Cannot use import statement outside a module". The package also ships a
+    // native Rust binary in vendor/<triple>/codex/codex that works standalone.
     //
-    // Pragmatic fix: if we're in a container workspace and `codex` exists on the host,
-    // copy it into the container root at /usr/local/bin, then retry.
+    // IMPORTANT: try the native binary copy BEFORE `command_available` — a previous
+    // mission may have left the broken Node.js wrapper at /usr/local/bin/codex,
+    // which passes `command_available` but fails at runtime.
     if workspace_exec.workspace.workspace_type == WorkspaceType::Container {
         if let Some(resolved) = resolve_host_executable(program) {
-            let resolved = resolve_openai_codex_native_binary(&resolved).unwrap_or(resolved);
+            let native = resolve_openai_codex_native_binary(&resolved);
+            tracing::info!(
+                host_path = %resolved.display(),
+                native_binary = ?native.as_ref().map(|p| p.display().to_string()),
+                "Codex CLI host resolution for container"
+            );
+            let to_copy = native.unwrap_or(resolved);
             if let Ok(dest_in_container) =
-                copy_host_executable_into_container(&workspace_exec.workspace, &resolved)
+                copy_host_executable_into_container(&workspace_exec.workspace, &to_copy)
             {
                 let rest = cli_path.splitn(2, ' ').nth(1).unwrap_or("").trim();
                 let container_cli = if rest.is_empty() {
@@ -4959,7 +4965,7 @@ async fn ensure_codex_cli_available(
                     .unwrap_or(&dest_in_container);
                 if command_available(workspace_exec, cwd, dest_program).await {
                     tracing::info!(
-                        host_path = %resolved.display(),
+                        host_source = %to_copy.display(),
                         container_path = %dest_program,
                         "Copied Codex CLI into container workspace"
                     );
@@ -4967,6 +4973,11 @@ async fn ensure_codex_cli_available(
                 }
             }
         }
+    }
+
+    // Check if already available (host workspace, or container with working binary)
+    if command_available(workspace_exec, cwd, program).await {
+        return Ok(cli_path.to_string());
     }
 
     // Check bun's global bin directories (bun installs globals to ~/.cache/.bun/bin/)
@@ -5070,12 +5081,27 @@ fn resolve_openai_codex_native_binary(
     //
     // When we copy it into a container as a standalone file, Node runs it as CJS and it
     // fails to import ESM. Instead, copy the actual native binary shipped in vendor/.
-    let real = std::fs::canonicalize(wrapper_path).ok()?;
-    if real
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == "codex.js")
-    {
+    let real = match std::fs::canonicalize(wrapper_path) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(
+                path = %wrapper_path.display(),
+                error = %e,
+                "Failed to canonicalize Codex wrapper path"
+            );
+            return None;
+        }
+    };
+
+    let file_name = real.file_name().and_then(|n| n.to_str());
+    tracing::debug!(
+        wrapper = %wrapper_path.display(),
+        canonical = %real.display(),
+        file_name = ?file_name,
+        "Resolving Codex native binary"
+    );
+
+    if file_name.is_some_and(|n| n == "codex.js") {
         // .../@openai/codex/bin/codex.js
         let package_root = real.parent()?.parent()?;
         let os = std::env::consts::OS;
@@ -5086,7 +5112,10 @@ fn resolve_openai_codex_native_binary(
             ("linux", "aarch64") => "aarch64-unknown-linux-musl",
             ("macos", "x86_64") => "x86_64-apple-darwin",
             ("macos", "aarch64") => "aarch64-apple-darwin",
-            _ => return None,
+            _ => {
+                tracing::debug!(os, arch, "No Codex native binary triple for this platform");
+                return None;
+            }
         };
 
         let binary_name = if cfg!(windows) { "codex.exe" } else { "codex" };
@@ -5096,8 +5125,16 @@ fn resolve_openai_codex_native_binary(
             .join("codex")
             .join(binary_name);
         if native.is_file() {
+            tracing::info!(
+                native_path = %native.display(),
+                "Found Codex native binary"
+            );
             return Some(native);
         }
+        tracing::debug!(
+            expected = %native.display(),
+            "Codex native binary not found at expected path"
+        );
     }
 
     None
