@@ -4942,6 +4942,7 @@ async fn ensure_codex_cli_available(
     // copy it into the container root at /usr/local/bin, then retry.
     if workspace_exec.workspace.workspace_type == WorkspaceType::Container {
         if let Some(resolved) = resolve_host_executable(program) {
+            let resolved = resolve_openai_codex_native_binary(&resolved).unwrap_or(resolved);
             if let Ok(dest_in_container) =
                 copy_host_executable_into_container(&workspace_exec.workspace, &resolved)
             {
@@ -5059,6 +5060,45 @@ async fn ensure_codex_cli_available(
         "Codex CLI install completed but '{}' is still not available in workspace PATH.",
         cli_path
     ))
+}
+
+fn resolve_openai_codex_native_binary(wrapper_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    // If `codex` was installed via npm/bun (@openai/codex), the entrypoint is a Node
+    // wrapper script that expects its surrounding package layout (package.json, vendor/).
+    //
+    // When we copy it into a container as a standalone file, Node runs it as CJS and it
+    // fails to import ESM. Instead, copy the actual native binary shipped in vendor/.
+    let real = std::fs::canonicalize(wrapper_path).ok()?;
+    if real
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "codex.js")
+    {
+        // .../@openai/codex/bin/codex.js
+        let package_root = real.parent()?.parent()?;
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+
+        let triple = match (os, arch) {
+            ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+            ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+            ("macos", "x86_64") => "x86_64-apple-darwin",
+            ("macos", "aarch64") => "aarch64-apple-darwin",
+            _ => return None,
+        };
+
+        let binary_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let native = package_root
+            .join("vendor")
+            .join(triple)
+            .join("codex")
+            .join(binary_name);
+        if native.is_file() {
+            return Some(native);
+        }
+    }
+
+    None
 }
 
 fn resolve_host_executable(program: &str) -> Option<std::path::PathBuf> {
