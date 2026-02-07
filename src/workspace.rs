@@ -1357,6 +1357,14 @@ async fn write_claudecode_config(
     let settings_json_path = claude_dir.join("settings.json");
     tokio::fs::write(&settings_json_path, &settings_content).await?;
 
+    // Also write settings under XDG_CONFIG_HOME/claude for Claude CLI XDG lookups.
+    let xdg_claude_dir = workspace_dir.join(".config").join("claude");
+    tokio::fs::create_dir_all(&xdg_claude_dir).await?;
+    let xdg_settings_path = xdg_claude_dir.join("settings.json");
+    tokio::fs::write(&xdg_settings_path, &settings_content).await?;
+    let xdg_settings_local = xdg_claude_dir.join("settings.local.json");
+    tokio::fs::write(&xdg_settings_local, &settings_content).await?;
+
     // Also write settings to ~/.claude so `claude mcp list` sees workspace MCPs.
     let claude_home = resolve_claudecode_dir(workspace_root, workspace_type, workspace_env);
     if claude_home != claude_dir {
