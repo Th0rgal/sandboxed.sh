@@ -16,6 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use super::routes::AppState;
+use crate::workspace::WorkspaceType;
 
 #[derive(Debug, Deserialize)]
 struct RuntimeWorkspace {
@@ -187,7 +188,16 @@ async fn resolve_path_for_workspace(
 
     // Resolve the final path based on input type
     let resolved = if input.is_absolute() {
-        input.to_path_buf()
+        if workspace.workspace_type == WorkspaceType::Container {
+            if input.starts_with(&workspace_root) {
+                input.to_path_buf()
+            } else {
+                let rel = input.strip_prefix("/").unwrap_or(input);
+                workspace_root.join(rel)
+            }
+        } else {
+            input.to_path_buf()
+        }
     } else if path.starts_with("./context") || path.starts_with("context") {
         // For "context" paths, use the mission-specific context directory if mission_id provided
         let suffix = path
@@ -556,7 +566,11 @@ pub async fn download(
     State(state): State<Arc<AppState>>,
     Query(q): Query<PathQuery>,
 ) -> Result<Response, (StatusCode, String)> {
-    let resolved_path = resolve_download_path(&q.path, Some(&state.config.working_dir))?;
+    let resolved_path = if let Some(workspace_id) = q.workspace_id {
+        resolve_path_for_workspace(&state, workspace_id, &q.path, q.mission_id).await?
+    } else {
+        resolve_download_path(&q.path, Some(&state.config.working_dir))?
+    };
     let filename = q
         .path
         .split('/')

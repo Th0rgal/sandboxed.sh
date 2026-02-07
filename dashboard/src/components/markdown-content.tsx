@@ -15,6 +15,8 @@ interface MarkdownContentProps {
   content: string;
   className?: string;
   basePath?: string;
+  workspaceId?: string;
+  missionId?: string;
 }
 
 const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"];
@@ -112,7 +114,12 @@ function formatFileSize(bytes: number): string {
 }
 
 // Imperative modal - rendered outside React's component tree
-function showFilePreviewModal(path: string, resolvedPath: string) {
+function showFilePreviewModal(
+  path: string,
+  resolvedPath: string,
+  workspaceId?: string,
+  missionId?: string
+) {
   // Prevent multiple modals
   if (document.getElementById("file-preview-modal-root")) return;
 
@@ -127,16 +134,32 @@ function showFilePreviewModal(path: string, resolvedPath: string) {
     container.remove();
   };
 
-  root.render(<FilePreviewModalContent path={path} resolvedPath={resolvedPath} onClose={cleanup} />);
+  root.render(
+    <FilePreviewModalContent
+      path={path}
+      resolvedPath={resolvedPath}
+      workspaceId={workspaceId}
+      missionId={missionId}
+      onClose={cleanup}
+    />
+  );
 }
 
 interface FilePreviewModalContentProps {
   path: string;
   resolvedPath: string;
+  workspaceId?: string;
+  missionId?: string;
   onClose: () => void;
 }
 
-function FilePreviewModalContent({ path, resolvedPath, onClose }: FilePreviewModalContentProps) {
+function FilePreviewModalContent({
+  path,
+  resolvedPath,
+  workspaceId,
+  missionId,
+  onClose,
+}: FilePreviewModalContentProps) {
   const isImage = isImageFile(path);
   const FileIcon = getFileIcon(path);
   const fileName = path.split("/").pop() || "file";
@@ -154,7 +177,10 @@ function FilePreviewModalContent({ path, resolvedPath, onClose }: FilePreviewMod
     let cancelled = false;
     const fetchImage = async () => {
       const API_BASE = getRuntimeApiBase();
-      const downloadUrl = `${API_BASE}/api/fs/download?path=${encodeURIComponent(resolvedPath)}`;
+      const params = new URLSearchParams({ path: resolvedPath });
+      if (workspaceId) params.set("workspace_id", workspaceId);
+      if (missionId) params.set("mission_id", missionId);
+      const downloadUrl = `${API_BASE}/api/fs/download?${params.toString()}`;
 
       try {
         const res = await fetch(downloadUrl, { headers: { ...authHeader() } });
@@ -192,10 +218,12 @@ function FilePreviewModalContent({ path, resolvedPath, onClose }: FilePreviewMod
     setDownloading(true);
     try {
       const API_BASE = getRuntimeApiBase();
-      const res = await fetch(
-        `${API_BASE}/api/fs/download?path=${encodeURIComponent(resolvedPath)}`,
-        { headers: { ...authHeader() } }
-      );
+      const params = new URLSearchParams({ path: resolvedPath });
+      if (workspaceId) params.set("workspace_id", workspaceId);
+      if (missionId) params.set("mission_id", missionId);
+      const res = await fetch(`${API_BASE}/api/fs/download?${params.toString()}`, {
+        headers: { ...authHeader() },
+      });
       if (!res.ok) {
         setError(`Download failed (${res.status})`);
         return;
@@ -355,7 +383,13 @@ function CopyCodeButton({ code }: { code: string }) {
 }
 
 // Memoized to prevent re-renders when parent re-renders with same props
-export const MarkdownContent = memo(function MarkdownContent({ content, className, basePath }: MarkdownContentProps) {
+export const MarkdownContent = memo(function MarkdownContent({
+  content,
+  className,
+  basePath,
+  workspaceId,
+  missionId,
+}: MarkdownContentProps) {
   // Memoize components object to prevent react-markdown from re-creating DOM on every render
   const components: Components = useMemo(() => ({
     a({ href, children, ...props }) {
@@ -387,7 +421,12 @@ export const MarkdownContent = memo(function MarkdownContent({ content, classNam
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                showFilePreviewModal(codeString, resolvePath(codeString, basePath));
+                showFilePreviewModal(
+                  codeString,
+                  resolvePath(codeString, basePath),
+                  workspaceId,
+                  missionId
+                );
               }}
               title="Click to preview"
             >
@@ -429,7 +468,7 @@ export const MarkdownContent = memo(function MarkdownContent({ content, classNam
     pre({ children }) {
       return <>{children}</>;
     },
-  }), [basePath]);
+  }), [basePath, workspaceId, missionId]);
 
   // Memoize remarkPlugins array to prevent recreation
   const plugins = useMemo(() => [remarkGfm], []);
