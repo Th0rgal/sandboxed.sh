@@ -1631,6 +1631,7 @@ fn codex_entry_from_mcp(
             let command = command_vec
                 .first()
                 .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let args: Vec<String> = command_vec
                 .iter()
                 .skip(1)
