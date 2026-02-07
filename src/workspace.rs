@@ -1353,14 +1353,18 @@ async fn write_claudecode_config(
     });
     let settings_path = claude_dir.join("settings.local.json");
     let settings_content = serde_json::to_string_pretty(&settings)?;
-    tokio::fs::write(&settings_path, settings_content).await?;
+    tokio::fs::write(&settings_path, &settings_content).await?;
+    let settings_json_path = claude_dir.join("settings.json");
+    tokio::fs::write(&settings_json_path, &settings_content).await?;
 
     // Also write settings to ~/.claude so `claude mcp list` sees workspace MCPs.
     let claude_home = resolve_claudecode_dir(workspace_root, workspace_type, workspace_env);
     if claude_home != claude_dir {
         tokio::fs::create_dir_all(&claude_home).await?;
         let home_settings = claude_home.join("settings.local.json");
-        tokio::fs::write(&home_settings, serde_json::to_string_pretty(&settings)?).await?;
+        tokio::fs::write(&home_settings, &settings_content).await?;
+        let home_settings_json = claude_home.join("settings.json");
+        tokio::fs::write(&home_settings_json, &settings_content).await?;
     }
 
     // Write skills to .claude/skills/ using Claude Code's native format
