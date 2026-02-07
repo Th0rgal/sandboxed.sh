@@ -1362,7 +1362,6 @@ async fn write_claudecode_config(
     let mcp_content = serde_json::to_string_pretty(&mcp_only)?;
     let mcp_config_path = claude_dir.join("mcp.json");
     tokio::fs::write(&mcp_config_path, &mcp_content).await?;
-
     // Also write settings under XDG_CONFIG_HOME/claude for Claude CLI XDG lookups.
     let xdg_claude_dir = workspace_dir.join(".config").join("claude");
     tokio::fs::create_dir_all(&xdg_claude_dir).await?;
@@ -1664,7 +1663,13 @@ fn codex_entry_from_mcp(
     shared_network: Option<bool>,
     override_name: Option<String>,
 ) -> Option<CodexMcpEntry> {
-    let name = override_name.unwrap_or_else(|| config.name.clone());
+    let raw_name = override_name.unwrap_or_else(|| config.name.clone());
+    let sanitized = sanitize_key(&raw_name);
+    let name = if sanitized.is_empty() {
+        "mcp".to_string()
+    } else {
+        sanitized
+    };
     match &config.transport {
         McpTransport::Http { endpoint, headers } => Some(CodexMcpEntry {
             name,
@@ -1729,11 +1734,18 @@ fn update_codex_mcp_config(existing: &str, entries: &[CodexMcpEntry]) -> String 
     let mut filtered: Vec<String> = Vec::new();
     let mut skip = false;
     for line in existing.lines() {
-        if let Some(section_name) = parse_mcp_section_name(line) {
-            if names.contains(&section_name) {
-                skip = true;
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if let Some(section_name) = parse_mcp_section_name(line) {
+                if names.contains(&section_name) {
+                    skip = true;
+                    continue;
+                }
+                skip = false;
+                filtered.push(line.to_string());
                 continue;
             }
+            // Non-MCP section: stop skipping and keep section header.
             skip = false;
             filtered.push(line.to_string());
             continue;
@@ -1772,7 +1784,7 @@ fn parse_mcp_section_name(line: &str) -> Option<String> {
     }
     let rest = &inner[prefix.len()..];
     let base = rest.split('.').next()?;
-    Some(base.to_string())
+    Some(sanitize_key(base))
 }
 
 fn render_codex_mcp_entry(entry: &CodexMcpEntry) -> String {

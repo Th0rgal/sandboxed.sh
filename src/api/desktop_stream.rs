@@ -448,7 +448,7 @@ async fn run_xdotool_scroll(
     let steps_x = (delta_x.abs() / 120).max(1).min(10);
 
     if delta_y != 0 {
-        let button = if delta_y > 0 { "4" } else { "5" };
+        let button = if delta_y > 0 { "5" } else { "4" };
         run_xdotool(
             display,
             &["click", "--repeat", &steps_y.to_string(), button],
@@ -457,7 +457,7 @@ async fn run_xdotool_scroll(
     }
 
     if delta_x != 0 {
-        let button = if delta_x > 0 { "6" } else { "7" };
+        let button = if delta_x > 0 { "7" } else { "6" };
         run_xdotool(
             display,
             &["click", "--repeat", &steps_x.to_string(), button],
