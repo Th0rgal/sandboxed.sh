@@ -287,36 +287,6 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
                                 return;
                             }
                         }
-                        let display = x11_display.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = xdotool_click(&display, x, y, button, double).await {
-                                tracing::warn!(error = %err, "Click failed");
-                            }
-                        });
-                    }
-                    ClientCommand::Scroll { amount, x, y } => {
-                        let display = x11_display.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = xdotool_scroll(&display, amount, x, y).await {
-                                tracing::warn!(error = %err, "Scroll failed");
-                            }
-                        });
-                    }
-                    ClientCommand::TypeText { text, delay_ms } => {
-                        let display = x11_display.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = xdotool_type_text(&display, &text, delay_ms).await {
-                                tracing::warn!(error = %err, "Type failed");
-                            }
-                        });
-                    }
-                    ClientCommand::Key { key, delay_ms } => {
-                        let display = x11_display.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = xdotool_key(&display, &key, delay_ms).await {
-                                tracing::warn!(error = %err, "Key failed");
-                            }
-                        });
                     }
                 }
             }
