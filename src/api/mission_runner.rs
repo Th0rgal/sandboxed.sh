@@ -1964,6 +1964,8 @@ pub fn run_claudecode_turn<'a>(
             "XDG_CACHE_HOME".to_string(),
             workspace_exec.translate_path_for_container(&xdg_cache_home),
         );
+        let claude_config_dir = workspace_exec.translate_path_for_container(&work_dir.join(".claude"));
+        env.insert("CLAUDE_CONFIG_DIR".to_string(), claude_config_dir);
 
         if let Some(ref auth) = api_auth {
             match auth {
