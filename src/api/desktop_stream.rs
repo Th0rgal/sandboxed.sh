@@ -143,7 +143,6 @@ enum ClickButton {
     Name(String),
     Number(u8),
 }
-}
 
 /// Handle the WebSocket connection for desktop streaming
 async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {

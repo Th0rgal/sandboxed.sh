@@ -1470,7 +1470,10 @@ pub fn run_claudecode_turn<'a>(
         use tokio::time::{Duration, Instant};
 
         fn describe_pty_exit_status(
-            exit_status: &Result<Result<portable_pty::ExitStatus, std::io::Error>, tokio::task::JoinError>,
+            exit_status: &Result<
+                Result<portable_pty::ExitStatus, std::io::Error>,
+                tokio::task::JoinError,
+            >,
         ) -> String {
             match exit_status {
                 Ok(Ok(status)) => format!("{:?}", status),

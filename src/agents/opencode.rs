@@ -235,7 +235,9 @@ impl OpenCodeAgent {
         let resumable = ctx.mission_id.is_some();
 
         tokio::spawn(async move {
-            if let (Some(status), Some(events), Some(mid)) = (&control_status, &events_tx, mission_id) {
+            if let (Some(status), Some(events), Some(mid)) =
+                (&control_status, &events_tx, mission_id)
+            {
                 let (queue_len, mission_id_opt) = {
                     let mut guard = status.write().await;
                     if let Some(existing) = guard.mission_id {
@@ -263,7 +265,9 @@ impl OpenCodeAgent {
             let Ok(result) = rx.await else {
                 return;
             };
-            if let (Some(status), Some(events), Some(mid)) = (&control_status, &events_tx, mission_id) {
+            if let (Some(status), Some(events), Some(mid)) =
+                (&control_status, &events_tx, mission_id)
+            {
                 let (queue_len, mission_id_opt) = {
                     let mut guard = status.write().await;
                     if let Some(existing) = guard.mission_id {

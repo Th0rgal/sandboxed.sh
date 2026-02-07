@@ -129,17 +129,7 @@ fn is_safe_repo_path(path: &std::path::Path) -> bool {
     }
 
     let banned = [
-        "/",
-        "/home",
-        "/root",
-        "/etc",
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/lib",
-        "/lib64",
-        "/opt",
-        "/var",
+        "/", "/home", "/root", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/var",
         "/tmp",
     ];
     if banned.iter().any(|p| path == std::path::Path::new(p)) {
@@ -163,9 +153,9 @@ async fn is_git_repo(repo_path: &std::path::Path) -> bool {
         .await;
 
     match output {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().eq_ignore_ascii_case("true")
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .eq_ignore_ascii_case("true"),
         _ => false,
     }
 }
@@ -225,27 +215,33 @@ async fn ensure_repo_present(repo_path: &std::path::Path) -> Result<(), String> 
                 .await
                 .map_err(|e| format!("Failed to remove file at {}: {}", repo_path.display(), e))?;
         } else {
-            tokio::fs::remove_dir_all(repo_path)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "Failed to remove non-git directory at {}: {}",
-                        repo_path.display(),
-                        e
-                    )
-                })?;
+            tokio::fs::remove_dir_all(repo_path).await.map_err(|e| {
+                format!(
+                    "Failed to remove non-git directory at {}: {}",
+                    repo_path.display(),
+                    e
+                )
+            })?;
         }
     }
 
     if !repo_path.exists() {
         if let Some(parent) = repo_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| format!("Failed to create parent directory {}: {}", parent.display(), e))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                format!(
+                    "Failed to create parent directory {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
         }
 
         let output = Command::new("git")
-            .args(["clone", SANDBOXED_REPO_REMOTE, repo_path.to_string_lossy().as_ref()])
+            .args([
+                "clone",
+                SANDBOXED_REPO_REMOTE,
+                repo_path.to_string_lossy().as_ref(),
+            ])
             .output()
             .await
             .map_err(|e| format!("Failed to run git clone: {}", e))?;
@@ -1268,7 +1264,7 @@ fn stream_amp_update() -> impl Stream<Item = Result<Event, std::convert::Infalli
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_repo_path, select_repo_path, is_safe_repo_path};
+    use super::{is_safe_repo_path, normalize_repo_path, select_repo_path};
 
     #[test]
     fn select_repo_path_prefers_env() {
@@ -1293,7 +1289,10 @@ mod tests {
 
     #[test]
     fn normalize_repo_path_trims_and_drops_empty() {
-        assert_eq!(normalize_repo_path(Some("  /x  ".to_string())), Some("/x".to_string()));
+        assert_eq!(
+            normalize_repo_path(Some("  /x  ".to_string())),
+            Some("/x".to_string())
+        );
         assert_eq!(normalize_repo_path(Some("   ".to_string())), None);
         assert_eq!(normalize_repo_path(None), None);
     }
