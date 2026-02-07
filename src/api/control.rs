@@ -5038,7 +5038,7 @@ async fn run_single_control_turn(
     ctx.mission_control = mission_control;
     ctx.control_events = Some(events_tx.clone());
     ctx.frontend_tool_hub = Some(tool_hub.clone());
-    ctx.control_status = Some(status);
+    ctx.control_status = Some(status.clone());
     ctx.cancel_token = Some(cancel.clone());
     ctx.tree_snapshot = Some(tree_snapshot);
     ctx.progress_snapshot = Some(progress_snapshot);
