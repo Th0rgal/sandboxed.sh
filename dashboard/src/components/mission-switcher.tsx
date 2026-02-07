@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { Search, XCircle, Check, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { type Mission, type MissionStatus, type RunningMissionInfo } from '@/lib/api';
+import { getMissionShortName } from '@/lib/mission-display';
 import { STATUS_DOT_COLORS, STATUS_LABELS, getMissionDotColor, getMissionTitle } from '@/lib/mission-status';
 
 interface MissionSwitcherProps {
@@ -13,16 +14,35 @@ interface MissionSwitcherProps {
   runningMissions: RunningMissionInfo[];
   currentMissionId?: string | null;
   viewingMissionId?: string | null;
+  workspaceNameById?: Record<string, string>;
   onSelectMission: (missionId: string) => Promise<void> | void;
   onCancelMission: (missionId: string) => void;
   onRefresh?: () => void;
 }
 
-function getMissionDisplayName(mission: Mission): string {
+function getWorkspaceLabel(
+  mission: Mission,
+  workspaceNameById?: Record<string, string>
+): string | null {
+  if (mission.workspace_name) {
+    return mission.workspace_name;
+  }
+  if (mission.workspace_id && workspaceNameById?.[mission.workspace_id]) {
+    return workspaceNameById[mission.workspace_id];
+  }
+  return null;
+}
+
+function getMissionDisplayName(
+  mission: Mission,
+  workspaceNameById?: Record<string, string>
+): string {
   const parts: string[] = [];
-  if (mission.workspace_name) parts.push(mission.workspace_name);
-  if (mission.agent) parts.push(mission.agent);
-  parts.push(mission.id.slice(0, 8));
+  const workspaceLabel = getWorkspaceLabel(mission, workspaceNameById);
+  if (workspaceLabel) {
+    parts.push(workspaceLabel);
+  }
+  parts.push(getMissionShortName(mission.id));
   return parts.join(' · ');
 }
 
@@ -37,6 +57,7 @@ export function MissionSwitcher({
   runningMissions,
   currentMissionId,
   viewingMissionId,
+  workspaceNameById,
   onSelectMission,
   onCancelMission,
   onRefresh,
@@ -118,11 +139,11 @@ export function MissionSwitcher({
     const query = searchQuery.toLowerCase();
     return allItems.filter((item) => {
       if (!item.mission) return false;
-      const name = getMissionDisplayName(item.mission).toLowerCase();
+      const name = getMissionDisplayName(item.mission, workspaceNameById).toLowerCase();
       const desc = getMissionDescription(item.mission).toLowerCase();
       return name.includes(query) || desc.includes(query);
     });
-  }, [allItems, searchQuery]);
+  }, [allItems, searchQuery, workspaceNameById]);
 
   // Reset state on open/close
   useEffect(() => {
@@ -278,14 +299,12 @@ export function MissionSwitcher({
                 const isRunning = item.type === 'running';
                 const runningInfo = item.runningInfo;
 
-                const isStalled =
-                  isRunning &&
-                  runningInfo?.state === 'running' &&
-                  (runningInfo?.seconds_since_activity ?? 0) > 60;
-                const isSeverlyStalled =
-                  isRunning &&
-                  runningInfo?.state === 'running' &&
-                  (runningInfo?.seconds_since_activity ?? 0) > 120;
+                const stallInfo =
+                  isRunning && runningInfo?.health?.status === 'stalled'
+                    ? runningInfo.health
+                    : null;
+                const isStalled = Boolean(stallInfo);
+                const isSeverlyStalled = stallInfo?.severity === 'severe';
                 const isLoading = loadingMissionId === item.id;
 
                 return (
@@ -348,12 +367,12 @@ export function MissionSwitcher({
                         <div className="flex items-center gap-2">
                           <span className="font-medium text-sm truncate">
                             {mission
-                              ? getMissionDisplayName(mission)
-                              : item.id.slice(0, 8)}
+                              ? getMissionDisplayName(mission, workspaceNameById)
+                              : getMissionShortName(item.id)}
                           </span>
                           {isStalled && (
                             <span className="text-[10px] text-amber-400 tabular-nums shrink-0">
-                              {Math.floor(runningInfo?.seconds_since_activity ?? 0)}s
+                              {Math.floor(stallInfo?.seconds_since_activity ?? 0)}s
                             </span>
                           )}
                         </div>

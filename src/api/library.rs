@@ -298,6 +298,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
             "/harness-default/:harness/*file_name",
             get(get_harness_default_file),
         )
+        .route(
+            "/harness-default/:harness/*file_name",
+            put(save_harness_default_file),
+        )
         // Skills Registry (skills.sh)
         .route("/skill/registry/search", get(search_registry))
         .route("/skill/registry/list/:identifier", get(list_repo_skills))
@@ -1616,9 +1620,15 @@ fn filter_agents_by_config(
 pub async fn validate_agent_exists(
     state: &super::routes::AppState,
     agent_name: &str,
+    config_profile: Option<&str>,
 ) -> Result<(), String> {
-    // Fetch all agents from OpenCode
-    let all_agents = match crate::api::opencode::fetch_opencode_agents(state).await {
+    // Fetch all agents from OpenCode (profile-aware when provided)
+    let all_agents = match crate::api::opencode::fetch_opencode_agents_for_profile(
+        state,
+        config_profile,
+    )
+    .await
+    {
         Ok(agents) => agents,
         Err(e) => {
             // If we can't fetch agents, log warning but allow the request
@@ -1628,8 +1638,27 @@ pub async fn validate_agent_exists(
         }
     };
 
-    // Read config to get hidden agents list
-    let config = crate::workspace::read_sandboxed_config(&state.config.working_dir).await;
+    // Read config to get hidden agents list (profile-aware when provided)
+    let config = if let Some(profile) = config_profile {
+        let library_guard = state.library.read().await;
+        if let Some(lib) = library_guard.as_ref() {
+            match lib.get_sandboxed_config_for_profile(profile).await {
+                Ok(profile_config) => profile_config,
+                Err(e) => {
+                    tracing::warn!(
+                        profile = %profile,
+                        "Failed to read sandboxed config for profile: {}",
+                        e
+                    );
+                    crate::workspace::read_sandboxed_config(&state.config.working_dir).await
+                }
+            }
+        } else {
+            crate::workspace::read_sandboxed_config(&state.config.working_dir).await
+        }
+    } else {
+        crate::workspace::read_sandboxed_config(&state.config.working_dir).await
+    };
     let visible_agents = filter_visible_agents_with_fallback(all_agents.clone(), &config);
 
     // Extract agent names from the visible agents list.
@@ -1654,6 +1683,14 @@ pub async fn validate_agent_exists(
         .iter()
         .any(|name| name.eq_ignore_ascii_case(agent_name))
     {
+        return Ok(());
+    }
+
+    if agent_names.is_empty() && raw_agent_names.is_empty() {
+        tracing::warn!(
+            "No OpenCode agents available to validate '{}'; skipping validation",
+            agent_name
+        );
         return Ok(());
     }
 
@@ -2210,6 +2247,27 @@ async fn get_harness_default_file(
             if e.to_string().contains("not found") {
                 (StatusCode::NOT_FOUND, e.to_string())
             } else if e.to_string().contains("Invalid harness") {
+                (StatusCode::BAD_REQUEST, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
+}
+
+/// PUT /api/library/harness-default/:harness/*file_name - Save a harness default file.
+async fn save_harness_default_file(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path((harness, file_name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_harness_default_file(&harness, &file_name, &body)
+        .await
+        .map(|_| (StatusCode::OK, "Harness default file saved".to_string()))
+        .map_err(|e| {
+            if e.to_string().contains("Invalid harness") {
                 (StatusCode::BAD_REQUEST, e.to_string())
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())

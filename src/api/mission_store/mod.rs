@@ -17,6 +17,7 @@ use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo, Mission
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -94,22 +95,136 @@ pub struct StoredEvent {
     pub metadata: serde_json::Value,
 }
 
-/// An automation that triggers commands at intervals.
+// ─────────────────────────────────────────────────────────────────────────────
+// Automation Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Source of the command to execute in an automation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommandSource {
+    /// Command from the library (by name)
+    Library { name: String },
+    /// Command from a local file (relative to mission workspace)
+    LocalFile { path: String },
+    /// Inline command content
+    Inline { content: String },
+}
+
+/// Webhook configuration for webhook-triggered automations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebhookConfig {
+    /// Unique webhook ID (part of the webhook URL path)
+    pub webhook_id: String,
+    /// Optional secret token for HMAC validation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// Variable mappings from webhook payload to command variables
+    /// Example: {"repo": "webhook.repository.name", "commit": "webhook.head_commit.id"}
+    #[serde(default)]
+    pub variable_mappings: HashMap<String, String>,
+}
+
+/// Trigger type for an automation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TriggerType {
+    /// Fixed interval in seconds
+    Interval { seconds: u64 },
+    /// Webhook trigger
+    Webhook { config: WebhookConfig },
+}
+
+/// Retry configuration for automation execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts
+    pub max_retries: u32,
+    /// Initial delay in seconds between retries
+    pub retry_delay_seconds: u64,
+    /// Backoff multiplier for exponential backoff (1.0 = no backoff)
+    #[serde(default = "default_backoff_multiplier")]
+    pub backoff_multiplier: f64,
+}
+
+fn default_backoff_multiplier() -> f64 {
+    2.0
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            retry_delay_seconds: 60,
+            backoff_multiplier: 2.0,
+        }
+    }
+}
+
+/// An automation that triggers commands based on various triggers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Automation {
     pub id: Uuid,
     pub mission_id: Uuid,
-    /// Command name from library to execute
-    pub command_name: String,
-    /// Interval in seconds between executions
-    pub interval_seconds: u64,
+    /// Source of the command to execute
+    pub command_source: CommandSource,
+    /// Trigger configuration
+    pub trigger: TriggerType,
+    /// Variable substitutions to apply to the command
+    /// Example: {"timestamp": "<timestamp/>", "mission_name": "<mission_name/>"}
+    #[serde(default)]
+    pub variables: HashMap<String, String>,
     /// Whether this automation is currently active
     pub active: bool,
     /// When this automation was created
     pub created_at: String,
-    /// When this automation was last triggered
+    /// When this automation was last triggered (for interval-based automations)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_triggered_at: Option<String>,
+    /// Retry configuration
+    #[serde(default)]
+    pub retry_config: RetryConfig,
+}
+
+/// Execution status for automation runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStatus {
+    Pending,
+    Running,
+    Success,
+    Failed,
+    Cancelled,
+    Skipped,
+}
+
+/// A record of a single automation execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationExecution {
+    pub id: Uuid,
+    pub automation_id: Uuid,
+    pub mission_id: Uuid,
+    /// When this execution was triggered
+    pub triggered_at: String,
+    /// What triggered this execution
+    pub trigger_source: String, // "interval", "webhook", "manual"
+    /// Current execution status
+    pub status: ExecutionStatus,
+    /// Webhook payload (if triggered by webhook)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_payload: Option<serde_json::Value>,
+    /// Variables that were substituted in the command
+    #[serde(default)]
+    pub variables_used: HashMap<String, String>,
+    /// When execution completed (success or failure)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    /// Error message if execution failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Number of retry attempts made
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 /// Get current timestamp as RFC3339 string.
@@ -247,13 +362,8 @@ pub trait MissionStore: Send + Sync {
     // === Automation methods (default no-op for backward compatibility) ===
 
     /// Create an automation for a mission.
-    async fn create_automation(
-        &self,
-        mission_id: Uuid,
-        command_name: &str,
-        interval_seconds: u64,
-    ) -> Result<Automation, String> {
-        let _ = (mission_id, command_name, interval_seconds);
+    async fn create_automation(&self, automation: Automation) -> Result<Automation, String> {
+        let _ = automation;
         Err("Automations not supported by this store".to_string())
     }
 
@@ -263,10 +373,21 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// List all active automations across missions.
+    async fn list_active_automations(&self) -> Result<Vec<Automation>, String> {
+        Ok(vec![])
+    }
+
     /// Get an automation by ID.
     async fn get_automation(&self, id: Uuid) -> Result<Option<Automation>, String> {
         let _ = id;
         Ok(None)
+    }
+
+    /// Update an automation.
+    async fn update_automation(&self, automation: Automation) -> Result<(), String> {
+        let _ = automation;
+        Err("Automations not supported by this store".to_string())
     }
 
     /// Update automation active status.
@@ -285,6 +406,55 @@ pub trait MissionStore: Send + Sync {
     async fn delete_automation(&self, id: Uuid) -> Result<bool, String> {
         let _ = id;
         Ok(false)
+    }
+
+    /// Get automation by webhook ID.
+    async fn get_automation_by_webhook_id(
+        &self,
+        webhook_id: &str,
+    ) -> Result<Option<Automation>, String> {
+        let _ = webhook_id;
+        Ok(None)
+    }
+
+    // === Automation Execution methods ===
+
+    /// Create an automation execution record.
+    async fn create_automation_execution(
+        &self,
+        execution: AutomationExecution,
+    ) -> Result<AutomationExecution, String> {
+        let _ = execution;
+        Err("Automation executions not supported by this store".to_string())
+    }
+
+    /// Update an automation execution record.
+    async fn update_automation_execution(
+        &self,
+        execution: AutomationExecution,
+    ) -> Result<(), String> {
+        let _ = execution;
+        Err("Automation executions not supported by this store".to_string())
+    }
+
+    /// Get execution history for an automation.
+    async fn get_automation_executions(
+        &self,
+        automation_id: Uuid,
+        limit: Option<usize>,
+    ) -> Result<Vec<AutomationExecution>, String> {
+        let _ = (automation_id, limit);
+        Ok(vec![])
+    }
+
+    /// Get execution history for a mission.
+    async fn get_mission_automation_executions(
+        &self,
+        mission_id: Uuid,
+        limit: Option<usize>,
+    ) -> Result<Vec<AutomationExecution>, String> {
+        let _ = (mission_id, limit);
+        Ok(vec![])
     }
 }
 

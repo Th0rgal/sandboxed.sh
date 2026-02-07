@@ -52,10 +52,10 @@ without recreating the base filesystem.
 
 Each mission targets a specific workspace. When a mission starts, Sandboxed.sh:
 
-1. Creates a per-mission working directory inside the workspace
-   (`/workspaces/mission-<id>`).
-2. Syncs skills, tools, and MCP server configs from the Library into that
-   directory.
+1. Uses the workspace root as the working directory (missions share a workspace
+   directory).
+2. Syncs skills, tools, and MCP server configs from the Library into the
+   workspace.
 3. Launches the chosen AI harness (Claude Code, OpenCode, or Amp) inside the
    workspace.
 

@@ -55,6 +55,7 @@ jsonwebtoken = "9"
 aes-gcm = "0.10"
 pbkdf2 = "0.12"
 sha2 = "0.10"
+hmac = "0.12"
 rand = "0.8"
 hex = "0.4"
 
@@ -84,6 +85,10 @@ path = "src/bin/desktop_mcp.rs"
 [[bin]]
 name = "workspace-mcp"
 path = "src/bin/workspace_mcp.rs"
+
+[[bin]]
+name = "automation-manager-mcp"
+path = "src/bin/automation_manager_mcp.rs"
 
 [dev-dependencies]
 tokio-test = "0.4"

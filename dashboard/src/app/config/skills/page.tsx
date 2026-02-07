@@ -44,6 +44,7 @@ import { useLibrary } from '@/contexts/library-context';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
 import { RenameDialog } from '@/components/rename-dialog';
 import { useToast } from '@/components/toast';
+import { validateFrontmatterBlock } from '@/lib/frontmatter-validation';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -866,6 +867,11 @@ export default function SkillsPage() {
     try {
       if (selectedFile === 'SKILL.md') {
         const content = buildContent(frontmatter, bodyContent);
+        const validationError = validateFrontmatterBlock(content);
+        if (validationError) {
+          showError(validationError);
+          return;
+        }
         await saveSkill(selectedSkill.name, content);
         // Reload skill to get updated references
         const updated = await getLibrarySkill(selectedSkill.name);

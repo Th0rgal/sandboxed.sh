@@ -17,6 +17,7 @@ pub struct CodexBackend {
     id: String,
     name: String,
     config: Arc<RwLock<CodexConfig>>,
+    workspace_exec: Option<crate::workspace_exec::WorkspaceExec>,
 }
 
 impl CodexBackend {
@@ -25,6 +26,7 @@ impl CodexBackend {
             id: "codex".to_string(),
             name: "Codex".to_string(),
             config: Arc::new(RwLock::new(CodexConfig::default())),
+            workspace_exec: None,
         }
     }
 
@@ -33,6 +35,19 @@ impl CodexBackend {
             id: "codex".to_string(),
             name: "Codex".to_string(),
             config: Arc::new(RwLock::new(config)),
+            workspace_exec: None,
+        }
+    }
+
+    pub fn with_config_and_workspace(
+        config: CodexConfig,
+        workspace_exec: crate::workspace_exec::WorkspaceExec,
+    ) -> Self {
+        Self {
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
+            config: Arc::new(RwLock::new(config)),
+            workspace_exec: Some(workspace_exec),
         }
     }
 
@@ -90,6 +105,7 @@ impl Backend for CodexBackend {
     ) -> Result<(mpsc::Receiver<ExecutionEvent>, JoinHandle<()>), Error> {
         let config = self.config.read().await.clone();
         let client = CodexClient::with_config(config);
+        let workspace_exec = self.workspace_exec.as_ref();
 
         let (mut codex_rx, codex_handle) = client
             .execute_message(
@@ -98,6 +114,7 @@ impl Backend for CodexBackend {
                 session.model.as_deref(),
                 Some(&session.id),
                 session.agent.as_deref(),
+                workspace_exec,
             )
             .await?;
 
@@ -142,6 +159,48 @@ fn convert_codex_event(
     event: CodexEvent,
     item_content_cache: &mut std::collections::HashMap<String, String>,
 ) -> Vec<ExecutionEvent> {
+    fn emit_text_delta(
+        results: &mut Vec<ExecutionEvent>,
+        item_content_cache: &mut std::collections::HashMap<String, String>,
+        item_id: &str,
+        text: &str,
+    ) {
+        let last_content = item_content_cache.get(item_id);
+        let new_content = if let Some(last) = last_content {
+            if text.starts_with(last) {
+                text[last.len()..].to_string()
+            } else {
+                text.to_string()
+            }
+        } else {
+            text.to_string()
+        };
+
+        if !new_content.is_empty() {
+            results.push(ExecutionEvent::TextDelta {
+                content: new_content,
+            });
+        }
+
+        item_content_cache.insert(item_id.to_string(), text.to_string());
+    }
+
+    fn emit_thinking_if_changed(
+        results: &mut Vec<ExecutionEvent>,
+        item_content_cache: &mut std::collections::HashMap<String, String>,
+        item_id: &str,
+        text: &str,
+    ) {
+        if item_content_cache.get(item_id).map(|v| v.as_str()) == Some(text) {
+            return;
+        }
+
+        results.push(ExecutionEvent::Thinking {
+            content: text.to_string(),
+        });
+        item_content_cache.insert(item_id.to_string(), text.to_string());
+    }
+
     let mut results = vec![];
 
     match event {
@@ -155,6 +214,11 @@ fn convert_codex_event(
 
         CodexEvent::TurnCompleted { summary } => {
             if let Some(summary_text) = summary {
+                if !summary_text.trim().is_empty() {
+                    results.push(ExecutionEvent::TurnSummary {
+                        content: summary_text.clone(),
+                    });
+                }
                 debug!("Codex turn completed: {}", summary_text);
             } else {
                 debug!("Codex turn completed");
@@ -170,48 +234,16 @@ fn convert_codex_event(
         CodexEvent::ItemCreated { item } | CodexEvent::ItemUpdated { item } => {
             // Handle different item types
             match item.item_type.as_str() {
-                "message" => {
+                "message" | "agent_message" | "assistant_message" => {
                     // Extract message content
-                    if let Some(content) = item.data.get("content") {
-                        if let Some(text) = content.as_str() {
-                            if !text.is_empty() {
-                                // Check if this is new content or an update
-                                let last_content = item_content_cache.get(&item.id);
-                                let new_content = if let Some(last) = last_content {
-                                    // ItemUpdated: only emit the delta (new text)
-                                    if text.starts_with(last) {
-                                        text[last.len()..].to_string()
-                                    } else {
-                                        // Content was replaced, emit full text
-                                        text.to_string()
-                                    }
-                                } else {
-                                    // ItemCreated: emit full text
-                                    text.to_string()
-                                };
-
-                                if !new_content.is_empty() {
-                                    results.push(ExecutionEvent::TextDelta {
-                                        content: new_content,
-                                    });
-                                }
-
-                                // Update cache with current full content
-                                item_content_cache.insert(item.id.clone(), text.to_string());
-                            }
-                        }
+                    if let Some(text) = extract_text_field(&item.data) {
+                        emit_text_delta(&mut results, item_content_cache, &item.id, &text);
                     }
                 }
                 "reasoning" | "thinking" => {
                     // Extract thinking/reasoning content
-                    if let Some(content) = item.data.get("content") {
-                        if let Some(text) = content.as_str() {
-                            if !text.is_empty() {
-                                results.push(ExecutionEvent::Thinking {
-                                    content: text.to_string(),
-                                });
-                            }
-                        }
+                    if let Some(text) = extract_text_field(&item.data) {
+                        emit_thinking_if_changed(&mut results, item_content_cache, &item.id, &text);
                     }
                 }
                 "command" | "tool" => {
@@ -233,17 +265,30 @@ fn convert_codex_event(
         }
 
         CodexEvent::ItemCompleted { item } => {
-            // Extract tool result if available
-            if item.item_type == "command" || item.item_type == "tool" {
-                if let Some(result) = item.data.get("result") {
-                    if let Some(name) = item.data.get("name").and_then(|v| v.as_str()) {
-                        results.push(ExecutionEvent::ToolResult {
-                            id: item.id.clone(),
-                            name: name.to_string(),
-                            result: result.clone(),
-                        });
+            match item.item_type.as_str() {
+                "command" | "tool" => {
+                    // Extract tool result if available
+                    if let Some(result) = item.data.get("result") {
+                        if let Some(name) = item.data.get("name").and_then(|v| v.as_str()) {
+                            results.push(ExecutionEvent::ToolResult {
+                                id: item.id.clone(),
+                                name: name.to_string(),
+                                result: result.clone(),
+                            });
+                        }
                     }
                 }
+                "message" | "agent_message" | "assistant_message" => {
+                    if let Some(text) = extract_text_field(&item.data) {
+                        emit_text_delta(&mut results, item_content_cache, &item.id, &text);
+                    }
+                }
+                "reasoning" | "thinking" => {
+                    if let Some(text) = extract_text_field(&item.data) {
+                        emit_thinking_if_changed(&mut results, item_content_cache, &item.id, &text);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -257,6 +302,45 @@ fn convert_codex_event(
     }
 
     results
+}
+
+fn extract_text_field(
+    data: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    fn extract_str(value: Option<&serde_json::Value>) -> Option<String> {
+        value
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn extract_from_content(value: &serde_json::Value) -> Option<String> {
+        let mut out = String::new();
+        let items = value.as_array()?;
+        for item in items {
+            if let Some(text) = extract_str(item.get("text")) {
+                out.push_str(&text);
+                continue;
+            }
+            if let Some(text) = extract_str(item.get("content")) {
+                out.push_str(&text);
+                continue;
+            }
+            if let Some(text) = extract_str(item.get("output_text")) {
+                out.push_str(&text);
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    extract_str(data.get("text"))
+        .or_else(|| extract_str(data.get("content")))
+        .or_else(|| extract_str(data.get("output_text")))
+        .or_else(|| data.get("content").and_then(extract_from_content))
 }
 
 /// Create a registry entry for the Codex backend.

@@ -116,6 +116,7 @@ impl OpenCodeAgent {
                 resumable: ctx.mission_id.is_some(), // Can resume if within a mission
             },
             OpenCodeEvent::MessageComplete { .. } => return, // Don't forward completion marker
+            OpenCodeEvent::TurnSummary { .. } => return,     // Summary is handled elsewhere
         };
 
         match events_tx.send(agent_event) {

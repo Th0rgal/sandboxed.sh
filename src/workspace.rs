@@ -1,7 +1,7 @@
 //! Workspace management for OpenCode sessions.
 //!
-//! Open Agent acts as a workspace host for OpenCode. This module creates
-//! per-task/mission workspace directories and writes `opencode.json`
+//! Open Agent acts as a workspace host for OpenCode. This module prepares
+//! per-workspace directories (shared across missions) and writes `opencode.json`
 //! with the currently configured MCP servers.
 //!
 //! ## Workspace Types
@@ -586,7 +586,7 @@ fn opencode_entry_from_mcp(
     workspace_env: &HashMap<String, String>,
     shared_network: Option<bool>,
 ) -> serde_json::Value {
-    fn resolve_command_path(cmd: &str) -> String {
+    fn resolve_host_command_path(cmd: &str) -> String {
         let cmd_path = Path::new(cmd);
         if cmd_path.is_absolute() || cmd.contains('/') {
             return cmd.to_string();
@@ -603,6 +603,62 @@ fn opencode_entry_from_mcp(
             }
         }
 
+        cmd.to_string()
+    }
+
+    fn resolve_container_command_path(
+        cmd: &str,
+        container_root_host: &Path,
+        container_fallback: bool,
+        per_workspace_runner: bool,
+    ) -> String {
+        // Only needed when the harness spawns MCP servers inside the container.
+        // In container fallback mode, commands run on the host, so host paths are correct.
+        if container_fallback || !per_workspace_runner {
+            return resolve_host_command_path(cmd);
+        }
+
+        let cmd_path = Path::new(cmd);
+        let cmd_has_path = cmd_path.is_absolute() || cmd.contains('/');
+
+        // If the MCP config hardcodes an absolute path (e.g. /usr/bin/bunx), validate it
+        // exists in the container rootfs. If it doesn't, try common fallbacks.
+        if cmd_has_path && cmd_path.is_absolute() {
+            let host_candidate = container_root_host.join(cmd.trim_start_matches('/'));
+            if host_candidate.exists() {
+                return cmd.to_string();
+            }
+
+            // Common mismatch: host resolves to /usr/bin, container uses /usr/local/bin.
+            if let Some(base) = cmd_path.file_name().and_then(|n| n.to_str()) {
+                let host_usr_local = container_root_host.join("usr/local/bin").join(base);
+                if host_usr_local.exists() {
+                    return format!("/usr/local/bin/{}", base);
+                }
+
+                let host_usr_bin = container_root_host.join("usr/bin").join(base);
+                if host_usr_bin.exists() {
+                    return format!("/usr/bin/{}", base);
+                }
+            }
+
+            return cmd.to_string();
+        }
+
+        // Bare command: prefer /usr/local/bin then /usr/bin inside the container.
+        if !cmd_has_path {
+            let host_usr_local = container_root_host.join("usr/local/bin").join(cmd);
+            if host_usr_local.exists() {
+                return format!("/usr/local/bin/{}", cmd);
+            }
+
+            let host_usr_bin = container_root_host.join("usr/bin").join(cmd);
+            if host_usr_bin.exists() {
+                return format!("/usr/bin/{}", cmd);
+            }
+        }
+
+        // Relative paths (e.g. ./scripts/foo) should remain as-is.
         cmd.to_string()
     }
 
@@ -703,7 +759,7 @@ fn opencode_entry_from_mcp(
                 nspawn_env.insert("WORKING_DIR".to_string(), rel_str.clone());
 
                 let mut cmd = vec![
-                    resolve_command_path("systemd-nspawn"),
+                    resolve_host_command_path("systemd-nspawn"),
                     "-D".to_string(),
                     workspace_root.to_string_lossy().to_string(),
                     "--quiet".to_string(),
@@ -791,7 +847,16 @@ fn opencode_entry_from_mcp(
                     merged_env.insert("WORKING_DIR".to_string(), rel_str);
                 }
 
-                let mut cmd = vec![resolve_command_path(command)];
+                let resolved_command = match workspace_type {
+                    WorkspaceType::Container => resolve_container_command_path(
+                        command,
+                        workspace_root,
+                        container_fallback,
+                        per_workspace_runner,
+                    ),
+                    WorkspaceType::Host => resolve_host_command_path(command),
+                };
+                let mut cmd = vec![resolved_command];
                 cmd.extend(args.clone());
                 entry.insert("command".to_string(), json!(cmd));
                 if !merged_env.is_empty() {
@@ -1425,7 +1490,7 @@ async fn write_codex_config(
     _workspace_root: &Path,
     _workspace_type: WorkspaceType,
     _workspace_env: &HashMap<String, String>,
-    _skill_contents: Option<&[SkillContent]>,
+    skill_contents: Option<&[SkillContent]>,
     _shared_network: Option<bool>,
 ) -> anyhow::Result<()> {
     // Codex doesn't require workspace-specific config files
@@ -1437,6 +1502,11 @@ async fn write_codex_config(
     tokio::fs::create_dir_all(&codex_dir).await?;
 
     tracing::debug!("Created Codex config directory at {}", codex_dir.display());
+
+    // Write skills to .codex/skills/ using Codex's native skills format
+    if let Some(skills) = skill_contents {
+        write_codex_skills_to_workspace(workspace_dir, skills).await?;
+    }
 
     Ok(())
 }
@@ -1877,6 +1947,82 @@ pub async fn write_claudecode_skills_to_workspace(
     Ok(())
 }
 
+/// Write skill files to the workspace's `.codex/skills/` directory.
+/// This makes skills available to Codex using its native skills format.
+/// Codex looks for skills in `.codex/skills/<name>/SKILL.md`.
+pub async fn write_codex_skills_to_workspace(
+    workspace_dir: &Path,
+    skills: &[SkillContent],
+) -> anyhow::Result<()> {
+    let skills_dir = workspace_dir.join(".codex").join("skills");
+
+    tracing::debug!(
+        workspace = %workspace_dir.display(),
+        skills_dir = %skills_dir.display(),
+        skill_count = skills.len(),
+        skill_names = ?skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        "Writing Codex skills to workspace"
+    );
+
+    // Clean up old skills directory to remove stale skills
+    if skills_dir.exists() {
+        let _ = tokio::fs::remove_dir_all(&skills_dir).await;
+    }
+
+    if skills.is_empty() {
+        tracing::warn!(
+            workspace = %workspace_dir.display(),
+            "No skills to write for Codex"
+        );
+        return Ok(());
+    }
+
+    tokio::fs::create_dir_all(&skills_dir).await?;
+
+    for skill in skills {
+        let skill_dir = skills_dir.join(&skill.name);
+        tokio::fs::create_dir_all(&skill_dir).await?;
+
+        // Ensure skill content has required frontmatter fields for Codex
+        let content_with_frontmatter = ensure_claudecode_skill_frontmatter(
+            &skill.content,
+            &skill.name,
+            skill.description.as_deref(),
+        );
+
+        // Strip <encrypted> tags - deployed skills should have bare plaintext values
+        let content_for_workspace = strip_encrypted_tags(&content_with_frontmatter);
+
+        // Write SKILL.md
+        let skill_md_path = skill_dir.join("SKILL.md");
+        tokio::fs::write(&skill_md_path, &content_for_workspace).await?;
+
+        // Write additional files (preserving subdirectory structure)
+        for (relative_path, file_content) in &skill.files {
+            let file_path = skill_dir.join(relative_path);
+            if let Some(parent) = file_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let file_content_stripped = strip_encrypted_tags(file_content);
+            tokio::fs::write(&file_path, file_content_stripped).await?;
+        }
+
+        tracing::debug!(
+            skill = %skill.name,
+            workspace = %workspace_dir.display(),
+            "Wrote Codex skill to workspace"
+        );
+    }
+
+    tracing::info!(
+        count = skills.len(),
+        workspace = %workspace_dir.display(),
+        "Wrote Codex skills to workspace"
+    );
+
+    Ok(())
+}
+
 /// Write command files to the workspace's `.claude/commands/` directory.
 /// Claude Code custom slash commands are simple markdown files at `.claude/commands/<name>.md`.
 pub async fn write_claudecode_commands_to_workspace(
@@ -2118,7 +2264,11 @@ fn ensure_claudecode_skill_frontmatter(
             }
         }
 
-        return format!("---\n{}{}", new_frontmatter.trim_end(), rest);
+        return format!(
+            "---\n{}\n{}",
+            new_frontmatter.trim_end(),
+            rest.trim_start_matches('\n')
+        );
     }
 
     // Malformed frontmatter, return as-is
@@ -2436,7 +2586,7 @@ pub async fn prepare_custom_workspace(
     Ok(workspace_dir)
 }
 
-/// Prepare a workspace directory for a mission and write `opencode.json`.
+/// Prepare the workspace directory for a mission and write `opencode.json`.
 pub async fn prepare_mission_workspace(
     config: &Config,
     mcp: &McpRegistry,
@@ -2447,11 +2597,14 @@ pub async fn prepare_mission_workspace(
 }
 
 /// Prepare a workspace directory for a mission under a specific workspace root.
+/// Missions share the workspace root directory (no per-mission isolation).
 pub async fn prepare_mission_workspace_in(
     workspace: &Workspace,
     mcp: &McpRegistry,
     mission_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
+    // Use a mission-specific directory under the workspace root so multiple missions
+    // can run concurrently without clobbering per-workspace config files.
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
     let mcp_configs = filter_mcp_configs_for_workspace(mcp.list_configs().await, &workspace.mcps);
@@ -2533,6 +2686,8 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     custom_providers: Option<&[AIProvider]>,
     config_profile: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
+    // Mission workspace directory lives under the selected workspace root.
+    // This keeps filesystem and config effects scoped to the mission.
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
 
@@ -2576,8 +2731,8 @@ pub async fn prepare_mission_workspace_with_skills_backend(
             command_contents = Some(commands);
         }
 
-        // Collect skills (only for claudecode and amp, which use skill contents directly)
-        if backend_id == "claudecode" || backend_id == "amp" {
+        // Collect skills (for backends that use skill contents directly)
+        if backend_id == "claudecode" || backend_id == "amp" || backend_id == "codex" {
             let skill_names = match resolve_workspace_skill_names(workspace, lib).await {
                 Ok(names) => {
                     tracing::debug!(
@@ -2832,38 +2987,48 @@ pub async fn write_runtime_workspace_state(
     }
     let context_link = working_dir.join(context_dir_name);
     if let Some(target) = mission_context.as_ref() {
-        if !context_link.exists() {
-            #[cfg(unix)]
-            {
-                // For container workspaces, the symlink must point to the container path
-                // since /root/context is bind-mounted, not the host path
-                let symlink_target = if workspace.workspace_type == WorkspaceType::Container {
-                    PathBuf::from("/root")
-                        .join(context_dir_name)
-                        .join(mission_id.unwrap().to_string())
-                } else {
-                    target.clone()
-                };
-                if let Err(e) = std::os::unix::fs::symlink(&symlink_target, &context_link) {
+        if context_link.exists() {
+            if tokio::fs::remove_file(&context_link).await.is_err() {
+                if let Err(e) = tokio::fs::remove_dir_all(&context_link).await {
                     tracing::warn!(
                         workspace = %workspace.name,
                         mission = ?mission_id,
                         error = %e,
-                        "Failed to create context symlink; falling back to directory"
+                        "Failed to clear existing context link"
                     );
-                    let _ = tokio::fs::create_dir_all(&context_link).await;
                 }
             }
-            #[cfg(not(unix))]
-            {
+        }
+        #[cfg(unix)]
+        {
+            // For container workspaces, the symlink must point to the container path
+            // since /root/context is bind-mounted, not the host path
+            let symlink_target = if workspace.workspace_type == WorkspaceType::Container {
+                PathBuf::from("/root")
+                    .join(context_dir_name)
+                    .join(mission_id.unwrap().to_string())
+            } else {
+                target.clone()
+            };
+            if let Err(e) = std::os::unix::fs::symlink(&symlink_target, &context_link) {
+                tracing::warn!(
+                    workspace = %workspace.name,
+                    mission = ?mission_id,
+                    error = %e,
+                    "Failed to create context symlink; falling back to directory"
+                );
                 let _ = tokio::fs::create_dir_all(&context_link).await;
             }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::fs::create_dir_all(&context_link).await;
         }
     }
 
     // For container workspaces, translate paths to container-relative paths.
     // Inside the container:
-    // - working_dir becomes relative to container root (e.g., /workspaces/mission-xxx)
+    // - working_dir becomes relative to container root (e.g., /workspaces/<workspace>)
     // - context is bind-mounted at /root/context
     let (effective_working_dir, effective_context_root, effective_mission_context): (
         PathBuf,

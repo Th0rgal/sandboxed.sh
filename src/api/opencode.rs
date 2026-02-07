@@ -51,6 +51,83 @@ fn resolve_oh_my_opencode_path() -> std::path::PathBuf {
         .join("oh-my-opencode.json")
 }
 
+/// Resolve the path to opencode.json configuration file.
+fn resolve_opencode_config_path() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("OPENCODE_CONFIG") {
+        if !path.trim().is_empty() {
+            return std::path::PathBuf::from(path);
+        }
+    }
+    if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
+        if !dir.trim().is_empty() {
+            return std::path::PathBuf::from(dir).join("opencode.json");
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    std::path::PathBuf::from(home)
+        .join(".config")
+        .join("opencode")
+        .join("opencode.json")
+}
+
+fn strip_jsonc_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            continue;
+        }
+
+        if c == '/' {
+            match chars.peek() {
+                Some('/') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut prev = '\0';
+                    while let Some(n) = chars.next() {
+                        if prev == '*' && n == '/' {
+                            break;
+                        }
+                        prev = n;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        out.push(c);
+    }
+
+    out
+}
+
 /// GET /api/opencode/settings - Read oh-my-opencode settings.
 pub async fn get_opencode_settings() -> Result<Json<Value>, (StatusCode, String)> {
     let config_path = resolve_oh_my_opencode_path();
@@ -73,6 +150,47 @@ pub async fn get_opencode_settings() -> Result<Json<Value>, (StatusCode, String)
             format!("Invalid JSON in oh-my-opencode.json: {}", e),
         )
     })?;
+
+    Ok(Json(config))
+}
+
+/// GET /api/opencode/config - Read opencode.json settings.
+pub async fn get_opencode_config() -> Result<Json<Value>, (StatusCode, String)> {
+    let config_path = resolve_opencode_config_path();
+
+    let mut read_path = config_path.clone();
+    if !read_path.exists() {
+        // Try opencode.jsonc in the same directory
+        let jsonc_path = if let Some(parent) = config_path.parent() {
+            parent.join("opencode.jsonc")
+        } else {
+            config_path.with_extension("jsonc")
+        };
+        if jsonc_path.exists() {
+            read_path = jsonc_path;
+        } else {
+            return Ok(Json(serde_json::json!({})));
+        }
+    }
+
+    let contents = tokio::fs::read_to_string(&read_path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read opencode config: {}", e),
+        )
+    })?;
+
+    let config: Value = serde_json::from_str(&contents)
+        .or_else(|_| {
+            let stripped = strip_jsonc_comments(&contents);
+            serde_json::from_str(&stripped)
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid JSON in opencode config: {}", e),
+            )
+        })?;
 
     Ok(Json(config))
 }
@@ -107,6 +225,38 @@ pub async fn update_opencode_settings(
         })?;
 
     tracing::info!(path = %config_path.display(), "Updated oh-my-opencode settings");
+
+    Ok(Json(config))
+}
+
+/// PUT /api/opencode/config - Write opencode.json settings.
+pub async fn update_opencode_config(
+    Json(config): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let config_path = resolve_opencode_config_path();
+
+    if let Some(parent) = config_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create config directory: {}", e),
+            )
+        })?;
+    }
+
+    let contents = serde_json::to_string_pretty(&config)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)))?;
+
+    tokio::fs::write(&config_path, contents)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to write opencode.json: {}", e),
+            )
+        })?;
+
+    tracing::info!(path = %config_path.display(), "Updated opencode config");
 
     Ok(Json(config))
 }
@@ -219,36 +369,74 @@ pub struct TestConnectionResponse {
 // Public Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn extract_agents_from_settings(settings: &Value) -> Option<Value> {
+    let agents = settings.get("agents")?;
+    if let Some(obj) = agents.as_object() {
+        if obj.is_empty() {
+            return None;
+        }
+        let agent_names: Vec<Value> = obj.keys().cloned().map(Value::String).collect();
+        return Some(Value::Array(agent_names));
+    }
+    if let Some(arr) = agents.as_array() {
+        if arr.is_empty() {
+            return None;
+        }
+        return Some(Value::Array(arr.clone()));
+    }
+    None
+}
+
 /// Fetch agents from Library configuration (no central server needed).
 /// Reads agents from Library's oh-my-opencode.json, falling back to defaults.
 pub async fn fetch_opencode_agents(state: &super::routes::AppState) -> Result<Value, String> {
-    // Try to read agents from Library's oh-my-opencode.json
+    fetch_opencode_agents_for_profile(state, None).await
+}
+
+/// Fetch agents from Library configuration for a specific config profile.
+/// Falls back to the default profile if the profile has no agent list.
+pub async fn fetch_opencode_agents_for_profile(
+    state: &super::routes::AppState,
+    profile: Option<&str>,
+) -> Result<Value, String> {
     let library_guard = state.library.read().await;
-    if let Some(lib) = library_guard.as_ref() {
-        match lib.get_opencode_settings().await {
+    let Some(lib) = library_guard.as_ref() else {
+        tracing::debug!("Library not configured, no agents available");
+        return Ok(Value::Array(vec![]));
+    };
+
+    if let Some(profile_name) = profile {
+        match lib.get_opencode_settings_for_profile(profile_name).await {
             Ok(settings) => {
-                // Extract agents from the settings
-                if let Some(agents) = settings.get("agents") {
-                    if agents.is_object() && !agents.as_object().unwrap().is_empty() {
-                        // Return agent names as array
-                        let agent_names: Vec<Value> = agents
-                            .as_object()
-                            .unwrap()
-                            .keys()
-                            .map(|k| Value::String(k.clone()))
-                            .collect();
-                        tracing::debug!("Loaded {} agents from Library", agent_names.len());
-                        return Ok(Value::Array(agent_names));
-                    }
+                if let Some(agents) = extract_agents_from_settings(&settings) {
+                    tracing::debug!(
+                        profile = %profile_name,
+                        "Loaded agents from Library profile"
+                    );
+                    return Ok(agents);
                 }
-                tracing::debug!("No agents in Library oh-my-opencode.json");
             }
             Err(e) => {
-                tracing::warn!("Failed to read Library opencode settings: {}", e);
+                tracing::warn!(
+                    profile = %profile_name,
+                    "Failed to read Library opencode settings: {}",
+                    e
+                );
             }
         }
-    } else {
-        tracing::debug!("Library not configured, no agents available");
+    }
+
+    match lib.get_opencode_settings().await {
+        Ok(settings) => {
+            if let Some(agents) = extract_agents_from_settings(&settings) {
+                tracing::debug!("Loaded agents from Library default profile");
+                return Ok(agents);
+            }
+            tracing::debug!("No agents in Library oh-my-opencode.json");
+        }
+        Err(e) => {
+            tracing::warn!("Failed to read Library opencode settings: {}", e);
+        }
     }
 
     // No hardcoded fallback — Library is the source of truth

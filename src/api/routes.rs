@@ -40,8 +40,10 @@ fn cli_available(name: &str) -> bool {
 }
 
 use super::ai_providers as ai_providers_api;
+use super::ampcode as ampcode_api;
 use super::auth::{self, AuthUser};
 use super::backends as backends_api;
+use super::claudecode as claudecode_api;
 use super::console;
 use super::control;
 use super::desktop;
@@ -364,6 +366,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let public_routes = Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/login", post(auth::login))
+        // Webhook receiver endpoint (no auth required - uses webhook secret validation)
+        .route(
+            "/api/webhooks/:mission_id/:webhook_id",
+            post(control::webhook_receiver),
+        )
         // WebSocket console uses subprotocol-based auth (browser can't set Authorization header)
         .route("/api/console/ws", get(console::console_ws))
         // WebSocket workspace shell uses subprotocol-based auth
@@ -469,6 +476,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/:id/automations",
             post(control::create_automation),
         )
+        .route(
+            "/api/control/automations",
+            get(control::list_active_automations),
+        )
         .route("/api/control/automations/:id", get(control::get_automation))
         .route(
             "/api/control/automations/:id",
@@ -477,6 +488,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/automations/:id",
             axum::routing::delete(control::delete_automation),
+        )
+        .route(
+            "/api/control/automations/:id/executions",
+            get(control::get_automation_executions),
+        )
+        .route(
+            "/api/control/missions/:id/automation-executions",
+            get(control::get_mission_automation_executions),
         )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))
@@ -528,6 +547,27 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/opencode/settings",
             axum::routing::put(opencode_api::update_opencode_settings),
+        )
+        .route(
+            "/api/opencode/config",
+            get(opencode_api::get_opencode_config),
+        )
+        .route(
+            "/api/opencode/config",
+            axum::routing::put(opencode_api::update_opencode_config),
+        )
+        .route(
+            "/api/claudecode/config",
+            get(claudecode_api::get_claudecode_config),
+        )
+        .route(
+            "/api/claudecode/config",
+            axum::routing::put(claudecode_api::update_claudecode_config),
+        )
+        .route("/api/amp/config", get(ampcode_api::get_amp_config))
+        .route(
+            "/api/amp/config",
+            axum::routing::put(ampcode_api::update_amp_config),
         )
         .route(
             "/api/opencode/restart",

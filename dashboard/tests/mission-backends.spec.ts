@@ -39,6 +39,63 @@ async function getHostWorkspace(request: APIRequestContext) {
 test.describe('Mission backend configs', () => {
   test.setTimeout(180_000);
 
+  test('new mission dialog shows spark-local profile agents', async ({ page, request }) => {
+    const profilesRes = await request.get(`${API_BASE}/api/library/config-profile`);
+    expect(profilesRes.ok()).toBeTruthy();
+    const profiles = (await profilesRes.json()) as Array<{ name: string }>;
+    const sparkProfile = profiles.find((profile) => profile.name === 'spark-local');
+    expect(sparkProfile).toBeTruthy();
+
+    const hostWorkspace = await getHostWorkspace(request);
+    expect(hostWorkspace).toBeTruthy();
+
+    const updateRes = await request.put(`${API_BASE}/api/workspaces/${hostWorkspace!.id}`, {
+      data: { config_profile: 'spark-local' },
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(updateRes.ok()).toBeTruthy();
+
+    const settingsRes = await request.get(
+      `${API_BASE}/api/library/config-profile/spark-local/opencode/settings`
+    );
+    expect(settingsRes.ok()).toBeTruthy();
+    const settings = (await settingsRes.json()) as { agents?: Record<string, unknown> | unknown[] };
+    const agentNames = Array.isArray(settings.agents)
+      ? settings.agents
+          .map((entry) => {
+            if (typeof entry === 'string') return entry;
+            if (entry && typeof entry === 'object') {
+              const obj = entry as { name?: unknown; id?: unknown };
+              if (typeof obj.name === 'string') return obj.name;
+              if (typeof obj.id === 'string') return obj.id;
+            }
+            return null;
+          })
+          .filter((name): name is string => Boolean(name))
+      : settings.agents && typeof settings.agents === 'object'
+      ? Object.keys(settings.agents)
+      : [];
+
+    expect(agentNames.length).toBeGreaterThan(0);
+    const sampleAgent = agentNames[0];
+
+    await page.addInitScript((base) => {
+      localStorage.setItem('settings', JSON.stringify({ apiUrl: base }));
+    }, API_BASE);
+
+    await page.goto('/control');
+    await page.getByRole('button', { name: 'New Mission' }).click();
+    await page.getByText('Create New Mission').waitFor({ timeout: 10_000 });
+
+    const agentSelect = page
+      .locator('label:has-text("Agent")')
+      .locator('..')
+      .locator('select');
+    await expect(agentSelect.locator('option', { hasText: new RegExp(sampleAgent, 'i') })).toHaveCount(1, {
+      timeout: 10_000,
+    });
+  });
+
   test('claude and opencode missions emit configs on remote host workspace', async ({ page, request }) => {
     const hostWorkspace = await getHostWorkspace(request);
     if (!hostWorkspace) {
@@ -90,7 +147,7 @@ test.describe('Mission backend configs', () => {
       expect(missionRes.ok()).toBeTruthy();
       const mission = (await missionRes.json()) as { id: string };
 
-      const loadRes = await request.get(`${API_BASE}/api/control/missions/${mission.id}/load`);
+      const loadRes = await request.post(`${API_BASE}/api/control/missions/${mission.id}/load`);
       expect(loadRes.ok()).toBeTruthy();
 
       const messageRes = await request.post(`${API_BASE}/api/control/message`, {
@@ -99,9 +156,7 @@ test.describe('Mission backend configs', () => {
       });
       expect(messageRes.ok()).toBeTruthy();
 
-      const shortId = mission.id.slice(0, 8);
-      const missionDir = `${hostWorkspace.path}/workspaces/mission-${shortId}`;
-      await check(missionDir);
+      await check(hostWorkspace.path);
     }
   });
 });

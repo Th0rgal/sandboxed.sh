@@ -15,6 +15,7 @@ import {
   listWorkspaces,
   listMissions,
   getRunningMissions,
+  listActiveAutomations,
   cancelMission,
   deleteMission,
   resumeMission,
@@ -56,28 +57,30 @@ const columns: Column[] = [
 
 function CompactMissionCard({
   mission,
+  isRunningForDisplay,
   isActuallyRunning,
   onCancel,
   onResume,
   onDelete,
 }: {
   mission: Mission;
+  isRunningForDisplay: boolean;
   isActuallyRunning: boolean;
   onCancel: (id: string) => void;
   onResume: (id: string) => void;
   onDelete: (id: string) => void;
 }) {
-  const Icon = isActuallyRunning ? Loader : getStatusIcon(mission.status);
-  const color = getMissionTextColor(mission.status, isActuallyRunning);
+  const Icon = isRunningForDisplay ? Loader : getStatusIcon(mission.status);
+  const color = getMissionTextColor(mission.status, isRunningForDisplay);
   const title = getMissionTitle(mission);
-  const isResumable = !isActuallyRunning && mission.resumable &&
+  const isResumable = !isRunningForDisplay && mission.resumable &&
     (mission.status === 'interrupted' || mission.status === 'blocked' || mission.status === 'failed');
 
   return (
     <div className="group rounded-md bg-white/[0.02] border border-white/[0.06] hover:border-white/[0.12] px-2.5 py-2 transition-colors">
       <div className="flex items-center gap-2 mb-1.5">
         <Icon
-          className={cn('h-3.5 w-3.5 shrink-0', color, isActuallyRunning && 'animate-spin')}
+          className={cn('h-3.5 w-3.5 shrink-0', color, isRunningForDisplay && 'animate-spin')}
         />
         <Link href={`/control?mission=${mission.id}`} className="flex-1 min-w-0">
           <p className="text-xs text-white/80 leading-snug truncate hover:text-white transition-colors">
@@ -188,15 +191,38 @@ function OverviewPageContent() {
     }
   );
 
+  const { data: activeAutomations = [] } = useSWR(
+    'active-automations',
+    listActiveAutomations,
+    {
+      refreshInterval: 5000,
+      revalidateOnFocus: false,
+    }
+  );
+
   // Build a set of actually running mission IDs from the runtime state
   const runningMissionIds = useMemo(() => {
     return new Set(runningMissions.map((rm) => rm.mission_id));
   }, [runningMissions]);
 
+  // Build a set of missions with active automations
+  const automationMissionIds = useMemo(() => {
+    return new Set(activeAutomations.map((automation) => automation.mission_id));
+  }, [activeAutomations]);
+
+  // Union: runtime running + active automations
+  const runningLikeMissionIds = useMemo(() => {
+    const combined = new Set(runningMissionIds);
+    for (const missionId of automationMissionIds) {
+      combined.add(missionId);
+    }
+    return combined;
+  }, [runningMissionIds, automationMissionIds]);
+
   // Categorize missions using shared utility
   const categorized = useMemo(
-    () => categorizeMissions(missions, runningMissionIds),
-    [missions, runningMissionIds]
+    () => categorizeMissions(missions, runningLikeMissionIds),
+    [missions, runningLikeMissionIds]
   );
 
   // Build column data for display
@@ -346,6 +372,10 @@ function OverviewPageContent() {
                       <CompactMissionCard
                         key={mission.id}
                         mission={mission}
+                        isRunningForDisplay={
+                          runningMissionIds.has(mission.id) ||
+                          automationMissionIds.has(mission.id)
+                        }
                         isActuallyRunning={runningMissionIds.has(mission.id)}
                         onCancel={handleCancel}
                         onResume={handleResume}

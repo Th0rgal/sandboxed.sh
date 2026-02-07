@@ -95,11 +95,23 @@ fn default_providers_config() -> ProvidersConfig {
                 description: "Included in Claude Max".to_string(),
                 models: vec![
                     ProviderModel {
+                        id: "claude-opus-4-6".to_string(),
+                        name: "Claude Opus 4.6".to_string(),
+                        description: Some(
+                            "Most capable, recommended for complex tasks".to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "claude-opus-4-5-20251101".to_string(),
                         name: "Claude Opus 4.5".to_string(),
                         description: Some(
                             "Most capable, recommended for complex tasks".to_string(),
                         ),
+                    },
+                    ProviderModel {
+                        id: "claude-sonnet-5".to_string(),
+                        name: "Claude Sonnet 5".to_string(),
+                        description: Some("Balanced speed and capability".to_string()),
                     },
                     ProviderModel {
                         id: "claude-sonnet-4-20250514".to_string(),
@@ -120,6 +132,11 @@ fn default_providers_config() -> ProvidersConfig {
                 description: "ChatGPT Plus/Pro via OAuth".to_string(),
                 models: vec![
                     ProviderModel {
+                        id: "gpt-5.3-codex".to_string(),
+                        name: "GPT-5.3 Codex".to_string(),
+                        description: Some("Latest Codex model".to_string()),
+                    },
+                    ProviderModel {
                         id: "gpt-5.2-codex".to_string(),
                         name: "GPT-5.2 Codex".to_string(),
                         description: Some("Optimized for coding workflows".to_string()),
@@ -138,6 +155,11 @@ fn default_providers_config() -> ProvidersConfig {
                         id: "gpt-5.1-codex-mini".to_string(),
                         name: "GPT-5.1 Codex Mini".to_string(),
                         description: Some("Fast and economical".to_string()),
+                    },
+                    ProviderModel {
+                        id: "gpt-5.3".to_string(),
+                        name: "GPT-5.3".to_string(),
+                        description: Some("General-purpose GPT-5.3".to_string()),
                     },
                     ProviderModel {
                         id: "gpt-5.2".to_string(),

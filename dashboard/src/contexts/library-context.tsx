@@ -131,42 +131,85 @@ export function LibraryProvider({ children }: LibraryProviderProps) {
   const [divergedHistoryMessage, setDivergedHistoryMessage] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    try {
-      setLoading(true);
-      setLibraryUnavailable(false);
-      setLibraryUnavailableMessage(null);
+    setLoading(true);
+    setLibraryUnavailable(false);
+    setLibraryUnavailableMessage(null);
 
-      const [statusData, mcpsData, skillsData, commandsData, pluginsData, agentsData] = await Promise.all([
-        getLibraryStatus(),
-        getLibraryMcps(),
-        listLibrarySkills(),
-        listLibraryCommands(),
-        getLibraryPlugins().catch(() => ({})), // May not exist yet
-        listLibraryAgents().catch(() => []),
-      ]);
+    const results = await Promise.allSettled([
+      getLibraryStatus(),
+      getLibraryMcps(),
+      listLibrarySkills(),
+      listLibraryCommands(),
+      getLibraryPlugins().catch(() => ({})),
+      listLibraryAgents().catch(() => []),
+    ]);
 
-      setStatus(statusData);
-      setMcps(mcpsData);
-      setSkills(skillsData);
-      setCommands(commandsData);
-      setPlugins(pluginsData);
-      setLibraryAgents(agentsData);
-    } catch (err) {
-      if (err instanceof LibraryUnavailableError) {
+    const errors: string[] = [];
+    const handleRejection = (label: string, reason: unknown) => {
+      if (reason instanceof LibraryUnavailableError) {
         setLibraryUnavailable(true);
-        setLibraryUnavailableMessage(err.message);
+        setLibraryUnavailableMessage(reason.message);
         setStatus(null);
         setMcps({});
         setSkills([]);
         setCommands([]);
         setPlugins({});
         setLibraryAgents([]);
-        return;
+        return true;
       }
-      showError(err instanceof Error ? err.message : 'Failed to load library data');
-    } finally {
+      errors.push(`${label}: ${reason instanceof Error ? reason.message : 'Failed to load'}`);
+      return false;
+    };
+
+    const [statusRes, mcpsRes, skillsRes, commandsRes, pluginsRes, agentsRes] = results;
+
+    if (statusRes.status === 'fulfilled') {
+      setStatus(statusRes.value);
+    } else if (handleRejection('Status', statusRes.reason)) {
       setLoading(false);
+      return;
     }
+
+    if (mcpsRes.status === 'fulfilled') {
+      setMcps(mcpsRes.value);
+    } else if (handleRejection('MCPs', mcpsRes.reason)) {
+      setLoading(false);
+      return;
+    }
+
+    if (skillsRes.status === 'fulfilled') {
+      setSkills(skillsRes.value);
+    } else if (handleRejection('Skills', skillsRes.reason)) {
+      setLoading(false);
+      return;
+    }
+
+    if (commandsRes.status === 'fulfilled') {
+      setCommands(commandsRes.value);
+    } else if (handleRejection('Commands', commandsRes.reason)) {
+      setLoading(false);
+      return;
+    }
+
+    if (pluginsRes.status === 'fulfilled') {
+      setPlugins(pluginsRes.value);
+    } else if (handleRejection('Plugins', pluginsRes.reason)) {
+      setLoading(false);
+      return;
+    }
+
+    if (agentsRes.status === 'fulfilled') {
+      setLibraryAgents(agentsRes.value);
+    } else if (handleRejection('Agents', agentsRes.reason)) {
+      setLoading(false);
+      return;
+    }
+
+    if (errors.length > 0) {
+      showError(errors[0]);
+    }
+
+    setLoading(false);
   }, [showError]);
 
   const refreshStatus = useCallback(async () => {

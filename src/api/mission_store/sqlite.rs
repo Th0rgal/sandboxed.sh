@@ -1,13 +1,15 @@
 //! SQLite-based mission store with full event logging.
 
 use super::{
-    now_string, sanitize_filename, Automation, Mission, MissionHistoryEntry, MissionStatus,
-    MissionStore, StoredEvent,
+    now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, ExecutionStatus,
+    Mission, MissionHistoryEntry, MissionStatus, MissionStore, RetryConfig, StoredEvent,
+    TriggerType, WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -81,16 +83,42 @@ CREATE INDEX IF NOT EXISTS idx_summaries_mission ON mission_summaries(mission_id
 CREATE TABLE IF NOT EXISTS automations (
     id TEXT PRIMARY KEY NOT NULL,
     mission_id TEXT NOT NULL,
-    command_name TEXT NOT NULL,
-    interval_seconds INTEGER NOT NULL,
+    command_source_type TEXT NOT NULL,
+    command_source_data TEXT NOT NULL,
+    trigger_type TEXT NOT NULL,
+    trigger_data TEXT NOT NULL,
+    variables TEXT NOT NULL DEFAULT '{}',
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     last_triggered_at TEXT,
+    retry_max_retries INTEGER NOT NULL DEFAULT 3,
+    retry_delay_seconds INTEGER NOT NULL DEFAULT 60,
+    retry_backoff_multiplier REAL NOT NULL DEFAULT 2.0,
     FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_automations_mission ON automations(mission_id);
 CREATE INDEX IF NOT EXISTS idx_automations_active ON automations(mission_id, active);
+
+CREATE TABLE IF NOT EXISTS automation_executions (
+    id TEXT PRIMARY KEY NOT NULL,
+    automation_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL,
+    triggered_at TEXT NOT NULL,
+    trigger_source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    webhook_payload TEXT,
+    variables_used TEXT NOT NULL DEFAULT '{}',
+    completed_at TEXT,
+    error TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (automation_id) REFERENCES automations(id) ON DELETE CASCADE,
+    FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_executions_automation ON automation_executions(automation_id, triggered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_executions_mission ON automation_executions(mission_id, triggered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_executions_status ON automation_executions(status);
 "#;
 
 /// Content size threshold for inline storage (64KB).
@@ -102,6 +130,148 @@ pub struct SqliteMissionStore {
 }
 
 impl SqliteMissionStore {
+    /// Parse an automation row from the database.
+    fn parse_automation_row(row: &rusqlite::Row<'_>) -> Result<Automation, rusqlite::Error> {
+        let id: String = row.get(0)?;
+        let mission_id: String = row.get(1)?;
+        let command_source_type: String = row.get(2)?;
+        let command_source_data: String = row.get(3)?;
+        let trigger_type: String = row.get(4)?;
+        let trigger_data: String = row.get(5)?;
+        let variables_json: String = row.get(6)?;
+        let active: i64 = row.get(7)?;
+        let created_at: String = row.get(8)?;
+        let last_triggered_at: Option<String> = row.get(9)?;
+        let retry_max_retries: i64 = row.get(10)?;
+        let retry_delay_seconds: i64 = row.get(11)?;
+        let retry_backoff_multiplier: f64 = row.get(12)?;
+
+        // Parse command source
+        let command_source: CommandSource = match command_source_type.as_str() {
+            "library" => {
+                let data: serde_json::Value = serde_json::from_str(&command_source_data)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                CommandSource::Library {
+                    name: data["name"].as_str().unwrap_or("").to_string(),
+                }
+            }
+            "local_file" => {
+                let data: serde_json::Value = serde_json::from_str(&command_source_data)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                CommandSource::LocalFile {
+                    path: data["path"].as_str().unwrap_or("").to_string(),
+                }
+            }
+            "inline" => {
+                let data: serde_json::Value = serde_json::from_str(&command_source_data)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                CommandSource::Inline {
+                    content: data["content"].as_str().unwrap_or("").to_string(),
+                }
+            }
+            _ => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(
+                    format!("Unknown command source type: {}", command_source_type).into(),
+                ))
+            }
+        };
+
+        // Parse trigger
+        let trigger: TriggerType = match trigger_type.as_str() {
+            "interval" => {
+                let data: serde_json::Value = serde_json::from_str(&trigger_data)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                TriggerType::Interval {
+                    seconds: data["seconds"].as_u64().unwrap_or(60),
+                }
+            }
+            "webhook" => {
+                let config: WebhookConfig = serde_json::from_str(&trigger_data)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                TriggerType::Webhook { config }
+            }
+            _ => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(
+                    format!("Unknown trigger type: {}", trigger_type).into(),
+                ))
+            }
+        };
+
+        // Parse variables
+        let variables: HashMap<String, String> =
+            serde_json::from_str(&variables_json).unwrap_or_default();
+
+        Ok(Automation {
+            id: Uuid::parse_str(&id)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+            mission_id: Uuid::parse_str(&mission_id)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+            command_source,
+            trigger,
+            variables,
+            active: active != 0,
+            created_at,
+            last_triggered_at,
+            retry_config: RetryConfig {
+                max_retries: retry_max_retries as u32,
+                retry_delay_seconds: retry_delay_seconds as u64,
+                backoff_multiplier: retry_backoff_multiplier,
+            },
+        })
+    }
+
+    /// Parse an automation execution row from the database.
+    fn parse_execution_row(
+        row: &rusqlite::Row<'_>,
+    ) -> Result<AutomationExecution, rusqlite::Error> {
+        let id: String = row.get(0)?;
+        let automation_id: String = row.get(1)?;
+        let mission_id: String = row.get(2)?;
+        let triggered_at: String = row.get(3)?;
+        let trigger_source: String = row.get(4)?;
+        let status_str: String = row.get(5)?;
+        let webhook_payload: Option<String> = row.get(6)?;
+        let variables_used_json: String = row.get(7)?;
+        let completed_at: Option<String> = row.get(8)?;
+        let error: Option<String> = row.get(9)?;
+        let retry_count: i64 = row.get(10)?;
+
+        // Parse status
+        let status = match status_str.as_str() {
+            "pending" => ExecutionStatus::Pending,
+            "running" => ExecutionStatus::Running,
+            "success" => ExecutionStatus::Success,
+            "failed" => ExecutionStatus::Failed,
+            "cancelled" => ExecutionStatus::Cancelled,
+            "skipped" => ExecutionStatus::Skipped,
+            _ => ExecutionStatus::Failed,
+        };
+
+        // Parse webhook payload
+        let webhook_payload_value = webhook_payload.and_then(|s| serde_json::from_str(&s).ok());
+
+        // Parse variables
+        let variables_used: HashMap<String, String> =
+            serde_json::from_str(&variables_used_json).unwrap_or_default();
+
+        Ok(AutomationExecution {
+            id: Uuid::parse_str(&id)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+            automation_id: Uuid::parse_str(&automation_id)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+            mission_id: Uuid::parse_str(&mission_id)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+            triggered_at,
+            trigger_source,
+            status,
+            webhook_payload: webhook_payload_value,
+            variables_used,
+            completed_at,
+            error,
+            retry_count: retry_count as u32,
+        })
+    }
+
     pub async fn new(base_dir: PathBuf, user_id: &str) -> Result<Self, String> {
         let sanitized = sanitize_filename(user_id);
         let db_path = base_dir.join(format!("missions-{}.db", sanitized));
@@ -241,6 +411,185 @@ impl SqliteMissionStore {
             tracing::info!("Running migration: adding 'config_profile' column to missions table");
             conn.execute("ALTER TABLE missions ADD COLUMN config_profile TEXT", [])
                 .map_err(|e| format!("Failed to add config_profile column: {}", e))?;
+        }
+
+        // Migrate automations table to new schema
+        Self::migrate_automations_table(conn)?;
+        Self::ensure_automation_indexes(conn)?;
+
+        Ok(())
+    }
+
+    /// Migrate the automations table from old schema to new schema.
+    fn migrate_automations_table(conn: &Connection) -> Result<(), String> {
+        // Check if the automations table has the old schema
+        let has_command_name: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('automations') WHERE name = 'command_name'")
+            .map_err(|e| format!("Failed to check automations schema: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+
+        if has_command_name {
+            tracing::info!("Running migration: updating automations table to new schema");
+
+            // Read existing automations
+            let mut stmt = conn
+                .prepare("SELECT id, mission_id, command_name, interval_seconds, active, created_at, last_triggered_at FROM automations")
+                .map_err(|e| format!("Failed to read old automations: {}", e))?;
+
+            let old_automations: Vec<(String, String, String, i64, i64, String, Option<String>)> =
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                })
+                .map_err(|e| format!("Failed to query old automations: {}", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect old automations: {}", e))?;
+
+            // Drop the old table
+            conn.execute("DROP TABLE IF EXISTS automations", [])
+                .map_err(|e| format!("Failed to drop old automations table: {}", e))?;
+
+            // Create the new table
+            conn.execute_batch(
+                "CREATE TABLE automations (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    mission_id TEXT NOT NULL,
+                    command_source_type TEXT NOT NULL,
+                    command_source_data TEXT NOT NULL,
+                    trigger_type TEXT NOT NULL,
+                    trigger_data TEXT NOT NULL,
+                    variables TEXT NOT NULL DEFAULT '{}',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    last_triggered_at TEXT,
+                    retry_max_retries INTEGER NOT NULL DEFAULT 3,
+                    retry_delay_seconds INTEGER NOT NULL DEFAULT 60,
+                    retry_backoff_multiplier REAL NOT NULL DEFAULT 2.0,
+                    FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_automations_mission ON automations(mission_id);
+                CREATE INDEX IF NOT EXISTS idx_automations_active ON automations(mission_id, active);
+                CREATE INDEX IF NOT EXISTS idx_automations_webhook_id ON automations(json_extract(trigger_data, '$.webhook_id')) WHERE trigger_type = 'webhook';
+
+                CREATE TABLE IF NOT EXISTS automation_executions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    automation_id TEXT NOT NULL,
+                    mission_id TEXT NOT NULL,
+                    triggered_at TEXT NOT NULL,
+                    trigger_source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    webhook_payload TEXT,
+                    variables_used TEXT NOT NULL DEFAULT '{}',
+                    completed_at TEXT,
+                    error TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (automation_id) REFERENCES automations(id) ON DELETE CASCADE,
+                    FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_executions_automation ON automation_executions(automation_id, triggered_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_executions_mission ON automation_executions(mission_id, triggered_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_executions_status ON automation_executions(status);"
+            )
+            .map_err(|e| format!("Failed to create new automations table: {}", e))?;
+
+            // Migrate old data to new schema
+            let automation_count = old_automations.len();
+            for (
+                id,
+                mission_id,
+                command_name,
+                interval_seconds,
+                active,
+                created_at,
+                last_triggered_at,
+            ) in old_automations
+            {
+                // Convert old format to new format
+                let command_source_data = serde_json::json!({
+                    "name": command_name
+                })
+                .to_string();
+
+                let trigger_data = serde_json::json!({
+                    "seconds": interval_seconds
+                })
+                .to_string();
+
+                conn.execute(
+                    "INSERT INTO automations (id, mission_id, command_source_type, command_source_data,
+                                             trigger_type, trigger_data, variables, active, created_at,
+                                             last_triggered_at, retry_max_retries, retry_delay_seconds, retry_backoff_multiplier)
+                     VALUES (?, ?, 'library', ?, 'interval', ?, '{}', ?, ?, ?, 3, 60, 2.0)",
+                    params![id, mission_id, command_source_data, trigger_data, active, created_at, last_triggered_at],
+                )
+                .map_err(|e| format!("Failed to migrate automation: {}", e))?;
+            }
+
+            tracing::info!(
+                "Successfully migrated {} automations to new schema",
+                automation_count
+            );
+        } else {
+            // Check if automation_executions table exists
+            let has_executions_table: bool = conn
+                .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='automation_executions'")
+                .map_err(|e| format!("Failed to check for automation_executions table: {}", e))?
+                .exists([])
+                .map_err(|e| format!("Failed to query sqlite_master: {}", e))?;
+
+            if !has_executions_table {
+                tracing::info!("Creating automation_executions table");
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS automation_executions (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        automation_id TEXT NOT NULL,
+                        mission_id TEXT NOT NULL,
+                        triggered_at TEXT NOT NULL,
+                        trigger_source TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        webhook_payload TEXT,
+                        variables_used TEXT NOT NULL DEFAULT '{}',
+                        completed_at TEXT,
+                        error TEXT,
+                        retry_count INTEGER NOT NULL DEFAULT 0,
+                        FOREIGN KEY (automation_id) REFERENCES automations(id) ON DELETE CASCADE,
+                        FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_executions_automation ON automation_executions(automation_id, triggered_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_executions_mission ON automation_executions(mission_id, triggered_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_executions_status ON automation_executions(status);"
+                )
+                .map_err(|e| format!("Failed to create automation_executions table: {}", e))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ensure_automation_indexes(conn: &Connection) -> Result<(), String> {
+        let has_trigger_data: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('automations') WHERE name = 'trigger_data'")
+            .map_err(|e| format!("Failed to check automations columns: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+
+        if has_trigger_data {
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_automations_webhook_id ON automations(json_extract(trigger_data, '$.webhook_id')) WHERE trigger_type = 'webhook'",
+                [],
+            )
+            .map_err(|e| format!("Failed to create automation webhook index: {}", e))?;
         }
 
         Ok(())
@@ -978,6 +1327,14 @@ impl MissionStore for SqliteMissionStore {
                 message.clone(),
                 serde_json::json!({ "resumable": resumable }),
             ),
+            AgentEvent::TextDelta { content, .. } => (
+                "text_delta",
+                Some("text_delta_latest".to_string()),
+                None,
+                None,
+                content.clone(),
+                serde_json::json!({}),
+            ),
             AgentEvent::MissionStatusChanged {
                 status, summary, ..
             } => (
@@ -994,7 +1351,6 @@ impl MissionStore for SqliteMissionStore {
             | AgentEvent::AgentTree { .. }
             | AgentEvent::Progress { .. }
             | AgentEvent::SessionIdUpdate { .. }
-            | AgentEvent::TextDelta { .. }
             | AgentEvent::MissionActivity { .. } => return Ok(()),
         };
 
@@ -1018,9 +1374,18 @@ impl MissionStore for SqliteMissionStore {
                     .unwrap_or(None);
 
                 if let Some(row_id) = existing {
+                    let (content_inline, content_file) = SqliteMissionStore::store_content(
+                        &content_dir,
+                        mission_id,
+                        row_id,
+                        &event_type,
+                        &content,
+                    );
                     conn.execute(
-                        "UPDATE mission_events SET metadata = ?1, timestamp = ?2 WHERE id = ?3",
-                        params![metadata_str, now, row_id],
+                        "UPDATE mission_events
+                         SET metadata = ?1, timestamp = ?2, content = ?3, content_file = ?4
+                         WHERE id = ?5",
+                        params![metadata_str, now, content_inline, content_file, row_id],
                     )
                     .map_err(|e| e.to_string())?;
                     return Ok(());
@@ -1175,39 +1540,62 @@ impl MissionStore for SqliteMissionStore {
         Ok(total as u64)
     }
 
-    async fn create_automation(
-        &self,
-        mission_id: Uuid,
-        command_name: &str,
-        interval_seconds: u64,
-    ) -> Result<Automation, String> {
+    async fn create_automation(&self, automation: Automation) -> Result<Automation, String> {
         let conn = self.conn.clone();
-        let now = now_string();
-        let id = Uuid::new_v4();
-        let command_name = command_name.to_string();
 
-        let automation = Automation {
-            id,
-            mission_id,
-            command_name: command_name.clone(),
-            interval_seconds,
-            active: true,
-            created_at: now.clone(),
-            last_triggered_at: None,
+        // Serialize command source
+        let (command_source_type, command_source_data) = match &automation.command_source {
+            CommandSource::Library { name } => {
+                ("library", serde_json::json!({ "name": name }).to_string())
+            }
+            CommandSource::LocalFile { path } => (
+                "local_file",
+                serde_json::json!({ "path": path }).to_string(),
+            ),
+            CommandSource::Inline { content } => (
+                "inline",
+                serde_json::json!({ "content": content }).to_string(),
+            ),
         };
+
+        // Serialize trigger
+        let (trigger_type, trigger_data) = match &automation.trigger {
+            TriggerType::Interval { seconds } => (
+                "interval",
+                serde_json::json!({ "seconds": seconds }).to_string(),
+            ),
+            TriggerType::Webhook { config } => (
+                "webhook",
+                serde_json::to_string(config).map_err(|e| e.to_string())?,
+            ),
+        };
+
+        // Serialize variables
+        let variables_json =
+            serde_json::to_string(&automation.variables).map_err(|e| e.to_string())?;
 
         let a = automation.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO automations (id, mission_id, command_name, interval_seconds, active, created_at)
-                 VALUES (?, ?, ?, ?, 1, ?)",
+                "INSERT INTO automations (id, mission_id, command_source_type, command_source_data,
+                                         trigger_type, trigger_data, variables, active, created_at,
+                                         last_triggered_at, retry_max_retries, retry_delay_seconds, retry_backoff_multiplier)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
-                    id.to_string(),
-                    mission_id.to_string(),
-                    command_name,
-                    interval_seconds as i64,
-                    now,
+                    a.id.to_string(),
+                    a.mission_id.to_string(),
+                    command_source_type,
+                    command_source_data,
+                    trigger_type,
+                    trigger_data,
+                    variables_json,
+                    if a.active { 1 } else { 0 },
+                    a.created_at,
+                    a.last_triggered_at,
+                    a.retry_config.max_retries as i64,
+                    a.retry_config.retry_delay_seconds as i64,
+                    a.retry_config.backoff_multiplier,
                 ],
             )
             .map(|_| ())
@@ -1216,7 +1604,7 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| format!("Task join error: {}", e))?
         .map_err(|e| e.to_string())?;
 
-        Ok(a)
+        Ok(automation)
     }
 
     async fn get_mission_automations(&self, mission_id: Uuid) -> Result<Vec<Automation>, String> {
@@ -1226,29 +1614,43 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn
-                .prepare("SELECT id, mission_id, command_name, interval_seconds, active, created_at, last_triggered_at
+                .prepare("SELECT id, mission_id, command_source_type, command_source_data,
+                                trigger_type, trigger_data, variables, active, created_at, last_triggered_at,
+                                retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
                          FROM automations WHERE mission_id = ? ORDER BY created_at DESC")
                 .map_err(|e| e.to_string())?;
 
             let automations = stmt
                 .query_map([mission_id_str], |row| {
-                    let id: String = row.get(0)?;
-                    let mission_id: String = row.get(1)?;
-                    let command_name: String = row.get(2)?;
-                    let interval_seconds: i64 = row.get(3)?;
-                    let active: i64 = row.get(4)?;
-                    let created_at: String = row.get(5)?;
-                    let last_triggered_at: Option<String> = row.get(6)?;
+                    Self::parse_automation_row(row)
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
 
-                    Ok(Automation {
-                        id: Uuid::parse_str(&id).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                        mission_id: Uuid::parse_str(&mission_id).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                        command_name,
-                        interval_seconds: interval_seconds as u64,
-                        active: active != 0,
-                        created_at,
-                        last_triggered_at,
-                    })
+            Ok(automations)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn list_active_automations(&self) -> Result<Vec<Automation>, String> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, mission_id, command_source_type, command_source_data,
+                            trigger_type, trigger_data, variables, active, created_at, last_triggered_at,
+                            retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
+                     FROM automations WHERE active = 1 ORDER BY created_at DESC",
+                )
+                .map_err(|e| e.to_string())?;
+
+            let automations = stmt
+                .query_map([], |row| {
+                    Self::parse_automation_row(row)
                 })
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
@@ -1268,28 +1670,12 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let result = conn
                 .query_row(
-                    "SELECT id, mission_id, command_name, interval_seconds, active, created_at, last_triggered_at
+                    "SELECT id, mission_id, command_source_type, command_source_data,
+                            trigger_type, trigger_data, variables, active, created_at, last_triggered_at,
+                            retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
                      FROM automations WHERE id = ?",
                     [id_str],
-                    |row| {
-                        let id: String = row.get(0)?;
-                        let mission_id: String = row.get(1)?;
-                        let command_name: String = row.get(2)?;
-                        let interval_seconds: i64 = row.get(3)?;
-                        let active: i64 = row.get(4)?;
-                        let created_at: String = row.get(5)?;
-                        let last_triggered_at: Option<String> = row.get(6)?;
-
-                        Ok(Automation {
-                            id: Uuid::parse_str(&id).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                            mission_id: Uuid::parse_str(&mission_id).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                            command_name,
-                            interval_seconds: interval_seconds as u64,
-                            active: active != 0,
-                            created_at,
-                            last_triggered_at,
-                        })
-                    },
+                    |row| Self::parse_automation_row(row),
                 )
                 .optional()
                 .map_err(|e| e.to_string())?;
@@ -1345,6 +1731,269 @@ impl MissionStore for SqliteMissionStore {
                 .execute("DELETE FROM automations WHERE id = ?", params![id_str])
                 .map_err(|e| e.to_string())?;
             Ok(rows > 0)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn update_automation(&self, automation: Automation) -> Result<(), String> {
+        let conn = self.conn.clone();
+
+        // Serialize command source
+        let (command_source_type, command_source_data) = match &automation.command_source {
+            CommandSource::Library { name } => {
+                ("library", serde_json::json!({ "name": name }).to_string())
+            }
+            CommandSource::LocalFile { path } => (
+                "local_file",
+                serde_json::json!({ "path": path }).to_string(),
+            ),
+            CommandSource::Inline { content } => (
+                "inline",
+                serde_json::json!({ "content": content }).to_string(),
+            ),
+        };
+
+        // Serialize trigger
+        let (trigger_type, trigger_data) = match &automation.trigger {
+            TriggerType::Interval { seconds } => (
+                "interval",
+                serde_json::json!({ "seconds": seconds }).to_string(),
+            ),
+            TriggerType::Webhook { config } => (
+                "webhook",
+                serde_json::to_string(config).map_err(|e| e.to_string())?,
+            ),
+        };
+
+        // Serialize variables
+        let variables_json =
+            serde_json::to_string(&automation.variables).map_err(|e| e.to_string())?;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE automations SET command_source_type = ?, command_source_data = ?,
+                                       trigger_type = ?, trigger_data = ?, variables = ?, active = ?,
+                                       last_triggered_at = ?, retry_max_retries = ?, retry_delay_seconds = ?,
+                                       retry_backoff_multiplier = ?
+                 WHERE id = ?",
+                params![
+                    command_source_type,
+                    command_source_data,
+                    trigger_type,
+                    trigger_data,
+                    variables_json,
+                    if automation.active { 1 } else { 0 },
+                    automation.last_triggered_at,
+                    automation.retry_config.max_retries as i64,
+                    automation.retry_config.retry_delay_seconds as i64,
+                    automation.retry_config.backoff_multiplier,
+                    automation.id.to_string(),
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| e.to_string())
+    }
+
+    async fn get_automation_by_webhook_id(
+        &self,
+        webhook_id: &str,
+    ) -> Result<Option<Automation>, String> {
+        let conn = self.conn.clone();
+        let webhook_id = webhook_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let result = conn
+                .query_row(
+                    "SELECT id, mission_id, command_source_type, command_source_data,
+                            trigger_type, trigger_data, variables, active, created_at, last_triggered_at,
+                            retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
+                     FROM automations
+                     WHERE trigger_type = 'webhook' AND json_extract(trigger_data, '$.webhook_id') = ?",
+                    [webhook_id],
+                    |row| Self::parse_automation_row(row),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+
+            Ok(result)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn create_automation_execution(
+        &self,
+        execution: AutomationExecution,
+    ) -> Result<AutomationExecution, String> {
+        let conn = self.conn.clone();
+
+        let webhook_payload_json = execution
+            .webhook_payload
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
+
+        let variables_used_json =
+            serde_json::to_string(&execution.variables_used).unwrap_or_else(|_| "{}".to_string());
+
+        let status_str = match execution.status {
+            ExecutionStatus::Pending => "pending",
+            ExecutionStatus::Running => "running",
+            ExecutionStatus::Success => "success",
+            ExecutionStatus::Failed => "failed",
+            ExecutionStatus::Cancelled => "cancelled",
+            ExecutionStatus::Skipped => "skipped",
+        };
+
+        let exec = execution.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO automation_executions (id, automation_id, mission_id, triggered_at,
+                                                    trigger_source, status, webhook_payload, variables_used,
+                                                    completed_at, error, retry_count)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    exec.id.to_string(),
+                    exec.automation_id.to_string(),
+                    exec.mission_id.to_string(),
+                    exec.triggered_at,
+                    exec.trigger_source,
+                    status_str,
+                    webhook_payload_json,
+                    variables_used_json,
+                    exec.completed_at,
+                    exec.error,
+                    exec.retry_count as i64,
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| e.to_string())?;
+
+        Ok(execution)
+    }
+
+    async fn update_automation_execution(
+        &self,
+        execution: AutomationExecution,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+
+        let webhook_payload_json = execution
+            .webhook_payload
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
+
+        let variables_used_json =
+            serde_json::to_string(&execution.variables_used).unwrap_or_else(|_| "{}".to_string());
+
+        let status_str = match execution.status {
+            ExecutionStatus::Pending => "pending",
+            ExecutionStatus::Running => "running",
+            ExecutionStatus::Success => "success",
+            ExecutionStatus::Failed => "failed",
+            ExecutionStatus::Cancelled => "cancelled",
+            ExecutionStatus::Skipped => "skipped",
+        };
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE automation_executions SET status = ?, webhook_payload = ?, variables_used = ?,
+                                                 completed_at = ?, error = ?, retry_count = ?
+                 WHERE id = ?",
+                params![
+                    status_str,
+                    webhook_payload_json,
+                    variables_used_json,
+                    execution.completed_at,
+                    execution.error,
+                    execution.retry_count as i64,
+                    execution.id.to_string(),
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| e.to_string())
+    }
+
+    async fn get_automation_executions(
+        &self,
+        automation_id: Uuid,
+        limit: Option<usize>,
+    ) -> Result<Vec<AutomationExecution>, String> {
+        let conn = self.conn.clone();
+        let automation_id_str = automation_id.to_string();
+        let limit = limit.unwrap_or(100) as i64;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, automation_id, mission_id, triggered_at, trigger_source, status,
+                            webhook_payload, variables_used, completed_at, error, retry_count
+                     FROM automation_executions
+                     WHERE automation_id = ?
+                     ORDER BY triggered_at DESC
+                     LIMIT ?",
+                )
+                .map_err(|e| e.to_string())?;
+
+            let executions = stmt
+                .query_map(params![automation_id_str, limit], |row| {
+                    Self::parse_execution_row(row)
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            Ok(executions)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn get_mission_automation_executions(
+        &self,
+        mission_id: Uuid,
+        limit: Option<usize>,
+    ) -> Result<Vec<AutomationExecution>, String> {
+        let conn = self.conn.clone();
+        let mission_id_str = mission_id.to_string();
+        let limit = limit.unwrap_or(100) as i64;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, automation_id, mission_id, triggered_at, trigger_source, status,
+                            webhook_payload, variables_used, completed_at, error, retry_count
+                     FROM automation_executions
+                     WHERE mission_id = ?
+                     ORDER BY triggered_at DESC
+                     LIMIT ?",
+                )
+                .map_err(|e| e.to_string())?;
+
+            let executions = stmt
+                .query_map(params![mission_id_str, limit], |row| {
+                    Self::parse_execution_row(row)
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            Ok(executions)
         })
         .await
         .map_err(|e| format!("Task join error: {}", e))?

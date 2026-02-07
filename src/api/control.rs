@@ -12,8 +12,9 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{Extension, Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, Sse},
     Json,
 };
@@ -180,6 +181,23 @@ fn build_history_context(history: &[(String, String)], max_chars: usize) -> Stri
     }
 
     result
+}
+
+async fn mission_has_active_automation(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+) -> bool {
+    match mission_store.get_mission_automations(mission_id).await {
+        Ok(automations) => automations.iter().any(|automation| automation.active),
+        Err(err) => {
+            tracing::warn!(
+                "Failed to load automations for mission {}: {}",
+                mission_id,
+                err
+            );
+            false
+        }
+    }
 }
 
 pub(crate) async fn resolve_claudecode_default_model(
@@ -1322,31 +1340,6 @@ pub async fn create_mission(
         backend = Some(registry.default_id().to_string());
     }
 
-    // Validate agent exists before creating mission (fail fast with clear error)
-    // Skip validation for Claude Code, Amp, and Codex - they have their own built-in agents
-    if let Some(ref agent_name) = agent {
-        let backend_id = backend.as_deref();
-        let skip_validation = backend_id == Some("claudecode")
-            || backend_id == Some("amp")
-            || backend_id == Some("codex");
-        if !skip_validation {
-            super::library::validate_agent_exists(&state, agent_name)
-                .await
-                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-        }
-    }
-
-    // Validate backend exists
-    if let Some(ref backend_id) = backend {
-        let registry = state.backend_registry.read().await;
-        if registry.get(backend_id).is_none() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Unknown backend: {}", backend_id),
-            ));
-        }
-    }
-
     // Resolve the effective config profile:
     // 1. Use explicit config_profile from request if provided
     // 2. Otherwise use workspace's config_profile
@@ -1362,6 +1355,35 @@ pub async fn create_mission(
     } else {
         None
     };
+
+    // Validate agent exists before creating mission (fail fast with clear error)
+    // Skip validation for Claude Code, Amp, and Codex - they have their own built-in agents
+    if let Some(ref agent_name) = agent {
+        let backend_id = backend.as_deref();
+        let skip_validation = backend_id == Some("claudecode")
+            || backend_id == Some("amp")
+            || backend_id == Some("codex");
+        if !skip_validation {
+            super::library::validate_agent_exists(
+                &state,
+                agent_name,
+                effective_config_profile.as_deref(),
+            )
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        }
+    }
+
+    // Validate backend exists
+    if let Some(ref backend_id) = backend {
+        let registry = state.backend_registry.read().await;
+        if registry.get(backend_id).is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Unknown backend: {}", backend_id),
+            ));
+        }
+    }
 
     // If no model_override specified, resolve from config profile for Claude Code
     if backend.as_deref() == Some("claudecode") && model_override.is_none() {
@@ -2085,7 +2107,7 @@ fn spawn_control_session(
         config.clone(),
         root_agent,
         mcp,
-        workspaces,
+        workspaces.clone(),
         library.clone(),
         cmd_rx,
         mission_cmd_rx,
@@ -2160,7 +2182,7 @@ fn spawn_control_session(
         tokio::spawn(stale_mission_cleanup_loop(
             Arc::clone(&state.mission_store),
             config.stale_mission_hours,
-            Arc::clone(&running_missions),
+            state.cmd_tx.clone(),
             events_tx.clone(),
         ));
     }
@@ -2191,12 +2213,15 @@ fn spawn_control_session(
     }
 
     // Spawn automation scheduler task
-    if state.mission_store.is_persistent() {
+    if state.mission_store.is_persistent() && config.automations_enabled {
         tokio::spawn(automation_scheduler_loop(
             Arc::clone(&state.mission_store),
             library.clone(),
             state.cmd_tx.clone(),
+            workspaces.clone(),
         ));
+    } else if state.mission_store.is_persistent() {
+        tracing::info!("Automation scheduler disabled by config");
     }
 
     state
@@ -2213,7 +2238,7 @@ fn spawn_control_session(
 async fn stale_mission_cleanup_loop(
     mission_store: Arc<dyn MissionStore>,
     stale_hours: u64,
-    running_missions: Arc<RwLock<Vec<super::mission_runner::RunningMissionInfo>>>,
+    cmd_tx: mpsc::Sender<ControlCommand>,
     events_tx: broadcast::Sender<AgentEvent>,
 ) {
     // Check every 5 minutes (fast enough to catch orphans promptly).
@@ -2230,38 +2255,62 @@ async fn stale_mission_cleanup_loop(
         // --- Orphan detection: active in DB but not running in-process ---
         match mission_store.get_all_active_missions().await {
             Ok(active_missions) if !active_missions.is_empty() => {
-                let running = running_missions.read().await;
-                let running_ids: std::collections::HashSet<Uuid> =
-                    running.iter().map(|r| r.mission_id).collect();
-                drop(running);
-
-                for mission in &active_missions {
-                    if !running_ids.contains(&mission.id) {
-                        tracing::info!(
-                            "Orphan detected: mission {} '{}' is active in DB but has no running process (last update: {})",
-                            mission.id,
-                            mission.title.as_deref().unwrap_or("Untitled"),
-                            mission.updated_at
-                        );
-                        if let Err(e) = mission_store
-                            .update_mission_status(mission.id, MissionStatus::Interrupted)
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to mark orphaned mission {} as interrupted: {}",
-                                mission.id,
-                                e
-                            );
-                        } else {
-                            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                mission_id: mission.id,
-                                status: MissionStatus::Interrupted,
-                                summary: Some(
-                                    "Interrupted: harness process is no longer running".to_string(),
-                                ),
-                            });
+                let running_ids: Option<std::collections::HashSet<Uuid>> = {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    if cmd_tx
+                        .send(ControlCommand::ListRunning { respond: tx })
+                        .await
+                        .is_err()
+                    {
+                        None
+                    } else {
+                        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                            Ok(Ok(running)) => Some(
+                                running
+                                    .into_iter()
+                                    .map(|r| r.mission_id)
+                                    .collect::<std::collections::HashSet<_>>(),
+                            ),
+                            Ok(Err(_)) => None,
+                            Err(_) => None,
                         }
                     }
+                };
+
+                if let Some(running_ids) = running_ids {
+                    for mission in &active_missions {
+                        if !running_ids.contains(&mission.id) {
+                            tracing::info!(
+                                "Orphan detected: mission {} '{}' is active in DB but has no running process (last update: {})",
+                                mission.id,
+                                mission.title.as_deref().unwrap_or("Untitled"),
+                                mission.updated_at
+                            );
+                            if let Err(e) = mission_store
+                                .update_mission_status(mission.id, MissionStatus::Interrupted)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to mark orphaned mission {} as interrupted: {}",
+                                    mission.id,
+                                    e
+                                );
+                            } else {
+                                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    mission_id: mission.id,
+                                    status: MissionStatus::Interrupted,
+                                    summary: Some(
+                                        "Interrupted: harness process is no longer running"
+                                            .to_string(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "Mission cleanup: failed to list running missions; skipping orphan check tick"
+                    );
                 }
             }
             Ok(_) => {}
@@ -2310,147 +2359,323 @@ async fn automation_scheduler_loop(
     mission_store: Arc<dyn MissionStore>,
     library: SharedLibrary,
     cmd_tx: mpsc::Sender<ControlCommand>,
+    workspaces: workspace::SharedWorkspaceStore,
 ) {
+    use super::automation_variables::{substitute_variables, SubstitutionContext};
+    use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus, TriggerType};
+
     // Check every 5 seconds for automations that need to run
     let check_interval = std::time::Duration::from_secs(5);
 
     tracing::info!("Automation scheduler task started");
 
+    let mut logged_unsupported = false;
+
     loop {
         tokio::time::sleep(check_interval).await;
 
-        // Get all active missions
-        let active_missions = match mission_store.get_all_active_missions().await {
-            Ok(missions) => missions,
+        let automations = match mission_store.list_active_automations().await {
+            Ok(automations) => automations,
             Err(e) => {
-                tracing::warn!("Failed to get active missions for automation: {}", e);
+                if !logged_unsupported {
+                    tracing::warn!("Automation scheduler disabled: {}", e);
+                    logged_unsupported = true;
+                }
                 continue;
             }
         };
 
-        // For each active mission, check its automations
-        for mission in active_missions {
-            let automations = match mission_store.get_mission_automations(mission.id).await {
-                Ok(automations) => automations,
-                Err(e) => {
+        for automation in automations {
+            // Only trigger interval-based automations (webhooks are triggered via HTTP endpoint)
+            let interval_seconds = match &automation.trigger {
+                TriggerType::Interval { seconds } => *seconds,
+                TriggerType::Webhook { .. } => {
+                    // Skip webhook automations - they're triggered via HTTP
+                    continue;
+                }
+            };
+
+            let mission = match mission_store.get_mission(automation.mission_id).await {
+                Ok(Some(mission)) => mission,
+                Ok(None) => {
                     tracing::debug!(
-                        "Failed to get automations for mission {}: {}",
-                        mission.id,
+                        "Automation {} references missing mission {}",
+                        automation.id,
+                        automation.mission_id
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load mission {} for automation {}: {}",
+                        automation.mission_id,
+                        automation.id,
                         e
                     );
                     continue;
                 }
             };
 
-            // Filter to active automations only
-            for automation in automations.into_iter().filter(|a| a.active) {
-                // Check if enough time has passed since last trigger
-                let should_trigger = if let Some(ref last_triggered) = automation.last_triggered_at
-                {
-                    match chrono::DateTime::parse_from_rfc3339(last_triggered) {
-                        Ok(last_time) => {
-                            let elapsed = chrono::Utc::now()
-                                .signed_duration_since(last_time.with_timezone(&chrono::Utc));
-                            elapsed.num_seconds() >= automation.interval_seconds as i64
-                        }
-                        Err(_) => true, // If we can't parse, trigger anyway
+            // Check if enough time has passed since last trigger
+            let should_trigger = if let Some(ref last_triggered) = automation.last_triggered_at {
+                match chrono::DateTime::parse_from_rfc3339(last_triggered) {
+                    Ok(last_time) => {
+                        let elapsed = chrono::Utc::now()
+                            .signed_duration_since(last_time.with_timezone(&chrono::Utc));
+                        elapsed.num_seconds() >= interval_seconds as i64
                     }
-                } else {
-                    // Never triggered before, should trigger now
-                    true
-                };
+                    Err(_) => true, // If we can't parse, trigger anyway
+                }
+            } else {
+                // Never triggered before, should trigger now
+                true
+            };
 
-                if !should_trigger {
+            if !should_trigger {
+                continue;
+            }
+
+            // Check if the mission is currently busy (has a running task or queued messages)
+            let is_busy = {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if cmd_tx
+                    .send(ControlCommand::ListRunning { respond: tx })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to send ListRunning command for automation busy check");
                     continue;
                 }
-
-                // Check if the mission is currently busy (has a running task or queued messages)
-                let is_busy = {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    if cmd_tx
-                        .send(ControlCommand::ListRunning { respond: tx })
-                        .await
-                        .is_err()
-                    {
+                match rx.await {
+                    Ok(running) => running.iter().any(|r| {
+                        r.mission_id == mission.id
+                            && (r.queue_len > 0
+                                || r.state == "running"
+                                || r.state == "waiting_for_tool")
+                    }),
+                    Err(_) => {
                         tracing::warn!(
-                            "Failed to send ListRunning command for automation busy check"
+                            "Failed to receive ListRunning response for automation busy check"
                         );
                         continue;
                     }
-                    match rx.await {
-                        Ok(running) => running.iter().any(|r| {
-                            r.mission_id == mission.id
-                                && (r.queue_len > 0
-                                    || r.state == "running"
-                                    || r.state == "waiting_for_tool")
-                        }),
-                        Err(_) => {
-                            tracing::warn!(
-                                "Failed to receive ListRunning response for automation busy check"
-                            );
-                            continue;
-                        }
-                    }
-                };
-
-                if is_busy {
-                    tracing::debug!(
-                        "Mission {} is busy, skipping automation trigger for command '{}'",
-                        mission.id,
-                        automation.command_name
-                    );
-                    continue;
                 }
+            };
 
-                // Fetch the command content from the library
-                let command_content = if let Some(lib) = library.read().await.as_ref() {
-                    match lib.get_command(&automation.command_name).await {
-                        Ok(command) => command.content,
+            if is_busy {
+                tracing::debug!(
+                    "Mission {} is busy, skipping automation trigger",
+                    mission.id
+                );
+                continue;
+            }
+
+            // Get workspace for reading local files
+            let workspace = workspaces.get(mission.workspace_id).await;
+
+            // Fetch the command content based on the command source
+            let command_content = match &automation.command_source {
+                CommandSource::Library { name } => {
+                    if let Some(lib) = library.read().await.as_ref() {
+                        match lib.get_command(name).await {
+                            Ok(command) => command.content,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to fetch command '{}' for automation {}: {}",
+                                    name,
+                                    automation.id,
+                                    e
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        tracing::debug!("Library not initialized, skipping automation trigger");
+                        continue;
+                    }
+                }
+                CommandSource::LocalFile { path } => {
+                    // Read file from mission workspace
+                    let file_path = if let Some(ws) = workspace.as_ref() {
+                        ws.path.join(path)
+                    } else {
+                        tracing::warn!(
+                            "Workspace {} not found for automation {}",
+                            mission.workspace_id,
+                            automation.id
+                        );
+                        continue;
+                    };
+
+                    match tokio::fs::read_to_string(&file_path).await {
+                        Ok(content) => content,
                         Err(e) => {
                             tracing::warn!(
-                                "Failed to fetch command '{}' for automation {}: {}",
-                                automation.command_name,
+                                "Failed to read file '{}' for automation {}: {}",
+                                file_path.display(),
                                 automation.id,
                                 e
                             );
                             continue;
                         }
                     }
-                } else {
-                    tracing::debug!("Library not initialized, skipping automation trigger");
+                }
+                CommandSource::Inline { content } => content.clone(),
+            };
+
+            // Build substitution context for variable replacement
+            let mut context = SubstitutionContext::new(mission.id);
+            if let Some(ref title) = mission.title {
+                context = context.with_mission_name(title.clone());
+            }
+            if let Some(ws) = workspace.as_ref() {
+                context = context.with_working_directory(ws.path.to_string_lossy().to_string());
+            }
+            context = context.with_custom_variables(automation.variables.clone());
+
+            // Apply variable substitution
+            let substituted_content = substitute_variables(&command_content, &context);
+
+            // Create execution record before execution
+            let execution_id = Uuid::new_v4();
+            let execution = AutomationExecution {
+                id: execution_id,
+                automation_id: automation.id,
+                mission_id: mission.id,
+                triggered_at: mission_store::now_string(),
+                trigger_source: "interval".to_string(),
+                status: ExecutionStatus::Pending,
+                webhook_payload: None,
+                variables_used: automation.variables.clone(),
+                completed_at: None,
+                error: None,
+                retry_count: 0,
+            };
+
+            let execution = match mission_store.create_automation_execution(execution).await {
+                Ok(exec) => exec,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to create execution record for automation {}: {}",
+                        automation.id,
+                        e
+                    );
                     continue;
-                };
+                }
+            };
 
-                tracing::info!(
-                    "Triggering automation {} for mission {}: command '{}'",
-                    automation.id,
-                    mission.id,
-                    automation.command_name
+            tracing::info!(
+                "Triggering automation {} (execution {}) for mission {}",
+                automation.id,
+                execution_id,
+                mission.id
+            );
+
+            // Update execution status to Running
+            let mut exec = execution.clone();
+            exec.status = ExecutionStatus::Running;
+            if let Err(e) = mission_store.update_automation_execution(exec).await {
+                tracing::warn!(
+                    "Failed to update execution status to running for {}: {}",
+                    execution_id,
+                    e
                 );
+            }
 
-                // Send the message to the mission
+            // Send the message to the mission with retry logic
+            let mut retry_attempt = 0;
+            let max_retries = automation.retry_config.max_retries;
+            let base_delay = automation.retry_config.retry_delay_seconds;
+            let backoff_multiplier = automation.retry_config.backoff_multiplier;
+
+            loop {
                 let message_id = Uuid::new_v4();
                 let (respond_tx, _respond_rx) = tokio::sync::oneshot::channel();
-                if let Err(e) = cmd_tx
+
+                let send_result = cmd_tx
                     .send(ControlCommand::UserMessage {
                         id: message_id,
-                        content: command_content,
+                        content: substituted_content.clone(),
                         agent: None,
                         target_mission_id: Some(mission.id),
                         respond: respond_tx,
                     })
-                    .await
-                {
-                    tracing::warn!("Failed to send automation message: {}", e);
-                    continue;
-                }
+                    .await;
 
-                // Update last triggered time
-                if let Err(e) = mission_store
-                    .update_automation_last_triggered(automation.id)
-                    .await
-                {
-                    tracing::warn!("Failed to update automation last triggered time: {}", e);
+                match send_result {
+                    Ok(_) => {
+                        // Success - update execution status
+                        let mut exec = execution.clone();
+                        exec.status = ExecutionStatus::Success;
+                        exec.completed_at = Some(mission_store::now_string());
+                        exec.retry_count = retry_attempt;
+
+                        if let Err(e) = mission_store.update_automation_execution(exec).await {
+                            tracing::warn!(
+                                "Failed to update execution status to success for {}: {}",
+                                execution_id,
+                                e
+                            );
+                        }
+
+                        // Update last triggered time
+                        if let Err(e) = mission_store
+                            .update_automation_last_triggered(automation.id)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to update automation last triggered time: {}",
+                                e
+                            );
+                        }
+
+                        break;
+                    }
+                    Err(e) => {
+                        if retry_attempt < max_retries {
+                            // Calculate exponential backoff delay
+                            let delay_seconds =
+                                base_delay as f64 * backoff_multiplier.powi(retry_attempt as i32);
+
+                            tracing::warn!(
+                                "Failed to send automation message (attempt {}/{}): {}. Retrying in {:.1}s",
+                                retry_attempt + 1,
+                                max_retries + 1,
+                                e,
+                                delay_seconds
+                            );
+
+                            retry_attempt += 1;
+
+                            // Wait before retry
+                            tokio::time::sleep(std::time::Duration::from_secs_f64(delay_seconds))
+                                .await;
+                        } else {
+                            // Max retries exceeded - mark as failed
+                            tracing::error!(
+                                "Failed to send automation message after {} attempts: {}",
+                                max_retries + 1,
+                                e
+                            );
+
+                            let mut exec = execution.clone();
+                            exec.status = ExecutionStatus::Failed;
+                            exec.completed_at = Some(mission_store::now_string());
+                            exec.error =
+                                Some(format!("Failed after {} retries: {}", max_retries + 1, e));
+                            exec.retry_count = retry_attempt;
+
+                            if let Err(e) = mission_store.update_automation_execution(exec).await {
+                                tracing::warn!(
+                                    "Failed to update execution status to failed for {}: {}",
+                                    execution_id,
+                                    e
+                                );
+                            }
+
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -2653,22 +2878,29 @@ async fn control_actor_loop(
             ));
         }
 
-        // Clean workspace if requested
         let workspace_root =
             workspace::resolve_workspace_root(workspaces, config, Some(mission.workspace_id)).await;
-        let mission_dir = workspace::mission_workspace_dir_for_root(&workspace_root, mission_id);
 
-        if clean_workspace && mission_dir.exists() {
+        // Clean mission context if requested.
+        // Missions share the workspace directory, so we avoid deleting project files.
+        if clean_workspace {
+            let context_root = config.working_dir.join(&config.context.context_dir_name);
+            let mission_context_dir = context_root.join(mission_id.to_string());
             tracing::info!(
-                "Cleaning workspace for mission {} at {:?}",
-                mission_id,
-                mission_dir
+                mission_id = %mission_id,
+                path = %mission_context_dir.display(),
+                "Cleaning mission context directory (shared workspace mode)"
             );
-            if let Err(e) = std::fs::remove_dir_all(&mission_dir) {
-                tracing::warn!("Failed to clean workspace: {}", e);
+            if mission_context_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&mission_context_dir) {
+                    tracing::warn!("Failed to clean mission context: {}", e);
+                }
             }
-            // Recreate the directory
-            let _ = std::fs::create_dir_all(&mission_dir);
+            let _ = std::fs::create_dir_all(&mission_context_dir);
+
+            let runtime_file =
+                workspace::runtime_workspace_file_path(&config.working_dir, Some(mission_id));
+            let _ = std::fs::remove_file(runtime_file);
         }
 
         // Build resume context
@@ -2682,7 +2914,7 @@ async fn control_actor_loop(
         };
 
         let workspace_note = if clean_workspace {
-            " (workspace cleaned)"
+            " (context cleaned)"
         } else {
             ""
         };
@@ -2722,12 +2954,12 @@ async fn control_actor_loop(
             }
         }
 
-        // Scan work directory for artifacts (use mission_dir defined earlier)
-        if mission_dir.exists() {
+        // Scan work directory for artifacts (shared workspace root)
+        if workspace_root.exists() {
             resume_parts.push("\n## Work Directory Contents".to_string());
 
             let mut files_found = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&mission_dir) {
+            if let Ok(entries) = std::fs::read_dir(&workspace_root) {
                 for entry in entries.filter_map(|e| e.ok()) {
                     let path = entry.path();
                     if path.is_dir() {
@@ -2747,7 +2979,7 @@ async fn control_actor_loop(
                                 let subpath = subentry.path();
                                 if subpath.is_file() {
                                     let rel_path = subpath
-                                        .strip_prefix(&mission_dir)
+                                        .strip_prefix(&workspace_root)
                                         .map(|p| p.display().to_string())
                                         .unwrap_or_else(|_| subpath.display().to_string());
                                     files_found.push(rel_path);
@@ -2756,7 +2988,7 @@ async fn control_actor_loop(
                         }
                     } else if path.is_file() {
                         let rel_path = path
-                            .strip_prefix(&mission_dir)
+                            .strip_prefix(&workspace_root)
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|_| path.display().to_string());
                         files_found.push(rel_path);
@@ -2887,9 +3119,19 @@ async fn control_actor_loop(
                                     // Load mission and start in parallel
                                     match load_mission_record(&mission_store, tid).await {
                                         Ok(mission) => {
-                                            // Activate mission: if pending, interrupted, or blocked, update status to active
-                                            if matches!(mission.status, MissionStatus::Pending | MissionStatus::Interrupted | MissionStatus::Blocked) {
-                                                tracing::info!("Activating parallel mission {} (was {})", tid, mission.status);
+                                            // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
+                                            if matches!(
+                                                mission.status,
+                                                MissionStatus::Pending
+                                                    | MissionStatus::Interrupted
+                                                    | MissionStatus::Blocked
+                                                    | MissionStatus::Completed
+                                                    | MissionStatus::Failed
+                                            ) {
+                                                tracing::info!(
+                                                    "Activating parallel mission {} (was {})",
+                                                    tid, mission.status
+                                                );
                                                 if let Err(e) = mission_store.update_mission_status(tid, MissionStatus::Active).await {
                                                     tracing::warn!("Failed to activate parallel mission {}: {}", tid, e);
                                                 } else {
@@ -2970,9 +3212,19 @@ async fn control_actor_loop(
                                                 mission.history.len(), tid
                                             );
                                         }
-                                        // Activate mission if it was interrupted/blocked
-                                        if matches!(mission.status, MissionStatus::Pending | MissionStatus::Interrupted | MissionStatus::Blocked) {
-                                            tracing::info!("Activating main mission {} (was {})", tid, mission.status);
+                                        // Activate mission if it was pending/interrupted/blocked/completed
+                                        if matches!(
+                                            mission.status,
+                                            MissionStatus::Pending
+                                                | MissionStatus::Interrupted
+                                                | MissionStatus::Blocked
+                                                | MissionStatus::Completed
+                                                | MissionStatus::Failed
+                                        ) {
+                                            tracing::info!(
+                                                "Activating main mission {} (was {})",
+                                                tid, mission.status
+                                            );
                                             if let Err(e) = mission_store.update_mission_status(tid, MissionStatus::Active).await {
                                                 tracing::warn!("Failed to activate main mission {}: {}", tid, e);
                                             } else {
@@ -3000,9 +3252,19 @@ async fn control_actor_loop(
                                             for entry in &mission.history {
                                                 history.push((entry.role.clone(), entry.content.clone()));
                                             }
-                                            // Activate mission if it was interrupted/blocked
-                                            if matches!(mission.status, MissionStatus::Pending | MissionStatus::Interrupted | MissionStatus::Blocked) {
-                                                tracing::info!("Activating switched mission {} (was {})", tid, mission.status);
+                                            // Activate mission if it was pending/interrupted/blocked/completed
+                                            if matches!(
+                                                mission.status,
+                                                MissionStatus::Pending
+                                                    | MissionStatus::Interrupted
+                                                    | MissionStatus::Blocked
+                                                    | MissionStatus::Completed
+                                                    | MissionStatus::Failed
+                                            ) {
+                                                tracing::info!(
+                                                    "Activating switched mission {} (was {})",
+                                                    tid, mission.status
+                                                );
                                                 if let Err(e) = mission_store.update_mission_status(tid, MissionStatus::Active).await {
                                                     tracing::warn!("Failed to activate switched mission {}: {}", tid, e);
                                                 } else {
@@ -3031,9 +3293,19 @@ async fn control_actor_loop(
                                                     mission.history.len(), tid
                                                 );
                                             }
-                                            // Activate mission if it was interrupted/blocked (same mission, reloading)
-                                            if matches!(mission.status, MissionStatus::Pending | MissionStatus::Interrupted | MissionStatus::Blocked) {
-                                                tracing::info!("Activating reloaded mission {} (was {})", tid, mission.status);
+                                            // Activate mission if it was pending/interrupted/blocked/completed (same mission, reloading)
+                                            if matches!(
+                                                mission.status,
+                                                MissionStatus::Pending
+                                                    | MissionStatus::Interrupted
+                                                    | MissionStatus::Blocked
+                                                    | MissionStatus::Completed
+                                                    | MissionStatus::Failed
+                                            ) {
+                                                tracing::info!(
+                                                    "Activating reloaded mission {} (was {})",
+                                                    tid, mission.status
+                                                );
                                                 if let Err(e) = mission_store.update_mission_status(tid, MissionStatus::Active).await {
                                                     tracing::warn!("Failed to activate reloaded mission {}: {}", tid, e);
                                                 } else {
@@ -3114,9 +3386,19 @@ async fn control_actor_loop(
                                 let (workspace_id, model_override, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
                                     match mission_store.get_mission(mid).await {
                                         Ok(Some(mission)) => {
-                                            // Activate mission: if pending, interrupted, or blocked, update status to active
-                                            if matches!(mission.status, MissionStatus::Pending | MissionStatus::Interrupted | MissionStatus::Blocked) {
-                                                tracing::info!("Activating mission {} (was {})", mid, mission.status);
+                                            // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
+                                            if matches!(
+                                                mission.status,
+                                                MissionStatus::Pending
+                                                    | MissionStatus::Interrupted
+                                                    | MissionStatus::Blocked
+                                                    | MissionStatus::Completed
+                                                    | MissionStatus::Failed
+                                            ) {
+                                                tracing::info!(
+                                                    "Activating mission {} (was {})",
+                                                    mid, mission.status
+                                                );
                                                 if let Err(e) = mission_store.update_mission_status(mid, MissionStatus::Active).await {
                                                     tracing::warn!("Failed to activate mission {}: {}", mid, e);
                                                 } else {
@@ -3456,12 +3738,18 @@ async fn control_actor_loop(
                         // instead of current_mission (which can change when user creates a new mission)
                         if running.is_some() {
                             if let Some(mission_id) = running_mission_id {
+                                let seconds_since_activity =
+                                    main_runner_last_activity.elapsed().as_secs();
                                 running_list.push(super::mission_runner::RunningMissionInfo {
                                     mission_id,
                                     state: "running".to_string(),
                                     queue_len: queue.len(),
                                     history_len: history.len(),
-                                    seconds_since_activity: main_runner_last_activity.elapsed().as_secs(),
+                                    seconds_since_activity,
+                                    health: super::mission_runner::running_health(
+                                        super::mission_runner::MissionRunState::Running,
+                                        seconds_since_activity,
+                                    ),
                                     expected_deliverables: 0,
                                     current_activity: main_runner_activity.clone(),
                                     subtask_total: main_runner_subtasks.len(),
@@ -3786,6 +4074,15 @@ async fn control_actor_loop(
                                     crate::tools::mission::MissionStatusValue::NotFeasible => MissionStatus::NotFeasible,
                                 };
                                 let success = matches!(status, crate::tools::mission::MissionStatusValue::Completed);
+                                if new_status == MissionStatus::Completed
+                                    && mission_has_active_automation(&mission_store, id).await
+                                {
+                                    tracing::info!(
+                                        "Skipping completion for mission {} because active automations are enabled",
+                                        id
+                                    );
+                                    continue;
+                                }
                                 // Save the final tree before updating status
                                 if let Some(tree) = current_tree.read().await.clone() {
                                     if let Err(e) = mission_store.update_mission_tree(id, &tree).await {
@@ -3952,34 +4249,43 @@ async fn control_actor_loop(
                                                     TerminalReason::InfiniteLoop => "infinite_loop",
                                                     TerminalReason::MaxIterations => "max_iterations",
                                                 });
-                                                tracing::info!(
-                                                    "Auto-completing mission {} with status '{:?}' (terminal_reason: {:?})",
-                                                    mission_id, new_status, agent_result.terminal_reason
-                                                );
-                                                if let Err(e) = mission_store
-                                                    .update_mission_status_with_reason(mission_id, new_status, terminal_reason_str)
-                                                    .await
+                                                if new_status == MissionStatus::Completed
+                                                    && mission_has_active_automation(&mission_store, mission_id).await
                                                 {
-                                                    tracing::warn!("Failed to auto-complete mission: {}", e);
+                                                    tracing::info!(
+                                                        "Skipping auto-complete for mission {} because active automations are enabled",
+                                                        mission_id
+                                                    );
                                                 } else {
-                                                    // Send status change event - the actual completion content
-                                                    // is already in the assistant_message event, so we just provide
-                                                    // a clean summary based on how the mission ended
-                                                    let summary = match agent_result.terminal_reason {
-                                                        Some(TerminalReason::Completed) => None, // Normal completion, no extra explanation needed
-                                                        Some(TerminalReason::MaxIterations) => Some("Reached iteration limit".to_string()),
-                                                        Some(TerminalReason::Cancelled) => Some("Cancelled by user".to_string()),
-                                                        Some(TerminalReason::Stalled) => Some("No progress detected".to_string()),
-                                                        Some(TerminalReason::InfiniteLoop) => Some("Detected repetitive behavior".to_string()),
-                                                        Some(TerminalReason::LlmError) => Some("Model error".to_string()),
-                                                        None if agent_result.success => None,
-                                                        None => Some("Unexpected termination".to_string()),
-                                                    };
-                                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                                        mission_id,
-                                                        status: new_status,
-                                                        summary,
-                                                    });
+                                                    tracing::info!(
+                                                        "Auto-completing mission {} with status '{:?}' (terminal_reason: {:?})",
+                                                        mission_id, new_status, agent_result.terminal_reason
+                                                    );
+                                                    if let Err(e) = mission_store
+                                                        .update_mission_status_with_reason(mission_id, new_status, terminal_reason_str)
+                                                        .await
+                                                    {
+                                                        tracing::warn!("Failed to auto-complete mission: {}", e);
+                                                    } else {
+                                                        // Send status change event - the actual completion content
+                                                        // is already in the assistant_message event, so we just provide
+                                                        // a clean summary based on how the mission ended
+                                                        let summary = match agent_result.terminal_reason {
+                                                            Some(TerminalReason::Completed) => None, // Normal completion, no extra explanation needed
+                                                            Some(TerminalReason::MaxIterations) => Some("Reached iteration limit".to_string()),
+                                                            Some(TerminalReason::Cancelled) => Some("Cancelled by user".to_string()),
+                                                            Some(TerminalReason::Stalled) => Some("No progress detected".to_string()),
+                                                            Some(TerminalReason::InfiniteLoop) => Some("Detected repetitive behavior".to_string()),
+                                                            Some(TerminalReason::LlmError) => Some("Model error".to_string()),
+                                                            None if agent_result.success => None,
+                                                            None => Some("Unexpected termination".to_string()),
+                                                        };
+                                                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                                            mission_id,
+                                                            status: new_status,
+                                                            summary,
+                                                        });
+                                                    }
                                                 }
                                             } else {
                                                 tracing::debug!(
@@ -4161,7 +4467,9 @@ async fn control_actor_loop(
                             // Mark failures as resumable
                             let resumable = !result.success;
                             let _ = events_tx.send(AgentEvent::AssistantMessage {
-                                id: msg_id,
+                                // Use a unique id so we don't overwrite the user_message event
+                                // (event_id is used for de-dupe in the SQLite event logger).
+                                id: Uuid::new_v4(),
                                 content: result.output.clone(),
                                 success: result.success,
                                 cost_cents: result.cost_cents,
@@ -4204,7 +4512,14 @@ async fn control_actor_loop(
                                         } else {
                                             MissionStatus::Failed
                                         };
-                                        if let Err(e) = mission_store
+                                        if new_status == MissionStatus::Completed
+                                            && mission_has_active_automation(&mission_store, *mission_id).await
+                                        {
+                                            tracing::info!(
+                                                "Skipping parallel completion for mission {} because active automations are enabled",
+                                                mission_id
+                                            );
+                                        } else if let Err(e) = mission_store
                                             .update_mission_status(*mission_id, new_status)
                                             .await
                                         {
@@ -4241,9 +4556,16 @@ async fn control_actor_loop(
                         AgentEvent::ToolCall { mission_id, .. } => *mission_id,
                         AgentEvent::ToolResult { mission_id, .. } => *mission_id,
                         AgentEvent::Thinking { mission_id, .. } => *mission_id,
+                        AgentEvent::TextDelta { mission_id, .. } => *mission_id,
+                        AgentEvent::UserMessage { mission_id, .. } => *mission_id,
+                        AgentEvent::AssistantMessage { mission_id, .. } => *mission_id,
+                        AgentEvent::Error { mission_id, .. } => *mission_id,
+                        AgentEvent::MissionStatusChanged { mission_id, .. } => Some(*mission_id),
                         AgentEvent::AgentPhase { mission_id, .. } => *mission_id,
                         AgentEvent::AgentTree { mission_id, .. } => *mission_id,
                         AgentEvent::Progress { mission_id, .. } => *mission_id,
+                        AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
+                        AgentEvent::SessionIdUpdate { mission_id, .. } => Some(*mission_id),
                         _ => None,
                     };
                     // Update last_activity for matching runner (main or parallel)
@@ -4679,7 +5001,7 @@ async fn run_single_control_turn(
     convo.push_str("User:\n");
     convo.push_str(&user_message);
     convo.push_str("\n\nInstructions:\n- Continue the conversation helpfully.\n- Use available tools as needed.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n");
-    let mut task = match crate::task::Task::new(convo, Some(1000)) {
+    let mut task = match crate::task::Task::new(convo.clone(), Some(1000)) {
         Ok(t) => t,
         Err(e) => {
             let r = crate::agents::AgentResult::failure(format!("Failed to create task: {}", e), 0);
@@ -4797,9 +5119,9 @@ async fn run_single_control_turn(
             super::mission_runner::run_codex_turn(
                 exec_workspace,
                 &ctx.working_dir,
-                &user_message,
+                &convo,
                 config.default_model.as_deref(),
-                agent_override.as_deref(),
+                config.opencode_agent.as_deref(),
                 mid,
                 events_tx.clone(),
                 cancel,
@@ -4841,12 +5163,20 @@ async fn run_single_control_turn(
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAutomationRequest {
-    pub command_name: String,
-    pub interval_seconds: u64,
+    pub command_source: mission_store::CommandSource,
+    pub trigger: mission_store::TriggerType,
+    #[serde(default)]
+    pub variables: HashMap<String, String>,
+    #[serde(default)]
+    pub retry_config: Option<mission_store::RetryConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateAutomationRequest {
+    pub command_source: Option<mission_store::CommandSource>,
+    pub trigger: Option<mission_store::TriggerType>,
+    pub variables: Option<HashMap<String, String>>,
+    pub retry_config: Option<mission_store::RetryConfig>,
     pub active: Option<bool>,
 }
 
@@ -4867,6 +5197,22 @@ pub async fn list_mission_automations(
     Ok(Json(automations))
 }
 
+/// List all active automations across missions.
+pub async fn list_active_automations(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<mission_store::Automation>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let automations = control
+        .mission_store
+        .list_active_automations()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(automations))
+}
+
 /// Create an automation for a mission.
 pub async fn create_automation(
     State(state): State<Arc<AppState>>,
@@ -4876,36 +5222,63 @@ pub async fn create_automation(
 ) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
-    // Validate the command exists in the library
-    if let Some(lib) = state.library.read().await.as_ref() {
-        match lib.get_command(&req.command_name).await {
-            Ok(_) => {} // Command exists, continue
-            Err(e) => {
-                // Check if it's a "not found" error
-                let error_msg = e.to_string();
-                if error_msg.contains("not found") || error_msg.contains("does not exist") {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!("Command '{}' not found in library", req.command_name),
-                    ));
-                } else {
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to validate command: {}", e),
-                    ));
+    // Validate the command exists in the library if CommandSource::Library
+    if let mission_store::CommandSource::Library { ref name } = req.command_source {
+        if let Some(lib) = state.library.read().await.as_ref() {
+            match lib.get_command(name).await {
+                Ok(_) => {} // Command exists, continue
+                Err(e) => {
+                    // Check if it's a "not found" error
+                    let error_msg = e.to_string();
+                    if error_msg.contains("not found") || error_msg.contains("does not exist") {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            format!("Command '{}' not found in library", name),
+                        ));
+                    } else {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to validate command: {}", e),
+                        ));
+                    }
                 }
             }
+        } else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Library not initialized".to_string(),
+            ));
         }
-    } else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Library not initialized".to_string(),
-        ));
     }
+
+    // Generate webhook_id if trigger type is Webhook
+    let trigger = match req.trigger {
+        mission_store::TriggerType::Webhook { mut config } => {
+            // Generate a unique webhook_id if not provided or empty
+            if config.webhook_id.is_empty() {
+                config.webhook_id = Uuid::new_v4().to_string();
+            }
+            mission_store::TriggerType::Webhook { config }
+        }
+        other => other,
+    };
+
+    // Build the complete Automation struct
+    let automation = mission_store::Automation {
+        id: Uuid::new_v4(),
+        mission_id,
+        command_source: req.command_source,
+        trigger,
+        variables: req.variables,
+        active: true,
+        created_at: mission_store::now_string(),
+        last_triggered_at: None,
+        retry_config: req.retry_config.unwrap_or_default(),
+    };
 
     let automation = control
         .mission_store
-        .create_automation(mission_id, &req.command_name, req.interval_seconds)
+        .create_automation(automation)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -4933,7 +5306,7 @@ pub async fn get_automation(
     Ok(Json(automation))
 }
 
-/// Update an automation (currently only supports changing active status).
+/// Update an automation.
 pub async fn update_automation(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -4943,7 +5316,7 @@ pub async fn update_automation(
     let control = control_for_user(&state, &user).await;
 
     // Verify automation exists
-    let automation = control
+    let mut automation = control
         .mission_store
         .get_automation(automation_id)
         .await
@@ -4953,27 +5326,75 @@ pub async fn update_automation(
             format!("Automation {} not found", automation_id),
         ))?;
 
-    // Update active status if provided
-    if let Some(active) = req.active {
-        control
-            .mission_store
-            .update_automation_active(automation_id, active)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Validate the command exists in the library if CommandSource::Library is being updated
+    if let Some(ref command_source) = req.command_source {
+        if let mission_store::CommandSource::Library { ref name } = command_source {
+            if let Some(lib) = state.library.read().await.as_ref() {
+                match lib.get_command(name).await {
+                    Ok(_) => {} // Command exists, continue
+                    Err(e) => {
+                        // Check if it's a "not found" error
+                        let error_msg = e.to_string();
+                        if error_msg.contains("not found") || error_msg.contains("does not exist") {
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                format!("Command '{}' not found in library", name),
+                            ));
+                        } else {
+                            return Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to validate command: {}", e),
+                            ));
+                        }
+                    }
+                }
+            } else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Library not initialized".to_string(),
+                ));
+            }
+        }
     }
 
-    // Return updated automation
-    let updated = control
-        .mission_store
-        .get_automation(automation_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!("Automation {} not found", automation_id),
-        ))?;
+    // Update fields if provided
+    if let Some(command_source) = req.command_source {
+        automation.command_source = command_source;
+    }
 
-    Ok(Json(updated))
+    if let Some(trigger) = req.trigger {
+        // Generate webhook_id if trigger type is Webhook and webhook_id is empty
+        automation.trigger = match trigger {
+            mission_store::TriggerType::Webhook { mut config } => {
+                if config.webhook_id.is_empty() {
+                    config.webhook_id = Uuid::new_v4().to_string();
+                }
+                mission_store::TriggerType::Webhook { config }
+            }
+            other => other,
+        };
+    }
+
+    if let Some(variables) = req.variables {
+        automation.variables = variables;
+    }
+
+    if let Some(retry_config) = req.retry_config {
+        automation.retry_config = retry_config;
+    }
+
+    if let Some(active) = req.active {
+        automation.active = active;
+    }
+
+    // Update automation in the store
+    control
+        .mission_store
+        .update_automation(automation.clone())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(automation))
 }
 
 /// Delete an automation.
@@ -4997,5 +5418,368 @@ pub async fn delete_automation(
             StatusCode::NOT_FOUND,
             format!("Automation {} not found", automation_id),
         ))
+    }
+}
+
+/// Get execution history for an automation.
+pub async fn get_automation_executions(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(automation_id): Path<Uuid>,
+) -> Result<Json<Vec<mission_store::AutomationExecution>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    // Verify automation exists
+    let _automation = control
+        .mission_store
+        .get_automation(automation_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Automation {} not found", automation_id),
+        ))?;
+
+    let executions = control
+        .mission_store
+        .get_automation_executions(automation_id, Some(100))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(executions))
+}
+
+/// Get all automation executions for a mission.
+pub async fn get_mission_automation_executions(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+) -> Result<Json<Vec<mission_store::AutomationExecution>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let executions = control
+        .mission_store
+        .get_mission_automation_executions(mission_id, Some(100))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(executions))
+}
+
+/// Webhook receiver endpoint for triggering automations.
+/// Accepts POST requests with JSON body and validates webhook secret if configured.
+pub async fn webhook_receiver(
+    State(state): State<Arc<AppState>>,
+    Path((mission_id, webhook_id)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, String)> {
+    use super::automation_variables::{
+        apply_webhook_mappings, substitute_variables, SubstitutionContext,
+    };
+    use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus, TriggerType};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let payload: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid JSON payload: {}", e),
+        )
+    })?;
+
+    // Search across all user sessions for the webhook automation.
+    // Automations are user-scoped, so we must check every session's mission store.
+    let sessions = state.control.all_sessions().await;
+    let mut found: Option<(mission_store::Automation, ControlState)> = None;
+    for session in &sessions {
+        match session
+            .mission_store
+            .get_automation_by_webhook_id(&webhook_id)
+            .await
+        {
+            Ok(Some(automation)) => {
+                found = Some((automation, session.clone()));
+                break;
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!("Error searching webhook {} in session: {}", webhook_id, e);
+                continue;
+            }
+        }
+    }
+
+    let (automation, control) = found.ok_or((
+        StatusCode::NOT_FOUND,
+        format!("Webhook {} not found", webhook_id),
+    ))?;
+
+    // Verify mission_id matches
+    if automation.mission_id != mission_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Webhook {} does not belong to mission {}",
+                webhook_id, mission_id
+            ),
+        ));
+    }
+
+    // Check if automation is active
+    if !automation.active {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Automation {} is not active", automation.id),
+        ));
+    }
+
+    // Extract webhook config
+    let webhook_config = match &automation.trigger {
+        TriggerType::Webhook { config } => config,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Automation is not configured for webhook trigger".to_string(),
+            ));
+        }
+    };
+
+    // Validate webhook secret if configured (HMAC-SHA256)
+    if let Some(ref secret) = webhook_config.secret {
+        // Check for signature in headers (support both GitHub and generic formats)
+        let signature_header = headers
+            .get("x-hub-signature-256")
+            .or_else(|| headers.get("x-webhook-signature"))
+            .and_then(|v| v.to_str().ok());
+
+        if let Some(signature) = signature_header {
+            let signature = signature.trim();
+            let signature = signature.strip_prefix("sha256=").unwrap_or(signature);
+            let signature_bytes = hex::decode(signature).map_err(|_| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid webhook signature".to_string(),
+                )
+            })?;
+
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid webhook secret".to_string(),
+                )
+            })?;
+            mac.update(&body);
+
+            if mac.verify_slice(&signature_bytes).is_err() {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid webhook signature".to_string(),
+                ));
+            }
+        } else {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Missing webhook signature".to_string(),
+            ));
+        }
+    }
+
+    // Get mission
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Mission {} not found", mission_id),
+        ))?;
+
+    // Get workspace for reading local files
+    let workspace = state.workspaces.get(mission.workspace_id).await;
+
+    // Fetch the command content based on the command source
+    let command_content = match &automation.command_source {
+        CommandSource::Library { name } => {
+            if let Some(lib) = state.library.read().await.as_ref() {
+                match lib.get_command(name.as_str()).await {
+                    Ok(command) => command.content,
+                    Err(e) => {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to fetch command '{}': {}", name, e),
+                        ));
+                    }
+                }
+            } else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Library not initialized".to_string(),
+                ));
+            }
+        }
+        CommandSource::LocalFile { path } => {
+            // Read file from mission workspace
+            let file_path = if let Some(ws) = workspace.as_ref() {
+                ws.path.join(path)
+            } else {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Workspace {} not found", mission.workspace_id),
+                ));
+            };
+
+            match tokio::fs::read_to_string(&file_path).await {
+                Ok(content) => content,
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to read file '{}': {}", file_path.display(), e),
+                    ));
+                }
+            }
+        }
+        CommandSource::Inline { content } => content.clone(),
+    };
+
+    // Apply webhook variable mappings
+    let webhook_vars = apply_webhook_mappings(&payload, &webhook_config.variable_mappings);
+
+    // Extract direct "variables" from payload (allows callers to pass {"variables": {"key": "value"}})
+    let direct_vars: HashMap<String, String> = payload
+        .get("variables")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Build substitution context for variable replacement
+    let mut context = SubstitutionContext::new(mission.id);
+    if let Some(ref title) = mission.title {
+        context = context.with_mission_name(title.clone());
+    }
+    if let Some(ws) = workspace.as_ref() {
+        context = context.with_working_directory(ws.path.to_string_lossy().to_string());
+    }
+    context = context.with_webhook_payload(payload.clone());
+
+    // Merge variables: automation defaults < webhook mappings < direct variables (highest priority)
+    let mut merged_vars = automation.variables.clone();
+    merged_vars.extend(webhook_vars.clone());
+    merged_vars.extend(direct_vars);
+    context = context.with_custom_variables(merged_vars.clone());
+
+    // Apply variable substitution
+    let substituted_content = substitute_variables(&command_content, &context);
+
+    // Create execution record
+    let execution_id = Uuid::new_v4();
+    let execution = AutomationExecution {
+        id: execution_id,
+        automation_id: automation.id,
+        mission_id: mission.id,
+        triggered_at: mission_store::now_string(),
+        trigger_source: "webhook".to_string(),
+        status: ExecutionStatus::Pending,
+        webhook_payload: Some(payload),
+        variables_used: merged_vars,
+        completed_at: None,
+        error: None,
+        retry_count: 0,
+    };
+
+    let mut execution = match control
+        .mission_store
+        .create_automation_execution(execution)
+        .await
+    {
+        Ok(exec) => exec,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create execution record: {}", e),
+            ));
+        }
+    };
+
+    tracing::info!(
+        "Webhook {} triggered automation {} (execution {}) for mission {}",
+        webhook_id,
+        automation.id,
+        execution_id,
+        mission.id
+    );
+
+    // Update execution status to Running
+    execution.status = ExecutionStatus::Running;
+    if let Err(e) = control
+        .mission_store
+        .update_automation_execution(execution.clone())
+        .await
+    {
+        tracing::warn!(
+            "Failed to update execution status to running for {}: {}",
+            execution_id,
+            e
+        );
+    }
+
+    // Send the message to the mission
+    let message_id = Uuid::new_v4();
+    let (respond_tx, _respond_rx) = tokio::sync::oneshot::channel();
+
+    let cmd_tx = control.cmd_tx.clone();
+    let mission_store = control.mission_store.clone();
+    drop(control); // Release the lock before sending
+
+    let send_result = cmd_tx
+        .send(ControlCommand::UserMessage {
+            id: message_id,
+            content: substituted_content,
+            agent: None,
+            target_mission_id: Some(mission.id),
+            respond: respond_tx,
+        })
+        .await;
+
+    match send_result {
+        Ok(_) => {
+            // Success - update execution status
+            execution.status = ExecutionStatus::Success;
+            execution.completed_at = Some(mission_store::now_string());
+
+            if let Err(e) = mission_store.update_automation_execution(execution).await {
+                tracing::warn!(
+                    "Failed to update execution status to success for {}: {}",
+                    execution_id,
+                    e
+                );
+            }
+
+            Ok(StatusCode::OK)
+        }
+        Err(e) => {
+            // Failed - update execution status
+            execution.status = ExecutionStatus::Failed;
+            execution.completed_at = Some(mission_store::now_string());
+            execution.error = Some(format!("Failed to send message: {}", e));
+
+            if let Err(e) = mission_store.update_automation_execution(execution).await {
+                tracing::warn!(
+                    "Failed to update execution status to failed for {}: {}",
+                    execution_id,
+                    e
+                );
+            }
+
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to trigger automation: {}", e),
+            ))
+        }
     }
 }

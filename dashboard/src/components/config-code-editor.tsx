@@ -1,10 +1,17 @@
 'use client';
 
+import { useMemo } from 'react';
 import dynamic from 'next/dynamic';
 import { cn } from '@/lib/utils';
+import type { Extension } from '@codemirror/state';
+import { RangeSetBuilder } from '@codemirror/state';
+import { Decoration, EditorView, ViewPlugin, placeholder as placeholderExt } from '@codemirror/view';
+import { StreamLanguage } from '@codemirror/language';
+import { json as jsonLanguage } from '@codemirror/lang-json';
+import { markdown as markdownLanguage } from '@codemirror/lang-markdown';
+import { shell } from '@codemirror/legacy-modes/mode/shell';
 
-// Dynamic import to avoid SSR issues with react-simple-code-editor
-const Editor = dynamic(() => import('react-simple-code-editor').then(mod => mod.default), {
+const CodeMirror = dynamic(() => import('@uiw/react-codemirror').then(mod => mod.default), {
   ssr: false,
   loading: () => <div className="animate-pulse bg-white/5 rounded h-32" />,
 });
@@ -26,148 +33,110 @@ interface ConfigCodeEditorProps {
   language?: Language;
 }
 
-// Escape HTML special characters
-const escapeHtml = (str: string): string =>
-  str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+const encryptedTag = Decoration.mark({ class: 'cm-encrypted-tag' });
+const encryptedFailedTag = Decoration.mark({ class: 'cm-encrypted-failed-tag' });
 
-// Simple JSON syntax highlighting
-function highlightJson(code: string): string {
-  let html = escapeHtml(code);
+const encryptedTagHighlighter = ViewPlugin.fromClass(
+  class {
+    decorations: ReturnType<typeof Decoration.set>;
 
-  // Process in a single pass to avoid double-highlighting
-  // Match strings, numbers, booleans/null, and punctuation
-  html = html.replace(
-    /(&quot;)((?:[^&]|&(?!quot;))*)(&quot;)|(-?\b\d+\.?\d*\b)|\b(true|false|null)\b|([{}\[\]:,])/g,
-    (match, strOpen, strContent, strClose, num, bool, punct) => {
-      if (strOpen) {
-        // String (key or value)
-        return `<span class="token string">${strOpen}${strContent}${strClose}</span>`;
-      } else if (num) {
-        // Number
-        return `<span class="token number">${num}</span>`;
-      } else if (bool) {
-        // Boolean or null
-        return `<span class="token boolean">${bool}</span>`;
-      } else if (punct) {
-        // Punctuation
-        return `<span class="token punctuation">${punct}</span>`;
-      }
-      return match;
+    constructor(view: EditorView) {
+      this.decorations = this.buildDecorations(view);
     }
+
+    update(update: { view: EditorView; docChanged: boolean; viewportChanged: boolean }) {
+      if (update.docChanged || update.viewportChanged) {
+        this.decorations = this.buildDecorations(update.view);
+      }
+    }
+
+    buildDecorations(view: EditorView) {
+      const builder = new RangeSetBuilder<Decoration>();
+      const failedRegex = /<encrypted-failed(?:\s+v="\d+")?>[\s\S]*?<\/encrypted-failed>/gi;
+      const encryptedRegex = /<encrypted(?:\s+v="\d+")?>[\s\S]*?<\/encrypted>/gi;
+      const ranges: Array<{ from: number; to: number; deco: Decoration }> = [];
+
+      for (const { from, to } of view.visibleRanges) {
+        const text = view.state.doc.sliceString(from, to);
+        for (const match of text.matchAll(failedRegex)) {
+          if (match.index === undefined) continue;
+          const start = from + match.index;
+          const end = start + match[0].length;
+          ranges.push({ from: start, to: end, deco: encryptedFailedTag });
+        }
+        for (const match of text.matchAll(encryptedRegex)) {
+          if (match.index === undefined) continue;
+          const start = from + match.index;
+          const end = start + match[0].length;
+          ranges.push({ from: start, to: end, deco: encryptedTag });
+        }
+      }
+
+      ranges.sort((a, b) => (a.from === b.from ? a.to - b.to : a.from - b.from));
+      for (const range of ranges) {
+        builder.add(range.from, range.to, range.deco);
+      }
+
+      return builder.finish();
+    }
+  },
+  {
+    decorations: (v) => v.decorations,
+  }
+);
+
+function editorTheme(padding: number | undefined): Extension {
+  const paddingValue = typeof padding === 'number' ? `${padding}px` : '12px';
+  return EditorView.theme(
+    {
+      '&': {
+        backgroundColor: 'transparent',
+        color: 'rgba(255, 255, 255, 0.9)',
+      },
+      '&.cm-editor': {
+        backgroundColor: 'transparent',
+      },
+      '.cm-scroller': {
+        backgroundColor: 'transparent',
+        fontFamily:
+          '"JetBrainsMono Nerd Font Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+        fontSize: '14px',
+        lineHeight: '1.5',
+      },
+      '.cm-gutters': {
+        backgroundColor: 'transparent',
+        border: 'none',
+        color: 'rgba(255, 255, 255, 0.35)',
+      },
+      '.cm-content': {
+        backgroundColor: 'transparent',
+        padding: paddingValue,
+        caretColor: 'white',
+        fontVariantLigatures: 'none',
+        fontFeatureSettings: '"liga" 0, "calt" 0',
+        fontKerning: 'none',
+        letterSpacing: '0',
+      },
+      '.cm-placeholder': {
+        color: 'rgba(255, 255, 255, 0.25)',
+      },
+      '.cm-encrypted-tag': {
+        color: '#f59e0b',
+        backgroundColor: 'rgba(251, 191, 36, 0.1)',
+        borderRadius: '2px',
+        padding: '0 2px',
+      },
+      '.cm-encrypted-failed-tag': {
+        color: '#ef4444',
+        backgroundColor: 'rgba(239, 68, 68, 0.15)',
+        borderRadius: '2px',
+        padding: '0 2px',
+        textDecoration: 'line-through',
+        textDecorationColor: 'rgba(239, 68, 68, 0.5)',
+      },
+    },
+    { dark: true }
   );
-
-  return html;
-}
-
-// Simple Markdown syntax highlighting
-function highlightMarkdown(code: string): string {
-  let html = escapeHtml(code);
-
-  // Code blocks (``` ... ```) - must be done first
-  html = html.replace(
-    /^(```)(\w*)([\s\S]*?)(```)$/gm,
-    '<span class="token comment">$1$2$3$4</span>'
-  );
-
-  // Inline code (`...`)
-  html = html.replace(
-    /(`[^`\n]+`)/g,
-    '<span class="token string">$1</span>'
-  );
-
-  // Headers (# ## ### etc)
-  html = html.replace(
-    /^(#{1,6}\s.*)$/gm,
-    '<span class="token keyword">$1</span>'
-  );
-
-  // Bold (**text** or __text__)
-  html = html.replace(
-    /(\*\*|__)([^*_]+)(\*\*|__)/g,
-    '<span class="token important">$1$2$3</span>'
-  );
-
-  // Links [text](url)
-  html = html.replace(
-    /(\[)([^\]]+)(\]\()([^)]+)(\))/g,
-    '<span class="token punctuation">$1</span><span class="token string">$2</span><span class="token punctuation">$3</span><span class="token url">$4</span><span class="token punctuation">$5</span>'
-  );
-
-  // List items (- or * or numbers)
-  html = html.replace(
-    /^(\s*)([-*]|\d+\.)\s/gm,
-    '$1<span class="token punctuation">$2</span> '
-  );
-
-  // YAML frontmatter delimiter
-  html = html.replace(
-    /^(---)\s*$/gm,
-    '<span class="token comment">$1</span>'
-  );
-
-  // YAML-style keys in frontmatter (key: value)
-  html = html.replace(
-    /^(\s*)(\w+)(:)/gm,
-    '$1<span class="token property">$2</span><span class="token punctuation">$3</span>'
-  );
-
-  return html;
-}
-
-// Simple Bash syntax highlighting
-function highlightBash(code: string): string {
-  let html = escapeHtml(code);
-
-  // Comments
-  html = html.replace(
-    /^(\s*)(#.*)$/gm,
-    '$1<span class="token comment">$2</span>'
-  );
-
-  // Strings
-  html = html.replace(
-    /(&quot;[^&]*(?:&(?!quot;)[^&]*)*&quot;)/g,
-    '<span class="token string">$1</span>'
-  );
-  html = html.replace(
-    /('[^']*')/g,
-    '<span class="token string">$1</span>'
-  );
-
-  // Variables
-  html = html.replace(
-    /(\$\w+|\$\{[^}]+\})/g,
-    '<span class="token variable">$1</span>'
-  );
-
-  // Keywords
-  html = html.replace(
-    /\b(if|then|else|elif|fi|for|while|do|done|case|esac|function|return|exit|export|source|alias)\b/g,
-    '<span class="token keyword">$1</span>'
-  );
-
-  return html;
-}
-
-// Highlight encrypted tags (including failed-to-decrypt ones)
-function highlightEncryptedTags(html: string): string {
-  // First handle failed-to-decrypt tags (show in red)
-  html = html.replace(
-    /&lt;encrypted-failed(?:\s+v=&quot;\d+&quot;)?&gt;(.*?)&lt;\/encrypted-failed&gt;/g,
-    '<span class="token-encrypted-failed-tag">&lt;encrypted-failed&gt;</span><span class="token-encrypted-failed-value">$1</span><span class="token-encrypted-failed-tag">&lt;/encrypted-failed&gt;</span>'
-  );
-
-  // Then handle normal encrypted tags (show in yellow)
-  html = html.replace(
-    /&lt;encrypted(?:\s+v=&quot;\d+&quot;)?&gt;(.*?)&lt;\/encrypted&gt;/g,
-    '<span class="token-encrypted-tag">&lt;encrypted&gt;</span><span class="token-encrypted-value">$1</span><span class="token-encrypted-tag">&lt;/encrypted&gt;</span>'
-  );
-
-  return html;
 }
 
 export function ConfigCodeEditor({
@@ -182,39 +151,38 @@ export function ConfigCodeEditor({
   highlightEncrypted = false,
   language = 'plain',
 }: ConfigCodeEditorProps) {
-  const highlightCode = (code: string): string => {
-    let html: string;
-
-    switch (language) {
-      case 'json':
-        html = highlightJson(code);
-        break;
-      case 'markdown':
-        html = highlightMarkdown(code);
-        break;
-      case 'bash':
-        html = highlightBash(code);
-        break;
-      default:
-        html = escapeHtml(code);
-    }
-
-    // Apply encrypted tag highlighting if enabled
-    if (highlightEncrypted) {
-      html = highlightEncryptedTags(html);
-    }
-
-    return html;
-  };
-
   // Check if value contains encrypted tags for visual indicator
   const hasEncryptedContent = highlightEncrypted && /<encrypted(?:\s+v="\d+")?>/i.test(value);
   const hasFailedEncryptedContent = highlightEncrypted && /<encrypted-failed/i.test(value);
 
+  const extensions = useMemo<Extension[]>(() => {
+    const list: Extension[] = [editorTheme(padding), EditorView.lineWrapping];
+    if (placeholder) {
+      list.push(placeholderExt(placeholder));
+    }
+    if (highlightEncrypted) {
+      list.push(encryptedTagHighlighter);
+    }
+    switch (language) {
+      case 'json':
+        list.push(jsonLanguage());
+        break;
+      case 'markdown':
+        list.push(markdownLanguage());
+        break;
+      case 'bash':
+        list.push(StreamLanguage.define(shell));
+        break;
+      default:
+        break;
+    }
+    return list;
+  }, [highlightEncrypted, language, padding, placeholder]);
+
   return (
     <div
       className={cn(
-        'rounded-lg bg-[#0d0d0e] border border-white/[0.06] focus-within:border-indigo-500/50 transition-colors overflow-auto relative',
+        'rounded-lg bg-black/20 border border-white/[0.06] focus-within:border-indigo-500/50 transition-colors overflow-hidden relative',
         disabled && 'opacity-60',
         className
       )}
@@ -230,26 +198,21 @@ export function ConfigCodeEditor({
           Contains encrypted values
         </div>
       )}
-      <Editor
+      <CodeMirror
         value={value}
-        onValueChange={onChange}
-        highlight={highlightCode}
-        padding={padding}
-        placeholder={placeholder}
-        readOnly={disabled}
+        onChange={onChange}
+        editable={!disabled}
+        extensions={extensions}
+        theme="none"
+        minHeight={typeof minHeight === 'number' ? `${minHeight}px` : minHeight}
         className={cn('config-code-editor', editorClassName)}
-        textareaClassName="focus:outline-none"
-        style={{
-          fontFamily:
-            '"JetBrainsMono Nerd Font Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
-          fontSize: 14,
-          lineHeight: 1.5,
-          fontVariantLigatures: 'none',
-          fontFeatureSettings: '"liga" 0, "calt" 0',
-          fontKerning: 'none',
-          letterSpacing: '0',
-          color: 'rgba(255, 255, 255, 0.9)',
-          minHeight,
+        basicSetup={{
+          lineNumbers: false,
+          highlightActiveLine: false,
+          highlightActiveLineGutter: false,
+          foldGutter: false,
+          bracketMatching: true,
+          closeBrackets: true,
         }}
       />
     </div>

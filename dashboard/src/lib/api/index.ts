@@ -101,3 +101,22 @@ export {
   oauthCallback,
   listProviders,
 } from "./providers";
+
+// Automations
+export {
+  type CommandSource,
+  type TriggerType,
+  type Automation,
+  type AutomationExecution,
+  type ExecutionStatus,
+  type CreateAutomationInput,
+  listMissionAutomations,
+  listActiveAutomations,
+  createMissionAutomation,
+  getAutomation,
+  updateAutomation,
+  updateAutomationActive,
+  deleteAutomation,
+  getAutomationExecutions,
+  getMissionAutomationExecutions,
+} from "./automations";

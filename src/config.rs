@@ -230,6 +230,9 @@ pub struct Config {
 
     /// Default backend to use (if specified in environment)
     pub default_backend: Option<String>,
+
+    /// Whether mission automations are enabled
+    pub automations_enabled: bool,
 }
 
 /// API auth configuration.
@@ -480,6 +483,15 @@ impl Config {
             }
         });
 
+        let automations_enabled = std::env::var("AUTOMATIONS_ENABLED")
+            .ok()
+            .map(|v| {
+                parse_bool(&v)
+                    .map_err(|e| ConfigError::InvalidValue("AUTOMATIONS_ENABLED".to_string(), e))
+            })
+            .transpose()?
+            .unwrap_or(true);
+
         Ok(Self {
             default_model,
             working_dir,
@@ -496,6 +508,7 @@ impl Config {
             opencode_permissive,
             library_path,
             default_backend,
+            automations_enabled,
         })
     }
 
@@ -518,6 +531,7 @@ impl Config {
             opencode_permissive: true,
             library_path,
             default_backend: None,
+            automations_enabled: true,
         }
     }
 }

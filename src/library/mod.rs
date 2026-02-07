@@ -1987,12 +1987,15 @@ impl LibraryStore {
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
         // Try new path first, then legacy
         let new_path = profile_dir.join(".opencode").join("oh-my-opencode.json");
+        let legacy_settings_path = profile_dir.join(".opencode").join("settings.json");
         let legacy_path = profile_dir.join("opencode").join("oh-my-opencode.json");
 
         tracing::debug!(
             profile = %profile,
             new_path = %new_path.display(),
             new_path_exists = new_path.exists(),
+            legacy_settings_path = %legacy_settings_path.display(),
+            legacy_settings_path_exists = legacy_settings_path.exists(),
             legacy_path = %legacy_path.display(),
             legacy_path_exists = legacy_path.exists(),
             "Checking OpenCode settings paths"
@@ -2000,6 +2003,8 @@ impl LibraryStore {
 
         let path = if new_path.exists() {
             new_path
+        } else if legacy_settings_path.exists() {
+            legacy_settings_path
         } else if legacy_path.exists() {
             legacy_path
         } else {
@@ -2028,7 +2033,7 @@ impl LibraryStore {
         fs::create_dir_all(&opencode_dir).await?;
 
         let content = serde_json::to_string_pretty(settings)?;
-        fs::write(opencode_dir.join("settings.json"), content)
+        fs::write(opencode_dir.join("oh-my-opencode.json"), content)
             .await
             .context("Failed to write opencode settings")?;
 
@@ -2332,6 +2337,32 @@ impl LibraryStore {
 
         files.sort();
         Ok(files)
+    }
+
+    /// Save a harness default file to the library.
+    pub async fn save_harness_default_file(
+        &self,
+        harness: &str,
+        file_name: &str,
+        content: &str,
+    ) -> Result<()> {
+        // Validate harness name
+        let valid_harnesses = ["opencode", "claudecode", "ampcode", "sandboxed"];
+        if !valid_harnesses.contains(&harness) {
+            anyhow::bail!("Invalid harness: {}", harness);
+        }
+
+        let harness_dir = self.path.join(harness);
+        if !harness_dir.exists() {
+            fs::create_dir_all(&harness_dir).await?;
+        }
+
+        let path = harness_dir.join(file_name);
+        fs::write(&path, content)
+            .await
+            .context("Failed to write harness default file")?;
+
+        Ok(())
     }
 
     // ─────────────────────────────────────────────────────────────────────────

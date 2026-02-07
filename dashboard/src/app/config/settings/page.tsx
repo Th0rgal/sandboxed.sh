@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import useSWR from 'swr';
 import {
   getBackendConfig,
@@ -11,7 +11,19 @@ import {
   saveConfigProfileFile,
   deleteConfigProfileFile,
   getHarnessDefaultFile,
+  saveHarnessDefaultFile,
+  getOpenCodeSettings,
+  updateOpenCodeSettings,
+  getOpenCodeConfig,
+  updateOpenCodeConfig,
+  getClaudeCodeConfig,
+  saveClaudeCodeConfig,
+  getClaudeCodeHostConfig,
+  updateClaudeCodeHostConfig,
+  getAmpCodeHostConfig,
+  updateAmpCodeHostConfig,
   ConfigProfileSummary,
+  ClaudeCodeConfig,
   DivergedHistoryError,
 } from '@/lib/api';
 import { Save, Loader, AlertCircle, Check, RefreshCw, X, GitBranch, Upload, Download, GitMerge, ChevronDown, Plus, Layers, FileJson, FolderOpen, Trash2 } from 'lucide-react';
@@ -87,6 +99,40 @@ function parseJsonc(text: string): unknown {
   return JSON.parse(result);
 }
 
+function normalizeJson(value: unknown): string {
+  const sortKeys = (input: unknown): unknown => {
+    if (Array.isArray(input)) {
+      return input.map(sortKeys);
+    }
+    if (input && typeof input === 'object') {
+      const obj = input as Record<string, unknown>;
+      const sorted: Record<string, unknown> = {};
+      Object.keys(obj)
+        .sort()
+        .forEach((key) => {
+          sorted[key] = sortKeys(obj[key]);
+        });
+      return sorted;
+    }
+    return input;
+  };
+
+  return JSON.stringify(sortKeys(value));
+}
+
+const coerceClaudeCodeConfig = (value: Record<string, unknown> | null): ClaudeCodeConfig => {
+  if (!value) {
+    return { default_model: null, default_agent: null, hidden_agents: [] };
+  }
+  const defaultModel = typeof value.default_model === 'string' ? value.default_model : null;
+  const defaultAgent = typeof value.default_agent === 'string' ? value.default_agent : null;
+  const hiddenAgentsRaw = value.hidden_agents;
+  const hiddenAgents = Array.isArray(hiddenAgentsRaw)
+    ? hiddenAgentsRaw.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  return { default_model: defaultModel, default_agent: defaultAgent, hidden_agents: hiddenAgents };
+};
+
 // Harness configuration metadata
 // Maps harness IDs to their profile directory and library directory
 const HARNESS_CONFIG = {
@@ -118,7 +164,7 @@ const HARNESS_CONFIG = {
   openagent: {
     name: 'Sandboxed.sh',
     dir: '.openagent',
-    libraryDir: 'openagent',
+    libraryDir: 'sandboxed',
     files: [
       { name: 'config.json', description: 'Agent visibility and defaults for mission dialog', libraryName: 'config.json' },
     ],
@@ -147,6 +193,41 @@ const EMPTY_FALLBACKS: Record<string, Record<string, string>> = {
 const DEFAULT_PROFILE = 'default';
 
 type HarnessId = keyof typeof HARNESS_CONFIG;
+
+type HostSyncHandler = {
+  label: string;
+  load: () => Promise<Record<string, unknown>>;
+  save: (value: Record<string, unknown>) => Promise<Record<string, unknown> | void>;
+};
+
+const HOST_SYNC_MAP: Partial<Record<HarnessId, Record<string, HostSyncHandler>>> = {
+  opencode: {
+    'settings.json': {
+      label: 'opencode.json',
+      load: getOpenCodeConfig,
+      save: updateOpenCodeConfig,
+    },
+    'oh-my-opencode.json': {
+      label: 'oh-my-opencode.json',
+      load: getOpenCodeSettings,
+      save: updateOpenCodeSettings,
+    },
+  },
+  claudecode: {
+    'settings.json': {
+      label: '~/.claude/settings.json',
+      load: getClaudeCodeHostConfig,
+      save: updateClaudeCodeHostConfig,
+    },
+  },
+  ampcode: {
+    'settings.json': {
+      label: '~/.config/amp/settings.json',
+      load: getAmpCodeHostConfig,
+      save: updateAmpCodeHostConfig,
+    },
+  },
+};
 
 export default function SettingsPage() {
   const {
@@ -223,6 +304,11 @@ export default function SettingsPage() {
   const [error, setError] = useState<string | null>(null);
   const [parseError, setParseError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [hostFileJson, setHostFileJson] = useState<Record<string, unknown> | null>(null);
+  const [hostLoading, setHostLoading] = useState(false);
+  const [hostSyncing, setHostSyncing] = useState(false);
+  const [hostError, setHostError] = useState<string | null>(null);
+  const [hostSyncSuccess, setHostSyncSuccess] = useState<'pull' | 'push' | null>(null);
 
   // Profile files list
   const [profileFiles, setProfileFiles] = useState<string[]>([]);
@@ -230,8 +316,14 @@ export default function SettingsPage() {
   const profileDropdownRef = useRef<HTMLDivElement>(null);
   // Track current load request to prevent race conditions when switching files rapidly
   const currentLoadRequestRef = useRef<number>(0);
+  const currentHostRequestRef = useRef<number>(0);
 
   const isDirty = fileContent !== originalFileContent;
+  const hostHandler = useMemo(() => {
+    if (!selectedFile) return null;
+    const fileName = selectedFile.split('/').pop() || '';
+    return HOST_SYNC_MAP[activeHarness]?.[fileName] || null;
+  }, [selectedFile, activeHarness]);
 
   // Load profile files when profile or harness changes
   const loadProfileFiles = useCallback(async () => {
@@ -246,6 +338,35 @@ export default function SettingsPage() {
   useEffect(() => {
     loadProfileFiles();
   }, [loadProfileFiles]);
+
+  const loadHostFile = useCallback(async () => {
+    if (!hostHandler) {
+      currentHostRequestRef.current += 1;
+      setHostFileJson(null);
+      setHostError(null);
+      setHostLoading(false);
+      return;
+    }
+
+    const requestId = ++currentHostRequestRef.current;
+    const isStale = () => currentHostRequestRef.current !== requestId;
+
+    try {
+      setHostLoading(true);
+      setHostError(null);
+      const data = await hostHandler.load();
+      if (isStale()) return;
+      setHostFileJson(data || {});
+    } catch (err) {
+      if (isStale()) return;
+      setHostFileJson(null);
+      setHostError(err instanceof Error ? err.message : 'Failed to load host config');
+    } finally {
+      if (!isStale()) {
+        setHostLoading(false);
+      }
+    }
+  }, [hostHandler]);
 
   // Load file content
   const loadFile = useCallback(async (filePath: string) => {
@@ -274,6 +395,17 @@ export default function SettingsPage() {
         const content = await getHarnessDefaultFile(harnessConfig.libraryDir, libraryFileName);
         return { content, isDefault: true };
       } catch (err) {
+        if (harnessId === 'claudecode' && libraryFileName === 'config.json') {
+          try {
+            const config = await getClaudeCodeConfig();
+            return { content: JSON.stringify(config, null, 2), isDefault: true };
+          } catch (fallbackErr) {
+            console.warn(
+              'Failed to load Claude Code library config fallback:',
+              fallbackErr instanceof Error ? fallbackErr.message : fallbackErr
+            );
+          }
+        }
         console.warn(
           `Failed to load library default for ${harnessConfig.libraryDir}/${libraryFileName}:`,
           err instanceof Error ? err.message : err
@@ -352,6 +484,11 @@ export default function SettingsPage() {
     }
   }, [activeHarness, selectedProfile, loadFile]);
 
+  useEffect(() => {
+    setHostSyncSuccess(null);
+    void loadHostFile();
+  }, [loadHostFile, selectedFile, activeHarness, selectedProfile]);
+
   // Validate JSON on change
   useEffect(() => {
     if (!fileContent.trim()) {
@@ -367,15 +504,208 @@ export default function SettingsPage() {
     }
   }, [fileContent]);
 
+  useEffect(() => {
+    if (!hostSyncSuccess) return;
+    const timer = setTimeout(() => setHostSyncSuccess(null), 2000);
+    return () => clearTimeout(timer);
+  }, [hostSyncSuccess]);
+
+  const hostSyncAvailable = Boolean(hostHandler);
+  const normalizedHost = (() => {
+    if (!hostFileJson) return null;
+    if (activeHarness === 'claudecode' && selectedFile?.endsWith('/settings.json')) {
+      return normalizeJson(coerceClaudeCodeConfig(hostFileJson));
+    }
+    return normalizeJson(hostFileJson);
+  })();
+  let normalizedLibrary: string | null = null;
+  if (hostSyncAvailable) {
+    try {
+      const parsedLibrary = fileContent.trim() ? parseJsonc(fileContent) : {};
+      if (activeHarness === 'claudecode' && selectedFile?.endsWith('/settings.json')) {
+        if (!parsedLibrary || typeof parsedLibrary !== 'object' || Array.isArray(parsedLibrary)) {
+          throw new Error('Claude Code config must be a JSON object.');
+        }
+        normalizedLibrary = normalizeJson(
+          coerceClaudeCodeConfig(parsedLibrary as Record<string, unknown>)
+        );
+      } else {
+        normalizedLibrary = normalizeJson(parsedLibrary);
+      }
+    } catch {
+      normalizedLibrary = null;
+    }
+  }
+  const hostDiff =
+    hostSyncAvailable &&
+    normalizedHost !== null &&
+    normalizedLibrary !== null &&
+    normalizedHost !== normalizedLibrary;
+  const hostMatches =
+    hostSyncAvailable &&
+    normalizedHost !== null &&
+    normalizedLibrary !== null &&
+    normalizedHost === normalizedLibrary;
+  const hostComparisonInvalid = hostSyncAvailable && normalizedLibrary === null;
+  // Always show host sync status when available so it's obvious what the app is comparing against.
+  const showHostBanner = hostSyncAvailable;
+  const hostComparisonLabel =
+    selectedProfile === DEFAULT_PROFILE ? 'library default' : `profile "${selectedProfile}"`;
+
+  const handleApplyToHost = useCallback(async () => {
+    if (!hostHandler || !selectedFile) return;
+    if (parseError) {
+      setError('Fix JSON before applying to host.');
+      return;
+    }
+    if (hostMatches && !confirm('Host already matches the library default. Re-apply anyway?')) {
+      return;
+    }
+
+    let parsed: unknown = {};
+    try {
+      parsed = fileContent.trim() ? parseJsonc(fileContent) : {};
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Invalid JSON');
+      return;
+    }
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      setError('Host config must be a JSON object.');
+      return;
+    }
+
+    try {
+      setHostSyncing(true);
+      setError(null);
+      await hostHandler.save(parsed as Record<string, unknown>);
+      setHostSyncSuccess('push');
+      await loadHostFile();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update host config');
+    } finally {
+      setHostSyncing(false);
+    }
+  }, [hostHandler, selectedFile, parseError, hostMatches, fileContent, loadHostFile]);
+
+  const handlePullFromHost = useCallback(async () => {
+    if (!hostHandler || !selectedFile) return;
+    if (hostFileJson === null) {
+      setError('Host config is not available yet.');
+      return;
+    }
+    if (isDirty && !confirm('Replace your current edits with the host configuration?')) {
+      return;
+    }
+    if (
+      hostMatches &&
+      !confirm(
+        'Host already matches the library default. Pull anyway? This may rewrite formatting/comments.'
+      )
+    ) {
+      return;
+    }
+
+    const harnessEntry = Object.entries(HARNESS_CONFIG).find(([, cfg]) =>
+      selectedFile.startsWith(cfg.dir)
+    );
+    if (!harnessEntry) {
+      setError('Unknown harness for file path');
+      return;
+    }
+
+    const [, harnessConfigEntry] = harnessEntry;
+    const fileName = selectedFile.split('/').pop() || '';
+    const fileConfig = harnessConfigEntry.files.find(f => f.name === fileName);
+    const libraryFileName = fileConfig?.libraryName || fileName;
+    const content = JSON.stringify(hostFileJson, null, 2);
+
+    try {
+      setHostSyncing(true);
+      setError(null);
+      if (selectedProfile === DEFAULT_PROFILE) {
+        if (harnessConfigEntry.libraryDir === 'claudecode' && libraryFileName === 'config.json') {
+          const sanitized = coerceClaudeCodeConfig(hostFileJson);
+          const sanitizedContent = JSON.stringify(sanitized, null, 2);
+          await saveClaudeCodeConfig(sanitized);
+          setFileContent(sanitizedContent);
+          setOriginalFileContent(sanitizedContent);
+        } else {
+          await saveHarnessDefaultFile(harnessConfigEntry.libraryDir, libraryFileName, content);
+          setFileContent(content);
+          setOriginalFileContent(content);
+        }
+        setIsLibraryDefault(true);
+      } else {
+        // Pull into the currently selected profile file.
+        // This preserves the ability to diff/apply host config while working in non-default profiles.
+        const payload =
+          activeHarness === 'claudecode' && selectedFile.endsWith('/settings.json')
+            ? JSON.stringify(coerceClaudeCodeConfig(hostFileJson), null, 2)
+            : content;
+        await saveConfigProfileFile(selectedProfile, selectedFile, payload);
+        setFileContent(payload);
+        setOriginalFileContent(payload);
+        setIsLibraryDefault(false);
+        await loadProfileFiles();
+      }
+      setParseError(null);
+      setHostSyncSuccess('pull');
+      await refreshStatus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update library defaults');
+    } finally {
+      setHostSyncing(false);
+    }
+  }, [
+    hostHandler,
+    selectedFile,
+    hostFileJson,
+    hostMatches,
+    isDirty,
+    refreshStatus,
+    selectedProfile,
+    activeHarness,
+    loadProfileFiles,
+  ]);
+
   const handleSave = useCallback(async () => {
     if (parseError || !selectedFile) return;
 
     try {
       setSaving(true);
       setError(null);
-      await saveConfigProfileFile(selectedProfile, selectedFile, fileContent);
+      if (selectedProfile === DEFAULT_PROFILE) {
+        const harnessEntry = Object.entries(HARNESS_CONFIG).find(([, cfg]) =>
+          selectedFile.startsWith(cfg.dir)
+        );
+        if (!harnessEntry) {
+          throw new Error('Unknown harness for file path');
+        }
+        const [, harnessConfigEntry] = harnessEntry;
+        const fileName = selectedFile.split('/').pop() || '';
+        const fileConfig = harnessConfigEntry.files.find(f => f.name === fileName);
+        const libraryFileName = fileConfig?.libraryName || fileName;
+        const validHarnessDefaults = ['opencode', 'claudecode', 'ampcode', 'sandboxed'];
+        if (harnessConfigEntry.libraryDir === 'claudecode' && libraryFileName === 'config.json') {
+          const parsed = parseJsonc(fileContent);
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error('Claude Code config must be a JSON object.');
+          }
+          await saveClaudeCodeConfig(coerceClaudeCodeConfig(parsed as Record<string, unknown>));
+          setIsLibraryDefault(true);
+        } else if (validHarnessDefaults.includes(harnessConfigEntry.libraryDir)) {
+          await saveHarnessDefaultFile(harnessConfigEntry.libraryDir, libraryFileName, fileContent);
+          setIsLibraryDefault(true);
+        } else {
+          await saveConfigProfileFile(selectedProfile, selectedFile, fileContent);
+          setIsLibraryDefault(false);
+        }
+      } else {
+        await saveConfigProfileFile(selectedProfile, selectedFile, fileContent);
+        setIsLibraryDefault(false); // No longer showing library default after save
+      }
       setOriginalFileContent(fileContent);
-      setIsLibraryDefault(false); // No longer showing library default after save
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 2000);
       await refreshStatus();
@@ -904,6 +1234,129 @@ export default function SettingsPage() {
               </button>
             </div>
           </div>
+
+          {showHostBanner && (
+            <div className="mb-3 p-3 rounded-lg border border-white/[0.08] bg-white/[0.02]">
+              {hostLoading && (
+                <div className="flex items-center gap-2 text-xs text-white/60">
+                  <Loader className="h-3.5 w-3.5 animate-spin text-white/40" />
+                  Checking host config…
+                </div>
+              )}
+
+              {!hostLoading && hostError && (
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 text-xs text-red-400">
+                    <AlertCircle className="h-3.5 w-3.5" />
+                    {hostError}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleApplyToHost}
+                      disabled={hostSyncing || !!parseError}
+                      className="px-3 py-1.5 text-xs font-medium text-white/80 bg-white/[0.06] hover:bg-white/[0.1] rounded-lg transition-colors disabled:opacity-50"
+                      title="Apply the current editor content to the host configuration file"
+                    >
+                      Apply to Host
+                    </button>
+                    <button
+                      onClick={() => void loadHostFile()}
+                      disabled={hostSyncing}
+                      className="px-3 py-1.5 text-xs font-medium text-white/80 bg-white/[0.06] hover:bg-white/[0.1] rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {!hostLoading && !hostError && hostComparisonInvalid && (
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 text-xs text-amber-400">
+                    <AlertCircle className="h-3.5 w-3.5" />
+                    Cannot compare with host due to invalid JSON.
+                  </div>
+                  <button
+                    onClick={handlePullFromHost}
+                    disabled={hostSyncing || !hostFileJson}
+                    className="px-3 py-1.5 text-xs font-medium text-white/80 bg-white/[0.06] hover:bg-white/[0.1] rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    Pull from Host
+                  </button>
+                </div>
+              )}
+
+              {!hostLoading && !hostError && !hostComparisonInvalid && hostDiff && (
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-medium text-amber-400">Host differs</p>
+                    <p className="text-[11px] text-white/50">
+                      Host {hostHandler?.label} does not match the {hostComparisonLabel}.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleApplyToHost}
+                      disabled={hostSyncing || !!parseError}
+                      className="px-3 py-1.5 text-xs font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      Apply to Host
+                    </button>
+                    <button
+                      onClick={handlePullFromHost}
+                      disabled={hostSyncing || !hostFileJson}
+                      className="px-3 py-1.5 text-xs font-medium text-white/80 bg-white/[0.06] hover:bg-white/[0.1] rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      Pull from Host
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {!hostLoading &&
+                !hostError &&
+                !hostComparisonInvalid &&
+                hostMatches &&
+                !hostSyncSuccess && (
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-medium text-emerald-400">Host matches</p>
+                    <p className="text-[11px] text-white/50">
+                      Host {hostHandler?.label} matches the {hostComparisonLabel}
+                      {hostFileJson && Object.keys(hostFileJson).length === 0 ? ' (empty)' : ''}.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                      <button
+                        onClick={handleApplyToHost}
+                        disabled={hostSyncing || !!parseError}
+                        className="px-3 py-1.5 text-xs font-medium text-white/80 bg-white/[0.06] hover:bg-white/[0.1] rounded-lg transition-colors disabled:opacity-50"
+                      >
+                        Apply to Host
+                      </button>
+                      <button
+                        onClick={handlePullFromHost}
+                        disabled={hostSyncing || !hostFileJson}
+                        className="px-3 py-1.5 text-xs font-medium text-white/80 bg-white/[0.06] hover:bg-white/[0.1] rounded-lg transition-colors disabled:opacity-50"
+                      >
+                        Pull from Host
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+              {!hostLoading && !hostError && !hostComparisonInvalid && !hostDiff && hostSyncSuccess && (
+                <div className="flex items-center gap-2 text-xs text-emerald-400">
+                  <Check className="h-3.5 w-3.5" />
+                  {hostSyncSuccess === 'push'
+                    ? 'Host updated'
+                    : selectedProfile === DEFAULT_PROFILE
+                    ? 'Library defaults updated'
+                    : `Profile "${selectedProfile}" updated`}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Editor - fills remaining space */}
           <div className="flex-1 rounded-xl bg-white/[0.02] border border-white/[0.06] overflow-hidden">

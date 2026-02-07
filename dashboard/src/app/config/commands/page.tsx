@@ -23,6 +23,8 @@ import { LibraryUnavailable } from '@/components/library-unavailable';
 import { useLibrary } from '@/contexts/library-context';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
 import { RenameDialog } from '@/components/rename-dialog';
+import { useToast } from '@/components/toast';
+import { validateFrontmatterBlock } from '@/lib/frontmatter-validation';
 
 export default function CommandsPage() {
   const {
@@ -41,6 +43,7 @@ export default function CommandsPage() {
     committing,
     pushing,
   } = useLibrary();
+  const { showError } = useToast();
 
   const [selectedCommand, setSelectedCommand] = useState<Command | null>(null);
   const [commandContent, setCommandContent] = useState('');
@@ -117,6 +120,11 @@ export default function CommandsPage() {
     const contentBeingSaved = commandContent;
     try {
       setCommandSaving(true);
+      const validationError = validateFrontmatterBlock(contentBeingSaved);
+      if (validationError) {
+        showError(validationError);
+        return;
+      }
       await saveCommand(selectedCommand.name, contentBeingSaved);
       // Only clear dirty if content hasn't changed during save
       if (commandContentRef.current === contentBeingSaved) {

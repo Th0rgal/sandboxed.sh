@@ -5,21 +5,19 @@ import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import { getHealth } from '@/lib/api';
 import { Save } from 'lucide-react';
-import { readSavedSettings, writeSavedSettings } from '@/lib/settings';
+import { getRuntimeApiBase, writeSavedSettings } from '@/lib/settings';
 import { ServerConnectionCard } from '@/components/server-connection-card';
 
 export default function SystemSettingsPage() {
   const [testingConnection, setTestingConnection] = useState(false);
 
   // Form state
-  const [apiUrl, setApiUrl] = useState(
-    () => readSavedSettings().apiUrl ?? 'http://127.0.0.1:3000'
-  );
+  const [apiUrl, setApiUrl] = useState(() => getRuntimeApiBase());
 
   // Track original values for unsaved changes
-  const [originalValues, setOriginalValues] = useState({
-    apiUrl: readSavedSettings().apiUrl ?? 'http://127.0.0.1:3000',
-  });
+  const [originalValues, setOriginalValues] = useState(() => ({
+    apiUrl: getRuntimeApiBase(),
+  }));
 
   // Validation state
   const [urlError, setUrlError] = useState<string | null>(null);

@@ -43,6 +43,7 @@ struct OpencodeSseState {
     response_tool_args: HashMap<String, String>,
     response_tool_names: HashMap<String, String>,
     last_emitted_thinking: Option<String>,
+    last_emitted_text: Option<String>,
 }
 
 struct OpencodeSseParseResult {
@@ -66,6 +67,37 @@ fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option
     } else {
         extract_str(part, &["text", "content", "output_text"])
     }
+}
+
+fn extract_thought_line(text: &str) -> Option<(String, String)> {
+    let mut thought: Option<String> = None;
+    let mut remaining: Vec<&str> = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        let is_thought = lower.starts_with("thought:")
+            || lower.starts_with("thoughts:")
+            || lower.starts_with("thinking:");
+        if thought.is_none() && is_thought {
+            let content = trimmed
+                .splitn(2, ':')
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !content.is_empty() {
+                thought = Some(content);
+            }
+            continue;
+        }
+        remaining.push(line);
+    }
+
+    thought.map(|t| {
+        let cleaned = remaining.join("\n").trim().to_string();
+        (t, cleaned)
+    })
 }
 
 fn is_opencode_status_line(line: &str) -> bool {
@@ -203,7 +235,10 @@ fn handle_part_update(
         return handle_tool_part_update(part, state, mission_id);
     }
 
-    if !matches!(part_type, "thinking" | "reasoning") {
+    let is_thinking = matches!(part_type, "thinking" | "reasoning");
+    let is_text = matches!(part_type, "text" | "output_text");
+
+    if !is_thinking && !is_text {
         return None;
     }
 
@@ -220,7 +255,11 @@ fn handle_part_update(
 
     let delta = props.get("delta").and_then(|v| v.as_str());
     let full_text = extract_part_text(part, part_type);
-    let buffer_key = part_id.or(message_id).unwrap_or(part_type).to_string();
+    let buffer_key = format!(
+        "{}:{}",
+        part_type,
+        part_id.or(message_id).unwrap_or(part_type)
+    );
     let buffer = state.part_buffers.entry(buffer_key).or_default();
 
     let content = if let Some(delta) = delta {
@@ -250,14 +289,24 @@ fn handle_part_update(
         return None;
     }
 
-    if state.last_emitted_thinking.as_ref() == Some(&content) {
+    if is_thinking {
+        if state.last_emitted_thinking.as_ref() == Some(&content) {
+            return None;
+        }
+        state.last_emitted_thinking = Some(content.clone());
+        return Some(AgentEvent::Thinking {
+            content,
+            done: false,
+            mission_id: Some(mission_id),
+        });
+    }
+
+    if state.last_emitted_text.as_ref() == Some(&content) {
         return None;
     }
-    state.last_emitted_thinking = Some(content.clone());
-
-    Some(AgentEvent::Thinking {
+    state.last_emitted_text = Some(content.clone());
+    Some(AgentEvent::TextDelta {
         content,
-        done: false,
         mission_id: Some(mission_id),
     })
 }
@@ -508,8 +557,19 @@ pub enum MissionRunState {
     Finished,
 }
 
+const STALL_WARN_SECS: u64 = 120;
+const STALL_SEVERE_SECS: u64 = 300;
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionStallSeverity {
+    Warning,
+    Severe,
+}
+
 /// Health status of a mission.
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum MissionHealth {
     /// Mission is progressing normally
     Healthy,
@@ -517,11 +577,38 @@ pub enum MissionHealth {
     Stalled {
         seconds_since_activity: u64,
         last_state: String,
+        severity: MissionStallSeverity,
     },
     /// Mission completed without deliverables
     MissingDeliverables { missing: Vec<String> },
     /// Mission ended unexpectedly
     UnexpectedEnd { reason: String },
+}
+
+fn stall_severity(seconds_since_activity: u64) -> Option<MissionStallSeverity> {
+    if seconds_since_activity > STALL_SEVERE_SECS {
+        Some(MissionStallSeverity::Severe)
+    } else if seconds_since_activity > STALL_WARN_SECS {
+        Some(MissionStallSeverity::Warning)
+    } else {
+        None
+    }
+}
+
+pub fn running_health(state: MissionRunState, seconds_since_activity: u64) -> MissionHealth {
+    if matches!(
+        state,
+        MissionRunState::Running | MissionRunState::WaitingForTool
+    ) {
+        if let Some(severity) = stall_severity(seconds_since_activity) {
+            return MissionHealth::Stalled {
+                seconds_since_activity,
+                last_state: format!("{:?}", state),
+                severity,
+            };
+        }
+    }
+    MissionHealth::Healthy
 }
 
 /// A message queued for this mission.
@@ -652,12 +739,15 @@ impl MissionRunner {
     pub async fn check_health(&self) -> MissionHealth {
         let seconds_since = self.last_activity.elapsed().as_secs();
 
-        // If running and no activity for 60+ seconds, consider stalled
-        if self.is_running() && seconds_since > 60 {
-            return MissionHealth::Stalled {
-                seconds_since_activity: seconds_since,
-                last_state: format!("{:?}", self.state),
-            };
+        // If running and no activity for a while, consider stalled
+        if self.is_running() {
+            if let Some(severity) = stall_severity(seconds_since) {
+                return MissionHealth::Stalled {
+                    seconds_since_activity: seconds_since,
+                    last_state: format!("{:?}", self.state),
+                    severity,
+                };
+            }
         }
 
         // If finished without explicit completion and has deliverables, check them
@@ -1146,7 +1236,7 @@ async fn run_mission_turn(
             run_codex_turn(
                 &workspace,
                 &mission_work_dir,
-                &user_message,
+                &convo,
                 config.default_model.as_deref(),
                 effective_agent.as_deref(),
                 mission_id,
@@ -1256,6 +1346,25 @@ fn get_claudecode_cli_path_from_config(_app_working_dir: &std::path::Path) -> Op
     None
 }
 
+/// Read CLI path from Codex backend config file if available.
+fn get_codex_cli_path_from_config(_app_working_dir: &std::path::Path) -> Option<String> {
+    let configs = read_backend_configs()?;
+
+    for config in configs {
+        if config.get("id")?.as_str()? == "codex" {
+            if let Some(settings) = config.get("settings") {
+                if let Some(cli_path) = settings.get("cli_path").and_then(|v| v.as_str()) {
+                    if !cli_path.is_empty() {
+                        tracing::info!("Using Codex CLI path from backend config: {}", cli_path);
+                        return Some(cli_path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Read API key from Amp backend config file if available.
 pub fn get_amp_api_key_from_config() -> Option<String> {
     let configs = read_backend_configs()?;
@@ -1319,11 +1428,10 @@ pub fn run_claudecode_turn<'a>(
         use super::ai_providers::{
             ensure_anthropic_oauth_token_valid, get_anthropic_auth_for_claudecode,
             get_anthropic_auth_from_host_with_expiry, get_anthropic_auth_from_workspace,
-            get_workspace_auth_path, refresh_workspace_anthropic_auth,
-            write_claudecode_credentials_for_workspace, ClaudeCodeAuth,
+            get_workspace_auth_path, refresh_workspace_anthropic_auth, ClaudeCodeAuth,
         };
         use std::collections::HashMap;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::time::{Duration, Instant};
 
         fn classify_claudecode_secret(value: String) -> ClaudeCodeAuth {
             if value.starts_with("sk-ant-oat") {
@@ -1333,8 +1441,111 @@ pub fn run_claudecode_turn<'a>(
             }
         }
 
-        // Ensure OAuth tokens are fresh before resolving credentials.
-        let oauth_refresh_result = ensure_anthropic_oauth_token_valid().await;
+        fn looks_like_claude_cli_credentials(path: &std::path::Path) -> bool {
+            let metadata = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            if metadata.len() == 0 {
+                return false;
+            }
+            let contents = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            let creds: serde_json::Value = match serde_json::from_str(&contents) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let oauth = match creds.get("claudeAiOauth") {
+                Some(o) => o,
+                None => return false,
+            };
+            let has_access_token = oauth
+                .get("accessToken")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_access_token {
+                return false;
+            }
+            // Check if the access token is expired.
+            // Claude Code in --print mode does not auto-refresh OAuth tokens,
+            // so we must ensure the token is valid before launching.
+            let expires_at = oauth
+                .get("expiresAt")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(i64::MAX);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            // Add 60s buffer to avoid race conditions with near-expiry tokens
+            if expires_at < now_ms + 60_000 {
+                let has_refresh = oauth
+                    .get("refreshToken")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                tracing::warn!(
+                    path = %path.display(),
+                    expires_at = expires_at,
+                    has_refresh = has_refresh,
+                    "Claude CLI credentials expired or near-expiry, will use OAuth refresh flow"
+                );
+                return false;
+            }
+            true
+        }
+
+        fn find_host_claude_cli_credentials() -> Option<std::path::PathBuf> {
+            let mut candidates = vec![
+                std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
+                std::path::PathBuf::from("/root/.claude/.credentials.json"),
+            ];
+            if let Ok(home) = std::env::var("HOME") {
+                candidates.push(std::path::PathBuf::from(home).join(".claude/.credentials.json"));
+            }
+
+            candidates
+                .into_iter()
+                .find(|p| looks_like_claude_cli_credentials(p))
+        }
+
+        // Prefer the user's Claude CLI login if present, but avoid mutating the global
+        // credentials file. We run each mission with a per-mission HOME, and copy the
+        // host credentials into the mission directory if needed.
+        let mission_creds_path = work_dir.join(".claude").join(".credentials.json");
+        if !looks_like_claude_cli_credentials(&mission_creds_path) {
+            if let Some(host_creds) = find_host_claude_cli_credentials() {
+                if let Some(parent) = mission_creds_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::copy(&host_creds, &mission_creds_path) {
+                    Ok(_) => {
+                        tracing::info!(
+                            from = %host_creds.display(),
+                            to = %mission_creds_path.display(),
+                            "Copied Claude CLI credentials into mission directory"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            from = %host_creds.display(),
+                            to = %mission_creds_path.display(),
+                            error = %e,
+                            "Failed to copy Claude CLI credentials into mission directory"
+                        );
+                    }
+                }
+            }
+        }
+        let has_cli_creds = looks_like_claude_cli_credentials(&mission_creds_path);
+
+        // Only refresh OpenCode/Anthropic OAuth tokens if we plan to inject them.
+        let oauth_refresh_result = if has_cli_creds {
+            Ok(())
+        } else {
+            // Ensure OAuth tokens are fresh before resolving credentials.
+            ensure_anthropic_oauth_token_valid().await
+        };
         if let Err(e) = &oauth_refresh_result {
             tracing::warn!("Failed to refresh Anthropic OAuth token: {}", e);
         }
@@ -1342,7 +1553,9 @@ pub fn run_claudecode_turn<'a>(
         // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
         // For container workspaces, compare workspace auth vs host auth and use the fresher one.
         // If workspace auth is expired, try to refresh it using the refresh token.
-        let api_auth = {
+        let api_auth = if has_cli_creds {
+            None
+        } else {
             // For container workspaces, get both workspace and host auth with expiry info
             let mut workspace_auth = if workspace.workspace_type == WorkspaceType::Container {
                 get_anthropic_auth_from_workspace(&workspace.path)
@@ -1503,44 +1716,14 @@ pub fn run_claudecode_turn<'a>(
             }
         }
 
-        // Fail fast if no auth is available
-        if api_auth.is_none() {
-            let err_msg = "No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
+        // Fail fast only if neither:
+        // - Claude CLI credentials are available (copied into the mission directory), nor
+        // - We have explicit API auth to inject via env vars.
+        if api_auth.is_none() && !has_cli_creds {
+            let err_msg = "No Claude Code credentials detected. Either run `claude /login` on the host, or authenticate in Settings → AI Providers / set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
             tracing::warn!(mission_id = %mission_id, "{}", err_msg);
             return AgentResult::failure(err_msg.to_string(), 0)
                 .with_terminal_reason(TerminalReason::LlmError);
-        }
-
-        // Write Claude Code credentials file with refresh token for long-running missions.
-        // This allows Claude Code to refresh tokens automatically during execution.
-        let is_oauth = matches!(api_auth, Some(ClaudeCodeAuth::OAuthToken(_)));
-        let mut wrote_claude_credentials = false;
-        tracing::debug!(
-            mission_id = %mission_id,
-            is_oauth = is_oauth,
-            workspace_path = %workspace.path.display(),
-            workspace_type = ?workspace.workspace_type,
-            "Checking if should write Claude Code credentials"
-        );
-        if is_oauth {
-            match write_claudecode_credentials_for_workspace(&workspace) {
-                Ok(()) => {
-                    wrote_claude_credentials = true;
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        workspace_type = ?workspace.workspace_type,
-                        "Wrote Claude Code credentials with refresh token for automatic token refresh"
-                    );
-                }
-                Err(e) => {
-                    // Non-fatal: we still have the access token in env var as fallback
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        error = %e,
-                        "Failed to write Claude Code credentials file (token refresh during mission may fail)"
-                    );
-                }
-            }
         }
 
         // Determine CLI path: prefer backend config, then env var, then default
@@ -1627,13 +1810,18 @@ pub fn run_claudecode_turn<'a>(
         // to allow --dangerously-skip-permissions even when running as root.
         args.push("--dangerously-skip-permissions".to_string());
 
-        // Ensure per-workspace MCP config is loaded (Claude CLI may not auto-load .claude in --print mode).
+        // Ensure per-workspace Claude settings are loaded (Claude CLI may not auto-load .claude in --print mode).
+        //
+        // Important: `--mcp-config` expects MCP server definitions, but Claude Code 2.1+ treats raw
+        // paths (e.g. "/root/work...") as JSON strings and can hang after a parse error. `--settings`
+        // reliably loads our `.claude/settings.local.json` file (which includes mcpServers + permissions).
+        //
         // For container workspaces, we must translate the path to be relative to the container filesystem.
-        let mcp_config_path = work_dir.join(".claude").join("settings.local.json");
-        if mcp_config_path.exists() {
-            args.push("--mcp-config".to_string());
+        let settings_path = work_dir.join(".claude").join("settings.local.json");
+        if settings_path.exists() {
+            args.push("--settings".to_string());
             // Translate the path for container execution (host path -> container-relative path)
-            let translated_path = workspace_exec.translate_path_for_container(&mcp_config_path);
+            let translated_path = workspace_exec.translate_path_for_container(&settings_path);
             args.push(translated_path);
         }
 
@@ -1657,9 +1845,19 @@ pub fn run_claudecode_turn<'a>(
                 .unwrap_or(false);
 
         // Determine if we should use --resume:
-        // - If we have assistant messages in history (normal continuation)
-        // - OR if the session was previously initiated for THIS mission (handles crash/cancel case)
-        let use_resume = is_continuation || session_was_initiated;
+        // We can only resume if the session was actually initiated at THIS work_dir
+        // (confirmed by the marker file containing the matching session ID).
+        //
+        // Having assistant messages in history (is_continuation) is NOT sufficient on its own,
+        // because:
+        // - Error messages from failed attempts are recorded as assistant messages
+        // - The session may have been created at a different HOME (e.g., container root
+        //   before per-mission HOME isolation was added)
+        // - The session_id may have been reset (e.g., database update after stuck session)
+        //
+        // Using --resume with a non-existent session causes Claude Code to exit with
+        // "No conversation found with session ID: ..." and code 1.
+        let use_resume = session_was_initiated;
 
         if use_resume {
             args.push("--resume".to_string());
@@ -1690,30 +1888,82 @@ pub fn run_claudecode_turn<'a>(
             );
         }
 
+        // Skip `--agent general-purpose` because it's the default behaviour in
+        // `--print` mode and causes the CLI to hang during "Loading commands and
+        // agents" when spawned from a systemd service (missing interactive
+        // environment).  Non-default agents (e.g. Bash, Explore, Plan) are still
+        // passed through.
         if let Some(a) = agent {
-            args.push("--agent".to_string());
-            args.push(a.to_string());
+            if a != "general-purpose" {
+                args.push("--agent".to_string());
+                args.push(a.to_string());
+            }
         }
+
+        // Provide the prompt as a positional argument (instead of stdin).
+        //
+        // In production we have observed cases where piping stdin from the backend results in
+        // Claude Code producing no stdout events (even though it creates the session files),
+        // leaving missions stuck "Agent is working..." indefinitely.
+        args.push("--".to_string());
+        args.push(effective_message.clone());
 
         // Build environment variables
         let mut env: HashMap<String, String> = HashMap::new();
         // Allow --dangerously-skip-permissions when running as root inside containers.
         env.insert("IS_SANDBOX".to_string(), "1".to_string());
+
+        // Run Claude Code with a per-mission HOME to avoid:
+        // - clobbering global `~/.claude/.credentials.json`
+        // - cross-mission config lock contention inside the shared home dir
+        let mission_home = workspace_exec.translate_path_for_container(work_dir);
+        let xdg_config_home = work_dir.join(".config");
+        let xdg_data_home = work_dir.join(".local").join("share");
+        let xdg_state_home = work_dir.join(".local").join("state");
+        let xdg_cache_home = work_dir.join(".cache");
+
+        for dir in [
+            &xdg_config_home,
+            &xdg_data_home,
+            &xdg_state_home,
+            &xdg_cache_home,
+        ] {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    path = %dir.display(),
+                    error = %e,
+                    "Failed to create per-mission XDG directory"
+                );
+            }
+        }
+
+        env.insert("HOME".to_string(), mission_home);
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            workspace_exec.translate_path_for_container(&xdg_config_home),
+        );
+        env.insert(
+            "XDG_DATA_HOME".to_string(),
+            workspace_exec.translate_path_for_container(&xdg_data_home),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            workspace_exec.translate_path_for_container(&xdg_state_home),
+        );
+        env.insert(
+            "XDG_CACHE_HOME".to_string(),
+            workspace_exec.translate_path_for_container(&xdg_cache_home),
+        );
+
         if let Some(ref auth) = api_auth {
             match auth {
                 ClaudeCodeAuth::OAuthToken(token) => {
                     env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
-                    if wrote_claude_credentials {
-                        tracing::debug!(
-                            "Claude credentials file also written for token refresh (token_len={})",
-                            token.len()
-                        );
-                    } else {
-                        tracing::debug!(
-                            "Using OAuth token for Claude CLI authentication (token_len={})",
-                            token.len()
-                        );
-                    }
+                    tracing::debug!(
+                        "Injecting OAuth token for Claude CLI authentication (token_len={})",
+                        token.len()
+                    );
                 }
                 ClaudeCodeAuth::ApiKey(key) => {
                     env.insert("ANTHROPIC_API_KEY".to_string(), key.clone());
@@ -1721,11 +1971,15 @@ pub fn run_claudecode_turn<'a>(
                 }
             }
         } else {
-            tracing::warn!("No authentication available for Claude Code!");
+            if has_cli_creds {
+                tracing::debug!("Using Claude CLI credentials from mission directory");
+            } else {
+                tracing::warn!("No authentication available for Claude Code!");
+            }
         }
 
         // Handle case where cli_path might be a wrapper command like "bun /path/to/claude"
-        let (program, mut full_args) = if cli_path.contains(' ') {
+        let (mut program, mut full_args) = if cli_path.contains(' ') {
             let parts: Vec<&str> = cli_path.splitn(2, ' ').collect();
             let program = parts[0].to_string();
             let mut full_args = if parts.len() > 1 {
@@ -1739,9 +1993,40 @@ pub fn run_claudecode_turn<'a>(
             (cli_path.clone(), args.clone())
         };
 
-        // Use WorkspaceExec to spawn the CLI in the correct workspace context
-        let mut child = match workspace_exec
-            .spawn_streaming(work_dir, &program, &full_args, env)
+        // Container workaround:
+        //
+        // Claude Code CLI 2.1.x in our container templates uses Bun APIs in some
+        // code paths (e.g. `Bun.which`). When executed under Node it can crash
+        // with `ReferenceError: Bun is not defined`, which breaks automations.
+        //
+        // If Bun is available in the workspace, prefer running Claude via Bun.
+        if workspace.workspace_type == WorkspaceType::Container
+            && env_var_bool("SANDBOXED_SH_CLAUDECODE_USE_BUN", true)
+            && program != "bun"
+            && !program.ends_with("/bun")
+        {
+            let is_claude_program = program == "claude" || program.ends_with("/claude");
+            if is_claude_program && command_available(&workspace_exec, work_dir, "bun").await {
+                if let Some(claude_path) =
+                    resolve_command_path_in_workspace(&workspace_exec, work_dir, &program).await
+                {
+                    program = "bun".to_string();
+                    full_args.insert(0, claude_path);
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        "Running Claude CLI via bun wrapper (container workspace)"
+                    );
+                }
+            }
+        }
+
+        // Use WorkspaceExec to spawn the CLI in the correct workspace context.
+        //
+        // Claude Code 2.1.x can hang indefinitely when stdout is a pipe (non-tty),
+        // even in `--print --output-format stream-json` mode. Running it under a PTY
+        // fixes this and restores streaming.
+        let mut pty = match workspace_exec
+            .spawn_streaming_pty(work_dir, &program, &full_args, env)
             .await
         {
             Ok(child) => child,
@@ -1753,113 +2038,78 @@ pub fn run_claudecode_turn<'a>(
             }
         };
 
-        // Write message to stdin (use effective_message which may have been transformed from slash commands)
-        // Important: We spawn a task but also track it to ensure stdin is written
-        let stdin_task = if let Some(mut stdin) = child.stdin.take() {
-            let msg = effective_message.clone();
-            let mission_id_for_stdin = mission_id;
-            Some(tokio::spawn(async move {
-                // Ensure message ends with a newline (some CLIs require this)
-                let msg_with_newline = if msg.ends_with('\n') {
-                    msg
-                } else {
-                    format!("{}\n", msg)
-                };
-                tracing::debug!(
-                    mission_id = %mission_id_for_stdin,
-                    msg_len = msg_with_newline.len(),
-                    "Writing message to Claude stdin"
-                );
-                if let Err(e) = stdin.write_all(msg_with_newline.as_bytes()).await {
-                    tracing::error!(mission_id = %mission_id_for_stdin, "Failed to write to Claude stdin: {}", e);
-                    return false;
-                }
-                tracing::debug!(mission_id = %mission_id_for_stdin, "Successfully wrote message to Claude stdin");
-                // Flush to ensure data is sent
-                if let Err(e) = stdin.flush().await {
-                    tracing::error!(mission_id = %mission_id_for_stdin, "Failed to flush Claude stdin: {}", e);
-                    return false;
-                }
-                // Close stdin to signal end of input
-                drop(stdin);
-                tracing::debug!(mission_id = %mission_id_for_stdin, "Closed Claude stdin (EOF signaled)");
-                true
-            }))
-        } else {
-            None
-        };
+        // Keep stdin open - dropping the writer (closing stdin) can cause some Claude CLI
+        // agent modes to hang. We pass the prompt via argv so stdin is not needed, but the
+        // CLI may check if stdin is open during initialization.
+        let _stdin_writer = pty.take_writer();
+        tracing::debug!(mission_id = %mission_id, "PTY writer taken (kept alive)");
 
-        // Wait for stdin to be written before proceeding (with timeout)
-        if let Some(task) = stdin_task {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
-                Ok(Ok(true)) => {
-                    tracing::debug!(mission_id = %mission_id, "Stdin write completed successfully");
-                }
-                Ok(Ok(false)) => {
-                    tracing::error!(mission_id = %mission_id, "Stdin write failed");
-                    let _ = child.kill().await;
-                    return AgentResult::failure(
-                        "Failed to write prompt to Claude CLI".to_string(),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError);
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(mission_id = %mission_id, "Stdin task panicked: {:?}", e);
-                    let _ = child.kill().await;
-                    return AgentResult::failure(
-                        "Failed to write prompt to Claude CLI (task panic)".to_string(),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError);
-                }
-                Err(_) => {
-                    tracing::error!(mission_id = %mission_id, "Stdin write timed out after 5s");
-                    let _ = child.kill().await;
-                    return AgentResult::failure(
-                        "Timed out writing prompt to Claude CLI".to_string(),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError);
-                }
+        let reader = match pty.try_clone_reader() {
+            Ok(r) => {
+                tracing::debug!(mission_id = %mission_id, "PTY reader cloned successfully");
+                r
             }
-        }
-
-        // Get stdout for reading events
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                let err_msg = "Failed to capture Claude stdout";
+            Err(e) => {
+                pty.kill();
+                let err_msg = format!("Failed to capture Claude PTY output: {}", e);
                 tracing::error!("{}", err_msg);
-                return AgentResult::failure(err_msg.to_string(), 0)
+                return AgentResult::failure(err_msg, 0)
                     .with_terminal_reason(TerminalReason::LlmError);
             }
         };
 
-        // Capture stderr for debugging
-        let stderr = child.stderr.take();
-        let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
-        let stderr_capture_clone = stderr_capture.clone();
-        let mission_id_for_stderr = mission_id;
-        let mut stderr_handle = if let Some(stderr) = stderr {
-            Some(tokio::spawn(async move {
-                let stderr_reader = BufReader::new(stderr);
-                let mut stderr_lines = stderr_reader.lines();
-                while let Ok(Some(line)) = stderr_lines.next_line().await {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        tracing::debug!(mission_id = %mission_id_for_stderr, stderr = %trimmed, "Claude Code stderr");
-                        let mut captured = stderr_capture_clone.lock().await;
-                        if !captured.is_empty() {
-                            captured.push('\n');
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let reader_mission_id = mission_id.to_string();
+        let reader_handle = tokio::task::spawn_blocking(move || {
+            use std::io::BufRead;
+            tracing::debug!(mission_id = %reader_mission_id, "PTY reader task started, waiting for first read");
+            let mut buf_reader = std::io::BufReader::new(reader);
+            let mut buf: Vec<u8> = Vec::with_capacity(8192);
+            let mut line_count = 0u64;
+            loop {
+                buf.clear();
+                match buf_reader.read_until(b'\n', &mut buf) {
+                    Ok(0) => {
+                        tracing::debug!(
+                            mission_id = %reader_mission_id,
+                            total_lines = line_count,
+                            "PTY reader got EOF"
+                        );
+                        break;
+                    }
+                    Ok(n) => {
+                        line_count += 1;
+                        if line_count <= 3 {
+                            tracing::debug!(
+                                mission_id = %reader_mission_id,
+                                bytes = n,
+                                line_num = line_count,
+                                "PTY reader got line"
+                            );
                         }
-                        captured.push_str(trimmed);
+                        let s = String::from_utf8_lossy(&buf).to_string();
+                        if line_tx.send(s).is_err() {
+                            tracing::debug!(
+                                mission_id = %reader_mission_id,
+                                "PTY reader: channel closed"
+                            );
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            mission_id = %reader_mission_id,
+                            error = %e,
+                            total_lines = line_count,
+                            "PTY reader error"
+                        );
+                        break;
                     }
                 }
-            }))
-        } else {
-            None
-        };
+            }
+        });
+
+        let mut non_json_output: Vec<String> = Vec::new();
 
         // Track tool calls for result mapping
         let mut pending_tools: HashMap<String, String> = HashMap::new();
@@ -1874,136 +2124,116 @@ pub fn run_claudecode_turn<'a>(
         let mut text_buffer: HashMap<u32, String> = HashMap::new();
         let mut last_thinking_len: usize = 0; // Track last emitted length to avoid re-sending same content
         let mut last_text_len: usize = 0; // Track last emitted text length for streaming text deltas
+        let mut thinking_emitted = false;
 
-        let auth_missing = api_auth.is_none();
-        let auth_timeout = std::time::Duration::from_secs(45);
-        // General inactivity timeout - if no output for 5 minutes, something is likely wrong
-        let inactivity_timeout = std::time::Duration::from_secs(300);
-        // Much longer timeout when tools are in progress (30 minutes) - some bash commands
-        // or web fetches can take a very long time
-        let tool_in_progress_timeout = std::time::Duration::from_secs(1800);
-        let mut received_any_event = false;
-        let mut last_activity = std::time::Instant::now();
-
-        // Create a buffered reader for stdout
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
+        let mut saw_non_init_event = false;
+        let startup_timeout = Duration::from_secs(
+            std::env::var("SANDBOXED_SH_CLAUDECODE_STARTUP_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(20),
+        );
+        let idle_timeout = Duration::from_secs(
+            std::env::var("SANDBOXED_SH_CLAUDECODE_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(600),
+        );
+        let startup_deadline = Instant::now() + startup_timeout;
+        let mut idle_deadline = Instant::now() + idle_timeout;
 
         // Process events until completion or cancellation
         loop {
-            // Use auth timeout initially (45s), then inactivity timeout (5min) after first event
-            // Exception: if tools are in progress, use a much longer timeout (30min)
-            let timeout_duration = if !pending_tools.is_empty() {
-                tool_in_progress_timeout
-            } else if received_any_event {
-                inactivity_timeout
-            } else if auth_missing {
-                auth_timeout
-            } else {
-                // Initial startup timeout - allow 2 minutes for CLI to start and connect
-                std::time::Duration::from_secs(120)
-            };
-            let time_since_activity = last_activity.elapsed();
-            let remaining = timeout_duration.saturating_sub(time_since_activity);
-            let mut timeout = tokio::time::sleep(remaining);
-            tokio::pin!(timeout);
             tokio::select! {
                 _ = cancel.cancelled() => {
                     tracing::info!(mission_id = %mission_id, "Claude Code execution cancelled, killing process");
                     // Kill the process to stop consuming API resources
-                    let _ = child.kill().await;
-                    if let Some(handle) = stderr_handle.take() {
-                        handle.abort();
-                    }
+                    pty.kill();
+                    reader_handle.abort();
                     return AgentResult::failure("Cancelled".to_string(), 0)
                         .with_terminal_reason(TerminalReason::Cancelled);
                 }
-                _ = &mut timeout => {
-                    // Timeout fired - determine the appropriate error message
-                    let stderr_content = stderr_capture.lock().await;
-                    let has_network_error = stderr_content.contains("Could not resolve host")
-                        || stderr_content.contains("Connection refused")
-                        || stderr_content.contains("Network is unreachable")
-                        || stderr_content.contains("DNS")
-                        || stderr_content.contains("ENOTFOUND")
-                        || stderr_content.contains("getaddrinfo");
-
-                    // Pre-compute truncated stderr to avoid duplication
-                    let truncated_stderr = if stderr_content.len() > 500 {
-                        let end = safe_truncate_index(&stderr_content, 500);
-                        format!("{}...", &stderr_content[..end])
-                    } else {
-                        stderr_content.to_string()
-                    };
-
-                    let err_msg = if !received_any_event && auth_missing {
-                        "Claude Code produced no output. No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.".to_string()
-                    } else if has_network_error {
-                        format!(
-                            "Claude Code appears stuck due to network issues. Check workspace DNS/network configuration. Stderr: {}",
-                            truncated_stderr
-                        )
-                    } else if !received_any_event {
-                        let stderr_hint = if stderr_content.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" Stderr: {}", truncated_stderr)
-                        };
-                        format!(
-                            "Claude Code produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.{}",
-                            timeout_duration.as_secs(),
-                            stderr_hint
-                        )
-                    } else if !pending_tools.is_empty() {
-                        let tool_names: Vec<_> = pending_tools.values().cloned().collect();
-                        format!(
-                            "Claude Code stopped responding after {}s while waiting for tool(s): {}. The tool(s) may be stuck or taking too long.",
-                            tool_in_progress_timeout.as_secs(),
-                            tool_names.join(", ")
-                        )
-                    } else {
-                        format!(
-                            "Claude Code stopped responding after {}s of inactivity. This may indicate a network issue or API timeout.",
-                            inactivity_timeout.as_secs()
-                        )
-                    };
-
-                    tracing::warn!(mission_id = %mission_id, "{}", err_msg);
-                    let _ = child.kill().await;
-                    if let Some(handle) = stderr_handle.take() {
-                        handle.abort();
+                _ = tokio::time::sleep_until(startup_deadline), if !saw_non_init_event => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        non_json_lines = non_json_output.len(),
+                        non_json_sample = ?non_json_output.first(),
+                        "Claude Code startup timeout - no stream events received"
+                    );
+                    pty.kill();
+                    reader_handle.abort();
+                    let mut msg = "Claude Code produced no stream events after startup timeout. This is typically caused by the Claude CLI hanging when run without a TTY.".to_string();
+                    if !non_json_output.is_empty() {
+                        msg.push_str(&format!(
+                            "\n\nNon-JSON output captured ({} lines):\n{}",
+                            non_json_output.len(),
+                            non_json_output.join("\n")
+                        ));
                     }
-                    return AgentResult::failure(err_msg, 0)
+                    return AgentResult::failure(msg, 0)
                         .with_terminal_reason(TerminalReason::LlmError);
                 }
-                line_result = lines.next_line() => {
-                    match line_result {
-                        Ok(Some(line)) => {
-                            if line.is_empty() {
-                                continue;
-                            }
+                _ = tokio::time::sleep_until(idle_deadline), if saw_non_init_event => {
+                    pty.kill();
+                    reader_handle.abort();
+                    return AgentResult::failure(
+                        "Claude Code produced no output for an extended period and was terminated (idle timeout).".to_string(),
+                        0,
+                    )
+                    .with_terminal_reason(TerminalReason::LlmError);
+                }
+                line_opt = line_rx.recv() => {
+                    let Some(raw_line) = line_opt else {
+                        // EOF - PTY closed
+                        break;
+                    };
 
-                            let claude_event: ClaudeEvent = match serde_json::from_str(&line) {
-                                Ok(event) => event,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        mission_id = %mission_id,
-                                        "Failed to parse Claude event: {} - line: {}",
-                                        e,
-                                        if line.len() > 200 {
-                                            let end = safe_truncate_index(&line, 200);
-                                            format!("{}...", &line[..end])
-                                        } else {
-                                            line.clone()
-                                        }
-                                    );
-                                    continue;
+                    idle_deadline = Instant::now() + idle_timeout;
+
+                    let raw_line = raw_line.trim_end_matches(&['\r', '\n'][..]);
+                    let mut cleaned = strip_ansi_codes(raw_line);
+                    // The Claude CLI can occasionally emit NUL/control characters on PTY streams
+                    // (e.g. leading '^@') which breaks JSON parsing. Remove them before parsing.
+                    cleaned.retain(|ch| !ch.is_control());
+                    let line = cleaned.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    if !line.starts_with('{') {
+                        // Preserve a small excerpt for diagnostics on "no output" failures.
+                        if non_json_output.len() < 20 {
+                            non_json_output.push(if line.len() > 200 {
+                                let end = safe_truncate_index(line, 200);
+                                format!("{}...", &line[..end])
+                            } else {
+                                line.to_string()
+                            });
+                        }
+                        continue;
+                    }
+
+                    let claude_event: ClaudeEvent = match serde_json::from_str(line) {
+                        Ok(event) => event,
+                        Err(e) => {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                "Failed to parse Claude event: {} - line: {}",
+                                e,
+                                if line.len() > 200 {
+                                    let end = safe_truncate_index(line, 200);
+                                    format!("{}...", &line[..end])
+                                } else {
+                                    line.to_string()
                                 }
-                            };
+                            );
+                            continue;
+                        }
+                    };
 
-                            // Track activity for timeout detection
-                            received_any_event = true;
-                            last_activity = std::time::Instant::now();
+                    if !matches!(claude_event, ClaudeEvent::System(_)) {
+                        saw_non_init_event = true;
+                    }
 
                             match claude_event {
                                 ClaudeEvent::System(sys) => {
@@ -2015,10 +2245,18 @@ pub fn run_claudecode_turn<'a>(
                                 ClaudeEvent::StreamEvent(wrapper) => {
                                     match wrapper.event {
                                         StreamEvent::ContentBlockDelta { index, delta } => {
+                                            let block_type = block_types
+                                                .get(&index)
+                                                .map(|value| value.as_str());
+                                            let is_thinking_block =
+                                                matches!(block_type, Some("thinking"));
                                             // Check the delta type to determine where to route content
                                             // "thinking_delta" -> thinking panel (uses delta.thinking field)
                                             // "text_delta" -> text output (uses delta.text field)
-                                            if delta.delta_type == "thinking_delta" {
+                                            if delta.delta_type == "thinking_delta"
+                                                || (is_thinking_block
+                                                    && delta.delta_type == "text_delta")
+                                            {
                                                 // For thinking deltas, check both `thinking` and `text` fields
                                                 // Extended thinking uses `thinking`, but some versions use `text`
                                                 let thinking_text = delta.thinking.or(delta.text.clone());
@@ -2041,6 +2279,7 @@ pub fn run_claudecode_turn<'a>(
                                                                 done: false,
                                                                 mission_id: Some(mission_id),
                                                             });
+                                                            thinking_emitted = true;
                                                         }
                                                     }
                                                 }
@@ -2089,7 +2328,25 @@ pub fn run_claudecode_turn<'a>(
                                                 // Text content is the final assistant response
                                                 // Don't send as Thinking - it will be in the final AssistantMessage
                                                 if !text.is_empty() {
-                                                    final_result = text;
+                                                    if !thinking_emitted {
+                                                        if let Some((thought, cleaned)) =
+                                                            extract_thought_line(&text)
+                                                        {
+                                                            let _ = events_tx.send(
+                                                                AgentEvent::Thinking {
+                                                                    content: thought,
+                                                                    done: true,
+                                                                    mission_id: Some(mission_id),
+                                                                },
+                                                            );
+                                                            thinking_emitted = true;
+                                                            final_result = cleaned;
+                                                        } else {
+                                                            final_result = text;
+                                                        }
+                                                    } else {
+                                                        final_result = text;
+                                                    }
                                                 }
                                             }
                                             ContentBlock::ToolUse { id, name, input } => {
@@ -2112,10 +2369,8 @@ pub fn run_claudecode_turn<'a>(
                                                         let hub = Arc::clone(hub);
                                                         let rx = hub.register(id.clone()).await;
 
-                                                        let _ = child.kill().await;
-                                                        if let Some(handle) = stderr_handle.take() {
-                                                            handle.abort();
-                                                        }
+                                                        pty.kill();
+                                                        reader_handle.abort();
 
                                                         let answer = tokio::select! {
                                                             _ = cancel.cancelled() => {
@@ -2175,6 +2430,7 @@ pub fn run_claudecode_turn<'a>(
                                                         done: true, // Mark as done since this is the final block
                                                         mission_id: Some(mission_id),
                                                     });
+                                                    thinking_emitted = true;
                                                 }
                                             }
                                             _ => {}
@@ -2216,21 +2472,24 @@ pub fn run_claudecode_turn<'a>(
                                     if let Some(cost) = res.total_cost_usd {
                                         total_cost_usd = cost;
                                     }
-                                    // Check for errors: explicit error flags OR result text that looks like an API error
-                                    let result_text = res.result.clone().unwrap_or_default();
-                                    let looks_like_api_error = result_text.starts_with("API Error:")
-                                        || result_text.contains("\"type\":\"error\"")
-                                        || result_text.contains("\"type\":\"overloaded_error\"")
-                                        || result_text.contains("\"type\":\"api_error\"");
+                                    // Check for errors: explicit error flags OR embedded API error payloads.
+                                    //
+                                    // Note: Claude Code may populate error details in `error` / `message`
+                                    // fields (not just `result`). Use `error_message()` for best-effort
+                                    // extraction.
+                                    let error_msg = res.error_message();
+                                    let looks_like_api_error = error_msg.starts_with("API Error:")
+                                        || error_msg.contains("\"type\":\"error\"")
+                                        || error_msg.contains("\"type\":\"overloaded_error\"")
+                                        || error_msg.contains("\"type\":\"api_error\"");
 
                                     if res.is_error || res.subtype == "error" || looks_like_api_error {
                                         had_error = true;
-                                        let err_msg = if result_text.is_empty() { "Unknown error".to_string() } else { result_text };
                                         // Don't send an Error event here - let the failure propagate
                                         // through the AgentResult. control.rs will emit an AssistantMessage
                                         // with success=false which the UI displays as a failure message.
                                         // Sending Error here would cause duplicate messages.
-                                        final_result = err_msg;
+                                        final_result = error_msg;
                                     } else if let Some(result) = res.result {
                                         final_result = result;
                                     }
@@ -2242,36 +2501,28 @@ pub fn run_claudecode_turn<'a>(
                                     break;
                                 }
                             }
-                        }
-                        Ok(None) => {
-                            // EOF - process finished
-                            tracing::debug!(
-                                mission_id = %mission_id,
-                                received_any_event = received_any_event,
-                                final_result_len = final_result.len(),
-                                had_error = had_error,
-                                "Claude stdout EOF reached"
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!(mission_id = %mission_id, "Error reading from Claude CLI: {}", e);
-                            break;
-                        }
-                    }
                 }
             }
         }
 
-        // Wait for child process to finish and clean up
-        tracing::debug!(mission_id = %mission_id, "Event loop completed, waiting for child process");
-        let exit_status = child.wait().await;
-        tracing::debug!(mission_id = %mission_id, exit_status = ?exit_status, "Child process exited");
+        // Wait for child process to finish and clean up.
+        tracing::debug!(
+            mission_id = %mission_id,
+            "Event loop completed, waiting for Claude Code process"
+        );
+        let exit_status = tokio::task::spawn_blocking(move || {
+            let mut pty = pty;
+            pty.wait()
+        })
+        .await;
+        tracing::debug!(
+            mission_id = %mission_id,
+            exit_status = ?exit_status,
+            "Claude Code process exited"
+        );
 
-        // Wait for stderr capture to complete
-        if let Some(handle) = stderr_handle {
-            let _ = handle.await;
-        }
+        // Ensure the PTY reader task stops (it should naturally end after process exit).
+        let _ = reader_handle.await;
 
         // Convert cost from USD to cents
         let cost_cents = (total_cost_usd * 100.0) as u64;
@@ -2296,32 +2547,37 @@ pub fn run_claudecode_turn<'a>(
 
         if final_result.trim().is_empty() && !had_error {
             had_error = true;
-            // Include stderr in error message if available
-            let stderr_content = stderr_capture.lock().await;
-            if !stderr_content.is_empty() {
+            if !non_json_output.is_empty() {
                 tracing::warn!(
                     mission_id = %mission_id,
-                    stderr = %stderr_content,
                     exit_status = ?exit_status,
-                    "Claude Code produced no output but had stderr"
+                    "Claude Code produced no parseable JSON output"
                 );
                 final_result = format!(
-                    "Claude Code error: {}",
-                    stderr_content
-                        .lines()
-                        .take(5)
-                        .collect::<Vec<_>>()
-                        .join(" | ")
+                    "Claude Code produced no parseable output. Last output: {}",
+                    non_json_output.join(" | ")
                 );
             } else {
                 tracing::warn!(
                     mission_id = %mission_id,
                     exit_status = ?exit_status,
-                    "Claude Code produced no output and no stderr"
+                    "Claude Code produced no output"
                 );
                 final_result =
                     "Claude Code produced no output. Check CLI installation or authentication."
                         .to_string();
+            }
+        }
+
+        // If Claude reported an error but didn't provide a useful message, fall back to raw output.
+        if had_error && (final_result.trim().is_empty() || final_result.trim() == "Unknown error") {
+            if !non_json_output.is_empty() {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    exit_status = ?exit_status,
+                    "Claude Code failed with empty/generic error; using raw output excerpt"
+                );
+                final_result = format!("Claude Code error: {}", non_json_output.join(" | "));
             }
         }
 
@@ -4278,6 +4534,34 @@ async fn command_available(
     false
 }
 
+async fn resolve_command_path_in_workspace(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    program: &str,
+) -> Option<String> {
+    if program.contains('/') {
+        return Some(program.to_string());
+    }
+
+    let mut args = Vec::new();
+    args.push("-lc".to_string());
+    args.push(format!("command -v {} 2>/dev/null", program));
+    let output = workspace_exec
+        .output(cwd, "/bin/sh", &args, HashMap::new())
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path = stdout.lines().next().unwrap_or("").trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
 /// Check basic internet connectivity using a reliable public endpoint.
 /// This verifies the workspace has any network access at all.
 async fn check_basic_internet_connectivity(
@@ -4590,9 +4874,24 @@ async fn ensure_claudecode_cli_available(
     cwd: &std::path::Path,
     cli_path: &str,
 ) -> Result<String, String> {
-    // Check if claude is available at the specified path
-    if command_available(workspace_exec, cwd, cli_path).await {
-        return Ok(cli_path.to_string());
+    // Allow wrapper commands like `bun /path/to/claude` by validating the
+    // leading program (and optionally the first argument if it looks like a program).
+    let mut parts = cli_path.split_whitespace();
+    let program = parts.next().unwrap_or(cli_path);
+    let arg0 = parts.next();
+
+    // Check if the wrapper program exists.
+    if command_available(workspace_exec, cwd, program).await {
+        // If a wrapper is used (e.g. bun <script>), also sanity-check that the
+        // wrapped target exists so we don't claim success and then fail at spawn time.
+        if let Some(arg0) = arg0 {
+            // Skip flags like `--something`; only validate likely program/path tokens.
+            if !arg0.starts_with('-') && command_available(workspace_exec, cwd, arg0).await {
+                return Ok(cli_path.to_string());
+            }
+        } else {
+            return Ok(cli_path.to_string());
+        }
     }
 
     // Also check bun's global bin directory (bun installs globals to ~/.cache/.bun/bin/)
@@ -4717,6 +5016,279 @@ async fn ensure_claudecode_cli_available(
         "Claude Code install completed but '{}' is still not available in workspace PATH.",
         cli_path
     ))
+}
+
+/// Returns the path to the Codex CLI that should be used.
+async fn ensure_codex_cli_available(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> Result<String, String> {
+    let program = cli_path.splitn(2, ' ').next().unwrap_or(cli_path);
+
+    // For container workspaces, the Codex npm package ships a Node.js ESM wrapper
+    // that requires Node 20+. Containers often only have Node 18, which fails with
+    // "Cannot use import statement outside a module". The package also ships a
+    // native Rust binary in vendor/<triple>/codex/codex that works standalone.
+    //
+    // IMPORTANT: try the native binary copy BEFORE `command_available` — a previous
+    // mission may have left the broken Node.js wrapper at /usr/local/bin/codex,
+    // which passes `command_available` but fails at runtime.
+    if workspace_exec.workspace.workspace_type == WorkspaceType::Container {
+        if let Some(resolved) = resolve_host_executable(program) {
+            let native = resolve_openai_codex_native_binary(&resolved);
+            tracing::info!(
+                host_path = %resolved.display(),
+                native_binary = ?native.as_ref().map(|p| p.display().to_string()),
+                "Codex CLI host resolution for container"
+            );
+            let to_copy = native.unwrap_or(resolved);
+            if let Ok(dest_in_container) =
+                copy_host_executable_into_container(&workspace_exec.workspace, &to_copy)
+            {
+                let rest = cli_path.splitn(2, ' ').nth(1).unwrap_or("").trim();
+                let container_cli = if rest.is_empty() {
+                    dest_in_container.clone()
+                } else {
+                    format!("{} {}", dest_in_container, rest)
+                };
+
+                let dest_program = container_cli
+                    .splitn(2, ' ')
+                    .next()
+                    .unwrap_or(&dest_in_container);
+                if command_available(workspace_exec, cwd, dest_program).await {
+                    tracing::info!(
+                        host_source = %to_copy.display(),
+                        container_path = %dest_program,
+                        "Copied Codex CLI into container workspace"
+                    );
+                    return Ok(container_cli);
+                }
+            }
+        }
+    }
+
+    // Check if already available (host workspace, or container with working binary)
+    if command_available(workspace_exec, cwd, program).await {
+        return Ok(cli_path.to_string());
+    }
+
+    // Check bun's global bin directories (bun installs globals to ~/.cache/.bun/bin/)
+    const BUN_GLOBAL_CODEX_PATHS: &[&str] =
+        &["/root/.cache/.bun/bin/codex", "/root/.bun/bin/codex"];
+    for codex_path in BUN_GLOBAL_CODEX_PATHS {
+        if command_available(workspace_exec, cwd, codex_path).await {
+            tracing::info!(
+                path = %codex_path,
+                "Found Codex CLI in bun global bin"
+            );
+            return Ok(codex_path.to_string());
+        }
+    }
+
+    // Auto-install Codex CLI if enabled (defaults to true)
+    let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_CODEX", true);
+    if !auto_install {
+        return Err(format!(
+            "Codex CLI '{}' not found in workspace. Install it or set CODEX_CLI_PATH.",
+            cli_path
+        ));
+    }
+
+    let has_bun = command_available(workspace_exec, cwd, "bun").await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+    let has_npm = command_available(workspace_exec, cwd, "npm").await;
+
+    if !has_bun && !has_npm {
+        return Err(format!(
+            "Codex CLI '{}' not found and neither npm nor bun is available in the workspace. Install Node.js/npm or Bun in the workspace template, or set CODEX_CLI_PATH.",
+            cli_path
+        ));
+    }
+
+    let install_cmd = if has_bun {
+        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @openai/codex@latest 2>&1"#
+    } else {
+        "npm install -g @openai/codex@latest 2>&1"
+    };
+
+    tracing::info!(
+        installer = if has_bun { "bun" } else { "npm" },
+        "Auto-installing Codex CLI"
+    );
+
+    let output = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &["-lc".to_string(), install_cmd.to_string()],
+            std::collections::HashMap::new(),
+        )
+        .await
+        .map_err(|e| format!("Failed to install Codex CLI: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut message = String::new();
+        if !stderr.trim().is_empty() {
+            message.push_str(stderr.trim());
+        }
+        if !stdout.trim().is_empty() {
+            if !message.is_empty() {
+                message.push_str(" | ");
+            }
+            message.push_str(stdout.trim());
+        }
+        if message.is_empty() {
+            message = "Codex CLI install failed with no output".to_string();
+        }
+        return Err(format!("Codex CLI install failed: {}", message));
+    }
+
+    // Re-check availability after install
+    if command_available(workspace_exec, cwd, cli_path).await {
+        return Ok(cli_path.to_string());
+    }
+    for codex_path in BUN_GLOBAL_CODEX_PATHS {
+        if command_available(workspace_exec, cwd, codex_path).await {
+            tracing::info!(
+                path = %codex_path,
+                "Codex CLI available after auto-install"
+            );
+            return Ok(codex_path.to_string());
+        }
+    }
+
+    Err(format!(
+        "Codex CLI install completed but '{}' is still not available in workspace PATH.",
+        cli_path
+    ))
+}
+
+fn resolve_openai_codex_native_binary(
+    wrapper_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    // If `codex` was installed via npm/bun (@openai/codex), the entrypoint is a Node
+    // wrapper script that expects its surrounding package layout (package.json, vendor/).
+    //
+    // When we copy it into a container as a standalone file, Node runs it as CJS and it
+    // fails to import ESM. Instead, copy the actual native binary shipped in vendor/.
+    let real = match std::fs::canonicalize(wrapper_path) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(
+                path = %wrapper_path.display(),
+                error = %e,
+                "Failed to canonicalize Codex wrapper path"
+            );
+            return None;
+        }
+    };
+
+    let file_name = real.file_name().and_then(|n| n.to_str());
+    tracing::debug!(
+        wrapper = %wrapper_path.display(),
+        canonical = %real.display(),
+        file_name = ?file_name,
+        "Resolving Codex native binary"
+    );
+
+    if file_name.is_some_and(|n| n == "codex.js") {
+        // .../@openai/codex/bin/codex.js
+        let package_root = real.parent()?.parent()?;
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+
+        let triple = match (os, arch) {
+            ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+            ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+            ("macos", "x86_64") => "x86_64-apple-darwin",
+            ("macos", "aarch64") => "aarch64-apple-darwin",
+            _ => {
+                tracing::debug!(os, arch, "No Codex native binary triple for this platform");
+                return None;
+            }
+        };
+
+        let binary_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let native = package_root
+            .join("vendor")
+            .join(triple)
+            .join("codex")
+            .join(binary_name);
+        if native.is_file() {
+            tracing::info!(
+                native_path = %native.display(),
+                "Found Codex native binary"
+            );
+            return Some(native);
+        }
+        tracing::debug!(
+            expected = %native.display(),
+            "Codex native binary not found at expected path"
+        );
+    }
+
+    None
+}
+
+fn resolve_host_executable(program: &str) -> Option<std::path::PathBuf> {
+    if program.contains('/') {
+        let p = std::path::PathBuf::from(program);
+        if p.is_file() {
+            return Some(p);
+        }
+        return None;
+    }
+
+    let path_var = std::env::var("PATH").ok()?;
+    for dir in path_var.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = std::path::Path::new(dir).join(program);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn copy_host_executable_into_container(
+    workspace: &crate::workspace::Workspace,
+    host_executable: &std::path::Path,
+) -> Result<String, String> {
+    let name = host_executable
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "Host executable has invalid filename".to_string())?;
+
+    let dest_dir = workspace.path.join("usr").join("local").join("bin");
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("Failed to create container /usr/local/bin: {}", e))?;
+
+    let dest = dest_dir.join(name);
+    let tmp = dest_dir.join(format!("{}.tmp", name));
+    std::fs::copy(host_executable, &tmp).map_err(|e| {
+        format!(
+            "Failed to copy host executable {} into container: {}",
+            host_executable.display(),
+            e
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+    }
+
+    std::fs::rename(&tmp, &dest)
+        .map_err(|e| format!("Failed to finalize container executable: {}", e))?;
+
+    Ok(format!("/usr/local/bin/{}", name))
 }
 
 fn runner_is_oh_my_opencode(path: &str) -> bool {
@@ -4946,6 +5518,8 @@ pub async fn run_opencode_turn(
         }
     }
 
+    let needs_google = matches!(provider_hint.as_deref(), Some("google" | "gemini"));
+
     let fallback_provider = if has_openai {
         Some("openai")
     } else if has_google {
@@ -5053,7 +5627,7 @@ pub async fn run_opencode_turn(
         runner_is_direct,
         has_openai,
         has_anthropic,
-        has_google,
+        needs_google,
     )
     .await;
     sync_opencode_agent_config(
@@ -5071,7 +5645,7 @@ pub async fn run_opencode_turn(
     if resolved_model.is_none() {
         resolved_model = agent_model.clone();
     }
-    if has_google {
+    if needs_google {
         if let Some(project_id) = detect_google_project_id() {
             ensure_opencode_google_project_id(&opencode_config_dir_host, &project_id);
         }
@@ -5282,176 +5856,194 @@ pub async fn run_opencode_turn(
     let mut had_error = false;
     let session_id_capture: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let sse_emitted_thinking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sse_emitted_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sse_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let sse_cancel = CancellationToken::new();
 
     // oh-my-opencode doesn't support --format json, so use SSE curl for events.
     let use_json_stdout = false;
-    let sse_handle =
-        if !use_json_stdout && command_available(&workspace_exec, work_dir, "curl").await {
-            let workspace_exec = workspace_exec.clone();
-            let work_dir = work_dir.to_path_buf();
-            let work_dir_arg = work_dir_arg.clone();
-            let session_id_capture = session_id_capture.clone();
-            let sse_emitted_thinking = sse_emitted_thinking.clone();
-            let sse_done_sent = sse_done_sent.clone();
-            let sse_cancel = sse_cancel.clone();
-            let events_tx = events_tx.clone();
-            let opencode_port = opencode_port.clone();
-            let mission_id = mission_id;
-            let sse_host = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "127.0.0.1".to_string());
+    let sse_handle = if !use_json_stdout
+        && command_available(&workspace_exec, work_dir, "curl").await
+    {
+        let workspace_exec = workspace_exec.clone();
+        let work_dir = work_dir.to_path_buf();
+        let work_dir_arg = work_dir_arg.clone();
+        let session_id_capture = session_id_capture.clone();
+        let sse_emitted_thinking = sse_emitted_thinking.clone();
+        let sse_emitted_text = sse_emitted_text.clone();
+        let sse_done_sent = sse_done_sent.clone();
+        let sse_error_message = sse_error_message.clone();
+        let sse_cancel = sse_cancel.clone();
+        let events_tx = events_tx.clone();
+        let opencode_port = opencode_port.clone();
+        let mission_id = mission_id;
+        let sse_host = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
 
-            Some(tokio::spawn(async move {
-                let event_url = format!(
-                    "http://{}:{}/event?directory={}",
-                    sse_host,
-                    opencode_port,
-                    urlencoding::encode(&work_dir_arg)
-                );
+        Some(tokio::spawn(async move {
+            let event_url = format!(
+                "http://{}:{}/event?directory={}",
+                sse_host,
+                opencode_port,
+                urlencoding::encode(&work_dir_arg)
+            );
 
-                let mut attempts = 0u32;
+            let mut attempts = 0u32;
+            loop {
+                if sse_cancel.is_cancelled() {
+                    break;
+                }
+                if attempts > 5 {
+                    break;
+                }
+                attempts += 1;
+
+                let args = vec![
+                    "-N".to_string(),
+                    "-s".to_string(),
+                    "-H".to_string(),
+                    "Accept: text/event-stream".to_string(),
+                    "-H".to_string(),
+                    "Cache-Control: no-cache".to_string(),
+                    event_url.clone(),
+                ];
+
+                let child = workspace_exec
+                    .spawn_streaming(&work_dir, "curl", &args, HashMap::new())
+                    .await;
+
+                let mut child = match child {
+                    Ok(child) => child,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        continue;
+                    }
+                };
+
+                let stdout = match child.stdout.take() {
+                    Some(stdout) => stdout,
+                    None => {
+                        let _ = child.kill().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        continue;
+                    }
+                };
+
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                let mut current_event: Option<String> = None;
+                let mut data_lines: Vec<String> = Vec::new();
+                let mut state = OpencodeSseState::default();
+                let mut saw_complete = false;
+
                 loop {
                     if sse_cancel.is_cancelled() {
-                        break;
+                        let _ = child.kill().await;
+                        return;
                     }
-                    if attempts > 5 {
-                        break;
-                    }
-                    attempts += 1;
-
-                    let args = vec![
-                        "-N".to_string(),
-                        "-s".to_string(),
-                        "-H".to_string(),
-                        "Accept: text/event-stream".to_string(),
-                        "-H".to_string(),
-                        "Cache-Control: no-cache".to_string(),
-                        event_url.clone(),
-                    ];
-
-                    let child = workspace_exec
-                        .spawn_streaming(&work_dir, "curl", &args, HashMap::new())
-                        .await;
-
-                    let mut child = match child {
-                        Ok(child) => child,
-                        Err(_) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                            continue;
-                        }
-                    };
-
-                    let stdout = match child.stdout.take() {
-                        Some(stdout) => stdout,
-                        None => {
-                            let _ = child.kill().await;
-                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                            continue;
-                        }
-                    };
-
-                    let mut reader = BufReader::new(stdout);
-                    let mut line = String::new();
-                    let mut current_event: Option<String> = None;
-                    let mut data_lines: Vec<String> = Vec::new();
-                    let mut state = OpencodeSseState::default();
-                    let mut saw_complete = false;
-
-                    loop {
-                        if sse_cancel.is_cancelled() {
-                            let _ = child.kill().await;
-                            return;
-                        }
-                        line.clear();
-                        match reader.read_line(&mut line).await {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                let trimmed = line.trim_end();
-                                if trimmed.is_empty() {
-                                    if !data_lines.is_empty() {
-                                        let data = data_lines.join("\n");
-                                        let current_session =
-                                            session_id_capture.lock().unwrap().clone();
-                                        if let Some(parsed) = parse_opencode_sse_event(
-                                            &data,
-                                            current_event.as_deref(),
-                                            current_session.as_deref(),
-                                            &mut state,
-                                            mission_id,
-                                        ) {
-                                            if let Some(session_id) = parsed.session_id {
-                                                let mut guard = session_id_capture.lock().unwrap();
-                                                if guard.is_none() {
-                                                    *guard = Some(session_id);
-                                                }
-                                            }
-                                            if let Some(event) = parsed.event {
-                                                if matches!(event, AgentEvent::Thinking { .. }) {
-                                                    sse_emitted_thinking.store(
-                                                        true,
-                                                        std::sync::atomic::Ordering::SeqCst,
-                                                    );
-                                                }
-                                                let _ = events_tx.send(event);
-                                            }
-                                            if parsed.message_complete {
-                                                saw_complete = true;
-                                                if sse_emitted_thinking
-                                                    .load(std::sync::atomic::Ordering::SeqCst)
-                                                    && !sse_done_sent
-                                                        .load(std::sync::atomic::Ordering::SeqCst)
-                                                {
-                                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                                        content: String::new(),
-                                                        done: true,
-                                                        mission_id: Some(mission_id),
-                                                    });
-                                                    sse_done_sent.store(
-                                                        true,
-                                                        std::sync::atomic::Ordering::SeqCst,
-                                                    );
-                                                }
-                                                let _ = child.kill().await;
-                                                break;
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim_end();
+                            if trimmed.is_empty() {
+                                if !data_lines.is_empty() {
+                                    let data = data_lines.join("\n");
+                                    let current_session =
+                                        session_id_capture.lock().unwrap().clone();
+                                    if let Some(parsed) = parse_opencode_sse_event(
+                                        &data,
+                                        current_event.as_deref(),
+                                        current_session.as_deref(),
+                                        &mut state,
+                                        mission_id,
+                                    ) {
+                                        if let Some(session_id) = parsed.session_id {
+                                            let mut guard = session_id_capture.lock().unwrap();
+                                            if guard.is_none() {
+                                                *guard = Some(session_id);
                                             }
                                         }
+                                        if let Some(event) = parsed.event {
+                                            if let AgentEvent::Error { ref message, .. } = event {
+                                                let mut guard = sse_error_message.lock().unwrap();
+                                                if guard.is_none() {
+                                                    *guard = Some(message.clone());
+                                                }
+                                            }
+                                            if matches!(event, AgentEvent::Thinking { .. }) {
+                                                sse_emitted_thinking.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                            }
+                                            if matches!(event, AgentEvent::TextDelta { .. }) {
+                                                sse_emitted_text.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                            }
+                                            let _ = events_tx.send(event);
+                                        }
+                                        if parsed.message_complete {
+                                            saw_complete = true;
+                                            if sse_emitted_thinking
+                                                .load(std::sync::atomic::Ordering::SeqCst)
+                                                && !sse_done_sent
+                                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                            {
+                                                let _ = events_tx.send(AgentEvent::Thinking {
+                                                    content: String::new(),
+                                                    done: true,
+                                                    mission_id: Some(mission_id),
+                                                });
+                                                sse_done_sent.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                            }
+                                            let _ = child.kill().await;
+                                            break;
+                                        }
                                     }
-
-                                    current_event = None;
-                                    data_lines.clear();
-                                    continue;
                                 }
 
-                                if let Some(rest) = trimmed.strip_prefix("event:") {
-                                    current_event = Some(rest.trim_start().to_string());
-                                    continue;
-                                }
-
-                                if let Some(rest) = trimmed.strip_prefix("data:") {
-                                    data_lines.push(rest.trim_start().to_string());
-                                    continue;
-                                }
+                                current_event = None;
+                                data_lines.clear();
+                                continue;
                             }
-                            Err(_) => break,
-                        }
-                    }
 
-                    let _ = child.kill().await;
-                    if saw_complete {
-                        break;
+                            if let Some(rest) = trimmed.strip_prefix("event:") {
+                                current_event = Some(rest.trim_start().to_string());
+                                continue;
+                            }
+
+                            if let Some(rest) = trimmed.strip_prefix("data:") {
+                                data_lines.push(rest.trim_start().to_string());
+                                continue;
+                            }
+                        }
+                        Err(_) => break,
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
-            }))
-        } else {
-            None
-        };
+
+                let _ = child.kill().await;
+                if saw_complete {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }))
+    } else {
+        None
+    };
 
     // Spawn a task to read stderr (just log in JSON mode, events come on stdout)
     let mission_id_clone = mission_id;
+    let stderr_error_capture = sse_error_message.clone();
     let stderr_handle = if let Some(stderr) = stderr {
         Some(tokio::spawn(async move {
             let stderr_reader = BufReader::new(stderr);
@@ -5460,6 +6052,21 @@ pub async fn run_opencode_turn(
                 let clean = line.trim().to_string();
                 if !clean.is_empty() {
                     tracing::debug!(mission_id = %mission_id_clone, line = %clean, "OpenCode CLI stderr");
+
+                    // Detect session errors from stderr
+                    let lower = clean.to_lowercase();
+                    if lower.contains("session.error") || lower.contains("session ended with error")
+                    {
+                        if let Some(pos) = clean.find(": ") {
+                            let err_part = clean[pos + 2..].trim();
+                            if !err_part.is_empty() {
+                                let mut guard = stderr_error_capture.lock().unwrap();
+                                if guard.is_none() {
+                                    *guard = Some(err_part.to_string());
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }))
@@ -5473,30 +6080,7 @@ pub async fn run_opencode_turn(
     let mut stdout_lines = stdout_reader.lines();
     let mut state = OpencodeSseState::default();
 
-    // Timeout handling for stalled missions
-    let startup_timeout = std::time::Duration::from_secs(120);
-    let inactivity_timeout = std::time::Duration::from_secs(300);
-    // Much longer timeout when tools are in progress (30 minutes) - some bash commands
-    // or web fetches can take a very long time
-    let tool_in_progress_timeout = std::time::Duration::from_secs(1800);
-    let mut received_any_event = false;
-    let mut last_activity = std::time::Instant::now();
-
     loop {
-        // Check if any tools are pending (started but not completed)
-        let has_pending_tools = state.emitted_tool_calls.len() > state.emitted_tool_results.len();
-        let timeout_duration = if has_pending_tools {
-            tool_in_progress_timeout
-        } else if received_any_event {
-            inactivity_timeout
-        } else {
-            startup_timeout
-        };
-        let time_since_activity = last_activity.elapsed();
-        let remaining = timeout_duration.saturating_sub(time_since_activity);
-        let mut timeout = tokio::time::sleep(remaining);
-        tokio::pin!(timeout);
-
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!(mission_id = %mission_id, "OpenCode execution cancelled, killing process");
@@ -5510,35 +6094,6 @@ pub async fn run_opencode_turn(
                 }
                 return AgentResult::failure("Cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
-            }
-            _ = &mut timeout => {
-                let err_msg = if !received_any_event {
-                    format!(
-                        "OpenCode produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.",
-                        startup_timeout.as_secs()
-                    )
-                } else if has_pending_tools {
-                    format!(
-                        "OpenCode stopped responding after {}s while waiting for tool(s) to complete. The tool(s) may be stuck or taking too long.",
-                        tool_in_progress_timeout.as_secs()
-                    )
-                } else {
-                    format!(
-                        "OpenCode stopped responding after {}s of inactivity. This may indicate a network issue or API timeout.",
-                        inactivity_timeout.as_secs()
-                    )
-                };
-                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
-                let _ = child.kill().await;
-                if let Some(handle) = stderr_handle {
-                    handle.abort();
-                }
-                sse_cancel.cancel();
-                if let Some(handle) = sse_handle {
-                    handle.abort();
-                }
-                return AgentResult::failure(err_msg, 0)
-                    .with_terminal_reason(TerminalReason::LlmError);
             }
             line_result = stdout_lines.next_line() => {
                 match line_result {
@@ -5554,10 +6109,6 @@ pub async fn run_opencode_turn(
 
                         // Try to parse as JSON event
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                            // Track activity for timeout detection
-                            received_any_event = true;
-                            last_activity = std::time::Instant::now();
-
                             let event_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
                             tracing::debug!(
                                 mission_id = %mission_id,
@@ -5610,8 +6161,17 @@ pub async fn run_opencode_turn(
                                     }
                                 }
                                 if let Some(event) = parsed.event {
+                                    if let AgentEvent::Error { ref message, .. } = event {
+                                        let mut guard = sse_error_message.lock().unwrap();
+                                        if guard.is_none() {
+                                            *guard = Some(message.clone());
+                                        }
+                                    }
                                     if matches!(event, AgentEvent::Thinking { .. }) {
                                         sse_emitted_thinking.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                    if matches!(event, AgentEvent::TextDelta { .. }) {
+                                        sse_emitted_text.store(true, std::sync::atomic::Ordering::SeqCst);
                                     }
                                     let _ = events_tx.send(event);
                                 }
@@ -5631,11 +6191,25 @@ pub async fn run_opencode_turn(
                             }
                         } else {
                             // Non-JSON line - this is the expected output format without --format json
-                            // Track activity for timeout detection (same as JSON events)
-                            received_any_event = true;
-                            last_activity = std::time::Instant::now();
-
                             tracing::debug!(mission_id = %mission_id, line = %trimmed, "OpenCode stdout");
+
+                            // Detect error lines from CLI stdout
+                            let lower = trimmed.to_lowercase();
+                            if lower.contains("session ended with error")
+                                || lower.contains("session.error")
+                            {
+                                had_error = true;
+                                if let Some(pos) = trimmed.find(": ") {
+                                    let err_part = trimmed[pos + 2..].trim();
+                                    if !err_part.is_empty() {
+                                        let mut guard = sse_error_message.lock().unwrap();
+                                        if guard.is_none() {
+                                            *guard = Some(err_part.to_string());
+                                        }
+                                    }
+                                }
+                            }
+
                             final_result.push_str(trimmed);
                             final_result.push('\n');
                         }
@@ -5669,6 +6243,14 @@ pub async fn run_opencode_turn(
             if final_result.is_empty() {
                 final_result = format!("OpenCode CLI exited with status: {}", status);
             }
+        }
+    }
+
+    // Surface SSE error messages (e.g. session.error) that were captured during streaming
+    if let Some(err_msg) = sse_error_message.lock().unwrap().clone() {
+        had_error = true;
+        if opencode_output_needs_fallback(&final_result) {
+            final_result = err_msg;
         }
     }
 
@@ -5730,6 +6312,18 @@ pub async fn run_opencode_turn(
         }
     }
 
+    if !sse_emitted && !emitted_thinking {
+        if let Some((thought, cleaned)) = extract_thought_line(&final_result) {
+            let _ = events_tx.send(AgentEvent::Thinking {
+                content: thought,
+                done: false,
+                mission_id: Some(mission_id),
+            });
+            emitted_thinking = true;
+            final_result = cleaned;
+        }
+    }
+
     if emitted_thinking {
         let _ = events_tx.send(AgentEvent::Thinking {
             content: String::new(),
@@ -5740,6 +6334,15 @@ pub async fn run_opencode_turn(
         let _ = events_tx.send(AgentEvent::Thinking {
             content: String::new(),
             done: true,
+            mission_id: Some(mission_id),
+        });
+    }
+
+    if !sse_emitted_text.load(std::sync::atomic::Ordering::SeqCst)
+        && !final_result.trim().is_empty()
+    {
+        let _ = events_tx.send(AgentEvent::TextDelta {
+            content: final_result.clone(),
             mission_id: Some(mission_id),
         });
     }
@@ -6077,30 +6680,8 @@ pub async fn run_amp_turn(
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
 
-    // Timeout handling for stalled missions
-    let startup_timeout = std::time::Duration::from_secs(120);
-    let inactivity_timeout = std::time::Duration::from_secs(300);
-    // Much longer timeout when tools are in progress (30 minutes) - some bash commands
-    // or web fetches can take a very long time
-    let tool_in_progress_timeout = std::time::Duration::from_secs(1800);
-    let mut received_any_event = false;
-    let mut last_activity = std::time::Instant::now();
-
     // Process events until completion or cancellation
     loop {
-        // Use longer timeout when tools are in progress
-        let timeout_duration = if !pending_tools.is_empty() {
-            tool_in_progress_timeout
-        } else if received_any_event {
-            inactivity_timeout
-        } else {
-            startup_timeout
-        };
-        let time_since_activity = last_activity.elapsed();
-        let remaining = timeout_duration.saturating_sub(time_since_activity);
-        let mut timeout = tokio::time::sleep(remaining);
-        tokio::pin!(timeout);
-
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!(mission_id = %mission_id, "Amp execution cancelled, killing process");
@@ -6110,33 +6691,6 @@ pub async fn run_amp_turn(
                 }
                 return AgentResult::failure("Cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
-            }
-            _ = &mut timeout => {
-                let err_msg = if !received_any_event {
-                    format!(
-                        "Amp produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.",
-                        startup_timeout.as_secs()
-                    )
-                } else if !pending_tools.is_empty() {
-                    let tool_names: Vec<_> = pending_tools.values().cloned().collect();
-                    format!(
-                        "Amp stopped responding after {}s while waiting for tool(s): {}. The tool(s) may be stuck or taking too long.",
-                        tool_in_progress_timeout.as_secs(),
-                        tool_names.join(", ")
-                    )
-                } else {
-                    format!(
-                        "Amp stopped responding after {}s of inactivity. This may indicate a network issue or API timeout.",
-                        inactivity_timeout.as_secs()
-                    )
-                };
-                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
-                let _ = child.kill().await;
-                if let Some(handle) = stderr_handle {
-                    handle.abort();
-                }
-                return AgentResult::failure(err_msg, 0)
-                    .with_terminal_reason(TerminalReason::LlmError);
             }
             line_result = lines.next_line() => {
                 match line_result {
@@ -6157,10 +6711,6 @@ pub async fn run_amp_turn(
                                 continue;
                             }
                         };
-
-                        // Track activity for timeout detection
-                        received_any_event = true;
-                        last_activity = std::time::Instant::now();
 
                         match amp_event {
                             AmpEvent::System(sys) => {
@@ -6183,8 +6733,17 @@ pub async fn run_amp_turn(
                             AmpEvent::StreamEvent(wrapper) => {
                                 match wrapper.event {
                                     StreamEvent::ContentBlockDelta { index, delta } => {
-                                        if delta.delta_type == "thinking_delta" {
-                                            if let Some(thinking_text) = delta.thinking {
+                                        let block_type = block_types
+                                            .get(&index)
+                                            .map(|value| value.as_str());
+                                        let is_thinking_block =
+                                            matches!(block_type, Some("thinking"));
+                                        if delta.delta_type == "thinking_delta"
+                                            || (is_thinking_block
+                                                && delta.delta_type == "text_delta")
+                                        {
+                                            let thinking_text = delta.thinking.or(delta.text.clone());
+                                            if let Some(thinking_text) = thinking_text {
                                                 if !thinking_text.is_empty() {
                                                     let buffer = thinking_buffer.entry(index).or_default();
                                                     buffer.push_str(&thinking_text);
@@ -6254,7 +6813,25 @@ pub async fn run_amp_turn(
                                     match block {
                                         ContentBlock::Text { text } => {
                                             if !text.is_empty() {
-                                                final_result = text;
+                                                if !thinking_streamed {
+                                                    if let Some((thought, cleaned)) =
+                                                        extract_thought_line(&text)
+                                                    {
+                                                        let _ = events_tx.send(
+                                                            AgentEvent::Thinking {
+                                                                content: thought,
+                                                                done: true,
+                                                                mission_id: Some(mission_id),
+                                                            },
+                                                        );
+                                                        thinking_streamed = true;
+                                                        final_result = cleaned;
+                                                    } else {
+                                                        final_result = text;
+                                                    }
+                                                } else {
+                                                    final_result = text;
+                                                }
                                             }
                                         }
                                         ContentBlock::ToolUse { id, name, input } => {
@@ -6509,6 +7086,7 @@ pub struct RunningMissionInfo {
     pub queue_len: usize,
     pub history_len: usize,
     pub seconds_since_activity: u64,
+    pub health: MissionHealth,
     pub expected_deliverables: usize,
     /// Current activity label (e.g., "Reading: main.rs")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6521,6 +7099,7 @@ pub struct RunningMissionInfo {
 
 impl From<&MissionRunner> for RunningMissionInfo {
     fn from(runner: &MissionRunner) -> Self {
+        let seconds_since_activity = runner.last_activity.elapsed().as_secs();
         Self {
             mission_id: runner.mission_id,
             state: match runner.state {
@@ -6531,7 +7110,8 @@ impl From<&MissionRunner> for RunningMissionInfo {
             },
             queue_len: runner.queue.len(),
             history_len: runner.history.len(),
-            seconds_since_activity: runner.last_activity.elapsed().as_secs(),
+            seconds_since_activity,
+            health: running_health(runner.state, seconds_since_activity),
             expected_deliverables: runner.deliverables.deliverables.len(),
             current_activity: runner.current_activity.clone(),
             subtask_total: runner.subtasks.len(),
@@ -6549,7 +7129,7 @@ pub async fn run_codex_turn(
     mission_id: Uuid,
     events_tx: broadcast::Sender<AgentEvent>,
     cancel: CancellationToken,
-    _working_dir: &std::path::Path,
+    app_working_dir: &std::path::Path,
     _session_id: Option<&str>,
 ) -> AgentResult {
     use crate::backend::codex::CodexBackend;
@@ -6563,8 +7143,21 @@ pub async fn run_codex_turn(
         "Starting Codex turn"
     );
 
-    // Write Codex credentials to workspace
-    if let Err(e) = crate::api::ai_providers::write_codex_credentials_for_workspace(workspace) {
+    // Best-effort: try to mint an OpenAI API key from the OAuth refresh token.
+    // If this fails (e.g. no API platform org), write_codex_credentials_for_workspace
+    // will fall back to auth_mode: "chatgpt" using the access_token directly.
+    if let Err(e) = crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
+    {
+        tracing::warn!(
+            "Could not ensure OpenAI API key for Codex (will try chatgpt auth mode): {}",
+            e
+        );
+    }
+
+    // Ensure Codex auth.json is present in the workspace context (host or container).
+    if let Err(e) =
+        crate::api::ai_providers::write_codex_credentials_for_workspace(workspace, app_working_dir)
+    {
         tracing::error!("Failed to write Codex credentials: {}", e);
         return AgentResult::failure(
             format!("Failed to configure Codex authentication: {}", e),
@@ -6573,8 +7166,32 @@ pub async fn run_codex_turn(
         .with_terminal_reason(TerminalReason::LlmError);
     }
 
+    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let cli_path = get_codex_cli_path_from_config(app_working_dir)
+        .or_else(|| std::env::var("CODEX_CLI_PATH").ok())
+        .unwrap_or_else(|| "codex".to_string());
+    let cli_path = match ensure_codex_cli_available(&workspace_exec, mission_work_dir, &cli_path)
+        .await
+    {
+        Ok(path) => path,
+        Err(err_msg) => {
+            tracing::error!("{}", err_msg);
+            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+
+    tracing::info!(
+        mission_id = %mission_id,
+        workspace_type = ?workspace.workspace_type,
+        cli_path = %cli_path,
+        "Starting Codex execution via WorkspaceExec"
+    );
+
+    let mut codex_config = crate::backend::codex::client::CodexConfig::default();
+    codex_config.cli_path = cli_path;
+
     // Create Codex backend
-    let backend = CodexBackend::new();
+    let backend = CodexBackend::with_config_and_workspace(codex_config, workspace_exec);
 
     // Create session
     let session = match backend
@@ -6605,33 +7222,17 @@ pub async fn run_codex_turn(
         }
     };
 
-    // Process events with timeout handling
+    // Process events until completion or cancellation
     let mut assistant_message = String::new();
     let mut success = false;
     let mut error_message: Option<String> = None;
-    let mut received_any_event = false;
-    let mut last_activity = std::time::Instant::now();
     let mut pending_tools: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-
-    // Timeout configuration (similar to Amp)
-    let startup_timeout = std::time::Duration::from_secs(30);
-    let inactivity_timeout = std::time::Duration::from_secs(120);
-    let tool_in_progress_timeout = std::time::Duration::from_secs(180);
+    let mut thinking_emitted = false;
+    let mut thinking_done_emitted = false;
+    let mut last_summary: Option<String> = None;
 
     loop {
-        let timeout_duration = if !pending_tools.is_empty() {
-            tool_in_progress_timeout
-        } else if !received_any_event {
-            startup_timeout
-        } else {
-            inactivity_timeout
-        };
-        let time_since_activity = last_activity.elapsed();
-        let remaining = timeout_duration.saturating_sub(time_since_activity);
-        let mut timeout = tokio::time::sleep(remaining);
-        tokio::pin!(timeout);
-
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("Codex turn cancelled for mission {}", mission_id);
@@ -6639,32 +7240,7 @@ pub async fn run_codex_turn(
                 return AgentResult::failure("Mission cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
             }
-            _ = &mut timeout => {
-                let err_msg = if !received_any_event {
-                    format!(
-                        "Codex produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.",
-                        startup_timeout.as_secs()
-                    )
-                } else if !pending_tools.is_empty() {
-                    let tool_names: Vec<_> = pending_tools.values().cloned().collect();
-                    format!(
-                        "Codex stopped responding after {}s while waiting for tool(s): {}. The tool(s) may be stuck or taking too long.",
-                        tool_in_progress_timeout.as_secs(),
-                        tool_names.join(", ")
-                    )
-                } else {
-                    format!(
-                        "Codex stopped responding after {}s of inactivity. This may indicate a network issue or API timeout.",
-                        inactivity_timeout.as_secs()
-                    )
-                };
-                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
-                return AgentResult::failure(err_msg, 0)
-                    .with_terminal_reason(TerminalReason::LlmError);
-            }
             Some(event) = event_rx.recv() => {
-                received_any_event = true;
-                last_activity = std::time::Instant::now();
                 match event {
                     ExecutionEvent::TextDelta { content } => {
                         assistant_message.push_str(&content);
@@ -6679,6 +7255,7 @@ pub async fn run_codex_turn(
                             done: false,
                             mission_id: Some(mission_id),
                         });
+                        thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
                         pending_tools.insert(id.clone(), name.clone());
@@ -6698,6 +7275,11 @@ pub async fn run_codex_turn(
                             mission_id: Some(mission_id),
                         });
                     }
+                    ExecutionEvent::TurnSummary { content } => {
+                        if !content.trim().is_empty() {
+                            last_summary = Some(content);
+                        }
+                    }
                     ExecutionEvent::Error { message } => {
                         error_message = Some(message.clone());
                         tracing::error!("Codex error: {}", message);
@@ -6715,10 +7297,42 @@ pub async fn run_codex_turn(
         }
     }
 
+    if !thinking_emitted {
+        if let Some((thought, cleaned)) = extract_thought_line(&assistant_message) {
+            let _ = events_tx.send(AgentEvent::Thinking {
+                content: thought,
+                done: true,
+                mission_id: Some(mission_id),
+            });
+            thinking_emitted = true;
+            thinking_done_emitted = true;
+            assistant_message = cleaned;
+        }
+    }
+
+    if thinking_emitted && !thinking_done_emitted {
+        let _ = events_tx.send(AgentEvent::Thinking {
+            content: String::new(),
+            done: true,
+            mission_id: Some(mission_id),
+        });
+    }
+
+    let no_output = assistant_message.trim().is_empty() && last_summary.is_none();
+    if no_output && error_message.is_none() {
+        success = false;
+        error_message = Some(
+            "Codex produced no output. This usually means the Codex CLI failed before emitting JSON (often authentication). Check that the host has a valid `~/.codex/auth.json` and that the backend can access it."
+                .to_string(),
+        );
+    }
+
     let final_message = if let Some(err) = error_message {
         err
     } else if !assistant_message.is_empty() {
         assistant_message
+    } else if let Some(summary) = last_summary {
+        summary
     } else {
         "No response from Codex".to_string()
     };

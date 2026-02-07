@@ -69,8 +69,22 @@ export interface RunningMissionInfo {
   queue_len: number;
   history_len: number;
   seconds_since_activity: number;
+  health: MissionHealth;
   expected_deliverables: number;
 }
+
+export type MissionStallSeverity = "warning" | "severe";
+
+export type MissionHealth =
+  | { status: "healthy" }
+  | {
+      status: "stalled";
+      seconds_since_activity: number;
+      last_state: string;
+      severity: MissionStallSeverity;
+    }
+  | { status: "missing_deliverables"; missing: string[] }
+  | { status: "unexpected_end"; reason: string };
 
 // ---------------------------------------------------------------------------
 // API Functions

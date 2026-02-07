@@ -19,6 +19,8 @@ pub enum ExecutionEvent {
     },
     /// Text content being streamed.
     TextDelta { content: String },
+    /// Optional turn summary (backend-specific).
+    TurnSummary { content: String },
     /// Message execution completed.
     MessageComplete { session_id: String },
     /// Error occurred.

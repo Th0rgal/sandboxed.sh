@@ -140,8 +140,8 @@ fn is_inside_container() -> bool {
 }
 
 /// Translate a HOST path to a container-relative path.
-/// HOST path: /root/.sandboxed-sh/containers/<name>/workspaces/mission-xxx
-/// Container path: /workspaces/mission-xxx
+/// HOST path: /root/.sandboxed-sh/containers/<name>/<workspace>
+/// Container path: /workspaces/<workspace>
 fn translate_host_path_for_container(host_path: &str, workspace_root: Option<&str>) -> String {
     // If we have the workspace_root (container root on host), strip it from the path
     if let Some(root) = workspace_root {

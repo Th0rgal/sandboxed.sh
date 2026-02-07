@@ -210,17 +210,10 @@ impl ProviderType {
         match self {
             Self::OpenAI => vec![
                 AuthMethod {
-                    label: "ChatGPT Plus/Pro (Codex Subscription)".to_string(),
+                    label: "ChatGPT Plus/Pro (OAuth)".to_string(),
                     method_type: AuthMethodType::Oauth,
                     description: Some(
-                        "Use your ChatGPT Plus/Pro subscription via official OAuth".to_string(),
-                    ),
-                },
-                AuthMethod {
-                    label: "ChatGPT Plus/Pro (Manual URL Paste)".to_string(),
-                    method_type: AuthMethodType::Oauth,
-                    description: Some(
-                        "Paste the full redirect URL if automatic callback fails".to_string(),
+                        "Use your ChatGPT subscription via official OAuth".to_string(),
                     ),
                 },
                 AuthMethod {

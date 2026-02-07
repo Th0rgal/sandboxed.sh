@@ -49,14 +49,9 @@ const getProviderAuthMethods = (providerType: AIProviderType): AIProviderAuthMet
   if (providerType === 'openai') {
     return [
       {
-        label: 'ChatGPT Plus/Pro (Codex Subscription)',
+        label: 'ChatGPT Plus/Pro (OAuth)',
         type: 'oauth',
-        description: 'Use your ChatGPT Plus/Pro subscription via official OAuth',
-      },
-      {
-        label: 'ChatGPT Plus/Pro (Manual URL Paste)',
-        type: 'oauth',
-        description: 'Paste the full redirect URL if the callback fails',
+        description: 'Use your ChatGPT subscription via official OAuth',
       },
       { label: 'Enter API Key', type: 'api', description: 'Use an existing API key' },
     ];
@@ -92,7 +87,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
   const [oauthResponse, setOauthResponse] = useState<OAuthAuthorizeResponse | null>(null);
   const [oauthCode, setOauthCode] = useState('');
   const [loading, setLoading] = useState(false);
-  // Backend selection for Anthropic (OpenCode and/or Claude Code)
+  // Backend selection for providers that can target multiple harness backends.
   const [selectedBackends, setSelectedBackends] = useState<string[]>(['opencode']);
 
   // Custom provider state
@@ -167,6 +162,15 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     const typeInfo = providerTypes.find(t => t.id === providerType);
     const methods = getProviderAuthMethods(providerType);
 
+    // Default backend targeting by provider (may be adjusted after method selection).
+    if (providerType === 'anthropic') {
+      setSelectedBackends(['opencode']);
+    } else if (providerType === 'openai') {
+      setSelectedBackends(['opencode', 'codex']);
+    } else {
+      setSelectedBackends(['opencode']);
+    }
+
     // If provider has OAuth options, show method selection
     if (typeInfo?.uses_oauth && methods.length > 0) {
       setStep('select-method');
@@ -180,8 +184,12 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     const method = authMethods[methodIndex];
     setSelectedMethodIndex(methodIndex);
 
-    // For Anthropic, show backend selection step first
-    if (selectedProvider === 'anthropic') {
+    // Providers that support multiple backends should select targeting first.
+    if (selectedProvider === 'anthropic' || selectedProvider === 'openai') {
+      // For OpenAI, default backends depend on auth method.
+      if (selectedProvider === 'openai') {
+        setSelectedBackends(['opencode', 'codex']);
+      }
       setStep('select-backends');
       return;
     }
@@ -246,8 +254,11 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
         provider_type: selectedProvider,
         name: selectedTypeInfo?.name || selectedProvider,
         api_key: apiKey,
-        // Include backend targeting for Anthropic
-        use_for_backends: selectedProvider === 'anthropic' ? selectedBackends : undefined,
+        // Include backend targeting for supported providers
+        use_for_backends:
+          selectedProvider === 'anthropic' || selectedProvider === 'openai'
+            ? selectedBackends
+            : undefined,
       });
       toast.success('Provider added');
       onSuccess();
@@ -268,8 +279,10 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
         selectedProvider,
         selectedMethodIndex,
         oauthCode,
-        // Include backend targeting for Anthropic
-        selectedProvider === 'anthropic' ? selectedBackends : undefined
+        // Include backend targeting for supported providers
+        selectedProvider === 'anthropic' || selectedProvider === 'openai'
+          ? selectedBackends
+          : undefined
       );
       toast.success('Provider connected');
       onSuccess();
@@ -343,7 +356,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     } else if (step === 'select-backends') {
       setStep('select-method');
     } else if (step === 'enter-api-key') {
-      if (selectedProvider === 'anthropic') {
+      if (selectedProvider === 'anthropic' || selectedProvider === 'openai') {
         setStep('select-backends');
       } else if (hasOAuth) {
         setStep('select-method');
@@ -478,14 +491,28 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
             </div>
           )}
 
-          {/* Step 2.5: Select Backends (Anthropic only) */}
+          {/* Step 2.5: Select Backends */}
           {step === 'select-backends' && (
             <div className="space-y-4">
               <p className="text-sm text-white/60">
-                Choose which backends should use this Anthropic provider:
+                Choose which backends should use this {selectedTypeInfo?.name} provider:
               </p>
+              {selectedProvider === 'openai' &&
+                (() => {
+                  const method =
+                    selectedMethodIndex !== null ? authMethods[selectedMethodIndex] : null;
+                  const isOAuth = method?.type === 'oauth';
+                  if (!isOAuth) return null;
+                  return (
+                    <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200/80">
+                      If you enable Codex, we will mint an OpenAI API key during connect (this is what the Codex CLI does after OAuth).
+                    </div>
+                  );
+                })()}
               <div className="space-y-2">
-                <label className="flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] hover:bg-white/[0.02] transition-colors cursor-pointer">
+                {selectedProvider === 'anthropic' && (
+                  <>
+                    <label className="flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] hover:bg-white/[0.02] transition-colors cursor-pointer">
                   <input
                     type="checkbox"
                     checked={selectedBackends.includes('opencode')}
@@ -509,6 +536,53 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                     <div className="text-xs text-white/40">Use for Claude CLI-based missions</div>
                   </div>
                 </label>
+                  </>
+                )}
+
+                {selectedProvider === 'openai' && (
+                  <>
+                    <label className="flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] hover:bg-white/[0.02] transition-colors cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedBackends.includes('opencode')}
+                        onChange={() => toggleBackend('opencode')}
+                        className="rounded border-white/20 bg-white/[0.02] text-indigo-500 focus:ring-indigo-500/30 cursor-pointer"
+                      />
+                      <div className="flex-1">
+                        <div className="text-sm text-white">OpenCode</div>
+                        <div className="text-xs text-white/40">Use for OpenCode agents and missions</div>
+                      </div>
+                    </label>
+
+                    {(() => {
+                      const method = selectedMethodIndex !== null ? authMethods[selectedMethodIndex] : null;
+                      const disableCodex = false;
+                      return (
+                        <label
+                          className={cn(
+                            "flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] transition-colors",
+                            disableCodex ? "opacity-50 cursor-not-allowed" : "hover:bg-white/[0.02] cursor-pointer"
+                          )}
+                          title={disableCodex ? "Codex is disabled." : undefined}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selectedBackends.includes('codex')}
+                            onChange={() => toggleBackend('codex')}
+                            disabled={disableCodex}
+                            className="rounded border-white/20 bg-white/[0.02] text-indigo-500 focus:ring-indigo-500/30 cursor-pointer"
+                          />
+                          <div className="flex-1">
+                            <div className="text-sm text-white">Codex</div>
+                            <div className="text-xs text-white/40">
+                              Use for Codex CLI missions
+                            </div>
+                          </div>
+                        </label>
+                      );
+                    })()}
+                  </>
+                )}
               </div>
               <button
                 onClick={handleContinueFromBackends}

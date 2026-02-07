@@ -64,7 +64,7 @@ test.describe("AI Providers", () => {
   test("shows AI Providers section", async ({ page }) => {
     // Check the AI Providers section exists
     await expect(page.getByRole("heading", { name: "AI Providers" })).toBeVisible({ timeout: 10000 });
-    await expect(page.getByText("Configure inference providers for OpenCode")).toBeVisible();
+    await expect(page.getByText("Configure inference providers for OpenCode, Claude Code, and Codex")).toBeVisible();
   });
 
   test("shows empty state when no providers configured", async ({ page }) => {
@@ -155,6 +155,10 @@ test.describe("AI Providers", () => {
 
     // Select API key method
     await page.getByRole("button", { name: /Enter API Key/i }).click();
+
+    // OpenAI supports backend targeting. Continue to API key entry.
+    await expect(page.getByRole("heading", { name: /Select Backends/i })).toBeVisible();
+    await page.getByRole("button", { name: "Continue" }).click();
 
     // Should show API key field
     await expect(page.getByPlaceholder("sk-...")).toBeVisible();

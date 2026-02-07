@@ -46,9 +46,7 @@ import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
 import { useLibrary } from '@/contexts/library-context';
 import { EnvVarsEditor, type EnvRow, toEnvRows, envRowsToMap, getEncryptedKeys } from '@/components/env-vars-editor';
-import Editor from 'react-simple-code-editor';
-import { highlight, languages } from 'prismjs';
-import 'prismjs/components/prism-bash';
+import { ConfigCodeEditor } from '@/components/config-code-editor';
 
 type TemplateTab = 'overview' | 'skills' | 'environment' | 'init';
 
@@ -801,23 +799,16 @@ set -e
               </div>
 
               <div className="flex-1 min-h-0 p-4 overflow-hidden">
-                <div className="h-full rounded-lg bg-black/20 border border-white/[0.06] overflow-auto focus-within:border-emerald-500/50 transition-colors">
-                  <Editor
-                    value={fragmentContent}
-                    onValueChange={setFragmentContent}
-                    highlight={(code) => highlight(code, languages.bash, 'bash')}
-                    placeholder="#!/usr/bin/env bash"
-                    padding={16}
-                    style={{
-                      fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
-                      fontSize: 12,
-                      lineHeight: 1.6,
-                      minHeight: '100%',
-                    }}
-                    className="init-script-editor"
-                    textareaClassName="focus:outline-none"
-                  />
-                </div>
+                <ConfigCodeEditor
+                  value={fragmentContent}
+                  onChange={setFragmentContent}
+                  placeholder="#!/usr/bin/env bash"
+                  padding={16}
+                  minHeight="100%"
+                  language="bash"
+                  className="h-full focus-within:border-emerald-500/50"
+                  editorClassName="h-full"
+                />
               </div>
             </>
           ) : (
@@ -1223,23 +1214,16 @@ set -e
                         <p className="text-xs text-white/50 font-medium">Custom Init Script</p>
                       </div>
                       <div className="p-4 flex flex-col flex-1 min-h-0">
-                        <div className="flex-1 min-h-[150px] rounded-lg bg-black/20 border border-white/[0.06] overflow-auto focus-within:border-indigo-500/50 transition-colors">
-                          <Editor
-                            value={initScript}
-                            onValueChange={setInitScript}
-                            highlight={(code) => highlight(code, languages.bash, 'bash')}
-                            placeholder="#!/usr/bin/env bash&#10;# Additional setup that runs after fragments"
-                            padding={12}
-                            style={{
-                              fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
-                              fontSize: 12,
-                              lineHeight: 1.6,
-                              minHeight: '100%',
-                            }}
-                            className="init-script-editor"
-                            textareaClassName="focus:outline-none"
-                          />
-                        </div>
+                        <ConfigCodeEditor
+                          value={initScript}
+                          onChange={setInitScript}
+                          placeholder={`#!/usr/bin/env bash\n# Additional setup that runs after fragments`}
+                          padding={12}
+                          minHeight="100%"
+                          language="bash"
+                          className="flex-1 min-h-[150px] focus-within:border-indigo-500/50"
+                          editorClassName="h-full"
+                        />
                         <p className="text-xs text-white/35 mt-3 flex-shrink-0">
                           Runs after fragments during build.
                         </p>

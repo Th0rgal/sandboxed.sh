@@ -2,18 +2,17 @@
 
 import { useEffect, useRef, useState, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
-import { Plus, X, ExternalLink, Layers } from 'lucide-react';
+import { Plus, X, ExternalLink } from 'lucide-react';
 import useSWR from 'swr';
-import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getBackendConfig, getClaudeCodeConfig, listConfigProfiles, type Backend, type BackendAgent, type ConfigProfileSummary } from '@/lib/api';
+import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getBackendConfig, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, type Backend, type BackendAgent } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
 
 /** Options returned by the dialog's getCreateOptions() method */
 export interface NewMissionDialogOptions {
   workspaceId?: string;
   agent?: string;
-  /** @deprecated Use configProfile instead */
+  /** @deprecated Use workspace config profiles instead */
   modelOverride?: string;
-  /** Config profile to use for this mission (overrides workspace's default) */
   configProfile?: string;
   backend?: string;
   /** Whether the mission will be opened in a new tab (skip local state updates) */
@@ -79,6 +78,19 @@ const parseAgentNames = (payload: unknown): string[] => {
   return Array.from(new Set(names));
 };
 
+const parseAgentNamesFromSettings = (settings: Record<string, unknown> | null | undefined): string[] => {
+  if (!settings) return [];
+  const agents = (settings as { agents?: unknown }).agents;
+  if (!agents) return [];
+  if (Array.isArray(agents)) {
+    return parseAgentNames(agents);
+  }
+  if (agents && typeof agents === 'object') {
+    return Object.keys(agents as Record<string, unknown>);
+  }
+  return [];
+};
+
 export function NewMissionDialog({
   workspaces,
   disabled = false,
@@ -93,7 +105,6 @@ export function NewMissionDialog({
   const [newMissionWorkspace, setNewMissionWorkspace] = useState('');
   // Combined value: "backend:agent" or empty for default
   const [selectedAgentValue, setSelectedAgentValue] = useState('');
-  const [selectedConfigProfile, setSelectedConfigProfile] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [defaultSet, setDefaultSet] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -181,11 +192,25 @@ export function NewMissionDialog({
     { revalidateOnFocus: false, dedupingInterval: 30000 }
   );
 
-  // SWR: fetch config profiles
-  const { data: configProfiles = [] } = useSWR<ConfigProfileSummary[]>(
-    'config-profiles',
-    listConfigProfiles,
+  const workspaceProfile = useMemo(() => {
+    const targetWorkspace = newMissionWorkspace
+      ? workspaces.find((workspace) => workspace.id === newMissionWorkspace)
+      : workspaces.find((workspace) => workspace.id === '00000000-0000-0000-0000-000000000000')
+        || workspaces.find((workspace) => workspace.workspace_type === 'host');
+    return targetWorkspace?.config_profile || null;
+  }, [newMissionWorkspace, workspaces]);
+
+  const effectiveProfileForAgents = workspaceProfile || null;
+
+  const { data: opencodeProfileSettings } = useSWR(
+    effectiveProfileForAgents ? ['opencode-profile-settings', effectiveProfileForAgents] : null,
+    ([, profile]) => getLibraryOpenCodeSettingsForProfile(profile as string),
     { revalidateOnFocus: false, dedupingInterval: 30000 }
+  );
+
+  const opencodeProfileAgentNames = useMemo(
+    () => parseAgentNamesFromSettings(opencodeProfileSettings as Record<string, unknown> | null),
+    [opencodeProfileSettings]
   );
 
   // Combine all agents from enabled backends
@@ -200,7 +225,8 @@ export function NewMissionDialog({
 
       if (backend.id === 'opencode') {
         // Filter out hidden OpenCode agents by name
-        const backendAgents = opencodeAgents || [];
+        const profileAgents = opencodeProfileAgentNames.map(name => ({ id: name, name }));
+        const backendAgents = profileAgents.length > 0 ? profileAgents : (opencodeAgents || []);
         const visibleAgents = backendAgents.filter(a => !openCodeHiddenAgents.includes(a.name));
         if (visibleAgents.length > 0) {
           agents = visibleAgents;
@@ -245,7 +271,7 @@ export function NewMissionDialog({
     }
 
     return result;
-  }, [enabledBackends, opencodeAgents, claudecodeAgents, ampAgents, codexAgents, agentsPayload, config, claudeCodeLibConfig]);
+  }, [enabledBackends, opencodeAgents, opencodeProfileAgentNames, claudecodeAgents, ampAgents, codexAgents, agentsPayload, config, claudeCodeLibConfig]);
 
   // Group agents by backend for display
   const agentsByBackend = useMemo(() => {
@@ -374,7 +400,6 @@ export function NewMissionDialog({
   const resetForm = () => {
     setNewMissionWorkspace('');
     setSelectedAgentValue('');
-    setSelectedConfigProfile('');
     setDefaultSet(false);
   };
 
@@ -389,8 +414,8 @@ export function NewMissionDialog({
     return {
       workspaceId: newMissionWorkspace || undefined,
       agent: parsed?.agent || undefined,
-      configProfile: selectedConfigProfile || undefined,
       backend: parsed?.backend || 'claudecode',
+      configProfile: workspaceProfile || undefined,
     };
   };
 
@@ -404,13 +429,15 @@ export function NewMissionDialog({
 
       if (openInNewTab) {
         window.open(url, '_blank');
+        setOpen(false);
+        resetForm();
+        onClose?.();
       } else {
         router.push(url);
+        setOpen(false);
+        resetForm();
+        onClose?.();
       }
-
-      setOpen(false);
-      resetForm();
-      onClose?.();
     } finally {
       setSubmitting(false);
     }
@@ -515,43 +542,6 @@ export function NewMissionDialog({
               </select>
               <p className="text-xs text-white/30 mt-1.5">
                 Select an agent and backend to power this mission
-              </p>
-            </div>
-
-            {/* Config Profile */}
-            <div>
-              <label className="block text-xs text-white/50 mb-1.5 flex items-center gap-1.5">
-                <Layers className="h-3 w-3" />
-                Config Profile
-              </label>
-              <select
-                value={selectedConfigProfile}
-                onChange={(e) => setSelectedConfigProfile(e.target.value)}
-                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
-                style={{
-                  backgroundImage:
-                    "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
-                  backgroundPosition: 'right 0.5rem center',
-                  backgroundRepeat: 'no-repeat',
-                  backgroundSize: '1.5em 1.5em',
-                  paddingRight: '2.5rem',
-                }}
-              >
-                <option value="" className="bg-[#1a1a1a]">
-                  Default (from workspace)
-                </option>
-                {configProfiles.map((profile) => (
-                  <option
-                    key={profile.name}
-                    value={profile.name}
-                    className="bg-[#1a1a1a]"
-                  >
-                    {profile.name}{profile.is_default ? ' (default)' : ''}
-                  </option>
-                ))}
-              </select>
-              <p className="text-xs text-white/30 mt-1.5">
-                Override config settings (model, mode, etc.)
               </p>
             </div>
 

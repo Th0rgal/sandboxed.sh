@@ -15,6 +15,7 @@ export * from "./api/core";
 export * from "./api/missions";
 export * from "./api/workspaces";
 export * from "./api/providers";
+export * from "./api/automations";
 
 // Import core utilities for use in this file (remaining APIs not yet split)
 import {
@@ -1678,6 +1679,48 @@ export async function updateOpenCodeSettings(settings: Record<string, unknown>):
   return apiPut("/api/opencode/settings", settings, "Failed to update OpenCode settings");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenCode Config API (opencode.json)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Get OpenCode config (opencode.json)
+export async function getOpenCodeConfig(): Promise<Record<string, unknown>> {
+  return apiGet("/api/opencode/config", "Failed to get OpenCode config");
+}
+
+// Update OpenCode config (opencode.json)
+export async function updateOpenCodeConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return apiPut("/api/opencode/config", config, "Failed to update OpenCode config");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Claude Code Host Config API
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getClaudeCodeHostConfig(): Promise<Record<string, unknown>> {
+  return apiGet("/api/claudecode/config", "Failed to get Claude Code host config");
+}
+
+export async function updateClaudeCodeHostConfig(
+  config: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  return apiPut("/api/claudecode/config", config, "Failed to update Claude Code host config");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Amp Host Config API
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getAmpCodeHostConfig(): Promise<Record<string, unknown>> {
+  return apiGet("/api/amp/config", "Failed to get Amp host config");
+}
+
+export async function updateAmpCodeHostConfig(
+  config: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  return apiPut("/api/amp/config", config, "Failed to update Amp host config");
+}
+
 // Restart OpenCode service (to apply settings changes)
 export async function restartOpenCodeService(): Promise<{ success: boolean; message: string }> {
   return apiPost("/api/opencode/restart", undefined, "Failed to restart OpenCode service");
@@ -1709,7 +1752,7 @@ export interface OpenAgentConfig {
 // Get OpenAgent config from Library
 export async function getOpenAgentConfig(): Promise<OpenAgentConfig> {
   try {
-    return await apiGet("/api/library/openagent/config", "Failed to get OpenAgent config");
+    return await apiGet("/api/library/sandboxed-sh/config", "Failed to get OpenAgent config");
   } catch {
     // Return default config if endpoint doesn't exist (not yet implemented)
     return { hidden_agents: [], default_agent: null };
@@ -1718,13 +1761,13 @@ export async function getOpenAgentConfig(): Promise<OpenAgentConfig> {
 
 // Save OpenAgent config to Library
 export async function saveOpenAgentConfig(config: OpenAgentConfig): Promise<void> {
-  return apiPut("/api/library/openagent/config", config, "Failed to save OpenAgent config");
+  return apiPut("/api/library/sandboxed-sh/config", config, "Failed to save OpenAgent config");
 }
 
 // Get visible agents (filtered by OpenAgent config)
 export async function getVisibleAgents(): Promise<unknown> {
   try {
-    return await apiGet("/api/library/openagent/agents", "Failed to get visible agents");
+    return await apiGet("/api/library/sandboxed-sh/agents", "Failed to get visible agents");
   } catch {
     // Return empty array if endpoint doesn't exist (not yet implemented)
     return [];
@@ -1836,7 +1879,7 @@ export async function saveLibraryOpenCodeSettingsForProfile(
 export async function getOpenAgentConfigForProfile(profile: string): Promise<OpenAgentConfig> {
   try {
     return await apiGet(
-      `/api/library/config-profile/${encodeURIComponent(profile)}/openagent/config`,
+      `/api/library/config-profile/${encodeURIComponent(profile)}/sandboxed-sh/config`,
       "Failed to get OpenAgent config for profile"
     );
   } catch {
@@ -1851,7 +1894,7 @@ export async function saveOpenAgentConfigForProfile(
   config: OpenAgentConfig
 ): Promise<void> {
   return apiPut(
-    `/api/library/config-profile/${encodeURIComponent(profile)}/openagent/config`,
+    `/api/library/config-profile/${encodeURIComponent(profile)}/sandboxed-sh/config`,
     config,
     "Failed to save OpenAgent config for profile"
   );
@@ -1981,6 +2024,28 @@ export async function getHarnessDefaultFile(harness: string, fileName: string): 
     throw new Error(`Failed to get harness default file: ${response.statusText}`);
   }
   return response.text();
+}
+
+// Save a harness default file in the library
+export async function saveHarnessDefaultFile(
+  harness: string,
+  fileName: string,
+  content: string
+): Promise<void> {
+  const response = await fetch(
+    apiUrl(`/api/library/harness-default/${encodeURIComponent(harness)}/${fileName}`),
+    {
+      method: "PUT",
+      headers: {
+        ...authHeader(),
+        "Content-Type": "text/plain",
+      },
+      body: content,
+    }
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to save harness default file: ${response.statusText}`);
+  }
 }
 
 // AI Provider types and functions are now exported from ./api/providers

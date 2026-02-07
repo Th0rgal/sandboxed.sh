@@ -75,6 +75,8 @@ pub struct CreateWorkspaceRequest {
     /// Empty = use default MCPs (those with `default_enabled = true`).
     #[serde(default)]
     pub mcps: Vec<String>,
+    /// Optional config profile to apply to this workspace.
+    pub config_profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +104,8 @@ pub struct UpdateWorkspaceRequest {
     pub tailscale_mode: Option<TailscaleMode>,
     /// MCP server names to enable for this workspace.
     pub mcps: Option<Vec<String>>,
+    /// Optional config profile to apply to this workspace.
+    pub config_profile: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -373,10 +377,18 @@ async fn create_workspace(
             .unwrap_or_default()
     };
 
-    // Config profile from template
-    let config_profile = template_data
+    // Config profile from template (request overrides)
+    let mut config_profile = template_data
         .as_ref()
         .and_then(|t| t.config_profile.clone());
+    if let Some(custom_profile) = req.config_profile.as_ref() {
+        let trimmed = custom_profile.trim();
+        if trimmed.is_empty() {
+            config_profile = None;
+        } else {
+            config_profile = Some(trimmed.to_string());
+        }
+    }
 
     let mut workspace = match workspace_type {
         WorkspaceType::Host => Workspace {
@@ -482,7 +494,16 @@ async fn create_workspace(
                 );
             }
 
-            workspaces_store.update(workspace_for_build).await;
+            // Preserve any workspace updates made while the build was running (env vars, init script, etc.)
+            // by only applying build-related fields to the latest stored workspace.
+            if let Some(mut latest) = workspaces_store.get(workspace_for_build.id).await {
+                latest.status = workspace_for_build.status;
+                latest.error_message = workspace_for_build.error_message;
+                latest.distro = workspace_for_build.distro;
+                workspaces_store.update(latest).await;
+            } else {
+                workspaces_store.update(workspace_for_build).await;
+            }
         });
 
         tracing::info!(
@@ -591,6 +612,15 @@ async fn update_workspace(
     // Update MCPs if provided
     if let Some(mcps) = req.mcps {
         workspace.mcps = mcps;
+    }
+
+    if let Some(config_profile) = req.config_profile {
+        let trimmed = config_profile.trim();
+        if trimmed.is_empty() {
+            workspace.config_profile = None;
+        } else {
+            workspace.config_profile = Some(trimmed.to_string());
+        }
     }
 
     // Save the updated workspace
@@ -846,7 +876,16 @@ async fn build_workspace(
             );
         }
 
-        workspaces_store.update(workspace_for_build).await;
+        // Preserve any workspace updates made while the build was running (env vars, init script, etc.)
+        // by only applying build-related fields to the latest stored workspace.
+        if let Some(mut latest) = workspaces_store.get(workspace_for_build.id).await {
+            latest.status = workspace_for_build.status;
+            latest.error_message = workspace_for_build.error_message;
+            latest.distro = workspace_for_build.distro;
+            workspaces_store.update(latest).await;
+        } else {
+            workspaces_store.update(workspace_for_build).await;
+        }
     });
 
     Ok(Json(workspace.into()))

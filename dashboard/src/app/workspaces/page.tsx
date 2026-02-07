@@ -13,12 +13,14 @@ import {
   listWorkspaceTemplates,
   saveWorkspaceTemplate,
   listLibrarySkills,
+  listConfigProfiles,
   getWorkspaceDebug,
   getWorkspaceInitLog,
   CONTAINER_DISTROS,
   type Workspace,
   type ContainerDistro,
   type WorkspaceTemplateSummary,
+  type ConfigProfileSummary,
   type SkillSummary,
   type WorkspaceDebugInfo,
   type InitLogResponse,
@@ -88,6 +90,7 @@ export default function WorkspacesPage() {
   const [initScript, setInitScript] = useState('');
   const [sharedNetwork, setSharedNetwork] = useState<boolean | null>(null);
   const [tailscaleMode, setTailscaleMode] = useState<TailscaleMode | null>(null);
+  const [configProfile, setConfigProfile] = useState('');
   const [savingWorkspace, setSavingWorkspace] = useState(false);
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [templateName, setTemplateName] = useState('');
@@ -111,6 +114,13 @@ export default function WorkspacesPage() {
   const { data: availableSkills = [], error: skillsError } = useSWR(
     'library-skills',
     listLibrarySkills,
+    { revalidateOnFocus: false }
+  );
+
+  // SWR: fetch config profiles
+  const { data: configProfiles = [], error: configProfilesError } = useSWR<ConfigProfileSummary[]>(
+    'config-profiles',
+    listConfigProfiles,
     { revalidateOnFocus: false }
   );
 
@@ -168,6 +178,7 @@ export default function WorkspacesPage() {
       setInitScript(selectedWorkspace.init_script ?? '');
       setSharedNetwork(selectedWorkspace.shared_network ?? null);
       setTailscaleMode(selectedWorkspace.tailscale_mode ?? null);
+      setConfigProfile(selectedWorkspace.config_profile ?? '');
       setSelectedSkills(selectedWorkspace.skills ?? []);
       setTemplateName(`${selectedWorkspace.name}-template`);
       setTemplateDescription('');
@@ -362,6 +373,7 @@ export default function WorkspacesPage() {
         skills: selectedSkills,
         shared_network: sharedNetwork,
         tailscale_mode: tailscaleMode,
+        config_profile: configProfile.trim() ? configProfile.trim() : null,
       });
       setSelectedWorkspace(updated);
       await mutateWorkspaces();
@@ -391,6 +403,7 @@ export default function WorkspacesPage() {
         env_vars,
         encrypted_keys,
         init_script: initScript,
+        config_profile: configProfile.trim() || undefined,
       });
       await mutateTemplates();
     } catch (err) {
@@ -611,6 +624,50 @@ export default function WorkspacesPage() {
                   {/* Path - Minimal */}
                   <div className="text-xs text-white/40">
                     <code className="font-mono text-white/60">{selectedWorkspace.path}</code>
+                  </div>
+
+                  {configProfilesError && (
+                    <div className="rounded-lg bg-amber-500/5 border border-amber-500/15 p-3">
+                      <p className="text-xs text-amber-300/80">
+                        Failed to load config profiles. Try refreshing the page.
+                      </p>
+                    </div>
+                  )}
+
+                  <div className="rounded-lg bg-white/[0.02] border border-white/[0.05] p-3">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-xs text-white/60 font-medium">Config Profile</p>
+                        <p className="text-[10px] text-white/30 mt-0.5">
+                          Default settings for missions started in this workspace.
+                        </p>
+                      </div>
+                    </div>
+                    <select
+                      value={configProfile}
+                      onChange={(e) => setConfigProfile(e.target.value)}
+                      className="mt-2 w-full rounded-lg border border-white/[0.06] bg-black/20 px-2.5 py-1.5 text-xs text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
+                      style={{
+                        backgroundImage:
+                          "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
+                        backgroundPosition: 'right 0.5rem center',
+                        backgroundRepeat: 'no-repeat',
+                        backgroundSize: '1em 1em',
+                      }}
+                    >
+                      <option value="" className="bg-[#1a1a1a]">
+                        Default (none)
+                      </option>
+                      {configProfiles.map((profile) => (
+                        <option
+                          key={profile.name}
+                          value={profile.name}
+                          className="bg-[#1a1a1a]"
+                        >
+                          {profile.name}{profile.is_default ? ' (default)' : ''}
+                        </option>
+                      ))}
+                    </select>
                   </div>
 
                   {selectedWorkspace.error_message && (

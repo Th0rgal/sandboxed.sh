@@ -43,9 +43,11 @@ fn normalize_model(model: &str) -> &str {
         s if s.contains("claude-3-5-sonnet") || s.contains("claude-3.5-sonnet") => {
             "claude-3-5-sonnet"
         }
+        s if s.contains("claude-sonnet-5") || s.contains("claude-5-sonnet") => "claude-sonnet-5",
         s if s.contains("claude-sonnet-4") || s.contains("claude-4-sonnet") => "claude-sonnet-4",
         s if s.contains("claude-3-5-haiku") || s.contains("claude-3.5-haiku") => "claude-3-5-haiku",
         s if s.contains("claude-3-opus") || s.contains("claude-3.0-opus") => "claude-3-opus",
+        s if s.contains("claude-opus-4-6") || s.contains("claude-4-6-opus") => "claude-opus-4-6",
         s if s.contains("claude-opus-4") || s.contains("claude-4-opus") => "claude-opus-4",
 
         // GPT models
@@ -88,6 +90,14 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_read_nano_per_token: Some(300),     // 90% less than input
         }),
 
+        // Claude Sonnet 5: assume same as Sonnet 4 until pricing is updated
+        "claude-sonnet-5" => Some(ModelPricing {
+            input_nano_per_token: 3_000,
+            output_nano_per_token: 15_000,
+            cache_create_nano_per_token: Some(3_750),
+            cache_read_nano_per_token: Some(300),
+        }),
+
         // Claude Sonnet 4: $3/1M input, $15/1M output (same as 3.5)
         "claude-sonnet-4" => Some(ModelPricing {
             input_nano_per_token: 3_000,
@@ -106,6 +116,14 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
 
         // Claude 3 Opus: $15/1M input, $75/1M output
         "claude-3-opus" => Some(ModelPricing {
+            input_nano_per_token: 15_000,
+            output_nano_per_token: 75_000,
+            cache_create_nano_per_token: Some(18_750),
+            cache_read_nano_per_token: Some(1_500),
+        }),
+
+        // Claude Opus 4.6: assume same as Opus 4 until pricing is updated
+        "claude-opus-4-6" => Some(ModelPricing {
             input_nano_per_token: 15_000,
             output_nano_per_token: 75_000,
             cache_create_nano_per_token: Some(18_750),
