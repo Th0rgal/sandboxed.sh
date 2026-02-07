@@ -1469,6 +1469,16 @@ pub fn run_claudecode_turn<'a>(
         use std::collections::HashMap;
         use tokio::time::{Duration, Instant};
 
+        fn describe_pty_exit_status(
+            exit_status: &Result<Result<portable_pty::ExitStatus, std::io::Error>, tokio::task::JoinError>,
+        ) -> String {
+            match exit_status {
+                Ok(Ok(status)) => format!("{:?}", status),
+                Ok(Err(err)) => format!("wait error: {}", err),
+                Err(err) => format!("join error: {}", err),
+            }
+        }
+
         fn classify_claudecode_secret(value: String) -> ClaudeCodeAuth {
             if value.starts_with("sk-ant-oat") {
                 ClaudeCodeAuth::OAuthToken(value)
@@ -2651,14 +2661,23 @@ pub fn run_claudecode_turn<'a>(
                     non_json_output.join(" | ")
                 );
             } else {
+                let exit_summary = describe_pty_exit_status(&exit_status);
+                let mut message = format!(
+                    "Claude Code produced no output. Exit status: {}.",
+                    exit_summary
+                );
+                if exit_summary.contains("signal: Some(\"Killed\")") {
+                    message.push_str(
+                        " The process was killed by the OS (often OOM or sandbox limits).",
+                    );
+                }
+                message.push_str(" Check CLI installation or authentication.");
                 tracing::warn!(
                     mission_id = %mission_id,
                     exit_status = ?exit_status,
                     "Claude Code produced no output"
                 );
-                final_result =
-                    "Claude Code produced no output. Check CLI installation or authentication."
-                        .to_string();
+                final_result = message;
             }
         }
 
