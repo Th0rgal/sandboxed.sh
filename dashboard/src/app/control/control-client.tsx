@@ -733,9 +733,13 @@ function PhaseItem({ item }: { item: Extract<ChatItem, { kind: "phase" }> }) {
 function ThinkingGroupItem({
   items,
   basePath,
+  workspaceId,
+  missionId,
 }: {
   items: SidePanelItem[];
   basePath?: string;
+  workspaceId?: string;
+  missionId?: string;
 }) {
   // Filter out empty items for display
   const nonEmptyItems = useMemo(() =>
@@ -869,6 +873,8 @@ function ThinkingGroupItem({
                   isStreaming={!item.done}
                   className="text-xs text-white/60 [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
                   basePath={basePath}
+                  workspaceId={workspaceId}
+                  missionId={missionId}
                 />
               </div>
             ))}
@@ -890,10 +896,14 @@ function ThinkingPanelItem({
   item,
   isActive,
   basePath,
+  workspaceId,
+  missionId,
 }: {
   item: SidePanelItem;
   isActive: boolean;
   basePath?: string;
+  workspaceId?: string;
+  missionId?: string;
 }) {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -963,6 +973,8 @@ function ThinkingPanelItem({
               isStreaming={isActive}
               className="text-xs [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
               basePath={basePath}
+              workspaceId={workspaceId}
+              missionId={missionId}
             />
             {/* Expand/collapse button for long content */}
             {isLongContent && (
@@ -1510,7 +1522,15 @@ function extractImagePaths(text: string): string[] {
 }
 
 // Component to display an image preview with click-to-open functionality
-function ImagePreview({ path }: { path: string }) {
+function ImagePreview({
+  path,
+  workspaceId,
+  missionId,
+}: {
+  path: string;
+  workspaceId?: string;
+  missionId?: string;
+}) {
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1522,10 +1542,12 @@ function ImagePreview({ path }: { path: string }) {
       setError(null);
       try {
         const API_BASE = getRuntimeApiBase();
-        const res = await fetch(
-          `${API_BASE}/api/fs/download?path=${encodeURIComponent(path)}`,
-          { headers: { ...authHeader() } }
-        );
+        const params = new URLSearchParams({ path });
+        if (workspaceId) params.set("workspace_id", workspaceId);
+        if (missionId) params.set("mission_id", missionId);
+        const res = await fetch(`${API_BASE}/api/fs/download?${params.toString()}`, {
+          headers: { ...authHeader() },
+        });
         if (!res.ok) {
           throw new Error(`Failed to load image: ${res.status}`);
         }
@@ -1546,7 +1568,7 @@ function ImagePreview({ path }: { path: string }) {
       if (imageUrl) URL.revokeObjectURL(imageUrl);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path]);
+  }, [path, workspaceId, missionId]);
 
   const openInNewTab = () => {
     if (imageUrl) {
@@ -1607,8 +1629,12 @@ function ImagePreview({ path }: { path: string }) {
 // Memoized to prevent re-renders when parent state changes
 const ToolCallItem = memo(function ToolCallItem({
   item,
+  workspaceId,
+  missionId,
 }: {
   item: Extract<ChatItem, { kind: "tool" }>;
+  workspaceId?: string;
+  missionId?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -1814,7 +1840,12 @@ const ToolCallItem = memo(function ToolCallItem({
                 return (
                   <div className="space-y-2">
                     {imagePaths.map((path) => (
-                      <ImagePreview key={path} path={path} />
+                      <ImagePreview
+                        key={path}
+                        path={path}
+                        workspaceId={workspaceId}
+                        missionId={missionId}
+                      />
                     ))}
                   </div>
                 );
@@ -1840,10 +1871,14 @@ function CollapsedToolGroup({
   tools,
   isExpanded,
   onToggleExpand,
+  workspaceId,
+  missionId,
 }: {
   tools: Extract<ChatItem, { kind: "tool" }>[];
   isExpanded: boolean;
   onToggleExpand: () => void;
+  workspaceId?: string;
+  missionId?: string;
 }) {
   const hiddenCount = tools.length - 1;
   const lastTool = tools[tools.length - 1];
@@ -1853,7 +1888,14 @@ function CollapsedToolGroup({
     if (isSubagentTool(tool.name)) {
       return <SubagentToolItem key={tool.id} item={tool} />;
     }
-    return <ToolCallItem key={tool.id} item={tool} />;
+    return (
+      <ToolCallItem
+        key={tool.id}
+        item={tool}
+        workspaceId={workspaceId}
+        missionId={missionId}
+      />
+    );
   };
 
   if (isExpanded) {
@@ -2370,7 +2412,8 @@ export default function ControlClient() {
       .slice(0, 6);
   }, [recentMissions, runningMissions, currentMission?.id]);
 
-  const isBusy = viewingMissionIsRunning;
+  // Treat "waiting_for_tool" as not busy for message input (user should respond immediately)
+  const isBusy = viewingRunState === "running";
 
   const streamCleanupRef = useRef<null | (() => void)>(null);
   const enhancedInputRef = useRef<EnhancedInputHandle>(null);
@@ -2722,9 +2765,11 @@ export default function ControlClient() {
     []
   );
 
+  const missionForDownloads = viewingMission ?? currentMission;
+
   // Derive working directory from mission's desktop sessions for file path resolution
   const missionWorkingDirectory = useMemo(() => {
-    const mission = viewingMission ?? currentMission;
+    const mission = missionForDownloads;
     if (!mission) return undefined;
 
     if (mission.desktop_sessions?.length) {
@@ -2748,7 +2793,7 @@ export default function ControlClient() {
     if (!workspace?.path) return undefined;
     const cleanRoot = workspace.path.replace(/\/+$/, "");
     return cleanRoot;
-  }, [viewingMission, currentMission, workspaces]);
+  }, [missionForDownloads, workspaces]);
 
   const missionHistoryToItems = useCallback((mission: Mission): ChatItem[] => {
     // Estimate timestamps based on mission creation time
@@ -4781,7 +4826,7 @@ export default function ControlClient() {
     // Message is queued only if agent is currently busy AND there are existing user messages
     // The first message in a conversation should never be shown as queued
     const hasExistingUserMessages = items.some((item) => item.kind === "user");
-    const willBeQueued = viewingMissionIsRunning && hasExistingUserMessages;
+    const willBeQueued = isBusy && hasExistingUserMessages;
 
     setItems((prev) => [
       ...prev,
@@ -4878,7 +4923,7 @@ export default function ControlClient() {
     const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const timestamp = Date.now();
     const hasExistingUserMessages = items.some((item) => item.kind === "user");
-    const willBeQueued = viewingMissionIsRunning && hasExistingUserMessages;
+    const willBeQueued = isBusy && hasExistingUserMessages;
 
     // Use raw content for optimistic message (not prefixed with agent)
     // This ensures content matches what SSE echoes back, preventing duplicate messages
@@ -4922,7 +4967,7 @@ export default function ControlClient() {
     } finally {
       submittingRef.current = false;
     }
-  }, [items, viewingMissionIsRunning, applyDesktopSessionState, missionHistoryToItems]);
+  }, [items, isBusy, applyDesktopSessionState, missionHistoryToItems]);
 
   const handleStop = async () => {
     const targetId = viewingMissionIdRef.current;
@@ -5632,15 +5677,13 @@ export default function ControlClient() {
                           return next;
                         });
                       }}
+                      workspaceId={missionForDownloads?.workspace_id}
+                      missionId={missionForDownloads?.id}
                     />
                   );
                 }
 
                 if (item.kind === "user") {
-                  // Skip queued messages here - they render after "Agent is working..."
-                  if (item.queued === true) {
-                    return null;
-                  }
                   return (
                     <div key={item.id} className="flex justify-end gap-3 group">
                       <CopyButton
@@ -5648,12 +5691,24 @@ export default function ControlClient() {
                         className="self-start mt-2"
                       />
                       <div className="max-w-[80%]">
-                        <div className="rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light bg-indigo-500">
+                        <div
+                          className={cn(
+                            "rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light",
+                            item.queued
+                              ? "border-2 border-dashed border-indigo-500/60 bg-indigo-500/20"
+                              : "bg-indigo-500"
+                          )}
+                        >
                           <p className="whitespace-pre-wrap text-sm">
                             {item.content}
                           </p>
                         </div>
                         <div className="mt-1 text-right flex items-center justify-end gap-2">
+                          {item.queued === true && (
+                            <span className="text-[10px] text-white/30">
+                              Queued
+                            </span>
+                          )}
                           <span className="text-[10px] text-white/30">
                             {formatTime(item.timestamp)}
                           </span>
@@ -5715,7 +5770,12 @@ export default function ControlClient() {
                             {formatTime(item.timestamp)}
                           </span>
                         </div>
-                        <MarkdownContent content={item.content} basePath={missionWorkingDirectory} />
+                        <MarkdownContent
+                          content={item.content}
+                          basePath={missionWorkingDirectory}
+                          workspaceId={missionForDownloads?.workspace_id}
+                          missionId={missionForDownloads?.id}
+                        />
                         {/* Render shared files */}
                         {item.sharedFiles && item.sharedFiles.length > 0 && (
                           <div className="mt-2">
@@ -5751,17 +5811,41 @@ export default function ControlClient() {
 
                 if (item.kind === "thinking_group") {
                   // Render grouped thinking items as a single merged block
-                  return <ThinkingGroupItem key={item.groupId} items={item.thoughts} basePath={missionWorkingDirectory} />;
+                  return (
+                    <ThinkingGroupItem
+                      key={item.groupId}
+                      items={item.thoughts}
+                      basePath={missionWorkingDirectory}
+                      workspaceId={missionForDownloads?.workspace_id}
+                      missionId={missionForDownloads?.id}
+                    />
+                  );
                 }
 
                 if (item.kind === "thinking") {
                   // Fallback for individual thinking items (should be rare with grouping)
-                  return <ThinkingGroupItem key={item.id} items={[item]} basePath={missionWorkingDirectory} />;
+                  return (
+                    <ThinkingGroupItem
+                      key={item.id}
+                      items={[item]}
+                      basePath={missionWorkingDirectory}
+                      workspaceId={missionForDownloads?.workspace_id}
+                      missionId={missionForDownloads?.id}
+                    />
+                  );
                 }
 
                 if (item.kind === "stream") {
                   // Fallback for individual stream items (should be rare with grouping)
-                  return <ThinkingGroupItem key={item.id} items={[item]} basePath={missionWorkingDirectory} />;
+                  return (
+                    <ThinkingGroupItem
+                      key={item.id}
+                      items={[item]}
+                      basePath={missionWorkingDirectory}
+                      workspaceId={missionForDownloads?.workspace_id}
+                      missionId={missionForDownloads?.id}
+                    />
+                  );
                 }
 
                 if (item.kind === "tool") {
@@ -5915,16 +5999,30 @@ export default function ControlClient() {
                     }
 
                     // Unknown UI tool - still show with ToolCallItem
-                    return <ToolCallItem key={item.id} item={item} />;
+                    return (
+                      <ToolCallItem
+                        key={item.id}
+                        item={item}
+                        workspaceId={missionForDownloads?.workspace_id}
+                        missionId={missionForDownloads?.id}
+                      />
+                    );
                   }
 
                   // Subagent/background task tools get enhanced rendering
                   if (isSubagentTool(item.name)) {
-                    return <SubagentToolItem key={item.id} item={item} />;
+                  return <SubagentToolItem key={item.id} item={item} />;
                   }
 
                   // Non-UI tools use the collapsible ToolCallItem component
-                  return <ToolCallItem key={item.id} item={item} />;
+                  return (
+                    <ToolCallItem
+                      key={item.id}
+                      item={item}
+                      workspaceId={missionForDownloads?.workspace_id}
+                      missionId={missionForDownloads?.id}
+                    />
+                  );
                 }
 
                 // system
@@ -5980,36 +6078,6 @@ export default function ControlClient() {
                     </div>
                   </div>
                 )}
-
-              {/* Queued messages - rendered after "Agent is working..." since they'll be sent after */}
-              {items
-                .filter((item): item is Extract<ChatItem, { kind: "user" }> => item.kind === "user" && item.queued === true)
-                .map(item => (
-                  <div key={item.id} className="flex justify-end gap-3 group">
-                    <CopyButton
-                      text={item.content}
-                      className="self-start mt-2"
-                    />
-                    <div className="max-w-[80%]">
-                      <div className="rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light border-2 border-dashed border-indigo-500/60 bg-indigo-500/20">
-                        <p className="whitespace-pre-wrap text-sm">
-                          {item.content}
-                        </p>
-                      </div>
-                      <div className="mt-1 text-right flex items-center justify-end gap-2">
-                        <span className="text-[10px] text-white/30">
-                          Queued
-                        </span>
-                        <span className="text-[10px] text-white/30">
-                          {formatTime(item.timestamp)}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.04]">
-                      <User className="h-4 w-4 text-white/40" />
-                    </div>
-                  </div>
-                ))}
 
               {/* Waiting banner for question tool */}
               {hasPendingQuestion && (
