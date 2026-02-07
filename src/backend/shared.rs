@@ -288,6 +288,8 @@ pub enum ToolUseResultInfo {
     },
     /// Simple string result (often an error message)
     Text(String),
+    /// Fallback for newer/unknown shapes (e.g. tool_result content blocks)
+    Raw(serde_json::Value),
 }
 
 impl ToolUseResultInfo {
@@ -295,6 +297,7 @@ impl ToolUseResultInfo {
         match self {
             ToolUseResultInfo::Structured { stdout, .. } => stdout.as_deref(),
             ToolUseResultInfo::Text(_) => None,
+            ToolUseResultInfo::Raw(_) => None,
         }
     }
 
@@ -302,6 +305,7 @@ impl ToolUseResultInfo {
         match self {
             ToolUseResultInfo::Structured { stderr, .. } => stderr.as_deref(),
             ToolUseResultInfo::Text(s) => Some(s.as_str()),
+            ToolUseResultInfo::Raw(_) => None,
         }
     }
 
@@ -309,6 +313,7 @@ impl ToolUseResultInfo {
         match self {
             ToolUseResultInfo::Structured { interrupted, .. } => *interrupted,
             ToolUseResultInfo::Text(_) => None,
+            ToolUseResultInfo::Raw(_) => None,
         }
     }
 }
