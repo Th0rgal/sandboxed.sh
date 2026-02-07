@@ -6,7 +6,7 @@
 //! Communicates over stdio using JSON-RPC 2.0.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -49,24 +49,51 @@ fn find_browser_command() -> Option<String> {
         if candidate.is_empty() {
             continue;
         }
-        let candidate_path = std::path::Path::new(&candidate);
-        if candidate_path.is_absolute() || candidate.contains('/') {
-            if candidate_path.exists() {
-                return Some(candidate);
+        let candidate_path = resolve_browser_candidate(&candidate);
+        if let Some(path) = candidate_path {
+            if is_snap_stub(&path) {
+                continue;
             }
-            continue;
-        }
-        if let Ok(path_var) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&path_var) {
-                let full = dir.join(&candidate);
-                if full.exists() {
-                    return Some(candidate);
-                }
-            }
+            return Some(path.to_string_lossy().to_string());
         }
     }
 
     None
+}
+
+fn resolve_browser_candidate(candidate: &str) -> Option<PathBuf> {
+    let candidate_path = std::path::Path::new(candidate);
+    if candidate_path.is_absolute() || candidate.contains('/') {
+        if candidate_path.exists() {
+            return Some(candidate_path.to_path_buf());
+        }
+        return None;
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let full = dir.join(candidate);
+            if full.exists() {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+fn is_snap_stub(path: &Path) -> bool {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+    if meta.len() > 256 * 1024 {
+        return false;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return false,
+    };
+    let lower = content.to_lowercase();
+    lower.contains("snap install") || (lower.contains("snap") && lower.contains("chromium"))
 }
 
 // =============================================================================
@@ -335,7 +362,7 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
             }
         };
 
-        let chromium = match std::process::Command::new(&browser_cmd)
+        let mut chromium = match std::process::Command::new(&browser_cmd)
             .args([
                 // Security/sandbox (required for running as root)
                 "--no-sandbox",
@@ -379,7 +406,15 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
         };
 
         let chromium_pid = chromium.id();
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if let Ok(Some(status)) = chromium.try_wait() {
+            kill_process(i3_pid);
+            kill_process(xvfb_pid);
+            return Err(format!(
+                "Browser exited immediately with status: {:?}",
+                status
+            ));
+        }
 
         (
             Some(chromium_pid),

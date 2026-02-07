@@ -10,7 +10,7 @@
 //! Requires: Xvfb, i3, xdotool, scrot, tesseract, AT-SPI2
 //! Only available when DESKTOP_ENABLED=true
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -76,24 +76,52 @@ fn find_browser_command() -> Option<String> {
         if candidate.is_empty() {
             continue;
         }
-        let candidate_path = std::path::Path::new(&candidate);
-        if candidate_path.is_absolute() || candidate.contains('/') {
-            if candidate_path.exists() {
-                return Some(candidate);
+        let candidate_path = resolve_browser_candidate(&candidate);
+        if let Some(path) = candidate_path {
+            if is_snap_stub(&path) {
+                continue;
             }
-            continue;
-        }
-        if let Ok(path_var) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&path_var) {
-                let full = dir.join(&candidate);
-                if full.exists() {
-                    return Some(candidate);
-                }
-            }
+            return Some(path.to_string_lossy().to_string());
         }
     }
 
     None
+}
+
+fn resolve_browser_candidate(candidate: &str) -> Option<PathBuf> {
+    let candidate_path = std::path::Path::new(candidate);
+    if candidate_path.is_absolute() || candidate.contains('/') {
+        if candidate_path.exists() {
+            return Some(candidate_path.to_path_buf());
+        }
+        return None;
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let full = dir.join(candidate);
+            if full.exists() {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+fn is_snap_stub(path: &Path) -> bool {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+    // Snap stubs are tiny scripts; skip large binaries.
+    if meta.len() > 256 * 1024 {
+        return false;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return false,
+    };
+    let lower = content.to_lowercase();
+    lower.contains("snap install") || (lower.contains("snap") && lower.contains("chromium"))
 }
 
 /// Run a command with DISPLAY environment variable set
@@ -254,7 +282,7 @@ impl Tool for StartSession {
                 )
             })?;
 
-            let chromium = Command::new(&browser_cmd)
+            let mut chromium = Command::new(&browser_cmd)
                 .args([
                     "--no-sandbox",
                     "--disable-gpu",
@@ -270,6 +298,13 @@ impl Tool for StartSession {
                 .map_err(|e| anyhow::anyhow!("Failed to start Chromium: {}", e))?;
 
             let chromium_pid = chromium.id().unwrap_or(0);
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            if let Ok(Some(status)) = chromium.try_wait() {
+                return Err(anyhow::anyhow!(
+                    "Browser exited immediately with status: {:?}",
+                    status
+                ));
+            }
 
             // Wait for browser to load
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
