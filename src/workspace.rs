@@ -1506,29 +1506,209 @@ async fn write_amp_config(
 
 async fn write_codex_config(
     workspace_dir: &Path,
-    _mcp_configs: Vec<McpServerConfig>,
-    _workspace_root: &Path,
-    _workspace_type: WorkspaceType,
-    _workspace_env: &HashMap<String, String>,
+    mcp_configs: Vec<McpServerConfig>,
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
     skill_contents: Option<&[SkillContent]>,
-    _shared_network: Option<bool>,
+    shared_network: Option<bool>,
 ) -> anyhow::Result<()> {
-    // Codex doesn't require workspace-specific config files
-    // OAuth tokens are written to ~/.codex/config.toml by the credential sync function
-    // just before mission execution.
-    //
-    // We only need to ensure the .codex directory exists
-    let codex_dir = workspace_dir.join(".codex");
-    tokio::fs::create_dir_all(&codex_dir).await?;
+    // Codex loads configuration from ~/.codex/config.toml. For container workspaces,
+    // HOME is /root, which maps to <workspace_root>/root on the host filesystem.
+    let codex_dir = match workspace_type {
+        WorkspaceType::Container => workspace_root.join("root").join(".codex"),
+        WorkspaceType::Host => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            PathBuf::from(home).join(".codex")
+        }
+    };
 
+    tokio::fs::create_dir_all(&codex_dir).await?;
     tracing::debug!("Created Codex config directory at {}", codex_dir.display());
 
-    // Write skills to .codex/skills/ using Codex's native skills format
+    // Sync MCP servers into ~/.codex/config.toml (Codex CLI reads MCP servers from this file).
+    write_codex_mcp_config(
+        &codex_dir,
+        &mcp_configs,
+        workspace_dir,
+        workspace_root,
+        workspace_type,
+        workspace_env,
+        shared_network,
+    )
+    .await?;
+
+    // Write skills to ~/.codex/skills/ using Codex's native skills format
     if let Some(skills) = skill_contents {
-        write_codex_skills_to_workspace(workspace_dir, skills).await?;
+        write_codex_skills_to_workspace(&codex_dir, skills).await?;
     }
 
     Ok(())
+}
+
+async fn write_codex_mcp_config(
+    codex_dir: &Path,
+    mcp_configs: &[McpServerConfig],
+    workspace_dir: &Path,
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+    shared_network: Option<bool>,
+) -> anyhow::Result<()> {
+    let config_path = codex_dir.join("config.toml");
+    let mut existing = tokio::fs::read_to_string(&config_path).await.unwrap_or_default();
+    let mut existing_servers = std::collections::HashSet::new();
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed
+            .strip_prefix("[mcp_servers.")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            existing_servers.insert(name.trim().to_string());
+        }
+    }
+
+    let mut additions = String::new();
+    let mut used_names = std::collections::HashSet::new();
+    for config in mcp_configs.iter().filter(|c| c.enabled) {
+        let key = sanitize_key(&config.name);
+        let unique = unique_key(&key, &mut used_names);
+        if existing_servers.contains(&unique) {
+            continue;
+        }
+
+        if let Some(section) = codex_mcp_section(
+            config,
+            &unique,
+            workspace_dir,
+            workspace_root,
+            workspace_type,
+            workspace_env,
+            shared_network,
+        ) {
+            if !additions.is_empty() {
+                additions.push('\n');
+            }
+            additions.push_str(&section);
+        }
+    }
+
+    if !additions.is_empty() {
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            existing.push('\n');
+        }
+        existing.push_str(&additions);
+        tokio::fs::write(&config_path, existing).await?;
+        tracing::info!(
+            path = %config_path.display(),
+            "Updated Codex MCP config"
+        );
+    }
+
+    Ok(())
+}
+
+fn codex_mcp_section(
+    config: &McpServerConfig,
+    key: &str,
+    workspace_dir: &Path,
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+    shared_network: Option<bool>,
+) -> Option<String> {
+    fn toml_escape(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for ch in value.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(ch),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    match &config.transport {
+        McpTransport::Http { endpoint, headers } => {
+            if !headers.is_empty() {
+                tracing::warn!(
+                    mcp = %config.name,
+                    "Codex MCP config does not support custom headers; skipping headers"
+                );
+            }
+            let mut section = String::new();
+            section.push_str(&format!("[mcp_servers.{}]\n", key));
+            section.push_str(&format!("url = {}\n", toml_escape(endpoint)));
+            Some(section)
+        }
+        McpTransport::Stdio { .. } => {
+            let opencode_entry = opencode_entry_from_mcp(
+                config,
+                workspace_dir,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                shared_network,
+            );
+
+            let command_vec = opencode_entry
+                .get("command")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let command = command_vec
+                .first()
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if command.is_empty() {
+                return None;
+            }
+            let args: Vec<String> = command_vec
+                .iter()
+                .skip(1)
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+
+            let mut section = String::new();
+            section.push_str(&format!("[mcp_servers.{}]\n", key));
+            section.push_str(&format!("command = {}\n", toml_escape(&command)));
+            if !args.is_empty() {
+                let args_joined = args
+                    .iter()
+                    .map(|arg| toml_escape(arg))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                section.push_str(&format!("args = [{}]\n", args_joined));
+            }
+
+            if let Some(env) = opencode_entry
+                .get("environment")
+                .and_then(|v| v.as_object())
+            {
+                if !env.is_empty() {
+                    section.push_str(&format!("\n[mcp_servers.{}.env]\n", key));
+                    for (k, v) in env {
+                        if let Some(value) = v.as_str() {
+                            section.push_str(&format!("{} = {}\n", k, toml_escape(value)));
+                        } else if v.is_null() {
+                            section.push_str(&format!("{} = \"\"\n", k));
+                        } else {
+                            section.push_str(&format!("{} = {}\n", k, toml_escape(&v.to_string())));
+                        }
+                    }
+                }
+            }
+
+            Some(section)
+        }
+    }
 }
 
 /// Convert an MCP config to Amp settings.json format.
@@ -1971,13 +2151,13 @@ pub async fn write_claudecode_skills_to_workspace(
 /// This makes skills available to Codex using its native skills format.
 /// Codex looks for skills in `.codex/skills/<name>/SKILL.md`.
 pub async fn write_codex_skills_to_workspace(
-    workspace_dir: &Path,
+    codex_dir: &Path,
     skills: &[SkillContent],
 ) -> anyhow::Result<()> {
-    let skills_dir = workspace_dir.join(".codex").join("skills");
+    let skills_dir = codex_dir.join("skills");
 
     tracing::debug!(
-        workspace = %workspace_dir.display(),
+        workspace = %codex_dir.display(),
         skills_dir = %skills_dir.display(),
         skill_count = skills.len(),
         skill_names = ?skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
@@ -1991,7 +2171,7 @@ pub async fn write_codex_skills_to_workspace(
 
     if skills.is_empty() {
         tracing::warn!(
-            workspace = %workspace_dir.display(),
+            workspace = %codex_dir.display(),
             "No skills to write for Codex"
         );
         return Ok(());
@@ -2029,14 +2209,14 @@ pub async fn write_codex_skills_to_workspace(
 
         tracing::debug!(
             skill = %skill.name,
-            workspace = %workspace_dir.display(),
+            workspace = %codex_dir.display(),
             "Wrote Codex skill to workspace"
         );
     }
 
     tracing::info!(
         count = skills.len(),
-        workspace = %workspace_dir.display(),
+        workspace = %codex_dir.display(),
         "Wrote Codex skills to workspace"
     );
 
