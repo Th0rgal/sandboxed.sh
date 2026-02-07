@@ -359,33 +359,23 @@ fn convert_codex_event(
                 }
                 "mcp_tool_call" => {
                     if let Some(name) = mcp_tool_name(&item.data) {
-                        let args = mcp_tool_args(&item.data);
-                        let result = mcp_tool_result(&item.data);
-                        let already_emitted = tool_call_emitted(item_content_cache, &item.id);
-
-                        if let Some(args) = args {
-                            if !already_emitted && !mark_tool_call_emitted(item_content_cache, &item.id) {
+                        if let Some(args) = mcp_tool_args(&item.data) {
+                            if !tool_call_emitted(item_content_cache, &item.id)
+                                && !mark_tool_call_emitted(item_content_cache, &item.id)
+                            {
                                 results.push(ExecutionEvent::ToolCall {
                                     id: item.id.clone(),
                                     name: name.clone(),
                                     args,
                                 });
                             }
-                            if let Some(result) = result {
-                                results.push(ExecutionEvent::ToolResult {
-                                    id: item.id.clone(),
-                                    name,
-                                    result,
-                                });
-                            }
-                        } else if already_emitted {
-                            if let Some(result) = result {
-                                results.push(ExecutionEvent::ToolResult {
-                                    id: item.id.clone(),
-                                    name,
-                                    result,
-                                });
-                            }
+                        }
+                        if let Some(result) = mcp_tool_result(&item.data) {
+                            results.push(ExecutionEvent::ToolResult {
+                                id: item.id.clone(),
+                                name,
+                                result,
+                            });
                         }
                     }
                 }
