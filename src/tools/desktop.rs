@@ -39,12 +39,21 @@ fn env_var_bool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn kill_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+}
+
 /// Get the configured resolution
 fn get_resolution() -> String {
     std::env::var("DESKTOP_RESOLUTION").unwrap_or_else(|_| "1280x720".to_string())
 }
 
-fn find_browser_command() -> Option<String> {
+pub fn find_browser_command() -> Option<String> {
     let mut candidates: Vec<String> = Vec::new();
 
     if let Ok(chromium_bin) = std::env::var("CHROMIUM_BIN") {
@@ -67,6 +76,7 @@ fn find_browser_command() -> Option<String> {
             "google-chrome-stable",
             "brave-browser",
             "microsoft-edge",
+            "msedge",
         ]
         .iter()
         .map(|s| s.to_string()),
@@ -274,9 +284,17 @@ impl Tool for StartSession {
         let launch_browser = args["launch_browser"].as_bool().unwrap_or(false);
         let browser_info = if launch_browser {
             let url = args["url"].as_str().unwrap_or("about:blank");
-            let browser_cmd = find_browser_command().ok_or_else(|| {
-                anyhow::anyhow!("Could not find a Chromium-based browser. Is Chromium installed?")
-            })?;
+            let browser_cmd = match find_browser_command() {
+                Some(cmd) => cmd,
+                None => {
+                    kill_pid(xvfb_pid);
+                    kill_pid(i3_pid);
+                    return Err(anyhow::anyhow!(
+                        "Failed to find a Chromium-compatible browser in PATH. \
+                        Set CHROMIUM_BIN or BROWSER, or install chromium/chromium-browser."
+                    ));
+                }
+            };
             let mut chromium = Command::new(&browser_cmd)
                 .args([
                     "--no-sandbox",
@@ -290,11 +308,17 @@ impl Tool for StartSession {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .map_err(|e| anyhow::anyhow!("Failed to start Chromium: {}", e))?;
+                .map_err(|e| {
+                    kill_pid(xvfb_pid);
+                    kill_pid(i3_pid);
+                    anyhow::anyhow!("Failed to start Chromium: {}", e)
+                })?;
 
             let chromium_pid = chromium.id().unwrap_or(0);
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             if let Ok(Some(status)) = chromium.try_wait() {
+                kill_pid(xvfb_pid);
+                kill_pid(i3_pid);
                 return Err(anyhow::anyhow!(
                     "Browser exited immediately with status: {:?}",
                     status
@@ -305,8 +329,8 @@ impl Tool for StartSession {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
             format!(
-                ", \"browser\": \"chromium\", \"browser_pid\": {}, \"url\": \"{}\"",
-                chromium_pid, url
+                ", \"browser\": \"{}\", \"browser_pid\": {}, \"url\": \"{}\"",
+                browser_cmd, chromium_pid, url
             )
         } else {
             String::new()

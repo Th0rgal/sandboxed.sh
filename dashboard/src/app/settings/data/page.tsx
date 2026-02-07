@@ -6,6 +6,7 @@ import { toast } from '@/components/toast';
 import {
   getSettings,
   updateLibraryRemote,
+  updateSettings,
   downloadBackup,
   restoreBackup,
 } from '@/lib/api';
@@ -24,6 +25,9 @@ export default function DataSettingsPage() {
   const [editingLibraryRemote, setEditingLibraryRemote] = useState(false);
   const [libraryRemoteValue, setLibraryRemoteValue] = useState('');
   const [savingLibraryRemote, setSavingLibraryRemote] = useState(false);
+  const [editingRepoPath, setEditingRepoPath] = useState(false);
+  const [repoPathValue, setRepoPathValue] = useState('');
+  const [savingRepoPath, setSavingRepoPath] = useState(false);
 
   const [downloadingBackup, setDownloadingBackup] = useState(false);
   const [restoringBackup, setRestoringBackup] = useState(false);
@@ -76,6 +80,37 @@ export default function DataSettingsPage() {
       );
     } finally {
       setSavingLibraryRemote(false);
+    }
+  };
+
+  const handleStartEditRepoPath = () => {
+    setRepoPathValue(serverSettings?.sandboxed_repo_path || '');
+    setEditingRepoPath(true);
+  };
+
+  const handleCancelEditRepoPath = () => {
+    setEditingRepoPath(false);
+    setRepoPathValue('');
+  };
+
+  const handleSaveRepoPath = async () => {
+    setSavingRepoPath(true);
+    try {
+      const trimmed = repoPathValue.trim();
+      await updateSettings({ sandboxed_repo_path: trimmed || null });
+      mutateSettings();
+      setEditingRepoPath(false);
+      if (trimmed) {
+        toast.success('Source repo path updated');
+      } else {
+        toast.success('Source repo path cleared');
+      }
+    } catch (err) {
+      toast.error(
+        `Failed to save: ${err instanceof Error ? err.message : 'Unknown error'}`
+      );
+    } finally {
+      setSavingRepoPath(false);
     }
   };
 
@@ -202,6 +237,86 @@ export default function DataSettingsPage() {
               )}
               <p className="mt-1.5 text-xs text-white/30">
                 Git remote URL for skills, tools, agents, and rules. Click to edit.
+              </p>
+            </div>
+          </div>
+
+          {/* Open Agent Source */}
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10">
+                <Archive className="h-5 w-5 text-emerald-400" />
+              </div>
+              <div>
+                <h2 className="text-sm font-medium text-white">Open Agent Source</h2>
+                <p className="text-xs text-white/40">
+                  Path to the sandboxed.sh git checkout used for updates
+                </p>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-white/60 mb-1.5">
+                Source Repo Path
+              </label>
+              {settingsLoading ? (
+                <div className="flex items-center gap-2 py-2.5">
+                  <Loader className="h-4 w-4 animate-spin text-white/40" />
+                  <span className="text-sm text-white/40">Loading...</span>
+                </div>
+              ) : editingRepoPath ? (
+                <div className="space-y-2">
+                  <input
+                    type="text"
+                    value={repoPathValue}
+                    onChange={(e) => setRepoPathValue(e.target.value)}
+                    placeholder="/opt/sandboxed-sh/vaduz-v1"
+                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-emerald-500/50"
+                    autoFocus
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleSaveRepoPath();
+                      if (e.key === 'Escape') handleCancelEditRepoPath();
+                    }}
+                  />
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleSaveRepoPath}
+                      disabled={savingRepoPath}
+                      className="flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs text-white hover:bg-emerald-600 transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      {savingRepoPath ? (
+                        <Loader className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <Check className="h-3 w-3" />
+                      )}
+                      Save
+                    </button>
+                    <button
+                      onClick={handleCancelEditRepoPath}
+                      disabled={savingRepoPath}
+                      className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] px-3 py-1.5 text-xs text-white/60 hover:bg-white/[0.04] transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      <X className="h-3 w-3" />
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div
+                  onClick={handleStartEditRepoPath}
+                  className={cn(
+                    'w-full rounded-lg border px-3 py-2.5 text-sm font-mono cursor-pointer transition-colors',
+                    serverSettings?.sandboxed_repo_path
+                      ? 'border-white/[0.06] bg-white/[0.01] text-white/70 hover:border-emerald-500/30 hover:bg-white/[0.02]'
+                      : 'border-amber-500/20 bg-amber-500/5 text-amber-400/80 hover:border-amber-500/30 hover:bg-amber-500/10'
+                  )}
+                  title="Click to edit"
+                >
+                  {serverSettings?.sandboxed_repo_path || 'Using default path'}
+                </div>
+              )}
+              <p className="mt-2 text-xs text-white/40">
+                Leave blank to use the server default or <span className="font-mono">SANDBOXED_SH_REPO_PATH</span>.
               </p>
             </div>
           </div>

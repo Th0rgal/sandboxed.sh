@@ -2309,6 +2309,7 @@ export interface ComponentInfo {
   installed: boolean;
   update_available: string | null;
   path: string | null;
+  source_path?: string | null;
   status: ComponentStatus;
 }
 
@@ -2434,6 +2435,7 @@ export async function uninstallSystemComponent(
 
 export interface SettingsResponse {
   library_remote: string | null;
+  sandboxed_repo_path: string | null;
 }
 
 export interface UpdateLibraryRemoteResponse {
@@ -2445,6 +2447,21 @@ export interface UpdateLibraryRemoteResponse {
 // Get all settings
 export async function getSettings(): Promise<SettingsResponse> {
   return apiGet('/api/settings', 'Failed to get settings');
+}
+
+export async function updateSettings(
+  settings: Partial<SettingsResponse>
+): Promise<SettingsResponse> {
+  const res = await apiFetch('/api/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || 'Failed to update settings');
+  }
+  return res.json();
 }
 
 // Update the library remote URL

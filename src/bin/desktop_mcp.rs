@@ -6,95 +6,16 @@
 //! Communicates over stdio using JSON-RPC 2.0.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sandboxed_sh::tools::desktop::find_browser_command;
 
 /// Global counter for display numbers to avoid conflicts
 static DISPLAY_COUNTER: AtomicU32 = AtomicU32::new(99);
-
-fn find_browser_command() -> Option<String> {
-    let mut candidates: Vec<String> = Vec::new();
-
-    if let Ok(chromium_bin) = std::env::var("CHROMIUM_BIN") {
-        if !chromium_bin.trim().is_empty() {
-            candidates.push(chromium_bin);
-        }
-    }
-
-    if let Ok(browser) = std::env::var("BROWSER") {
-        if !browser.trim().is_empty() {
-            candidates.extend(browser.split(':').map(|s| s.trim().to_string()));
-        }
-    }
-
-    candidates.extend(
-        [
-            "chromium",
-            "chromium-browser",
-            "google-chrome",
-            "google-chrome-stable",
-            "brave-browser",
-            "microsoft-edge",
-            "msedge",
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
-
-    for candidate in candidates {
-        if candidate.is_empty() {
-            continue;
-        }
-        let candidate_path = resolve_browser_candidate(&candidate);
-        if let Some(path) = candidate_path {
-            if is_snap_stub(&path) {
-                continue;
-            }
-            return Some(path.to_string_lossy().to_string());
-        }
-    }
-
-    None
-}
-
-fn resolve_browser_candidate(candidate: &str) -> Option<PathBuf> {
-    let candidate_path = std::path::Path::new(candidate);
-    if candidate_path.is_absolute() || candidate.contains('/') {
-        if candidate_path.exists() {
-            return Some(candidate_path.to_path_buf());
-        }
-        return None;
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let full = dir.join(candidate);
-            if full.exists() {
-                return Some(full);
-            }
-        }
-    }
-    None
-}
-
-fn is_snap_stub(path: &Path) -> bool {
-    let meta = match std::fs::metadata(path) {
-        Ok(meta) => meta,
-        Err(_) => return false,
-    };
-    if meta.len() > 256 * 1024 {
-        return false;
-    }
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => return false,
-    };
-    let lower = content.to_lowercase();
-    lower.contains("snap install") || (lower.contains("snap") && lower.contains("chromium"))
-}
 
 // =============================================================================
 // JSON-RPC Types

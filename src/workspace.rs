@@ -1717,11 +1717,18 @@ fn update_codex_mcp_config(existing: &str, entries: &[CodexMcpEntry]) -> String 
     let mut filtered: Vec<String> = Vec::new();
     let mut skip = false;
     for line in existing.lines() {
-        if let Some(section_name) = parse_mcp_section_name(line) {
-            if names.contains(&section_name) {
-                skip = true;
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if let Some(section_name) = parse_mcp_section_name(line) {
+                if names.contains(&section_name) {
+                    skip = true;
+                    continue;
+                }
+                skip = false;
+                filtered.push(line.to_string());
                 continue;
             }
+            // Non-MCP section: stop skipping and keep section header.
             skip = false;
             filtered.push(line.to_string());
             continue;

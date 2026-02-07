@@ -8,12 +8,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Default repo path for sandboxed.sh source (used for self-updates).
+pub const DEFAULT_SANDBOXED_REPO_PATH: &str = "/opt/sandboxed-sh/vaduz-v1";
+
 /// Global application settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     /// Git remote URL for the configuration library.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library_remote: Option<String>,
+    /// Path to the sandboxed.sh source repo (used for self-updates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandboxed_repo_path: Option<String>,
 }
 
 /// In-memory store for global settings with disk persistence.
@@ -66,6 +72,10 @@ impl SettingsStore {
             library_remote: std::env::var("LIBRARY_REMOTE").ok().or_else(|| {
                 Some("https://github.com/Th0rgal/sandboxed-library-template.git".to_string())
             }),
+            sandboxed_repo_path: std::env::var("SANDBOXED_SH_REPO_PATH")
+                .or_else(|_| std::env::var("SANDBOXED_REPO_PATH"))
+                .ok()
+                .or_else(|| Some(DEFAULT_SANDBOXED_REPO_PATH.to_string())),
         }
     }
 
@@ -101,6 +111,11 @@ impl SettingsStore {
     /// Get the library remote URL.
     pub async fn get_library_remote(&self) -> Option<String> {
         self.settings.read().await.library_remote.clone()
+    }
+
+    /// Get the configured sandboxed.sh repo path.
+    pub async fn get_sandboxed_repo_path(&self) -> Option<String> {
+        self.settings.read().await.sandboxed_repo_path.clone()
     }
 
     /// Update the library remote URL.

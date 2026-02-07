@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import type { MouseEvent, WheelEvent, KeyboardEvent } from "react";
 import { cn } from "@/lib/utils";
 import { getValidJwt } from "@/lib/auth";
 import { getRuntimeApiBase } from "@/lib/settings";
@@ -52,6 +53,8 @@ export function DesktopStream({
   const pipVideoRef = useRef<HTMLVideoElement | null>(null);
   const pipStreamRef = useRef<MediaStream | null>(null);
   const connectionIdRef = useRef(0); // Guard against stale callbacks from old connections
+  const moveRafRef = useRef<number | null>(null);
+  const pendingMoveRef = useRef<{ x: number; y: number } | null>(null);
 
   // Refs to store current values without triggering reconnection on slider changes
   const fpsRef = useRef(initialFps);
@@ -181,6 +184,214 @@ export function DesktopStream({
       wsRef.current.send(JSON.stringify(cmd));
     }
   }, []);
+
+  const getCanvasCoords = useCallback(
+    (event: { clientX: number; clientY: number }) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return null;
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return null;
+      const x = Math.round(
+        ((event.clientX - rect.left) * canvas.width) / rect.width
+      );
+      const y = Math.round(
+        ((event.clientY - rect.top) * canvas.height) / rect.height
+      );
+      return {
+        x: Math.max(0, Math.min(canvas.width - 1, x)),
+        y: Math.max(0, Math.min(canvas.height - 1, y)),
+      };
+    },
+    []
+  );
+
+  const sendMouseMove = useCallback(
+    (x: number, y: number) => {
+      sendCommand({ t: "move", x, y });
+    },
+    [sendCommand]
+  );
+
+  const handleMouseMove = useCallback(
+    (event: MouseEvent<HTMLCanvasElement>) => {
+      if (connectionState !== "connected") return;
+      const coords = getCanvasCoords(event);
+      if (!coords) return;
+      pendingMoveRef.current = coords;
+      if (moveRafRef.current !== null) return;
+      moveRafRef.current = requestAnimationFrame(() => {
+        moveRafRef.current = null;
+        if (pendingMoveRef.current) {
+          sendMouseMove(pendingMoveRef.current.x, pendingMoveRef.current.y);
+          pendingMoveRef.current = null;
+        }
+      });
+    },
+    [connectionState, getCanvasCoords, sendMouseMove]
+  );
+
+  const handleClick = useCallback(
+    (event: MouseEvent<HTMLCanvasElement>) => {
+      if (connectionState !== "connected") return;
+      const coords = getCanvasCoords(event);
+      if (!coords) return;
+      const isDouble = event.detail >= 2;
+      sendCommand({
+        t: "click",
+        x: coords.x,
+        y: coords.y,
+        button: 1,
+        double: isDouble,
+      });
+      event.preventDefault();
+      event.stopPropagation();
+      containerRef.current?.focus();
+    },
+    [connectionState, getCanvasCoords, sendCommand]
+  );
+
+  const handleAuxClick = useCallback(
+    (event: MouseEvent<HTMLCanvasElement>) => {
+      if (connectionState !== "connected") return;
+      if (event.button !== 1) return;
+      const coords = getCanvasCoords(event);
+      if (!coords) return;
+      sendCommand({
+        t: "click",
+        x: coords.x,
+        y: coords.y,
+        button: 2,
+        double: false,
+      });
+      event.preventDefault();
+      event.stopPropagation();
+      containerRef.current?.focus();
+    },
+    [connectionState, getCanvasCoords, sendCommand]
+  );
+
+  const handleContextMenu = useCallback(
+    (event: MouseEvent<HTMLCanvasElement>) => {
+      if (connectionState !== "connected") return;
+      const coords = getCanvasCoords(event);
+      if (!coords) return;
+      sendCommand({
+        t: "click",
+        x: coords.x,
+        y: coords.y,
+        button: 3,
+        double: false,
+      });
+      event.preventDefault();
+      event.stopPropagation();
+      containerRef.current?.focus();
+    },
+    [connectionState, getCanvasCoords, sendCommand]
+  );
+
+  const handleWheel = useCallback(
+    (event: WheelEvent<HTMLCanvasElement>) => {
+      if (connectionState !== "connected") return;
+      const coords = getCanvasCoords(event);
+      sendCommand({
+        t: "scroll",
+        delta_x: Math.round(event.deltaX),
+        delta_y: Math.round(event.deltaY),
+        x: coords?.x ?? null,
+        y: coords?.y ?? null,
+      });
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    [connectionState, getCanvasCoords, sendCommand]
+  );
+
+  const formatKeyForXdotool = useCallback(
+    (event: KeyboardEvent<HTMLDivElement>) => {
+      let key = event.key;
+      const modifiers: string[] = [];
+      if (event.ctrlKey) modifiers.push("ctrl");
+      if (event.altKey) modifiers.push("alt");
+      if (event.metaKey) modifiers.push("super");
+      if (event.shiftKey) modifiers.push("shift");
+
+      switch (key) {
+        case " ":
+          key = "space";
+          break;
+        case "Enter":
+          key = "Return";
+          break;
+        case "Backspace":
+          key = "BackSpace";
+          break;
+        case "Escape":
+          key = "Escape";
+          break;
+        case "Tab":
+          key = "Tab";
+          break;
+        case "ArrowUp":
+          key = "Up";
+          break;
+        case "ArrowDown":
+          key = "Down";
+          break;
+        case "ArrowLeft":
+          key = "Left";
+          break;
+        case "ArrowRight":
+          key = "Right";
+          break;
+        case "PageUp":
+          key = "Page_Up";
+          break;
+        case "PageDown":
+          key = "Page_Down";
+          break;
+        case "Delete":
+          key = "Delete";
+          break;
+        case "Home":
+          key = "Home";
+          break;
+        case "End":
+          key = "End";
+          break;
+        default:
+          break;
+      }
+
+      if (key.length === 1) {
+        key = key.toLowerCase();
+      }
+
+      if (modifiers.length) {
+        return `${modifiers.join("+")}+${key}`;
+      }
+      return key;
+    },
+    []
+  );
+
+  const handleKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLDivElement>) => {
+      if (connectionState !== "connected") return;
+      if (event.key === "Shift" || event.key === "Control" || event.key === "Alt" || event.key === "Meta") {
+        return;
+      }
+      const isPrintable = event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey;
+      if (isPrintable) {
+        sendCommand({ t: "type", text: event.key });
+      } else {
+        const formatted = formatKeyForXdotool(event);
+        sendCommand({ t: "key", key: formatted });
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    [connectionState, formatKeyForXdotool, sendCommand]
+  );
 
   // Control handlers
   const handlePause = useCallback(() => {
@@ -318,6 +529,8 @@ export function DesktopStream({
   return (
     <div
       ref={containerRef}
+      tabIndex={0}
+      onKeyDown={handleKeyDown}
       className={cn(
         "relative flex flex-col bg-[#0a0a0a] rounded-xl overflow-hidden border border-white/[0.06]",
         className
@@ -412,6 +625,11 @@ export function DesktopStream({
           <canvas
             ref={canvasRef}
             className="max-w-full max-h-full object-contain"
+            onMouseMove={handleMouseMove}
+            onClick={handleClick}
+            onAuxClick={handleAuxClick}
+            onContextMenu={handleContextMenu}
+            onWheel={handleWheel}
           />
         ) : connectionState === "connecting" ? (
           <div className="flex flex-col items-center gap-3 text-white/60">
