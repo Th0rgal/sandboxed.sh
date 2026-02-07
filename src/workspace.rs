@@ -1355,6 +1355,14 @@ async fn write_claudecode_config(
     let settings_content = serde_json::to_string_pretty(&settings)?;
     tokio::fs::write(&settings_path, settings_content).await?;
 
+    // Also write settings to ~/.claude so `claude mcp list` sees workspace MCPs.
+    let claude_home = resolve_claudecode_dir(workspace_root, workspace_type, workspace_env);
+    if claude_home != claude_dir {
+        tokio::fs::create_dir_all(&claude_home).await?;
+        let home_settings = claude_home.join("settings.local.json");
+        tokio::fs::write(&home_settings, serde_json::to_string_pretty(&settings)?).await?;
+    }
+
     // Write skills to .claude/skills/ using Claude Code's native format
     // This allows Claude to discover and list skills properly
     if let Some(skills) = skill_contents {
@@ -1593,6 +1601,24 @@ fn resolve_codex_dir(
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home).join(".codex")
+}
+
+fn resolve_claudecode_dir(
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+) -> PathBuf {
+    let container_fallback = workspace_env
+        .get("SANDBOXED_SH_CONTAINER_FALLBACK")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"))
+        .unwrap_or(false);
+
+    if workspace_type == WorkspaceType::Container && !container_fallback {
+        return workspace_root.join("root").join(".claude");
+    }
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".claude")
 }
 
 fn codex_entry_from_mcp(
