@@ -1008,6 +1008,9 @@ async fn write_opencode_config(
 
     let mut mcp_map = serde_json::Map::new();
     let mut used = std::collections::HashSet::new();
+    let has_desktop_mcp = mcp_configs
+        .iter()
+        .any(|config| config.enabled && config.name == "desktop");
 
     let filtered_configs = mcp_configs.into_iter().filter(|c| {
         if !c.enabled {
@@ -1063,13 +1066,30 @@ async fn write_opencode_config(
             );
         }
     }
+    let workspace_desktop_flag = workspace_env
+        .get("SANDBOXED_SH_ENABLE_DESKTOP_TOOLS")
+        .or_else(|| workspace_env.get("DESKTOP_ENABLED"))
+        .map(|value| {
+            matches!(
+                value.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "on"
+            )
+        })
+        .unwrap_or(false);
+    let workspace_has_display = workspace_env.contains_key("DISPLAY");
+
     // Tool policy:
     // - We want shell/file effects scoped to the workspace by running the agent process
     //   inside the workspace execution context (host/container).
     // - Therefore, OpenCode built-in bash MUST be enabled for all workspace types.
     // - The legacy workspace-mcp/desktop-mcp proxy tools are no longer required for core flows.
+    // - Enable desktop tools automatically when a desktop MCP exists or the workspace advertises
+    //   a display (browser/X11 templates), even if global env flags are unset.
     let enable_desktop_tools = env_var_bool("SANDBOXED_SH_ENABLE_DESKTOP_TOOLS", false)
-        || env_var_bool("DESKTOP_ENABLED", false);
+        || env_var_bool("DESKTOP_ENABLED", false)
+        || workspace_desktop_flag
+        || workspace_has_display
+        || has_desktop_mcp;
     let container_fallback = workspace_env
         .get("SANDBOXED_SH_CONTAINER_FALLBACK")
         .map(|v| {
@@ -1335,6 +1355,14 @@ async fn write_claudecode_config(
     let settings_content = serde_json::to_string_pretty(&settings)?;
     tokio::fs::write(&settings_path, settings_content).await?;
 
+    // Also write settings to ~/.claude so `claude mcp list` sees workspace MCPs.
+    let claude_home = resolve_claudecode_dir(workspace_root, workspace_type, workspace_env);
+    if claude_home != claude_dir {
+        tokio::fs::create_dir_all(&claude_home).await?;
+        let home_settings = claude_home.join("settings.local.json");
+        tokio::fs::write(&home_settings, serde_json::to_string_pretty(&settings)?).await?;
+    }
+
     // Write skills to .claude/skills/ using Claude Code's native format
     // This allows Claude to discover and list skills properly
     if let Some(skills) = skill_contents {
@@ -1486,29 +1514,308 @@ async fn write_amp_config(
 
 async fn write_codex_config(
     workspace_dir: &Path,
-    _mcp_configs: Vec<McpServerConfig>,
-    _workspace_root: &Path,
-    _workspace_type: WorkspaceType,
-    _workspace_env: &HashMap<String, String>,
+    mcp_configs: Vec<McpServerConfig>,
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
     skill_contents: Option<&[SkillContent]>,
-    _shared_network: Option<bool>,
+    shared_network: Option<bool>,
 ) -> anyhow::Result<()> {
-    // Codex doesn't require workspace-specific config files
-    // OAuth tokens are written to ~/.codex/config.toml by the credential sync function
-    // just before mission execution.
-    //
-    // We only need to ensure the .codex directory exists
-    let codex_dir = workspace_dir.join(".codex");
+    let codex_dir = resolve_codex_dir(workspace_dir, workspace_root, workspace_type, workspace_env);
     tokio::fs::create_dir_all(&codex_dir).await?;
 
-    tracing::debug!("Created Codex config directory at {}", codex_dir.display());
+    tracing::debug!("Ensuring Codex config directory at {}", codex_dir.display());
 
-    // Write skills to .codex/skills/ using Codex's native skills format
+    // Write MCP config for Codex so tools are available.
+    let config_path = codex_dir.join("config.toml");
+    let existing = tokio::fs::read_to_string(&config_path).await.unwrap_or_default();
+
+    let mut entries = Vec::new();
+    let mut existing_names = std::collections::HashSet::new();
+    for config in mcp_configs.iter().filter(|c| c.enabled) {
+        existing_names.insert(config.name.clone());
+        if let Some(entry) = codex_entry_from_mcp(
+            config,
+            workspace_dir,
+            workspace_root,
+            workspace_type,
+            workspace_env,
+            shared_network,
+            None,
+        ) {
+            entries.push(entry);
+        }
+    }
+
+    // Provide a filesystem alias for Codex (many prompts/toolchains expect it).
+    if existing_names.contains("workspace") && !existing_names.contains("filesystem") {
+        if let Some(workspace_cfg) = mcp_configs.iter().find(|c| c.name == "workspace") {
+            if let Some(entry) = codex_entry_from_mcp(
+                workspace_cfg,
+                workspace_dir,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                shared_network,
+                Some("filesystem".to_string()),
+            ) {
+                entries.push(entry);
+            }
+        }
+    }
+
+    let config_payload = update_codex_mcp_config(&existing, &entries);
+    tokio::fs::write(&config_path, config_payload).await?;
+
+    // Write skills to ~/.codex/skills using Codex's native skills format
     if let Some(skills) = skill_contents {
-        write_codex_skills_to_workspace(workspace_dir, skills).await?;
+        write_codex_skills_to_workspace(&codex_dir, skills).await?;
     }
 
     Ok(())
+}
+
+struct CodexMcpEntry {
+    name: String,
+    command: Option<String>,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    url: Option<String>,
+    headers: HashMap<String, String>,
+}
+
+fn resolve_codex_dir(
+    _workspace_dir: &Path,
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+) -> PathBuf {
+    let container_fallback = workspace_env
+        .get("SANDBOXED_SH_CONTAINER_FALLBACK")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"))
+        .unwrap_or(false);
+
+    if workspace_type == WorkspaceType::Container && !container_fallback {
+        return workspace_root.join("root").join(".codex");
+    }
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".codex")
+}
+
+fn resolve_claudecode_dir(
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+) -> PathBuf {
+    let container_fallback = workspace_env
+        .get("SANDBOXED_SH_CONTAINER_FALLBACK")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"))
+        .unwrap_or(false);
+
+    if workspace_type == WorkspaceType::Container && !container_fallback {
+        return workspace_root.join("root").join(".claude");
+    }
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".claude")
+}
+
+fn codex_entry_from_mcp(
+    config: &McpServerConfig,
+    workspace_dir: &Path,
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+    shared_network: Option<bool>,
+    override_name: Option<String>,
+) -> Option<CodexMcpEntry> {
+    let name = override_name.unwrap_or_else(|| config.name.clone());
+    match &config.transport {
+        McpTransport::Http { endpoint, headers } => Some(CodexMcpEntry {
+            name,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some(endpoint.clone()),
+            headers: headers.clone(),
+        }),
+        McpTransport::Stdio { .. } => {
+            let opencode_entry = opencode_entry_from_mcp(
+                config,
+                workspace_dir,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                shared_network,
+            );
+            let command_vec = opencode_entry
+                .get("command")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let command = command_vec
+                .first()
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let args: Vec<String> = command_vec
+                .iter()
+                .skip(1)
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+
+            let env = opencode_entry
+                .get("environment")
+                .and_then(|v| v.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect::<HashMap<String, String>>()
+                })
+                .unwrap_or_default();
+
+            command.map(|cmd| CodexMcpEntry {
+                name,
+                command: Some(cmd),
+                args,
+                env,
+                url: None,
+                headers: HashMap::new(),
+            })
+        }
+    }
+}
+
+fn update_codex_mcp_config(existing: &str, entries: &[CodexMcpEntry]) -> String {
+    let mut names = std::collections::HashSet::new();
+    for entry in entries {
+        names.insert(entry.name.clone());
+    }
+
+    let mut filtered: Vec<String> = Vec::new();
+    let mut skip = false;
+    for line in existing.lines() {
+        if let Some(section_name) = parse_mcp_section_name(line) {
+            if names.contains(&section_name) {
+                skip = true;
+                continue;
+            }
+            skip = false;
+            filtered.push(line.to_string());
+            continue;
+        }
+        if skip {
+            continue;
+        }
+        filtered.push(line.to_string());
+    }
+
+    let mut output = filtered.join("\n");
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    if !output.is_empty() && !output.ends_with("\n\n") {
+        output.push('\n');
+    }
+
+    for entry in entries {
+        output.push_str(&render_codex_mcp_entry(entry));
+        output.push('\n');
+    }
+
+    output
+}
+
+fn parse_mcp_section_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return None;
+    }
+    let inner = trimmed.trim_start_matches('[').trim_end_matches(']');
+    let prefix = "mcp_servers.";
+    if !inner.starts_with(prefix) {
+        return None;
+    }
+    let rest = &inner[prefix.len()..];
+    let base = rest.split('.').next()?;
+    Some(base.to_string())
+}
+
+fn render_codex_mcp_entry(entry: &CodexMcpEntry) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("[mcp_servers.{}]\n", entry.name));
+
+    if let Some(url) = &entry.url {
+        out.push_str(&format!("url = {}\n", toml_string(url)));
+        if !entry.headers.is_empty() {
+            out.push('\n');
+            out.push_str(&format!("[mcp_servers.{}.headers]\n", entry.name));
+            let mut headers = entry.headers.iter().collect::<Vec<_>>();
+            headers.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in headers {
+                out.push_str(&format!(
+                    "{} = {}\n",
+                    toml_key(key),
+                    toml_string(value)
+                ));
+            }
+        }
+        return out;
+    }
+
+    if let Some(command) = &entry.command {
+        out.push_str(&format!("command = {}\n", toml_string(command)));
+        if !entry.args.is_empty() {
+            let args = entry
+                .args
+                .iter()
+                .map(|arg| toml_string(arg))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("args = [{}]\n", args));
+        }
+        if !entry.env.is_empty() {
+            out.push('\n');
+            out.push_str(&format!("[mcp_servers.{}.env]\n", entry.name));
+            let mut envs = entry.env.iter().collect::<Vec<_>>();
+            envs.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in envs {
+                out.push_str(&format!(
+                    "{} = {}\n",
+                    toml_key(key),
+                    toml_string(value)
+                ));
+            }
+        }
+    }
+
+    out
+}
+
+fn toml_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn toml_key(key: &str) -> String {
+    if key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return key.to_string();
+    }
+    toml_string(key)
 }
 
 /// Convert an MCP config to Amp settings.json format.
@@ -1947,21 +2254,20 @@ pub async fn write_claudecode_skills_to_workspace(
     Ok(())
 }
 
-/// Write skill files to the workspace's `.codex/skills/` directory.
-/// This makes skills available to Codex using its native skills format.
-/// Codex looks for skills in `.codex/skills/<name>/SKILL.md`.
+/// Write skill files to Codex's native skills directory.
+/// Codex looks for skills in `<codex_root>/skills/<name>/SKILL.md`.
 pub async fn write_codex_skills_to_workspace(
-    workspace_dir: &Path,
+    codex_root: &Path,
     skills: &[SkillContent],
 ) -> anyhow::Result<()> {
-    let skills_dir = workspace_dir.join(".codex").join("skills");
+    let skills_dir = codex_root.join("skills");
 
     tracing::debug!(
-        workspace = %workspace_dir.display(),
+        codex_root = %codex_root.display(),
         skills_dir = %skills_dir.display(),
         skill_count = skills.len(),
         skill_names = ?skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
-        "Writing Codex skills to workspace"
+        "Writing Codex skills"
     );
 
     // Clean up old skills directory to remove stale skills
@@ -1970,10 +2276,7 @@ pub async fn write_codex_skills_to_workspace(
     }
 
     if skills.is_empty() {
-        tracing::warn!(
-            workspace = %workspace_dir.display(),
-            "No skills to write for Codex"
-        );
+        tracing::warn!(codex_root = %codex_root.display(), "No skills to write for Codex");
         return Ok(());
     }
 
@@ -2007,17 +2310,13 @@ pub async fn write_codex_skills_to_workspace(
             tokio::fs::write(&file_path, file_content_stripped).await?;
         }
 
-        tracing::debug!(
-            skill = %skill.name,
-            workspace = %workspace_dir.display(),
-            "Wrote Codex skill to workspace"
-        );
+        tracing::debug!(skill = %skill.name, codex_root = %codex_root.display(), "Wrote Codex skill");
     }
 
     tracing::info!(
         count = skills.len(),
-        workspace = %workspace_dir.display(),
-        "Wrote Codex skills to workspace"
+        codex_root = %codex_root.display(),
+        "Wrote Codex skills"
     );
 
     Ok(())
@@ -3212,6 +3511,12 @@ fn find_host_binary(name: &str, working_dir: &Path) -> Option<PathBuf> {
         }
     }
 
+    // Fall back to common install locations even if PATH is trimmed.
+    let fallback = PathBuf::from("/usr/local/bin").join(name);
+    if fallback.exists() {
+        return Some(fallback);
+    }
+
     None
 }
 
@@ -3251,6 +3556,16 @@ async fn sync_workspace_mcp_binaries(
         copy_binary_into_container(working_dir, container_root, binary).await?;
     }
     Ok(())
+}
+
+pub async fn sync_workspace_mcp_binaries_for_workspace(
+    working_dir: &Path,
+    workspace: &Workspace,
+) -> anyhow::Result<()> {
+    if workspace.workspace_type != WorkspaceType::Container {
+        return Ok(());
+    }
+    sync_workspace_mcp_binaries(working_dir, &workspace.path).await
 }
 
 fn mark_container_fallback(workspace: &mut Workspace, reason: &str) {
