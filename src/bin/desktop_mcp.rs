@@ -16,6 +16,59 @@ use serde_json::{json, Value};
 /// Global counter for display numbers to avoid conflicts
 static DISPLAY_COUNTER: AtomicU32 = AtomicU32::new(99);
 
+fn find_browser_command() -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+
+    if let Ok(chromium_bin) = std::env::var("CHROMIUM_BIN") {
+        if !chromium_bin.trim().is_empty() {
+            candidates.push(chromium_bin);
+        }
+    }
+
+    if let Ok(browser) = std::env::var("BROWSER") {
+        if !browser.trim().is_empty() {
+            candidates.extend(browser.split(':').map(|s| s.trim().to_string()));
+        }
+    }
+
+    candidates.extend(
+        [
+            "chromium",
+            "chromium-browser",
+            "google-chrome",
+            "google-chrome-stable",
+            "brave-browser",
+            "microsoft-edge",
+            "msedge",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+
+    for candidate in candidates {
+        if candidate.is_empty() {
+            continue;
+        }
+        let candidate_path = std::path::Path::new(&candidate);
+        if candidate_path.is_absolute() || candidate.contains('/') {
+            if candidate_path.exists() {
+                return Some(candidate);
+            }
+            continue;
+        }
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let full = dir.join(&candidate);
+                if full.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 // =============================================================================
 // JSON-RPC Types
 // =============================================================================
@@ -270,7 +323,19 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("about:blank");
 
-        let chromium = match std::process::Command::new("chromium")
+        let browser_cmd = match find_browser_command() {
+            Some(cmd) => cmd,
+            None => {
+                kill_process(i3_pid);
+                kill_process(xvfb_pid);
+                return Err(
+                    "Failed to start Chromium: no browser binary found (set CHROMIUM_BIN or BROWSER)"
+                        .to_string(),
+                );
+            }
+        };
+
+        let chromium = match std::process::Command::new(&browser_cmd)
             .args([
                 // Security/sandbox (required for running as root)
                 "--no-sandbox",
@@ -319,8 +384,8 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
         (
             Some(chromium_pid),
             format!(
-                ", \"browser\": \"chromium\", \"browser_pid\": {}, \"url\": \"{}\"",
-                chromium_pid, url
+                ", \"browser\": \"{}\", \"browser_pid\": {}, \"url\": \"{}\"",
+                browser_cmd, chromium_pid, url
             ),
         )
     } else {
