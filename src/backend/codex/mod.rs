@@ -214,19 +214,9 @@ fn convert_codex_event(
         }
     }
 
-    fn tool_call_emitted(
-        item_content_cache: &std::collections::HashMap<String, String>,
-        item_id: &str,
-    ) -> bool {
-        let key = format!("tool_call:{}", item_id);
-        item_content_cache.contains_key(&key)
-    }
-
     let mut results = vec![];
 
-    fn mcp_tool_name(
-        data: &std::collections::HashMap<String, serde_json::Value>,
-    ) -> Option<String> {
+    fn mcp_tool_name(data: &std::collections::HashMap<String, serde_json::Value>) -> Option<String> {
         let server = data.get("server")?.as_str()?;
         let tool = data.get("tool")?.as_str()?;
         Some(format!("mcp__{}__{}", server, tool))
@@ -243,10 +233,7 @@ fn convert_codex_event(
     fn mcp_tool_result(
         data: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Option<serde_json::Value> {
-        let result = data
-            .get("result")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        let result = data.get("result").cloned().unwrap_or(serde_json::Value::Null);
         let error = data.get("error").cloned();
         let status = data.get("status").cloned();
 
@@ -359,10 +346,8 @@ fn convert_codex_event(
                 }
                 "mcp_tool_call" => {
                     if let Some(name) = mcp_tool_name(&item.data) {
-                        if let Some(args) = mcp_tool_args(&item.data) {
-                            if !tool_call_emitted(item_content_cache, &item.id)
-                                && !mark_tool_call_emitted(item_content_cache, &item.id)
-                            {
+                        if !mark_tool_call_emitted(item_content_cache, &item.id) {
+                            if let Some(args) = mcp_tool_args(&item.data) {
                                 results.push(ExecutionEvent::ToolCall {
                                     id: item.id.clone(),
                                     name: name.clone(),
