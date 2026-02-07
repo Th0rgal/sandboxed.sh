@@ -3412,6 +3412,12 @@ fn find_host_binary(name: &str, working_dir: &Path) -> Option<PathBuf> {
         }
     }
 
+    // Fall back to common install locations even if PATH is trimmed.
+    let fallback = PathBuf::from("/usr/local/bin").join(name);
+    if fallback.exists() {
+        return Some(fallback);
+    }
+
     None
 }
 
@@ -3451,6 +3457,16 @@ async fn sync_workspace_mcp_binaries(
         copy_binary_into_container(working_dir, container_root, binary).await?;
     }
     Ok(())
+}
+
+pub async fn sync_workspace_mcp_binaries_for_workspace(
+    working_dir: &Path,
+    workspace: &Workspace,
+) -> anyhow::Result<()> {
+    if workspace.workspace_type != WorkspaceType::Container {
+        return Ok(());
+    }
+    sync_workspace_mcp_binaries(working_dir, &workspace.path).await
 }
 
 fn mark_container_fallback(workspace: &mut Workspace, reason: &str) {

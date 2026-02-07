@@ -1146,6 +1146,15 @@ async fn run_mission_turn(
 
     // Ensure mission workspace exists and is configured for OpenCode.
     let workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    if let Err(e) =
+        workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
+    {
+        tracing::warn!(
+            workspace = %workspace.name,
+            error = %e,
+            "Failed to sync MCP binaries into workspace"
+        );
+    }
     let workspace_root = workspace.path.clone();
     let mission_work_dir = match {
         let lib_guard = library.read().await;
