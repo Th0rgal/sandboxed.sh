@@ -1824,6 +1824,12 @@ pub fn run_claudecode_turn<'a>(
             let translated_path = workspace_exec.translate_path_for_container(&settings_path);
             args.push(translated_path);
         }
+        let mcp_config_path = work_dir.join(".claude").join("mcp.json");
+        if mcp_config_path.exists() {
+            args.push("--mcp-config".to_string());
+            let translated_path = workspace_exec.translate_path_for_container(&mcp_config_path);
+            args.push(translated_path);
+        }
 
         if let Some(m) = model {
             args.push("--model".to_string());
@@ -2015,12 +2021,39 @@ pub fn run_claudecode_turn<'a>(
                 if let Some(claude_path) =
                     resolve_command_path_in_workspace(&workspace_exec, work_dir, &program).await
                 {
-                    program = "bun".to_string();
-                    full_args.insert(0, claude_path);
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        "Running Claude CLI via bun wrapper (container workspace)"
-                    );
+                    let force_bun =
+                        env_var_bool("SANDBOXED_SH_CLAUDECODE_FORCE_BUN", false);
+                    let prefers_bun = if force_bun {
+                        true
+                    } else if claude_path.contains("/.bun/") || claude_path.contains("/.cache/.bun/")
+                    {
+                        true
+                    } else {
+                        claude_cli_shebang_contains(&workspace_exec, work_dir, &claude_path, "bun")
+                            .await
+                            .unwrap_or(false)
+                    };
+                    let shebang_is_node =
+                        claude_cli_shebang_contains(&workspace_exec, work_dir, &claude_path, "node")
+                            .await
+                            .unwrap_or(false);
+
+                    if prefers_bun && !shebang_is_node {
+                        program = "bun".to_string();
+                        full_args.insert(0, claude_path);
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            "Running Claude CLI via bun wrapper (container workspace)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            mission_id = %mission_id,
+                            claude_path = %claude_path,
+                            prefers_bun = prefers_bun,
+                            shebang_is_node = shebang_is_node,
+                            "Running Claude CLI directly (bun wrapper not required)"
+                        );
+                    }
                 }
             }
         }
@@ -4565,6 +4598,51 @@ async fn resolve_command_path_in_workspace(
     } else {
         Some(path.to_string())
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+async fn claude_cli_shebang_contains(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    path: &str,
+    needle: &str,
+) -> Option<bool> {
+    if path.trim().is_empty() || needle.trim().is_empty() {
+        return None;
+    }
+    let quoted = shell_quote(path);
+    let cmd = format!("head -n 1 {} 2>/dev/null", quoted);
+    let output = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &["-lc".to_string(), cmd],
+            std::collections::HashMap::new(),
+        )
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    let first_line = line.lines().next().unwrap_or("").trim().to_lowercase();
+    if first_line.is_empty() {
+        return None;
+    }
+    Some(first_line.contains(&needle.to_lowercase()))
 }
 
 /// Check basic internet connectivity using a reliable public endpoint.

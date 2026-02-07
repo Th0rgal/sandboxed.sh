@@ -1357,6 +1357,12 @@ async fn write_claudecode_config(
     let settings_json_path = claude_dir.join("settings.json");
     tokio::fs::write(&settings_json_path, &settings_content).await?;
 
+    // Write a dedicated MCP config for CLI flags like --mcp-config.
+    let mcp_only = json!({ "mcpServers": mcp_servers });
+    let mcp_content = serde_json::to_string_pretty(&mcp_only)?;
+    let mcp_config_path = claude_dir.join("mcp.json");
+    tokio::fs::write(&mcp_config_path, &mcp_content).await?;
+
     // Also write settings under XDG_CONFIG_HOME/claude for Claude CLI XDG lookups.
     let xdg_claude_dir = workspace_dir.join(".config").join("claude");
     tokio::fs::create_dir_all(&xdg_claude_dir).await?;
@@ -1364,6 +1370,8 @@ async fn write_claudecode_config(
     tokio::fs::write(&xdg_settings_path, &settings_content).await?;
     let xdg_settings_local = xdg_claude_dir.join("settings.local.json");
     tokio::fs::write(&xdg_settings_local, &settings_content).await?;
+    let xdg_mcp_path = xdg_claude_dir.join("mcp.json");
+    tokio::fs::write(&xdg_mcp_path, &mcp_content).await?;
 
     // Also write settings to ~/.claude so `claude mcp list` sees workspace MCPs.
     let claude_home = resolve_claudecode_dir(workspace_root, workspace_type, workspace_env);
@@ -1373,6 +1381,8 @@ async fn write_claudecode_config(
         tokio::fs::write(&home_settings, &settings_content).await?;
         let home_settings_json = claude_home.join("settings.json");
         tokio::fs::write(&home_settings_json, &settings_content).await?;
+        let home_mcp = claude_home.join("mcp.json");
+        tokio::fs::write(&home_mcp, &mcp_content).await?;
     }
 
     // Write skills to .claude/skills/ using Claude Code's native format
