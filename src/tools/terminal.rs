@@ -29,6 +29,37 @@ struct RuntimeContext {
     mission_id: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn validate_command_blocks_root_rm_rf_by_default() {
+        let _guard = env_lock().lock().unwrap();
+        env::remove_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS");
+
+        let result = validate_command("rm -rf /");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_command_allows_root_rm_rf_when_flagged() {
+        let _guard = env_lock().lock().unwrap();
+        env::set_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS", "1");
+
+        let result = validate_command("rm -rf /");
+        env::remove_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS");
+
+        assert!(result.is_ok());
+    }
+}
+
 /// Read context information from the local context file or fall back to env vars.
 /// This function is called before each container command to ensure we have the latest
 /// context information, even if the context file was written after the MCP started.
@@ -141,6 +172,10 @@ const DANGEROUS_PATTERNS: &[(&str, &str)] = &[
 /// Validate a command against dangerous patterns.
 /// Returns Ok(()) if safe, Err with suggestion if blocked.
 fn validate_command(cmd: &str) -> Result<(), String> {
+    if allow_dangerous_commands() {
+        return Ok(());
+    }
+
     let cmd_trimmed = cmd.trim();
     let prefixes = ["sudo ", "time ", "nice ", "nohup "];
 
@@ -222,6 +257,17 @@ fn validate_command(cmd: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn allow_dangerous_commands() -> bool {
+    let raw = match env::var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS") {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    matches!(
+        raw.trim().to_lowercase().as_str(),
+        "1" | "true" | "yes" | "y" | "on"
+    )
 }
 
 fn container_root_from_env() -> Option<PathBuf> {

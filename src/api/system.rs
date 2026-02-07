@@ -22,8 +22,8 @@ use tokio::process::Command;
 
 use super::routes::AppState;
 
-/// Default repo path for sandboxed.sh source
-const SANDBOXED_REPO_PATH: &str = "/opt/sandboxed-sh/vaduz-v1";
+/// Git remote used for sandboxed.sh self-updates
+const SANDBOXED_REPO_REMOTE: &str = "https://github.com/Th0rgal/sandboxed.sh.git";
 
 /// Information about a system component.
 #[derive(Debug, Clone, Serialize)]
@@ -33,6 +33,8 @@ pub struct ComponentInfo {
     pub installed: bool,
     pub update_available: Option<String>,
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     pub status: ComponentStatus,
 }
 
@@ -78,6 +80,181 @@ fn sse(
     ))
 }
 
+fn normalize_repo_path(value: Option<String>) -> Option<String> {
+    value.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn select_repo_path(settings_value: Option<String>, env_override: Option<String>) -> String {
+    normalize_repo_path(env_override)
+        .or_else(|| normalize_repo_path(settings_value))
+        .unwrap_or_else(|| crate::settings::DEFAULT_SANDBOXED_REPO_PATH.to_string())
+}
+
+fn repo_path_from_env() -> Option<String> {
+    std::env::var("SANDBOXED_SH_REPO_PATH")
+        .or_else(|_| std::env::var("SANDBOXED_REPO_PATH"))
+        .ok()
+}
+
+async fn resolve_sandboxed_repo_path(state: &Arc<AppState>) -> String {
+    let settings_value = state.settings.get_sandboxed_repo_path().await;
+    select_repo_path(settings_value, repo_path_from_env())
+}
+
+fn is_safe_repo_path(path: &std::path::Path) -> bool {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return false;
+    }
+
+    let mut normal_count = 0usize;
+    for component in path.components() {
+        match component {
+            Component::CurDir | Component::ParentDir => return false,
+            Component::Normal(_) => normal_count += 1,
+            _ => {}
+        }
+    }
+
+    if normal_count < 2 {
+        return false;
+    }
+
+    let banned = [
+        "/", "/home", "/root", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/var",
+        "/tmp",
+    ];
+    if banned.iter().any(|p| path == std::path::Path::new(p)) {
+        return false;
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        if path == std::path::Path::new(&home) {
+            return false;
+        }
+    }
+
+    true
+}
+
+async fn is_git_repo(repo_path: &std::path::Path) -> bool {
+    let output = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(repo_path)
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+async fn ensure_origin_remote(repo_path: &std::path::Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to check git remote: {}", e))?;
+
+    if output.status.success() {
+        let current = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if current == SANDBOXED_REPO_REMOTE {
+            return Ok(());
+        }
+        let set_output = Command::new("git")
+            .args(["remote", "set-url", "origin", SANDBOXED_REPO_REMOTE])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to set git remote: {}", e))?;
+        if set_output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&set_output.stderr);
+        return Err(format!("Failed to set git remote: {}", stderr));
+    }
+
+    let add_output = Command::new("git")
+        .args(["remote", "add", "origin", SANDBOXED_REPO_REMOTE])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to add git remote: {}", e))?;
+
+    if add_output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&add_output.stderr);
+        Err(format!("Failed to add git remote: {}", stderr))
+    }
+}
+
+async fn ensure_repo_present(repo_path: &std::path::Path) -> Result<(), String> {
+    if !is_safe_repo_path(repo_path) {
+        return Err(format!(
+            "Refusing to operate on unsafe repo path {}",
+            repo_path.display()
+        ));
+    }
+
+    if repo_path.exists() && !is_git_repo(repo_path).await {
+        if repo_path.is_file() {
+            tokio::fs::remove_file(repo_path)
+                .await
+                .map_err(|e| format!("Failed to remove file at {}: {}", repo_path.display(), e))?;
+        } else {
+            tokio::fs::remove_dir_all(repo_path).await.map_err(|e| {
+                format!(
+                    "Failed to remove non-git directory at {}: {}",
+                    repo_path.display(),
+                    e
+                )
+            })?;
+        }
+    }
+
+    if !repo_path.exists() {
+        if let Some(parent) = repo_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                format!(
+                    "Failed to create parent directory {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+        }
+
+        let output = Command::new("git")
+            .args([
+                "clone",
+                SANDBOXED_REPO_REMOTE,
+                repo_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git clone: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Failed to clone repo: {}", stderr));
+        }
+    }
+
+    ensure_origin_remote(repo_path).await
+}
+
 /// Information about an installed OpenCode plugin.
 #[derive(Debug, Clone, Serialize)]
 pub struct InstalledPluginInfo {
@@ -115,10 +292,11 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// Get information about all system components.
 async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemComponentsResponse> {
     let mut components = Vec::new();
+    let repo_path = resolve_sandboxed_repo_path(&state).await;
 
     // Open Agent (self)
     let current_version = env!("CARGO_PKG_VERSION");
-    let update_available = check_sandboxed_update(Some(current_version)).await;
+    let update_available = check_sandboxed_update(Some(current_version), Some(&repo_path)).await;
     let status = if update_available.is_some() {
         ComponentStatus::UpdateAvailable
     } else {
@@ -130,6 +308,7 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
         installed: true,
         update_available,
         path: Some("/usr/local/bin/sandboxed-sh".to_string()),
+        source_path: Some(repo_path),
         status,
     });
 
@@ -189,6 +368,7 @@ async fn get_opencode_info(_config: &crate::config::Config) -> ComponentInfo {
                 installed: true,
                 update_available,
                 path: which_opencode().await,
+                source_path: None,
                 status,
             }
         }
@@ -198,6 +378,7 @@ async fn get_opencode_info(_config: &crate::config::Config) -> ComponentInfo {
             installed: false,
             update_available: None,
             path: None,
+            source_path: None,
             status: ComponentStatus::NotInstalled,
         },
     }
@@ -234,6 +415,7 @@ async fn get_claude_code_info() -> ComponentInfo {
                 installed: true,
                 update_available,
                 path: which_claude_code().await,
+                source_path: None,
                 status,
             }
         }
@@ -243,6 +425,7 @@ async fn get_claude_code_info() -> ComponentInfo {
             installed: false,
             update_available: None,
             path: None,
+            source_path: None,
             status: ComponentStatus::NotInstalled,
         },
     }
@@ -270,6 +453,7 @@ async fn get_codex_info() -> ComponentInfo {
                 installed: true,
                 update_available: None,
                 path: which_codex().await,
+                source_path: None,
                 status: ComponentStatus::Ok,
             }
         }
@@ -279,6 +463,7 @@ async fn get_codex_info() -> ComponentInfo {
             installed: false,
             update_available: None,
             path: None,
+            source_path: None,
             status: ComponentStatus::NotInstalled,
         },
     }
@@ -350,6 +535,7 @@ async fn get_amp_info() -> ComponentInfo {
                 installed: true,
                 update_available,
                 path: which_amp().await,
+                source_path: None,
                 status,
             }
         }
@@ -359,6 +545,7 @@ async fn get_amp_info() -> ComponentInfo {
             installed: false,
             update_available: None,
             path: None,
+            source_path: None,
             status: ComponentStatus::NotInstalled,
         },
     }
@@ -461,7 +648,10 @@ async fn check_opencode_update(current_version: Option<&str>) -> Option<String> 
 
 /// Check if there's a newer version of Open Agent available.
 /// First checks GitHub releases, then falls back to git tags if no releases exist.
-async fn check_sandboxed_update(current_version: Option<&str>) -> Option<String> {
+async fn check_sandboxed_update(
+    current_version: Option<&str>,
+    repo_path_override: Option<&str>,
+) -> Option<String> {
     let current = current_version?;
 
     // First, try GitHub releases API
@@ -487,22 +677,24 @@ async fn check_sandboxed_update(current_version: Option<&str>) -> Option<String>
     }
 
     // Fallback: check git tags from the repo if it exists
-    let repo_path = std::path::Path::new(SANDBOXED_REPO_PATH);
-    if !repo_path.exists() {
+    let repo_path = repo_path_override
+        .map(std::path::Path::new)
+        .unwrap_or_else(|| std::path::Path::new(crate::settings::DEFAULT_SANDBOXED_REPO_PATH));
+    if !repo_path.exists() || !is_git_repo(repo_path).await {
         return None;
     }
 
     // Fetch tags first
     let _ = Command::new("git")
         .args(["fetch", "--tags", "origin"])
-        .current_dir(SANDBOXED_REPO_PATH)
+        .current_dir(repo_path)
         .output()
         .await;
 
     // Get the latest tag
     let tag_result = Command::new("git")
         .args(["describe", "--tags", "--abbrev=0", "origin/master"])
-        .current_dir(SANDBOXED_REPO_PATH)
+        .current_dir(repo_path)
         .output()
         .await
         .ok()?;
@@ -581,6 +773,7 @@ async fn get_oh_my_opencode_info() -> ComponentInfo {
             installed: false,
             update_available: None,
             path: None,
+            source_path: None,
             status: ComponentStatus::NotInstalled,
         };
     }
@@ -601,6 +794,7 @@ async fn get_oh_my_opencode_info() -> ComponentInfo {
         installed: true,
         update_available,
         path: Some(config_path),
+        source_path: None,
         status,
     }
 }
@@ -681,11 +875,11 @@ async fn check_oh_my_opencode_update(current_version: Option<&str>) -> Option<St
 
 /// Update a system component.
 async fn update_component(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Sse<UpdateStream>, (StatusCode, String)> {
     match name.as_str() {
-        "sandboxed_sh" => Ok(Sse::new(Box::pin(stream_sandboxed_update()))),
+        "sandboxed_sh" => Ok(Sse::new(Box::pin(stream_sandboxed_update(state)))),
         "opencode" => Ok(Sse::new(Box::pin(stream_opencode_update()))),
         "claude_code" => Ok(Sse::new(Box::pin(stream_claude_code_update()))),
         "amp" => Ok(Sse::new(Box::pin(stream_amp_update()))),
@@ -720,14 +914,19 @@ async fn uninstall_component(
 
 /// Stream the Open Agent update process.
 /// Builds from source using git tags (no pre-built binaries needed).
-fn stream_sandboxed_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+fn stream_sandboxed_update(
+    state: Arc<AppState>,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
         yield sse("log", "Starting Open Agent update...", Some(0));
 
-        // Check if source repo exists
-        let repo_path = std::path::Path::new(SANDBOXED_REPO_PATH);
-        if !repo_path.exists() {
-            yield sse("error", format!("Source repo not found at {}. Clone the repo first (see INSTALL.md).", SANDBOXED_REPO_PATH), None);
+        let repo_path_str = resolve_sandboxed_repo_path(&state).await;
+        let repo_path = std::path::Path::new(&repo_path_str);
+
+        yield sse("log", format!("Using source repo path: {}", repo_path.display()), Some(2));
+
+        if let Err(err) = ensure_repo_present(repo_path).await {
+            yield sse("error", format!("Failed to prepare source repo: {}", err), None);
             return;
         }
 
@@ -736,7 +935,7 @@ fn stream_sandboxed_update() -> impl Stream<Item = Result<Event, std::convert::I
 
         let fetch_result = Command::new("git")
             .args(["fetch", "--tags", "origin"])
-            .current_dir(SANDBOXED_REPO_PATH)
+            .current_dir(repo_path)
             .output()
             .await;
 
@@ -758,7 +957,7 @@ fn stream_sandboxed_update() -> impl Stream<Item = Result<Event, std::convert::I
 
         let tag_result = Command::new("git")
             .args(["describe", "--tags", "--abbrev=0", "origin/master"])
-            .current_dir(SANDBOXED_REPO_PATH)
+            .current_dir(repo_path)
             .output()
             .await;
 
@@ -777,21 +976,21 @@ fn stream_sandboxed_update() -> impl Stream<Item = Result<Event, std::convert::I
         // Reset any local changes before checkout to prevent conflicts
         let _ = Command::new("git")
             .args(["reset", "--hard", "HEAD"])
-            .current_dir(SANDBOXED_REPO_PATH)
+            .current_dir(repo_path)
             .output()
             .await;
 
         // Clean untracked files that might interfere
         let _ = Command::new("git")
             .args(["clean", "-fd"])
-            .current_dir(SANDBOXED_REPO_PATH)
+            .current_dir(repo_path)
             .output()
             .await;
 
         // Checkout the tag/branch
         match Command::new("git")
             .args(["checkout", &latest_tag])
-            .current_dir(SANDBOXED_REPO_PATH)
+            .current_dir(repo_path)
             .output()
             .await
         {
@@ -811,7 +1010,7 @@ fn stream_sandboxed_update() -> impl Stream<Item = Result<Event, std::convert::I
         if latest_tag == "origin/master" {
             if let Ok(output) = Command::new("git")
                 .args(["pull", "origin", "master"])
-                .current_dir(SANDBOXED_REPO_PATH)
+                .current_dir(repo_path)
                 .output()
                 .await
             {
@@ -827,7 +1026,7 @@ fn stream_sandboxed_update() -> impl Stream<Item = Result<Event, std::convert::I
 
         match Command::new("bash")
             .args(["-c", "source /root/.cargo/env && cargo build --bin sandboxed-sh"])
-            .current_dir(SANDBOXED_REPO_PATH)
+            .current_dir(repo_path)
             .output()
             .await
         {
@@ -853,7 +1052,7 @@ fn stream_sandboxed_update() -> impl Stream<Item = Result<Event, std::convert::I
         let binaries = [("sandboxed_sh", "/usr/local/bin/sandboxed-sh")];
 
         for (name, dest) in binaries {
-            let src = format!("{}/target/debug/{}", SANDBOXED_REPO_PATH, name);
+            let src = format!("{}/target/debug/{}", repo_path.display(), name);
             match Command::new("install")
                 .args(["-m", "0755", &src, dest])
                 .output()
@@ -1060,6 +1259,47 @@ fn stream_amp_update() -> impl Stream<Item = Result<Event, std::convert::Infalli
                 yield sse("error", format!("Failed to run update: {}", e), None);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_safe_repo_path, normalize_repo_path, select_repo_path};
+
+    #[test]
+    fn select_repo_path_prefers_env() {
+        let result = select_repo_path(
+            Some("/opt/custom".to_string()),
+            Some(" /env/override ".to_string()),
+        );
+        assert_eq!(result, "/env/override");
+    }
+
+    #[test]
+    fn select_repo_path_falls_back_to_settings() {
+        let result = select_repo_path(Some("/opt/custom".to_string()), None);
+        assert_eq!(result, "/opt/custom");
+    }
+
+    #[test]
+    fn select_repo_path_uses_default_when_empty() {
+        let result = select_repo_path(Some("  ".to_string()), Some("".to_string()));
+        assert_eq!(result, crate::settings::DEFAULT_SANDBOXED_REPO_PATH);
+    }
+
+    #[test]
+    fn normalize_repo_path_trims_and_drops_empty() {
+        assert_eq!(
+            normalize_repo_path(Some("  /x  ".to_string())),
+            Some("/x".to_string())
+        );
+        assert_eq!(normalize_repo_path(Some("   ".to_string())), None);
+        assert_eq!(normalize_repo_path(None), None);
+    }
+
+    #[test]
+    fn safe_repo_path_rejects_root() {
+        assert!(!is_safe_repo_path(std::path::Path::new("/")));
     }
 }
 

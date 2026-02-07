@@ -13,7 +13,7 @@
 //! flexibility for tasks that require broader access.
 
 mod composite;
-mod desktop;
+pub mod desktop;
 mod directory;
 mod file_ops;
 mod index;

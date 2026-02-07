@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use sandboxed_sh::tools::desktop::find_browser_command;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -270,7 +271,19 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("about:blank");
 
-        let chromium = match std::process::Command::new("chromium")
+        let browser_cmd = match find_browser_command() {
+            Some(cmd) => cmd,
+            None => {
+                kill_process(i3_pid);
+                kill_process(xvfb_pid);
+                return Err(
+                    "Failed to start Chromium: no browser binary found (set CHROMIUM_BIN or BROWSER)"
+                        .to_string(),
+                );
+            }
+        };
+
+        let mut chromium = match std::process::Command::new(&browser_cmd)
             .args([
                 // Security/sandbox (required for running as root)
                 "--no-sandbox",
@@ -314,13 +327,21 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
         };
 
         let chromium_pid = chromium.id();
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if let Ok(Some(status)) = chromium.try_wait() {
+            kill_process(i3_pid);
+            kill_process(xvfb_pid);
+            return Err(format!(
+                "Browser exited immediately with status: {:?}",
+                status
+            ));
+        }
 
         (
             Some(chromium_pid),
             format!(
-                ", \"browser\": \"chromium\", \"browser_pid\": {}, \"url\": \"{}\"",
-                chromium_pid, url
+                ", \"browser\": \"{}\", \"browser_pid\": {}, \"url\": \"{}\"",
+                browser_cmd, chromium_pid, url
             ),
         )
     } else {

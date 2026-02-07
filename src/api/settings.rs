@@ -31,12 +31,14 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[derive(Debug, Serialize)]
 pub struct SettingsResponse {
     pub library_remote: Option<String>,
+    pub sandboxed_repo_path: Option<String>,
 }
 
 impl From<Settings> for SettingsResponse {
     fn from(settings: Settings) -> Self {
         Self {
             library_remote: settings.library_remote,
+            sandboxed_repo_path: settings.sandboxed_repo_path,
         }
     }
 }
@@ -45,7 +47,9 @@ impl From<Settings> for SettingsResponse {
 #[derive(Debug, Deserialize)]
 pub struct UpdateSettingsRequest {
     #[serde(default)]
-    pub library_remote: Option<String>,
+    pub library_remote: Option<Option<String>>,
+    #[serde(default)]
+    pub sandboxed_repo_path: Option<Option<String>>,
 }
 
 /// Request to update library remote specifically.
@@ -79,9 +83,13 @@ async fn update_settings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UpdateSettingsRequest>,
 ) -> Result<Json<SettingsResponse>, (StatusCode, String)> {
-    let new_settings = Settings {
-        library_remote: req.library_remote,
-    };
+    let mut new_settings = state.settings.get().await;
+    if let Some(value) = req.library_remote {
+        new_settings.library_remote = value;
+    }
+    if let Some(value) = req.sandboxed_repo_path {
+        new_settings.sandboxed_repo_path = value;
+    }
 
     state
         .settings

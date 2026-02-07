@@ -8,7 +8,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::agents::{Agent, AgentContext, AgentId, AgentResult, AgentType, TerminalReason};
-use crate::api::control::{AgentEvent, AgentTreeNode};
+use crate::api::control::{AgentEvent, AgentTreeNode, ControlRunState};
 use crate::config::Config;
 use crate::opencode::{extract_reasoning, extract_text, OpenCodeClient, OpenCodeEvent};
 use crate::task::Task;
@@ -230,14 +230,67 @@ impl OpenCodeAgent {
         let session_id = session_id.to_string();
         let directory = directory.to_string();
         let events_tx = ctx.control_events.clone();
+        let control_status = ctx.control_status.clone();
         let mission_id = ctx.mission_id;
         let resumable = ctx.mission_id.is_some();
 
         tokio::spawn(async move {
+            if let (Some(status), Some(events), Some(mid)) =
+                (&control_status, &events_tx, mission_id)
+            {
+                let (queue_len, mission_id_opt) = {
+                    let mut guard = status.write().await;
+                    if let Some(existing) = guard.mission_id {
+                        if existing != mid {
+                            (guard.queue_len, guard.mission_id)
+                        } else {
+                            guard.state = ControlRunState::WaitingForTool;
+                            (guard.queue_len, guard.mission_id)
+                        }
+                    } else {
+                        guard.mission_id = Some(mid);
+                        guard.state = ControlRunState::WaitingForTool;
+                        (guard.queue_len, guard.mission_id)
+                    }
+                };
+                if mission_id_opt == Some(mid) {
+                    let _ = events.send(AgentEvent::Status {
+                        state: ControlRunState::WaitingForTool,
+                        queue_len,
+                        mission_id: mission_id_opt,
+                    });
+                }
+            }
             let rx = tool_hub.register(tool_call_id.clone()).await;
             let Ok(result) = rx.await else {
                 return;
             };
+            if let (Some(status), Some(events), Some(mid)) =
+                (&control_status, &events_tx, mission_id)
+            {
+                let (queue_len, mission_id_opt) = {
+                    let mut guard = status.write().await;
+                    if let Some(existing) = guard.mission_id {
+                        if existing != mid {
+                            (guard.queue_len, guard.mission_id)
+                        } else {
+                            guard.state = ControlRunState::Running;
+                            (guard.queue_len, guard.mission_id)
+                        }
+                    } else {
+                        guard.mission_id = Some(mid);
+                        guard.state = ControlRunState::Running;
+                        (guard.queue_len, guard.mission_id)
+                    }
+                };
+                if mission_id_opt == Some(mid) {
+                    let _ = events.send(AgentEvent::Status {
+                        state: ControlRunState::Running,
+                        queue_len,
+                        mission_id: mission_id_opt,
+                    });
+                }
+            }
 
             let answers = result
                 .get("answers")

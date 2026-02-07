@@ -3740,14 +3740,29 @@ async fn control_actor_loop(
                             if let Some(mission_id) = running_mission_id {
                                 let seconds_since_activity =
                                     main_runner_last_activity.elapsed().as_secs();
+                                let state_label = {
+                                    let status_guard = status.read().await;
+                                    if status_guard.mission_id == Some(mission_id)
+                                        && status_guard.state == ControlRunState::WaitingForTool
+                                    {
+                                        "waiting_for_tool"
+                                    } else {
+                                        "running"
+                                    }
+                                };
+                                let mission_state = if state_label == "waiting_for_tool" {
+                                    super::mission_runner::MissionRunState::WaitingForTool
+                                } else {
+                                    super::mission_runner::MissionRunState::Running
+                                };
                                 running_list.push(super::mission_runner::RunningMissionInfo {
                                     mission_id,
-                                    state: "running".to_string(),
+                                    state: state_label.to_string(),
                                     queue_len: queue.len(),
                                     history_len: history.len(),
                                     seconds_since_activity,
                                     health: super::mission_runner::running_health(
-                                        super::mission_runner::MissionRunState::Running,
+                                        mission_state,
                                         seconds_since_activity,
                                     ),
                                     expected_deliverables: 0,
@@ -4943,6 +4958,15 @@ async fn run_single_control_turn(
     // Ensure a workspace directory for this mission (if applicable).
     let (working_dir_path, runtime_workspace) = if let Some(mid) = mission_id {
         let ws = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+        if let Err(e) =
+            workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &ws).await
+        {
+            tracing::warn!(
+                workspace = %ws.name,
+                error = %e,
+                "Failed to sync MCP binaries into workspace"
+            );
+        }
         // Get library for skill syncing
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
@@ -5014,7 +5038,7 @@ async fn run_single_control_turn(
     ctx.mission_control = mission_control;
     ctx.control_events = Some(events_tx.clone());
     ctx.frontend_tool_hub = Some(tool_hub.clone());
-    ctx.control_status = Some(status);
+    ctx.control_status = Some(status.clone());
     ctx.cancel_token = Some(cancel.clone());
     ctx.tree_snapshot = Some(tree_snapshot);
     ctx.progress_snapshot = Some(progress_snapshot);
@@ -5063,6 +5087,7 @@ async fn run_single_control_turn(
                 session_id.as_deref(),
                 is_continuation,
                 Some(tool_hub.clone()),
+                Some(status.clone()),
             )
             .await
         }

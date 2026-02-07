@@ -30,7 +30,7 @@ use crate::workspace_exec::WorkspaceExec;
 
 use super::control::{
     resolve_claudecode_default_model, safe_truncate_index, AgentEvent, AgentTreeNode,
-    ControlStatus, ExecutionProgress, FrontendToolHub,
+    ControlRunState, ControlStatus, ExecutionProgress, FrontendToolHub,
 };
 use super::library::SharedLibrary;
 
@@ -98,6 +98,31 @@ fn extract_thought_line(text: &str) -> Option<(String, String)> {
         let cleaned = remaining.join("\n").trim().to_string();
         (t, cleaned)
     })
+}
+
+async fn set_control_state_for_mission(
+    status: &Arc<RwLock<ControlStatus>>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    mission_id: Uuid,
+    state: ControlRunState,
+) {
+    let (queue_len, mission_id_opt) = {
+        let mut guard = status.write().await;
+        if let Some(existing) = guard.mission_id {
+            if existing != mission_id {
+                return;
+            }
+        } else {
+            guard.mission_id = Some(mission_id);
+        }
+        guard.state = state;
+        (guard.queue_len, guard.mission_id)
+    };
+    let _ = events_tx.send(AgentEvent::Status {
+        state,
+        queue_len,
+        mission_id: mission_id_opt,
+    });
 }
 
 fn is_opencode_status_line(line: &str) -> bool {
@@ -1039,7 +1064,7 @@ async fn run_mission_turn(
     library: SharedLibrary,
     events_tx: broadcast::Sender<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
-    _status: Arc<RwLock<ControlStatus>>,
+    status: Arc<RwLock<ControlStatus>>,
     cancel: CancellationToken,
     history: Vec<(String, String)>,
     user_message: String,
@@ -1146,6 +1171,15 @@ async fn run_mission_turn(
 
     // Ensure mission workspace exists and is configured for OpenCode.
     let workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    if let Err(e) =
+        workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
+    {
+        tracing::warn!(
+            workspace = %workspace.name,
+            error = %e,
+            "Failed to sync MCP binaries into workspace"
+        );
+    }
     let workspace_root = workspace.path.clone();
     let mission_work_dir = match {
         let lib_guard = library.read().await;
@@ -1196,6 +1230,7 @@ async fn run_mission_turn(
                 session_id.as_deref(),
                 is_continuation,
                 Some(Arc::clone(&tool_hub)),
+                Some(Arc::clone(&status)),
             )
             .await
         }
@@ -1423,6 +1458,7 @@ pub fn run_claudecode_turn<'a>(
     session_id: Option<&'a str>,
     is_continuation: bool,
     tool_hub: Option<Arc<FrontendToolHub>>,
+    status: Option<Arc<RwLock<ControlStatus>>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
     Box::pin(async move {
         use super::ai_providers::{
@@ -1432,6 +1468,19 @@ pub fn run_claudecode_turn<'a>(
         };
         use std::collections::HashMap;
         use tokio::time::{Duration, Instant};
+
+        fn describe_pty_exit_status(
+            exit_status: &Result<
+                Result<portable_pty::ExitStatus, std::io::Error>,
+                tokio::task::JoinError,
+            >,
+        ) -> String {
+            match exit_status {
+                Ok(Ok(status)) => format!("{:?}", status),
+                Ok(Err(err)) => format!("wait error: {}", err),
+                Err(err) => format!("join error: {}", err),
+            }
+        }
 
         fn classify_claudecode_secret(value: String) -> ClaudeCodeAuth {
             if value.starts_with("sk-ant-oat") {
@@ -1824,6 +1873,12 @@ pub fn run_claudecode_turn<'a>(
             let translated_path = workspace_exec.translate_path_for_container(&settings_path);
             args.push(translated_path);
         }
+        let mcp_config_path = work_dir.join(".claude").join("mcp.json");
+        if mcp_config_path.exists() {
+            args.push("--mcp-config".to_string());
+            let translated_path = workspace_exec.translate_path_for_container(&mcp_config_path);
+            args.push(translated_path);
+        }
 
         if let Some(m) = model {
             args.push("--model".to_string());
@@ -1955,6 +2010,11 @@ pub fn run_claudecode_turn<'a>(
             "XDG_CACHE_HOME".to_string(),
             workspace_exec.translate_path_for_container(&xdg_cache_home),
         );
+        let claude_config_dir =
+            workspace_exec.translate_path_for_container(&work_dir.join(".claude"));
+        env.insert("CLAUDE_CONFIG_DIR".to_string(), claude_config_dir.clone());
+        let claude_config_path = format!("{}/settings.json", claude_config_dir);
+        env.insert("CLAUDE_CONFIG".to_string(), claude_config_path);
 
         if let Some(ref auth) = api_auth {
             match auth {
@@ -2010,12 +2070,43 @@ pub fn run_claudecode_turn<'a>(
                 if let Some(claude_path) =
                     resolve_command_path_in_workspace(&workspace_exec, work_dir, &program).await
                 {
-                    program = "bun".to_string();
-                    full_args.insert(0, claude_path);
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        "Running Claude CLI via bun wrapper (container workspace)"
-                    );
+                    let force_bun = env_var_bool("SANDBOXED_SH_CLAUDECODE_FORCE_BUN", false);
+                    let prefers_bun = if force_bun {
+                        true
+                    } else if claude_path.contains("/.bun/")
+                        || claude_path.contains("/.cache/.bun/")
+                    {
+                        true
+                    } else {
+                        claude_cli_shebang_contains(&workspace_exec, work_dir, &claude_path, "bun")
+                            .await
+                            .unwrap_or(false)
+                    };
+                    let shebang_is_node = claude_cli_shebang_contains(
+                        &workspace_exec,
+                        work_dir,
+                        &claude_path,
+                        "node",
+                    )
+                    .await
+                    .unwrap_or(false);
+
+                    if prefers_bun && !shebang_is_node {
+                        program = "bun".to_string();
+                        full_args.insert(0, claude_path);
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            "Running Claude CLI via bun wrapper (container workspace)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            mission_id = %mission_id,
+                            claude_path = %claude_path,
+                            prefers_bun = prefers_bun,
+                            shebang_is_node = shebang_is_node,
+                            "Running Claude CLI directly (bun wrapper not required)"
+                        );
+                    }
                 }
             }
         }
@@ -2367,6 +2458,15 @@ pub fn run_claudecode_turn<'a>(
                                                             "Frontend tool detected, pausing for user input"
                                                         );
                                                         let hub = Arc::clone(hub);
+                                                        if let Some(ref status_ref) = status {
+                                                            set_control_state_for_mission(
+                                                                status_ref,
+                                                                &events_tx,
+                                                                mission_id,
+                                                                ControlRunState::WaitingForTool,
+                                                            )
+                                                            .await;
+                                                        }
                                                         let rx = hub.register(id.clone()).await;
 
                                                         pty.kill();
@@ -2389,6 +2489,15 @@ pub fn run_claudecode_turn<'a>(
                                                             }
                                                         };
 
+                                                        if let Some(ref status_ref) = status {
+                                                            set_control_state_for_mission(
+                                                                status_ref,
+                                                                &events_tx,
+                                                                mission_id,
+                                                                ControlRunState::Running,
+                                                            )
+                                                            .await;
+                                                        }
                                                         let _ = events_tx.send(AgentEvent::ToolResult {
                                                             tool_call_id: id.clone(),
                                                             name: name.clone(),
@@ -2416,6 +2525,7 @@ pub fn run_claudecode_turn<'a>(
                                                             Some(&session_id),
                                                             true,
                                                             tool_hub,
+                                                            status,
                                                         ).await;
                                                     }
                                                 }
@@ -2558,14 +2668,23 @@ pub fn run_claudecode_turn<'a>(
                     non_json_output.join(" | ")
                 );
             } else {
+                let exit_summary = describe_pty_exit_status(&exit_status);
+                let mut message = format!(
+                    "Claude Code produced no output. Exit status: {}.",
+                    exit_summary
+                );
+                if exit_summary.contains("signal: Some(\"Killed\")") {
+                    message.push_str(
+                        " The process was killed by the OS (often OOM or sandbox limits).",
+                    );
+                }
+                message.push_str(" Check CLI installation or authentication.");
                 tracing::warn!(
                     mission_id = %mission_id,
                     exit_status = ?exit_status,
                     "Claude Code produced no output"
                 );
-                final_result =
-                    "Claude Code produced no output. Check CLI installation or authentication."
-                        .to_string();
+                final_result = message;
             }
         }
 
@@ -4560,6 +4679,51 @@ async fn resolve_command_path_in_workspace(
     } else {
         Some(path.to_string())
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+async fn claude_cli_shebang_contains(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    path: &str,
+    needle: &str,
+) -> Option<bool> {
+    if path.trim().is_empty() || needle.trim().is_empty() {
+        return None;
+    }
+    let quoted = shell_quote(path);
+    let cmd = format!("head -n 1 {} 2>/dev/null", quoted);
+    let output = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &["-lc".to_string(), cmd],
+            std::collections::HashMap::new(),
+        )
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    let first_line = line.lines().next().unwrap_or("").trim().to_lowercase();
+    if first_line.is_empty() {
+        return None;
+    }
+    Some(first_line.contains(&needle.to_lowercase()))
 }
 
 /// Check basic internet connectivity using a reliable public endpoint.
@@ -7339,6 +7503,7 @@ pub async fn run_codex_turn(
 
     let mut result = if success {
         AgentResult::success(final_message, 0) // TODO: Calculate cost from Codex usage
+            .with_terminal_reason(TerminalReason::Completed)
     } else {
         AgentResult::failure(final_message, 0).with_terminal_reason(TerminalReason::LlmError)
     };

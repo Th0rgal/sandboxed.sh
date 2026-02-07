@@ -9,6 +9,8 @@ interface StreamingMarkdownProps {
   isStreaming: boolean;
   className?: string;
   basePath?: string;
+  workspaceId?: string;
+  missionId?: string;
   /** Time in ms to wait before considering a block "stable" */
   stabilizeDelay?: number;
 }
@@ -29,6 +31,8 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
   isStreaming,
   className,
   basePath,
+  workspaceId,
+  missionId,
   stabilizeDelay = 300,
 }: StreamingMarkdownProps) {
   // Split content into blocks (paragraphs separated by double newlines)
@@ -88,6 +92,8 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
         content={content}
         className={className}
         basePath={basePath}
+        workspaceId={workspaceId}
+        missionId={missionId}
       />
     );
   }
@@ -97,12 +103,14 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
     <div className={cn("streaming-markdown", className)}>
       {/* Render stable blocks as cached markdown */}
       {stableBlocks.map((block, index) => (
-        <MemoizedBlock
-          key={`stable-${index}-${block.slice(0, 20)}`}
-          content={block}
-          basePath={basePath}
-          className={className}
-        />
+          <MemoizedBlock
+            key={`stable-${index}-${block.slice(0, 20)}`}
+            content={block}
+            basePath={basePath}
+            workspaceId={workspaceId}
+            missionId={missionId}
+            className={className}
+          />
       ))}
 
       {/* Render streaming block */}
@@ -112,6 +120,8 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
             key={`streaming-stable`}
             content={streamingBlock}
             basePath={basePath}
+            workspaceId={workspaceId}
+            missionId={missionId}
             className={className}
           />
         ) : (
@@ -128,10 +138,14 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
 const MemoizedBlock = memo(function MemoizedBlock({
   content,
   basePath,
+  workspaceId,
+  missionId,
   className,
 }: {
   content: string;
   basePath?: string;
+  workspaceId?: string;
+  missionId?: string;
   className?: string;
 }) {
   return (
@@ -139,9 +153,16 @@ const MemoizedBlock = memo(function MemoizedBlock({
       content={content}
       className={cn("[&>*:first-child]:mt-0 [&>*:last-child]:mb-0", className)}
       basePath={basePath}
+      workspaceId={workspaceId}
+      missionId={missionId}
     />
   );
-}, (prev, next) => prev.content === next.content && prev.basePath === next.basePath && prev.className === next.className);
+}, (prev, next) =>
+  prev.content === next.content &&
+  prev.basePath === next.basePath &&
+  prev.workspaceId === next.workspaceId &&
+  prev.missionId === next.missionId &&
+  prev.className === next.className);
 
 /**
  * Plain text streaming block - minimal DOM updates
