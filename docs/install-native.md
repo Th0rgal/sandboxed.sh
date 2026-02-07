@@ -648,7 +648,7 @@ Create `/etc/systemd/system/sandboxed_sh.service`:
 
 ```ini
 [Unit]
-Description=OpenAgent (cloud orchestrator)
+Description=sandboxed.sh (cloud orchestrator)
 After=network-online.target
 Wants=network-online.target
 

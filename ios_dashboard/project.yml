@@ -16,17 +16,17 @@ settings:
     ENABLE_PREVIEWS: "YES"
 
 targets:
-  OpenAgentDashboard:
+  SandboxedDashboard:
     type: application
     platform: iOS
     deploymentTarget: "18.0"
     sources:
-      - path: OpenAgentDashboard
+      - path: SandboxedDashboard
         excludes:
           - "**/.DS_Store"
     settings:
       base:
-        INFOPLIST_FILE: OpenAgentDashboard/Info.plist
+        INFOPLIST_FILE: SandboxedDashboard/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: sh.sandboxed-sh.dashboard
         PRODUCT_NAME: "sandboxed.sh"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -34,23 +34,23 @@ targets:
         SWIFT_EMIT_LOC_STRINGS: "YES"
         GENERATE_INFOPLIST_FILE: "NO"
     entitlements:
-      path: OpenAgentDashboard/OpenAgentDashboard.entitlements
+      path: SandboxedDashboard/SandboxedDashboard.entitlements
       properties: {}
 
-  OpenAgentDashboardTests:
+  SandboxedDashboardTests:
     type: bundle.unit-test
     platform: iOS
     deploymentTarget: "18.0"
     sources:
-      - path: OpenAgentDashboardTests
+      - path: SandboxedDashboardTests
         excludes:
           - "**/.DS_Store"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: sh.sandboxed-sh.dashboard.tests
-        PRODUCT_NAME: OpenAgentDashboardTests
+        PRODUCT_NAME: SandboxedDashboardTests
         GENERATE_INFOPLIST_FILE: "YES"
-        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Open Agent.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Open Agent"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/sandboxed.sh.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/sandboxed.sh"
         BUNDLE_LOADER: "$(TEST_HOST)"
     dependencies:
-      - target: OpenAgentDashboard
+      - target: SandboxedDashboard

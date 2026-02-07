@@ -1,10 +1,10 @@
-# Getting Started with OpenAgent
+# Getting Started with sandboxed.sh
 
-This guide will walk you through setting up and using OpenAgent for the first time, from configuring your backend connection to creating your first AI-powered mission.
+This guide will walk you through setting up and using sandboxed.sh for the first time, from configuring your backend connection to creating your first AI-powered mission.
 
-## What is OpenAgent?
+## What is sandboxed.sh?
 
-OpenAgent is a powerful AI agent orchestration platform that manages multiple AI coding assistants (OpenCode, Claude Code, Amp) through a unified dashboard. It provides:
+sandboxed.sh is a powerful AI agent orchestration platform that manages multiple AI coding assistants (OpenCode, Claude Code, Amp) through a unified dashboard. It provides:
 
 - **Git-backed configuration library** - Store and version control your skills, agents, commands, and tools
 - **Multiple workspace support** - Isolated containers for different projects
@@ -15,7 +15,7 @@ OpenAgent is a powerful AI agent orchestration platform that manages multiple AI
 
 Before starting, you need:
 
-1. **OpenAgent Backend** running (locally or remote)
+1. **sandboxed.sh backend** running (locally or remote)
    - Local: `http://localhost:3000` (default)
    - Remote: Your server URL (e.g., `https://agent-backend.example.com`)
 
@@ -25,7 +25,7 @@ Before starting, you need:
 
 ## Step 1: Initial Dashboard View
 
-When you first access the OpenAgent dashboard, you'll see the global monitor overview:
+When you first access the sandboxed.sh dashboard, you'll see the global monitor overview:
 
 ![Initial Dashboard](images/getting-started/01-dashboard-initial.webp)
 
@@ -83,7 +83,7 @@ The dashboard will reconnect to the new backend and display a success message.
 
 ## Step 3: Configure Your Library
 
-The OpenAgent Library is a Git-backed repository that stores all your reusable configurations:
+The sandboxed.sh Library is a Git-backed repository that stores all your reusable configurations:
 
 - **Skills** - Specialized knowledge and procedures
 - **Agents** - AI assistant configurations
@@ -105,7 +105,7 @@ The Data page shows:
 
 ### 3.2 Change Library Repository (Optional)
 
-The default library uses the OpenAgent template repository. To use your own:
+The default library uses the sandboxed.sh template repository. To use your own:
 
 1. Create a new Git repository (GitHub, GitLab, etc.)
 2. Click on the **Library Remote** field:
@@ -137,7 +137,7 @@ The default library includes several useful skills:
 - **bitwarden-secrets** - Secure credential management
 - **github-cli** - GitHub operations (PRs, issues)
 - **library-management** - Library API tools
-- **sandboxed.sh-dev** - OpenAgent development guide
+- **sandboxed.sh-dev** - sandboxed.sh development guide
 
 ### 4.2 Edit a Skill
 
@@ -154,7 +154,7 @@ You can modify the content directly and click **Save** to update the library.
 
 ## Step 5: Configure AI Harness Settings
 
-OpenAgent supports multiple AI coding harnesses (OpenCode, Claude Code, Amp). Each harness can have different configurations stored in profiles.
+sandboxed.sh supports multiple AI coding harnesses (OpenCode, Claude Code, Amp). Each harness can have different configurations stored in profiles.
 
 ### 5.1 Access Config Editor
 
@@ -163,7 +163,7 @@ Click **Library** > **Configs** to access the file-based config editor:
 ![Config Editor](images/getting-started/07-config-editor.webp)
 
 The config editor shows:
-- **Harness tabs** - Switch between OpenCode, Claude Code, Amp, OpenAgent
+- **Harness tabs** - Switch between OpenCode, Claude Code, Amp, sandboxed.sh
 - **Profile selector** - Choose or create config profiles (default, custom)
 - **Git status** - Branch and sync state
 - **File browser** - Navigate config files (`.opencode/`, `.claudecode/`, etc.)
@@ -332,4 +332,4 @@ You've learned how to:
 - ✅ Configure AI harness settings
 - ✅ Create and manage missions
 
-Start experimenting with your first mission and explore the powerful features OpenAgent offers for AI-powered development workflows!
+Start experimenting with your first mission and explore the powerful features sandboxed.sh offers for AI-powered development workflows!

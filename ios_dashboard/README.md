@@ -54,14 +54,14 @@ cd ios_dashboard
 xcodegen generate
 
 # Open in Xcode
-open OpenAgentDashboard.xcodeproj
+open SandboxedDashboard.xcodeproj
 ```
 
 ### Command Line Build
 
 ```bash
-xcodebuild -project OpenAgentDashboard.xcodeproj \
-  -scheme OpenAgentDashboard \
+xcodebuild -project SandboxedDashboard.xcodeproj \
+  -scheme SandboxedDashboard \
   -destination 'platform=iOS Simulator,name=iPhone 17' \
   build
 ```
@@ -79,8 +79,8 @@ In multi-user mode, the login screen also asks for a username.
 ```
 ios_dashboard/
 ├── project.yml                 # XcodeGen config
-├── OpenAgentDashboard/
-│   ├── OpenAgentDashboardApp.swift
+├── SandboxedDashboard/
+│   ├── SandboxedDashboardApp.swift
 │   ├── ContentView.swift       # Auth + Tab navigation
 │   ├── DesignSystem/
 │   │   └── Theme.swift         # Colors, typography, haptics
@@ -103,7 +103,7 @@ ios_dashboard/
 │   │       ├── RunningMissionsBar.swift   # Parallel missions UI
 │   │       └── ToolUI/         # Tool UI components
 │   └── Assets.xcassets/
-└── OpenAgentDashboard.xcodeproj/
+└── SandboxedDashboard.xcodeproj/
 ```
 
 ## Glass Components

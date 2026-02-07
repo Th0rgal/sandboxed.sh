@@ -2,17 +2,17 @@
 import PackageDescription
 
 let package = Package(
-    name: "OpenAgentDashboard",
+    name: "SandboxedDashboard",
     platforms: [
         .iOS(.v18)
     ],
     products: [
-        .library(name: "OpenAgentDashboard", targets: ["OpenAgentDashboard"])
+        .library(name: "SandboxedDashboard", targets: ["SandboxedDashboard"])
     ],
     targets: [
         .target(
-            name: "OpenAgentDashboard",
-            path: "OpenAgentDashboard"
+            name: "SandboxedDashboard",
+            path: "SandboxedDashboard"
         )
     ]
 )
