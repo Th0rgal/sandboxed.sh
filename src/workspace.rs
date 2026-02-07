@@ -1652,7 +1652,13 @@ fn codex_entry_from_mcp(
     shared_network: Option<bool>,
     override_name: Option<String>,
 ) -> Option<CodexMcpEntry> {
-    let name = override_name.unwrap_or_else(|| config.name.clone());
+    let raw_name = override_name.unwrap_or_else(|| config.name.clone());
+    let sanitized = sanitize_key(&raw_name);
+    let name = if sanitized.is_empty() {
+        "mcp".to_string()
+    } else {
+        sanitized
+    };
     match &config.transport {
         McpTransport::Http { endpoint, headers } => Some(CodexMcpEntry {
             name,
@@ -1767,7 +1773,7 @@ fn parse_mcp_section_name(line: &str) -> Option<String> {
     }
     let rest = &inner[prefix.len()..];
     let base = rest.split('.').next()?;
-    Some(base.to_string())
+    Some(sanitize_key(base))
 }
 
 fn render_codex_mcp_entry(entry: &CodexMcpEntry) -> String {

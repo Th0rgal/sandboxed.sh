@@ -55,6 +55,7 @@ export function DesktopStream({
   const connectionIdRef = useRef(0); // Guard against stale callbacks from old connections
   const moveRafRef = useRef<number | null>(null);
   const pendingMoveRef = useRef<{ x: number; y: number } | null>(null);
+  const clickTimeoutRef = useRef<number | null>(null);
 
   // Refs to store current values without triggering reconnection on slider changes
   const fpsRef = useRef(initialFps);
@@ -82,6 +83,14 @@ export function DesktopStream({
 
     return `${wsUrl}/api/desktop/stream?${params}`;
   }, [displayId]);
+
+  useEffect(() => {
+    return () => {
+      if (clickTimeoutRef.current !== null) {
+        window.clearTimeout(clickTimeoutRef.current);
+      }
+    };
+  }, []);
 
   // Connect to WebSocket
   const connect = useCallback(() => {
@@ -235,13 +244,44 @@ export function DesktopStream({
       if (connectionState !== "connected") return;
       const coords = getCanvasCoords(event);
       if (!coords) return;
-      const isDouble = event.detail >= 2;
+      if (event.detail > 1) {
+        return;
+      }
+      if (clickTimeoutRef.current !== null) {
+        window.clearTimeout(clickTimeoutRef.current);
+      }
+      clickTimeoutRef.current = window.setTimeout(() => {
+        clickTimeoutRef.current = null;
+        sendCommand({
+          t: "click",
+          x: coords.x,
+          y: coords.y,
+          button: 1,
+          double: false,
+        });
+      }, 180);
+      event.preventDefault();
+      event.stopPropagation();
+      containerRef.current?.focus();
+    },
+    [connectionState, getCanvasCoords, sendCommand]
+  );
+
+  const handleDoubleClick = useCallback(
+    (event: MouseEvent<HTMLCanvasElement>) => {
+      if (connectionState !== "connected") return;
+      const coords = getCanvasCoords(event);
+      if (!coords) return;
+      if (clickTimeoutRef.current !== null) {
+        window.clearTimeout(clickTimeoutRef.current);
+        clickTimeoutRef.current = null;
+      }
       sendCommand({
         t: "click",
         x: coords.x,
         y: coords.y,
         button: 1,
-        double: isDouble,
+        double: true,
       });
       event.preventDefault();
       event.stopPropagation();
@@ -627,6 +667,7 @@ export function DesktopStream({
             className="max-w-full max-h-full object-contain"
             onMouseMove={handleMouseMove}
             onClick={handleClick}
+            onDoubleClick={handleDoubleClick}
             onAuxClick={handleAuxClick}
             onContextMenu={handleContextMenu}
             onWheel={handleWheel}
