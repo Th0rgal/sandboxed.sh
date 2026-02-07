@@ -30,7 +30,7 @@ use crate::workspace_exec::WorkspaceExec;
 
 use super::control::{
     resolve_claudecode_default_model, safe_truncate_index, AgentEvent, AgentTreeNode,
-    ControlStatus, ExecutionProgress, FrontendToolHub,
+    ControlRunState, ControlStatus, ExecutionProgress, FrontendToolHub,
 };
 use super::library::SharedLibrary;
 
@@ -98,6 +98,31 @@ fn extract_thought_line(text: &str) -> Option<(String, String)> {
         let cleaned = remaining.join("\n").trim().to_string();
         (t, cleaned)
     })
+}
+
+async fn set_control_state_for_mission(
+    status: &Arc<RwLock<ControlStatus>>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    mission_id: Uuid,
+    state: ControlRunState,
+) {
+    let (queue_len, mission_id_opt) = {
+        let mut guard = status.write().await;
+        if let Some(existing) = guard.mission_id {
+            if existing != mission_id {
+                return;
+            }
+        } else {
+            guard.mission_id = Some(mission_id);
+        }
+        guard.state = state;
+        (guard.queue_len, guard.mission_id)
+    };
+    let _ = events_tx.send(AgentEvent::Status {
+        state,
+        queue_len,
+        mission_id: mission_id_opt,
+    });
 }
 
 fn is_opencode_status_line(line: &str) -> bool {
@@ -1039,7 +1064,7 @@ async fn run_mission_turn(
     library: SharedLibrary,
     events_tx: broadcast::Sender<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
-    _status: Arc<RwLock<ControlStatus>>,
+    status: Arc<RwLock<ControlStatus>>,
     cancel: CancellationToken,
     history: Vec<(String, String)>,
     user_message: String,
@@ -1205,6 +1230,7 @@ async fn run_mission_turn(
                 session_id.as_deref(),
                 is_continuation,
                 Some(Arc::clone(&tool_hub)),
+                Some(Arc::clone(&status)),
             )
             .await
         }
@@ -1432,6 +1458,7 @@ pub fn run_claudecode_turn<'a>(
     session_id: Option<&'a str>,
     is_continuation: bool,
     tool_hub: Option<Arc<FrontendToolHub>>,
+    status: Option<Arc<RwLock<ControlStatus>>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
     Box::pin(async move {
         use super::ai_providers::{
@@ -2414,6 +2441,15 @@ pub fn run_claudecode_turn<'a>(
                                                             "Frontend tool detected, pausing for user input"
                                                         );
                                                         let hub = Arc::clone(hub);
+                                                        if let Some(ref status_ref) = status {
+                                                            set_control_state_for_mission(
+                                                                status_ref,
+                                                                &events_tx,
+                                                                mission_id,
+                                                                ControlRunState::WaitingForTool,
+                                                            )
+                                                            .await;
+                                                        }
                                                         let rx = hub.register(id.clone()).await;
 
                                                         pty.kill();
@@ -2436,6 +2472,15 @@ pub fn run_claudecode_turn<'a>(
                                                             }
                                                         };
 
+                                                        if let Some(ref status_ref) = status {
+                                                            set_control_state_for_mission(
+                                                                status_ref,
+                                                                &events_tx,
+                                                                mission_id,
+                                                                ControlRunState::Running,
+                                                            )
+                                                            .await;
+                                                        }
                                                         let _ = events_tx.send(AgentEvent::ToolResult {
                                                             tool_call_id: id.clone(),
                                                             name: name.clone(),
@@ -2463,6 +2508,7 @@ pub fn run_claudecode_turn<'a>(
                                                             Some(&session_id),
                                                             true,
                                                             tool_hub,
+                                                            status,
                                                         ).await;
                                                     }
                                                 }

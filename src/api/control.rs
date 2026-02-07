@@ -3740,14 +3740,29 @@ async fn control_actor_loop(
                             if let Some(mission_id) = running_mission_id {
                                 let seconds_since_activity =
                                     main_runner_last_activity.elapsed().as_secs();
+                                let state_label = {
+                                    let status_guard = status.read().await;
+                                    if status_guard.mission_id == Some(mission_id)
+                                        && status_guard.state == ControlRunState::WaitingForTool
+                                    {
+                                        "waiting_for_tool"
+                                    } else {
+                                        "running"
+                                    }
+                                };
+                                let mission_state = if state_label == "waiting_for_tool" {
+                                    super::mission_runner::MissionRunState::WaitingForTool
+                                } else {
+                                    super::mission_runner::MissionRunState::Running
+                                };
                                 running_list.push(super::mission_runner::RunningMissionInfo {
                                     mission_id,
-                                    state: "running".to_string(),
+                                    state: state_label.to_string(),
                                     queue_len: queue.len(),
                                     history_len: history.len(),
                                     seconds_since_activity,
                                     health: super::mission_runner::running_health(
-                                        super::mission_runner::MissionRunState::Running,
+                                        mission_state,
                                         seconds_since_activity,
                                     ),
                                     expected_deliverables: 0,
@@ -5072,6 +5087,7 @@ async fn run_single_control_turn(
                 session_id.as_deref(),
                 is_continuation,
                 Some(tool_hub.clone()),
+                Some(status.clone()),
             )
             .await
         }

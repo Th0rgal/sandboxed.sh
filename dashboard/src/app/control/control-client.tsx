@@ -2198,6 +2198,32 @@ export default function ControlClient() {
     return out.reverse();
   }, [items]);
 
+  const displayItems = useMemo(() => {
+    if (!dedupedItems.some((item) => item.kind === "user" && item.queued)) {
+      return dedupedItems;
+    }
+    const queued: ChatItem[] = [];
+    const normal: ChatItem[] = [];
+    for (const item of dedupedItems) {
+      if (item.kind === "user" && item.queued) {
+        queued.push(item);
+      } else {
+        normal.push(item);
+      }
+    }
+    return [...normal, ...queued];
+  }, [dedupedItems]);
+
+  const lastNonQueuedItem = useMemo(() => {
+    for (let i = displayItems.length - 1; i >= 0; i--) {
+      const item = displayItems[i];
+      if (!(item.kind === "user" && item.queued)) {
+        return item;
+      }
+    }
+    return displayItems[displayItems.length - 1];
+  }, [displayItems]);
+
   // Extract thinking + streaming items for the side panel.
   const thinkingItems = useMemo(
     () =>
@@ -2311,7 +2337,7 @@ export default function ControlClient() {
     flushThinkingGroup();
 
     return result;
-  }, [dedupedItems, showThinkingPanel]);
+  }, [displayItems, showThinkingPanel]);
 
   const runningMissionById = useMemo(() => {
     return new Map(runningMissions.map((m) => [m.mission_id, m]));
@@ -4189,20 +4215,27 @@ export default function ControlClient() {
             return updated;
           }
 
-          return [
-            ...filtered,
-            {
-              kind: "assistant",
-              id: incomingId,
-              content: String(data["content"] ?? ""),
-              success: !isFailure,
-              costCents: Number(data["cost_cents"] ?? 0),
-              model: data["model"] ? String(data["model"]) : null,
-              timestamp: now,
-              sharedFiles,
-              resumable,
-            },
-          ];
+          const newItem: ChatItem = {
+            kind: "assistant",
+            id: incomingId,
+            content: String(data["content"] ?? ""),
+            success: !isFailure,
+            costCents: Number(data["cost_cents"] ?? 0),
+            model: data["model"] ? String(data["model"]) : null,
+            timestamp: now,
+            sharedFiles,
+            resumable,
+          };
+
+          const firstQueuedIdx = filtered.findIndex(
+            (item) => item.kind === "user" && item.queued
+          );
+          if (firstQueuedIdx === -1) {
+            return [...filtered, newItem];
+          }
+          const updated = [...filtered];
+          updated.splice(firstQueuedIdx, 0, newItem);
+          return updated;
         });
 
         // Reset stream phase to idle when agent finishes responding
@@ -5039,7 +5072,7 @@ export default function ControlClient() {
   // - Last turn completed (assistant message at end - ready for user input)
   // - User just sent a message (waiting for assistant response)
   // Note: For failed missions, we show resume even if lastTurnCompleted (error message is last)
-  const lastItem = items[items.length - 1];
+  const lastItem = lastNonQueuedItem ?? items[items.length - 1];
   const lastTurnCompleted = lastItem?.kind === 'assistant';
   const waitingForResponse = lastItem?.kind === 'user';
   const isFailed = activeMission?.status === 'failed';
