@@ -44,6 +44,58 @@ fn get_resolution() -> String {
     std::env::var("DESKTOP_RESOLUTION").unwrap_or_else(|_| "1280x720".to_string())
 }
 
+fn find_browser_command() -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+
+    if let Ok(chromium_bin) = std::env::var("CHROMIUM_BIN") {
+        if !chromium_bin.trim().is_empty() {
+            candidates.push(chromium_bin);
+        }
+    }
+
+    if let Ok(browser) = std::env::var("BROWSER") {
+        if !browser.trim().is_empty() {
+            candidates.extend(browser.split(':').map(|s| s.trim().to_string()));
+        }
+    }
+
+    candidates.extend(
+        [
+            "chromium",
+            "chromium-browser",
+            "google-chrome",
+            "google-chrome-stable",
+            "brave-browser",
+            "microsoft-edge",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+
+    for candidate in candidates {
+        if candidate.is_empty() {
+            continue;
+        }
+        let candidate_path = std::path::Path::new(&candidate);
+        if candidate_path.is_absolute() || candidate.contains('/') {
+            if candidate_path.exists() {
+                return Some(candidate);
+            }
+            continue;
+        }
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let full = dir.join(&candidate);
+                if full.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Run a command with DISPLAY environment variable set
 async fn run_with_display(
     display: &str,
@@ -195,8 +247,14 @@ impl Tool for StartSession {
         let launch_browser = args["launch_browser"].as_bool().unwrap_or(false);
         let browser_info = if launch_browser {
             let url = args["url"].as_str().unwrap_or("about:blank");
+            let browser_cmd = find_browser_command().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Failed to find a Chromium-compatible browser in PATH. \
+                    Set CHROMIUM_BIN or BROWSER, or install chromium/chromium-browser."
+                )
+            })?;
 
-            let chromium = Command::new("chromium")
+            let chromium = Command::new(&browser_cmd)
                 .args([
                     "--no-sandbox",
                     "--disable-gpu",
@@ -217,8 +275,8 @@ impl Tool for StartSession {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
             format!(
-                ", \"browser\": \"chromium\", \"browser_pid\": {}, \"url\": \"{}\"",
-                chromium_pid, url
+                ", \"browser\": \"{}\", \"browser_pid\": {}, \"url\": \"{}\"",
+                browser_cmd, chromium_pid, url
             )
         } else {
             String::new()

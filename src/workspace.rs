@@ -1569,17 +1569,58 @@ async fn write_codex_mcp_config(
     }
 
     let mut additions = String::new();
-    let mut used_names = std::collections::HashSet::new();
+    let has_filesystem_mcp = mcp_configs
+        .iter()
+        .any(|config| config.enabled && config.name == "filesystem");
+    let mut managed_names = std::collections::HashSet::new();
     for config in mcp_configs.iter().filter(|c| c.enabled) {
-        let key = sanitize_key(&config.name);
-        let unique = unique_key(&key, &mut used_names);
-        if existing_servers.contains(&unique) {
-            continue;
+        managed_names.insert(sanitize_key(&config.name));
+        if config.name == "workspace" && !has_filesystem_mcp {
+            managed_names.insert("filesystem".to_string());
         }
+    }
 
+    if !managed_names.is_empty() {
+        let mut rebuilt = String::new();
+        let mut skip = false;
+        for line in existing.lines() {
+            let trimmed = line.trim();
+            if let Some(section) = trimmed
+                .strip_prefix("[mcp_servers.")
+                .and_then(|rest| rest.strip_suffix(']'))
+            {
+                let base = section.split('.').next().unwrap_or(section);
+                if managed_names.contains(base) {
+                    skip = true;
+                    continue;
+                }
+                skip = false;
+            }
+            if !skip {
+                rebuilt.push_str(line);
+                rebuilt.push('\n');
+            }
+        }
+        existing = rebuilt;
+        existing_servers.clear();
+        for line in existing.lines() {
+            let trimmed = line.trim();
+            if let Some(name) = trimmed
+                .strip_prefix("[mcp_servers.")
+                .and_then(|rest| rest.strip_suffix(']'))
+            {
+                existing_servers.insert(name.trim().to_string());
+            }
+        }
+    }
+
+    let mut append_section = |config: &McpServerConfig, key: &str| {
+        if existing_servers.contains(key) {
+            return;
+        }
         if let Some(section) = codex_mcp_section(
             config,
-            &unique,
+            key,
             workspace_dir,
             workspace_root,
             workspace_type,
@@ -1590,6 +1631,17 @@ async fn write_codex_mcp_config(
                 additions.push('\n');
             }
             additions.push_str(&section);
+        }
+    };
+
+    for config in mcp_configs.iter().filter(|c| c.enabled) {
+        let key = sanitize_key(&config.name);
+        append_section(config, &key);
+
+        // Codex tends to reach for a "filesystem" MCP for local file access.
+        // Provide an alias to the workspace MCP when available.
+        if config.name == "workspace" && !has_filesystem_mcp {
+            append_section(config, "filesystem");
         }
     }
 
