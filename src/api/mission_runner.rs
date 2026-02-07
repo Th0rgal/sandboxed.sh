@@ -7496,6 +7496,7 @@ pub async fn run_codex_turn(
 
     let mut result = if success {
         AgentResult::success(final_message, 0) // TODO: Calculate cost from Codex usage
+            .with_terminal_reason(TerminalReason::Completed)
     } else {
         AgentResult::failure(final_message, 0).with_terminal_reason(TerminalReason::LlmError)
     };
