@@ -283,7 +283,7 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
             }
         };
 
-        let chromium = match std::process::Command::new(&browser_cmd)
+        let mut chromium = match std::process::Command::new(&browser_cmd)
             .args([
                 // Security/sandbox (required for running as root)
                 "--no-sandbox",
