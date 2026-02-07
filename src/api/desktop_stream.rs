@@ -92,6 +92,44 @@ enum ClientCommand {
     /// Change quality
     #[serde(rename = "quality")]
     SetQuality { quality: u32 },
+    /// Move mouse pointer
+    #[serde(rename = "mouse_move")]
+    MouseMove { x: i32, y: i32 },
+    /// Mouse down (for dragging)
+    #[serde(rename = "mouse_down")]
+    MouseDown {
+        x: i32,
+        y: i32,
+        button: Option<String>,
+    },
+    /// Mouse up (for dragging)
+    #[serde(rename = "mouse_up")]
+    MouseUp {
+        x: i32,
+        y: i32,
+        button: Option<String>,
+    },
+    /// Mouse click
+    #[serde(rename = "click")]
+    Click {
+        x: i32,
+        y: i32,
+        button: Option<String>,
+        double: Option<bool>,
+    },
+    /// Mouse scroll
+    #[serde(rename = "scroll")]
+    Scroll {
+        amount: i32,
+        x: Option<i32>,
+        y: Option<i32>,
+    },
+    /// Type text (using xdotool type)
+    #[serde(rename = "type")]
+    TypeText { text: String, delay_ms: Option<u64> },
+    /// Send a key combo (using xdotool key)
+    #[serde(rename = "key")]
+    Key { key: String, delay_ms: Option<u64> },
 }
 
 /// Handle the WebSocket connection for desktop streaming
@@ -160,6 +198,67 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
                     } => {
                         current_quality = new_quality.clamp(10, 100);
                         tracing::debug!(quality = current_quality, "Quality changed");
+                    }
+                    ClientCommand::MouseMove { x, y } => {
+                        let display = x11_display.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = xdotool_mouse_move(&display, x, y).await {
+                                tracing::warn!(error = %err, "Mouse move failed");
+                            }
+                        });
+                    }
+                    ClientCommand::MouseDown { x, y, button } => {
+                        let display = x11_display.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = xdotool_mouse_down(&display, x, y, button).await {
+                                tracing::warn!(error = %err, "Mouse down failed");
+                            }
+                        });
+                    }
+                    ClientCommand::MouseUp { x, y, button } => {
+                        let display = x11_display.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = xdotool_mouse_up(&display, x, y, button).await {
+                                tracing::warn!(error = %err, "Mouse up failed");
+                            }
+                        });
+                    }
+                    ClientCommand::Click {
+                        x,
+                        y,
+                        button,
+                        double,
+                    } => {
+                        let display = x11_display.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = xdotool_click(&display, x, y, button, double).await {
+                                tracing::warn!(error = %err, "Click failed");
+                            }
+                        });
+                    }
+                    ClientCommand::Scroll { amount, x, y } => {
+                        let display = x11_display.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = xdotool_scroll(&display, amount, x, y).await {
+                                tracing::warn!(error = %err, "Scroll failed");
+                            }
+                        });
+                    }
+                    ClientCommand::TypeText { text, delay_ms } => {
+                        let display = x11_display.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = xdotool_type_text(&display, &text, delay_ms).await {
+                                tracing::warn!(error = %err, "Type failed");
+                            }
+                        });
+                    }
+                    ClientCommand::Key { key, delay_ms } => {
+                        let display = x11_display.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = xdotool_key(&display, &key, delay_ms).await {
+                                tracing::warn!(error = %err, "Key failed");
+                            }
+                        });
                     }
                 }
             }
@@ -254,6 +353,171 @@ async fn capture_frame(display: &str, quality: u32) -> anyhow::Result<Vec<u8>> {
     }
 
     Ok(output.stdout)
+}
+
+fn map_button(button: Option<String>) -> &'static str {
+    match button.as_deref() {
+        Some("middle") => "2",
+        Some("right") => "3",
+        _ => "1",
+    }
+}
+
+async fn run_xdotool(display: &str, args: &[String]) -> anyhow::Result<()> {
+    let output = Command::new("xdotool")
+        .args(args)
+        .env("DISPLAY", display)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to run xdotool: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("xdotool failed: {}", stderr.trim()));
+    }
+
+    Ok(())
+}
+
+async fn xdotool_mouse_move(display: &str, x: i32, y: i32) -> anyhow::Result<()> {
+    run_xdotool(
+        display,
+        &[
+            "mousemove".to_string(),
+            x.max(0).to_string(),
+            y.max(0).to_string(),
+        ],
+    )
+    .await
+}
+
+async fn xdotool_mouse_down(
+    display: &str,
+    x: i32,
+    y: i32,
+    button: Option<String>,
+) -> anyhow::Result<()> {
+    let btn = map_button(button);
+    run_xdotool(
+        display,
+        &[
+            "mousemove".to_string(),
+            x.max(0).to_string(),
+            y.max(0).to_string(),
+        ],
+    )
+    .await?;
+    run_xdotool(display, &["mousedown".to_string(), btn.to_string()]).await
+}
+
+async fn xdotool_mouse_up(
+    display: &str,
+    x: i32,
+    y: i32,
+    button: Option<String>,
+) -> anyhow::Result<()> {
+    let btn = map_button(button);
+    run_xdotool(
+        display,
+        &[
+            "mousemove".to_string(),
+            x.max(0).to_string(),
+            y.max(0).to_string(),
+        ],
+    )
+    .await?;
+    run_xdotool(display, &["mouseup".to_string(), btn.to_string()]).await
+}
+
+async fn xdotool_click(
+    display: &str,
+    x: i32,
+    y: i32,
+    button: Option<String>,
+    double: Option<bool>,
+) -> anyhow::Result<()> {
+    let btn = map_button(button);
+    let repeat = if double.unwrap_or(false) { "2" } else { "1" };
+    run_xdotool(
+        display,
+        &[
+            "mousemove".to_string(),
+            x.max(0).to_string(),
+            y.max(0).to_string(),
+        ],
+    )
+    .await?;
+    run_xdotool(
+        display,
+        &[
+            "click".to_string(),
+            "--repeat".to_string(),
+            repeat.to_string(),
+            btn.to_string(),
+        ],
+    )
+    .await
+}
+
+async fn xdotool_scroll(
+    display: &str,
+    amount: i32,
+    x: Option<i32>,
+    y: Option<i32>,
+) -> anyhow::Result<()> {
+    if let (Some(x), Some(y)) = (x, y) {
+        run_xdotool(
+            display,
+            &[
+                "mousemove".to_string(),
+                x.max(0).to_string(),
+                y.max(0).to_string(),
+            ],
+        )
+        .await?;
+    }
+
+    let clamped = amount.clamp(-10, 10);
+    if clamped == 0 {
+        return Ok(());
+    }
+
+    let button = if clamped > 0 { "5" } else { "4" };
+    let steps = clamped.abs().clamp(1, 10) as usize;
+    for _ in 0..steps {
+        run_xdotool(display, &["click".to_string(), button.to_string()]).await?;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    Ok(())
+}
+
+async fn xdotool_type_text(display: &str, text: &str, delay_ms: Option<u64>) -> anyhow::Result<()> {
+    let delay = delay_ms.unwrap_or(12).to_string();
+    run_xdotool(
+        display,
+        &[
+            "type".to_string(),
+            "--delay".to_string(),
+            delay,
+            text.to_string(),
+        ],
+    )
+    .await
+}
+
+async fn xdotool_key(display: &str, key: &str, delay_ms: Option<u64>) -> anyhow::Result<()> {
+    let delay = delay_ms.unwrap_or(12).to_string();
+    run_xdotool(
+        display,
+        &[
+            "key".to_string(),
+            "--delay".to_string(),
+            delay,
+            key.to_string(),
+        ],
+    )
+    .await
 }
 
 #[cfg(test)]
