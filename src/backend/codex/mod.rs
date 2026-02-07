@@ -216,7 +216,9 @@ fn convert_codex_event(
 
     let mut results = vec![];
 
-    fn mcp_tool_name(data: &std::collections::HashMap<String, serde_json::Value>) -> Option<String> {
+    fn mcp_tool_name(
+        data: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Option<String> {
         let server = data.get("server")?.as_str()?;
         let tool = data.get("tool")?.as_str()?;
         Some(format!("mcp__{}__{}", server, tool))
@@ -233,7 +235,10 @@ fn convert_codex_event(
     fn mcp_tool_result(
         data: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Option<serde_json::Value> {
-        let result = data.get("result").cloned().unwrap_or(serde_json::Value::Null);
+        let result = data
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let error = data.get("error").cloned();
         let status = data.get("status").cloned();
 

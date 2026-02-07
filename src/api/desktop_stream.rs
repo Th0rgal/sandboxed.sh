@@ -220,8 +220,8 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
                     }
                     ClientCommand::MouseDown { x, y, button } => {
                         let button = resolve_button(button);
-                        if let Err(err) = run_xdotool_mouse_button(&x11_display, x, y, button, true)
-                            .await
+                        if let Err(err) =
+                            run_xdotool_mouse_button(&x11_display, x, y, button, true).await
                         {
                             if send_stream_error(&mut ws_sender, err).await.is_err() {
                                 return;
@@ -230,8 +230,8 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
                     }
                     ClientCommand::MouseUp { x, y, button } => {
                         let button = resolve_button(button);
-                        if let Err(err) = run_xdotool_mouse_button(&x11_display, x, y, button, false)
-                            .await
+                        if let Err(err) =
+                            run_xdotool_mouse_button(&x11_display, x, y, button, false).await
                         {
                             if send_stream_error(&mut ws_sender, err).await.is_err() {
                                 return;
@@ -245,7 +245,8 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
                         double,
                     } => {
                         let button = resolve_button(button);
-                        if let Err(err) = run_xdotool_click(&x11_display, x, y, button, double).await
+                        if let Err(err) =
+                            run_xdotool_click(&x11_display, x, y, button, double).await
                         {
                             if send_stream_error(&mut ws_sender, err).await.is_err() {
                                 return;
@@ -266,9 +267,7 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
                             (None, None, Some(a)) => (0, a),
                             _ => (0, 0),
                         };
-                        if let Err(err) =
-                            run_xdotool_scroll(&x11_display, dx, dy, x, y).await
-                        {
+                        if let Err(err) = run_xdotool_scroll(&x11_display, dx, dy, x, y).await {
                             if send_stream_error(&mut ws_sender, err).await.is_err() {
                                 return;
                             }
@@ -377,7 +376,11 @@ fn resolve_button(button: Option<ClickButton>) -> u8 {
 }
 
 async fn run_xdotool_mouse_move(display: &str, x: i32, y: i32) -> anyhow::Result<()> {
-    run_xdotool(display, &["mousemove", "--sync", &x.to_string(), &y.to_string()]).await
+    run_xdotool(
+        display,
+        &["mousemove", "--sync", &x.to_string(), &y.to_string()],
+    )
+    .await
 }
 
 async fn run_xdotool_mouse_button(
@@ -387,7 +390,11 @@ async fn run_xdotool_mouse_button(
     button: u8,
     is_down: bool,
 ) -> anyhow::Result<()> {
-    run_xdotool(display, &["mousemove", "--sync", &x.to_string(), &y.to_string()]).await?;
+    run_xdotool(
+        display,
+        &["mousemove", "--sync", &x.to_string(), &y.to_string()],
+    )
+    .await?;
     let cmd = if is_down { "mousedown" } else { "mouseup" };
     run_xdotool(display, &[cmd, &button.to_string()]).await
 }
@@ -399,7 +406,11 @@ async fn run_xdotool_click(
     button: u8,
     double_click: bool,
 ) -> anyhow::Result<()> {
-    run_xdotool(display, &["mousemove", "--sync", &x.to_string(), &y.to_string()]).await?;
+    run_xdotool(
+        display,
+        &["mousemove", "--sync", &x.to_string(), &y.to_string()],
+    )
+    .await?;
     if double_click {
         run_xdotool(
             display,
@@ -426,7 +437,11 @@ async fn run_xdotool_scroll(
     y: Option<i32>,
 ) -> anyhow::Result<()> {
     if let (Some(x), Some(y)) = (x, y) {
-        run_xdotool(display, &["mousemove", "--sync", &x.to_string(), &y.to_string()]).await?;
+        run_xdotool(
+            display,
+            &["mousemove", "--sync", &x.to_string(), &y.to_string()],
+        )
+        .await?;
     }
 
     let steps_y = (delta_y.abs() / 120).max(1).min(10);
@@ -453,11 +468,7 @@ async fn run_xdotool_scroll(
     Ok(())
 }
 
-async fn run_xdotool_type(
-    display: &str,
-    text: &str,
-    delay_ms: Option<u64>,
-) -> anyhow::Result<()> {
+async fn run_xdotool_type(display: &str, text: &str, delay_ms: Option<u64>) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
@@ -469,11 +480,7 @@ async fn run_xdotool_type(
     .await
 }
 
-async fn run_xdotool_key(
-    display: &str,
-    key: &str,
-    delay_ms: Option<u64>,
-) -> anyhow::Result<()> {
+async fn run_xdotool_key(display: &str, key: &str, delay_ms: Option<u64>) -> anyhow::Result<()> {
     if key.trim().is_empty() {
         return Ok(());
     }
@@ -495,10 +502,7 @@ async fn run_xdotool(display: &str, args: &[&str]) -> anyhow::Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "xdotool failed: {}",
-            stderr.trim()
-        ));
+        return Err(anyhow::anyhow!("xdotool failed: {}", stderr.trim()));
     }
 
     Ok(())

@@ -1550,7 +1550,9 @@ async fn write_codex_config(
 
     // Write MCP config for Codex so tools are available.
     let config_path = codex_dir.join("config.toml");
-    let existing = tokio::fs::read_to_string(&config_path).await.unwrap_or_default();
+    let existing = tokio::fs::read_to_string(&config_path)
+        .await
+        .unwrap_or_default();
 
     let mut entries = Vec::new();
     let mut existing_names = std::collections::HashSet::new();
@@ -1614,7 +1616,12 @@ fn resolve_codex_dir(
 ) -> PathBuf {
     let container_fallback = workspace_env
         .get("SANDBOXED_SH_CONTAINER_FALLBACK")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "on"
+            )
+        })
         .unwrap_or(false);
 
     if workspace_type == WorkspaceType::Container && !container_fallback {
@@ -1632,7 +1639,12 @@ fn resolve_claudecode_dir(
 ) -> PathBuf {
     let container_fallback = workspace_env
         .get("SANDBOXED_SH_CONTAINER_FALLBACK")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "on"
+            )
+        })
         .unwrap_or(false);
 
     if workspace_type == WorkspaceType::Container && !container_fallback {
@@ -1775,11 +1787,7 @@ fn render_codex_mcp_entry(entry: &CodexMcpEntry) -> String {
             let mut headers = entry.headers.iter().collect::<Vec<_>>();
             headers.sort_by(|a, b| a.0.cmp(b.0));
             for (key, value) in headers {
-                out.push_str(&format!(
-                    "{} = {}\n",
-                    toml_key(key),
-                    toml_string(value)
-                ));
+                out.push_str(&format!("{} = {}\n", toml_key(key), toml_string(value)));
             }
         }
         return out;
@@ -1802,11 +1810,7 @@ fn render_codex_mcp_entry(entry: &CodexMcpEntry) -> String {
             let mut envs = entry.env.iter().collect::<Vec<_>>();
             envs.sort_by(|a, b| a.0.cmp(b.0));
             for (key, value) in envs {
-                out.push_str(&format!(
-                    "{} = {}\n",
-                    toml_key(key),
-                    toml_string(value)
-                ));
+                out.push_str(&format!("{} = {}\n", toml_key(key), toml_string(value)));
             }
         }
     }
