@@ -1008,6 +1008,9 @@ async fn write_opencode_config(
 
     let mut mcp_map = serde_json::Map::new();
     let mut used = std::collections::HashSet::new();
+    let has_desktop_mcp = mcp_configs
+        .iter()
+        .any(|config| config.enabled && config.name == "desktop");
 
     let filtered_configs = mcp_configs.into_iter().filter(|c| {
         if !c.enabled {
@@ -1063,13 +1066,30 @@ async fn write_opencode_config(
             );
         }
     }
+    let workspace_desktop_flag = workspace_env
+        .get("SANDBOXED_SH_ENABLE_DESKTOP_TOOLS")
+        .or_else(|| workspace_env.get("DESKTOP_ENABLED"))
+        .map(|value| {
+            matches!(
+                value.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "on"
+            )
+        })
+        .unwrap_or(false);
+    let workspace_has_display = workspace_env.contains_key("DISPLAY");
+
     // Tool policy:
     // - We want shell/file effects scoped to the workspace by running the agent process
     //   inside the workspace execution context (host/container).
     // - Therefore, OpenCode built-in bash MUST be enabled for all workspace types.
     // - The legacy workspace-mcp/desktop-mcp proxy tools are no longer required for core flows.
+    // - Enable desktop tools automatically when a desktop MCP exists or the workspace advertises
+    //   a display (browser/X11 templates), even if global env flags are unset.
     let enable_desktop_tools = env_var_bool("SANDBOXED_SH_ENABLE_DESKTOP_TOOLS", false)
-        || env_var_bool("DESKTOP_ENABLED", false);
+        || env_var_bool("DESKTOP_ENABLED", false)
+        || workspace_desktop_flag
+        || workspace_has_display
+        || has_desktop_mcp;
     let container_fallback = workspace_env
         .get("SANDBOXED_SH_CONTAINER_FALLBACK")
         .map(|v| {
