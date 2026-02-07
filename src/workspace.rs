@@ -1362,7 +1362,6 @@ async fn write_claudecode_config(
     let mcp_content = serde_json::to_string_pretty(&mcp_only)?;
     let mcp_config_path = claude_dir.join("mcp.json");
     tokio::fs::write(&mcp_config_path, &mcp_content).await?;
-
     // Also write settings under XDG_CONFIG_HOME/claude for Claude CLI XDG lookups.
     let xdg_claude_dir = workspace_dir.join(".config").join("claude");
     tokio::fs::create_dir_all(&xdg_claude_dir).await?;
