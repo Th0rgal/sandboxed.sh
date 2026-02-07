@@ -55,6 +55,12 @@ export function DesktopStream({
   const connectionIdRef = useRef(0); // Guard against stale callbacks from old connections
   const moveRafRef = useRef<number | null>(null);
   const pendingMoveRef = useRef<{ x: number; y: number } | null>(null);
+  const mouseDownRef = useRef(false);
+  const mouseDragActiveRef = useRef(false);
+  const mouseDownCoordsRef = useRef<{ x: number; y: number } | null>(null);
+  const mouseDownButtonRef = useRef(1);
+  const suppressClickRef = useRef(false);
+  const lastCoordsRef = useRef<{ x: number; y: number } | null>(null);
 
   // Refs to store current values without triggering reconnection on slider changes
   const fpsRef = useRef(initialFps);
@@ -217,6 +223,24 @@ export function DesktopStream({
       if (connectionState !== "connected") return;
       const coords = getCanvasCoords(event);
       if (!coords) return;
+      lastCoordsRef.current = coords;
+      if (mouseDownRef.current && !mouseDragActiveRef.current) {
+        const start = mouseDownCoordsRef.current;
+        if (start) {
+          const dx = coords.x - start.x;
+          const dy = coords.y - start.y;
+          if (Math.hypot(dx, dy) >= 3) {
+            mouseDragActiveRef.current = true;
+            suppressClickRef.current = true;
+            sendCommand({
+              t: "mouse_down",
+              x: start.x,
+              y: start.y,
+              button: mouseDownButtonRef.current,
+            });
+          }
+        }
+      }
       pendingMoveRef.current = coords;
       if (moveRafRef.current !== null) return;
       moveRafRef.current = requestAnimationFrame(() => {
@@ -227,12 +251,78 @@ export function DesktopStream({
         }
       });
     },
-    [connectionState, getCanvasCoords, sendMouseMove]
+    [connectionState, getCanvasCoords, sendCommand, sendMouseMove]
   );
+
+  const handleMouseDown = useCallback(
+    (event: MouseEvent<HTMLCanvasElement>) => {
+      if (connectionState !== "connected") return;
+      if (event.button !== 0) return;
+      const coords = getCanvasCoords(event);
+      if (!coords) return;
+      mouseDownRef.current = true;
+      mouseDragActiveRef.current = false;
+      suppressClickRef.current = false;
+      mouseDownCoordsRef.current = coords;
+      mouseDownButtonRef.current = 1;
+      lastCoordsRef.current = coords;
+      event.preventDefault();
+      event.stopPropagation();
+      containerRef.current?.focus();
+    },
+    [connectionState, getCanvasCoords, sendCommand]
+  );
+
+  const handleMouseUp = useCallback(
+    (event: MouseEvent<HTMLCanvasElement>) => {
+      if (!mouseDownRef.current) return;
+      if (connectionState !== "connected") return;
+      const coords = getCanvasCoords(event) ?? lastCoordsRef.current;
+      mouseDownRef.current = false;
+      mouseDownCoordsRef.current = null;
+      if (!coords) return;
+      if (mouseDragActiveRef.current) {
+        mouseDragActiveRef.current = false;
+        suppressClickRef.current = true;
+        sendCommand({
+          t: "mouse_up",
+          x: coords.x,
+          y: coords.y,
+          button: mouseDownButtonRef.current,
+        });
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    [connectionState, getCanvasCoords, sendCommand]
+  );
+
+  const handleMouseLeave = useCallback(() => {
+    if (!mouseDownRef.current) return;
+    if (connectionState !== "connected") return;
+    const coords = lastCoordsRef.current;
+    mouseDownRef.current = false;
+    mouseDownCoordsRef.current = null;
+    if (!coords) return;
+    if (mouseDragActiveRef.current) {
+      mouseDragActiveRef.current = false;
+      suppressClickRef.current = true;
+      sendCommand({
+        t: "mouse_up",
+        x: coords.x,
+        y: coords.y,
+        button: mouseDownButtonRef.current,
+      });
+    }
+  }, [connectionState, sendCommand]);
 
   const handleClick = useCallback(
     (event: MouseEvent<HTMLCanvasElement>) => {
       if (connectionState !== "connected") return;
+      if (suppressClickRef.current) {
+        suppressClickRef.current = false;
+        return;
+      }
       const coords = getCanvasCoords(event);
       if (!coords) return;
       const isDouble = event.detail >= 2;
@@ -626,6 +716,9 @@ export function DesktopStream({
             ref={canvasRef}
             className="max-w-full max-h-full object-contain"
             onMouseMove={handleMouseMove}
+            onMouseDown={handleMouseDown}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={handleMouseLeave}
             onClick={handleClick}
             onAuxClick={handleAuxClick}
             onContextMenu={handleContextMenu}
