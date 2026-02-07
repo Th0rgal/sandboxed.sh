@@ -2067,11 +2067,11 @@ pub fn run_claudecode_turn<'a>(
                 if let Some(claude_path) =
                     resolve_command_path_in_workspace(&workspace_exec, work_dir, &program).await
                 {
-                    let force_bun =
-                        env_var_bool("SANDBOXED_SH_CLAUDECODE_FORCE_BUN", false);
+                    let force_bun = env_var_bool("SANDBOXED_SH_CLAUDECODE_FORCE_BUN", false);
                     let prefers_bun = if force_bun {
                         true
-                    } else if claude_path.contains("/.bun/") || claude_path.contains("/.cache/.bun/")
+                    } else if claude_path.contains("/.bun/")
+                        || claude_path.contains("/.cache/.bun/")
                     {
                         true
                     } else {
@@ -2079,10 +2079,14 @@ pub fn run_claudecode_turn<'a>(
                             .await
                             .unwrap_or(false)
                     };
-                    let shebang_is_node =
-                        claude_cli_shebang_contains(&workspace_exec, work_dir, &claude_path, "node")
-                            .await
-                            .unwrap_or(false);
+                    let shebang_is_node = claude_cli_shebang_contains(
+                        &workspace_exec,
+                        work_dir,
+                        &claude_path,
+                        "node",
+                    )
+                    .await
+                    .unwrap_or(false);
 
                     if prefers_bun && !shebang_is_node {
                         program = "bun".to_string();
