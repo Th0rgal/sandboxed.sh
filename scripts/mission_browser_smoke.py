@@ -18,7 +18,13 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Set
 
 DEFAULT_BACKENDS = ["claudecode", "codex"]
-REQUIRED_TOOL_PREFIXES = ("desktop_", "playwright_", "browser_")
+REQUIRED_TOOL_PREFIXES = (
+    "desktop_",
+    "playwright_",
+    "browser_",
+    "mcp__desktop__",
+    "mcp__playwright__",
+)
 
 
 def die(message: str) -> None:
@@ -40,6 +46,11 @@ def http_json(method: str, url: str, token: str, payload: Optional[dict]) -> dic
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Content-Type", "application/json")
+    req.add_header(
+        "User-Agent",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             body = resp.read().decode("utf-8")
@@ -55,6 +66,11 @@ def open_sse_stream(url: str, token: str, timeout: float) -> urllib.response.add
     req = urllib.request.Request(url, method="GET")
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "text/event-stream")
+    req.add_header(
+        "User-Agent",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    )
     return urllib.request.urlopen(req, timeout=timeout)
 
 
