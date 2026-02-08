@@ -214,14 +214,6 @@ fn convert_codex_event(
         }
     }
 
-    fn tool_call_emitted(
-        item_content_cache: &std::collections::HashMap<String, String>,
-        item_id: &str,
-    ) -> bool {
-        let key = format!("tool_call:{}", item_id);
-        item_content_cache.contains_key(&key)
-    }
-
     let mut results = vec![];
 
     fn mcp_tool_name(
@@ -360,9 +352,7 @@ fn convert_codex_event(
                 "mcp_tool_call" => {
                     if let Some(name) = mcp_tool_name(&item.data) {
                         if let Some(args) = mcp_tool_args(&item.data) {
-                            if !tool_call_emitted(item_content_cache, &item.id)
-                                && !mark_tool_call_emitted(item_content_cache, &item.id)
-                            {
+                            if !mark_tool_call_emitted(item_content_cache, &item.id) {
                                 results.push(ExecutionEvent::ToolCall {
                                     id: item.id.clone(),
                                     name: name.clone(),

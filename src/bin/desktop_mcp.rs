@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use sandboxed_sh::tools::desktop::find_browser_command;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use sandboxed_sh::tools::desktop::find_browser_command;
 
 /// Global counter for display numbers to avoid conflicts
 static DISPLAY_COUNTER: AtomicU32 = AtomicU32::new(99);

@@ -55,12 +55,10 @@ export function DesktopStream({
   const connectionIdRef = useRef(0); // Guard against stale callbacks from old connections
   const moveRafRef = useRef<number | null>(null);
   const pendingMoveRef = useRef<{ x: number; y: number } | null>(null);
-  const clickTimeoutRef = useRef<number | null>(null);
   const mouseDownRef = useRef(false);
   const mouseDragActiveRef = useRef(false);
   const mouseDownCoordsRef = useRef<{ x: number; y: number } | null>(null);
   const mouseDownButtonRef = useRef(1);
-  const suppressClickRef = useRef(false);
   const lastCoordsRef = useRef<{ x: number; y: number } | null>(null);
 
   // Refs to store current values without triggering reconnection on slider changes
@@ -89,14 +87,6 @@ export function DesktopStream({
 
     return `${wsUrl}/api/desktop/stream?${params}`;
   }, [displayId]);
-
-  useEffect(() => {
-    return () => {
-      if (clickTimeoutRef.current !== null) {
-        window.clearTimeout(clickTimeoutRef.current);
-      }
-    };
-  }, []);
 
   // Connect to WebSocket
   const connect = useCallback(() => {
@@ -240,13 +230,6 @@ export function DesktopStream({
           const dy = coords.y - start.y;
           if (Math.hypot(dx, dy) >= 3) {
             mouseDragActiveRef.current = true;
-            suppressClickRef.current = true;
-            sendCommand({
-              t: "mouse_down",
-              x: start.x,
-              y: start.y,
-              button: mouseDownButtonRef.current,
-            });
           }
         }
       }
@@ -271,10 +254,15 @@ export function DesktopStream({
       if (!coords) return;
       mouseDownRef.current = true;
       mouseDragActiveRef.current = false;
-      suppressClickRef.current = false;
       mouseDownCoordsRef.current = coords;
       mouseDownButtonRef.current = 1;
       lastCoordsRef.current = coords;
+      sendCommand({
+        t: "mouse_down",
+        x: coords.x,
+        y: coords.y,
+        button: mouseDownButtonRef.current,
+      });
       event.preventDefault();
       event.stopPropagation();
       containerRef.current?.focus();
@@ -292,14 +280,13 @@ export function DesktopStream({
       if (!coords) return;
       if (mouseDragActiveRef.current) {
         mouseDragActiveRef.current = false;
-        suppressClickRef.current = true;
-        sendCommand({
-          t: "mouse_up",
-          x: coords.x,
-          y: coords.y,
-          button: mouseDownButtonRef.current,
-        });
       }
+      sendCommand({
+        t: "mouse_up",
+        x: coords.x,
+        y: coords.y,
+        button: mouseDownButtonRef.current,
+      });
       event.preventDefault();
       event.stopPropagation();
     },
@@ -315,70 +302,14 @@ export function DesktopStream({
     if (!coords) return;
     if (mouseDragActiveRef.current) {
       mouseDragActiveRef.current = false;
-      suppressClickRef.current = true;
-      sendCommand({
-        t: "mouse_up",
-        x: coords.x,
-        y: coords.y,
-        button: mouseDownButtonRef.current,
-      });
     }
+    sendCommand({
+      t: "mouse_up",
+      x: coords.x,
+      y: coords.y,
+      button: mouseDownButtonRef.current,
+    });
   }, [connectionState, sendCommand]);
-
-  const handleClick = useCallback(
-    (event: MouseEvent<HTMLCanvasElement>) => {
-      if (connectionState !== "connected") return;
-      if (suppressClickRef.current) {
-        suppressClickRef.current = false;
-        return;
-      }
-      const coords = getCanvasCoords(event);
-      if (!coords) return;
-      if (event.detail > 1) {
-        return;
-      }
-      if (clickTimeoutRef.current !== null) {
-        window.clearTimeout(clickTimeoutRef.current);
-      }
-      clickTimeoutRef.current = window.setTimeout(() => {
-        clickTimeoutRef.current = null;
-        sendCommand({
-          t: "click",
-          x: coords.x,
-          y: coords.y,
-          button: 1,
-          double: false,
-        });
-      }, 180);
-      event.preventDefault();
-      event.stopPropagation();
-      containerRef.current?.focus();
-    },
-    [connectionState, getCanvasCoords, sendCommand]
-  );
-
-  const handleDoubleClick = useCallback(
-    (event: MouseEvent<HTMLCanvasElement>) => {
-      if (connectionState !== "connected") return;
-      const coords = getCanvasCoords(event);
-      if (!coords) return;
-      if (clickTimeoutRef.current !== null) {
-        window.clearTimeout(clickTimeoutRef.current);
-        clickTimeoutRef.current = null;
-      }
-      sendCommand({
-        t: "click",
-        x: coords.x,
-        y: coords.y,
-        button: 1,
-        double: true,
-      });
-      event.preventDefault();
-      event.stopPropagation();
-      containerRef.current?.focus();
-    },
-    [connectionState, getCanvasCoords, sendCommand]
-  );
 
   const handleAuxClick = useCallback(
     (event: MouseEvent<HTMLCanvasElement>) => {
@@ -759,8 +690,6 @@ export function DesktopStream({
             onMouseDown={handleMouseDown}
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseLeave}
-            onClick={handleClick}
-            onDoubleClick={handleDoubleClick}
             onAuxClick={handleAuxClick}
             onContextMenu={handleContextMenu}
             onWheel={handleWheel}

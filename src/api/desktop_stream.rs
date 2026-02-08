@@ -157,20 +157,33 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
         "Starting desktop stream"
     );
 
-    // Channel for control commands from client
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ClientCommand>();
+    // Channels for client commands
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ClientCommand>();
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<ClientCommand>();
+    let (input_err_tx, mut input_err_rx) = mpsc::unbounded_channel::<anyhow::Error>();
 
     // Split the socket
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // Spawn task to handle incoming messages
-    let cmd_tx_clone = cmd_tx.clone();
+    let control_tx_clone = control_tx.clone();
+    let input_tx_clone = input_tx.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 Message::Text(t) => {
                     if let Ok(cmd) = serde_json::from_str::<ClientCommand>(&t) {
-                        let _ = cmd_tx_clone.send(cmd);
+                        match cmd {
+                            ClientCommand::Pause
+                            | ClientCommand::Resume
+                            | ClientCommand::SetFps { .. }
+                            | ClientCommand::SetQuality { .. } => {
+                                let _ = control_tx_clone.send(cmd);
+                            }
+                            _ => {
+                                let _ = input_tx_clone.send(cmd);
+                            }
+                        }
                     }
                 }
                 Message::Close(_) => break,
@@ -184,13 +197,78 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
     let mut current_quality = quality;
     let mut frame_interval = Duration::from_millis(1000 / fps as u64);
 
+    let input_display = x11_display.clone();
+    let mut input_task = tokio::spawn(async move {
+        let mut scroll_acc_x: i32 = 0;
+        let mut scroll_acc_y: i32 = 0;
+        while let Some(cmd) = input_rx.recv().await {
+            let result = match cmd {
+                ClientCommand::MouseMove { x, y } => {
+                    run_xdotool_mouse_move(&input_display, x, y).await
+                }
+                ClientCommand::MouseDown { x, y, button } => {
+                    let button = resolve_button(button);
+                    run_xdotool_mouse_button(&input_display, x, y, button, true).await
+                }
+                ClientCommand::MouseUp { x, y, button } => {
+                    let button = resolve_button(button);
+                    run_xdotool_mouse_button(&input_display, x, y, button, false).await
+                }
+                ClientCommand::Click {
+                    x,
+                    y,
+                    button,
+                    double,
+                } => {
+                    let button = resolve_button(button);
+                    run_xdotool_click(&input_display, x, y, button, double).await
+                }
+                ClientCommand::Scroll {
+                    amount,
+                    delta_x,
+                    delta_y,
+                    x,
+                    y,
+                } => {
+                    let (dx, dy) = match (delta_x, delta_y, amount) {
+                        (Some(dx), Some(dy), _) => (dx, dy),
+                        (Some(dx), None, _) => (dx, 0),
+                        (None, Some(dy), _) => (0, dy),
+                        (None, None, Some(a)) => (0, a),
+                        _ => (0, 0),
+                    };
+                    scroll_acc_x = scroll_acc_x.saturating_add(dx);
+                    scroll_acc_y = scroll_acc_y.saturating_add(dy);
+
+                    let steps_x = scroll_acc_x / 120;
+                    let steps_y = scroll_acc_y / 120;
+                    scroll_acc_x -= steps_x * 120;
+                    scroll_acc_y -= steps_y * 120;
+
+                    run_xdotool_scroll_steps(&input_display, steps_x, steps_y, x, y).await
+                }
+                ClientCommand::Type { text, delay_ms } => {
+                    run_xdotool_type(&input_display, &text, delay_ms).await
+                }
+                ClientCommand::Key { key, delay_ms } => {
+                    run_xdotool_key(&input_display, &key, delay_ms).await
+                }
+                _ => Ok(()),
+            };
+
+            if let Err(err) = result {
+                let _ = input_err_tx.send(err);
+            }
+        }
+    });
+
     // Main streaming loop
     let mut stream_task = tokio::spawn(async move {
         let mut frame_count: u64 = 0;
 
         loop {
             // Check for control commands (non-blocking)
-            while let Ok(cmd) = cmd_rx.try_recv() {
+            while let Ok(cmd) = control_rx.try_recv() {
                 match cmd {
                     ClientCommand::Pause => {
                         paused = true;
@@ -211,82 +289,13 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
                         current_quality = new_quality.clamp(10, 100);
                         tracing::debug!(quality = current_quality, "Quality changed");
                     }
-                    ClientCommand::MouseMove { x, y } => {
-                        if let Err(err) = run_xdotool_mouse_move(&x11_display, x, y).await {
-                            if send_stream_error(&mut ws_sender, err).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    ClientCommand::MouseDown { x, y, button } => {
-                        let button = resolve_button(button);
-                        if let Err(err) =
-                            run_xdotool_mouse_button(&x11_display, x, y, button, true).await
-                        {
-                            if send_stream_error(&mut ws_sender, err).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    ClientCommand::MouseUp { x, y, button } => {
-                        let button = resolve_button(button);
-                        if let Err(err) =
-                            run_xdotool_mouse_button(&x11_display, x, y, button, false).await
-                        {
-                            if send_stream_error(&mut ws_sender, err).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    ClientCommand::Click {
-                        x,
-                        y,
-                        button,
-                        double,
-                    } => {
-                        let button = resolve_button(button);
-                        if let Err(err) =
-                            run_xdotool_click(&x11_display, x, y, button, double).await
-                        {
-                            if send_stream_error(&mut ws_sender, err).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    ClientCommand::Scroll {
-                        amount,
-                        delta_x,
-                        delta_y,
-                        x,
-                        y,
-                    } => {
-                        let (dx, dy) = match (delta_x, delta_y, amount) {
-                            (Some(dx), Some(dy), _) => (dx, dy),
-                            (Some(dx), None, _) => (dx, 0),
-                            (None, Some(dy), _) => (0, dy),
-                            (None, None, Some(a)) => (0, a),
-                            _ => (0, 0),
-                        };
-                        if let Err(err) = run_xdotool_scroll(&x11_display, dx, dy, x, y).await {
-                            if send_stream_error(&mut ws_sender, err).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    ClientCommand::Type { text, delay_ms } => {
-                        if let Err(err) = run_xdotool_type(&x11_display, &text, delay_ms).await {
-                            if send_stream_error(&mut ws_sender, err).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    ClientCommand::Key { key, delay_ms } => {
-                        if let Err(err) = run_xdotool_key(&x11_display, &key, delay_ms).await {
-                            if send_stream_error(&mut ws_sender, err).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
+                    _ => {}
+                }
+            }
+
+            while let Ok(err) = input_err_rx.try_recv() {
+                if send_stream_error(&mut ws_sender, err).await.is_err() {
+                    return;
                 }
             }
 
@@ -335,9 +344,15 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
     tokio::select! {
         _ = &mut recv_task => {
             stream_task.abort();
+            input_task.abort();
         }
         _ = &mut stream_task => {
             recv_task.abort();
+            input_task.abort();
+        }
+        _ = &mut input_task => {
+            recv_task.abort();
+            stream_task.abort();
         }
     }
 }
@@ -429,13 +444,16 @@ async fn run_xdotool_click(
     }
 }
 
-async fn run_xdotool_scroll(
+async fn run_xdotool_scroll_steps(
     display: &str,
-    delta_x: i32,
-    delta_y: i32,
+    steps_x: i32,
+    steps_y: i32,
     x: Option<i32>,
     y: Option<i32>,
 ) -> anyhow::Result<()> {
+    if steps_x == 0 && steps_y == 0 {
+        return Ok(());
+    }
     if let (Some(x), Some(y)) = (x, y) {
         run_xdotool(
             display,
@@ -444,23 +462,20 @@ async fn run_xdotool_scroll(
         .await?;
     }
 
-    let steps_y = (delta_y.abs() / 120).max(1).min(10);
-    let steps_x = (delta_x.abs() / 120).max(1).min(10);
-
-    if delta_y != 0 {
-        let button = if delta_y > 0 { "5" } else { "4" };
+    if steps_y != 0 {
+        let button = if steps_y > 0 { "5" } else { "4" };
         run_xdotool(
             display,
-            &["click", "--repeat", &steps_y.to_string(), button],
+            &["click", "--repeat", &steps_y.abs().to_string(), button],
         )
         .await?;
     }
 
-    if delta_x != 0 {
-        let button = if delta_x > 0 { "7" } else { "6" };
+    if steps_x != 0 {
+        let button = if steps_x > 0 { "7" } else { "6" };
         run_xdotool(
             display,
-            &["click", "--repeat", &steps_x.to_string(), button],
+            &["click", "--repeat", &steps_x.abs().to_string(), button],
         )
         .await?;
     }

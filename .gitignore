@@ -45,6 +45,7 @@ Thumbs.db
 # Playwright MCP local data
 .playwright-mcp/
 dashboard/playwright-report/
+dashboard/output/
 
 # npm lockfile (we use bun)
 dashboard/package-lock.json
