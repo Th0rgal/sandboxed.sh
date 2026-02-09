@@ -2093,6 +2093,8 @@ export default function ControlClient() {
     null
   );
   const [queueLen, setQueueLen] = useState(0);
+  const lastQueueLenRef = useRef<number | null>(null);
+  const syncingQueueRef = useRef(false);
 
   // Performance optimization: limit rendered items for large conversations
   const INITIAL_VISIBLE_ITEMS = 30;
@@ -4214,8 +4216,17 @@ export default function ControlClient() {
           shouldApplyStatus = !viewingId || viewingId === currentMissionId || !currentMissionId;
         }
 
-        setQueueLen(typeof q === "number" ? q : 0);
+        const nextQueueLen = typeof q === "number" ? q : 0;
+        setQueueLen(nextQueueLen);
         setRunStateMissionId(effectiveMissionId);
+
+        if (shouldApplyStatus && effectiveMissionId) {
+          const prevQueueLen = lastQueueLenRef.current;
+          lastQueueLenRef.current = nextQueueLen;
+          if (prevQueueLen !== null && nextQueueLen < prevQueueLen) {
+            syncQueueForMission(effectiveMissionId);
+          }
+        }
 
         // Clear progress and auto-close desktop stream when idle for the active mission
         if (newState === "idle" && effectiveMissionId) {
@@ -5211,6 +5222,30 @@ export default function ControlClient() {
       toast.error("Failed to cancel");
     }
   };
+
+  const syncQueueForMission = useCallback(async (missionId: string) => {
+    if (!missionId || syncingQueueRef.current) return;
+    syncingQueueRef.current = true;
+    try {
+      const queuedMessages = await getQueue();
+      const queuedForMission = queuedMessages.filter((qm) => qm.mission_id === missionId);
+      const queuedIds = new Set(queuedForMission.map((qm) => qm.id));
+
+      setItems((prev) =>
+        prev.map((item) => {
+          if (item.kind !== "user") return item;
+          if (item.id.startsWith("temp-")) return item;
+          const shouldBeQueued = queuedIds.has(item.id);
+          if (item.queued === shouldBeQueued) return item;
+          return { ...item, queued: shouldBeQueued };
+        })
+      );
+    } catch (err) {
+      console.warn("[control] failed to sync queue", err);
+    } finally {
+      syncingQueueRef.current = false;
+    }
+  }, []);
 
   // Compute queued items for the queue strip
   const queuedItems: QueueItem[] = useMemo(() => {
