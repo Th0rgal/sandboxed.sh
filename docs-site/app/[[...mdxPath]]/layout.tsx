@@ -15,7 +15,7 @@ function Logo() {
           color: "rgb(var(--foreground))",
         }}
       >
-        Open Agent
+        🏝️ sandboxed.sh
       </span>
     </div>
   );
@@ -30,7 +30,7 @@ export default async function DocsLayout({
     <Navbar
       logo={<Logo />}
       logoLink="/"
-      projectLink="https://github.com/Th0rgal/openagent"
+      projectLink="https://github.com/Th0rgal/sandboxed.sh"
     />
   );
   // Get the full page map
@@ -39,7 +39,7 @@ export default async function DocsLayout({
     <Layout
       navbar={navbar}
       editLink="Edit this page on GitHub"
-      docsRepositoryBase="https://github.com/Th0rgal/openagent/blob/main/docs-site"
+      docsRepositoryBase="https://github.com/Th0rgal/sandboxed.sh/blob/main/docs-site"
       sidebar={{ defaultMenuCollapseLevel: 1 }}
       pageMap={pageMap}
       footer={null}
