@@ -79,7 +79,7 @@ In multi-user mode, the login screen also asks for a username.
 The project uses XcodeGen to generate the Xcode project from `project.yml`. For Xcode Cloud builds:
 
 1. The `ci_scripts/ci_post_clone.sh` script automatically runs after cloning
-2. It installs XcodeGen via Homebrew and generates `SandboxedDashboard.xcodeproj`
+2. It installs XcodeGen from GitHub releases (with Homebrew as a fallback) and generates `SandboxedDashboard.xcodeproj`
 3. Configure your Xcode Cloud workflow to use:
    - **Scheme**: `SandboxedDashboard`
    - **Project**: `ios_dashboard/SandboxedDashboard.xcodeproj`
