@@ -4727,6 +4727,20 @@ async fn claude_cli_shebang_contains(
     Some(first_line.contains(&needle.to_lowercase()))
 }
 
+fn format_exit_status(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("code {}", code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("signal {}", signal);
+        }
+    }
+    "code <unknown>".to_string()
+}
+
 /// Check basic internet connectivity using a reliable public endpoint.
 /// This verifies the workspace has any network access at all.
 async fn check_basic_internet_connectivity(
@@ -4739,64 +4753,89 @@ async fn check_basic_internet_connectivity(
     // upstream `curl` may be terminated with SIGPIPE which yields an exit code of None (-1)
     // and causes spurious "network check failed" errors.
     let test_cmd = "curl -sS -o /dev/null -w '%{http_code}' --max-time 5 https://1.1.1.1";
+    let max_attempts = 3;
 
-    let output = match workspace_exec
-        .output(
-            cwd,
-            "/bin/sh",
-            &["-c".to_string(), test_cmd.to_string()],
-            std::collections::HashMap::new(),
-        )
-        .await
-    {
-        Ok(out) => out,
-        Err(e) => {
-            return Err(format!(
-                "Network connectivity check failed: {}. The workspace may have networking issues.",
-                e
-            ));
-        }
-    };
+    for attempt in 1..=max_attempts {
+        let output = match workspace_exec
+            .output(
+                cwd,
+                "/bin/sh",
+                &["-c".to_string(), test_cmd.to_string()],
+                std::collections::HashMap::new(),
+            )
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                let err = format!(
+                    "Network connectivity check failed: {}. The workspace may have networking issues.",
+                    e
+                );
+                if attempt < max_attempts {
+                    tracing::warn!(
+                        "Basic internet connectivity check failed on attempt {} of {}: {}",
+                        attempt,
+                        max_attempts,
+                        err
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{}{}", stdout, stderr);
 
-    // Check for network-level errors
-    if combined.contains("Network is unreachable") {
-        return Err("No internet connectivity: Network is unreachable. \
+        let err = if combined.contains("Network is unreachable") {
+            "No internet connectivity: Network is unreachable. \
              The workspace has no network access."
-            .to_string());
-    }
-    if combined.contains("Connection timed out") || combined.contains("Operation timed out") {
-        return Err("No internet connectivity: Connection timed out. \
+                .to_string()
+        } else if combined.contains("Connection timed out") || combined.contains("Operation timed out") {
+            "No internet connectivity: Connection timed out. \
              The workspace cannot reach the internet."
-            .to_string());
+                .to_string()
+        } else {
+            // Check for successful HTTP response (any non-000 code means we got an HTTP response).
+            let code = stdout.trim();
+            if !code.is_empty() && code != "000" {
+                tracing::debug!("Basic internet connectivity check passed");
+                return Ok(());
+            }
+
+            // If curl failed completely
+            if !output.status.success() {
+                format!(
+                    "No internet connectivity: Network check failed ({}). Output: {}",
+                    format_exit_status(&output.status),
+                    combined.trim()
+                )
+            } else {
+                format!(
+                    "No internet connectivity: unexpected curl output (http_code={}). Output: {}",
+                    if code.is_empty() { "<empty>" } else { code },
+                    combined.trim()
+                )
+            }
+        };
+
+        if attempt < max_attempts {
+            tracing::warn!(
+                "Basic internet connectivity check failed on attempt {} of {}: {}",
+                attempt,
+                max_attempts,
+                err
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
+            continue;
+        }
+
+        return Err(err);
     }
 
-    // Check for successful HTTP response (any non-000 code means we got an HTTP response).
-    let code = stdout.trim();
-    if !code.is_empty() && code != "000" {
-        tracing::debug!("Basic internet connectivity check passed");
-        return Ok(());
-    }
-
-    // If curl failed completely
-    if !output.status.success() {
-        return Err(format!(
-            "No internet connectivity: Network check failed (exit code {}). \
-             Output: {}",
-            output.status.code().unwrap_or(-1),
-            combined.trim()
-        ));
-    }
-
-    Err(format!(
-        "No internet connectivity: unexpected curl output (http_code={}). \
-         Output: {}",
-        if code.is_empty() { "<empty>" } else { code },
-        combined.trim()
-    ))
+    Err("No internet connectivity: unexpected error during connectivity check.".to_string())
 }
 
 /// Check DNS resolution for a specific hostname.
@@ -4951,10 +4990,10 @@ async fn check_api_reachability(
     // If curl failed with no clear error
     if !output.status.success() {
         return Err(format!(
-            "Cannot connect to {} API: Network check failed (exit code {}). \
+            "Cannot connect to {} API: Network check failed ({}). \
              Output: {}",
             api_name,
-            output.status.code().unwrap_or(-1),
+            format_exit_status(&output.status),
             combined.trim()
         ));
     }
