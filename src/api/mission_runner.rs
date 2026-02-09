@@ -4778,7 +4778,8 @@ async fn check_basic_internet_connectivity(
                         max_attempts,
                         err
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64))
+                        .await;
                     continue;
                 }
                 return Err(err);
@@ -4793,7 +4794,9 @@ async fn check_basic_internet_connectivity(
             "No internet connectivity: Network is unreachable. \
              The workspace has no network access."
                 .to_string()
-        } else if combined.contains("Connection timed out") || combined.contains("Operation timed out") {
+        } else if combined.contains("Connection timed out")
+            || combined.contains("Operation timed out")
+        {
             "No internet connectivity: Connection timed out. \
              The workspace cannot reach the internet."
                 .to_string()
@@ -4828,7 +4831,8 @@ async fn check_basic_internet_connectivity(
                 max_attempts,
                 err
             );
-            tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64))
+                        .await;
             continue;
         }
 
