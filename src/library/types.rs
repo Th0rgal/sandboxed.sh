@@ -474,6 +474,19 @@ impl Default for SandboxedConfig {
     }
 }
 
+/// Claude Code attribution settings for commits and PRs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClaudeCodeAttribution {
+    /// Text to add to commit messages. Empty string disables attribution.
+    /// Default: "Co-Authored-By: Claude <noreply@anthropic.com>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// Text to add to PR descriptions. Empty string disables attribution.
+    /// Default: "Generated with Claude Code"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<String>,
+}
+
 /// Claude Code configuration stored in the Library.
 /// Controls default model, agent preferences, and visibility for Claude Code backend.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -489,6 +502,10 @@ pub struct ClaudeCodeConfig {
     /// These agents won't appear in the dropdown but can still be used via API.
     #[serde(default)]
     pub hidden_agents: Vec<String>,
+    /// Attribution settings for commits and PRs.
+    /// Set commit/pr to empty strings to disable co-author attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<ClaudeCodeAttribution>,
 }
 
 /// Amp Code configuration stored in the Library.

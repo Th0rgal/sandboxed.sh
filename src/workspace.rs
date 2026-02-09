@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::ai_providers::{AIProvider, ProviderType};
 use crate::config::Config;
 use crate::library::env_crypto::strip_encrypted_tags;
+use crate::library::types::ClaudeCodeConfig;
 use crate::library::LibraryStore;
 use crate::mcp::{McpRegistry, McpScope, McpServerConfig, McpTransport};
 use crate::nspawn::{self, NspawnDistro};
@@ -1290,6 +1291,7 @@ async fn write_claudecode_config(
     skill_contents: Option<&[SkillContent]>,
     command_contents: Option<&[CommandContent]>,
     shared_network: Option<bool>,
+    claudecode_config: Option<&ClaudeCodeConfig>,
 ) -> anyhow::Result<()> {
     // Create .claude directory
     let claude_dir = workspace_dir.join(".claude");
@@ -1345,12 +1347,31 @@ async fn write_claudecode_config(
         WorkspaceType::Container => vec!["Bash", "Edit", "Write", "Read", "mcp__*"],
         WorkspaceType::Host => vec!["Bash", "Edit", "Write", "Read", "mcp__*"],
     };
-    let settings = json!({
+
+    // Build base settings
+    let mut settings = json!({
         "mcpServers": mcp_servers,
         "permissions": {
             "allow": permissions
         }
     });
+
+    // Add attribution settings if configured (allows disabling co-author in commits)
+    if let Some(config) = claudecode_config {
+        if let Some(attribution) = &config.attribution {
+            let mut attr_obj = serde_json::Map::new();
+            if let Some(commit) = &attribution.commit {
+                attr_obj.insert("commit".to_string(), json!(commit));
+            }
+            if let Some(pr) = &attribution.pr {
+                attr_obj.insert("pr".to_string(), json!(pr));
+            }
+            if !attr_obj.is_empty() {
+                settings["attribution"] = json!(attr_obj);
+            }
+        }
+    }
+
     let settings_path = claude_dir.join("settings.local.json");
     let settings_content = serde_json::to_string_pretty(&settings)?;
     tokio::fs::write(&settings_path, &settings_content).await?;
@@ -2000,6 +2021,7 @@ pub async fn write_backend_config(
     command_contents: Option<&[CommandContent]>,
     shared_network: Option<bool>,
     custom_providers: Option<&[AIProvider]>,
+    claudecode_config: Option<&ClaudeCodeConfig>,
 ) -> anyhow::Result<()> {
     match backend_id {
         "opencode" => {
@@ -2039,6 +2061,7 @@ pub async fn write_backend_config(
                 skill_contents,
                 command_contents,
                 shared_network,
+                claudecode_config,
             )
             .await
         }
@@ -3115,6 +3138,37 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         );
     }
 
+    // Fetch Claude Code config from library for attribution settings
+    let claudecode_config = if backend_id == "claudecode" {
+        if let Some(lib) = library {
+            let profile = config_profile.unwrap_or("default");
+            match lib.get_claudecode_config_for_profile(profile).await {
+                Ok(config) => {
+                    tracing::debug!(
+                        mission = %mission_id,
+                        profile = %profile,
+                        has_attribution = config.attribution.is_some(),
+                        "Loaded Claude Code config from profile"
+                    );
+                    Some(config)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        mission = %mission_id,
+                        profile = %profile,
+                        error = %e,
+                        "Failed to load Claude Code config from profile"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     write_backend_config(
         &dir,
         backend_id,
@@ -3127,6 +3181,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         command_contents.as_deref(),
         workspace.shared_network,
         effective_custom_providers,
+        claudecode_config.as_ref(),
     )
     .await?;
 
