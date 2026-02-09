@@ -4831,8 +4831,7 @@ async fn check_basic_internet_connectivity(
                 max_attempts,
                 err
             );
-            tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64))
-                        .await;
+            tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
             continue;
         }
 
