@@ -2086,8 +2086,19 @@ pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
     }
 
     let refresh_token = entry.refresh_token.clone();
+    let refresh_token_prefix = if refresh_token.len() > 12 {
+        &refresh_token[..12]
+    } else {
+        &refresh_token
+    };
 
-    tracing::info!("Refreshing Anthropic OAuth token");
+    tracing::info!(
+        "Refreshing Anthropic OAuth token (refresh_token prefix: {}..., expires_at: {})",
+        refresh_token_prefix,
+        chrono::DateTime::from_timestamp_millis(entry.expires_at)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| "invalid".to_string())
+    );
 
     // Exchange refresh token for new access token
     let client = reqwest::Client::new();
@@ -2163,12 +2174,32 @@ pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
         .as_str()
         .ok_or_else(|| "No access token in refresh response".to_string())?;
 
+    // Anthropic uses rotating refresh tokens - each refresh returns a NEW refresh token
+    // and invalidates the old one. If no refresh_token is returned, this is an error.
     let new_refresh_token = token_data["refresh_token"]
         .as_str()
-        .unwrap_or(refresh_token.as_str()); // Use old refresh token if not provided
+        .ok_or_else(|| {
+            tracing::error!(
+                "Anthropic token refresh response missing refresh_token. Response: {:?}",
+                token_data
+            );
+            "No refresh_token in Anthropic OAuth response - tokens may be rotating".to_string()
+        })?;
 
     let expires_in = token_data["expires_in"].as_i64().unwrap_or(3600);
     let expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
+
+    let new_refresh_prefix = if new_refresh_token.len() > 12 {
+        &new_refresh_token[..12]
+    } else {
+        new_refresh_token
+    };
+
+    tracing::info!(
+        "Received new tokens from Anthropic (new refresh_token prefix: {}..., expires_in: {}s)",
+        new_refresh_prefix,
+        expires_in
+    );
 
     // Update auth.json with new tokens
     sync_to_opencode_auth(
