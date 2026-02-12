@@ -4946,76 +4946,79 @@ async fn control_actor_loop(
                                 );
                             }
 
-                            // If runner has no more queued messages, update status and mark for cleanup
-                            if runner.queue.is_empty() && !runner.is_running() {
-                                // Enqueue agent_finished automations (if any) after a short delay.
-                                if runner.queue.is_empty() {
-                                    // Small delay so the UI can display the completion before restarting.
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                    let messages = agent_finished_automation_messages(
-                                        &mission_store,
-                                        *mission_id,
-                                        &library,
-                                        &workspaces,
-                                    )
-                                    .await;
-                                    for content in messages {
-                                        runner.queue_message(Uuid::new_v4(), content, None);
-                                    }
-                                    if !runner.is_running() {
-                                        runner.start_next(
-                                            config.clone(),
-                                            Arc::clone(&root_agent),
-                                            Arc::clone(&mcp),
-                                            Arc::clone(&workspaces),
-                                            library.clone(),
-                                            events_tx.clone(),
-                                            Arc::clone(&tool_hub),
-                                            Arc::clone(&status),
-                                            mission_cmd_tx.clone(),
-                                            Arc::new(RwLock::new(Some(*mission_id))),
-                                            secrets.clone(),
-                                        );
-                                    }
+                            // Check if we should enqueue agent_finished automations
+                            let was_queue_empty = runner.queue.is_empty();
+                            if was_queue_empty {
+                                // Small delay so the UI can display the completion before restarting.
+                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                let messages = agent_finished_automation_messages(
+                                    &mission_store,
+                                    *mission_id,
+                                    &library,
+                                    &workspaces,
+                                )
+                                .await;
+                                for content in messages {
+                                    runner.queue_message(Uuid::new_v4(), content, None);
                                 }
+                            }
 
-                                // Only update status if agent hasn't already set a terminal status
-                                if let Ok(Some(mission)) = mission_store.get_mission(*mission_id).await {
-                                    let should_update = matches!(
-                                        mission.status,
-                                        MissionStatus::Pending | MissionStatus::Active
-                                    );
-                                    if should_update {
-                                        let new_status = if result.success {
-                                            MissionStatus::Completed
-                                        } else {
-                                            MissionStatus::Failed
-                                        };
-                                        if new_status == MissionStatus::Completed
-                                            && mission_has_active_automation(&mission_store, *mission_id).await
-                                        {
-                                            tracing::info!(
-                                                "Skipping parallel completion for mission {} because active automations are enabled",
-                                                mission_id
-                                            );
-                                        } else if let Err(e) = mission_store
-                                            .update_mission_status(*mission_id, new_status)
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                "Failed to update parallel mission status: {}",
-                                                e
-                                            );
-                                        } else {
-                                            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                                mission_id: *mission_id,
-                                                status: new_status,
-                                                summary: None,
-                                            });
+                            // Always try to start next queued message (if any)
+                            if !runner.is_running() {
+                                let started = runner.start_next(
+                                    config.clone(),
+                                    Arc::clone(&root_agent),
+                                    Arc::clone(&mcp),
+                                    Arc::clone(&workspaces),
+                                    library.clone(),
+                                    events_tx.clone(),
+                                    Arc::clone(&tool_hub),
+                                    Arc::clone(&status),
+                                    mission_cmd_tx.clone(),
+                                    Arc::new(RwLock::new(Some(*mission_id))),
+                                    secrets.clone(),
+                                );
+
+                                // If no queued messages, update status and mark for cleanup
+                                if !started {
+                                    // Only update status if agent hasn't already set a terminal status
+                                    if let Ok(Some(mission)) = mission_store.get_mission(*mission_id).await {
+                                        let should_update = matches!(
+                                            mission.status,
+                                            MissionStatus::Pending | MissionStatus::Active
+                                        );
+                                        if should_update {
+                                            let new_status = if result.success {
+                                                MissionStatus::Completed
+                                            } else {
+                                                MissionStatus::Failed
+                                            };
+                                            if new_status == MissionStatus::Completed
+                                                && mission_has_active_automation(&mission_store, *mission_id).await
+                                            {
+                                                tracing::info!(
+                                                    "Skipping parallel completion for mission {} because active automations are enabled",
+                                                    mission_id
+                                                );
+                                            } else if let Err(e) = mission_store
+                                                .update_mission_status(*mission_id, new_status)
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    "Failed to update parallel mission status: {}",
+                                                    e
+                                                );
+                                            } else {
+                                                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                                    mission_id: *mission_id,
+                                                    status: new_status,
+                                                    summary: None,
+                                                });
+                                            }
                                         }
                                     }
+                                    completed_missions.push(*mission_id);
                                 }
-                                completed_missions.push(*mission_id);
                             }
                         }
                     }
