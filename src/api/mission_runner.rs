@@ -69,6 +69,9 @@ fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option
     }
 }
 
+/// Prefixes that indicate a thought/reasoning line
+const THOUGHT_PREFIXES: &[&str] = &["thought:", "thoughts:", "thinking:"];
+
 fn extract_thought_line(text: &str) -> Option<(String, String)> {
     let mut thought: Option<String> = None;
     let mut remaining: Vec<&str> = Vec::new();
@@ -76,9 +79,8 @@ fn extract_thought_line(text: &str) -> Option<(String, String)> {
     for line in text.lines() {
         let trimmed = line.trim();
         let lower = trimmed.to_lowercase();
-        let is_thought = lower.starts_with("thought:")
-            || lower.starts_with("thoughts:")
-            || lower.starts_with("thinking:");
+        let is_thought = THOUGHT_PREFIXES.iter().any(|prefix| lower.starts_with(prefix));
+
         if thought.is_none() && is_thought {
             let content = trimmed
                 .split_once(':')

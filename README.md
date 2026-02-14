@@ -40,7 +40,7 @@
 What if you could:
 
 **Hand off entire dev cycles.** Point an agent at a GitHub issue, let it write
-code, test by launching desktop applicatons, and open a PR when tests pass. You
+code, test by launching desktop applications, and open a PR when tests pass. You
 review the diff, not the process.
 
 **Run multi-day operations unattended.** Give an agent SSH access to your home
