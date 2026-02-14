@@ -60,7 +60,7 @@ Click on **System** to configure your backend connection:
 The System page shows:
 - **API URL** - Backend endpoint (currently connected status)
 - **System Components** - Installed harnesses and versions
-  - Sandboxed.sh (v0.5.1)
+  - Sandboxed.sh (current version shown)
   - OpenCode (with update notifications)
   - Claude Code (with update notifications)
   - Amp
