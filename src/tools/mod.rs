@@ -102,12 +102,7 @@ pub fn resolve_path(path_str: &str, workspace: &Path) -> PathResolution {
 ///
 /// Use this when you don't need the full `PathResolution` metadata.
 pub fn resolve_path_simple(path_str: &str, workspace: &Path) -> PathBuf {
-    let path = Path::new(path_str);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        workspace.join(path)
-    }
+    resolve_path(path_str, workspace).resolved
 }
 
 /// Safely truncate a string to a maximum number of bytes at a valid UTF-8 boundary.
