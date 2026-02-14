@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-opencode/master/assets/oh-my-opencode.schema.json",
+  "agents": {
+    "atlas": {
+      "model": "cerebras/llama-3.3-70b"
+    },
+    "explore": {
+      "model": "cerebras/llama-3.1-8b"
+    },
+    "hephaestus": {
+      "model": "cerebras/llama-3.3-70b"
+    },
+    "sisyphus": {
+      "model": "cerebras/llama-3.3-70b"
+    }
+  },
+  "categories": {
+    "quick": {
+      "model": "cerebras/llama-3.1-8b"
+    },
+    "deep": {
+      "model": "cerebras/llama-3.3-70b"
+    },
+    "unspecified-high": {
+      "model": "cerebras/llama-3.3-70b"
+    },
+    "unspecified-low": {
+      "model": "cerebras/llama-3.1-8b"
+    }
+  }
+}

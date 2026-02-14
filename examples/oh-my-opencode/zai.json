@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-opencode/master/assets/oh-my-opencode.schema.json",
+  "agents": {
+    "atlas": {
+      "model": "zai/glm-5"
+    },
+    "explore": {
+      "model": "zai/glm-4-flash"
+    },
+    "hephaestus": {
+      "model": "zai/glm-5"
+    },
+    "sisyphus": {
+      "model": "zai/glm-5"
+    }
+  },
+  "categories": {
+    "quick": {
+      "model": "zai/glm-4-flash"
+    },
+    "deep": {
+      "model": "zai/glm-5"
+    },
+    "unspecified-high": {
+      "model": "zai/glm-5"
+    },
+    "unspecified-low": {
+      "model": "zai/glm-4-flash"
+    }
+  }
+}
