@@ -125,40 +125,29 @@ async fn set_control_state_for_mission(
     });
 }
 
+/// Patterns that identify OpenCode status/debug lines to be filtered
+const OPENCODE_STATUS_PATTERNS: &[&str] = &[
+    "starting opencode server",
+    "opencode server started",
+    "sending prompt",
+    "waiting for completion",
+    "all tasks completed",
+    "session ended with error",
+    "[session.error]",
+    "session:",
+    "session: ses_",
+];
+
 fn is_opencode_status_line(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return true;
     }
+
     let lower = trimmed.to_lowercase();
-    if lower.starts_with("starting opencode server") {
-        return true;
-    }
-    if lower.starts_with("opencode server started") {
-        return true;
-    }
-    if lower.starts_with("sending prompt") {
-        return true;
-    }
-    if lower.starts_with("waiting for completion") {
-        return true;
-    }
-    if lower.starts_with("all tasks completed") {
-        return true;
-    }
-    if lower.starts_with("session ended with error") {
-        return true;
-    }
-    if lower.starts_with("[session.error]") {
-        return true;
-    }
-    if lower.starts_with("session:") || lower.contains("session: ses_") {
-        return true;
-    }
-    if lower.contains("starting opencode server") {
-        return true;
-    }
-    false
+    OPENCODE_STATUS_PATTERNS
+        .iter()
+        .any(|pattern| lower.starts_with(pattern) || lower.contains(pattern))
 }
 
 fn strip_opencode_status_lines(text: &str) -> String {
