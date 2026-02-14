@@ -79,7 +79,9 @@ fn extract_thought_line(text: &str) -> Option<(String, String)> {
     for line in text.lines() {
         let trimmed = line.trim();
         let lower = trimmed.to_lowercase();
-        let is_thought = THOUGHT_PREFIXES.iter().any(|prefix| lower.starts_with(prefix));
+        let is_thought = THOUGHT_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix));
 
         if thought.is_none() && is_thought {
             let content = trimmed
