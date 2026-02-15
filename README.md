@@ -127,7 +127,7 @@ isolation, and Library-based configuration management.
 
 ```bash
 git clone https://github.com/Th0rgal/sandboxed.sh.git
-cd sandboxed-sh
+cd sandboxed.sh
 cp .env.example .env
 # Edit .env with your settings
 docker compose up -d

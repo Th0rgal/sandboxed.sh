@@ -11,7 +11,7 @@ Docker is the easiest way to run sandboxed.sh (formerly Sandboxed.sh). One comma
 
 ```bash
 git clone https://github.com/Th0rgal/sandboxed-sh.git
-cd sandboxed-sh
+cd sandboxed.sh
 cp .env.example .env
 # Edit .env — at minimum, set DASHBOARD_PASSWORD and JWT_SECRET
 docker compose up -d
