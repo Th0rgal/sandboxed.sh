@@ -5582,25 +5582,18 @@ async fn run_single_control_turn(
             ))
             .await;
 
-            // Claude Code occasionally gets stuck when resuming an old session: the CLI emits only
-            // init JSON (or nothing) and then goes silent. When that happens, auto-reset the
-            // mission's session_id and retry once with a fresh session.
-            //
-            // This is intentionally conservative: only retry for the specific "no stream events"
-            // startup timeout failure, and only on continuation turns.
-            if is_continuation
-                && !result.success
-                && result.terminal_reason == Some(TerminalReason::LlmError)
-                && result
-                    .output
-                    .starts_with("Claude Code produced no stream events after startup timeout")
-            {
+            // Claude Code can fail when resuming a session due to stale/corrupt state:
+            // - CLI hangs and emits no parseable stream events
+            // - API rejects reconstructed history (e.g. mismatched tool_use_id)
+            // When that happens, auto-reset the session_id and retry once fresh.
+            if is_continuation && super::mission_runner::is_session_corruption_error(&result) {
                 let new_session_id = Uuid::new_v4().to_string();
                 tracing::warn!(
                     mission_id = %mid,
                     old_session_id = ?session_id,
                     new_session_id = %new_session_id,
-                    "Claude Code produced no stream events; resetting session and retrying once"
+                    error = %result.output,
+                    "Session corruption detected; resetting session and retrying once"
                 );
 
                 // Persist the new session ID via the existing event pipeline.
