@@ -394,15 +394,19 @@ fn parse_opencode_sse_event(
             None
         }
         "response.incomplete" => {
-            tracing::error!(
+            tracing::warn!(
                 mission_id = %mission_id,
                 event_data = ?props,
-                "❌ BUG DETECTED: response.incomplete received! Message was truncated. This should NOT complete the mission."
+                "⚠️ response.incomplete received — response was truncated. NOT completing mission; agent may continue."
             );
-            // TODO: This is the bug - we're completing on incomplete!
-            // For now, keeping current behavior to match prod, but logging prominently
-            message_complete = true;
-            None
+            // Don't set message_complete: the agent backend may send a follow-up
+            // response or retry. Emit a resumable error so the dashboard shows feedback.
+            Some(AgentEvent::Error {
+                message: "Response was truncated (incomplete). The agent will continue."
+                    .to_string(),
+                mission_id: Some(mission_id),
+                resumable: true,
+            })
         }
         "response.output_item.added" => {
             if let Some(item) = props.get("item") {
