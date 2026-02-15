@@ -62,7 +62,7 @@ fn extract_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a st
 }
 
 fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option<&'a str> {
-    if part_type == "thinking" || part_type == "reasoning" {
+    if matches!(part_type, "thinking" | "reasoning") {
         extract_str(part, &["thinking", "text", "content"])
     } else {
         extract_str(part, &["text", "content", "output_text"])
