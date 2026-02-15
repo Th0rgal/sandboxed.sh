@@ -155,14 +155,12 @@ fn is_opencode_status_line(line: &str) -> bool {
 }
 
 fn strip_opencode_status_lines(text: &str) -> String {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if is_opencode_status_line(line) {
-            continue;
-        }
-        out.push(line);
-    }
-    out.join("\n").trim().to_string()
+    text.lines()
+        .filter(|line| !is_opencode_status_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 fn handle_tool_part_update(
