@@ -1511,9 +1511,7 @@ pub async fn create_mission(
     // Skip validation for Claude Code, Amp, and Codex - they have their own built-in agents
     if let Some(ref agent_name) = agent {
         let backend_id = backend.as_deref();
-        let skip_validation = backend_id == Some("claudecode")
-            || backend_id == Some("amp")
-            || backend_id == Some("codex");
+        let skip_validation = matches!(backend_id, Some("claudecode" | "amp" | "codex"));
         if !skip_validation {
             super::library::validate_agent_exists(
                 &state,
@@ -2613,8 +2611,7 @@ async fn automation_scheduler_loop(
                     Ok(running) => running.iter().any(|r| {
                         r.mission_id == mission.id
                             && (r.queue_len > 0
-                                || r.state == "running"
-                                || r.state == "waiting_for_tool")
+                                || matches!(r.state.as_str(), "running" | "waiting_for_tool"))
                     }),
                     Err(_) => {
                         tracing::warn!(
@@ -3335,12 +3332,10 @@ async fn control_actor_loop(
                     if path.is_dir() {
                         let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
                         // Skip common non-artifact directories
-                        if dir_name == "venv"
-                            || dir_name == ".venv"
-                            || dir_name == ".sandboxed_sh"
-                            || dir_name == ".sandboxed-sh"
-                            || dir_name == "temp"
-                        {
+                        if matches!(
+                            dir_name.as_ref(),
+                            "venv" | ".venv" | ".sandboxed_sh" | ".sandboxed-sh" | "temp"
+                        ) {
                             continue;
                         }
                         // List files in subdirectory
