@@ -169,31 +169,43 @@ export function MissionAutomationsDialog({
   }, [commands]);
 
   // Track which variable keys were auto-populated (so we can distinguish from manual)
-  const [autoPopulatedKeys, setAutoPopulatedKeys] = useState<Set<string>>(new Set());
+  const autoPopulatedKeysRef = useRef<Set<string>>(new Set());
+
+  // Helper to add auto-populated variables (merges with existing, never overwrites manual)
+  const addAutoVariables = useCallback((names: string[]) => {
+    setVariables((prev) => {
+      const existingKeys = new Set(prev.map((v) => v.key));
+      const newVars = [...prev];
+      for (const name of names) {
+        if (!existingKeys.has(name)) {
+          newVars.push({ key: name, value: '' });
+          autoPopulatedKeysRef.current.add(name);
+        }
+      }
+      return newVars;
+    });
+  }, []);
 
   // Auto-populate variables when a library command is selected
   const handleCommandNameChange = useCallback(
     (name: string) => {
       setCommandName(name);
       const cmd = commandsByName.get(name);
-      if (!cmd?.params?.length) return;
-
-      setVariables((prev) => {
-        const existingKeys = new Set(prev.map((v) => v.key));
-        const newVars = [...prev];
-        const newAutoKeys = new Set(autoPopulatedKeys);
-        for (const param of cmd.params!) {
-          if (!existingKeys.has(param.name)) {
-            newVars.push({ key: param.name, value: '' });
-            newAutoKeys.add(param.name);
-          }
-        }
-        setAutoPopulatedKeys(newAutoKeys);
-        return newVars;
-      });
+      if (cmd?.params?.length) {
+        addAutoVariables(cmd.params.map((p) => p.name));
+      }
     },
-    [commandsByName, autoPopulatedKeys]
+    [commandsByName, addAutoVariables]
   );
+
+  // Re-populate variables when commands finish loading (fixes late-load race condition)
+  useEffect(() => {
+    if (commandSourceType !== 'library' || !commandName) return;
+    const cmd = commandsByName.get(commandName);
+    if (cmd?.params?.length) {
+      addAutoVariables(cmd.params.map((p) => p.name));
+    }
+  }, [commandsByName, commandName, commandSourceType, addAutoVariables]);
 
   // Debounced inline prompt variable parsing
   const promptTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -203,22 +215,10 @@ export function MissionAutomationsDialog({
       if (promptTimerRef.current) clearTimeout(promptTimerRef.current);
       promptTimerRef.current = setTimeout(() => {
         const detected = extractPromptVariables(text);
-        setVariables((prev) => {
-          const existingKeys = new Set(prev.map((v) => v.key));
-          const newVars = [...prev];
-          const newAutoKeys = new Set(autoPopulatedKeys);
-          for (const name of detected) {
-            if (!existingKeys.has(name)) {
-              newVars.push({ key: name, value: '' });
-              newAutoKeys.add(name);
-            }
-          }
-          setAutoPopulatedKeys(newAutoKeys);
-          return newVars;
-        });
+        addAutoVariables(detected);
       }, 400);
     },
-    [autoPopulatedKeys]
+    [addAutoVariables]
   );
 
   // Detected built-in variables in inline prompt
@@ -455,7 +455,11 @@ export function MissionAutomationsDialog({
       setIntervalValue('5');
       setIntervalUnit('minutes');
       setVariables([]);
-      setAutoPopulatedKeys(new Set());
+      autoPopulatedKeysRef.current = new Set();
+      if (promptTimerRef.current) {
+        clearTimeout(promptTimerRef.current);
+        promptTimerRef.current = null;
+      }
       setStartImmediately(true);
       toast.success(shouldStartImmediately ? 'Automation created' : 'Automation created (scheduled)');
     } catch (err) {
