@@ -54,7 +54,7 @@ literature. Local inference, isolated containers, nothing leaves your machines.
 
 ## Features
 
-- **Dual Runtime Support**: Run Claude Code or OpenCode agents in the same
+- **Multi-Runtime Support**: Run Claude Code, OpenCode, or Amp agents in the same
   infrastructure
 - **Mission Control**: Start, stop, and monitor agents remotely with real-time
   streaming
