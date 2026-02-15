@@ -168,9 +168,6 @@ export function MissionAutomationsDialog({
     return new Map(commands.map((command) => [command.name, command]));
   }, [commands]);
 
-  // Track which variable keys were auto-populated (so we can distinguish from manual)
-  const autoPopulatedKeysRef = useRef<Set<string>>(new Set());
-
   // Helper to add auto-populated variables (merges with existing, never overwrites manual)
   const addAutoVariables = useCallback((names: string[]) => {
     setVariables((prev) => {
@@ -179,7 +176,6 @@ export function MissionAutomationsDialog({
       for (const name of names) {
         if (!existingKeys.has(name)) {
           newVars.push({ key: name, value: '' });
-          autoPopulatedKeysRef.current.add(name);
         }
       }
       return newVars;
@@ -455,7 +451,6 @@ export function MissionAutomationsDialog({
       setIntervalValue('5');
       setIntervalUnit('minutes');
       setVariables([]);
-      autoPopulatedKeysRef.current = new Set();
       if (promptTimerRef.current) {
         clearTimeout(promptTimerRef.current);
         promptTimerRef.current = null;
