@@ -164,6 +164,32 @@ deployment:
 
 ---
 
+## Documentation
+
+### User Guides
+- **[Getting Started](docs/getting-started.md)** - First-time setup and usage
+- **[Docker Installation](docs/install-docker.md)** - Recommended installation method
+- **[Native Installation](docs/install-native.md)** - Bare metal Ubuntu setup
+
+### Architecture & APIs
+- **[Harness System](docs/HARNESS_SYSTEM.md)** - Backend integration architecture
+- **[Workspaces](docs/WORKSPACES.md)** - Isolated execution environments
+- **[Mission API](docs/MISSION_API.md)** - Mission lifecycle and control
+- **[Workspace API](docs/WORKSPACE_API.md)** - Workspace management endpoints
+- **[Backend API](docs/BACKEND_API.md)** - Backend configuration
+
+### Setup Guides
+- **[Desktop Setup](docs/DESKTOP_SETUP.md)** - X11/Xvfb configuration for GUI automation
+- **[Amp Proxy Setup](docs/AMP_PROXY_SETUP.md)** - Amp backend proxy configuration
+
+### Reference
+- **[agents.md](agents.md)** - Agent configuration and harness details
+- **[Persistent Sessions Design](PERSISTENT_SESSIONS_DESIGN.md)** - Claude CLI session management
+- **[Debugging Guide](DEBUGGING.md)** - Troubleshooting and debug workflows
+- **[Docker Analysis](docs/DOCKER_ANALYSIS.md)** - Docker setup deep dive
+
+---
+
 ## Development
 
 ### Setup git hooks
