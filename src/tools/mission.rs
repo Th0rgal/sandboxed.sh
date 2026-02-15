@@ -157,8 +157,10 @@ IMPORTANT: Use 'blocked' or 'not_feasible' instead of producing fake/placeholder
         }
 
         // For blocked/not_feasible, require a summary explaining why
-        if (matches!(status, MissionStatusValue::Blocked | MissionStatusValue::NotFeasible))
-            && args.summary.is_none()
+        if (matches!(
+            status,
+            MissionStatusValue::Blocked | MissionStatusValue::NotFeasible
+        )) && args.summary.is_none()
         {
             return Ok(format!(
                 "⚠️ A summary is required when marking a mission as '{}'. \n\
@@ -198,27 +200,32 @@ IMPORTANT: Use 'blocked' or 'not_feasible' instead of producing fake/placeholder
         }
 
         // Build enhanced summary for blocked/not_feasible
-        let enhanced_summary =
-            if matches!(status, MissionStatusValue::Blocked | MissionStatusValue::NotFeasible) {
-                let mut parts = vec![];
-                if let Some(ref summary) = args.summary {
-                    parts.push(summary.clone());
+        let enhanced_summary = if matches!(
+            status,
+            MissionStatusValue::Blocked | MissionStatusValue::NotFeasible
+        ) {
+            let mut parts = vec![];
+            if let Some(ref summary) = args.summary {
+                parts.push(summary.clone());
+            }
+            if let Some(ref blocker_type) = args.blocker_type {
+                parts.push(format!("Blocker type: {}", blocker_type));
+            }
+            if let Some(ref attempted) = args.attempted {
+                if !attempted.is_empty() {
+                    parts.push(format!("Attempted: {}", attempted.join(", ")));
                 }
-                if let Some(ref blocker_type) = args.blocker_type {
-                    parts.push(format!("Blocker type: {}", blocker_type));
-                }
-                if let Some(ref attempted) = args.attempted {
-                    if !attempted.is_empty() {
-                        parts.push(format!("Attempted: {}", attempted.join(", ")));
-                    }
-                }
-                Some(parts.join("\n"))
-            } else {
-                args.summary.clone()
-            };
+            }
+            Some(parts.join("\n"))
+        } else {
+            args.summary.clone()
+        };
 
         // Log blocked/not_feasible status clearly
-        if matches!(status, MissionStatusValue::Blocked | MissionStatusValue::NotFeasible) {
+        if matches!(
+            status,
+            MissionStatusValue::Blocked | MissionStatusValue::NotFeasible
+        ) {
             tracing::warn!(
                 "Mission marked as {} - {}",
                 status,
