@@ -3064,7 +3064,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         }
 
         // Collect skills (for backends that use skill contents directly)
-        if backend_id == "claudecode" || backend_id == "amp" || backend_id == "codex" {
+        if matches!(backend_id, "claudecode" | "amp" | "codex") {
             let skill_names = match resolve_workspace_skill_names(workspace, lib).await {
                 Ok(names) => {
                     tracing::debug!(

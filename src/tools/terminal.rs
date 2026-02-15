@@ -216,15 +216,21 @@ fn validate_command(cmd: &str) -> Result<(), String> {
         safe
     };
 
+    // Helper to check if a pattern should be allowed despite being dangerous
+    let is_pattern_allowed = |pattern: &str| -> bool {
+        if matches!(pattern, "find /" | "find / ") && is_safe_root_find {
+            return true;
+        }
+        if matches!(pattern, "grep -r /" | "grep -rn /" | "grep -R /") && is_safe_root_grep {
+            return true;
+        }
+        false
+    };
+
     for (pattern, suggestion) in DANGEROUS_PATTERNS {
         // Check if command starts with the dangerous pattern
         if cmd_trimmed.starts_with(pattern) {
-            if (pattern == &"find /" || pattern == &"find / ") && is_safe_root_find {
-                continue;
-            }
-            if (pattern == &"grep -r /" || pattern == &"grep -rn /" || pattern == &"grep -R /")
-                && is_safe_root_grep
-            {
+            if is_pattern_allowed(pattern) {
                 continue;
             }
             return Err(format!(
@@ -236,14 +242,7 @@ fn validate_command(cmd: &str) -> Result<(), String> {
         for prefix in prefixes {
             if let Some(after_prefix) = cmd_trimmed.strip_prefix(prefix) {
                 if after_prefix.starts_with(pattern) {
-                    if (pattern == &"find /" || pattern == &"find / ") && is_safe_root_find {
-                        continue;
-                    }
-                    if (pattern == &"grep -r /"
-                        || pattern == &"grep -rn /"
-                        || pattern == &"grep -R /")
-                        && is_safe_root_grep
-                    {
+                    if is_pattern_allowed(pattern) {
                         continue;
                     }
                     return Err(format!(
