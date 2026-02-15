@@ -397,16 +397,14 @@ fn parse_opencode_sse_event(
             tracing::warn!(
                 mission_id = %mission_id,
                 event_data = ?props,
-                "⚠️ response.incomplete received — response was truncated. NOT completing mission; agent may continue."
+                "response.incomplete received — response was truncated, not completing mission"
             );
             // Don't set message_complete: the agent backend may send a follow-up
-            // response or retry. Emit a resumable error so the dashboard shows feedback.
-            Some(AgentEvent::Error {
-                message: "Response was truncated (incomplete). The agent will continue."
-                    .to_string(),
-                mission_id: Some(mission_id),
-                resumable: true,
-            })
+            // response or retry. Don't emit AgentEvent::Error either, because
+            // downstream consumers (sse_error_message) would treat it as a terminal
+            // failure and override the outcome even if a later response.completed
+            // arrives successfully.
+            None
         }
         "response.output_item.added" => {
             if let Some(item) = props.get("item") {
