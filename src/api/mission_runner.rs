@@ -173,17 +173,11 @@ fn handle_tool_part_update(
     let state_obj = part.get("state")?;
     let status = state_obj.get("status").and_then(|v| v.as_str())?;
 
-    let tool_call_id = part
-        .get("callID")
-        .or_else(|| part.get("id"))
-        .and_then(|v| v.as_str())
+    let tool_call_id = extract_str(part, &["callID", "id"])
         .unwrap_or("unknown")
         .to_string();
 
-    let tool_name = part
-        .get("tool")
-        .or_else(|| part.get("name"))
-        .and_then(|v| v.as_str())
+    let tool_name = extract_str(part, &["tool", "name"])
         .unwrap_or("unknown")
         .to_string();
 
