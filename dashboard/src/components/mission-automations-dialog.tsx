@@ -11,6 +11,7 @@ import {
   Copy,
   Globe,
   History,
+  Info,
   Pencil,
   Plus,
   RefreshCw,
@@ -35,6 +36,45 @@ import {
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { toast } from '@/components/toast';
 import { getRuntimeApiBase } from '@/lib/settings';
+
+const BUILTIN_VARIABLES = new Set([
+  'timestamp',
+  'date',
+  'unix_time',
+  'mission_id',
+  'mission_name',
+  'cwd',
+]);
+
+/** Extract `<word/>` placeholders from text, excluding built-ins and webhook patterns. */
+function extractPromptVariables(text: string): string[] {
+  const matches = text.matchAll(/<(\w+)\/>/g);
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const m of matches) {
+    const name = m[1];
+    if (!BUILTIN_VARIABLES.has(name) && !name.startsWith('webhook') && !seen.has(name)) {
+      seen.add(name);
+      result.push(name);
+    }
+  }
+  return result;
+}
+
+/** Extract detected built-in variable names from text. */
+function extractDetectedBuiltins(text: string): string[] {
+  const matches = text.matchAll(/<(\w+)\/>/g);
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const m of matches) {
+    const name = m[1];
+    if (BUILTIN_VARIABLES.has(name) && !seen.has(name)) {
+      seen.add(name);
+      result.push(name);
+    }
+  }
+  return result;
+}
 
 export interface MissionAutomationsDialogProps {
   open: boolean;
@@ -127,6 +167,92 @@ export function MissionAutomationsDialog({
   const commandsByName = useMemo(() => {
     return new Map(commands.map((command) => [command.name, command]));
   }, [commands]);
+
+  // Track which variable keys were auto-populated (so we can distinguish from manual)
+  const [autoPopulatedKeys, setAutoPopulatedKeys] = useState<Set<string>>(new Set());
+
+  // Auto-populate variables when a library command is selected
+  const handleCommandNameChange = useCallback(
+    (name: string) => {
+      setCommandName(name);
+      const cmd = commandsByName.get(name);
+      if (!cmd?.params?.length) return;
+
+      setVariables((prev) => {
+        const existingKeys = new Set(prev.map((v) => v.key));
+        const newVars = [...prev];
+        const newAutoKeys = new Set(autoPopulatedKeys);
+        for (const param of cmd.params!) {
+          if (!existingKeys.has(param.name)) {
+            newVars.push({ key: param.name, value: '' });
+            newAutoKeys.add(param.name);
+          }
+        }
+        setAutoPopulatedKeys(newAutoKeys);
+        return newVars;
+      });
+    },
+    [commandsByName, autoPopulatedKeys]
+  );
+
+  // Debounced inline prompt variable parsing
+  const promptTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleInlinePromptChange = useCallback(
+    (text: string) => {
+      setInlinePrompt(text);
+      if (promptTimerRef.current) clearTimeout(promptTimerRef.current);
+      promptTimerRef.current = setTimeout(() => {
+        const detected = extractPromptVariables(text);
+        setVariables((prev) => {
+          const existingKeys = new Set(prev.map((v) => v.key));
+          const newVars = [...prev];
+          const newAutoKeys = new Set(autoPopulatedKeys);
+          for (const name of detected) {
+            if (!existingKeys.has(name)) {
+              newVars.push({ key: name, value: '' });
+              newAutoKeys.add(name);
+            }
+          }
+          setAutoPopulatedKeys(newAutoKeys);
+          return newVars;
+        });
+      }, 400);
+    },
+    [autoPopulatedKeys]
+  );
+
+  // Detected built-in variables in inline prompt
+  const detectedBuiltins = useMemo(
+    () => (commandSourceType === 'inline' ? extractDetectedBuiltins(inlinePrompt) : []),
+    [commandSourceType, inlinePrompt]
+  );
+
+  // Required params for current command (for validation hints)
+  const requiredParams = useMemo(() => {
+    if (commandSourceType !== 'library' || !commandName) return new Set<string>();
+    const cmd = commandsByName.get(commandName);
+    if (!cmd?.params) return new Set<string>();
+    return new Set(cmd.params.filter((p) => p.required).map((p) => p.name));
+  }, [commandSourceType, commandName, commandsByName]);
+
+  // Param descriptions for placeholder text
+  const paramDescriptions = useMemo(() => {
+    if (commandSourceType !== 'library' || !commandName) return new Map<string, string>();
+    const cmd = commandsByName.get(commandName);
+    if (!cmd?.params) return new Map<string, string>();
+    return new Map(
+      cmd.params
+        .filter((p) => p.description)
+        .map((p) => [p.name, p.description!])
+    );
+  }, [commandSourceType, commandName, commandsByName]);
+
+  // Warning: required params with no value
+  const missingRequiredParams = useMemo(() => {
+    if (requiredParams.size === 0) return [];
+    const filledKeys = new Map(variables.map((v) => [v.key, v.value]));
+    return [...requiredParams].filter((k) => !filledKeys.get(k)?.trim());
+  }, [requiredParams, variables]);
 
   const intervalSeconds = useMemo(() => {
     const value = Number(intervalValue);
@@ -329,6 +455,7 @@ export function MissionAutomationsDialog({
       setIntervalValue('5');
       setIntervalUnit('minutes');
       setVariables([]);
+      setAutoPopulatedKeys(new Set());
       setStartImmediately(true);
       toast.success(shouldStartImmediately ? 'Automation created' : 'Automation created (scheduled)');
     } catch (err) {
@@ -585,7 +712,7 @@ export function MissionAutomationsDialog({
                     <input
                       list="automation-command-list"
                       value={commandName}
-                      onChange={(e) => setCommandName(e.target.value)}
+                      onChange={(e) => handleCommandNameChange(e.target.value)}
                       placeholder={
                         commandsLoading ? 'Loading commands...' : 'Select or type a command'
                       }
@@ -617,7 +744,7 @@ export function MissionAutomationsDialog({
                     <label className="block text-xs text-white/50 mb-1.5">Prompt</label>
                     <textarea
                       value={inlinePrompt}
-                      onChange={(e) => setInlinePrompt(e.target.value)}
+                      onChange={(e) => handleInlinePromptChange(e.target.value)}
                       placeholder="Enter the prompt to send to the agent. Use <variable_name/> for variables."
                       rows={3}
                       className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50 resize-y"
@@ -629,6 +756,21 @@ export function MissionAutomationsDialog({
                       <code className="text-white/40">&lt;date/&gt;</code>,{' '}
                       <code className="text-white/40">&lt;mission_id/&gt;</code>
                     </div>
+                    {detectedBuiltins.length > 0 && (
+                      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-white/40">
+                        <Info className="h-3 w-3 shrink-0" />
+                        <span>
+                          Built-in variables detected:{' '}
+                          {detectedBuiltins.map((b, i) => (
+                            <span key={b}>
+                              {i > 0 && ', '}
+                              <code className="text-indigo-400/60">&lt;{b}/&gt;</code>
+                            </span>
+                          ))}
+                          {' '}— these are substituted automatically.
+                        </span>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -702,34 +844,64 @@ export function MissionAutomationsDialog({
                   </div>
                   {variables.length > 0 && (
                     <div className="space-y-2">
-                      {variables.map((v, i) => (
-                        <div key={i} className="flex items-center gap-2">
-                          <input
-                            value={v.key}
-                            onChange={(e) => handleVariableChange(i, 'key', e.target.value)}
-                            placeholder="key"
-                            className="w-1/3 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5 text-xs text-white placeholder:text-white/25 focus:outline-none focus:border-indigo-500/50"
-                          />
-                          <input
-                            value={v.value}
-                            onChange={(e) => handleVariableChange(i, 'value', e.target.value)}
-                            placeholder="default value"
-                            className="flex-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5 text-xs text-white placeholder:text-white/25 focus:outline-none focus:border-indigo-500/50"
-                          />
-                          <button
-                            onClick={() => handleRemoveVariable(i)}
-                            className="p-1 text-white/30 hover:text-red-400 transition-colors"
-                          >
-                            <X className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      ))}
+                      {variables.map((v, i) => {
+                        const isRequired = requiredParams.has(v.key);
+                        const description = paramDescriptions.get(v.key);
+                        return (
+                          <div key={i} className="flex items-center gap-2">
+                            <div className="relative w-1/3">
+                              <input
+                                value={v.key}
+                                onChange={(e) => handleVariableChange(i, 'key', e.target.value)}
+                                placeholder="key"
+                                className={cn(
+                                  'w-full rounded-lg border bg-white/[0.02] px-2.5 py-1.5 text-xs text-white placeholder:text-white/25 focus:outline-none focus:border-indigo-500/50',
+                                  isRequired
+                                    ? 'border-amber-500/30'
+                                    : 'border-white/[0.06]'
+                                )}
+                              />
+                              {isRequired && (
+                                <span className="absolute right-2 top-1/2 -translate-y-1/2 text-amber-400 text-[10px]">
+                                  *
+                                </span>
+                              )}
+                            </div>
+                            <input
+                              value={v.value}
+                              onChange={(e) => handleVariableChange(i, 'value', e.target.value)}
+                              placeholder={description || 'default value'}
+                              className="flex-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5 text-xs text-white placeholder:text-white/25 focus:outline-none focus:border-indigo-500/50"
+                            />
+                            <button
+                              onClick={() => handleRemoveVariable(i)}
+                              className="p-1 text-white/30 hover:text-red-400 transition-colors"
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        );
+                      })}
                       <div className="text-[11px] text-white/30">
                         Reference in prompt as{' '}
                         <code className="text-indigo-400/70">&lt;key/&gt;</code>. When triggered via
                         API, pass <code className="text-white/40">{'"variables": {"key": "value"}'}</code> to
                         override defaults.
                       </div>
+                    </div>
+                  )}
+                  {missingRequiredParams.length > 0 && (
+                    <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-200/80">
+                      <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
+                      <span>
+                        Required params with no default:{' '}
+                        {missingRequiredParams.map((k) => (
+                          <code key={k} className="text-amber-300">
+                            {k}
+                          </code>
+                        )).reduce<React.ReactNode[]>((acc, el, i) => (i === 0 ? [el] : [...acc, ', ', el]), [])}
+                        . Values can be provided at trigger time.
+                      </span>
                     </div>
                   )}
                 </div>
