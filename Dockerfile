@@ -114,7 +114,8 @@ RUN npm install -g @sourcegraph/amp@latest \
     || echo "[docker] WARNING: Amp CLI install failed (will be installed on first mission)"
 
 # -- RTK (CLI output compressor for token savings) --
-RUN curl -fsSL https://github.com/rtk-ai/rtk/releases/latest/download/rtk-x86_64-unknown-linux-gnu.tar.gz \
+RUN RTK_ARCH=$(case "$(uname -m)" in aarch64|arm64) echo "aarch64";; *) echo "x86_64";; esac) \
+    && curl -fsSL "https://github.com/rtk-ai/rtk/releases/latest/download/rtk-${RTK_ARCH}-unknown-linux-gnu.tar.gz" \
     | tar xz -C /usr/local/bin rtk \
     && chmod +x /usr/local/bin/rtk \
     && echo "[docker] RTK installed: $(rtk --version 2>/dev/null || echo 'unknown')" \
