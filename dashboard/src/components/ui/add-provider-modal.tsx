@@ -398,7 +398,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
       <div
         ref={dialogRef}
         className={cn(
-          "relative w-full rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl animate-in fade-in zoom-in-95 duration-200",
+          "relative w-full max-h-[calc(100vh-2rem)] flex flex-col rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl animate-in fade-in zoom-in-95 duration-200",
           step === 'custom-provider' ? 'max-w-md' : 'max-w-sm'
         )}
       >
@@ -428,7 +428,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
         </div>
 
         {/* Content */}
-        <div className="p-4">
+        <div className="p-4 overflow-y-auto">
           {/* Step 1: Select Provider */}
           {step === 'select-provider' && (
             <div className="space-y-1">
