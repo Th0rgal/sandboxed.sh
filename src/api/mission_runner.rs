@@ -188,38 +188,12 @@ async fn set_control_state_for_mission(
     });
 }
 
-/// Patterns that identify OpenCode status/debug lines to be filtered
-const OPENCODE_STATUS_PATTERNS: &[&str] = &[
-    "starting opencode server",
-    "opencode server started",
-    "sending prompt",
-    "waiting for completion",
-    "all tasks completed",
-    "session ended with error",
-    "[session.error]",
-    "session: ses_",
-    "session id: ses_",
-];
-
 fn is_opencode_status_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-
-    let lower = trimmed.to_lowercase();
-    OPENCODE_STATUS_PATTERNS
-        .iter()
-        .any(|pattern| lower.starts_with(pattern) || lower.contains(pattern))
+    is_opencode_banner_line(line)
 }
 
 fn strip_opencode_status_lines(text: &str) -> String {
-    text.lines()
-        .filter(|line| !is_opencode_status_line(line))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
+    strip_opencode_banner_lines(text)
 }
 
 fn handle_tool_part_update(
@@ -3605,7 +3579,8 @@ fn is_opencode_banner_line(line: &str) -> bool {
 }
 
 fn strip_opencode_banner_lines(output: &str) -> String {
-    output
+    let cleaned = strip_ansi_codes(output);
+    cleaned
         .lines()
         .filter(|line| !is_opencode_banner_line(line.trim()))
         .collect::<Vec<_>>()
@@ -9822,5 +9797,20 @@ mod tests {
         // Pure model output does NOT need fallback
         let model_only = "Here is your answer: 42";
         assert!(!opencode_output_needs_fallback(model_only));
+    }
+
+    #[test]
+    fn strip_opencode_banner_lines_handles_ansi_codes() {
+        use super::strip_opencode_banner_lines;
+
+        // ANSI-prefixed banner lines should be stripped too
+        let input_with_ansi = "\x1b[32mStarting opencode server\x1b[0m\n\x1b[33mUsing port 44563\x1b[0m\nHello, I am the model.";
+        let result = strip_opencode_banner_lines(input_with_ansi);
+        assert_eq!(result.trim(), "Hello, I am the model.");
+
+        // Pure ANSI-wrapped banners should become empty
+        let ansi_only = "\x1b[32mStarting opencode server\x1b[0m\n\x1b[33mAll tasks completed.\x1b[0m";
+        let result = strip_opencode_banner_lines(ansi_only);
+        assert!(result.trim().is_empty());
     }
 }
