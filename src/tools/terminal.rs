@@ -61,7 +61,7 @@ fn rtk_gain_stats() -> Option<(u64, u64)> {
     Some((input, output_tokens))
 }
 
-fn rtk_enabled() -> bool {
+pub fn rtk_enabled() -> bool {
     env::var("SANDBOXED_SH_RTK_ENABLED")
         .map(|v| {
             matches!(
@@ -72,7 +72,7 @@ fn rtk_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn rtk_binary_path() -> Option<PathBuf> {
+pub fn rtk_binary_path() -> Option<PathBuf> {
     let candidates = [
         PathBuf::from("/usr/local/bin/rtk"),
         PathBuf::from("/usr/bin/rtk"),
@@ -167,8 +167,17 @@ fn should_wrap_with_rtk(command: &str) -> bool {
         return false;
     }
     for pattern in RTK_WRAPPED_COMMANDS {
-        if cmd_lower.starts_with(pattern) || cmd_lower == *pattern {
+        if cmd_lower == *pattern {
             return true;
+        }
+        if cmd_lower.starts_with(pattern) {
+            // Ensure match is at a word boundary — the character after the pattern
+            // must be a space (or nothing). Without this, "ls" would match "lsof",
+            // "cat" would match "catkin_make", etc.
+            let next_char = cmd_lower.as_bytes().get(pattern.len());
+            if next_char.is_none() || next_char == Some(&b' ') {
+                return true;
+            }
         }
     }
     false

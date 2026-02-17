@@ -27,6 +27,7 @@ use crate::library::env_crypto::strip_encrypted_tags;
 use crate::library::LibraryStore;
 use crate::mcp::{McpRegistry, McpScope, McpServerConfig, McpTransport};
 use crate::nspawn::{self, NspawnDistro};
+use crate::tools::terminal::{rtk_binary_path, rtk_enabled};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Workspace Types
@@ -1305,24 +1306,14 @@ async fn write_rtk_hook_if_enabled(
     workspace_root: &Path,
     workspace_type: WorkspaceType,
 ) -> anyhow::Result<Option<serde_json::Value>> {
-    let rtk_enabled = std::env::var("SANDBOXED_SH_RTK_ENABLED")
-        .map(|v| {
-            matches!(
-                v.trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "y" | "on"
-            )
-        })
-        .unwrap_or(false);
-
-    if !rtk_enabled {
+    if !rtk_enabled() {
         return Ok(None);
     }
 
     // For container workspaces, copy the RTK binary from host into the container
-    let is_container =
-        workspace_type == WorkspaceType::Container && nspawn::nspawn_available();
+    let is_container = workspace_type == WorkspaceType::Container && nspawn::nspawn_available();
     if is_container {
-        if let Some(host_rtk) = rtk_binary_path_on_host() {
+        if let Some(host_rtk) = rtk_binary_path() {
             let dest_dir = workspace_root.join("usr").join("local").join("bin");
             std::fs::create_dir_all(&dest_dir).ok();
             let dest = dest_dir.join("rtk");
@@ -1337,10 +1328,8 @@ async fn write_rtk_hook_if_enabled(
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            &dest,
-                            std::fs::Permissions::from_mode(0o755),
-                        );
+                        let _ =
+                            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
                     }
                     tracing::info!(
                         dest = %dest.display(),
@@ -1466,27 +1455,6 @@ jq -n --arg cmd "$NEW_CMD" '{
             }]
         }]
     })))
-}
-
-/// Find the RTK binary on the host system (not inside a container).
-fn rtk_binary_path_on_host() -> Option<PathBuf> {
-    let candidates = ["/usr/local/bin/rtk", "/usr/bin/rtk"];
-    for p in &candidates {
-        let path = PathBuf::from(p);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    // Also check PATH
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in path_var.split(':') {
-            let candidate = PathBuf::from(dir).join("rtk");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
 }
 
 /// Write Claude Code configuration to the workspace.

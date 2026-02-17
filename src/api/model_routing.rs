@@ -17,8 +17,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::tools::terminal::rtk_stats;
 use crate::provider_health::{ChainEntry, ModelChain};
+use crate::tools::terminal::rtk_stats;
 
 /// Register model routing routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
