@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo, startTransition } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
 import { MarkdownContent } from "@/components/markdown-content";
@@ -9,6 +9,7 @@ import { EnhancedInput, type SubmitPayload, type EnhancedInputHandle } from "@/c
 import { MissionAutomationsDialog } from "@/components/mission-automations-dialog";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
 import { getMissionShortName } from "@/lib/mission-display";
 import { getRuntimeApiBase } from "@/lib/settings";
@@ -1788,13 +1789,9 @@ const SubagentToolItem = memo(function SubagentToolItem({
           </div>
         )}
 
-        {/* Expandable content */}
-        <div
-          className={cn(
-            "overflow-hidden transition-all duration-200 ease-out",
-            expanded ? "max-h-[600px] opacity-100" : "max-h-0 opacity-0"
-          )}
-        >
+        {/* Expandable content — conditionally rendered (issue #156) */}
+        {expanded && (
+        <div>
           <div className="px-3 py-3 space-y-3 border-t border-white/[0.06]">
             {/* Prompt preview */}
             {prompt && (
@@ -1821,30 +1818,18 @@ const SubagentToolItem = memo(function SubagentToolItem({
                   "max-h-60 overflow-y-auto rounded",
                   !success && "[&_pre]:!bg-red-500/10"
                 )}>
-                  <SyntaxHighlighter
-                    language="json"
-                    style={oneDark}
-                    customStyle={{
-                      margin: 0,
-                      padding: "0.5rem",
-                      fontSize: "0.75rem",
-                      borderRadius: "0.25rem",
-                      background: !success ? "rgba(239, 68, 68, 0.1)" : "rgba(0, 0, 0, 0.2)",
-                    }}
-                    codeTagProps={{
-                      style: {
-                        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-                        color: !success ? "rgb(248, 113, 113)" : undefined,
-                      },
-                    }}
+                  <LazyJsonHighlighter
+                    background={!success ? "rgba(239, 68, 68, 0.1)" : undefined}
+                    textColor={!success ? "rgb(248, 113, 113)" : undefined}
                   >
                     {resultStr}
-                  </SyntaxHighlighter>
+                  </LazyJsonHighlighter>
                 </div>
               </div>
             )}
           </div>
         </div>
+        )}
       </div>
     </div>
   );
@@ -2107,13 +2092,10 @@ const ToolCallItem = memo(function ToolCallItem({
         />
       </button>
 
-      {/* Expandable content with animation */}
-      <div
-        className={cn(
-          "overflow-hidden transition-all duration-200 ease-out",
-          expanded ? "max-h-[500px] opacity-100 mt-2" : "max-h-0 opacity-0"
-        )}
-      >
+      {/* Expandable content — conditionally rendered to avoid mounting
+          SyntaxHighlighter while collapsed (issue #156). */}
+      {expanded && (
+      <div className="mt-2">
         <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 space-y-3">
           {/* Arguments */}
           {argsStr && (
@@ -2122,24 +2104,9 @@ const ToolCallItem = memo(function ToolCallItem({
                 Arguments
               </div>
               <div className="max-h-40 overflow-y-auto rounded">
-                <SyntaxHighlighter
-                  language="json"
-                  style={oneDark}
-                  customStyle={{
-                    margin: 0,
-                    padding: "0.5rem",
-                    fontSize: "0.75rem",
-                    borderRadius: "0.25rem",
-                    background: "rgba(0, 0, 0, 0.2)",
-                  }}
-                  codeTagProps={{
-                    style: {
-                      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-                    },
-                  }}
-                >
+                <LazyJsonHighlighter>
                   {argsStr}
-                </SyntaxHighlighter>
+                </LazyJsonHighlighter>
               </div>
             </div>
           )}
@@ -2157,25 +2124,12 @@ const ToolCallItem = memo(function ToolCallItem({
                 "max-h-40 overflow-y-auto rounded",
                 isError && "[&_pre]:!bg-red-500/10"
               )}>
-                <SyntaxHighlighter
-                  language="json"
-                  style={oneDark}
-                  customStyle={{
-                    margin: 0,
-                    padding: "0.5rem",
-                    fontSize: "0.75rem",
-                    borderRadius: "0.25rem",
-                    background: isError ? "rgba(239, 68, 68, 0.1)" : "rgba(0, 0, 0, 0.2)",
-                  }}
-                  codeTagProps={{
-                    style: {
-                      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-                      color: isError ? "rgb(248, 113, 113)" : undefined,
-                    },
-                  }}
+                <LazyJsonHighlighter
+                  background={isError ? "rgba(239, 68, 68, 0.1)" : undefined}
+                  textColor={isError ? "rgb(248, 113, 113)" : undefined}
                 >
                   {resultStr}
-                </SyntaxHighlighter>
+                </LazyJsonHighlighter>
               </div>
               {/* Image previews for screenshot results - only from tools that produce images */}
               {(() => {
@@ -2211,6 +2165,7 @@ const ToolCallItem = memo(function ToolCallItem({
           )}
         </div>
       </div>
+      )}
     </div>
   );
 });
@@ -6323,14 +6278,19 @@ export default function ControlClient() {
                       tools={item.tools}
                       isExpanded={isExpanded}
                       onToggleExpand={() => {
-                        setExpandedToolGroups((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(item.groupId)) {
-                            next.delete(item.groupId);
-                          } else {
-                            next.add(item.groupId);
-                          }
-                          return next;
+                        // Use startTransition so expanding many tools
+                        // doesn't block the browser from painting the
+                        // button's click feedback first (issue #156).
+                        startTransition(() => {
+                          setExpandedToolGroups((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(item.groupId)) {
+                              next.delete(item.groupId);
+                            } else {
+                              next.add(item.groupId);
+                            }
+                            return next;
+                          });
                         });
                       }}
                       workspaceId={missionForDownloads?.workspace_id}
