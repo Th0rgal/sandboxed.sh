@@ -9807,7 +9807,6 @@ mod tests {
         let model_only = "Here is your answer: 42";
         assert!(!opencode_output_needs_fallback(model_only));
     }
-
     #[test]
     fn strip_opencode_banner_lines_handles_ansi_codes() {
         use super::strip_opencode_banner_lines;
