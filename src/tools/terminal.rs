@@ -206,13 +206,124 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    // ── should_wrap_with_rtk ──────────────────────────────────────────
+
+    #[test]
+    fn rtk_wraps_exact_command_match() {
+        assert!(should_wrap_with_rtk("git status"));
+        assert!(should_wrap_with_rtk("git diff"));
+        assert!(should_wrap_with_rtk("git log"));
+        assert!(should_wrap_with_rtk("ls"));
+        assert!(should_wrap_with_rtk("cat"));
+        assert!(should_wrap_with_rtk("head"));
+        assert!(should_wrap_with_rtk("tail"));
+        assert!(should_wrap_with_rtk("grep"));
+        assert!(should_wrap_with_rtk("rg"));
+        assert!(should_wrap_with_rtk("find"));
+        assert!(should_wrap_with_rtk("tree"));
+        assert!(should_wrap_with_rtk("cargo test"));
+        assert!(should_wrap_with_rtk("cargo build"));
+        assert!(should_wrap_with_rtk("cargo clippy"));
+        assert!(should_wrap_with_rtk("npm test"));
+        assert!(should_wrap_with_rtk("pytest"));
+        assert!(should_wrap_with_rtk("docker ps"));
+        assert!(should_wrap_with_rtk("kubectl get"));
+    }
+
+    #[test]
+    fn rtk_wraps_command_with_args() {
+        assert!(should_wrap_with_rtk("git status --short"));
+        assert!(should_wrap_with_rtk("git diff HEAD~1"));
+        assert!(should_wrap_with_rtk("git log --oneline -10"));
+        assert!(should_wrap_with_rtk("ls -la"));
+        assert!(should_wrap_with_rtk("ls -lah /tmp"));
+        assert!(should_wrap_with_rtk("cat README.md"));
+        assert!(should_wrap_with_rtk("grep -rn foo src/"));
+        assert!(should_wrap_with_rtk("rg pattern"));
+        assert!(should_wrap_with_rtk("find . -name '*.rs'"));
+        assert!(should_wrap_with_rtk("cargo test -- --nocapture"));
+        assert!(should_wrap_with_rtk("cargo build --release"));
+        assert!(should_wrap_with_rtk("npm test -- --coverage"));
+        assert!(should_wrap_with_rtk("docker ps -a"));
+        assert!(should_wrap_with_rtk("kubectl get pods -n default"));
+    }
+
+    #[test]
+    fn rtk_rejects_prefix_false_positives() {
+        // These commands start with an allowlisted prefix but are different commands.
+        // This is the bug that PR #160 fixed.
+        assert!(!should_wrap_with_rtk("lsof -i :8080"));
+        assert!(!should_wrap_with_rtk("catkin_make"));
+        assert!(!should_wrap_with_rtk("headless-chrome"));
+        assert!(!should_wrap_with_rtk("treeify something"));
+        assert!(!should_wrap_with_rtk("finding nemo"));
+        assert!(!should_wrap_with_rtk("grepping is not a word"));
+        assert!(!should_wrap_with_rtk("rgrep something")); // not "rg"
+    }
+
+    #[test]
+    fn rtk_case_insensitive() {
+        assert!(should_wrap_with_rtk("Git Status"));
+        assert!(should_wrap_with_rtk("GIT DIFF"));
+        assert!(should_wrap_with_rtk("LS -la"));
+        assert!(should_wrap_with_rtk("CARGO TEST"));
+    }
+
+    #[test]
+    fn rtk_skips_already_wrapped() {
+        assert!(!should_wrap_with_rtk("rtk git status"));
+        assert!(!should_wrap_with_rtk("rtk ls -la"));
+    }
+
+    #[test]
+    fn rtk_skips_piped_commands() {
+        assert!(!should_wrap_with_rtk("git log | head -5"));
+        assert!(!should_wrap_with_rtk("ls -la | grep foo"));
+        assert!(!should_wrap_with_rtk("cat file.txt | wc -l"));
+    }
+
+    #[test]
+    fn rtk_skips_chained_commands() {
+        assert!(!should_wrap_with_rtk("git add . && git commit -m 'test'"));
+        assert!(!should_wrap_with_rtk("ls -la || echo 'failed'"));
+    }
+
+    #[test]
+    fn rtk_skips_heredoc_commands() {
+        assert!(!should_wrap_with_rtk("cat << EOF\nhello\nEOF"));
+        assert!(!should_wrap_with_rtk("cat <<EOF"));
+    }
+
+    #[test]
+    fn rtk_handles_whitespace() {
+        assert!(should_wrap_with_rtk("  git status  "));
+        assert!(should_wrap_with_rtk("  ls  "));
+    }
+
+    #[test]
+    fn rtk_rejects_unknown_commands() {
+        assert!(!should_wrap_with_rtk("echo hello"));
+        assert!(!should_wrap_with_rtk("curl https://example.com"));
+        assert!(!should_wrap_with_rtk("python script.py"));
+        assert!(!should_wrap_with_rtk("node index.js"));
+        assert!(!should_wrap_with_rtk("make"));
+    }
+
+    #[test]
+    fn wrap_with_rtk_formats_correctly() {
+        let result = wrap_with_rtk("git status", Path::new("/usr/local/bin/rtk"));
+        assert_eq!(result, "/usr/local/bin/rtk git status");
+    }
+
+    // ── validate_command ──────────────────────────────────────────────
+
     #[test]
     fn validate_command_blocks_root_rm_rf_by_default() {
         let _guard = env_lock().lock().unwrap();
         env::remove_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS");
 
-        let result = validate_command("rm -rf /");
-        assert!(result.is_err());
+        assert!(validate_command("rm -rf /").is_err());
+        assert!(validate_command("rm -rf /*").is_err());
     }
 
     #[test]
@@ -224,6 +335,222 @@ mod tests {
         env::remove_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS");
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_command_blocks_root_find() {
+        let _guard = env_lock().lock().unwrap();
+        env::remove_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS");
+
+        assert!(validate_command("find /").is_err());
+        assert!(validate_command("find / -name '*.rs'").is_err());
+    }
+
+    #[test]
+    fn validate_command_allows_find_in_root_home() {
+        let _guard = env_lock().lock().unwrap();
+        env::remove_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS");
+
+        assert!(validate_command("find /root/work -name '*.rs'").is_ok());
+        assert!(validate_command("find /root -type f").is_ok());
+    }
+
+    #[test]
+    fn validate_command_blocks_root_grep() {
+        let _guard = env_lock().lock().unwrap();
+        env::remove_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS");
+
+        assert!(validate_command("grep -r /").is_err());
+        assert!(validate_command("grep -rn /").is_err());
+        assert!(validate_command("grep -R /").is_err());
+    }
+
+    #[test]
+    fn validate_command_allows_grep_in_root_home() {
+        let _guard = env_lock().lock().unwrap();
+        env::remove_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS");
+
+        assert!(validate_command("grep -r /root/work pattern").is_ok());
+        assert!(validate_command("grep -rn /root pattern").is_ok());
+        assert!(validate_command("grep -R /root/src pattern").is_ok());
+    }
+
+    #[test]
+    fn validate_command_blocks_device_writes() {
+        let _guard = env_lock().lock().unwrap();
+        env::remove_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS");
+
+        assert!(validate_command("> /dev/null").is_err());
+        assert!(validate_command("dd if=/dev/zero of=/tmp/test").is_err());
+    }
+
+    #[test]
+    fn validate_command_blocks_dangerous_with_sudo_prefix() {
+        let _guard = env_lock().lock().unwrap();
+        env::remove_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS");
+
+        assert!(validate_command("sudo rm -rf /").is_err());
+        assert!(validate_command("sudo find /").is_err());
+    }
+
+    #[test]
+    fn validate_command_allows_safe_commands() {
+        let _guard = env_lock().lock().unwrap();
+        env::remove_var("SANDBOXED_SH_ALLOW_DESTRUCTIVE_COMMANDS");
+
+        assert!(validate_command("ls -la").is_ok());
+        assert!(validate_command("echo hello").is_ok());
+        assert!(validate_command("cargo test").is_ok());
+        assert!(validate_command("git status").is_ok());
+        assert!(validate_command("cat README.md").is_ok());
+        assert!(validate_command("rm -rf ./target").is_ok());
+    }
+
+    // ── sanitize_output ───────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_output_preserves_normal_text() {
+        let input = b"Hello, world!\nLine two\n";
+        let result = sanitize_output(input);
+        assert_eq!(result, "Hello, world!\nLine two\n");
+    }
+
+    #[test]
+    fn sanitize_output_preserves_tabs_and_newlines() {
+        let input = b"col1\tcol2\ncol3\tcol4\n";
+        let result = sanitize_output(input);
+        assert_eq!(result, "col1\tcol2\ncol3\tcol4\n");
+    }
+
+    #[test]
+    fn sanitize_output_strips_null_bytes() {
+        let input = b"hello\x00world";
+        let result = sanitize_output(input);
+        assert_eq!(result, "helloworld");
+    }
+
+    #[test]
+    fn sanitize_output_detects_binary() {
+        // Create mostly binary content (>10% non-printable in >100 bytes)
+        let mut input = vec![0u8; 120];
+        // Fill first 100 bytes with binary
+        for (i, byte) in input.iter_mut().enumerate() {
+            *byte = if i < 15 { 0x01 } else { b'A' };
+        }
+        let result = sanitize_output(&input);
+        assert!(result.contains("Binary output detected"));
+    }
+
+    #[test]
+    fn sanitize_output_handles_empty() {
+        assert_eq!(sanitize_output(b""), "");
+    }
+
+    #[test]
+    fn sanitize_output_handles_utf8_replacement_char() {
+        let input = b"good \xff text";
+        let result = sanitize_output(input);
+        // The replacement character \u{FFFD} should be stripped
+        assert!(!result.contains('\u{FFFD}'));
+        assert!(result.contains("good"));
+        assert!(result.contains("text"));
+    }
+
+    // ── parse_timeout ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_timeout_uses_timeout_ms() {
+        let args = json!({"timeout_ms": 5000});
+        assert_eq!(parse_timeout(&args), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn parse_timeout_uses_timeout_secs() {
+        let args = json!({"timeout_secs": 30});
+        assert_eq!(parse_timeout(&args), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_timeout_ms_takes_precedence() {
+        let args = json!({"timeout_ms": 2000, "timeout_secs": 60});
+        assert_eq!(parse_timeout(&args), Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn parse_timeout_float() {
+        let args = json!({"timeout": 1.5});
+        assert_eq!(parse_timeout(&args), Duration::from_secs_f64(1.5));
+    }
+
+    #[test]
+    fn parse_timeout_defaults() {
+        let _guard = env_lock().lock().unwrap();
+        env::remove_var("SANDBOXED_SH_COMMAND_TIMEOUT_SECS");
+        let args = json!({});
+        assert_eq!(
+            parse_timeout(&args),
+            Duration::from_secs_f64(DEFAULT_COMMAND_TIMEOUT_SECS)
+        );
+    }
+
+    // ── parse_env ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_env_from_object() {
+        let args = json!({"env": {"FOO": "bar", "BAZ": "qux"}});
+        let env = parse_env(&args);
+        assert_eq!(env.get("FOO"), Some(&"bar".to_string()));
+        assert_eq!(env.get("BAZ"), Some(&"qux".to_string()));
+    }
+
+    #[test]
+    fn parse_env_empty_when_missing() {
+        let args = json!({});
+        let env = parse_env(&args);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn parse_env_skips_non_string_values() {
+        let args = json!({"env": {"FOO": "bar", "NUM": 42}});
+        let env = parse_env(&args);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env.get("FOO"), Some(&"bar".to_string()));
+    }
+
+    // ── parse_max_output_chars ────────────────────────────────────────
+
+    #[test]
+    fn parse_max_output_chars_default() {
+        let args = json!({});
+        assert_eq!(parse_max_output_chars(&args), DEFAULT_MAX_OUTPUT_CHARS);
+    }
+
+    #[test]
+    fn parse_max_output_chars_custom() {
+        let args = json!({"max_output_chars": 5000});
+        assert_eq!(parse_max_output_chars(&args), 5000);
+    }
+
+    #[test]
+    fn parse_max_output_chars_clamped_to_limit() {
+        let args = json!({"max_output_chars": 999999});
+        assert_eq!(parse_max_output_chars(&args), MAX_OUTPUT_CHARS_LIMIT);
+    }
+
+    #[test]
+    fn parse_max_output_chars_minimum_is_one() {
+        let args = json!({"max_output_chars": 0});
+        assert_eq!(parse_max_output_chars(&args), 1);
+    }
+
+    // ── resolve_shell ─────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_shell_defaults_to_bin_bash_or_sh() {
+        let shell = resolve_shell(None, None);
+        // On most systems /bin/bash or /bin/sh exists
+        assert!(shell == "/bin/bash" || shell == "/bin/sh");
     }
 }
 
