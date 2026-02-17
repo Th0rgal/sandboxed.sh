@@ -9809,7 +9809,8 @@ mod tests {
         assert_eq!(result.trim(), "Hello, I am the model.");
 
         // Pure ANSI-wrapped banners should become empty
-        let ansi_only = "\x1b[32mStarting opencode server\x1b[0m\n\x1b[33mAll tasks completed.\x1b[0m";
+        let ansi_only =
+            "\x1b[32mStarting opencode server\x1b[0m\n\x1b[33mAll tasks completed.\x1b[0m";
         let result = strip_opencode_banner_lines(ansi_only);
         assert!(result.trim().is_empty());
     }
