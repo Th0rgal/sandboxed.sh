@@ -598,6 +598,19 @@ mod tests {
 
     #[test]
     fn tool_use_result_info_raw_returns_none() {
+        // Use a JSON array — objects match Structured (all fields are #[serde(default)]),
+        // strings match Text, so only non-object non-string values reach Raw.
+        let info: ToolUseResultInfo =
+            serde_json::from_value(json!([{"type": "text", "text": "hello"}])).unwrap();
+        assert_eq!(info.stdout(), None);
+        assert_eq!(info.stderr(), None);
+        assert_eq!(info.interrupted(), None);
+    }
+
+    #[test]
+    fn tool_use_result_info_object_matches_structured_not_raw() {
+        // Verify that unknown-field objects still match Structured (not Raw)
+        // because all Structured fields are #[serde(default)].
         let info: ToolUseResultInfo =
             serde_json::from_value(json!({"unknown_field": true})).unwrap();
         assert_eq!(info.stdout(), None);
