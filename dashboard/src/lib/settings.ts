@@ -37,6 +37,5 @@ export function getRuntimeApiBase(): string {
   const saved = readSavedSettings().apiUrl;
   if (saved) return normalizeBaseUrl(saved);
   if (envBase) return normalizeBaseUrl(envBase);
-  const { protocol, hostname } = window.location;
-  return normalizeBaseUrl(`${protocol}//${hostname}:3000`);
+  return normalizeBaseUrl(window.location.origin);
 }
