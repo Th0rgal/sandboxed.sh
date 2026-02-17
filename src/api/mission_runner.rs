@@ -195,8 +195,10 @@ fn is_opencode_status_line(line: &str) -> bool {
 }
 
 /// Delegate to the unified banner-stripping function.
+/// Preserves the original contract: trims leading/trailing whitespace from
+/// the result so callers in the SSE streaming path get clean output.
 fn strip_opencode_status_lines(text: &str) -> String {
-    strip_opencode_banner_lines(text)
+    strip_opencode_banner_lines(text).trim().to_string()
 }
 
 fn handle_tool_part_update(
@@ -9844,21 +9846,20 @@ mod tests {
     }
 
     // ── strip_opencode_status_lines tests ─────────────────────────────
-    // strip_opencode_status_lines now delegates to strip_opencode_banner_lines.
+    // strip_opencode_status_lines delegates to strip_opencode_banner_lines
+    // and trims the result to preserve the original API contract.
 
     #[test]
     fn strip_opencode_status_lines_removes_status_keeps_content() {
         let input = "Starting OpenCode server\nHere is your answer\nall tasks completed";
-        assert_eq!(
-            strip_opencode_status_lines(input).trim(),
-            "Here is your answer"
-        );
+        // Result should be trimmed (no leading/trailing whitespace)
+        assert_eq!(strip_opencode_status_lines(input), "Here is your answer");
     }
 
     #[test]
     fn strip_opencode_status_lines_all_status_returns_empty() {
         let input = "Starting OpenCode server\nall tasks completed\n";
-        assert!(strip_opencode_status_lines(input).trim().is_empty());
+        assert_eq!(strip_opencode_status_lines(input), "");
     }
 
     #[test]
@@ -9868,6 +9869,17 @@ mod tests {
             strip_opencode_status_lines(input),
             "Hello world\nThis is real output"
         );
+    }
+
+    #[test]
+    fn strip_opencode_status_lines_trims_leading_trailing_newlines() {
+        // When banner lines surround content, the result should have no
+        // leading/trailing whitespace (preserving the original .trim() contract)
+        let input = "Starting opencode server\n\nHello model response\n\nAll tasks completed.";
+        let result = strip_opencode_status_lines(input);
+        assert!(!result.starts_with('\n'));
+        assert!(!result.ends_with('\n'));
+        assert!(result.contains("Hello model response"));
     }
 
     // ── strip_opencode_banner_lines tests ─────────────────────────────
