@@ -525,3 +525,582 @@ pub fn convert_cli_event(
 
     results
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── ToolResultContent::to_string_lossy tests ──────────────────────
+
+    #[test]
+    fn tool_result_content_text_returns_string() {
+        let content = ToolResultContent::Text("hello world".to_string());
+        assert_eq!(content.to_string_lossy(), "hello world");
+    }
+
+    #[test]
+    fn tool_result_content_structured_image_placeholder() {
+        let content = ToolResultContent::Structured(vec![
+            json!({"type": "image", "source": {"data": "base64..."}}),
+        ]);
+        assert_eq!(content.to_string_lossy(), "[image]");
+    }
+
+    #[test]
+    fn tool_result_content_structured_text_extracted() {
+        let content = ToolResultContent::Structured(vec![
+            json!({"type": "text", "text": "file contents here"}),
+        ]);
+        assert_eq!(content.to_string_lossy(), "file contents here");
+    }
+
+    #[test]
+    fn tool_result_content_structured_mixed() {
+        let content = ToolResultContent::Structured(vec![
+            json!({"type": "text", "text": "before"}),
+            json!({"type": "image", "source": {}}),
+            json!({"type": "text", "text": "after"}),
+        ]);
+        assert_eq!(content.to_string_lossy(), "before\n[image]\nafter");
+    }
+
+    #[test]
+    fn tool_result_content_structured_empty_falls_back_to_json() {
+        let content = ToolResultContent::Structured(vec![json!(42)]);
+        // No recognized objects, falls back to JSON serialization
+        let result = content.to_string_lossy();
+        assert!(result.contains("42"));
+    }
+
+    // ── ToolUseResultInfo method tests ────────────────────────────────
+
+    #[test]
+    fn tool_use_result_info_structured_stdout() {
+        let info: ToolUseResultInfo = serde_json::from_value(json!({
+            "stdout": "output here",
+            "stderr": "err here",
+            "interrupted": false
+        }))
+        .unwrap();
+        assert_eq!(info.stdout(), Some("output here"));
+        assert_eq!(info.stderr(), Some("err here"));
+        assert_eq!(info.interrupted(), Some(false));
+    }
+
+    #[test]
+    fn tool_use_result_info_text_stderr() {
+        let info: ToolUseResultInfo = serde_json::from_value(json!("error message")).unwrap();
+        assert_eq!(info.stdout(), None);
+        assert_eq!(info.stderr(), Some("error message"));
+        assert_eq!(info.interrupted(), None);
+    }
+
+    #[test]
+    fn tool_use_result_info_raw_returns_none() {
+        let info: ToolUseResultInfo =
+            serde_json::from_value(json!({"unknown_field": true})).unwrap();
+        assert_eq!(info.stdout(), None);
+        assert_eq!(info.stderr(), None);
+        assert_eq!(info.interrupted(), None);
+    }
+
+    // ── ResultEvent::error_message tests ──────────────────────────────
+
+    #[test]
+    fn error_message_prefers_result() {
+        let evt = ResultEvent {
+            subtype: "error".to_string(),
+            session_id: "s".to_string(),
+            result: Some("result msg".to_string()),
+            is_error: true,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: Some("error field".to_string()),
+            message: Some("message field".to_string()),
+            errors: vec![],
+        };
+        assert_eq!(evt.error_message(), "result msg");
+    }
+
+    #[test]
+    fn error_message_falls_back_to_error_field() {
+        let evt = ResultEvent {
+            subtype: "error".to_string(),
+            session_id: "s".to_string(),
+            result: None,
+            is_error: true,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: Some("error field".to_string()),
+            message: None,
+            errors: vec![],
+        };
+        assert_eq!(evt.error_message(), "error field");
+    }
+
+    #[test]
+    fn error_message_falls_back_to_message_field() {
+        let evt = ResultEvent {
+            subtype: "error".to_string(),
+            session_id: "s".to_string(),
+            result: None,
+            is_error: true,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: None,
+            message: Some("message field".to_string()),
+            errors: vec![],
+        };
+        assert_eq!(evt.error_message(), "message field");
+    }
+
+    #[test]
+    fn error_message_falls_back_to_errors_array() {
+        let evt = ResultEvent {
+            subtype: "error".to_string(),
+            session_id: "s".to_string(),
+            result: None,
+            is_error: true,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: None,
+            message: None,
+            errors: vec!["first error".to_string(), "second error".to_string()],
+        };
+        assert_eq!(evt.error_message(), "first error");
+    }
+
+    #[test]
+    fn error_message_unknown_when_all_empty() {
+        let evt = ResultEvent {
+            subtype: "error".to_string(),
+            session_id: "s".to_string(),
+            result: None,
+            is_error: true,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: None,
+            message: None,
+            errors: vec![],
+        };
+        assert_eq!(evt.error_message(), "Unknown error");
+    }
+
+    #[test]
+    fn error_message_parses_embedded_json() {
+        let evt = ResultEvent {
+            subtype: "error".to_string(),
+            session_id: "s".to_string(),
+            result: Some(r#"402 {"error":{"message":"Insufficient credits"}}"#.to_string()),
+            is_error: true,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: None,
+            message: None,
+            errors: vec![],
+        };
+        assert_eq!(evt.error_message(), "Insufficient credits");
+    }
+
+    #[test]
+    fn error_message_parses_top_level_message_json() {
+        let evt = ResultEvent {
+            subtype: "error".to_string(),
+            session_id: "s".to_string(),
+            result: Some(r#"{"message":"rate limited"}"#.to_string()),
+            is_error: true,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: None,
+            message: None,
+            errors: vec![],
+        };
+        assert_eq!(evt.error_message(), "rate limited");
+    }
+
+    #[test]
+    fn error_message_skips_empty_strings() {
+        let evt = ResultEvent {
+            subtype: "error".to_string(),
+            session_id: "s".to_string(),
+            result: Some("".to_string()),
+            is_error: true,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: Some("".to_string()),
+            message: Some("actual message".to_string()),
+            errors: vec![],
+        };
+        assert_eq!(evt.error_message(), "actual message");
+    }
+
+    // ── convert_cli_event tests ───────────────────────────────────────
+
+    #[test]
+    fn convert_cli_event_system_produces_no_events() {
+        let event = CliEvent::System(SystemEvent {
+            subtype: "init".to_string(),
+            session_id: "sess_1".to_string(),
+            tools: vec![],
+            model: Some("claude-3".to_string()),
+            agents: vec![],
+            cwd: None,
+            mcp_servers: vec![],
+        });
+        let mut pending = HashMap::new();
+        let results = convert_cli_event(event, &mut pending);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn convert_cli_event_text_delta() {
+        let event = CliEvent::StreamEvent(StreamEventWrapper {
+            event: StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: Delta {
+                    delta_type: "text_delta".to_string(),
+                    text: Some("hello".to_string()),
+                    partial_json: None,
+                    thinking: None,
+                },
+            },
+            session_id: "s1".to_string(),
+            parent_tool_use_id: None,
+        });
+        let mut pending = HashMap::new();
+        let results = convert_cli_event(event, &mut pending);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], ExecutionEvent::TextDelta { content } if content == "hello"));
+    }
+
+    #[test]
+    fn convert_cli_event_thinking_delta() {
+        let event = CliEvent::StreamEvent(StreamEventWrapper {
+            event: StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: Delta {
+                    delta_type: "thinking_delta".to_string(),
+                    text: None,
+                    partial_json: None,
+                    thinking: Some("reasoning...".to_string()),
+                },
+            },
+            session_id: "s1".to_string(),
+            parent_tool_use_id: None,
+        });
+        let mut pending = HashMap::new();
+        let results = convert_cli_event(event, &mut pending);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::Thinking { content } if content == "reasoning...")
+        );
+    }
+
+    #[test]
+    fn convert_cli_event_empty_text_delta_produces_nothing() {
+        let event = CliEvent::StreamEvent(StreamEventWrapper {
+            event: StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: Delta {
+                    delta_type: "text_delta".to_string(),
+                    text: Some("".to_string()),
+                    partial_json: None,
+                    thinking: None,
+                },
+            },
+            session_id: "s1".to_string(),
+            parent_tool_use_id: None,
+        });
+        let mut pending = HashMap::new();
+        let results = convert_cli_event(event, &mut pending);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn convert_cli_event_content_block_start_tool_use_tracks_pending() {
+        let event = CliEvent::StreamEvent(StreamEventWrapper {
+            event: StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlockInfo {
+                    block_type: "tool_use".to_string(),
+                    text: None,
+                    id: Some("tool_1".to_string()),
+                    name: Some("bash".to_string()),
+                },
+            },
+            session_id: "s1".to_string(),
+            parent_tool_use_id: None,
+        });
+        let mut pending = HashMap::new();
+        convert_cli_event(event, &mut pending);
+        assert_eq!(pending.get("tool_1").map(|s| s.as_str()), Some("bash"));
+    }
+
+    #[test]
+    fn convert_cli_event_assistant_tool_use() {
+        let event = CliEvent::Assistant(AssistantEvent {
+            message: AssistantMessage {
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "read".to_string(),
+                    input: json!({"path": "/tmp/test"}),
+                }],
+                stop_reason: None,
+                model: None,
+                id: None,
+                usage: None,
+            },
+            session_id: "s1".to_string(),
+            parent_tool_use_id: None,
+        });
+        let mut pending = HashMap::new();
+        let results = convert_cli_event(event, &mut pending);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::ToolCall { id, name, .. }
+            if id == "t1" && name == "read")
+        );
+        assert_eq!(pending.get("t1").map(|s| s.as_str()), Some("read"));
+    }
+
+    #[test]
+    fn convert_cli_event_assistant_text_becomes_thinking() {
+        let event = CliEvent::Assistant(AssistantEvent {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: "Let me analyze...".to_string(),
+                }],
+                stop_reason: None,
+                model: None,
+                id: None,
+                usage: None,
+            },
+            session_id: "s1".to_string(),
+            parent_tool_use_id: None,
+        });
+        let mut pending = HashMap::new();
+        let results = convert_cli_event(event, &mut pending);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::Thinking { content } if content == "Let me analyze...")
+        );
+    }
+
+    #[test]
+    fn convert_cli_event_user_tool_result() {
+        // First register a pending tool
+        let mut pending = HashMap::new();
+        pending.insert("t1".to_string(), "bash".to_string());
+
+        let event = CliEvent::User(UserEvent {
+            message: UserMessage {
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: ToolResultContent::Text("output here".to_string()),
+                    is_error: false,
+                }],
+                role: None,
+            },
+            session_id: "s1".to_string(),
+            parent_tool_use_id: None,
+            tool_use_result: None,
+        });
+        let results = convert_cli_event(event, &mut pending);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::ToolResult { id, name, .. }
+            if id == "t1" && name == "bash")
+        );
+    }
+
+    #[test]
+    fn convert_cli_event_user_unknown_tool() {
+        let mut pending = HashMap::new();
+        // Don't register any tool — should fall back to "unknown"
+
+        let event = CliEvent::User(UserEvent {
+            message: UserMessage {
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t99".to_string(),
+                    content: ToolResultContent::Text("result".to_string()),
+                    is_error: false,
+                }],
+                role: None,
+            },
+            session_id: "s1".to_string(),
+            parent_tool_use_id: None,
+            tool_use_result: None,
+        });
+        let results = convert_cli_event(event, &mut pending);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::ToolResult { name, .. }
+            if name == "unknown")
+        );
+    }
+
+    #[test]
+    fn convert_cli_event_user_tool_result_with_structured_extra() {
+        let mut pending = HashMap::new();
+        pending.insert("t1".to_string(), "bash".to_string());
+
+        let extra: ToolUseResultInfo = serde_json::from_value(json!({
+            "stdout": "hello",
+            "stderr": "",
+            "interrupted": false
+        }))
+        .unwrap();
+
+        let event = CliEvent::User(UserEvent {
+            message: UserMessage {
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: ToolResultContent::Text("output".to_string()),
+                    is_error: false,
+                }],
+                role: None,
+            },
+            session_id: "s1".to_string(),
+            parent_tool_use_id: None,
+            tool_use_result: Some(extra),
+        });
+        let results = convert_cli_event(event, &mut pending);
+        assert_eq!(results.len(), 1);
+        if let ExecutionEvent::ToolResult { result, .. } = &results[0] {
+            // When extra info is present, result is a JSON object with stdout/stderr
+            assert!(result.get("stdout").is_some());
+            assert!(result.get("content").is_some());
+        } else {
+            panic!("Expected ToolResult event");
+        }
+    }
+
+    #[test]
+    fn convert_cli_event_result_error_with_is_error() {
+        let event = CliEvent::Result(ResultEvent {
+            subtype: "result".to_string(),
+            session_id: "s1".to_string(),
+            result: Some("something went wrong".to_string()),
+            is_error: true,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: None,
+            message: None,
+            errors: vec![],
+        });
+        let mut pending = HashMap::new();
+        let results = convert_cli_event(event, &mut pending);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::Error { message } if message == "something went wrong")
+        );
+    }
+
+    #[test]
+    fn convert_cli_event_result_error_subtype() {
+        let event = CliEvent::Result(ResultEvent {
+            subtype: "error".to_string(),
+            session_id: "s1".to_string(),
+            result: None,
+            is_error: false,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: Some("timeout".to_string()),
+            message: None,
+            errors: vec![],
+        });
+        let mut pending = HashMap::new();
+        let results = convert_cli_event(event, &mut pending);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], ExecutionEvent::Error { message } if message == "timeout"));
+    }
+
+    #[test]
+    fn convert_cli_event_result_api_error_in_text() {
+        let event = CliEvent::Result(ResultEvent {
+            subtype: "result".to_string(),
+            session_id: "s1".to_string(),
+            result: Some(r#"API Error: 429 {"error":{"message":"Rate limited"}}"#.to_string()),
+            is_error: false,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: None,
+            message: None,
+            errors: vec![],
+        });
+        let mut pending = HashMap::new();
+        let results = convert_cli_event(event, &mut pending);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::Error { message } if message == "Rate limited")
+        );
+    }
+
+    #[test]
+    fn convert_cli_event_result_success_produces_nothing() {
+        let event = CliEvent::Result(ResultEvent {
+            subtype: "result".to_string(),
+            session_id: "s1".to_string(),
+            result: Some("Task completed".to_string()),
+            is_error: false,
+            total_cost_usd: Some(0.05),
+            duration_ms: Some(3000),
+            num_turns: Some(5),
+            error: None,
+            message: None,
+            errors: vec![],
+        });
+        let mut pending = HashMap::new();
+        let results = convert_cli_event(event, &mut pending);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn convert_cli_event_result_overloaded_error() {
+        let event = CliEvent::Result(ResultEvent {
+            subtype: "result".to_string(),
+            session_id: "s1".to_string(),
+            result: Some(r#"{"type":"overloaded_error","message":"server busy"}"#.to_string()),
+            is_error: false,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            error: None,
+            message: None,
+            errors: vec![],
+        });
+        let mut pending = HashMap::new();
+        let results = convert_cli_event(event, &mut pending);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], ExecutionEvent::Error { .. }));
+    }
+
+    // ── McpServerInfo tests ──────────────────────────────────────────
+
+    #[test]
+    fn mcp_server_info_name_object() {
+        let info = McpServerInfo::Object {
+            name: "my-server".to_string(),
+            status: "ready".to_string(),
+        };
+        assert_eq!(info.name(), "my-server");
+    }
+
+    #[test]
+    fn mcp_server_info_name_string() {
+        let info = McpServerInfo::String("legacy-server".to_string());
+        assert_eq!(info.name(), "legacy-server");
+    }
+}

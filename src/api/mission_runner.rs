@@ -9597,7 +9597,12 @@ fn cleanup_old_debug_files(
 
 #[cfg(test)]
 mod tests {
-    use super::{remap_legacy_codex_model, sync_opencode_agent_config};
+    use super::{
+        extract_str, extract_thought_line, is_opencode_banner_line, is_opencode_status_line,
+        is_tool_call_only_output, opencode_output_needs_fallback, remap_legacy_codex_model,
+        strip_ansi_codes, strip_opencode_status_lines, strip_think_tags,
+        sync_opencode_agent_config,
+    };
     use std::fs;
 
     #[test]
@@ -9706,5 +9711,334 @@ mod tests {
             Some("gpt-5-codex".to_string())
         );
         assert_eq!(remap_legacy_codex_model(None), None);
+    }
+
+    // ── extract_str tests ─────────────────────────────────────────────
+
+    #[test]
+    fn extract_str_returns_first_matching_key() {
+        let val = serde_json::json!({"text": "hello", "content": "world"});
+        assert_eq!(extract_str(&val, &["text", "content"]), Some("hello"));
+        assert_eq!(extract_str(&val, &["content", "text"]), Some("world"));
+    }
+
+    #[test]
+    fn extract_str_skips_non_string_values() {
+        let val = serde_json::json!({"text": 42, "content": "ok"});
+        assert_eq!(extract_str(&val, &["text", "content"]), Some("ok"));
+    }
+
+    #[test]
+    fn extract_str_returns_none_when_no_keys_match() {
+        let val = serde_json::json!({"foo": "bar"});
+        assert_eq!(extract_str(&val, &["text", "content"]), None);
+    }
+
+    // ── strip_think_tags tests ────────────────────────────────────────
+
+    #[test]
+    fn strip_think_tags_removes_single_block() {
+        assert_eq!(
+            strip_think_tags("hello <think>internal</think> world"),
+            "hello  world"
+        );
+    }
+
+    #[test]
+    fn strip_think_tags_removes_multiple_blocks() {
+        assert_eq!(
+            strip_think_tags("<think>a</think>middle<think>b</think>end"),
+            "middleend"
+        );
+    }
+
+    #[test]
+    fn strip_think_tags_case_insensitive() {
+        assert_eq!(
+            strip_think_tags("before<THINK>hidden</THINK>after"),
+            "beforeafter"
+        );
+        assert_eq!(strip_think_tags("x<Think>y</Think>z"), "xz");
+    }
+
+    #[test]
+    fn strip_think_tags_no_tags_returns_original() {
+        let input = "no think tags here";
+        assert_eq!(strip_think_tags(input), input);
+    }
+
+    #[test]
+    fn strip_think_tags_unclosed_tag_drops_rest() {
+        // Unclosed <think> tag: everything after the opening tag is dropped
+        assert_eq!(strip_think_tags("before<think>dangling"), "before");
+    }
+
+    #[test]
+    fn strip_think_tags_empty_content() {
+        assert_eq!(strip_think_tags("<think></think>"), "");
+    }
+
+    // ── extract_thought_line tests ────────────────────────────────────
+
+    #[test]
+    fn extract_thought_line_extracts_thought_prefix() {
+        let (thought, remaining) =
+            extract_thought_line("thought: I should search\nLet me help").unwrap();
+        assert_eq!(thought, "I should search");
+        assert_eq!(remaining, "Let me help");
+    }
+
+    #[test]
+    fn extract_thought_line_extracts_thinking_prefix() {
+        let (thought, remaining) =
+            extract_thought_line("Thinking: analyzing code\nHere is the result").unwrap();
+        assert_eq!(thought, "analyzing code");
+        assert_eq!(remaining, "Here is the result");
+    }
+
+    #[test]
+    fn extract_thought_line_extracts_thoughts_prefix() {
+        let (thought, _) = extract_thought_line("thoughts: multiple ideas\nrest").unwrap();
+        assert_eq!(thought, "multiple ideas");
+    }
+
+    #[test]
+    fn extract_thought_line_returns_none_without_thought() {
+        assert!(extract_thought_line("just normal text\nmore text").is_none());
+    }
+
+    #[test]
+    fn extract_thought_line_returns_none_for_empty_thought() {
+        // "thought:" with nothing after it should return None
+        assert!(extract_thought_line("thought:\nrest of text").is_none());
+    }
+
+    #[test]
+    fn extract_thought_line_only_first_thought_line_extracted() {
+        let input = "thought: first idea\nthought: second idea\nreal output";
+        let (thought, remaining) = extract_thought_line(input).unwrap();
+        assert_eq!(thought, "first idea");
+        // Second "thought:" line stays in remaining since only the first is extracted
+        assert!(remaining.contains("thought: second idea"));
+        assert!(remaining.contains("real output"));
+    }
+
+    // ── is_opencode_status_line tests ─────────────────────────────────
+
+    #[test]
+    fn is_opencode_status_line_matches_known_patterns() {
+        assert!(is_opencode_status_line("Starting OpenCode server..."));
+        assert!(is_opencode_status_line(
+            "opencode server started on port 8080"
+        ));
+        assert!(is_opencode_status_line("sending prompt to model"));
+        assert!(is_opencode_status_line("waiting for completion"));
+        assert!(is_opencode_status_line("all tasks completed"));
+        assert!(is_opencode_status_line("session ended with error: timeout"));
+        assert!(is_opencode_status_line("[session.error] something broke"));
+        assert!(is_opencode_status_line("session: ses_abc123"));
+        assert!(is_opencode_status_line("Session ID: ses_xyz789"));
+    }
+
+    #[test]
+    fn is_opencode_status_line_empty_line_is_status() {
+        assert!(is_opencode_status_line(""));
+        assert!(is_opencode_status_line("   "));
+    }
+
+    #[test]
+    fn is_opencode_status_line_real_content_is_not_status() {
+        assert!(!is_opencode_status_line("Here is the code you requested"));
+        assert!(!is_opencode_status_line("function hello() { return 42; }"));
+    }
+
+    // ── strip_opencode_status_lines tests ─────────────────────────────
+
+    #[test]
+    fn strip_opencode_status_lines_removes_status_keeps_content() {
+        let input = "Starting OpenCode server\nHere is your answer\nall tasks completed";
+        assert_eq!(strip_opencode_status_lines(input), "Here is your answer");
+    }
+
+    #[test]
+    fn strip_opencode_status_lines_all_status_returns_empty() {
+        let input = "Starting OpenCode server\nall tasks completed\n";
+        assert_eq!(strip_opencode_status_lines(input), "");
+    }
+
+    #[test]
+    fn strip_opencode_status_lines_preserves_real_content() {
+        let input = "Hello world\nThis is real output";
+        assert_eq!(
+            strip_opencode_status_lines(input),
+            "Hello world\nThis is real output"
+        );
+    }
+
+    // ── strip_ansi_codes tests ────────────────────────────────────────
+
+    #[test]
+    fn strip_ansi_codes_removes_color_codes() {
+        assert_eq!(strip_ansi_codes("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(
+            strip_ansi_codes("\x1b[1;32mbold green\x1b[0m"),
+            "bold green"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_codes_no_codes_unchanged() {
+        assert_eq!(strip_ansi_codes("plain text"), "plain text");
+    }
+
+    #[test]
+    fn strip_ansi_codes_empty_string() {
+        assert_eq!(strip_ansi_codes(""), "");
+    }
+
+    #[test]
+    fn strip_ansi_codes_multiple_codes_in_sequence() {
+        assert_eq!(
+            strip_ansi_codes("\x1b[34mblue\x1b[0m and \x1b[33myellow\x1b[0m"),
+            "blue and yellow"
+        );
+    }
+
+    // ── is_opencode_banner_line tests ─────────────────────────────────
+
+    #[test]
+    fn is_opencode_banner_line_matches_lifecycle_banners() {
+        assert!(is_opencode_banner_line("Starting opencode server..."));
+        assert!(is_opencode_banner_line(
+            "opencode server started on port 3000"
+        ));
+        assert!(is_opencode_banner_line("auto-selected port 8080"));
+        assert!(is_opencode_banner_line("using port 4000"));
+        assert!(is_opencode_banner_line("server listening on 0.0.0.0:3000"));
+    }
+
+    #[test]
+    fn is_opencode_banner_line_matches_prompt_status() {
+        assert!(is_opencode_banner_line("Sending prompt to claude"));
+        assert!(is_opencode_banner_line("Waiting for completion..."));
+        assert!(is_opencode_banner_line("All tasks completed successfully"));
+    }
+
+    #[test]
+    fn is_opencode_banner_line_matches_session_ids() {
+        assert!(is_opencode_banner_line("Session ID: ses_abc123"));
+        assert!(is_opencode_banner_line("session: ses_xyz789"));
+    }
+
+    #[test]
+    fn is_opencode_banner_line_matches_shutdown_banners() {
+        assert!(is_opencode_banner_line(
+            "Event stream did not close cleanly"
+        ));
+        assert!(is_opencode_banner_line("Continuing shutdown sequence"));
+    }
+
+    #[test]
+    fn is_opencode_banner_line_matches_run_prefix() {
+        assert!(is_opencode_banner_line("[run] starting process"));
+        assert!(is_opencode_banner_line("[Run] completed"));
+    }
+
+    #[test]
+    fn is_opencode_banner_line_rejects_real_content() {
+        assert!(!is_opencode_banner_line("Here is the code you requested"));
+        assert!(!is_opencode_banner_line(
+            "The session variable stores state"
+        ));
+        // "session:" without "ses_" prefix should not match
+        assert!(!is_opencode_banner_line("session: user context"));
+    }
+
+    // ── opencode_output_needs_fallback tests ──────────────────────────
+
+    #[test]
+    fn opencode_output_needs_fallback_true_for_empty() {
+        assert!(opencode_output_needs_fallback(""));
+        assert!(opencode_output_needs_fallback("   \n  \n  "));
+    }
+
+    #[test]
+    fn opencode_output_needs_fallback_true_for_only_banners() {
+        let output = "Starting opencode server\nopencode server started\nall tasks completed";
+        assert!(opencode_output_needs_fallback(output));
+    }
+
+    #[test]
+    fn opencode_output_needs_fallback_false_when_real_content() {
+        let output = "Starting opencode server\nHere is the actual response\nall tasks completed";
+        assert!(!opencode_output_needs_fallback(output));
+    }
+
+    #[test]
+    fn opencode_output_needs_fallback_strips_ansi_before_checking() {
+        let output = "\x1b[31mStarting opencode server\x1b[0m\n\x1b[32mall tasks completed\x1b[0m";
+        assert!(opencode_output_needs_fallback(output));
+    }
+
+    // ── is_tool_call_only_output tests ────────────────────────────────
+
+    #[test]
+    fn is_tool_call_only_output_detects_tool_use_type() {
+        let output = r#"{"type":"tool_use","name":"read_file","input":{"path":"foo.rs"}}"#;
+        assert!(is_tool_call_only_output(output));
+    }
+
+    #[test]
+    fn is_tool_call_only_output_detects_function_call_type() {
+        let output = r#"{"type":"function_call","name":"bash","arguments":{"cmd":"ls"}}"#;
+        assert!(is_tool_call_only_output(output));
+    }
+
+    #[test]
+    fn is_tool_call_only_output_detects_name_plus_arguments_shape() {
+        let output = r#"{"name":"search","arguments":{"query":"test"}}"#;
+        assert!(is_tool_call_only_output(output));
+    }
+
+    #[test]
+    fn is_tool_call_only_output_detects_name_plus_input_shape() {
+        let output = r#"{"name":"edit","input":{"file":"main.rs"}}"#;
+        assert!(is_tool_call_only_output(output));
+    }
+
+    #[test]
+    fn is_tool_call_only_output_false_for_real_text() {
+        assert!(!is_tool_call_only_output("Here is the code you requested"));
+    }
+
+    #[test]
+    fn is_tool_call_only_output_false_for_empty() {
+        assert!(!is_tool_call_only_output(""));
+    }
+
+    #[test]
+    fn is_tool_call_only_output_false_for_mixed_content() {
+        let output = "Here is text\n{\"name\":\"bash\",\"arguments\":{\"cmd\":\"ls\"}}";
+        assert!(!is_tool_call_only_output(output));
+    }
+
+    #[test]
+    fn is_tool_call_only_output_ignores_banner_lines() {
+        let output =
+            "Starting opencode server\n{\"type\":\"tool_use\",\"name\":\"read\",\"input\":{}}";
+        assert!(is_tool_call_only_output(output));
+    }
+
+    #[test]
+    fn is_tool_call_only_output_multiple_tool_calls() {
+        let output = "{\"name\":\"a\",\"arguments\":{}}\n{\"name\":\"b\",\"input\":{}}";
+        assert!(is_tool_call_only_output(output));
+    }
+
+    #[test]
+    fn is_tool_call_only_output_json_without_tool_markers() {
+        // JSON object that doesn't look like a tool call
+        let output = r#"{"result": "success", "count": 42}"#;
+        assert!(!is_tool_call_only_output(output));
     }
 }

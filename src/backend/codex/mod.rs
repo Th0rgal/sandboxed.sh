@@ -605,4 +605,354 @@ mod tests {
         assert!(!session.id.is_empty());
         assert_eq!(session.directory, "/tmp");
     }
+
+    // ── convert_codex_event tests ─────────────────────────────────────
+
+    use client::{CodexEvent, ErrorInfo, Item};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn make_item(id: &str, item_type: &str, data: serde_json::Value) -> Item {
+        let mut map: HashMap<String, serde_json::Value> = if let Some(obj) = data.as_object() {
+            obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        } else {
+            HashMap::new()
+        };
+        // Ensure id and type are not duplicated in data
+        map.remove("id");
+        map.remove("type");
+        Item {
+            id: id.to_string(),
+            item_type: item_type.to_string(),
+            data: map,
+        }
+    }
+
+    #[test]
+    fn convert_codex_event_thread_started_no_events() {
+        let event = CodexEvent::ThreadStarted {
+            thread_id: "t1".to_string(),
+        };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn convert_codex_event_turn_started_no_events() {
+        let event = CodexEvent::TurnStarted;
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn convert_codex_event_turn_completed_with_summary() {
+        let event = CodexEvent::TurnCompleted {
+            summary: Some("Task done".to_string()),
+        };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::TurnSummary { content } if content == "Task done")
+        );
+    }
+
+    #[test]
+    fn convert_codex_event_turn_completed_no_summary() {
+        let event = CodexEvent::TurnCompleted { summary: None };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn convert_codex_event_turn_completed_blank_summary() {
+        let event = CodexEvent::TurnCompleted {
+            summary: Some("   ".to_string()),
+        };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn convert_codex_event_turn_failed() {
+        let event = CodexEvent::TurnFailed {
+            error: ErrorInfo {
+                message: "timeout".to_string(),
+            },
+        };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], ExecutionEvent::Error { message } if message == "timeout"));
+    }
+
+    #[test]
+    fn convert_codex_event_error() {
+        let event = CodexEvent::Error {
+            message: "rate limited".to_string(),
+        };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::Error { message } if message == "rate limited")
+        );
+    }
+
+    #[test]
+    fn convert_codex_event_unknown_no_events() {
+        let event = CodexEvent::Unknown;
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn convert_codex_event_item_created_message() {
+        let item = make_item("msg1", "message", json!({"text": "Hello world"}));
+        let event = CodexEvent::ItemCreated { item };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::TextDelta { content } if content == "Hello world")
+        );
+    }
+
+    #[test]
+    fn convert_codex_event_item_created_thinking() {
+        let item = make_item("t1", "reasoning", json!({"text": "Let me think..."}));
+        let event = CodexEvent::ItemCreated { item };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::Thinking { content } if content == "Let me think...")
+        );
+    }
+
+    #[test]
+    fn convert_codex_event_item_created_tool_call() {
+        let item = make_item(
+            "tc1",
+            "tool_call",
+            json!({"name": "bash", "arguments": "{\"cmd\": \"ls\"}"}),
+        );
+        let event = CodexEvent::ItemCreated { item };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::ToolCall { id, name, .. }
+            if id == "tc1" && name == "bash")
+        );
+    }
+
+    #[test]
+    fn convert_codex_event_item_created_command() {
+        let item = make_item(
+            "cmd1",
+            "command",
+            json!({"command": "grep", "args": {"pattern": "foo"}}),
+        );
+        let event = CodexEvent::ItemCreated { item };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], ExecutionEvent::ToolCall { name, .. }
+            if name == "grep"));
+    }
+
+    #[test]
+    fn convert_codex_event_item_created_mcp_tool_call() {
+        let item = make_item(
+            "mcp1",
+            "mcp_tool_call",
+            json!({"server": "myserver", "tool": "query", "arguments": {"q": "test"}}),
+        );
+        let event = CodexEvent::ItemCreated { item };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], ExecutionEvent::ToolCall { name, .. }
+            if name == "mcp__myserver__query"));
+    }
+
+    #[test]
+    fn convert_codex_event_item_completed_tool_result() {
+        let item = make_item(
+            "tc1",
+            "tool_call",
+            json!({"name": "bash", "result": "file1.txt\nfile2.txt"}),
+        );
+        let event = CodexEvent::ItemCompleted { item };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::ToolResult { id, name, .. }
+            if id == "tc1" && name == "bash")
+        );
+    }
+
+    #[test]
+    fn convert_codex_event_item_completed_mcp_first_time() {
+        // When mcp_tool_call is completed but was NOT previously created,
+        // it should emit both ToolCall and ToolResult
+        let item = make_item(
+            "mcp1",
+            "mcp_tool_call",
+            json!({"server": "s", "tool": "t", "arguments": {}, "result": "ok"}),
+        );
+        let event = CodexEvent::ItemCompleted { item };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 2);
+        assert!(matches!(&results[0], ExecutionEvent::ToolCall { .. }));
+        assert!(matches!(&results[1], ExecutionEvent::ToolResult { .. }));
+    }
+
+    #[test]
+    fn convert_codex_event_item_completed_mcp_already_created() {
+        // When mcp_tool_call was already created (mark_tool_call_emitted),
+        // it should only emit ToolResult on completion
+        let item_created = make_item(
+            "mcp1",
+            "mcp_tool_call",
+            json!({"server": "s", "tool": "t", "arguments": {}}),
+        );
+        let item_completed = make_item(
+            "mcp1",
+            "mcp_tool_call",
+            json!({"server": "s", "tool": "t", "arguments": {}, "result": "done"}),
+        );
+        let mut cache = HashMap::new();
+        // First, create the item
+        convert_codex_event(CodexEvent::ItemCreated { item: item_created }, &mut cache);
+        // Now complete it — should only get ToolResult
+        let results = convert_codex_event(
+            CodexEvent::ItemCompleted {
+                item: item_completed,
+            },
+            &mut cache,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], ExecutionEvent::ToolResult { .. }));
+    }
+
+    #[test]
+    fn convert_codex_event_text_delta_deduplication() {
+        // When ItemUpdated is received with growing text, only the new delta is emitted
+        let mut cache = HashMap::new();
+
+        let item1 = make_item("msg1", "message", json!({"text": "Hello"}));
+        let results1 = convert_codex_event(CodexEvent::ItemCreated { item: item1 }, &mut cache);
+        assert_eq!(results1.len(), 1);
+        assert!(
+            matches!(&results1[0], ExecutionEvent::TextDelta { content } if content == "Hello")
+        );
+
+        let item2 = make_item("msg1", "message", json!({"text": "Hello world"}));
+        let results2 = convert_codex_event(CodexEvent::ItemUpdated { item: item2 }, &mut cache);
+        assert_eq!(results2.len(), 1);
+        // Only the new " world" part should be emitted
+        assert!(
+            matches!(&results2[0], ExecutionEvent::TextDelta { content } if content == " world")
+        );
+    }
+
+    #[test]
+    fn convert_codex_event_thinking_dedup_skips_unchanged() {
+        let mut cache = HashMap::new();
+
+        let item1 = make_item("r1", "thinking", json!({"text": "analyzing"}));
+        let results1 = convert_codex_event(CodexEvent::ItemCreated { item: item1 }, &mut cache);
+        assert_eq!(results1.len(), 1);
+
+        // Same text — should be skipped
+        let item2 = make_item("r1", "thinking", json!({"text": "analyzing"}));
+        let results2 = convert_codex_event(CodexEvent::ItemUpdated { item: item2 }, &mut cache);
+        assert!(results2.is_empty());
+    }
+
+    #[test]
+    fn convert_codex_event_item_completed_message() {
+        // ItemCompleted for a message should also emit remaining text delta
+        let mut cache = HashMap::new();
+
+        let item1 = make_item("msg1", "message", json!({"text": "Part 1"}));
+        convert_codex_event(CodexEvent::ItemCreated { item: item1 }, &mut cache);
+
+        let item2 = make_item("msg1", "message", json!({"text": "Part 1 and Part 2"}));
+        let results = convert_codex_event(CodexEvent::ItemCompleted { item: item2 }, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], ExecutionEvent::TextDelta { content } if content == " and Part 2")
+        );
+    }
+
+    #[test]
+    fn convert_codex_event_tool_result_with_error() {
+        let item = make_item(
+            "tc1",
+            "tool_call",
+            json!({"name": "bash", "result": "", "error": "command not found"}),
+        );
+        let event = CodexEvent::ItemCompleted { item };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        if let ExecutionEvent::ToolResult { result, .. } = &results[0] {
+            // With error present, result should be a structured object
+            assert!(result.get("error").is_some());
+        } else {
+            panic!("Expected ToolResult");
+        }
+    }
+
+    #[test]
+    fn convert_codex_event_unknown_item_type() {
+        let item = make_item("x1", "unknown_type", json!({"text": "something"}));
+        let event = CodexEvent::ItemCreated { item };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn convert_codex_event_tool_name_fallback_to_tool_object() {
+        let item = make_item(
+            "tc1",
+            "tool_call",
+            json!({"tool": {"name": "read_file", "args": {"path": "/tmp"}}}),
+        );
+        let event = CodexEvent::ItemCreated { item };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], ExecutionEvent::ToolCall { name, .. }
+            if name == "read_file"));
+    }
+
+    #[test]
+    fn convert_codex_event_tool_args_from_input_field() {
+        let item = make_item(
+            "tc1",
+            "tool_call",
+            json!({"name": "edit", "input": {"file": "main.rs", "content": "code"}}),
+        );
+        let event = CodexEvent::ItemCreated { item };
+        let mut cache = HashMap::new();
+        let results = convert_codex_event(event, &mut cache);
+        assert_eq!(results.len(), 1);
+        if let ExecutionEvent::ToolCall { args, .. } = &results[0] {
+            assert_eq!(args.get("file").and_then(|v| v.as_str()), Some("main.rs"));
+        } else {
+            panic!("Expected ToolCall");
+        }
+    }
 }
