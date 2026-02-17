@@ -139,7 +139,13 @@ impl NspawnDistro {
 
     pub fn mirror_url(&self) -> &'static str {
         match self {
-            Self::UbuntuNoble | Self::UbuntuJammy => "http://archive.ubuntu.com/ubuntu",
+            Self::UbuntuNoble | Self::UbuntuJammy => {
+                if std::env::consts::ARCH == "aarch64" {
+                    "http://ports.ubuntu.com/ubuntu-ports"
+                } else {
+                    "http://archive.ubuntu.com/ubuntu"
+                }
+            }
             Self::DebianBookworm => "http://deb.debian.org/debian",
             Self::ArchLinux => "https://geo.mirror.pkgbuild.com/",
         }
