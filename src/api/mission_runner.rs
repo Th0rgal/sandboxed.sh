@@ -3801,6 +3801,7 @@ fn summarize_recent_opencode_stderr(lines: &std::collections::VecDeque<String>) 
             || lower.contains("message.part.updated")
             || lower.contains("session.status: busy")
             || lower.contains("session.status: idle")
+            || (lower.contains("using") && lower.contains("skill") && !lower.contains("error"))
         {
             continue;
         }
@@ -10169,6 +10170,17 @@ mod tests {
             summarize_recent_opencode_stderr(&lines).as_deref(),
             Some("response.error: 404 Not Found")
         );
+    }
+
+    #[test]
+    fn summarize_recent_opencode_stderr_filters_skill_activation_messages() {
+        use std::collections::VecDeque;
+
+        let mut lines = VecDeque::new();
+        lines.push_back("server.connected".to_string());
+        lines.push_back("Start now using github-cli skill".to_string());
+
+        assert_eq!(summarize_recent_opencode_stderr(&lines), None);
     }
     #[test]
     fn strip_opencode_banner_lines_handles_ansi_codes() {
