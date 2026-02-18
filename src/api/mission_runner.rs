@@ -26,6 +26,7 @@ use crate::mcp::McpRegistry;
 use crate::opencode::{extract_reasoning, extract_text};
 use crate::secrets::SecretsStore;
 use crate::task::{extract_deliverables, DeliverableSet};
+use crate::util::{build_history_context, env_var_bool, home_dir};
 use crate::workspace::{self, Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
 
@@ -1135,21 +1136,6 @@ impl MissionRunner {
             .map(|h| h.is_finished())
             .unwrap_or(false)
     }
-}
-
-/// Build a history context string from conversation history.
-fn build_history_context(history: &[(String, String)], max_chars: usize) -> String {
-    let mut result = String::new();
-    let mut total_chars = 0;
-    for (role, content) in history.iter().rev() {
-        let entry = format!("{}: {}\n\n", role.to_uppercase(), content);
-        if total_chars + entry.len() > max_chars && !result.is_empty() {
-            break;
-        }
-        result = format!("{}{}", entry, result);
-        total_chars += entry.len();
-    }
-    result
 }
 
 /// Try to resolve a library command from a user message starting with `/`.
@@ -3626,7 +3612,7 @@ fn prepend_opencode_bin_to_path(env: &mut HashMap<String, String>, workspace: &W
     {
         "/root".to_string()
     } else {
-        std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
+        home_dir()
     };
     let bin_dir = format!("{}/.opencode/bin", home);
 
@@ -5296,10 +5282,8 @@ fn opencode_storage_roots(workspace: &Workspace) -> Vec<std::path::PathBuf> {
         return roots;
     }
 
-    let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        format!("{}/.local/share", home)
-    });
+    let data_home =
+        std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{}/.local/share", home_dir()));
     vec![std::path::PathBuf::from(data_home)
         .join("opencode")
         .join("storage")]
@@ -5877,16 +5861,6 @@ fn resolve_opencode_model_from_config(
         .get("model")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-}
-
-fn env_var_bool(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => matches!(
-            value.trim().to_lowercase().as_str(),
-            "1" | "true" | "yes" | "y" | "on"
-        ),
-        Err(_) => default,
-    }
 }
 
 async fn command_available(
@@ -10491,50 +10465,6 @@ mod tests {
     fn running_health_healthy_for_finished_state() {
         let health = running_health(MissionRunState::Finished, STALL_SEVERE_SECS + 100);
         assert!(matches!(health, MissionHealth::Healthy));
-    }
-
-    // ── build_history_context tests ───────────────────────────────────
-
-    #[test]
-    fn build_history_context_formats_entries() {
-        let history = vec![
-            ("user".to_string(), "hello".to_string()),
-            ("assistant".to_string(), "world".to_string()),
-        ];
-        let result = build_history_context(&history, 10000);
-        assert!(result.contains("USER: hello"));
-        assert!(result.contains("ASSISTANT: world"));
-    }
-
-    #[test]
-    fn build_history_context_respects_max_chars() {
-        let history = vec![
-            ("user".to_string(), "first message".to_string()),
-            ("assistant".to_string(), "second message".to_string()),
-            ("user".to_string(), "third message".to_string()),
-        ];
-        // Set max_chars to only allow one or two entries
-        let result = build_history_context(&history, 30);
-        // Should always include the most recent entry
-        assert!(result.contains("USER: third message"));
-    }
-
-    #[test]
-    fn build_history_context_empty_history() {
-        let history: Vec<(String, String)> = vec![];
-        let result = build_history_context(&history, 10000);
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn build_history_context_always_includes_most_recent() {
-        let history = vec![(
-            "user".to_string(),
-            "a very long message that exceeds the max".to_string(),
-        )];
-        let result = build_history_context(&history, 5);
-        // Should still include the only entry even if it exceeds max_chars
-        assert!(result.contains("USER: a very long message"));
     }
 
     // ── is_session_corruption_error tests ─────────────────────────────

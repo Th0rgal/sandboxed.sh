@@ -2,6 +2,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde_json::Value;
 
+use crate::util::home_dir;
+
 fn resolve_amp_config_path() -> std::path::PathBuf {
     if let Ok(path) = std::env::var("AMP_CONFIG") {
         if !path.trim().is_empty() {
@@ -14,8 +16,7 @@ fn resolve_amp_config_path() -> std::path::PathBuf {
         }
     }
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    std::path::PathBuf::from(home)
+    std::path::PathBuf::from(home_dir())
         .join(".config")
         .join("amp")
         .join("settings.json")

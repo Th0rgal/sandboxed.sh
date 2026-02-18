@@ -28,6 +28,7 @@ use crate::agents::{AgentContext, AgentRef, TerminalReason};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
 use crate::secrets::SecretsStore;
+use crate::util::build_history_context;
 use crate::workspace;
 
 use super::auth::AuthUser;
@@ -162,23 +163,6 @@ fn extract_title_from_assistant(content: &str) -> Option<String> {
     } else {
         Some(cleaned.to_string())
     }
-}
-
-/// Build a simple history context from conversation history.
-fn build_history_context(history: &[(String, String)], max_chars: usize) -> String {
-    let mut result = String::new();
-    let mut total_chars = 0;
-
-    for (role, content) in history.iter().rev() {
-        let entry = format!("{}: {}\n\n", role.to_uppercase(), content);
-        if total_chars + entry.len() > max_chars && !result.is_empty() {
-            break;
-        }
-        result = format!("{}{}", entry, result);
-        total_chars += entry.len();
-    }
-
-    result
 }
 
 async fn mission_has_active_automation(

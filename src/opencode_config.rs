@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::library::Plugin;
 use crate::mcp::{McpRegistry, McpScope, McpTransport};
+use crate::util::home_dir;
 
 /// OpenCode connection configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,7 +246,7 @@ fn resolve_command_path(cmd: &str) -> String {
 
     // User-local paths are checked first so that non-root installs (bun, npm,
     // the official OpenCode installer) take precedence over system-wide copies.
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = home_dir();
     let candidates = [
         PathBuf::from(&home).join(".opencode/bin").join(cmd),
         PathBuf::from(&home).join(".local/bin").join(cmd),
@@ -298,7 +299,7 @@ fn resolve_opencode_config_path() -> PathBuf {
             return PathBuf::from(dir).join("opencode.json");
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = home_dir();
     // OpenCode stores its config under ~/.config/opencode by default.
     PathBuf::from(home)
         .join(".config")

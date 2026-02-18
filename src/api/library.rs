@@ -29,6 +29,7 @@ use crate::library::{
     WorkspaceTemplate, WorkspaceTemplateSummary,
 };
 use crate::nspawn::NspawnDistro;
+use crate::util::sanitize_skill_list;
 use crate::workspace::{self, WorkspaceType, DEFAULT_WORKSPACE_ID};
 
 /// Shared library state.
@@ -382,21 +383,6 @@ pub struct CreateConfigProfileRequest {
     /// Optional base profile to copy settings from
     #[serde(default)]
     pub base_profile: Option<String>,
-}
-
-fn sanitize_skill_list(skills: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for skill in skills {
-        let trimmed = skill.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if seen.insert(trimmed.to_string()) {
-            out.push(trimmed.to_string());
-        }
-    }
-    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

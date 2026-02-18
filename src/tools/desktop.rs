@@ -19,24 +19,15 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use super::Tool;
+use crate::util::env_var_bool;
 
 /// Global counter for display numbers to avoid conflicts
 static DISPLAY_COUNTER: AtomicU32 = AtomicU32::new(99);
 
 /// Check if desktop tools are enabled
 pub(crate) fn desktop_enabled() -> bool {
-    env_var_bool("DESKTOP_ENABLED") || env_var_bool("SANDBOXED_SH_ENABLE_DESKTOP_TOOLS")
-}
-
-fn env_var_bool(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            matches!(
-                v.trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "y" | "on"
-            )
-        })
-        .unwrap_or(false)
+    env_var_bool("DESKTOP_ENABLED", false)
+        || env_var_bool("SANDBOXED_SH_ENABLE_DESKTOP_TOOLS", false)
 }
 
 fn kill_pid(pid: u32) {

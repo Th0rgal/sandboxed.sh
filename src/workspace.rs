@@ -28,6 +28,7 @@ use crate::library::LibraryStore;
 use crate::mcp::{McpRegistry, McpScope, McpServerConfig, McpTransport};
 use crate::nspawn::{self, NspawnDistro};
 use crate::tools::terminal::{rtk_binary_path, rtk_enabled};
+use crate::util::{env_var_bool, home_dir};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Workspace Types
@@ -1818,8 +1819,7 @@ fn resolve_codex_dir(
         return workspace_root.join("root").join(".codex");
     }
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home).join(".codex")
+    PathBuf::from(home_dir()).join(".codex")
 }
 
 fn resolve_claudecode_dir(
@@ -1841,8 +1841,7 @@ fn resolve_claudecode_dir(
         return workspace_root.join("root").join(".claude");
     }
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home).join(".claude")
+    PathBuf::from(home_dir()).join(".claude")
 }
 
 fn codex_entry_from_mcp(
@@ -3178,7 +3177,7 @@ fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
         workspace_root
             .join(".sandboxed-sh")
             .join("ai_providers.json"),
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
+        std::path::PathBuf::from(home_dir())
             .join(".sandboxed-sh")
             .join("ai_providers.json"),
     ];
@@ -4075,16 +4074,6 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn env_var_bool(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => matches!(
-            value.trim().to_lowercase().as_str(),
-            "1" | "true" | "yes" | "y" | "on"
-        ),
-        Err(_) => default,
-    }
-}
-
 async fn bootstrap_workspace_harnesses(workspace: &Workspace) -> anyhow::Result<()> {
     if workspace.workspace_type != WorkspaceType::Container || !use_nspawn_for_workspace(workspace)
     {
@@ -4359,8 +4348,7 @@ fn resolve_opencode_config_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
         return std::path::PathBuf::from(dir);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    std::path::PathBuf::from(home)
+    std::path::PathBuf::from(home_dir())
         .join(".config")
         .join("opencode")
 }

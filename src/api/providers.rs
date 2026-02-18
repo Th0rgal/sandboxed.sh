@@ -18,6 +18,7 @@ use tokio::sync::RwLock;
 
 use super::routes::AppState;
 use crate::ai_providers::{AIProviderStore, ProviderType};
+use crate::util::home_dir;
 
 /// Cached model lists fetched from provider APIs at startup.
 /// Maps provider ID (e.g. "anthropic") -> Vec<ProviderModel>
@@ -699,7 +700,7 @@ pub fn get_api_key_for_provider(
     }
 
     // 2. Check OpenCode auth.json
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = home_dir();
     let auth_paths = {
         let mut paths = Vec::new();
         if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
@@ -915,7 +916,7 @@ fn has_valid_auth(value: &serde_json::Value) -> bool {
 /// Get the set of configured provider IDs from OpenCode's auth files.
 fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String> {
     let mut configured = HashSet::new();
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = home_dir();
 
     // 1. Read OpenCode auth.json (~/.local/share/opencode/auth.json)
     let auth_path = {

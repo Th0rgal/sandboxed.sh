@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::library::WorkspaceTemplate;
 use crate::nspawn::NspawnDistro;
+use crate::util::sanitize_skill_list;
 use crate::workspace::{self, TailscaleMode, Workspace, WorkspaceStatus, WorkspaceType};
 
 /// Create workspace routes.
@@ -772,21 +773,6 @@ fn sanitize_env_vars(env_vars: HashMap<String, String>) -> HashMap<String, Strin
         .into_iter()
         .filter(|(key, _)| !key.trim().is_empty())
         .collect()
-}
-
-fn sanitize_skill_list(skills: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for skill in skills {
-        let trimmed = skill.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if seen.insert(trimmed.to_string()) {
-            out.push(trimmed.to_string());
-        }
-    }
-    out
 }
 
 /// Escape a string for safe use in shell commands.

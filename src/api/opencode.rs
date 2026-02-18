@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::opencode_config::OpenCodeConnection;
+use crate::util::home_dir;
 
 /// Create OpenCode connection routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -44,8 +45,7 @@ fn resolve_oh_my_opencode_path() -> std::path::PathBuf {
         }
     }
     // Fall back to ~/.config/opencode/oh-my-opencode.json
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    std::path::PathBuf::from(home)
+    std::path::PathBuf::from(home_dir())
         .join(".config")
         .join("opencode")
         .join("oh-my-opencode.json")
@@ -63,8 +63,7 @@ fn resolve_opencode_config_path() -> std::path::PathBuf {
             return std::path::PathBuf::from(dir).join("opencode.json");
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    std::path::PathBuf::from(home)
+    std::path::PathBuf::from(home_dir())
         .join(".config")
         .join("opencode")
         .join("opencode.json")

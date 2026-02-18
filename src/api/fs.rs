@@ -16,6 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use super::routes::AppState;
+use crate::util::home_dir;
 use crate::workspace::WorkspaceType;
 
 #[derive(Debug, Deserialize)]
@@ -33,8 +34,7 @@ fn runtime_workspace_path() -> PathBuf {
             return PathBuf::from(path);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home)
+    PathBuf::from(home_dir())
         .join(".sandboxed-sh")
         .join("runtime")
         .join("current_workspace.json")

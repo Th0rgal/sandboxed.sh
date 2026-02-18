@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::ai_providers::{AuthMethod, PendingOAuth, ProviderType};
+use crate::util::home_dir;
 
 /// Anthropic OAuth client ID (from opencode-anthropic-auth plugin)
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -40,11 +41,6 @@ const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const OPENAI_SCOPE: &str = "openid profile email offline_access";
 const OPENAI_TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const OPENAI_ID_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
-
-/// Get the HOME directory path, defaulting to /root if not set.
-fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
-}
 
 async fn exchange_openai_id_token_for_api_key(
     client: &reqwest::Client,

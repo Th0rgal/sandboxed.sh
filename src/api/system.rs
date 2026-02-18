@@ -21,6 +21,7 @@ use serde::Serialize;
 use tokio::process::Command;
 
 use super::routes::AppState;
+use crate::util::home_dir;
 
 /// Git remote used for sandboxed.sh self-updates
 const SANDBOXED_REPO_REMOTE: &str = "https://github.com/Th0rgal/sandboxed.sh.git";
@@ -484,7 +485,7 @@ async fn which_codex() -> Option<String> {
 /// Find the path to the OpenCode binary.
 /// Checks PATH first, then user-local install, then system-wide.
 async fn which_opencode() -> Option<String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = home_dir();
     let user_local = format!("{}/.opencode/bin/opencode", home);
     which_binary("opencode", &[&user_local, "/usr/local/bin/opencode"]).await
 }
@@ -772,7 +773,7 @@ fn extract_version_token(input: &str) -> Option<String> {
 /// Get oh-my-opencode version and status.
 async fn get_oh_my_opencode_info() -> ComponentInfo {
     // Check if oh-my-opencode is installed by looking for the config file
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = home_dir();
     let config_path = format!("{}/.config/opencode/oh-my-opencode.json", home);
 
     let installed = tokio::fs::metadata(&config_path).await.is_ok();
@@ -833,7 +834,7 @@ async fn get_oh_my_opencode_version() -> Option<String> {
 
     // Fallback: scan bun cache for platform-specific packages
     // (e.g. oh-my-opencode-linux-x64@3.0.1@@@1)
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = home_dir();
     let output = Command::new("bash")
         .args([
             "-c",
@@ -1162,7 +1163,7 @@ fn stream_opencode_update() -> impl Stream<Item = Result<Event, std::convert::In
 
         yield sse("log", "Download complete, installing...", Some(50));
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let home = home_dir();
         let source_path = format!("{}/.opencode/bin/opencode", home);
         // SAFETY: geteuid() is a trivial syscall with no preconditions.
         let is_root = unsafe { libc::geteuid() } == 0;
@@ -1375,7 +1376,7 @@ fn stream_oh_my_opencode_update() -> impl Stream<Item = Result<Event, std::conve
     async_stream::stream! {
         yield sse("log", "Starting oh-my-opencode update...", Some(0));
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let home = home_dir();
 
         // Remove conflicting npm/nvm global installs (we only use bunx)
         yield sse("log", "Removing npm/nvm global installs...", Some(5));
@@ -1442,7 +1443,7 @@ fn stream_opencode_uninstall() -> impl Stream<Item = Result<Event, std::convert:
     async_stream::stream! {
         yield sse("log", "Starting OpenCode uninstall...", Some(0));
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let home = home_dir();
         // SAFETY: geteuid() is a trivial syscall with no preconditions.
         let is_root = unsafe { libc::geteuid() } == 0;
 
@@ -1561,7 +1562,7 @@ fn stream_npm_package_uninstall(
                 yield sse("log", "Package removed from npm", Some(60));
 
                 // Remove configuration directory
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                let home = home_dir();
                 let config_path = format!("{}/{}", home, config_dir);
                 if std::path::Path::new(&config_path).exists() {
                     yield sse("log", format!("Removing {} configuration...", display_name), Some(80));
@@ -1605,7 +1606,7 @@ fn stream_oh_my_opencode_uninstall() -> impl Stream<Item = Result<Event, std::co
     async_stream::stream! {
         yield sse("log", "Starting oh-my-opencode uninstall...", Some(0));
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let home = home_dir();
 
         // Remove npm global install if exists
         yield sse("log", "Removing npm global install...", Some(10));

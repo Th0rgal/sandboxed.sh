@@ -37,15 +37,7 @@ pub enum NspawnError {
 
 pub type NspawnResult<T> = Result<T, NspawnError>;
 
-fn env_var_bool(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => matches!(
-            value.trim().to_lowercase().as_str(),
-            "1" | "true" | "yes" | "y" | "on"
-        ),
-        Err(_) => default,
-    }
-}
+use crate::util::env_var_bool;
 
 fn command_on_path(cmd: &str) -> bool {
     if cmd.contains('/') {

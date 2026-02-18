@@ -2,6 +2,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde_json::Value;
 
+use crate::util::home_dir;
+
 fn resolve_claudecode_config_path() -> std::path::PathBuf {
     if let Ok(path) = std::env::var("CLAUDE_CONFIG") {
         if !path.trim().is_empty() {
@@ -21,8 +23,7 @@ fn resolve_claudecode_config_path() -> std::path::PathBuf {
         return opencode_home;
     }
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    std::path::PathBuf::from(home)
+    std::path::PathBuf::from(home_dir())
         .join(".claude")
         .join("settings.json")
 }
