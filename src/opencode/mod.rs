@@ -219,6 +219,8 @@ impl OpenCodeClient {
                 Some(s) => s,
                 None => {
                     tracing::error!(session_id = %session_id_clone, "Failed to get curl stdout");
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
                     return;
                 }
             };
@@ -273,6 +275,7 @@ impl OpenCodeClient {
                                             "SSE receiver dropped"
                                         );
                                         let _ = child.kill().await;
+                                        let _ = child.wait().await;
                                         return;
                                     }
                                     if is_complete {
@@ -282,6 +285,7 @@ impl OpenCodeClient {
                                             "OpenCode message completed"
                                         );
                                         let _ = child.kill().await;
+                                        let _ = child.wait().await;
                                         return;
                                     }
                                 }
@@ -314,6 +318,7 @@ impl OpenCodeClient {
             }
 
             let _ = child.kill().await;
+            let _ = child.wait().await;
         });
 
         // Spawn message sending task

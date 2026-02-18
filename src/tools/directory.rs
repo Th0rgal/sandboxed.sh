@@ -214,8 +214,12 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     }
 
     // Last part must be at end if pattern doesn't end with *
-    if !pattern.ends_with('*') && !parts.last().unwrap().is_empty() {
-        return text.ends_with(parts.last().unwrap());
+    if !pattern.ends_with('*') {
+        if let Some(last) = parts.last() {
+            if !last.is_empty() {
+                return text.ends_with(last);
+            }
+        }
     }
 
     true
