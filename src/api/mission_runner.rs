@@ -81,6 +81,10 @@ fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option
     }
 }
 
+fn strip_opencode_status_lines(text: &str) -> Cow<'_, str> {
+    strip_opencode_banner_lines(text)
+}
+
 /// Strip `<think>...</think>` tags from text output.
 /// Some models (e.g. Minimax, DeepSeek) emit internal reasoning inside inline
 /// `<think>` tags that should not be shown in the text output.
@@ -187,14 +191,6 @@ async fn set_control_state_for_mission(
         queue_len,
         mission_id: mission_id_opt,
     });
-}
-
-fn is_opencode_status_line(line: &str) -> bool {
-    is_opencode_banner_line(line)
-}
-
-fn strip_opencode_status_lines(text: &str) -> String {
-    strip_opencode_banner_lines(text).into_owned()
 }
 
 fn handle_tool_part_update(
@@ -336,11 +332,13 @@ fn handle_part_update(
         return None;
     };
 
-    let filtered = strip_opencode_status_lines(&content);
-    if filtered != content {
-        *buffer = filtered.clone();
+    let mut content = content;
+    if let Cow::Owned(cleaned) = strip_opencode_status_lines(&content) {
+        if cleaned != content {
+            *buffer = cleaned.clone();
+        }
+        content = cleaned;
     }
-    let content = filtered;
 
     // Strip inline <think>...</think> tags from text parts.
     // Don't modify the buffer so incomplete tags across deltas are handled correctly.
@@ -9702,13 +9700,13 @@ fn cleanup_old_debug_files(
 mod tests {
     use super::{
         build_history_context, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_opencode_status_line, is_rate_limited_error,
-        is_session_corruption_error, is_tool_call_only_output, opencode_output_needs_fallback,
-        opencode_session_token_from_line, parse_opencode_session_token,
-        parse_opencode_stderr_text_part, remap_legacy_codex_model, running_health,
-        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_opencode_status_lines, strip_think_tags, sync_opencode_agent_config, MissionHealth,
-        MissionRunState, MissionStallSeverity, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        extract_thought_line, is_rate_limited_error, is_session_corruption_error,
+        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
+        parse_opencode_session_token, parse_opencode_stderr_text_part, remap_legacy_codex_model,
+        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
+        strip_opencode_banner_lines, strip_opencode_status_lines, strip_think_tags,
+        sync_opencode_agent_config, MissionHealth, MissionRunState, MissionStallSeverity,
+        STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
     use serde_json::json;
@@ -10159,17 +10157,6 @@ mod tests {
         assert_eq!(thought, "first");
         assert!(remaining.contains("thought: second"));
         assert!(remaining.contains("regular text"));
-    }
-
-    // ── is_opencode_status_line delegation tests ──────────────────────
-
-    #[test]
-    fn is_opencode_status_line_delegates_to_banner_line() {
-        // Verify delegation: status_line matches the same things as banner_line
-        assert!(is_opencode_status_line("Starting OpenCode server..."));
-        assert!(is_opencode_status_line("all tasks completed"));
-        assert!(is_opencode_status_line("session: ses_abc123"));
-        assert!(!is_opencode_status_line("Hello, I am the model."));
     }
 
     // ── strip_opencode_status_lines delegation tests ──────────────────
