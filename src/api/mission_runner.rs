@@ -10,6 +10,7 @@
 //! - Health monitoring
 //! - Working directory (isolated per mission)
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -2840,10 +2841,7 @@ pub fn run_claudecode_turn<'a>(
                     idle_deadline = Instant::now() + idle_timeout;
 
                     let raw_line = raw_line.trim_end_matches(&['\r', '\n'][..]);
-                    let mut cleaned = strip_ansi_codes(raw_line);
-                    // The Claude CLI can occasionally emit NUL/control characters on PTY streams
-                    // (e.g. leading '^@') which breaks JSON parsing. Remove them before parsing.
-                    cleaned.retain(|ch| !ch.is_control());
+                    let cleaned = strip_ansi_codes(raw_line);
                     let line = cleaned.trim();
                     if line.is_empty() {
                         continue;
@@ -3282,17 +3280,7 @@ pub fn run_claudecode_turn<'a>(
             // We check for specific Anthropic error types and HTTP status codes.
             // Using "overloaded_error" rather than bare "overloaded" to avoid
             // false positives from tool output or user content.
-            let lower = final_result.to_lowercase();
-            let is_rate_limited = lower.contains("overloaded_error")
-                || lower.contains("rate limit")
-                || lower.contains("rate_limit")
-                || lower.contains("resource_exhausted")
-                || lower.contains("too many requests")
-                || lower.contains("error: 429")
-                || lower.contains("error: 529")
-                || lower.contains("status code: 429")
-                || lower.contains("status code: 529");
-            let reason = if is_rate_limited {
+            let reason = if is_rate_limited_error(&final_result) {
                 TerminalReason::RateLimited
             } else {
                 TerminalReason::LlmError
@@ -3361,44 +3349,146 @@ fn workspace_path_for_env(
     host_path.to_path_buf()
 }
 
-fn strip_ansi_codes(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Skip ANSI escape sequences like "\x1b[31m"
-            if let Some('[') = chars.peek() {
-                let _ = chars.next();
-                for c in chars.by_ref() {
-                    if c == 'm' {
-                        break;
-                    }
-                }
-                continue;
-            }
-        }
-        out.push(ch);
+fn strip_ansi_codes(input: &str) -> Cow<'_, str> {
+    let bytes = input.as_bytes();
+    if !bytes
+        .iter()
+        .any(|byte| *byte == 0x1b || *byte == 0x9b || is_disallowed_control(*byte))
+    {
+        return Cow::Borrowed(input);
     }
-    out
+
+    let mut cleaned = String::with_capacity(input.len());
+    let mut last_copy = 0;
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        match bytes[idx] {
+            0x1b => {
+                cleaned.push_str(&input[last_copy..idx]);
+                idx = consume_escape_sequence(bytes, idx);
+                last_copy = idx;
+            }
+            0x9b => {
+                cleaned.push_str(&input[last_copy..idx]);
+                idx = consume_csi_sequence(bytes, idx + 1);
+                last_copy = idx;
+            }
+            byte if is_disallowed_control(byte) => {
+                cleaned.push_str(&input[last_copy..idx]);
+                idx += 1;
+                last_copy = idx;
+            }
+            _ => idx += 1,
+        }
+    }
+
+    cleaned.push_str(&input[last_copy..]);
+    Cow::Owned(cleaned)
 }
 
-fn parse_opencode_session_token(value: &str) -> Option<String> {
-    let mut token = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            token.push(ch);
-        } else {
-            break;
+fn is_disallowed_control(byte: u8) -> bool {
+    matches!(byte, 0x00..=0x08 | 0x0b | 0x0c | 0x0d | 0x0e..=0x1f | 0x7f)
+}
+
+fn consume_escape_sequence(bytes: &[u8], esc_idx: usize) -> usize {
+    let len = bytes.len();
+    let idx = esc_idx + 1;
+    if idx >= len {
+        return len;
+    }
+
+    match bytes[idx] {
+        b'[' => consume_csi_sequence(bytes, idx + 1),
+        b']' => consume_osc_sequence(bytes, idx + 1),
+        b'P' | b'^' | b'_' => consume_st_sequence(bytes, idx + 1),
+        _ => (esc_idx + 2).min(len),
+    }
+}
+
+fn consume_csi_sequence(bytes: &[u8], mut idx: usize) -> usize {
+    let len = bytes.len();
+    while idx < len {
+        let byte = bytes[idx];
+        if (0x40..=0x7e).contains(&byte) {
+            return idx + 1;
+        }
+        idx += 1;
+    }
+    len
+}
+
+fn consume_osc_sequence(bytes: &[u8], mut idx: usize) -> usize {
+    let len = bytes.len();
+    while idx < len {
+        match bytes[idx] {
+            0x07 => return idx + 1,
+            0x1b if idx + 1 < len && bytes[idx + 1] == b'\\' => return idx + 2,
+            _ => idx += 1,
         }
     }
-    if token.starts_with("ses_") {
-        return Some(token);
+    len
+}
+
+fn consume_st_sequence(bytes: &[u8], mut idx: usize) -> usize {
+    let len = bytes.len();
+    while idx < len {
+        if bytes[idx] == 0x1b && idx + 1 < len && bytes[idx + 1] == b'\\' {
+            return idx + 2;
+        }
+        idx += 1;
     }
-    if token.len() < 8 {
-        None
-    } else {
+    len
+}
+
+const OPENCODE_SESSION_KEYS: [&[u8]; 4] =
+    [b"session id:", b"session:", b"session_id:", b"session="];
+
+fn parse_opencode_session_token(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut end = 0;
+    for (idx, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' => {
+                end = idx + 1;
+            }
+            _ => break,
+        }
+    }
+
+    if end == 0 {
+        return None;
+    }
+
+    let token = &value[..end];
+    if token.starts_with("ses_") || token.len() >= 8 {
         Some(token)
+    } else {
+        None
     }
+}
+
+fn opencode_session_token_from_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let bytes = trimmed.as_bytes();
+    for key in OPENCODE_SESSION_KEYS {
+        if let Some(idx) = find_ascii_case_insensitive(bytes, key) {
+            let rest = trimmed[idx + key.len()..].trim();
+            if let Some(token) = parse_opencode_session_token(rest) {
+                return Some(token);
+            }
+        }
+    }
+
+    None
 }
 
 /// Install a lightweight `opencode` wrapper script that intercepts `opencode serve` commands
@@ -3522,22 +3612,10 @@ fn prepend_opencode_bin_to_path(env: &mut HashMap<String, String>, workspace: &W
 }
 
 fn extract_opencode_session_id(output: &str) -> Option<String> {
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let lower = trimmed.to_lowercase();
-        for key in ["session id:", "session:", "session_id:", "session="] {
-            if let Some(idx) = lower.find(key) {
-                let rest = trimmed[idx + key.len()..].trim();
-                if let Some(token) = parse_opencode_session_token(rest) {
-                    return Some(token);
-                }
-            }
-        }
-    }
-    None
+    output
+        .lines()
+        .find_map(opencode_session_token_from_line)
+        .map(ToOwned::to_owned)
 }
 
 /// Returns true if the line is an OpenCode runner/status banner (not model output).
@@ -3551,61 +3629,115 @@ fn extract_opencode_session_id(output: &str) -> Option<String> {
 /// contain that word (e.g. "Task completed successfully"), which is a critical
 /// correctness bug when the SSE path is unavailable and stdout is the only source.
 fn is_opencode_banner_line(line: &str) -> bool {
-    let lower = line.to_lowercase();
+    const PREFIXES: [&[u8]; 11] = [
+        b"starting opencode server",
+        b"opencode server started",
+        b"auto-selected port",
+        b"using port",
+        b"server listening",
+        b"sending prompt",
+        b"waiting for completion",
+        b"all tasks completed",
+        b"event stream did not close",
+        b"continuing shutdown",
+        b"[run]",
+    ];
 
-    // Runner lifecycle banners (exact prefix matches)
-    lower.contains("starting opencode server")
-        || lower.contains("opencode server started")
-        || lower.contains("auto-selected port")
-        || lower.starts_with("using port")
-        || lower.contains("server listening")
-
-    // Prompt / completion status
-        || lower.starts_with("sending prompt")
-        || lower.starts_with("waiting for completion")
-        || lower.starts_with("all tasks completed")
-
-    // Session identification lines — match the "Session: ses_" / "Session ID: ses_"
-    // prefix, not bare "session:" which would match model text discussing sessions.
-        || lower.starts_with("session id:")
-        || lower.starts_with("session: ses_")
-
-    // Shutdown / cleanup banners
-        || lower.contains("event stream did not close")
-        || lower.contains("continuing shutdown")
-
-    // [run]-prefixed runner status lines
-        || lower.starts_with("[run]")
+    let bytes = line.as_bytes();
+    PREFIXES
+        .iter()
+        .any(|needle| starts_with_ascii_case_insensitive(bytes, needle))
+        || opencode_session_token_from_line(line).is_some()
 }
 
-fn strip_opencode_banner_lines(output: &str) -> String {
-    let cleaned = strip_ansi_codes(output);
-    cleaned
-        .lines()
-        .filter(|line| !is_opencode_banner_line(line.trim()))
-        .collect::<Vec<_>>()
-        .join("\n")
+fn starts_with_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    if haystack.len() < needle.len() {
+        return false;
+    }
+
+    haystack[..needle.len()]
+        .iter()
+        .zip(needle.iter())
+        .all(|(&left, &right)| ascii_lower(left) == ascii_lower(right))
+}
+
+fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if haystack.len() < needle.len() || needle.is_empty() {
+        return None;
+    }
+
+    for idx in 0..=haystack.len() - needle.len() {
+        if starts_with_ascii_case_insensitive(&haystack[idx..], needle) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+#[inline]
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    find_ascii_case_insensitive(haystack.as_bytes(), needle.as_bytes()).is_some()
+}
+
+#[inline]
+fn ascii_lower(byte: u8) -> u8 {
+    match byte {
+        b'A'..=b'Z' => byte + 32,
+        _ => byte,
+    }
+}
+
+fn is_rate_limited_error(message: &str) -> bool {
+    const RATE_LIMIT_MARKERS: [&str; 9] = [
+        "overloaded_error",
+        "rate limit",
+        "rate_limit",
+        "resource_exhausted",
+        "too many requests",
+        "error: 429",
+        "error: 529",
+        "status code: 429",
+        "status code: 529",
+    ];
+
+    RATE_LIMIT_MARKERS
+        .iter()
+        .any(|needle| contains_ascii_case_insensitive(message, needle))
+}
+
+fn strip_opencode_banner_lines(output: &str) -> Cow<'_, str> {
+    let no_ansi = strip_ansi_codes(output);
+    let source = no_ansi.as_ref();
+    let has_banner = source.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && is_opencode_banner_line(trimmed)
+    });
+    if !has_banner {
+        return no_ansi;
+    }
+
+    let mut result = String::with_capacity(source.len());
+    let mut wrote_line = false;
+    for line in source.lines().filter(|line| {
+        let trimmed = line.trim();
+        trimmed.is_empty() || !is_opencode_banner_line(trimmed)
+    }) {
+        if wrote_line {
+            result.push('\n');
+        }
+        result.push_str(line);
+        wrote_line = true;
+    }
+    Cow::Owned(result)
+}
+
+fn sanitized_opencode_stdout(output: &str) -> Cow<'_, str> {
+    strip_opencode_banner_lines(output)
 }
 
 fn opencode_output_needs_fallback(output: &str) -> bool {
-    let cleaned = strip_ansi_codes(output);
-    let lines: Vec<String> = cleaned
-        .lines()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-        .collect();
-
-    if lines.is_empty() {
-        return true;
-    }
-
-    for line in lines {
-        if !is_opencode_banner_line(&line) {
-            return false;
-        }
-    }
-
-    true
+    let sanitized = sanitized_opencode_stdout(output);
+    sanitized.trim().is_empty()
 }
 
 /// Returns true if the output looks like a raw tool-call JSON fragment rather
@@ -3618,21 +3750,19 @@ fn opencode_output_needs_fallback(output: &str) -> bool {
 /// or `type` == `function_call`/`tool_use`/`tool-call`), the output is
 /// considered tool-call-only and should not be returned as assistant text.
 fn is_tool_call_only_output(output: &str) -> bool {
-    let cleaned = strip_ansi_codes(output);
-    let lines: Vec<String> = cleaned
-        .lines()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty() && !is_opencode_banner_line(line))
-        .collect();
+    let sanitized = sanitized_opencode_stdout(output);
+    let mut saw_candidate = false;
 
-    if lines.is_empty() {
-        return false; // empty/banner-only is handled by opencode_output_needs_fallback
-    }
+    for raw_line in sanitized.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
 
-    for line in &lines {
+        saw_candidate = true;
+
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
             if let Some(obj) = json.as_object() {
-                // Check for tool-call type markers
                 let is_type_tool = obj
                     .get("type")
                     .and_then(|v| v.as_str())
@@ -3644,21 +3774,18 @@ fn is_tool_call_only_output(output: &str) -> bool {
                     })
                     .unwrap_or(false);
 
-                // Check for name + arguments/input pattern (common in all tool-call formats)
                 let has_name = obj.contains_key("name");
                 let has_args = obj.contains_key("arguments") || obj.contains_key("input");
-                let is_tool_shape = has_name && has_args;
-
-                if is_type_tool || is_tool_shape {
-                    continue; // this line is a tool-call fragment
+                if is_type_tool || (has_name && has_args) {
+                    continue;
                 }
             }
         }
-        // Line is not a tool-call JSON fragment — real text exists
-        return false;
+
+        return false; // Non-tool JSON or plain text means we have a real answer
     }
 
-    true // every non-banner line was a tool-call JSON fragment
+    saw_candidate // true only if at least one non-banner, non-empty line existed
 }
 
 fn allocate_opencode_server_port() -> Option<u16> {
@@ -8155,6 +8282,9 @@ pub async fn run_opencode_turn(
         let _ = handle.await;
     }
 
+    let sse_error = sse_error_message.lock().unwrap().clone();
+    let has_sse_error = sse_error.is_some();
+
     // Check exit status
     if let Ok(status) = exit_status {
         if !status.success() {
@@ -8167,10 +8297,10 @@ pub async fn run_opencode_turn(
 
     // Surface SSE error messages (e.g. session.error) that were captured during streaming.
     // These are high-confidence errors from the SSE stream and should block recovery.
-    if let Some(err_msg) = sse_error_message.lock().unwrap().clone() {
+    if let Some(err_msg) = sse_error.as_ref() {
         had_error = true;
         if opencode_output_needs_fallback(&final_result) {
-            final_result = err_msg;
+            final_result = err_msg.clone();
         }
     }
 
@@ -8179,7 +8309,7 @@ pub async fn run_opencode_turn(
     // uses broad pattern matching and can produce false positives.  They set
     // had_error but do NOT write into sse_error_message, so recovery guards
     // below can still clear had_error when valid content is recovered.
-    if sse_error_message.lock().unwrap().is_none() {
+    if !has_sse_error {
         if let Some(err_msg) = stderr_error_message.lock().unwrap().clone() {
             had_error = true;
             if opencode_output_needs_fallback(&final_result) {
@@ -8260,28 +8390,26 @@ pub async fn run_opencode_turn(
     // Only clear had_error from recovery if there is no real SSE error.
     // Without this guard, a session.error followed by partial text in the
     // SSE buffer would clear the error and return a truncated response.
-    if (recovered_from_sse || recovered_from_stderr) && sse_error_message.lock().unwrap().is_none()
-    {
+    if (recovered_from_sse || recovered_from_stderr) && !has_sse_error {
         had_error = false;
     }
 
     // Clear had_error when we have real (non-banner) content and no SSE error.
     // This avoids false failures when the CLI exited non-zero but produced real output.
-    if had_error
-        && !opencode_output_needs_fallback(&final_result)
-        && sse_error_message.lock().unwrap().is_none()
-    {
+    if had_error && !opencode_output_needs_fallback(&final_result) && !has_sse_error {
         had_error = false;
     }
 
     // Strip inline <think>...</think> tags from final output (Minimax, DeepSeek, etc.)
     final_result = strip_think_tags(&final_result);
 
-    // Final safeguard: strip any remaining banner lines that may have leaked through
+    // Final safeguard: reuse the same ANSI + banner sanitizer we employ for detection
     // (fixes #151 - runner logs appearing in assistant message)
-    let stripped_result = strip_opencode_banner_lines(&final_result);
-    if !stripped_result.trim().is_empty() {
-        final_result = stripped_result;
+    let cleaned_result = sanitized_opencode_stdout(&final_result);
+    if !cleaned_result.trim().is_empty() {
+        if let Cow::Owned(clean) = cleaned_result {
+            final_result = clean;
+        }
     }
 
     let mut emitted_thinking = false;
@@ -9096,17 +9224,7 @@ pub async fn run_amp_turn(
             .with_terminal_reason(TerminalReason::Completed)
     } else {
         // Detect rate limit / overloaded errors for account rotation.
-        let lower = final_result.to_lowercase();
-        let is_rate_limited = lower.contains("overloaded_error")
-            || lower.contains("rate limit")
-            || lower.contains("rate_limit")
-            || lower.contains("resource_exhausted")
-            || lower.contains("too many requests")
-            || lower.contains("error: 429")
-            || lower.contains("error: 529")
-            || lower.contains("status code: 429")
-            || lower.contains("status code: 529");
-        let reason = if is_rate_limited {
+        let reason = if is_rate_limited_error(&final_result) {
             TerminalReason::RateLimited
         } else {
             TerminalReason::LlmError
@@ -9424,17 +9542,7 @@ pub async fn run_codex_turn(
             .with_terminal_reason(TerminalReason::Completed)
     } else {
         // Detect rate limit / overloaded errors for account rotation.
-        let lower = final_message.to_lowercase();
-        let is_rate_limited = lower.contains("overloaded_error")
-            || lower.contains("rate limit")
-            || lower.contains("rate_limit")
-            || lower.contains("resource_exhausted")
-            || lower.contains("too many requests")
-            || lower.contains("error: 429")
-            || lower.contains("error: 529")
-            || lower.contains("status code: 429")
-            || lower.contains("status code: 529");
-        let reason = if is_rate_limited {
+        let reason = if is_rate_limited_error(&final_message) {
             TerminalReason::RateLimited
         } else {
             TerminalReason::LlmError
@@ -9593,15 +9701,18 @@ fn cleanup_old_debug_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_history_context, extract_part_text, extract_str, extract_thought_line,
-        is_opencode_status_line, is_session_corruption_error, is_tool_call_only_output,
-        parse_opencode_session_token, parse_opencode_stderr_text_part, remap_legacy_codex_model,
-        running_health, stall_severity, strip_ansi_codes, strip_opencode_status_lines,
-        strip_think_tags, sync_opencode_agent_config, MissionHealth, MissionRunState,
-        MissionStallSeverity, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        build_history_context, extract_opencode_session_id, extract_part_text, extract_str,
+        extract_thought_line, is_opencode_status_line, is_rate_limited_error,
+        is_session_corruption_error, is_tool_call_only_output, opencode_output_needs_fallback,
+        opencode_session_token_from_line, parse_opencode_session_token,
+        parse_opencode_stderr_text_part, remap_legacy_codex_model, running_health,
+        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
+        strip_opencode_status_lines, strip_think_tags, sync_opencode_agent_config, MissionHealth,
+        MissionRunState, MissionStallSeverity, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
     use serde_json::json;
+    use std::borrow::Cow;
     use std::fs;
 
     #[test]
@@ -9763,12 +9874,62 @@ mod tests {
             "The file has been modified successfully."
         ));
         assert!(!is_opencode_banner_line("I found 3 issues in your code."));
+        assert!(!is_opencode_banner_line(
+            "If you see 'All tasks completed', the build finished."
+        ));
+    }
+
+    #[test]
+    fn is_rate_limited_error_detects_markers_case_insensitively() {
+        assert!(is_rate_limited_error("Error: 429 Too Many Requests"));
+        assert!(is_rate_limited_error("resource_exhausted: slow down"));
+        assert!(is_rate_limited_error("Overloaded_Error occurred"));
+        assert!(!is_rate_limited_error("Model finished successfully"));
+        assert!(!is_rate_limited_error("error: 123"));
+    }
+
+    #[test]
+    fn extract_opencode_session_id_matches_case_insensitively() {
+        let source = "noise\nSESSION ID: ses_abc123\nmore noise";
+        assert_eq!(
+            extract_opencode_session_id(source),
+            Some("ses_abc123".to_string())
+        );
+
+        let equals_variant = "Session=SES_DEF456";
+        assert_eq!(
+            extract_opencode_session_id(equals_variant),
+            Some("SES_DEF456".to_string())
+        );
+
+        assert!(extract_opencode_session_id("no session here").is_none());
+    }
+
+    #[test]
+    fn opencode_session_token_from_line_parses_supported_variants() {
+        assert_eq!(
+            opencode_session_token_from_line("Session ID: ses_abc123"),
+            Some("ses_abc123")
+        );
+        assert_eq!(
+            opencode_session_token_from_line("session: SES_DEF456"),
+            Some("SES_DEF456")
+        );
+        assert_eq!(
+            opencode_session_token_from_line("session_id: foo-bar-123"),
+            Some("foo-bar-123")
+        );
+        assert_eq!(
+            opencode_session_token_from_line("session=foo_bar_789"),
+            Some("foo_bar_789")
+        );
+        assert_eq!(opencode_session_token_from_line("session=foo_bar"), None);
+        assert_eq!(opencode_session_token_from_line("session id: short"), None);
+        assert_eq!(opencode_session_token_from_line("no session here"), None);
     }
 
     #[test]
     fn strip_opencode_banner_lines_removes_runner_status() {
-        use super::strip_opencode_banner_lines;
-
         // Pure banner output should become empty
         let input = "Starting opencode server (auto port selection enabled)...\nUsing port 44563\nSession: ses_abc\nSending prompt...\nWaiting for completion...\nAll tasks completed.";
         let result = strip_opencode_banner_lines(input);
@@ -9782,13 +9943,53 @@ mod tests {
         // Non-banner output should be preserved
         let model_output = "Here's the solution:\n\n```python\nprint('hello')\n```";
         let result = strip_opencode_banner_lines(model_output);
+        assert!(matches!(result, Cow::Borrowed(_)));
         assert_eq!(result, model_output);
     }
 
     #[test]
-    fn opencode_output_needs_fallback_detects_banner_only() {
-        use super::opencode_output_needs_fallback;
+    fn strip_opencode_banner_lines_preserves_inner_whitespace() {
+        let input = "Starting opencode server...\n\n  indented line\n[run] helper\ntrailing  \n";
+        let result = strip_opencode_banner_lines(input);
+        assert_eq!(result.as_ref(), "\n  indented line\ntrailing  ");
+    }
 
+    #[test]
+    fn strip_ansi_codes_removes_csi_and_osc_sequences() {
+        let input = "\u{1b}[31mred\u{1b}[0m normal \u{1b}]0;title\u{7}text";
+        let cleaned = strip_ansi_codes(input);
+        assert_eq!(cleaned, "red normal text");
+    }
+
+    #[test]
+    fn strip_ansi_codes_handles_st_terminated_sequences() {
+        let input = "\u{1b}]52;c;payload\u{1b}\\body\u{1b}[?25l";
+        let cleaned = strip_ansi_codes(input);
+        assert_eq!(cleaned, "body");
+    }
+
+    #[test]
+    fn strip_ansi_codes_removes_disallowed_control_bytes() {
+        let input = "\0leading\u{1f}middle\u{7f}end";
+        let cleaned = strip_ansi_codes(input);
+        assert_eq!(cleaned, "leadingmiddleend");
+    }
+
+    #[test]
+    fn sanitized_opencode_stdout_strips_ansi_and_banners() {
+        let noisy = "\u{1b}[31mStarting opencode server...\u{1b}[0m\n[run] helper\nreal output";
+        let sanitized = sanitized_opencode_stdout(noisy);
+        assert_eq!(sanitized, "real output");
+        assert!(matches!(sanitized, Cow::Owned(_)));
+
+        let clean = "Here is the answer";
+        let passthrough = sanitized_opencode_stdout(clean);
+        assert_eq!(passthrough, clean);
+        assert!(matches!(passthrough, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn opencode_output_needs_fallback_detects_banner_only() {
         // Empty output needs fallback
         assert!(opencode_output_needs_fallback(""));
         assert!(opencode_output_needs_fallback("   "));
@@ -10373,5 +10574,26 @@ mod tests {
             parse_opencode_stderr_text_part(line),
             Some("Hello world".to_string())
         );
+    }
+
+    #[test]
+    fn opencode_output_needs_fallback_ignores_ansi_banners() {
+        let banner_with_ansi = "\u{1b}[32mStarting opencode server...\u{1b}[0m";
+        assert!(opencode_output_needs_fallback(banner_with_ansi));
+
+        let ansi_with_content = "\u{1b}[33mStarting opencode server...\u{1b}[0m\nreal output";
+        assert!(!opencode_output_needs_fallback(ansi_with_content));
+    }
+
+    #[test]
+    fn is_tool_call_only_output_detects_tool_json_after_sanitizing() {
+        let ansi_tool = "\u{1b}[32mStarting opencode server...\u{1b}[0m\n{\"name\":\"do\",\"arguments\":\"{}\"}";
+        assert!(is_tool_call_only_output(ansi_tool));
+    }
+
+    #[test]
+    fn is_tool_call_only_output_rejects_real_text() {
+        let mixed = "{\"name\":\"tool\",\"arguments\":\"{}\"}\nreal answer";
+        assert!(!is_tool_call_only_output(mixed));
     }
 }
