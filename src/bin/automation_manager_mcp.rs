@@ -620,16 +620,20 @@ async fn main() {
             Err(e) => {
                 let error_resp =
                     JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {}", e));
-                let response_json = serde_json::to_string(&error_resp).unwrap();
-                writeln!(stdout, "{}", response_json).ok();
+                if let Ok(json) = serde_json::to_string(&error_resp) {
+                    writeln!(stdout, "{}", json).ok();
+                }
                 stdout.flush().ok();
                 continue;
             }
         };
 
         let response = server.handle_request(request).await;
-        let response_json = serde_json::to_string(&response).unwrap();
-        writeln!(stdout, "{}", response_json).ok();
+        if let Ok(json) = serde_json::to_string(&response) {
+            writeln!(stdout, "{}", json).ok();
+        } else {
+            eprintln!("[automation-mcp] Failed to serialize response");
+        }
         stdout.flush().ok();
     }
 }

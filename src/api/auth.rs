@@ -199,7 +199,9 @@ pub async fn login(
                 ));
             }
 
-            let account = account.unwrap();
+            // account is guaranteed Some here: the None branch above sets valid=false,
+            // and we returned early on !valid.
+            let account = account.expect("account must be Some when valid is true");
             let effective_id = effective_user_id(account);
 
             AuthUser {
@@ -435,10 +437,10 @@ pub async fn change_password(
         let current_valid = if has_stored_hash {
             let hash = stored_auth
                 .as_ref()
-                .unwrap()
+                .expect("stored_auth must be Some when has_stored_hash is true")
                 .password_hash
                 .as_ref()
-                .unwrap();
+                .expect("password_hash must be Some when has_stored_hash is true");
             verify_password_hash(current, hash)
         } else {
             let expected = state

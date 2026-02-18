@@ -740,7 +740,9 @@ fn main() {
             Ok(req) => req,
             Err(e) => {
                 let response = JsonRpcResponse::error(Value::Null, -32700, e.to_string());
-                let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap());
+                if let Ok(json) = serde_json::to_string(&response) {
+                    let _ = writeln!(stdout, "{}", json);
+                }
                 let _ = stdout.flush();
                 continue;
             }

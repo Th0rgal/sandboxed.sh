@@ -1162,8 +1162,9 @@ fn main() {
             Err(e) => {
                 eprintln!("[desktop-mcp] Parse error: {}", e);
                 let response = JsonRpcResponse::error(Value::Null, -32700, "Parse error");
-                let json = serde_json::to_string(&response).unwrap();
-                let _ = writeln!(stdout, "{}", json);
+                if let Ok(json) = serde_json::to_string(&response) {
+                    let _ = writeln!(stdout, "{}", json);
+                }
                 let _ = stdout.flush();
                 continue;
             }
@@ -1171,7 +1172,13 @@ fn main() {
 
         // Only send response if it's not a notification (per JSON-RPC 2.0 spec)
         if let Some(response) = handle_request(request) {
-            let json = serde_json::to_string(&response).unwrap();
+            let json = match serde_json::to_string(&response) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("[desktop-mcp] Failed to serialize response: {}", e);
+                    continue;
+                }
+            };
             eprintln!("[desktop-mcp] Sending: {}", json);
 
             if let Err(e) = writeln!(stdout, "{}", json) {

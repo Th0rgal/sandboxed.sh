@@ -1177,11 +1177,12 @@ async fn stream_task(
 
             // Send new log entries
             for entry in log_entries.iter().skip(last_log_len) {
-                let event = Event::default()
-                    .event("log")
-                    .json_data(entry)
-                    .unwrap();
-                yield Ok(event);
+                match Event::default().event("log").json_data(entry) {
+                    Ok(event) => yield Ok(event),
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to serialize task log SSE event");
+                    }
+                }
             }
             last_log_len = log_entries.len();
 
@@ -1190,14 +1191,17 @@ async fn stream_task(
                 status,
                 TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
             ) {
-                let event = Event::default()
+                match Event::default()
                     .event("done")
                     .json_data(serde_json::json!({
                         "status": status,
                         "result": result
-                    }))
-                    .unwrap();
-                yield Ok(event);
+                    })) {
+                    Ok(event) => yield Ok(event),
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to serialize task done SSE event");
+                    }
+                }
                 break;
             }
 
