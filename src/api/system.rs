@@ -1231,8 +1231,12 @@ fn stream_claude_code_update() -> impl Stream<Item = Result<Event, std::convert:
         yield sse("log", "Starting Claude Code installation/update...", Some(0));
 
         // Check if npm is available
-        let npm_check = Command::new("npm").arg("--version").output().await;
-        if npm_check.is_err() || !npm_check.unwrap().status.success() {
+        let npm_ok = Command::new("npm")
+            .arg("--version")
+            .output()
+            .await
+            .map_or(false, |o| o.status.success());
+        if !npm_ok {
             yield sse("error", "npm is required to install Claude Code. Please install Node.js first.", None);
             return;
         }
@@ -1310,8 +1314,12 @@ fn stream_codex_update() -> impl Stream<Item = Result<Event, std::convert::Infal
         yield sse("log", "Starting Codex installation/update...", Some(0));
 
         // Check if npm is available
-        let npm_check = Command::new("npm").arg("--version").output().await;
-        if npm_check.is_err() || !npm_check.unwrap().status.success() {
+        let npm_ok = Command::new("npm")
+            .arg("--version")
+            .output()
+            .await
+            .map_or(false, |o| o.status.success());
+        if !npm_ok {
             yield sse("error", "npm is required to install Codex. Please install Node.js first.", None);
             return;
         }
@@ -1530,8 +1538,12 @@ fn stream_npm_package_uninstall(
         yield sse("log", format!("Starting {} uninstall...", display_name), Some(0));
 
         // Check if npm is available
-        let npm_check = Command::new("npm").arg("--version").output().await;
-        if npm_check.is_err() || !npm_check.unwrap().status.success() {
+        let npm_ok = Command::new("npm")
+            .arg("--version")
+            .output()
+            .await
+            .map_or(false, |o| o.status.success());
+        if !npm_ok {
             yield sse("error", format!("npm is required to uninstall {}.", display_name), None);
             return;
         }
