@@ -10477,18 +10477,12 @@ mod tests {
     #[test]
     fn parse_opencode_session_token_ses_prefix_short() {
         // ses_ prefix is accepted regardless of length
-        assert_eq!(
-            parse_opencode_session_token("ses_a"),
-            Some("ses_a")
-        );
+        assert_eq!(parse_opencode_session_token("ses_a"), Some("ses_a"));
     }
 
     #[test]
     fn parse_opencode_session_token_long_token_without_prefix() {
-        assert_eq!(
-            parse_opencode_session_token("abcdefgh"),
-            Some("abcdefgh")
-        );
+        assert_eq!(parse_opencode_session_token("abcdefgh"), Some("abcdefgh"));
     }
 
     #[test]
