@@ -194,7 +194,7 @@ fn is_opencode_status_line(line: &str) -> bool {
 }
 
 fn strip_opencode_status_lines(text: &str) -> String {
-    strip_opencode_banner_lines(text)
+    strip_opencode_banner_lines(text).into_owned()
 }
 
 fn handle_tool_part_update(
@@ -10470,7 +10470,7 @@ mod tests {
     fn parse_opencode_session_token_ses_prefix() {
         assert_eq!(
             parse_opencode_session_token("ses_abc123"),
-            Some("ses_abc123".to_string())
+            Some("ses_abc123")
         );
     }
 
@@ -10479,7 +10479,7 @@ mod tests {
         // ses_ prefix is accepted regardless of length
         assert_eq!(
             parse_opencode_session_token("ses_a"),
-            Some("ses_a".to_string())
+            Some("ses_a")
         );
     }
 
@@ -10487,7 +10487,7 @@ mod tests {
     fn parse_opencode_session_token_long_token_without_prefix() {
         assert_eq!(
             parse_opencode_session_token("abcdefgh"),
-            Some("abcdefgh".to_string())
+            Some("abcdefgh")
         );
     }
 
@@ -10500,7 +10500,7 @@ mod tests {
     fn parse_opencode_session_token_stops_at_non_alnum_char() {
         assert_eq!(
             parse_opencode_session_token("ses_abc!rest"),
-            Some("ses_abc".to_string())
+            Some("ses_abc")
         );
     }
 
@@ -10508,7 +10508,7 @@ mod tests {
     fn parse_opencode_session_token_allows_hyphens_and_underscores() {
         assert_eq!(
             parse_opencode_session_token("ses_abc-def_ghi"),
-            Some("ses_abc-def_ghi".to_string())
+            Some("ses_abc-def_ghi")
         );
     }
 
