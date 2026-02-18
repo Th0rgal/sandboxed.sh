@@ -567,6 +567,8 @@ pub(crate) async fn close_desktop_session(
                 for pid_key in ["xvfb_pid", "i3_pid", "browser_pid"] {
                     if let Some(pid) = session_info[pid_key].as_u64() {
                         let pid = pid as i32;
+                        // SAFETY: PIDs are read from a session file we wrote;
+                        // SIGTERM is a safe signal to send to any process.
                         unsafe {
                             libc::kill(pid, libc::SIGTERM);
                         }

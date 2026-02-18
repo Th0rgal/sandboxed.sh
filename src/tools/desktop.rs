@@ -43,6 +43,8 @@ fn kill_pid(pid: u32) {
     if pid == 0 {
         return;
     }
+    // SAFETY: Sending SIGTERM to a valid PID. The pid == 0 guard above
+    // prevents accidentally signalling the caller's process group.
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
     }
@@ -398,6 +400,8 @@ impl Tool for StopSession {
                     for pid_key in ["xvfb_pid", "i3_pid", "browser_pid"] {
                         if let Some(pid) = session_info[pid_key].as_u64() {
                             let pid = pid as i32;
+                            // SAFETY: PIDs are read from a session file we wrote;
+                            // SIGTERM is a safe signal to send to any process.
                             unsafe {
                                 libc::kill(pid, libc::SIGTERM);
                             }

@@ -1164,6 +1164,7 @@ fn stream_opencode_update() -> impl Stream<Item = Result<Event, std::convert::In
 
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         let source_path = format!("{}/.opencode/bin/opencode", home);
+        // SAFETY: geteuid() is a trivial syscall with no preconditions.
         let is_root = unsafe { libc::geteuid() } == 0;
 
         if is_root {
@@ -1442,6 +1443,7 @@ fn stream_opencode_uninstall() -> impl Stream<Item = Result<Event, std::convert:
         yield sse("log", "Starting OpenCode uninstall...", Some(0));
 
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        // SAFETY: geteuid() is a trivial syscall with no preconditions.
         let is_root = unsafe { libc::geteuid() } == 0;
 
         // Stop the service first if running as root

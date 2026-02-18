@@ -412,6 +412,8 @@ fn tool_stop_session(args: &Value) -> Result<String, String> {
                 for pid_key in ["xvfb_pid", "i3_pid", "browser_pid"] {
                     if let Some(pid) = session_info.get(pid_key).and_then(|v| v.as_u64()) {
                         let pid = pid as i32;
+                        // SAFETY: PIDs are read from a session file we wrote;
+                        // SIGTERM is a safe signal to send to any process.
                         unsafe {
                             libc::kill(pid, libc::SIGTERM);
                         }

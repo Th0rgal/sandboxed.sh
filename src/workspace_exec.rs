@@ -131,6 +131,8 @@ impl PtyChild {
             #[cfg(unix)]
             PtyMasterHandle::Unix(fd) => {
                 use std::os::unix::io::{AsRawFd, FromRawFd};
+                // SAFETY: fd.as_raw_fd() returns a valid descriptor owned by
+                // PtyMasterHandle; dup() produces a new independent fd.
                 let duped = unsafe { libc::dup(fd.as_raw_fd()) };
                 if duped < 0 {
                     anyhow::bail!(
@@ -138,6 +140,8 @@ impl PtyChild {
                         std::io::Error::last_os_error()
                     );
                 }
+                // SAFETY: duped is a valid fd (checked above) and sole
+                // ownership is transferred to the File.
                 Ok(Box::new(unsafe { std::fs::File::from_raw_fd(duped) }))
             }
         }
@@ -149,6 +153,8 @@ impl PtyChild {
             #[cfg(unix)]
             PtyMasterHandle::Unix(fd) => {
                 use std::os::unix::io::{AsRawFd, FromRawFd};
+                // SAFETY: fd.as_raw_fd() returns a valid descriptor owned by
+                // PtyMasterHandle; dup() produces a new independent fd.
                 let duped = unsafe { libc::dup(fd.as_raw_fd()) };
                 if duped < 0 {
                     anyhow::bail!(
@@ -156,6 +162,8 @@ impl PtyChild {
                         std::io::Error::last_os_error()
                     );
                 }
+                // SAFETY: duped is a valid fd (checked above) and sole
+                // ownership is transferred to the File.
                 Ok(Box::new(unsafe { std::fs::File::from_raw_fd(duped) }))
             }
         }
@@ -1017,6 +1025,8 @@ impl WorkspaceExec {
         let mut master_raw: libc::c_int = 0;
         let mut slave_raw: libc::c_int = 0;
 
+        // SAFETY: master_raw and slave_raw are valid mutable pointers;
+        // remaining args are null (no name buffer, no termios, no winsize).
         let ret = unsafe {
             libc::openpty(
                 &mut master_raw,
@@ -1037,6 +1047,8 @@ impl WorkspaceExec {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        // SAFETY: master_raw is a valid PTY fd from openpty() above;
+        // &ws is a valid pointer to a properly initialized winsize struct.
         unsafe {
             libc::ioctl(master_raw, libc::TIOCSWINSZ, &ws);
         }
@@ -1055,6 +1067,12 @@ impl WorkspaceExec {
         }
 
         // Wire the PTY slave as stdin/stdout/stderr.
+        // SAFETY: slave_raw is a valid fd from openpty(). We dup() it three
+        // times and transfer ownership of each duplicate to Stdio via
+        // from_raw_fd(). The dup return values are checked for errors.
+        // pre_exec runs between fork() and exec() in the child process,
+        // where only async-signal-safe functions are called (close, setsid,
+        // ioctl are all async-signal-safe).
         unsafe {
             let slave_in = libc::dup(slave_raw);
             let slave_out = libc::dup(slave_raw);
@@ -1102,10 +1120,14 @@ impl WorkspaceExec {
         let child = cmd.spawn().context("Failed to spawn Host PTY command")?;
 
         // Close slave in parent - child owns it now.
+        // SAFETY: slave_raw is a valid fd; after close the child holds the
+        // only remaining references via the duped stdin/stdout/stderr.
         unsafe {
             libc::close(slave_raw);
         }
 
+        // SAFETY: master_raw is a valid fd from openpty() and we transfer
+        // sole ownership to OwnedFd (no other code will close it).
         let master_fd = unsafe { OwnedFd::from_raw_fd(master_raw) };
 
         Ok(PtyChild {
