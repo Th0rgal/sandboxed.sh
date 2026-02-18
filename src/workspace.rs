@@ -3543,13 +3543,11 @@ pub async fn write_runtime_workspace_state(
                 // mission_id is guaranteed Some here because we're inside
                 // `if let Some(target) = mission_context.as_ref()` and
                 // mission_context is derived from mission_id.map(...)
-                PathBuf::from("/root")
-                    .join(context_dir_name)
-                    .join(
-                        mission_id
-                            .expect("mission_id must be Some inside mission_context block")
-                            .to_string(),
-                    )
+                PathBuf::from("/root").join(context_dir_name).join(
+                    mission_id
+                        .expect("mission_id must be Some inside mission_context block")
+                        .to_string(),
+                )
             } else {
                 target.clone()
             };
