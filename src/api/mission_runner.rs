@@ -6688,11 +6688,6 @@ async fn ensure_codex_cli_available(
 fn resolve_openai_codex_native_binary(
     wrapper_path: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
-    // If `codex` was installed via npm/bun (@openai/codex), the entrypoint is a Node
-    // wrapper script that expects its surrounding package layout (package.json, vendor/).
-    //
-    // When we copy it into a container as a standalone file, Node runs it as CJS and it
-    // fails to import ESM. Instead, copy the actual native binary shipped in vendor/.
     let real = match std::fs::canonicalize(wrapper_path) {
         Ok(p) => p,
         Err(e) => {
@@ -6713,29 +6708,32 @@ fn resolve_openai_codex_native_binary(
         "Resolving Codex native binary"
     );
 
-    if file_name.is_some_and(|n| n == "codex.js") {
-        // .../@openai/codex/bin/codex.js
-        let package_root = real.parent()?.parent()?;
-        let os = std::env::consts::OS;
-        let arch = std::env::consts::ARCH;
+    let is_codex_wrapper =
+        file_name.is_some_and(|n| n == "codex.js") || is_codex_node_wrapper(&real);
 
-        let triple = match (os, arch) {
-            ("linux", "x86_64") => "x86_64-unknown-linux-musl",
-            ("linux", "aarch64") => "aarch64-unknown-linux-musl",
-            ("macos", "x86_64") => "x86_64-apple-darwin",
-            ("macos", "aarch64") => "aarch64-apple-darwin",
-            _ => {
-                tracing::debug!(os, arch, "No Codex native binary triple for this platform");
-                return None;
-            }
-        };
+    if !is_codex_wrapper {
+        return None;
+    }
 
-        let binary_name = if cfg!(windows) { "codex.exe" } else { "codex" };
-        let native = package_root
-            .join("vendor")
-            .join(triple)
-            .join("codex")
-            .join(binary_name);
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+
+    let triple = match (os, arch) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        _ => {
+            tracing::debug!(os, arch, "No Codex native binary triple for this platform");
+            return None;
+        }
+    };
+
+    let binary_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+
+    let search_paths = resolve_codex_native_binary_search_paths(&real, triple, binary_name);
+
+    for native in search_paths {
         if native.is_file() {
             tracing::info!(
                 native_path = %native.display(),
@@ -6744,12 +6742,112 @@ fn resolve_openai_codex_native_binary(
             return Some(native);
         }
         tracing::debug!(
-            expected = %native.display(),
-            "Codex native binary not found at expected path"
+            candidate = %native.display(),
+            "Codex native binary not found at candidate path"
         );
     }
 
+    tracing::debug!("Codex native binary not found in any search path");
     None
+}
+
+fn is_codex_node_wrapper(path: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+
+    let first_line = content.lines().next().unwrap_or("");
+    let has_node_shebang = first_line.starts_with("#!/usr/bin/env node")
+        || first_line.starts_with("#!/usr/bin/node")
+        || first_line.contains("node");
+
+    if !has_node_shebang {
+        return false;
+    }
+
+    let lower = content.to_lowercase();
+    lower.contains("@openai/codex") || lower.contains("codex-linux-x64")
+}
+
+fn resolve_codex_native_binary_search_paths(
+    wrapper_path: &std::path::Path,
+    triple: &str,
+    binary_name: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+
+    let binary_path = |base: &std::path::Path| {
+        base.join("vendor")
+            .join(triple)
+            .join("codex")
+            .join(binary_name)
+    };
+
+    if let Some(bin_dir) = wrapper_path.parent() {
+        if let Some(package_root) = bin_dir.parent() {
+            paths.push(binary_path(package_root));
+
+            let nested_optional = package_root
+                .join("node_modules")
+                .join("@openai")
+                .join("codex-linux-x64");
+            paths.push(binary_path(&nested_optional));
+        }
+
+        if let Some(package_parent) = bin_dir.parent() {
+            if let Some(node_modules) = package_parent.parent() {
+                let sibling_optional = node_modules.join("@openai").join("codex-linux-x64");
+                paths.push(binary_path(&sibling_optional));
+            }
+        }
+    }
+
+    if let Ok(npm_prefix) = std::env::var("npm_config_prefix") {
+        let npm_optional = std::path::PathBuf::from(&npm_prefix)
+            .join("lib")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex-linux-x64");
+        paths.push(binary_path(&npm_optional));
+    }
+
+    for prefix in ["/usr/local", "/usr"] {
+        let npm_optional = std::path::PathBuf::from(prefix)
+            .join("lib")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex-linux-x64");
+        paths.push(binary_path(&npm_optional));
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let bun_optional = std::path::PathBuf::from(&home)
+            .join(".bun")
+            .join("install")
+            .join("global")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex-linux-x64");
+        paths.push(binary_path(&bun_optional));
+
+        let bun_cache_optional = std::path::PathBuf::from(&home)
+            .join(".cache")
+            .join(".bun")
+            .join("install")
+            .join("global")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex-linux-x64");
+        paths.push(binary_path(&bun_cache_optional));
+    }
+
+    paths
 }
 
 fn resolve_host_executable(program: &str) -> Option<std::path::PathBuf> {
@@ -9834,12 +9932,13 @@ fn cleanup_old_debug_files(
 mod tests {
     use super::{
         build_history_context, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_rate_limited_error, is_session_corruption_error,
-        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_session_token, parse_opencode_stderr_text_part, running_health,
-        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        MissionHealth, MissionRunState, MissionStallSeverity, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        extract_thought_line, is_codex_node_wrapper, is_rate_limited_error,
+        is_session_corruption_error, is_tool_call_only_output, opencode_output_needs_fallback,
+        opencode_session_token_from_line, parse_opencode_session_token,
+        parse_opencode_stderr_text_part, running_health, sanitized_opencode_stdout, stall_severity,
+        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
+        summarize_recent_opencode_stderr, sync_opencode_agent_config, MissionHealth,
+        MissionRunState, MissionStallSeverity, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
     use serde_json::json;
@@ -10673,5 +10772,65 @@ mod tests {
     fn is_tool_call_only_output_rejects_real_text() {
         let mixed = "{\"name\":\"tool\",\"arguments\":\"{}\"}\nreal answer";
         assert!(!is_tool_call_only_output(mixed));
+    }
+
+    // ── is_codex_node_wrapper tests ─────────────────────────────────────
+
+    #[test]
+    fn is_codex_node_wrapper_detects_npm_installed_wrapper() {
+        use std::io::Write;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wrapper_path = temp_dir.path().join("codex");
+        let mut file = std::fs::File::create(&wrapper_path).unwrap();
+        writeln!(
+            file,
+            "#!/usr/bin/env node\nconst {{ spawn }} = require('child_process');\n// @openai/codex wrapper"
+        )
+        .unwrap();
+
+        assert!(is_codex_node_wrapper(&wrapper_path));
+    }
+
+    #[test]
+    fn is_codex_node_wrapper_detects_bun_installed_wrapper() {
+        use std::io::Write;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wrapper_path = temp_dir.path().join("codex");
+        let mut file = std::fs::File::create(&wrapper_path).unwrap();
+        writeln!(
+            file,
+            "#!/usr/bin/env node\n// references codex-linux-x64 optional dep"
+        )
+        .unwrap();
+
+        assert!(is_codex_node_wrapper(&wrapper_path));
+    }
+
+    #[test]
+    fn is_codex_node_wrapper_rejects_native_binary() {
+        use std::io::Write;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wrapper_path = temp_dir.path().join("codex");
+        let mut file = std::fs::File::create(&wrapper_path).unwrap();
+        write!(file, "\x7fELF\x02\x01\x01\x00").unwrap();
+
+        assert!(!is_codex_node_wrapper(&wrapper_path));
+    }
+
+    #[test]
+    fn is_codex_node_wrapper_rejects_shell_script() {
+        use std::io::Write;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wrapper_path = temp_dir.path().join("codex");
+        let mut file = std::fs::File::create(&wrapper_path).unwrap();
+        writeln!(file, "#!/bin/bash\necho 'hello'").unwrap();
+
+        assert!(!is_codex_node_wrapper(&wrapper_path));
+    }
+
+    #[test]
+    fn is_codex_node_wrapper_rejects_nonexistent_file() {
+        let wrapper_path = std::path::Path::new("/nonexistent/path/codex");
+        assert!(!is_codex_node_wrapper(wrapper_path));
     }
 }
