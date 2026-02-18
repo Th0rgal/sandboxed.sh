@@ -17,6 +17,21 @@ use uuid::Uuid;
 
 type LegacyAutomationRow = (String, String, String, i64, i64, String, Option<String>);
 
+/// Parse a UUID from a database string, logging a warning and falling back to
+/// the nil UUID when the value is malformed.  This prevents silent data
+/// corruption that `Uuid::parse_str(...).unwrap_or_default()` would introduce
+/// without any diagnostic.
+fn parse_uuid_or_nil(raw: &str) -> Uuid {
+    Uuid::parse_str(raw).unwrap_or_else(|e| {
+        tracing::warn!(
+            raw_value = %raw,
+            error = %e,
+            "Corrupt UUID in database; substituting nil UUID"
+        );
+        Uuid::nil()
+    })
+}
+
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -673,7 +688,7 @@ impl MissionStore for SqliteMissionStore {
                     let config_profile: Option<String> = row.get(16)?;
 
                     Ok(Mission {
-                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        id: parse_uuid_or_nil(&id_str),
                         status: parse_status(&status_str),
                         title: row.get(2)?,
                         workspace_id: Uuid::parse_str(&workspace_id_str)
@@ -737,7 +752,7 @@ impl MissionStore for SqliteMissionStore {
                     let config_profile: Option<String> = row.get(16)?;
 
                     Ok(Mission {
-                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        id: parse_uuid_or_nil(&id_str),
                         status: parse_status(&status_str),
                         title: row.get(2)?,
                         workspace_id: Uuid::parse_str(&workspace_id_str)
@@ -1141,7 +1156,7 @@ impl MissionStore for SqliteMissionStore {
                     let backend: String = row.get(12)?;
 
                     Ok(Mission {
-                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        id: parse_uuid_or_nil(&id_str),
                         status: parse_status(&status_str),
                         title: row.get(2)?,
                         workspace_id: Uuid::parse_str(&workspace_id_str)
@@ -1198,7 +1213,7 @@ impl MissionStore for SqliteMissionStore {
                     let backend: String = row.get(12)?;
 
                     Ok(Mission {
-                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        id: parse_uuid_or_nil(&id_str),
                         status: parse_status(&status_str),
                         title: row.get(2)?,
                         workspace_id: Uuid::parse_str(&workspace_id_str)
@@ -1502,7 +1517,7 @@ impl MissionStore for SqliteMissionStore {
 
                 Ok(StoredEvent {
                     id: row.get(0)?,
-                    mission_id: Uuid::parse_str(&mid_str).unwrap_or_default(),
+                    mission_id: parse_uuid_or_nil(&mid_str),
                     sequence: row.get(2)?,
                     event_type: row.get(3)?,
                     timestamp: row.get(4)?,

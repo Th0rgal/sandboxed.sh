@@ -3540,9 +3540,16 @@ pub async fn write_runtime_workspace_state(
             // For container workspaces, the symlink must point to the container path
             // since /root/context is bind-mounted, not the host path
             let symlink_target = if workspace.workspace_type == WorkspaceType::Container {
+                // mission_id is guaranteed Some here because we're inside
+                // `if let Some(target) = mission_context.as_ref()` and
+                // mission_context is derived from mission_id.map(...)
                 PathBuf::from("/root")
                     .join(context_dir_name)
-                    .join(mission_id.unwrap().to_string())
+                    .join(
+                        mission_id
+                            .expect("mission_id must be Some inside mission_context block")
+                            .to_string(),
+                    )
             } else {
                 target.clone()
             };

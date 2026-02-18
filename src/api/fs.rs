@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{Multipart, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, header::HeaderValue, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -628,11 +628,18 @@ pub async fn download(
         header::CONTENT_DISPOSITION,
         format!("attachment; filename=\"{}\"", filename)
             .parse()
-            .unwrap(),
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Filename produces an invalid header value: {}", filename),
+                )
+            })?,
     );
     headers.insert(
         header::CONTENT_TYPE,
-        content_type_for_path(&resolved_path).parse().unwrap(),
+        content_type_for_path(&resolved_path)
+            .parse()
+            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
     );
 
     let file = tokio::fs::File::open(&resolved_path)
@@ -832,68 +839,77 @@ pub async fn upload_finalize(
     let assembled_path =
         std::env::temp_dir().join(format!("sandboxed_sh_assembled_{}", safe_upload_id));
 
-    // Assemble chunks into single file
-    let mut assembled = tokio::fs::File::create(&assembled_path)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create assembled file: {}", e),
-            )
-        })?;
-
-    for i in 0..req.total_chunks {
-        let chunk_path = chunk_dir.join(format!("chunk_{:06}", i));
-        let chunk_data = tokio::fs::read(&chunk_path).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to read chunk {}: {}", i, e),
-            )
-        })?;
-        assembled.write_all(&chunk_data).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to write chunk {}: {}", i, e),
-            )
-        })?;
-    }
-    assembled
-        .flush()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    drop(assembled);
-
-    // Move assembled file to destination (using sanitized file_name)
-    let remote_path = base.join(&safe_file_name);
-    let target_dir = remote_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| base.clone());
-
-    tokio::fs::create_dir_all(&target_dir).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to create directory: {}", e),
-        )
-    })?;
-
-    if tokio::fs::rename(&assembled_path, &remote_path)
-        .await
-        .is_err()
-    {
-        tokio::fs::copy(&assembled_path, &remote_path)
+    // Inner block so that temp files are cleaned up on both success and error paths.
+    let result = async {
+        // Assemble chunks into single file
+        let mut assembled = tokio::fs::File::create(&assembled_path)
             .await
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to copy file: {}", e),
+                    format!("Failed to create assembled file: {}", e),
                 )
             })?;
-        let _ = tokio::fs::remove_file(&assembled_path).await;
-    }
 
-    // Cleanup chunk directory
+        for i in 0..req.total_chunks {
+            let chunk_path = chunk_dir.join(format!("chunk_{:06}", i));
+            let chunk_data = tokio::fs::read(&chunk_path).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to read chunk {}: {}", i, e),
+                )
+            })?;
+            assembled.write_all(&chunk_data).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to write chunk {}: {}", i, e),
+                )
+            })?;
+        }
+        assembled
+            .flush()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        drop(assembled);
+
+        // Move assembled file to destination (using sanitized file_name)
+        let remote_path = base.join(&safe_file_name);
+        let target_dir = remote_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| base.clone());
+
+        tokio::fs::create_dir_all(&target_dir).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create directory: {}", e),
+            )
+        })?;
+
+        if tokio::fs::rename(&assembled_path, &remote_path)
+            .await
+            .is_err()
+        {
+            tokio::fs::copy(&assembled_path, &remote_path)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to copy file: {}", e),
+                    )
+                })?;
+            let _ = tokio::fs::remove_file(&assembled_path).await;
+        }
+
+        Ok::<_, (StatusCode, String)>(())
+    }
+    .await;
+
+    // Always clean up temp files, even when assembly/move failed
     let _ = tokio::fs::remove_dir_all(&chunk_dir).await;
+    let _ = tokio::fs::remove_file(&assembled_path).await;
+
+    result?;
 
     Ok(Json(
         serde_json::json!({ "ok": true, "path": req.path, "name": safe_file_name }),
