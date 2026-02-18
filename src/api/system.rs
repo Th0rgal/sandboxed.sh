@@ -1235,7 +1235,7 @@ fn stream_claude_code_update() -> impl Stream<Item = Result<Event, std::convert:
             .arg("--version")
             .output()
             .await
-            .map_or(false, |o| o.status.success());
+            .is_ok_and(|o| o.status.success());
         if !npm_ok {
             yield sse("error", "npm is required to install Claude Code. Please install Node.js first.", None);
             return;
@@ -1318,7 +1318,7 @@ fn stream_codex_update() -> impl Stream<Item = Result<Event, std::convert::Infal
             .arg("--version")
             .output()
             .await
-            .map_or(false, |o| o.status.success());
+            .is_ok_and(|o| o.status.success());
         if !npm_ok {
             yield sse("error", "npm is required to install Codex. Please install Node.js first.", None);
             return;
@@ -1542,7 +1542,7 @@ fn stream_npm_package_uninstall(
             .arg("--version")
             .output()
             .await
-            .map_or(false, |o| o.status.success());
+            .is_ok_and(|o| o.status.success());
         if !npm_ok {
             yield sse("error", format!("npm is required to uninstall {}.", display_name), None);
             return;
