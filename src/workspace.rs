@@ -3185,18 +3185,27 @@ fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
 
     for path in &candidates {
         if let Ok(contents) = std::fs::read_to_string(path) {
-            if let Ok(providers) = serde_json::from_str::<Vec<AIProvider>>(&contents) {
-                let custom: Vec<AIProvider> = providers
-                    .into_iter()
-                    .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
-                    .collect();
-                if !custom.is_empty() {
-                    tracing::debug!(
+            match serde_json::from_str::<Vec<AIProvider>>(&contents) {
+                Ok(providers) => {
+                    let custom: Vec<AIProvider> = providers
+                        .into_iter()
+                        .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
+                        .collect();
+                    if !custom.is_empty() {
+                        tracing::debug!(
+                            path = %path.display(),
+                            count = custom.len(),
+                            "Loaded custom providers from file"
+                        );
+                        return custom;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
                         path = %path.display(),
-                        count = custom.len(),
-                        "Loaded custom providers from file"
+                        error = %e,
+                        "Failed to parse custom providers file; skipping"
                     );
-                    return custom;
                 }
             }
         }

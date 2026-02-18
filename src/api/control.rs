@@ -2186,11 +2186,15 @@ pub async fn stream(
 
     let stream = async_stream::stream! {
         let _guard = drop_guard;
-        let init_ev = Event::default()
+        match Event::default()
             .event("status")
             .json_data(AgentEvent::Status { state: initial.state, queue_len: initial.queue_len, mission_id: initial.mission_id })
-            .unwrap();
-        yield Ok(init_ev);
+        {
+            Ok(init_ev) => yield Ok(init_ev),
+            Err(e) => {
+                tracing::error!("Failed to serialize initial SSE status event: {e}");
+            }
+        }
 
         // Keepalive interval to prevent connection timeouts during long LLM calls
         let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(15));
@@ -2220,19 +2224,36 @@ pub async fn stream(
                                     );
                                 }
                             }
-                            let sse = Event::default().event(ev.event_name()).json_data(&ev).unwrap();
-                            yield Ok(sse);
+                            match Event::default().event(ev.event_name()).json_data(&ev) {
+                                Ok(sse) => yield Ok(sse),
+                                Err(e) => {
+                                    tracing::error!(
+                                        stream_id = %stream_id,
+                                        event = %ev.event_name(),
+                                        error = %e,
+                                        "Failed to serialize SSE event; dropping"
+                                    );
+                                }
+                            }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             tracing::warn!(
                                 stream_id = %stream_id,
                                 "Control SSE stream lagged; events dropped"
                             );
-                            let sse = Event::default()
+                            match Event::default()
                                 .event("error")
                                 .json_data(AgentEvent::Error { message: "event stream lagged; some events were dropped".to_string(), mission_id: None, resumable: false })
-                                .unwrap();
-                            yield Ok(sse);
+                            {
+                                Ok(sse) => yield Ok(sse),
+                                Err(e) => {
+                                    tracing::error!(
+                                        stream_id = %stream_id,
+                                        error = %e,
+                                        "Failed to serialize SSE lag error event"
+                                    );
+                                }
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }

@@ -2110,7 +2110,14 @@ pub fn run_claudecode_turn<'a>(
         if !looks_like_claude_cli_credentials(&mission_creds_path) {
             if let Some(host_creds) = find_host_claude_cli_credentials() {
                 if let Some(parent) = mission_creds_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            path = %parent.display(),
+                            error = %e,
+                            "Failed to create parent directory for Claude CLI credentials"
+                        );
+                    }
                 }
                 match std::fs::copy(&host_creds, &mission_creds_path) {
                     Ok(_) => {
@@ -7529,7 +7536,7 @@ pub async fn run_opencode_turn(
                                 if !data_lines.is_empty() {
                                     let data = data_lines.join("\n");
                                     let current_session =
-                                        session_id_capture.lock().unwrap().clone();
+                                        session_id_capture.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                     if let Some(parsed) = parse_opencode_sse_event(
                                         &data,
                                         current_event.as_deref(),
@@ -7538,7 +7545,7 @@ pub async fn run_opencode_turn(
                                         mission_id,
                                     ) {
                                         if let Some(session_id) = parsed.session_id {
-                                            let mut guard = session_id_capture.lock().unwrap();
+                                            let mut guard = session_id_capture.lock().unwrap_or_else(|e| e.into_inner());
                                             if guard.is_none() {
                                                 *guard = Some(session_id);
                                             }
@@ -7548,7 +7555,7 @@ pub async fn run_opencode_turn(
                                                 *guard = std::time::Instant::now();
                                             }
                                             if let AgentEvent::Error { ref message, .. } = event {
-                                                let mut guard = sse_error_message.lock().unwrap();
+                                                let mut guard = sse_error_message.lock().unwrap_or_else(|e| e.into_inner());
                                                 if guard.is_none() {
                                                     *guard = Some(message.clone());
                                                 }
@@ -7785,7 +7792,7 @@ pub async fn run_opencode_turn(
                                 error = %err_msg,
                                 "OpenCode provider error detected on stderr"
                             );
-                            let mut guard = stderr_error_capture.lock().unwrap();
+                            let mut guard = stderr_error_capture.lock().unwrap_or_else(|e| e.into_inner());
                             if guard.is_none() {
                                 *guard = Some(err_msg.clone());
                             }
@@ -7815,7 +7822,7 @@ pub async fn run_opencode_turn(
                             );
                             // Signal the main loop to kill the process early for faster recovery.
                             stderr_rate_limit.store(true, std::sync::atomic::Ordering::SeqCst);
-                            let mut guard = stderr_error_capture.lock().unwrap();
+                            let mut guard = stderr_error_capture.lock().unwrap_or_else(|e| e.into_inner());
                             if guard.is_none() {
                                 *guard = Some(format!(
                                     "LLM API request failed after {} retries (possible rate limit or API error). \
@@ -8162,7 +8169,7 @@ pub async fn run_opencode_turn(
                             }
 
                             // Route through SSE event parser for thinking/tool events
-                            let current_session = session_id_capture.lock().unwrap().clone();
+                            let current_session = session_id_capture.lock().unwrap_or_else(|e| e.into_inner()).clone();
                             if let Some(parsed) = parse_opencode_sse_event(
                                 trimmed,
                                 None,
@@ -8171,7 +8178,7 @@ pub async fn run_opencode_turn(
                                 mission_id,
                             ) {
                                 if let Some(session_id) = parsed.session_id {
-                                    let mut guard = session_id_capture.lock().unwrap();
+                                    let mut guard = session_id_capture.lock().unwrap_or_else(|e| e.into_inner());
                                     if guard.is_none() {
                                         *guard = Some(session_id);
                                     }
@@ -8181,7 +8188,7 @@ pub async fn run_opencode_turn(
                                         *guard = std::time::Instant::now();
                                     }
                                     if let AgentEvent::Error { ref message, .. } = event {
-                                        let mut guard = sse_error_message.lock().unwrap();
+                                        let mut guard = sse_error_message.lock().unwrap_or_else(|e| e.into_inner());
                                         if guard.is_none() {
                                             *guard = Some(message.clone());
                                         }
@@ -8242,7 +8249,7 @@ pub async fn run_opencode_turn(
                                 if let Some(pos) = trimmed.find(": ") {
                                     let err_part = trimmed[pos + 2..].trim();
                                     if !err_part.is_empty() {
-                                        let mut guard = sse_error_message.lock().unwrap();
+                                        let mut guard = sse_error_message.lock().unwrap_or_else(|e| e.into_inner());
                                         if guard.is_none() {
                                             *guard = Some(err_part.to_string());
                                         }
@@ -8310,7 +8317,7 @@ pub async fn run_opencode_turn(
         let _ = handle.await;
     }
 
-    let sse_error = sse_error_message.lock().unwrap().clone();
+    let sse_error = sse_error_message.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let has_sse_error = sse_error.is_some();
 
     // Check exit status
@@ -8338,7 +8345,7 @@ pub async fn run_opencode_turn(
     // had_error but do NOT write into sse_error_message, so recovery guards
     // below can still clear had_error when valid content is recovered.
     if !has_sse_error {
-        if let Some(err_msg) = stderr_error_message.lock().unwrap().clone() {
+        if let Some(err_msg) = stderr_error_message.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             had_error = true;
             if opencode_output_needs_fallback(&final_result) {
                 final_result = err_msg;
@@ -8346,7 +8353,7 @@ pub async fn run_opencode_turn(
         }
     }
 
-    let session_id = session_id_capture.lock().unwrap().clone();
+    let session_id = session_id_capture.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let session_id = session_id.or_else(|| extract_opencode_session_id(&final_result));
     let stored_message = session_id
         .as_deref()
