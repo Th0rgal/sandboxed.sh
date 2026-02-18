@@ -7535,8 +7535,10 @@ pub async fn run_opencode_turn(
                             if trimmed.is_empty() {
                                 if !data_lines.is_empty() {
                                     let data = data_lines.join("\n");
-                                    let current_session =
-                                        session_id_capture.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                    let current_session = session_id_capture
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .clone();
                                     if let Some(parsed) = parse_opencode_sse_event(
                                         &data,
                                         current_event.as_deref(),
@@ -7545,7 +7547,9 @@ pub async fn run_opencode_turn(
                                         mission_id,
                                     ) {
                                         if let Some(session_id) = parsed.session_id {
-                                            let mut guard = session_id_capture.lock().unwrap_or_else(|e| e.into_inner());
+                                            let mut guard = session_id_capture
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
                                             if guard.is_none() {
                                                 *guard = Some(session_id);
                                             }
@@ -7555,7 +7559,9 @@ pub async fn run_opencode_turn(
                                                 *guard = std::time::Instant::now();
                                             }
                                             if let AgentEvent::Error { ref message, .. } = event {
-                                                let mut guard = sse_error_message.lock().unwrap_or_else(|e| e.into_inner());
+                                                let mut guard = sse_error_message
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
                                                 if guard.is_none() {
                                                     *guard = Some(message.clone());
                                                 }
@@ -8317,7 +8323,10 @@ pub async fn run_opencode_turn(
         let _ = handle.await;
     }
 
-    let sse_error = sse_error_message.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let sse_error = sse_error_message
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let has_sse_error = sse_error.is_some();
 
     // Check exit status
@@ -8345,7 +8354,11 @@ pub async fn run_opencode_turn(
     // had_error but do NOT write into sse_error_message, so recovery guards
     // below can still clear had_error when valid content is recovered.
     if !has_sse_error {
-        if let Some(err_msg) = stderr_error_message.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if let Some(err_msg) = stderr_error_message
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
             had_error = true;
             if opencode_output_needs_fallback(&final_result) {
                 final_result = err_msg;
@@ -8353,7 +8366,10 @@ pub async fn run_opencode_turn(
         }
     }
 
-    let session_id = session_id_capture.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let session_id = session_id_capture
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let session_id = session_id.or_else(|| extract_opencode_session_id(&final_result));
     let stored_message = session_id
         .as_deref()

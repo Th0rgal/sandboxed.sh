@@ -2186,10 +2186,11 @@ pub async fn stream(
 
     let stream = async_stream::stream! {
         let _guard = drop_guard;
-        match Event::default()
-            .event("status")
-            .json_data(AgentEvent::Status { state: initial.state, queue_len: initial.queue_len, mission_id: initial.mission_id })
-        {
+        match Event::default().event("status").json_data(AgentEvent::Status {
+            state: initial.state,
+            queue_len: initial.queue_len,
+            mission_id: initial.mission_id,
+        }) {
             Ok(init_ev) => yield Ok(init_ev),
             Err(e) => {
                 tracing::error!("Failed to serialize initial SSE status event: {e}");
@@ -2243,8 +2244,13 @@ pub async fn stream(
                             );
                             match Event::default()
                                 .event("error")
-                                .json_data(AgentEvent::Error { message: "event stream lagged; some events were dropped".to_string(), mission_id: None, resumable: false })
-                            {
+                                .json_data(AgentEvent::Error {
+                                    message:
+                                        "event stream lagged; some events were dropped"
+                                            .to_string(),
+                                    mission_id: None,
+                                    resumable: false,
+                                }) {
                                 Ok(sse) => yield Ok(sse),
                                 Err(e) => {
                                     tracing::error!(
