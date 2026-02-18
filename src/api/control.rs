@@ -165,6 +165,32 @@ fn extract_title_from_assistant(content: &str) -> Option<String> {
     }
 }
 
+/// Error returned when the control session command channel is closed.
+fn session_unavailable<T>(_: T) -> (StatusCode, String) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "control session unavailable".to_string(),
+    )
+}
+
+/// Error returned when a oneshot response channel is dropped.
+fn recv_failed<T>(_: T) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Failed to receive response".to_string(),
+    )
+}
+
+/// Wrap a string error as an internal server error.
+fn internal_error(e: String) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, e)
+}
+
+/// Shorthand for a `{ "ok": true }` JSON response.
+fn ok_json() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "ok": true }))
+}
+
 async fn mission_has_active_automation(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
@@ -1198,12 +1224,7 @@ pub async fn post_message(
             respond: queued_tx,
         })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
     let queued = match queued_rx.await {
         Ok(value) => value,
         Err(_) => {
@@ -1239,14 +1260,9 @@ pub async fn post_tool_result(
             result: req.result,
         })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
 
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(ok_json())
 }
 
 /// Cancel the currently running control session task.
@@ -1259,13 +1275,8 @@ pub async fn post_cancel(
         .cmd_tx
         .send(ControlCommand::Cancel)
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+        .map_err(session_unavailable)?;
+    Ok(ok_json())
 }
 
 // ==================== Queue Management Endpoints ====================
@@ -1281,12 +1292,7 @@ pub async fn get_queue(
         .cmd_tx
         .send(ControlCommand::GetQueue { respond: tx })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
     let queue = rx.await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1311,12 +1317,7 @@ pub async fn remove_from_queue(
             respond: tx,
         })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
     let removed = rx.await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1324,7 +1325,7 @@ pub async fn remove_from_queue(
         )
     })?;
     if removed {
-        Ok(Json(serde_json::json!({ "ok": true })))
+        Ok(ok_json())
     } else {
         Err((StatusCode::NOT_FOUND, "message not in queue".to_string()))
     }
@@ -1341,12 +1342,7 @@ pub async fn clear_queue(
         .cmd_tx
         .send(ControlCommand::ClearQueue { respond: tx })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
     let cleared = rx.await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1368,7 +1364,7 @@ pub async fn list_missions(
         .mission_store
         .list_missions(50, 0)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     // Populate workspace_name for each mission
     for mission in &mut missions {
@@ -1391,7 +1387,7 @@ pub async fn get_mission(
         .mission_store
         .get_mission(id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(internal_error)?
     {
         Some(mut mission) => {
             // Populate workspace_name
@@ -1585,22 +1581,12 @@ pub async fn create_mission(
             respond: tx,
         })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
 
     rx.await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to receive response".to_string(),
-            )
-        })?
+        .map_err(recv_failed)?
         .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(internal_error)
 }
 
 /// Load/switch to a mission.
@@ -1616,29 +1602,16 @@ pub async fn load_mission(
         .cmd_tx
         .send(ControlCommand::LoadMission { id, respond: tx })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
 
-    rx.await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to receive response".to_string(),
-            )
-        })?
-        .map(Json)
-        .map_err(|e| {
-            // Return 404 if mission was not found
-            if e.contains("not found") {
-                (StatusCode::NOT_FOUND, e)
-            } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, e)
-            }
-        })
+    rx.await.map_err(recv_failed)?.map(Json).map_err(|e| {
+        // Return 404 if mission was not found
+        if e.contains("not found") {
+            (StatusCode::NOT_FOUND, e)
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })
 }
 
 /// Set mission status (completed/failed).
@@ -1659,22 +1632,12 @@ pub async fn set_mission_status(
             respond: tx,
         })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
 
     rx.await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to receive response".to_string(),
-            )
-        })?
-        .map(|_| Json(serde_json::json!({ "ok": true })))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(recv_failed)?
+        .map(|_| ok_json())
+        .map_err(internal_error)
 }
 
 /// Get the current mission (if any).
@@ -1691,7 +1654,7 @@ pub async fn get_current_mission(
                 .mission_store
                 .get_mission(id)
                 .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                .map_err(internal_error)?;
             Ok(Json(mission))
         }
         None => Ok(Json(None)),
@@ -1729,7 +1692,7 @@ pub async fn get_mission_tree(
         .mission_store
         .get_mission_tree(mission_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
     if tree.is_some() {
         return Ok(Json(tree));
     }
@@ -1738,7 +1701,7 @@ pub async fn get_mission_tree(
         .mission_store
         .get_mission(mission_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
     if mission_exists.is_some() {
         Ok(Json(None))
     } else {
@@ -1784,7 +1747,7 @@ pub async fn get_mission_events(
         .mission_store
         .get_mission(mission_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     if mission.is_none() {
         return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
@@ -1800,7 +1763,7 @@ pub async fn get_mission_events(
         .mission_store
         .get_events(mission_id, types.as_deref(), query.limit, query.offset)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     Ok(Json(events))
 }
@@ -1853,19 +1816,9 @@ pub async fn list_running_missions(
         .cmd_tx
         .send(ControlCommand::ListRunning { respond: tx })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
 
-    let running = rx.await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to receive response".to_string(),
-        )
-    })?;
+    let running = rx.await.map_err(recv_failed)?;
 
     Ok(Json(running))
 }
@@ -1894,20 +1847,10 @@ pub async fn start_mission_parallel(
             respond: tx,
         })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
 
     rx.await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to receive response".to_string(),
-            )
-        })?
+        .map_err(recv_failed)?
         .map(|_| Json(serde_json::json!({ "ok": true, "mission_id": mission_id })))
         .map_err(|e| (StatusCode::CONFLICT, e))
 }
@@ -1928,20 +1871,10 @@ pub async fn cancel_mission(
             respond: tx,
         })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
 
     rx.await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to receive response".to_string(),
-            )
-        })?
+        .map_err(recv_failed)?
         .map(|_| Json(serde_json::json!({ "ok": true, "cancelled": mission_id })))
         .map_err(|e| (StatusCode::NOT_FOUND, e))
 }
@@ -1981,20 +1914,10 @@ pub async fn resume_mission(
             respond: tx,
         })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
 
     rx.await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to receive response".to_string(),
-            )
-        })?
+        .map_err(recv_failed)?
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
@@ -2012,12 +1935,7 @@ pub async fn get_parallel_config(
         .cmd_tx
         .send(ControlCommand::ListRunning { respond: tx })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
 
     let running = rx.await.map_err(|_| {
         (
@@ -2047,12 +1965,7 @@ pub async fn delete_mission(
         .cmd_tx
         .send(ControlCommand::ListRunning { respond: tx })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
 
     let running = rx.await.map_err(|_| {
         (
@@ -2072,7 +1985,7 @@ pub async fn delete_mission(
         .mission_store
         .delete_mission(mission_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     if deleted {
         Ok(Json(serde_json::json!({
@@ -2099,12 +2012,7 @@ pub async fn cleanup_empty_missions(
         .cmd_tx
         .send(ControlCommand::ListRunning { respond: tx })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "control session unavailable".to_string(),
-            )
-        })?;
+        .map_err(session_unavailable)?;
 
     let running = rx.await.map_err(|_| {
         (
@@ -2119,7 +2027,7 @@ pub async fn cleanup_empty_missions(
         .mission_store
         .delete_empty_untitled_missions_excluding(&running_ids)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -5944,7 +5852,7 @@ pub async fn list_mission_automations(
         .mission_store
         .get_mission_automations(mission_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     Ok(Json(automations))
 }
@@ -5960,7 +5868,7 @@ pub async fn list_active_automations(
         .mission_store
         .list_active_automations()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     Ok(Json(automations))
 }
@@ -6043,7 +5951,7 @@ pub async fn create_automation(
         .mission_store
         .create_automation(automation)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     // If start_immediately is requested for agent_finished triggers, fire the
     // first execution right away by resolving the command and sending it as a
@@ -6113,7 +6021,7 @@ pub async fn get_automation(
         .mission_store
         .get_automation(automation_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(internal_error)?
         .ok_or((
             StatusCode::NOT_FOUND,
             format!("Automation {} not found", automation_id),
@@ -6136,7 +6044,7 @@ pub async fn update_automation(
         .mission_store
         .get_automation(automation_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(internal_error)?
         .ok_or((
             StatusCode::NOT_FOUND,
             format!("Automation {} not found", automation_id),
@@ -6206,7 +6114,7 @@ pub async fn update_automation(
         .mission_store
         .update_automation(automation.clone())
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     Ok(Json(automation))
 }
@@ -6223,7 +6131,7 @@ pub async fn delete_automation(
         .mission_store
         .delete_automation(automation_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     if deleted {
         Ok(StatusCode::NO_CONTENT)
@@ -6248,7 +6156,7 @@ pub async fn get_automation_executions(
         .mission_store
         .get_automation(automation_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(internal_error)?
         .ok_or((
             StatusCode::NOT_FOUND,
             format!("Automation {} not found", automation_id),
@@ -6258,7 +6166,7 @@ pub async fn get_automation_executions(
         .mission_store
         .get_automation_executions(automation_id, Some(100))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     Ok(Json(executions))
 }
@@ -6275,7 +6183,7 @@ pub async fn get_mission_automation_executions(
         .mission_store
         .get_mission_automation_executions(mission_id, Some(100))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     Ok(Json(executions))
 }
@@ -6404,7 +6312,7 @@ pub async fn webhook_receiver(
         .mission_store
         .get_mission(mission_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(internal_error)?
         .ok_or((
             StatusCode::NOT_FOUND,
             format!("Mission {} not found", mission_id),
