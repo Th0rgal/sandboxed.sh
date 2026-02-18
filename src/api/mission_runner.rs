@@ -9817,11 +9817,10 @@ mod tests {
         build_history_context, extract_opencode_session_id, extract_part_text, extract_str,
         extract_thought_line, is_rate_limited_error, is_session_corruption_error,
         is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_session_token, parse_opencode_stderr_text_part, remap_legacy_codex_model,
-        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
-        strip_opencode_banner_lines, strip_opencode_status_lines, strip_think_tags,
-        summarize_recent_opencode_stderr, sync_opencode_agent_config, MissionHealth,
-        MissionRunState, MissionStallSeverity, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        parse_opencode_session_token, parse_opencode_stderr_text_part, running_health,
+        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
+        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
+        MissionHealth, MissionRunState, MissionStallSeverity, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
     use serde_json::json;
