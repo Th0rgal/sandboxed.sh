@@ -1882,21 +1882,19 @@ fn read_backend_configs() -> Option<Vec<serde_json::Value>> {
     None
 }
 
-/// Read CLI path from backend config file if available.
-fn get_claudecode_cli_path_from_config(_app_working_dir: &std::path::Path) -> Option<String> {
+/// Read a non-empty string setting from a backend's config entry.
+fn get_backend_string_setting(backend_id: &str, key: &str) -> Option<String> {
     let configs = read_backend_configs()?;
-
     for config in configs {
-        if config.get("id")?.as_str()? == "claudecode" {
-            if let Some(settings) = config.get("settings") {
-                if let Some(cli_path) = settings.get("cli_path").and_then(|v| v.as_str()) {
-                    if !cli_path.is_empty() {
-                        tracing::info!(
-                            "Using Claude Code CLI path from backend config: {}",
-                            cli_path
-                        );
-                        return Some(cli_path.to_string());
-                    }
+        if config.get("id")?.as_str()? == backend_id {
+            if let Some(val) = config
+                .get("settings")
+                .and_then(|s| s.get(key))
+                .and_then(|v| v.as_str())
+            {
+                if !val.is_empty() {
+                    tracing::info!("Using {} {} from backend config: {}", backend_id, key, val);
+                    return Some(val.to_string());
                 }
             }
         }
@@ -1904,19 +1902,18 @@ fn get_claudecode_cli_path_from_config(_app_working_dir: &std::path::Path) -> Op
     None
 }
 
-/// Read CLI path from Codex backend config file if available.
-fn get_codex_cli_path_from_config(_app_working_dir: &std::path::Path) -> Option<String> {
+/// Read a boolean setting from a backend's config entry.
+fn get_backend_bool_setting(backend_id: &str, key: &str) -> Option<bool> {
     let configs = read_backend_configs()?;
-
     for config in configs {
-        if config.get("id")?.as_str()? == "codex" {
-            if let Some(settings) = config.get("settings") {
-                if let Some(cli_path) = settings.get("cli_path").and_then(|v| v.as_str()) {
-                    if !cli_path.is_empty() {
-                        tracing::info!("Using Codex CLI path from backend config: {}", cli_path);
-                        return Some(cli_path.to_string());
-                    }
-                }
+        if config.get("id")?.as_str()? == backend_id {
+            if let Some(val) = config
+                .get("settings")
+                .and_then(|s| s.get(key))
+                .and_then(|v| v.as_bool())
+            {
+                tracing::info!("Using {} {} from backend config: {}", backend_id, key, val);
+                return Some(val);
             }
         }
     }
@@ -1925,24 +1922,11 @@ fn get_codex_cli_path_from_config(_app_working_dir: &std::path::Path) -> Option<
 
 /// Read API key from Amp backend config file if available.
 pub fn get_amp_api_key_from_config() -> Option<String> {
-    let configs = read_backend_configs()?;
-
-    for config in configs {
-        if config.get("id")?.as_str()? == "amp" {
-            if let Some(settings) = config.get("settings") {
-                if let Some(api_key) = settings.get("api_key").and_then(|v| v.as_str()) {
-                    if !api_key.is_empty()
-                        && !api_key.starts_with("[REDACTED")
-                        && api_key != "********"
-                    {
-                        tracing::debug!("Using Amp API key from backend config");
-                        return Some(api_key.to_string());
-                    }
-                }
-            }
-        }
+    let key = get_backend_string_setting("amp", "api_key")?;
+    if key.starts_with("[REDACTED") || key == "********" {
+        return None;
     }
-    None
+    Some(key)
 }
 
 /// Read amp.url from Amp CLI settings file (~/.config/amp/settings.json)
@@ -2357,7 +2341,7 @@ pub fn run_claudecode_turn<'a>(
         }
 
         // Determine CLI path: prefer backend config, then env var, then default
-        let cli_path = get_claudecode_cli_path_from_config(app_working_dir)
+        let cli_path = get_backend_string_setting("claudecode", "cli_path")
             .or_else(|| std::env::var("CLAUDE_CLI_PATH").ok())
             .unwrap_or_else(|| "claude".to_string());
 
@@ -3321,43 +3305,6 @@ pub fn run_claudecode_turn<'a>(
 }
 
 /// Read CLI path for opencode from backend config file if available.
-fn get_opencode_cli_path_from_config(_app_working_dir: &std::path::Path) -> Option<String> {
-    let configs = read_backend_configs()?;
-
-    for config in configs {
-        if config.get("id")?.as_str()? == "opencode" {
-            if let Some(settings) = config.get("settings") {
-                if let Some(cli_path) = settings.get("cli_path").and_then(|v| v.as_str()) {
-                    if !cli_path.is_empty() {
-                        tracing::info!("Using OpenCode CLI path from backend config: {}", cli_path);
-                        return Some(cli_path.to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn get_opencode_permissive_from_config(_app_working_dir: &std::path::Path) -> Option<bool> {
-    let configs = read_backend_configs()?;
-
-    for config in configs {
-        if config.get("id")?.as_str()? == "opencode" {
-            if let Some(settings) = config.get("settings") {
-                if let Some(permissive) = settings.get("permissive").and_then(|v| v.as_bool()) {
-                    tracing::info!(
-                        "Using OpenCode permissive setting from backend config: {}",
-                        permissive
-                    );
-                    return Some(permissive);
-                }
-            }
-        }
-    }
-    None
-}
-
 fn workspace_path_for_env(
     workspace: &Workspace,
     host_path: &std::path::Path,
@@ -7312,7 +7259,7 @@ pub async fn run_opencode_turn(
     // failover — so removing it trades slightly higher 429 rates under heavy
     // concurrency for lower latency in the common case.
 
-    let configured_runner = get_opencode_cli_path_from_config(app_working_dir)
+    let configured_runner = get_backend_string_setting("opencode", "cli_path")
         .or_else(|| std::env::var("OPENCODE_CLI_PATH").ok());
 
     let mut runner_is_direct = false;
@@ -7588,7 +7535,7 @@ pub async fn run_opencode_turn(
             .or_insert(project_id);
     }
 
-    if let Some(permissive) = get_opencode_permissive_from_config(app_working_dir) {
+    if let Some(permissive) = get_backend_bool_setting("opencode", "permissive") {
         env.insert("OPENCODE_PERMISSIVE".to_string(), permissive.to_string());
     } else if let Ok(value) = std::env::var("OPENCODE_PERMISSIVE") {
         if !value.trim().is_empty() {
@@ -9696,7 +9643,7 @@ pub async fn run_codex_turn(
     }
 
     let workspace_exec = WorkspaceExec::new(workspace.clone());
-    let cli_path = get_codex_cli_path_from_config(app_working_dir)
+    let cli_path = get_backend_string_setting("codex", "cli_path")
         .or_else(|| std::env::var("CODEX_CLI_PATH").ok())
         .unwrap_or_else(|| "codex".to_string());
     let cli_path = match ensure_codex_cli_available(&workspace_exec, mission_work_dir, &cli_path)
