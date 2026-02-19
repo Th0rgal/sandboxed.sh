@@ -6979,11 +6979,11 @@ pub async fn check_backend_prerequisites(
         }
         _ => BackendPreflightResult {
             backend_id: backend_id.to_string(),
-            available: true,
-            cli_available: true,
+            available: false,
+            cli_available: false,
             auto_install_possible: false,
-            missing_dependencies: vec![],
-            message: None,
+            missing_dependencies: vec![format!("unknown backend: {}", backend_id)],
+            message: Some(format!("Unknown backend '{}'. Supported backends: claudecode, opencode, codex, amp", backend_id)),
         },
     }
 }
@@ -7084,7 +7084,9 @@ async fn check_codex_prerequisites(
     let mut missing = Vec::new();
     let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
 
-    let cli_available = command_available(workspace_exec, cwd, program).await;
+    let cli_available = command_available(workspace_exec, cwd, program).await
+        || command_available(workspace_exec, cwd, "/root/.cache/.bun/bin/codex").await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/codex").await;
 
     if cli_available {
         return BackendPreflightResult {
@@ -7128,25 +7130,41 @@ async fn check_amp_prerequisites(
 ) -> BackendPreflightResult {
     let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
 
-    let cli_available = command_available(workspace_exec, cwd, program).await;
+    let cli_available = command_available(workspace_exec, cwd, program).await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/amp").await
+        || command_available(workspace_exec, cwd, "/root/.cache/.bun/bin/amp").await;
+
+    if cli_available {
+        return BackendPreflightResult {
+            backend_id: "amp".to_string(),
+            available: true,
+            cli_available: true,
+            auto_install_possible: false,
+            missing_dependencies: vec![],
+            message: None,
+        };
+    }
+
+    let has_npm = command_available(workspace_exec, cwd, "npm").await;
+    let has_bun = command_available(workspace_exec, cwd, "bun").await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+
+    let auto_install_possible = has_npm || has_bun;
 
     BackendPreflightResult {
         backend_id: "amp".to_string(),
-        available: cli_available,
-        cli_available,
-        auto_install_possible: false,
-        missing_dependencies: if !cli_available {
+        available: auto_install_possible,
+        cli_available: false,
+        auto_install_possible,
+        missing_dependencies: if !auto_install_possible {
+            vec!["amp CLI".to_string(), "npm or bun".to_string()]
+        } else {
             vec!["amp CLI".to_string()]
-        } else {
-            vec![]
         },
-        message: if !cli_available {
-            Some(
-                "Amp CLI not found. Install amp in the workspace or set a custom CLI path."
-                    .to_string(),
-            )
+        message: if !auto_install_possible {
+            Some("Amp CLI not found and neither npm nor bun is available. Install Node.js/npm or Bun in the workspace template.".to_string())
         } else {
-            None
+            Some("Amp CLI not found but can be auto-installed via npm/bun.".to_string())
         },
     }
 }
