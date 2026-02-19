@@ -42,6 +42,12 @@ const OPENAI_SCOPE: &str = "openid profile email offline_access";
 const OPENAI_TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const OPENAI_ID_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
 
+/// Returns the OpenAI OAuth redirect URI.
+/// Checks OPENAI_REDIRECT_URI env var first, then falls back to default.
+fn openai_redirect_uri() -> String {
+    std::env::var("OPENAI_REDIRECT_URI").unwrap_or_else(|_| OPENAI_REDIRECT_URI.to_string())
+}
+
 async fn exchange_openai_id_token_for_api_key(
     client: &reqwest::Client,
     id_token: &str,
@@ -272,13 +278,14 @@ fn anthropic_redirect_uri(mode: &str, _client_id: &str) -> String {
 }
 
 fn openai_authorize_url(challenge: &str, state: &str) -> Result<String, String> {
+    let redirect_uri = openai_redirect_uri();
     let mut url =
         url::Url::parse(OPENAI_AUTHORIZE_URL).map_err(|e| format!("Failed to parse URL: {}", e))?;
 
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", OPENAI_CLIENT_ID)
-        .append_pair("redirect_uri", OPENAI_REDIRECT_URI)
+        .append_pair("redirect_uri", &redirect_uri)
         .append_pair("scope", OPENAI_SCOPE)
         .append_pair("code_challenge", challenge)
         .append_pair("code_challenge_method", "S256")
@@ -5572,12 +5579,13 @@ async fn oauth_callback_inner(
             }
 
             let client = reqwest::Client::new();
+            let redirect_uri = openai_redirect_uri();
             let token_body = url::form_urlencoded::Serializer::new(String::new())
                 .append_pair("grant_type", "authorization_code")
                 .append_pair("client_id", OPENAI_CLIENT_ID)
                 .append_pair("code", &code)
                 .append_pair("code_verifier", &pending.verifier)
-                .append_pair("redirect_uri", OPENAI_REDIRECT_URI)
+                .append_pair("redirect_uri", &redirect_uri)
                 .finish();
 
             let token_response = client
