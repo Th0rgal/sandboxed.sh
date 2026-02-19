@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::opencode_config::OpenCodeConnection;
-use crate::util::{home_dir, resolve_config_path, strip_jsonc_comments};
+use crate::util::{home_dir, read_json_config, resolve_config_path, write_json_config};
 
 /// Create OpenCode connection routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -63,102 +63,42 @@ fn resolve_opencode_config_path() -> std::path::PathBuf {
 
 /// GET /api/opencode/settings - Read oh-my-opencode settings.
 pub async fn get_opencode_settings() -> Result<Json<Value>, (StatusCode, String)> {
-    let config_path = resolve_oh_my_opencode_path();
-
-    if !config_path.exists() {
-        // Return empty object if file doesn't exist
-        return Ok(Json(serde_json::json!({})));
-    }
-
-    let contents = tokio::fs::read_to_string(&config_path).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read oh-my-opencode.json: {}", e),
-        )
-    })?;
-
-    let config: Value = serde_json::from_str(&contents).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Invalid JSON in oh-my-opencode.json: {}", e),
-        )
-    })?;
-
-    Ok(Json(config))
+    let path = resolve_oh_my_opencode_path();
+    read_json_config(&path, "oh-my-opencode.json")
+        .await
+        .map(Json)
 }
 
 /// GET /api/opencode/config - Read opencode.json settings.
 pub async fn get_opencode_config() -> Result<Json<Value>, (StatusCode, String)> {
     let config_path = resolve_opencode_config_path();
 
-    let mut read_path = config_path.clone();
-    if !read_path.exists() {
-        // Try opencode.jsonc in the same directory
-        let jsonc_path = if let Some(parent) = config_path.parent() {
-            parent.join("opencode.jsonc")
-        } else {
-            config_path.with_extension("jsonc")
-        };
+    // Fall back to .jsonc variant if the .json file doesn't exist.
+    let read_path = if config_path.exists() {
+        config_path.clone()
+    } else {
+        let jsonc_path = config_path
+            .parent()
+            .map(|p| p.join("opencode.jsonc"))
+            .unwrap_or_else(|| config_path.with_extension("jsonc"));
         if jsonc_path.exists() {
-            read_path = jsonc_path;
+            jsonc_path
         } else {
             return Ok(Json(serde_json::json!({})));
         }
-    }
+    };
 
-    let contents = tokio::fs::read_to_string(&read_path).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read opencode config: {}", e),
-        )
-    })?;
-
-    let config: Value = serde_json::from_str(&contents)
-        .or_else(|_| {
-            let stripped = strip_jsonc_comments(&contents);
-            serde_json::from_str(&stripped)
-        })
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Invalid JSON in opencode config: {}", e),
-            )
-        })?;
-
-    Ok(Json(config))
+    read_json_config(&read_path, "opencode config")
+        .await
+        .map(Json)
 }
 
 /// PUT /api/opencode/settings - Write oh-my-opencode settings.
 pub async fn update_opencode_settings(
     Json(config): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let config_path = resolve_oh_my_opencode_path();
-
-    // Ensure parent directory exists
-    if let Some(parent) = config_path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create config directory: {}", e),
-            )
-        })?;
-    }
-
-    // Write the config
-    let contents = serde_json::to_string_pretty(&config)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)))?;
-
-    tokio::fs::write(&config_path, contents)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to write oh-my-opencode.json: {}", e),
-            )
-        })?;
-
-    tracing::info!(path = %config_path.display(), "Updated oh-my-opencode settings");
-
+    let path = resolve_oh_my_opencode_path();
+    write_json_config(&path, &config, "oh-my-opencode settings").await?;
     Ok(Json(config))
 }
 
@@ -166,31 +106,8 @@ pub async fn update_opencode_settings(
 pub async fn update_opencode_config(
     Json(config): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let config_path = resolve_opencode_config_path();
-
-    if let Some(parent) = config_path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create config directory: {}", e),
-            )
-        })?;
-    }
-
-    let contents = serde_json::to_string_pretty(&config)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)))?;
-
-    tokio::fs::write(&config_path, contents)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to write opencode.json: {}", e),
-            )
-        })?;
-
-    tracing::info!(path = %config_path.display(), "Updated opencode config");
-
+    let path = resolve_opencode_config_path();
+    write_json_config(&path, &config, "opencode config").await?;
     Ok(Json(config))
 }
 

@@ -184,6 +184,73 @@ pub fn resolve_config_path(
     std::path::PathBuf::from(home_dir()).join(default_rel_path)
 }
 
+/// Read a JSON/JSONC config file, returning `{}` if it doesn't exist.
+///
+/// On parse failure, retries after stripping JSONC comments and trailing commas.
+/// `label` is used in error messages (e.g. "Amp config").
+pub async fn read_json_config(
+    path: &std::path::Path,
+    label: &str,
+) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+
+    let contents = tokio::fs::read_to_string(path).await.map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read {label}: {e}"),
+        )
+    })?;
+
+    serde_json::from_str(&contents)
+        .or_else(|_| {
+            let cleaned = strip_trailing_commas(&strip_jsonc_comments(&contents));
+            serde_json::from_str(&cleaned)
+        })
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid JSON in {label}: {e}"),
+            )
+        })
+}
+
+/// Write a JSON config file, creating parent directories as needed.
+///
+/// `label` is used in the log message (e.g. "Amp config").
+pub async fn write_json_config(
+    path: &std::path::Path,
+    config: &serde_json::Value,
+    label: &str,
+) -> Result<(), (axum::http::StatusCode, String)> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create config directory: {e}"),
+            )
+        })?;
+    }
+
+    let contents = serde_json::to_string_pretty(config).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("Invalid JSON: {e}"),
+        )
+    })?;
+
+    tokio::fs::write(path, contents).await.map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write {label}: {e}"),
+        )
+    })?;
+
+    tracing::info!(path = %path.display(), "Updated {label}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
