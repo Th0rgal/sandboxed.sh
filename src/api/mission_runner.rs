@@ -1893,7 +1893,11 @@ fn get_backend_string_setting(backend_id: &str, key: &str) -> Option<String> {
                 .and_then(|v| v.as_str())
             {
                 if !val.is_empty() {
-                    tracing::info!("Using {} {} from backend config: {}", backend_id, key, val);
+                    if key == "api_key" {
+                        tracing::info!("Using {} {} from backend config", backend_id, key);
+                    } else {
+                        tracing::info!("Using {} {} from backend config: {}", backend_id, key, val);
+                    }
                     return Some(val.to_string());
                 }
             }
