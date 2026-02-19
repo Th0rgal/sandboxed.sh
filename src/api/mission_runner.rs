@@ -6942,6 +6942,212 @@ async fn ensure_opencode_cli_available(
     Ok(())
 }
 
+/// Result of a backend preflight check
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackendPreflightResult {
+    pub backend_id: String,
+    pub available: bool,
+    pub cli_available: bool,
+    pub auto_install_possible: bool,
+    pub missing_dependencies: Vec<String>,
+    pub message: Option<String>,
+}
+
+/// Check if a backend can run in the given workspace.
+/// This performs a lightweight check without actually installing anything.
+pub async fn check_backend_prerequisites(
+    workspace: &Workspace,
+    backend_id: &str,
+    cli_path: Option<&str>,
+) -> BackendPreflightResult {
+    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let cwd = &workspace.path;
+
+    match backend_id {
+        "claudecode" => {
+            let cli = cli_path.unwrap_or("claude");
+            check_claudecode_prerequisites(&workspace_exec, cwd, cli).await
+        }
+        "opencode" => check_opencode_prerequisites(&workspace_exec, cwd).await,
+        "codex" => {
+            let cli = cli_path.unwrap_or("codex");
+            check_codex_prerequisites(&workspace_exec, cwd, cli).await
+        }
+        "amp" => {
+            let cli = cli_path.unwrap_or("amp");
+            check_amp_prerequisites(&workspace_exec, cwd, cli).await
+        }
+        _ => BackendPreflightResult {
+            backend_id: backend_id.to_string(),
+            available: true,
+            cli_available: true,
+            auto_install_possible: false,
+            missing_dependencies: vec![],
+            message: None,
+        },
+    }
+}
+
+async fn check_claudecode_prerequisites(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> BackendPreflightResult {
+    let mut missing = Vec::new();
+    let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
+
+    let cli_available = command_available(workspace_exec, cwd, program).await
+        || command_available(workspace_exec, cwd, "/root/.cache/.bun/bin/claude").await;
+
+    if cli_available {
+        return BackendPreflightResult {
+            backend_id: "claudecode".to_string(),
+            available: true,
+            cli_available: true,
+            auto_install_possible: false,
+            missing_dependencies: vec![],
+            message: None,
+        };
+    }
+
+    let has_npm = command_available(workspace_exec, cwd, "npm").await;
+    let has_bun = command_available(workspace_exec, cwd, "bun").await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+
+    if !has_npm && !has_bun {
+        missing.push("npm or bun".to_string());
+    }
+
+    let auto_install_possible = has_npm || has_bun;
+
+    BackendPreflightResult {
+        backend_id: "claudecode".to_string(),
+        available: auto_install_possible,
+        cli_available: false,
+        auto_install_possible,
+        missing_dependencies: missing,
+        message: if !auto_install_possible {
+            Some("Claude Code CLI not found and neither npm nor bun is available. Install Node.js/npm or Bun in the workspace template.".to_string())
+        } else {
+            Some("Claude Code CLI not found but can be auto-installed via npm/bun.".to_string())
+        },
+    }
+}
+
+async fn check_opencode_prerequisites(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> BackendPreflightResult {
+    let mut missing = Vec::new();
+
+    let cli_available = opencode_binary_available(workspace_exec, cwd).await;
+
+    if cli_available {
+        return BackendPreflightResult {
+            backend_id: "opencode".to_string(),
+            available: true,
+            cli_available: true,
+            auto_install_possible: false,
+            missing_dependencies: vec![],
+            message: None,
+        };
+    }
+
+    let has_curl = command_available(workspace_exec, cwd, "curl").await;
+    let has_wget = command_available(workspace_exec, cwd, "wget").await;
+
+    if !has_curl && !has_wget {
+        missing.push("curl or wget".to_string());
+    }
+
+    let auto_install_possible = has_curl || has_wget;
+
+    BackendPreflightResult {
+        backend_id: "opencode".to_string(),
+        available: auto_install_possible,
+        cli_available: false,
+        auto_install_possible,
+        missing_dependencies: missing,
+        message: if !auto_install_possible {
+            Some("OpenCode CLI not found and neither curl nor wget is available. Install curl/wget in the workspace template.".to_string())
+        } else {
+            Some("OpenCode CLI not found but can be auto-installed via curl/wget.".to_string())
+        },
+    }
+}
+
+async fn check_codex_prerequisites(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> BackendPreflightResult {
+    let mut missing = Vec::new();
+    let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
+
+    let cli_available = command_available(workspace_exec, cwd, program).await;
+
+    if cli_available {
+        return BackendPreflightResult {
+            backend_id: "codex".to_string(),
+            available: true,
+            cli_available: true,
+            auto_install_possible: false,
+            missing_dependencies: vec![],
+            message: None,
+        };
+    }
+
+    let has_npm = command_available(workspace_exec, cwd, "npm").await;
+    let has_bun = command_available(workspace_exec, cwd, "bun").await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+
+    if !has_npm && !has_bun {
+        missing.push("npm or bun".to_string());
+    }
+
+    let auto_install_possible = has_npm || has_bun;
+
+    BackendPreflightResult {
+        backend_id: "codex".to_string(),
+        available: auto_install_possible,
+        cli_available: false,
+        auto_install_possible,
+        missing_dependencies: missing,
+        message: if !auto_install_possible {
+            Some("Codex CLI not found and neither npm nor bun is available. Install Node.js/npm or Bun in the workspace template.".to_string())
+        } else {
+            Some("Codex CLI not found but can be auto-installed via npm/bun.".to_string())
+        },
+    }
+}
+
+async fn check_amp_prerequisites(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> BackendPreflightResult {
+    let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
+
+    let cli_available = command_available(workspace_exec, cwd, program).await;
+
+    BackendPreflightResult {
+        backend_id: "amp".to_string(),
+        available: cli_available,
+        cli_available,
+        auto_install_possible: false,
+        missing_dependencies: if !cli_available {
+            vec!["amp CLI".to_string()]
+        } else {
+            vec![]
+        },
+        message: if !cli_available {
+            Some("Amp CLI not found. Install amp in the workspace or set a custom CLI path.".to_string())
+        } else {
+            None
+        },
+    }
+}
+
 /// Execute a turn using OpenCode CLI backend.
 ///
 /// For Host workspaces: spawns the CLI directly on the host.

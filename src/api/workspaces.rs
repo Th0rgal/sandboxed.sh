@@ -41,6 +41,8 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         // Memory monitoring
         .route("/:id/memory", get(get_workspace_memory))
         .route("/memory/all", get(get_all_workspaces_memory))
+        // Backend preflight checks
+        .route("/:id/backends/:backend_id/preflight", get(check_backend_preflight))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1720,6 +1722,44 @@ fn parse_systemd_memory_stats(stdout: &str) -> MemoryStats {
         memory_available,
         None,
     )
+}
+
+/// Check if a backend can run in a workspace.
+/// GET /api/workspaces/:id/backends/:backend_id/preflight
+async fn check_backend_preflight(
+    AxumPath((workspace_id, backend_id)): AxumPath<(Uuid, String)>,
+    State(state): State<Arc<super::routes::AppState>>,
+) -> Result<Json<super::mission_runner::BackendPreflightResult>, (StatusCode, String)> {
+    let workspace = state
+        .workspaces
+        .get(workspace_id)
+        .await
+        .ok_or((StatusCode::NOT_FOUND, "Workspace not found".to_string()))?;
+
+    let cli_path = if backend_id == "claudecode" || backend_id == "codex" || backend_id == "amp" {
+        state
+            .backend_configs
+            .get(&backend_id)
+            .await
+            .and_then(|config| {
+                config
+                    .settings
+                    .get("cli_path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+    } else {
+        None
+    };
+
+    let result = super::mission_runner::check_backend_prerequisites(
+        &workspace,
+        &backend_id,
+        cli_path.as_deref(),
+    )
+    .await;
+
+    Ok(Json(result))
 }
 
 #[cfg(test)]
