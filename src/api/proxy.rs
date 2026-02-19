@@ -1062,11 +1062,11 @@ fn extract_rate_limit_snapshot(
             let requests_reset = headers
                 .get("anthropic-ratelimit-requests-reset")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| parse_iso_timestamp(s));
+                .and_then(parse_iso_timestamp);
             let tokens_reset = headers
                 .get("anthropic-ratelimit-tokens-reset")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| parse_iso_timestamp(s));
+                .and_then(parse_iso_timestamp);
 
             if requests_limit.is_none()
                 && requests_remaining.is_none()
