@@ -6765,12 +6765,11 @@ fn is_codex_node_wrapper(path: &std::path::Path) -> bool {
     }
 
     let lower = content.to_lowercase();
-    let has_codex_ref = lower.contains("@openai/codex")
+    lower.contains("@openai/codex")
         || lower.contains("codex-linux-x64")
         || lower.contains("codex-linux-arm64")
         || lower.contains("codex-darwin-x64")
-        || lower.contains("codex-darwin-arm64");
-    has_codex_ref
+        || lower.contains("codex-darwin-arm64")
 }
 
 fn codex_npm_package_name(triple: &str) -> &'static str {
