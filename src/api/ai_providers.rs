@@ -4569,8 +4569,7 @@ async fn get_provider(
     let provider_type = ProviderType::from_id(&id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let opencode_config =
-        read_opencode_config(&config_path).map_err(internal_error)?;
+    let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
     let auth_map = read_opencode_auth_map().map_err(internal_error)?;
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
@@ -4630,8 +4629,7 @@ async fn update_provider(
     }
 
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let mut opencode_config =
-        read_opencode_config(&config_path).map_err(internal_error)?;
+    let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
 
     set_provider_config_entry(
         &mut opencode_config,
@@ -4808,8 +4806,7 @@ async fn delete_provider(
     let provider_type = ProviderType::from_id(&id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let mut opencode_config =
-        read_opencode_config(&config_path).map_err(internal_error)?;
+    let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
 
     remove_provider_config_entry(&mut opencode_config, provider_type);
     write_opencode_config(&config_path, &opencode_config).map_err(internal_error)?;
@@ -4970,8 +4967,7 @@ async fn set_default(
         .map_err(internal_error)?;
 
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let opencode_config =
-        read_opencode_config(&config_path).map_err(internal_error)?;
+    let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
     let auth_map = read_opencode_auth_map().map_err(internal_error)?;
     let backends_state = read_provider_backends_state(&state.config.working_dir);
     let default_provider = Some(provider_type);
@@ -5395,8 +5391,8 @@ async fn oauth_callback_inner(
                 }
 
                 let config_path = get_opencode_config_path(&state.config.working_dir);
-                let mut opencode_config = read_opencode_config(&config_path)
-                    .map_err(internal_error)?;
+                let mut opencode_config =
+                    read_opencode_config(&config_path).map_err(internal_error)?;
 
                 // Update use_for_backends if specified
                 if let Some(ref backends) = req.use_for_backends {
@@ -5494,8 +5490,8 @@ async fn oauth_callback_inner(
                 }
 
                 let config_path = get_opencode_config_path(&state.config.working_dir);
-                let mut opencode_config = read_opencode_config(&config_path)
-                    .map_err(internal_error)?;
+                let mut opencode_config =
+                    read_opencode_config(&config_path).map_err(internal_error)?;
 
                 // Update use_for_backends if specified
                 if let Some(ref backends) = req.use_for_backends {
@@ -5665,8 +5661,7 @@ async fn oauth_callback_inner(
             }
 
             let config_path = get_opencode_config_path(&state.config.working_dir);
-            let opencode_config = read_opencode_config(&config_path)
-                .map_err(internal_error)?;
+            let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
             let backends_state = read_provider_backends_state(&state.config.working_dir);
             let default_provider = get_default_provider(&opencode_config);
             let config_entry = get_provider_config_entry(&opencode_config, provider_type);

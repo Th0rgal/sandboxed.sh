@@ -256,8 +256,8 @@ pub async fn login(
         )
     })?;
 
-    let (token, exp) = issue_jwt(secret, state.config.auth.jwt_ttl_days, &user)
-        .map_err(internal_error)?;
+    let (token, exp) =
+        issue_jwt(secret, state.config.auth.jwt_ttl_days, &user).map_err(internal_error)?;
 
     Ok(Json(LoginResponse { token, exp }))
 }
