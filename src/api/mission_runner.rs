@@ -1894,7 +1894,7 @@ fn get_backend_string_setting(backend_id: &str, key: &str) -> Option<String> {
             {
                 if !val.is_empty() {
                     if key == "api_key" {
-                        tracing::info!("Using {} {} from backend config", backend_id, key);
+                        tracing::debug!("Using {} {} from backend config", backend_id, key);
                     } else {
                         tracing::info!("Using {} {} from backend config: {}", backend_id, key, val);
                     }
