@@ -3962,8 +3962,7 @@ async fn list_providers(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<Vec<ProviderResponse>>, (StatusCode, String)> {
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let opencode_config =
-        read_opencode_config(&config_path).map_err(internal_error)?;
+    let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
     let auth_map = read_opencode_auth_map().map_err(internal_error)?;
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
@@ -4224,8 +4223,7 @@ async fn check_provider_health(
             }
 
             // Read OpenCode auth to get API key for standard providers
-            let auth_map =
-                read_opencode_auth_map().map_err(internal_error)?;
+            let auth_map = read_opencode_auth_map().map_err(internal_error)?;
             let auth = read_opencode_auth().map_err(internal_error)?;
 
             let auth_kind = auth_map.get(&provider_type);
