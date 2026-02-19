@@ -6652,14 +6652,14 @@ fn resolve_codex_native_binary_search_paths(
     }
 
     for prefix in ["/usr/local", "/usr"] {
-        let npm_optional = std::path::PathBuf::from(prefix)
+        let npm_root = std::path::PathBuf::from(prefix)
             .join("lib")
             .join("node_modules")
             .join("@openai")
-            .join("codex")
-            .join("node_modules")
-            .join("@openai")
-            .join(npm_pkg);
+            .join("codex");
+        paths.push(binary_path(&npm_root));
+
+        let npm_optional = npm_root.join("node_modules").join("@openai").join(npm_pkg);
         paths.push(binary_path(&npm_optional));
     }
 
