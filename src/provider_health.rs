@@ -45,6 +45,36 @@ impl std::fmt::Display for CooldownReason {
     }
 }
 
+/// Snapshot of rate-limit quota state from provider response headers.
+///
+/// Providers send rate-limit information on every response (not just 429s).
+/// This struct captures the current quota state for display in the health dashboard.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RateLimitSnapshot {
+    /// Maximum requests allowed in the current window.
+    pub requests_limit: Option<u64>,
+    /// Requests remaining in the current window.
+    pub requests_remaining: Option<u64>,
+    /// When the request quota resets (ISO 8601 timestamp).
+    pub requests_reset: Option<chrono::DateTime<chrono::Utc>>,
+    /// Maximum tokens allowed in the current window.
+    pub tokens_limit: Option<u64>,
+    /// Tokens remaining in the current window.
+    pub tokens_remaining: Option<u64>,
+    /// When the token quota resets (ISO 8601 timestamp).
+    pub tokens_reset: Option<chrono::DateTime<chrono::Utc>>,
+    /// Maximum input tokens allowed (Anthropic-specific).
+    pub input_tokens_limit: Option<u64>,
+    /// Input tokens remaining (Anthropic-specific).
+    pub input_tokens_remaining: Option<u64>,
+    /// Maximum output tokens allowed (Anthropic-specific).
+    pub output_tokens_limit: Option<u64>,
+    /// Output tokens remaining (Anthropic-specific).
+    pub output_tokens_remaining: Option<u64>,
+    /// When this snapshot was captured.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Health state for a single provider account.
 #[derive(Debug, Clone, Default)]
 pub struct AccountHealth {
@@ -74,6 +104,8 @@ pub struct AccountHealth {
     pub total_input_tokens: u64,
     /// Total output (completion) tokens consumed.
     pub total_output_tokens: u64,
+    /// Latest rate-limit quota snapshot from provider headers.
+    pub rate_limit_snapshot: Option<RateLimitSnapshot>,
 }
 
 impl AccountHealth {
@@ -209,6 +241,8 @@ pub struct AccountHealthSnapshot {
     pub total_output_tokens: u64,
     /// Whether the circuit breaker has tripped (consecutive failures exceeded threshold).
     pub is_degraded: bool,
+    /// Latest rate-limit quota snapshot from provider headers.
+    pub rate_limit_snapshot: Option<RateLimitSnapshot>,
 }
 
 impl Default for ProviderHealthTracker {
@@ -346,6 +380,15 @@ impl ProviderHealthTracker {
         health.total_output_tokens += output_tokens;
     }
 
+    /// Record rate-limit quota snapshot from provider response headers.
+    ///
+    /// Called on every successful response to track remaining quota.
+    pub async fn record_rate_limits(&self, account_id: Uuid, snapshot: RateLimitSnapshot) {
+        let mut accounts = self.accounts.write().await;
+        let health = accounts.entry(account_id).or_default();
+        health.rate_limit_snapshot = Some(snapshot);
+    }
+
     /// Record a fallback event (provider failover).
     pub async fn record_fallback_event(&self, event: FallbackEvent) {
         let mut events = self.fallback_events.write().await;
@@ -390,6 +433,7 @@ impl ProviderHealthTracker {
             total_input_tokens: health.total_input_tokens,
             total_output_tokens: health.total_output_tokens,
             is_degraded: health.consecutive_failures >= backoff_config.circuit_breaker_threshold,
+            rate_limit_snapshot: health.rate_limit_snapshot.clone(),
         }
     }
 
@@ -414,6 +458,7 @@ impl ProviderHealthTracker {
                 total_input_tokens: 0,
                 total_output_tokens: 0,
                 is_degraded: false,
+                rate_limit_snapshot: None,
             },
         }
     }

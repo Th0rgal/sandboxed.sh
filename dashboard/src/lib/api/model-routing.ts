@@ -30,6 +30,20 @@ export interface ResolvedEntry {
   has_base_url: boolean;
 }
 
+export interface RateLimitSnapshot {
+  requests_limit: number | null;
+  requests_remaining: number | null;
+  requests_reset: string | null;
+  tokens_limit: number | null;
+  tokens_remaining: number | null;
+  tokens_reset: string | null;
+  input_tokens_limit: number | null;
+  input_tokens_remaining: number | null;
+  output_tokens_limit: number | null;
+  output_tokens_remaining: number | null;
+  updated_at: string;
+}
+
 export interface AccountHealthSnapshot {
   account_id: string;
   provider_id: string | null;
@@ -46,6 +60,7 @@ export interface AccountHealthSnapshot {
   total_input_tokens: number;
   total_output_tokens: number;
   is_degraded: boolean;
+  rate_limit_snapshot: RateLimitSnapshot | null;
 }
 
 export interface FallbackEvent {
