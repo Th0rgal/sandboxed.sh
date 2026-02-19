@@ -6757,8 +6757,8 @@ fn is_codex_node_wrapper(path: &std::path::Path) -> bool {
     };
 
     let first_line = content.lines().next().unwrap_or("");
-    let has_node_shebang = first_line.starts_with("#!/usr/bin/env node")
-        || first_line.starts_with("#!/usr/bin/node");
+    let has_node_shebang =
+        first_line.starts_with("#!/usr/bin/env node") || first_line.starts_with("#!/usr/bin/node");
 
     if !has_node_shebang {
         return false;
