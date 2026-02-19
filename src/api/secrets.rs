@@ -16,6 +16,7 @@ use crate::secrets::{
     InitializeKeysResult, InitializeRequest, RegistryInfo, SecretInfo, SecretsStatus, SecretsStore,
     SetSecretRequest, UnlockRequest,
 };
+use crate::util::internal_error;
 
 use super::routes::AppState;
 
@@ -343,7 +344,7 @@ async fn initialize(
         .initialize(&req.key_id)
         .await
         .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(internal_error)
 }
 
 /// POST /api/secrets/unlock

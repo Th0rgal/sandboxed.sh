@@ -1445,7 +1445,7 @@ async fn get_visible_agents(
     // Fetch all agents from OpenCode
     let all_agents = crate::api::opencode::fetch_opencode_agents(&state)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     let visible_agents = filter_visible_agents_with_fallback(all_agents.clone(), &config);
 

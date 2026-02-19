@@ -22,6 +22,7 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use super::routes::AppState;
 use super::types::{LoginRequest, LoginResponse};
 use crate::config::{AuthMode, Config, UserAccount};
+use crate::util::internal_error;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Claims {
@@ -256,7 +257,7 @@ pub async fn login(
     })?;
 
     let (token, exp) = issue_jwt(secret, state.config.auth.jwt_ttl_days, &user)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     Ok(Json(LoginResponse { token, exp }))
 }

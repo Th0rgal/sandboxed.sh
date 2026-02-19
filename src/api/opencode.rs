@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::opencode_config::OpenCodeConnection;
-use crate::util::{home_dir, read_json_config, resolve_config_path, write_json_config};
+use crate::util::{home_dir, internal_error, read_json_config, resolve_config_path, write_json_config};
 
 /// Create OpenCode connection routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -321,7 +321,7 @@ pub async fn list_agents(
     // Fetch from Library (no HTTP call needed)
     let payload = fetch_opencode_agents(&state)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     // Update cache
     {
