@@ -476,13 +476,12 @@ fn parse_opencode_sse_event(
             tracing::warn!(
                 mission_id = %mission_id,
                 event_data = ?props,
-                "response.incomplete received — treating as completion (common with GLM models)"
+                "response.incomplete received — waiting for session.idle/response.completed before finishing"
             );
-            // GLM models from z.ai frequently emit response.incomplete as their
-            // terminal event without a subsequent response.completed.  Treat it
-            // the same as response.completed so the mission can finish.  If a
-            // retry does happen, it will produce a new response.completed.
-            message_complete = true;
+            // Some providers emit response.incomplete during intermediate states.
+            // Do not treat it as terminal; wait for stronger completion signals
+            // (response.completed, message.completed, or session idle fallback)
+            // to avoid cutting off follow-up output.
             None
         }
         "response.output_item.added" => {
@@ -10002,15 +10001,17 @@ mod tests {
         extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
         is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
         is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_session_token, parse_opencode_stderr_text_part, running_health,
-        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        MissionHealth, MissionRunState, MissionStallSeverity, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
+        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
+        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
+        sync_opencode_agent_config, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
     use serde_json::json;
     use std::borrow::Cow;
     use std::fs;
+    use uuid::Uuid;
 
     #[test]
     fn sync_opencode_agent_config_removes_overrides_when_plugin_enabled() {
@@ -10376,6 +10377,43 @@ mod tests {
     fn extract_part_text_normal_type_checks_text_first() {
         let val = json!({"text": "hello", "content": "world"});
         assert_eq!(extract_part_text(&val, "text"), Some("hello"));
+    }
+
+    #[test]
+    fn parse_opencode_sse_event_response_incomplete_is_not_terminal() {
+        let mut state = OpencodeSseState::default();
+        let mission_id = Uuid::new_v4();
+        let data = json!({
+            "type": "response.incomplete",
+            "properties": {
+                "status": "incomplete",
+                "incomplete_details": { "reason": "max_output_tokens" }
+            }
+        })
+        .to_string();
+
+        let parsed = parse_opencode_sse_event(&data, None, None, &mut state, mission_id)
+            .expect("event should parse");
+        assert!(parsed.event.is_none());
+        assert!(!parsed.message_complete);
+        assert!(!parsed.session_idle);
+        assert!(!parsed.session_retry);
+    }
+
+    #[test]
+    fn parse_opencode_sse_event_response_completed_is_terminal() {
+        let mut state = OpencodeSseState::default();
+        let mission_id = Uuid::new_v4();
+        let data = json!({
+            "type": "response.completed",
+            "properties": { "status": "completed" }
+        })
+        .to_string();
+
+        let parsed = parse_opencode_sse_event(&data, None, None, &mut state, mission_id)
+            .expect("event should parse");
+        assert!(parsed.event.is_none());
+        assert!(parsed.message_complete);
     }
 
     #[test]

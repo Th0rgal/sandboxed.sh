@@ -439,7 +439,7 @@ fn convert_codex_event(
                 }
                 "reasoning" | "thinking" => {
                     // Extract thinking/reasoning content
-                    if let Some(text) = extract_text_field(&item.data) {
+                    if let Some(text) = extract_text_field_with_reasoning(&item.data) {
                         emit_thinking_if_changed(&mut results, item_content_cache, &item.id, &text);
                     }
                 }
@@ -514,7 +514,7 @@ fn convert_codex_event(
                     }
                 }
                 "reasoning" | "thinking" => {
-                    if let Some(text) = extract_text_field(&item.data) {
+                    if let Some(text) = extract_text_field_with_reasoning(&item.data) {
                         emit_thinking_if_changed(&mut results, item_content_cache, &item.id, &text);
                     }
                 }
@@ -537,6 +537,19 @@ fn convert_codex_event(
 fn extract_text_field(
     data: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Option<String> {
+    extract_text_field_internal(data, false)
+}
+
+fn extract_text_field_with_reasoning(
+    data: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    extract_text_field_internal(data, true)
+}
+
+fn extract_text_field_internal(
+    data: &std::collections::HashMap<String, serde_json::Value>,
+    include_reasoning_blocks: bool,
+) -> Option<String> {
     fn extract_str(value: Option<&serde_json::Value>) -> Option<String> {
         value
             .and_then(|value| value.as_str())
@@ -544,12 +557,15 @@ fn extract_text_field(
             .filter(|value| !value.is_empty())
     }
 
-    fn extract_from_content(value: &serde_json::Value) -> Option<String> {
+    fn extract_from_content(
+        value: &serde_json::Value,
+        include_reasoning_blocks: bool,
+    ) -> Option<String> {
         let mut out = String::new();
         let items = value.as_array()?;
         for item in items {
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if matches!(item_type, "reasoning" | "thinking") {
+            if !include_reasoning_blocks && matches!(item_type, "reasoning" | "thinking") {
                 continue;
             }
             if let Some(text) = extract_str(item.get("text")) {
@@ -574,7 +590,10 @@ fn extract_text_field(
     extract_str(data.get("text"))
         .or_else(|| extract_str(data.get("content")))
         .or_else(|| extract_str(data.get("output_text")))
-        .or_else(|| data.get("content").and_then(extract_from_content))
+        .or_else(|| {
+            data.get("content")
+                .and_then(|content| extract_from_content(content, include_reasoning_blocks))
+        })
 }
 
 /// Create a registry entry for the Codex backend.
@@ -1218,5 +1237,19 @@ mod tests {
         );
         let result = extract_text_field(&data);
         assert_eq!(result, Some("actual answer".to_string()));
+    }
+
+    #[test]
+    fn extract_text_field_with_reasoning_includes_reasoning_blocks() {
+        let mut data = HashMap::new();
+        data.insert(
+            "content".to_string(),
+            json!([
+                {"type": "reasoning", "text": "thinking chunk"},
+                {"type": "output_text", "text": "final text"}
+            ]),
+        );
+        let result = extract_text_field_with_reasoning(&data);
+        assert_eq!(result, Some("thinking chunkfinal text".to_string()));
     }
 }
