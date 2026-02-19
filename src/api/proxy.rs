@@ -504,6 +504,8 @@ async fn chat_completions(
 
         // Stream the response back to the client.
         if is_stream && status.is_success() {
+            // Extract headers before consuming the response with bytes_stream()
+            let upstream_headers = upstream_resp.headers().clone();
             // Peek at the first SSE data line to detect in-stream errors.
             // Some providers (e.g. MiniMax) return HTTP 200 but send an error
             // payload as the first SSE event.
@@ -653,8 +655,7 @@ async fn chat_completions(
             let health_tracker = state.health_tracker.clone();
 
             // Extract rate-limit snapshot to record after stream completes
-            let rate_limit_snapshot =
-                extract_rate_limit_snapshot(upstream_resp.headers(), provider_type);
+            let rate_limit_snapshot = extract_rate_limit_snapshot(&upstream_headers, provider_type);
 
             let mut response_headers = HeaderMap::new();
             response_headers.insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
@@ -1093,6 +1094,13 @@ fn extract_rate_limit_snapshot(
         }
         _ => None,
     }
+}
+
+/// Parse an ISO 8601 timestamp and return as DateTime.
+fn parse_iso_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s.trim())
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
 /// Parse a reset timestamp and convert to DateTime.
