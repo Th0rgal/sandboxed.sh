@@ -1,5 +1,8 @@
 //! Shared utility functions used across the codebase.
 
+/// Relative path from a working directory to the AI providers config file.
+pub const AI_PROVIDERS_PATH: &str = ".sandboxed-sh/ai_providers.json";
+
 /// Parse an environment variable as a boolean, returning `default` if unset.
 ///
 /// Recognises `1`, `true`, `yes`, `y`, `on` (case-insensitive) as `true`;

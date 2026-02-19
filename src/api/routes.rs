@@ -26,6 +26,7 @@ use crate::backend::registry::BackendRegistry;
 use crate::backend_config::BackendConfigEntry;
 use crate::config::{AuthMode, Config};
 use crate::mcp::McpRegistry;
+use crate::util::AI_PROVIDERS_PATH;
 use crate::workspace;
 
 /// Check whether a CLI binary is available on `$PATH`.
@@ -145,10 +146,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Initialize AI provider store
     let ai_providers = Arc::new(
-        crate::ai_providers::AIProviderStore::new(
-            config.working_dir.join(".sandboxed-sh/ai_providers.json"),
-        )
-        .await,
+        crate::ai_providers::AIProviderStore::new(config.working_dir.join(AI_PROVIDERS_PATH)).await,
     );
     let pending_oauth = Arc::new(RwLock::new(HashMap::new()));
 

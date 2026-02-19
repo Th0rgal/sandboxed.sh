@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 
 use super::routes::AppState;
 use crate::ai_providers::{AIProviderStore, ProviderType};
-use crate::util::home_dir;
+use crate::util::{home_dir, AI_PROVIDERS_PATH};
 
 /// Cached model lists fetched from provider APIs at startup.
 /// Maps provider ID (e.g. "anthropic") -> Vec<ProviderModel>
@@ -976,7 +976,7 @@ fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String>
     }
 
     // 3. Check Open Agent provider config (.sandboxed-sh/ai_providers.json)
-    let ai_providers_path = working_dir.join(".sandboxed-sh").join("ai_providers.json");
+    let ai_providers_path = working_dir.join(AI_PROVIDERS_PATH);
     if let Ok(contents) = std::fs::read_to_string(&ai_providers_path) {
         if let Ok(providers) =
             serde_json::from_str::<Vec<crate::ai_providers::AIProvider>>(&contents)

@@ -28,7 +28,7 @@ use crate::library::LibraryStore;
 use crate::mcp::{McpRegistry, McpScope, McpServerConfig, McpTransport};
 use crate::nspawn::{self, NspawnDistro};
 use crate::tools::terminal::{rtk_binary_path, rtk_enabled};
-use crate::util::{env_var_bool, home_dir, strip_jsonc_comments};
+use crate::util::{env_var_bool, home_dir, strip_jsonc_comments, AI_PROVIDERS_PATH};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Workspace Types
@@ -3116,12 +3116,8 @@ pub async fn prepare_mission_workspace_with_skills(
 fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
     // Try both possible locations for ai_providers.json
     let candidates = [
-        workspace_root
-            .join(".sandboxed-sh")
-            .join("ai_providers.json"),
-        std::path::PathBuf::from(home_dir())
-            .join(".sandboxed-sh")
-            .join("ai_providers.json"),
+        workspace_root.join(AI_PROVIDERS_PATH),
+        std::path::PathBuf::from(home_dir()).join(AI_PROVIDERS_PATH),
     ];
 
     for path in &candidates {
