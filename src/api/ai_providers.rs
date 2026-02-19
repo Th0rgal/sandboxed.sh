@@ -4500,8 +4500,7 @@ async fn create_provider(
     }
 
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let mut opencode_config =
-        read_opencode_config(&config_path).map_err(internal_error)?;
+    let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
 
     // Default use_for_backends to ["opencode"] if not specified.
     let use_for_backends = req
@@ -4518,8 +4517,7 @@ async fn create_provider(
         req.google_project_id.map(Some),
     );
 
-    write_opencode_config(&config_path, &opencode_config)
-        .map_err(internal_error)?;
+    write_opencode_config(&config_path, &opencode_config).map_err(internal_error)?;
 
     // Save backends to separate state file (not in opencode.json)
     if let Some(ref backends) = use_for_backends {
@@ -4645,8 +4643,7 @@ async fn update_provider(
         req.google_project_id,
     );
 
-    write_opencode_config(&config_path, &opencode_config)
-        .map_err(internal_error)?;
+    write_opencode_config(&config_path, &opencode_config).map_err(internal_error)?;
 
     // Save backends to separate state file if provided
     if let Some(ref backends) = req.use_for_backends {
@@ -4815,8 +4812,7 @@ async fn delete_provider(
         read_opencode_config(&config_path).map_err(internal_error)?;
 
     remove_provider_config_entry(&mut opencode_config, provider_type);
-    write_opencode_config(&config_path, &opencode_config)
-        .map_err(internal_error)?;
+    write_opencode_config(&config_path, &opencode_config).map_err(internal_error)?;
 
     if let Err(e) = remove_opencode_auth_entry(provider_type) {
         tracing::error!("Failed to remove OpenCode auth entry: {}", e);
@@ -5156,8 +5152,7 @@ async fn oauth_authorize(
             let (verifier, challenge) = generate_pkce();
             let state_value = generate_state();
 
-            let url = openai_authorize_url(&challenge, &state_value)
-                .map_err(internal_error)?;
+            let url = openai_authorize_url(&challenge, &state_value).map_err(internal_error)?;
 
             let instructions = if method.label.contains("Manual") {
                 "After logging in, copy the full redirect URL and paste it here".to_string()
@@ -5189,8 +5184,7 @@ async fn oauth_authorize(
             let (verifier, challenge) = generate_pkce();
             let state_value = generate_state();
 
-            let url = google_authorize_url(&challenge, &state_value)
-                .map_err(internal_error)?;
+            let url = google_authorize_url(&challenge, &state_value).map_err(internal_error)?;
 
             {
                 let mut pending = state.pending_oauth.write().await;
@@ -5774,8 +5768,7 @@ async fn oauth_callback_inner(
             }
 
             let config_path = get_opencode_config_path(&state.config.working_dir);
-            let opencode_config = read_opencode_config(&config_path)
-                .map_err(internal_error)?;
+            let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
             let backends_state = read_provider_backends_state(&state.config.working_dir);
             let default_provider = get_default_provider(&opencode_config);
             let config_entry = get_provider_config_entry(&opencode_config, provider_type);
