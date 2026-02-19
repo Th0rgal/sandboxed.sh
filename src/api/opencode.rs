@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::opencode_config::OpenCodeConnection;
-use crate::util::{home_dir, strip_jsonc_comments};
+use crate::util::{home_dir, resolve_config_path, strip_jsonc_comments};
 
 /// Create OpenCode connection routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -53,20 +53,12 @@ fn resolve_oh_my_opencode_path() -> std::path::PathBuf {
 
 /// Resolve the path to opencode.json configuration file.
 fn resolve_opencode_config_path() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("OPENCODE_CONFIG") {
-        if !path.trim().is_empty() {
-            return std::path::PathBuf::from(path);
-        }
-    }
-    if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
-        if !dir.trim().is_empty() {
-            return std::path::PathBuf::from(dir).join("opencode.json");
-        }
-    }
-    std::path::PathBuf::from(home_dir())
-        .join(".config")
-        .join("opencode")
-        .join("opencode.json")
+    resolve_config_path(
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_DIR",
+        "opencode.json",
+        ".config/opencode/opencode.json",
+    )
 }
 
 /// GET /api/opencode/settings - Read oh-my-opencode settings.

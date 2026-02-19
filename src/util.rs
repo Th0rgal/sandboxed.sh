@@ -115,6 +115,75 @@ pub fn strip_jsonc_comments(input: &str) -> String {
     out
 }
 
+/// Strip trailing commas before `}` and `]` in a JSON-like string, preserving string literals.
+pub fn strip_trailing_commas(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            continue;
+        }
+
+        if c == ',' {
+            let mut lookahead = chars.clone();
+            while let Some(next) = lookahead.peek() {
+                if next.is_whitespace() {
+                    lookahead.next();
+                } else {
+                    break;
+                }
+            }
+            if matches!(lookahead.peek(), Some('}') | Some(']')) {
+                continue;
+            }
+        }
+
+        out.push(c);
+    }
+
+    out
+}
+
+/// Resolve a config file path using standard precedence:
+/// 1. `full_path_var` env var (if set, use as full path)
+/// 2. `dir_var` env var + `filename` (if set, use as directory)
+/// 3. `$HOME` / `default_rel_path`
+pub fn resolve_config_path(
+    full_path_var: &str,
+    dir_var: &str,
+    filename: &str,
+    default_rel_path: &str,
+) -> std::path::PathBuf {
+    if let Ok(path) = std::env::var(full_path_var) {
+        if !path.trim().is_empty() {
+            return std::path::PathBuf::from(path);
+        }
+    }
+    if let Ok(dir) = std::env::var(dir_var) {
+        if !dir.trim().is_empty() {
+            return std::path::PathBuf::from(dir).join(filename);
+        }
+    }
+    std::path::PathBuf::from(home_dir()).join(default_rel_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +247,17 @@ mod tests {
         let input = r#"{"url": "https://example.com"}"#;
         let result = strip_jsonc_comments(input);
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn strip_trailing_commas_removes_commas_before_braces() {
+        assert_eq!(strip_trailing_commas(r#"{"a": 1,}"#), r#"{"a": 1}"#);
+        assert_eq!(strip_trailing_commas(r#"[1, 2,]"#), r#"[1, 2]"#);
+    }
+
+    #[test]
+    fn strip_trailing_commas_preserves_commas_in_strings() {
+        assert_eq!(strip_trailing_commas(r#"{"a": "b,}"}"#), r#"{"a": "b,}"}"#);
     }
 
     #[test]

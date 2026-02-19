@@ -2,75 +2,28 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde_json::Value;
 
-use crate::util::{home_dir, strip_jsonc_comments};
+use crate::util::{resolve_config_path, strip_jsonc_comments, strip_trailing_commas};
 
 fn resolve_claudecode_config_path() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("CLAUDE_CONFIG") {
-        if !path.trim().is_empty() {
-            return std::path::PathBuf::from(path);
-        }
+    // Standard env-var resolution
+    let resolved = resolve_config_path(
+        "CLAUDE_CONFIG",
+        "CLAUDE_CONFIG_DIR",
+        "settings.json",
+        ".claude/settings.json",
+    );
+    // If an env var was set, use it directly
+    if std::env::var("CLAUDE_CONFIG").is_ok_and(|v| !v.trim().is_empty())
+        || std::env::var("CLAUDE_CONFIG_DIR").is_ok_and(|v| !v.trim().is_empty())
+    {
+        return resolved;
     }
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        if !dir.trim().is_empty() {
-            return std::path::PathBuf::from(dir).join("settings.json");
-        }
-    }
-
-    let opencode_home = std::path::PathBuf::from("/var/lib/opencode")
-        .join(".claude")
-        .join("settings.json");
+    // Probe OpenCode container path before using the home-dir fallback
+    let opencode_home = std::path::PathBuf::from("/var/lib/opencode/.claude/settings.json");
     if opencode_home.exists() {
         return opencode_home;
     }
-
-    std::path::PathBuf::from(home_dir())
-        .join(".claude")
-        .join("settings.json")
-}
-
-fn strip_trailing_commas(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escape = false;
-
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if escape {
-                escape = false;
-            } else if c == '\\' {
-                escape = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            continue;
-        }
-
-        if c == ',' {
-            let mut lookahead = chars.clone();
-            while let Some(next) = lookahead.peek() {
-                if next.is_whitespace() {
-                    lookahead.next();
-                } else {
-                    break;
-                }
-            }
-            if matches!(lookahead.peek(), Some('}') | Some(']')) {
-                continue;
-            }
-        }
-
-        out.push(c);
-    }
-
-    out
+    resolved
 }
 
 /// GET /api/claudecode/config - Read Claude Code host settings.

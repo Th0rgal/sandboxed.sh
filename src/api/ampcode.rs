@@ -2,69 +2,15 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde_json::Value;
 
-use crate::util::{home_dir, strip_jsonc_comments};
+use crate::util::{resolve_config_path, strip_jsonc_comments, strip_trailing_commas};
 
 fn resolve_amp_config_path() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("AMP_CONFIG") {
-        if !path.trim().is_empty() {
-            return std::path::PathBuf::from(path);
-        }
-    }
-    if let Ok(dir) = std::env::var("AMP_CONFIG_DIR") {
-        if !dir.trim().is_empty() {
-            return std::path::PathBuf::from(dir).join("settings.json");
-        }
-    }
-
-    std::path::PathBuf::from(home_dir())
-        .join(".config")
-        .join("amp")
-        .join("settings.json")
-}
-
-fn strip_trailing_commas(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escape = false;
-
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if escape {
-                escape = false;
-            } else if c == '\\' {
-                escape = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            continue;
-        }
-
-        if c == ',' {
-            let mut lookahead = chars.clone();
-            while let Some(next) = lookahead.peek() {
-                if next.is_whitespace() {
-                    lookahead.next();
-                } else {
-                    break;
-                }
-            }
-            if matches!(lookahead.peek(), Some('}') | Some(']')) {
-                continue;
-            }
-        }
-
-        out.push(c);
-    }
-
-    out
+    resolve_config_path(
+        "AMP_CONFIG",
+        "AMP_CONFIG_DIR",
+        "settings.json",
+        ".config/amp/settings.json",
+    )
 }
 
 /// GET /api/amp/config - Read Amp host settings.

@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::library::Plugin;
 use crate::mcp::{McpRegistry, McpScope, McpTransport};
-use crate::util::home_dir;
+use crate::util::{home_dir, resolve_config_path};
 
 /// OpenCode connection configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,22 +289,12 @@ fn opencode_entry_from_mcp(config: &crate::mcp::McpServerConfig) -> Value {
 }
 
 fn resolve_opencode_config_path() -> PathBuf {
-    if let Ok(path) = std::env::var("OPENCODE_CONFIG") {
-        if !path.trim().is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-    if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir).join("opencode.json");
-        }
-    }
-    let home = home_dir();
-    // OpenCode stores its config under ~/.config/opencode by default.
-    PathBuf::from(home)
-        .join(".config")
-        .join("opencode")
-        .join("opencode.json")
+    resolve_config_path(
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_DIR",
+        "opencode.json",
+        ".config/opencode/opencode.json",
+    )
 }
 
 pub async fn ensure_global_config(mcp: &McpRegistry) -> anyhow::Result<()> {
