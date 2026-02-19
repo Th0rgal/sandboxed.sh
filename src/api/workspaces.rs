@@ -164,6 +164,17 @@ impl From<Workspace> for WorkspaceResponse {
     }
 }
 
+/// Look up a workspace by ID, returning 404 if it does not exist.
+async fn require_workspace(
+    store: &workspace::WorkspaceStore,
+    id: Uuid,
+) -> Result<Workspace, (StatusCode, String)> {
+    store
+        .get(id)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Handlers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -530,12 +541,9 @@ async fn get_workspace(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
-    state
-        .workspaces
-        .get(id)
+    require_workspace(&state.workspaces, id)
         .await
         .map(|w| Json(w.into()))
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))
 }
 
 /// PUT /api/workspaces/:id - Update a workspace.
@@ -544,11 +552,7 @@ async fn update_workspace(
     AxumPath(id): AxumPath<Uuid>,
     Json(req): Json<UpdateWorkspaceRequest>,
 ) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
-    let mut workspace = state
-        .workspaces
-        .get(id)
-        .await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
+    let mut workspace = require_workspace(&state.workspaces, id).await?;
 
     // Validate name if provided
     if let Some(ref name) = req.name {
@@ -660,11 +664,7 @@ async fn sync_workspace(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
-    let workspace = state
-        .workspaces
-        .get(id)
-        .await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
+    let workspace = require_workspace(&state.workspaces, id).await?;
 
     // Get library
     let library_guard = state.library.read().await;
@@ -792,11 +792,7 @@ async fn build_workspace(
     AxumPath(id): AxumPath<Uuid>,
     body: Option<Json<BuildWorkspaceRequest>>,
 ) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
-    let mut workspace = state
-        .workspaces
-        .get(id)
-        .await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
+    let mut workspace = require_workspace(&state.workspaces, id).await?;
 
     if workspace.workspace_type != WorkspaceType::Container {
         return Err((
@@ -990,11 +986,7 @@ async fn exec_workspace_command(
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
-    let workspace = state
-        .workspaces
-        .get(id)
-        .await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
+    let workspace = require_workspace(&state.workspaces, id).await?;
 
     // For container workspaces, ensure container is ready
     if workspace.workspace_type == WorkspaceType::Container
@@ -1240,11 +1232,7 @@ async fn get_workspace_debug(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<WorkspaceDebugInfo>, (StatusCode, String)> {
-    let workspace = state
-        .workspaces
-        .get(id)
-        .await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
+    let workspace = require_workspace(&state.workspaces, id).await?;
 
     let path = &workspace.path;
     let path_exists = path.exists();
@@ -1332,11 +1320,7 @@ async fn get_init_log(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<InitLogResponse>, (StatusCode, String)> {
-    let workspace = state
-        .workspaces
-        .get(id)
-        .await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
+    let workspace = require_workspace(&state.workspaces, id).await?;
 
     let log_path = "/var/log/sandboxed-init.log";
     let host_log_path = workspace.path.join("var/log/sandboxed-init.log");
@@ -1397,11 +1381,7 @@ async fn rerun_init_script(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<RerunInitResponse>, (StatusCode, String)> {
-    let mut workspace = state
-        .workspaces
-        .get(id)
-        .await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
+    let mut workspace = require_workspace(&state.workspaces, id).await?;
 
     // Only works for container workspaces
     if workspace.workspace_type != WorkspaceType::Container {
@@ -1559,11 +1539,7 @@ async fn get_workspace_memory(
     AxumPath(id): AxumPath<Uuid>,
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<WorkspaceMemoryStats>, (StatusCode, String)> {
-    let workspace = state
-        .workspaces
-        .get(id)
-        .await
-        .ok_or((StatusCode::NOT_FOUND, "Workspace not found".to_string()))?;
+    let workspace = require_workspace(&state.workspaces, id).await?;
 
     let stats = get_container_memory_stats(&workspace).await;
     Ok(Json(stats))
@@ -1733,11 +1709,7 @@ async fn check_backend_preflight(
     AxumPath((workspace_id, backend_id)): AxumPath<(Uuid, String)>,
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<super::mission_runner::BackendPreflightResult>, (StatusCode, String)> {
-    let workspace = state
-        .workspaces
-        .get(workspace_id)
-        .await
-        .ok_or((StatusCode::NOT_FOUND, "Workspace not found".to_string()))?;
+    let workspace = require_workspace(&state.workspaces, workspace_id).await?;
 
     let cli_path = if backend_id == "claudecode" || backend_id == "codex" || backend_id == "amp" {
         state
