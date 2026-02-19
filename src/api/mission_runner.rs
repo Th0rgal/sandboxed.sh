@@ -7141,7 +7141,10 @@ async fn check_amp_prerequisites(
             vec![]
         },
         message: if !cli_available {
-            Some("Amp CLI not found. Install amp in the workspace or set a custom CLI path.".to_string())
+            Some(
+                "Amp CLI not found. Install amp in the workspace or set a custom CLI path."
+                    .to_string(),
+            )
         } else {
             None
         },

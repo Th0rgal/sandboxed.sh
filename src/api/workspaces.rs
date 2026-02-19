@@ -42,7 +42,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/:id/memory", get(get_workspace_memory))
         .route("/memory/all", get(get_all_workspaces_memory))
         // Backend preflight checks
-        .route("/:id/backends/:backend_id/preflight", get(check_backend_preflight))
+        .route(
+            "/:id/backends/:backend_id/preflight",
+            get(check_backend_preflight),
+        )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
