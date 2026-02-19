@@ -540,90 +540,43 @@ async fn which_amp() -> Option<String> {
     which_binary("amp", &[]).await
 }
 
-/// Check if there's a newer version of Amp available.
-async fn check_amp_update(current_version: Option<&str>) -> Option<String> {
-    let current_raw = current_version?;
-    let current = extract_version_token(current_raw)?;
-
-    // Check npm registry for @sourcegraph/amp
-    let client = reqwest::Client::new();
-    let resp = client
-        .get("https://registry.npmjs.org/@sourcegraph/amp/latest")
+/// Fetch the latest version string for an npm package from the registry.
+async fn fetch_npm_latest_version(package: &str) -> Option<String> {
+    let url = format!("https://registry.npmjs.org/{package}/latest");
+    let resp = reqwest::Client::new()
+        .get(&url)
         .header("User-Agent", "open-agent")
         .send()
         .await
         .ok()?;
-
     if !resp.status().is_success() {
         return None;
     }
-
     let json: serde_json::Value = resp.json().await.ok()?;
-    let latest = json.get("version")?.as_str()?;
+    json.get("version")?.as_str().map(|s| s.to_string())
+}
 
-    if version_is_newer(latest, &current) {
-        Some(latest.to_string())
-    } else {
-        None
-    }
+/// Check if there's a newer version of Amp available.
+async fn check_amp_update(current_version: Option<&str>) -> Option<String> {
+    let current = extract_version_token(current_version?)?;
+    let latest = fetch_npm_latest_version("@sourcegraph/amp").await?;
+    version_is_newer(&latest, &current).then_some(latest)
 }
 
 /// Check if there's a newer version of Claude Code available.
 async fn check_claude_code_update(current_version: Option<&str>) -> Option<String> {
-    let current_raw = current_version?;
-    let current = extract_version_token(current_raw)?;
-
-    // Check npm registry for @anthropic-ai/claude-code
-    let client = reqwest::Client::new();
-    let resp = client
-        .get("https://registry.npmjs.org/@anthropic-ai/claude-code/latest")
-        .header("User-Agent", "open-agent")
-        .send()
-        .await
-        .ok()?;
-
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    let json: serde_json::Value = resp.json().await.ok()?;
-    let latest_raw = json.get("version")?.as_str()?;
-    let latest = extract_version_token(latest_raw)
+    let current = extract_version_token(current_version?)?;
+    let latest_raw = fetch_npm_latest_version("@anthropic-ai/claude-code").await?;
+    let latest = extract_version_token(&latest_raw)
         .unwrap_or_else(|| latest_raw.trim_start_matches('v').to_string());
-
-    if latest != current && version_is_newer(&latest, &current) {
-        Some(latest.to_string())
-    } else {
-        None
-    }
+    (latest != current && version_is_newer(&latest, &current)).then_some(latest)
 }
 
 /// Check if there's a newer version of Codex available.
 async fn check_codex_update(current_version: Option<&str>) -> Option<String> {
-    let current_raw = current_version?;
-    let current = extract_version_token(current_raw)?;
-
-    // Check npm registry for @openai/codex
-    let client = reqwest::Client::new();
-    let resp = client
-        .get("https://registry.npmjs.org/@openai/codex/latest")
-        .header("User-Agent", "open-agent")
-        .send()
-        .await
-        .ok()?;
-
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    let json: serde_json::Value = resp.json().await.ok()?;
-    let latest = json.get("version")?.as_str()?;
-
-    if version_is_newer(latest, &current) {
-        Some(latest.to_string())
-    } else {
-        None
-    }
+    let current = extract_version_token(current_version?)?;
+    let latest = fetch_npm_latest_version("@openai/codex").await?;
+    version_is_newer(&latest, &current).then_some(latest)
 }
 
 /// Check if there's a newer version of OpenCode available.
@@ -861,26 +814,10 @@ async fn get_oh_my_opencode_version() -> Option<String> {
 
 /// Check if there's a newer version of oh-my-opencode available.
 async fn check_oh_my_opencode_update(current_version: Option<&str>) -> Option<String> {
-    // Query npm registry for latest version
-    let client = reqwest::Client::new();
-    let resp = client
-        .get("https://registry.npmjs.org/oh-my-opencode/latest")
-        .send()
-        .await
-        .ok()?;
-
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    let json: serde_json::Value = resp.json().await.ok()?;
-    let latest = json.get("version")?.as_str()?;
-
+    let latest = fetch_npm_latest_version("oh-my-opencode").await?;
     match current_version {
-        Some(current) if latest != current && version_is_newer(latest, current) => {
-            Some(latest.to_string())
-        }
-        None => Some(latest.to_string()), // If no current version, suggest the latest
+        Some(current) if latest != current && version_is_newer(&latest, current) => Some(latest),
+        None => Some(latest), // If no current version, suggest the latest
         _ => None,
     }
 }
