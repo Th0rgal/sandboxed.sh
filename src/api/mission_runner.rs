@@ -7161,9 +7161,9 @@ async fn check_amp_prerequisites(
         cli_available: false,
         auto_install_possible,
         missing_dependencies: if !auto_install_possible {
-            vec!["amp CLI".to_string(), "npm or bun".to_string()]
+            vec!["npm or bun".to_string()]
         } else {
-            vec!["amp CLI".to_string()]
+            vec![]
         },
         message: if !auto_install_possible {
             Some("Amp CLI not found and neither npm nor bun is available. Install Node.js/npm or Bun in the workspace template.".to_string())
