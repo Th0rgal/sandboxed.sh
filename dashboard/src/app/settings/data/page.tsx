@@ -9,6 +9,7 @@ import {
   updateSettings,
   downloadBackup,
   restoreBackup,
+  updateRtkEnabled,
 } from '@/lib/api';
 import {
   GitBranch,
@@ -18,6 +19,7 @@ import {
   Download,
   Upload,
   Archive,
+  Terminal,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -28,6 +30,7 @@ export default function DataSettingsPage() {
   const [editingRepoPath, setEditingRepoPath] = useState(false);
   const [repoPathValue, setRepoPathValue] = useState('');
   const [savingRepoPath, setSavingRepoPath] = useState(false);
+  const [togglingRtk, setTogglingRtk] = useState(false);
 
   const [downloadingBackup, setDownloadingBackup] = useState(false);
   const [restoringBackup, setRestoringBackup] = useState(false);
@@ -111,6 +114,21 @@ export default function DataSettingsPage() {
       );
     } finally {
       setSavingRepoPath(false);
+    }
+  };
+
+  const handleToggleRtk = async (enabled: boolean) => {
+    setTogglingRtk(true);
+    try {
+      await updateRtkEnabled(enabled);
+      mutateSettings();
+      toast.success(enabled ? 'RTK enabled' : 'RTK disabled');
+    } catch (err) {
+      toast.error(
+        `Failed to update RTK setting: ${err instanceof Error ? err.message : 'Unknown error'}`
+      );
+    } finally {
+      setTogglingRtk(false);
     }
   };
 
@@ -318,6 +336,56 @@ export default function DataSettingsPage() {
               <p className="mt-2 text-xs text-white/40">
                 Leave blank to use the server default or <span className="font-mono">SANDBOXED_SH_REPO_PATH</span>.
               </p>
+            </div>
+          </div>
+
+          {/* RTK Settings */}
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-violet-500/10">
+                <Terminal className="h-5 w-5 text-violet-400" />
+              </div>
+              <div>
+                <h2 className="text-sm font-medium text-white">RTK (Rich Terminal Kit)</h2>
+                <p className="text-xs text-white/40">
+                  Compress terminal output to reduce token consumption
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-white/70">
+                  {serverSettings?.rtk_enabled
+                    ? 'RTK compression is enabled for terminal commands'
+                    : 'RTK compression is disabled'}
+                </p>
+                <p className="mt-1 text-xs text-white/40">
+                  When enabled, eligible terminal commands are wrapped with RTK to compress output
+                  before returning to the LLM, reducing token consumption.
+                </p>
+              </div>
+              <button
+                onClick={() => handleToggleRtk(!serverSettings?.rtk_enabled)}
+                disabled={togglingRtk || settingsLoading}
+                className={cn(
+                  'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
+                  serverSettings?.rtk_enabled
+                    ? 'bg-violet-500'
+                    : 'bg-white/10'
+                )}
+              >
+                {togglingRtk ? (
+                  <Loader className="h-4 w-4 animate-spin absolute left-1/2 -translate-x-1/2 text-white" />
+                ) : (
+                  <span
+                    className={cn(
+                      'inline-block h-4 w-4 transform rounded-full bg-white transition-transform',
+                      serverSettings?.rtk_enabled ? 'translate-x-6' : 'translate-x-1'
+                    )}
+                  />
+                )}
+              </button>
             </div>
           </div>
 

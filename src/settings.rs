@@ -5,8 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Global cached RTK enabled state, updated when settings change.
+/// This allows synchronous checks from non-async contexts.
+static RTK_ENABLED_CACHED: AtomicBool = AtomicBool::new(false);
 
 /// Default repo path for sandboxed.sh source (used for self-updates).
 pub const DEFAULT_SANDBOXED_REPO_PATH: &str = "/opt/sandboxed-sh/vaduz-v1";
@@ -34,6 +39,10 @@ pub struct Settings {
     /// Dashboard-managed auth settings (password hash, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthSettings>,
+    /// Whether RTK (Rich Terminal Kit) wrapping is enabled for terminal commands.
+    /// When None, falls back to the SANDBOXED_SH_RTK_ENABLED env var (default: false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtk_enabled: Option<bool>,
 }
 
 /// In-memory store for global settings with disk persistence.
@@ -82,6 +91,15 @@ impl SettingsStore {
 
     /// Load settings from environment variables as initial defaults.
     fn defaults_from_env() -> Settings {
+        let rtk_enabled = std::env::var("SANDBOXED_SH_RTK_ENABLED")
+            .ok()
+            .and_then(|v| {
+                matches!(
+                    v.trim().to_lowercase().as_str(),
+                    "1" | "true" | "yes" | "y" | "on"
+                )
+                .then_some(true)
+            });
         Settings {
             library_remote: std::env::var("LIBRARY_REMOTE").ok().or_else(|| {
                 Some("https://github.com/Th0rgal/sandboxed-library-template.git".to_string())
@@ -91,6 +109,7 @@ impl SettingsStore {
                 .ok()
                 .or_else(|| Some(DEFAULT_SANDBOXED_REPO_PATH.to_string())),
             auth: None,
+            rtk_enabled,
         }
     }
 
@@ -166,6 +185,36 @@ impl SettingsStore {
         self.save_to_disk().await
     }
 
+    /// Get the RTK enabled setting.
+    /// Returns None if not explicitly set (caller should check env var as fallback).
+    pub async fn get_rtk_enabled(&self) -> Option<bool> {
+        self.settings.read().await.rtk_enabled
+    }
+
+    /// Update the RTK enabled setting.
+    ///
+    /// Returns `(changed, previous_value)`.
+    pub async fn set_rtk_enabled(
+        &self,
+        enabled: Option<bool>,
+    ) -> Result<(bool, Option<bool>), std::io::Error> {
+        let mut settings = self.settings.write().await;
+        let previous = settings.rtk_enabled;
+
+        if previous != enabled {
+            settings.rtk_enabled = enabled;
+            // Update the cached value for synchronous access
+            if let Some(e) = enabled {
+                set_rtk_enabled_cached(e);
+            }
+            drop(settings); // Release lock before saving
+            self.save_to_disk().await?;
+            Ok((true, previous))
+        } else {
+            Ok((false, previous))
+        }
+    }
+
     /// Update multiple settings at once.
     pub async fn update(&self, new_settings: Settings) -> Result<(), std::io::Error> {
         let mut settings = self.settings.write().await;
@@ -186,7 +235,31 @@ impl SettingsStore {
         }
         Ok(())
     }
+
+    /// Initialize cached values from loaded settings.
+    /// Must be called after creating the settings store, before any workspace operations.
+    pub fn init_cached_values(&self) {
+        // Try to get the current value using block_in_place for sync access
+        // Since we're in the constructor/startup context, use try_read
+        if let Ok(settings) = self.settings.try_read() {
+            if let Some(enabled) = settings.rtk_enabled {
+                set_rtk_enabled_cached(enabled);
+            }
+        }
+    }
 }
 
 /// Shared settings store wrapped in Arc for concurrent access.
 pub type SharedSettingsStore = Arc<SettingsStore>;
+
+/// Get the cached RTK enabled state.
+/// This is a synchronous check that uses a cached value updated when settings change.
+pub fn rtk_enabled_cached() -> bool {
+    RTK_ENABLED_CACHED.load(Ordering::Relaxed)
+}
+
+/// Update the cached RTK enabled state.
+/// Called during startup and when the setting is changed via the API.
+pub fn set_rtk_enabled_cached(enabled: bool) {
+    RTK_ENABLED_CACHED.store(enabled, Ordering::Relaxed);
+}

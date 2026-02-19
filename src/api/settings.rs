@@ -23,6 +23,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(get_settings).put(update_settings))
         .route("/library-remote", put(update_library_remote))
+        .route("/rtk-enabled", put(update_rtk_enabled))
         .route("/backup", get(download_backup))
         .route("/restore", post(restore_backup))
 }
@@ -32,6 +33,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 pub struct SettingsResponse {
     pub library_remote: Option<String>,
     pub sandboxed_repo_path: Option<String>,
+    pub rtk_enabled: Option<bool>,
 }
 
 impl From<Settings> for SettingsResponse {
@@ -39,6 +41,7 @@ impl From<Settings> for SettingsResponse {
         Self {
             library_remote: settings.library_remote,
             sandboxed_repo_path: settings.sandboxed_repo_path,
+            rtk_enabled: settings.rtk_enabled,
         }
     }
 }
@@ -50,6 +53,8 @@ pub struct UpdateSettingsRequest {
     pub library_remote: Option<Option<String>>,
     #[serde(default)]
     pub sandboxed_repo_path: Option<Option<String>>,
+    #[serde(default)]
+    pub rtk_enabled: Option<bool>,
 }
 
 /// Request to update library remote specifically.
@@ -89,6 +94,11 @@ async fn update_settings(
     }
     if let Some(value) = req.sandboxed_repo_path {
         new_settings.sandboxed_repo_path = value;
+    }
+    if let Some(value) = req.rtk_enabled {
+        new_settings.rtk_enabled = Some(value);
+        // Update the cached value for synchronous access
+        crate::settings::set_rtk_enabled_cached(value);
     }
 
     state
@@ -139,6 +149,44 @@ async fn update_library_remote(
         library_remote: new_remote,
         library_reinitialized,
         library_error,
+    }))
+}
+
+/// Request to update RTK enabled setting.
+#[derive(Debug, Deserialize)]
+pub struct UpdateRtkEnabledRequest {
+    /// Whether RTK wrapping should be enabled for terminal commands.
+    pub rtk_enabled: bool,
+}
+
+/// Response after updating RTK enabled setting.
+#[derive(Debug, Serialize)]
+pub struct UpdateRtkEnabledResponse {
+    pub rtk_enabled: bool,
+    pub previous_value: Option<bool>,
+}
+
+/// PUT /api/settings/rtk-enabled
+/// Update the RTK enabled setting.
+async fn update_rtk_enabled(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<UpdateRtkEnabledRequest>,
+) -> Result<Json<UpdateRtkEnabledResponse>, (StatusCode, String)> {
+    let (_changed, previous) = state
+        .settings
+        .set_rtk_enabled(Some(req.rtk_enabled))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tracing::info!(
+        rtk_enabled = req.rtk_enabled,
+        previous = ?previous,
+        "RTK setting updated"
+    );
+
+    Ok(Json(UpdateRtkEnabledResponse {
+        rtk_enabled: req.rtk_enabled,
+        previous_value: previous,
     }))
 }
 

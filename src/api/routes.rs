@@ -185,6 +185,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Initialize global settings store
     let settings = Arc::new(crate::settings::SettingsStore::new(&config.working_dir).await);
+    settings.init_cached_values();
 
     // Initialize backend config store (persisted settings).
     // Probe each CLI binary so backends whose CLI is missing default to disabled.

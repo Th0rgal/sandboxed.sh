@@ -2365,6 +2365,7 @@ export async function uninstallSystemComponent(
 export interface SettingsResponse {
   library_remote: string | null;
   sandboxed_repo_path: string | null;
+  rtk_enabled: boolean | null;
 }
 
 export interface UpdateLibraryRemoteResponse {
@@ -2405,6 +2406,22 @@ export async function updateLibraryRemote(
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || 'Failed to update library remote');
+  }
+  return res.json();
+}
+
+// Update the RTK enabled setting
+export async function updateRtkEnabled(
+  rtkEnabled: boolean
+): Promise<{ rtk_enabled: boolean; previous_value: boolean | null }> {
+  const res = await apiFetch('/api/settings/rtk-enabled', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rtk_enabled: rtkEnabled }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || 'Failed to update RTK setting');
   }
   return res.json();
 }

@@ -62,6 +62,11 @@ fn rtk_gain_stats() -> Option<(u64, u64)> {
 }
 
 pub fn rtk_enabled() -> bool {
+    // Check the cached value from settings store first
+    if crate::settings::rtk_enabled_cached() {
+        return true;
+    }
+    // Fall back to env var for backwards compatibility
     env::var("SANDBOXED_SH_RTK_ENABLED")
         .map(|v| {
             matches!(
