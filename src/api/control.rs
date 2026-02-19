@@ -186,6 +186,65 @@ fn ok_json() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
+/// Query the control actor for the list of currently running missions.
+async fn get_running_missions(
+    control: &ControlState,
+) -> Result<Vec<super::mission_runner::RunningMissionInfo>, (StatusCode, String)> {
+    let (tx, rx) = oneshot::channel();
+    control
+        .cmd_tx
+        .send(ControlCommand::ListRunning { respond: tx })
+        .await
+        .map_err(session_unavailable)?;
+    rx.await.map_err(recv_failed)
+}
+
+/// Look up an automation by ID, returning 404 if it does not exist.
+async fn require_automation(
+    store: &Arc<dyn MissionStore>,
+    id: Uuid,
+) -> Result<mission_store::Automation, (StatusCode, String)> {
+    store
+        .get_automation(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Automation {} not found", id),
+        ))
+}
+
+/// Validate that a command exists in the library.
+async fn validate_library_command(
+    state: &AppState,
+    name: &str,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(lib) = state.library.read().await.as_ref() {
+        match lib.get_command(name).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("not found") || msg.contains("does not exist") {
+                    Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("Command '{}' not found in library", name),
+                    ))
+                } else {
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to validate command: {}", e),
+                    ))
+                }
+            }
+        }
+    } else {
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Library not initialized".to_string(),
+        ))
+    }
+}
+
 async fn mission_has_active_automation(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
@@ -1846,17 +1905,8 @@ pub async fn list_running_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<super::mission_runner::RunningMissionInfo>>, (StatusCode, String)> {
-    let (tx, rx) = oneshot::channel();
-
     let control = control_for_user(&state, &user).await;
-    control
-        .cmd_tx
-        .send(ControlCommand::ListRunning { respond: tx })
-        .await
-        .map_err(session_unavailable)?;
-
-    let running = rx.await.map_err(recv_failed)?;
-
+    let running = get_running_missions(&control).await?;
     Ok(Json(running))
 }
 
@@ -1964,22 +2014,8 @@ pub async fn get_parallel_config(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Query actual running count from the control actor
-    // (the running state is tracked in the actor loop, not in shared state)
-    let (tx, rx) = oneshot::channel();
     let control = control_for_user(&state, &user).await;
-    control
-        .cmd_tx
-        .send(ControlCommand::ListRunning { respond: tx })
-        .await
-        .map_err(session_unavailable)?;
-
-    let running = rx.await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to get running missions".to_string(),
-        )
-    })?;
+    let running = get_running_missions(&control).await?;
 
     Ok(Json(serde_json::json!({
         "max_parallel_missions": control.max_parallel,
@@ -1994,22 +2030,8 @@ pub async fn delete_mission(
     Extension(user): Extension<AuthUser>,
     Path(mission_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Check if mission is currently running by querying the control actor
-    // (the actual running state is tracked in the actor loop, not in shared state)
-    let (tx, rx) = oneshot::channel();
     let control = control_for_user(&state, &user).await;
-    control
-        .cmd_tx
-        .send(ControlCommand::ListRunning { respond: tx })
-        .await
-        .map_err(session_unavailable)?;
-
-    let running = rx.await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to check running missions".to_string(),
-        )
-    })?;
+    let running = get_running_missions(&control).await?;
 
     if running.iter().any(|m| m.mission_id == mission_id) {
         return Err((
@@ -2041,23 +2063,8 @@ pub async fn cleanup_empty_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Get currently running mission IDs to exclude from cleanup
-    // (a newly-started mission may have empty history in DB while actively running)
-    let (tx, rx) = oneshot::channel();
     let control = control_for_user(&state, &user).await;
-    control
-        .cmd_tx
-        .send(ControlCommand::ListRunning { respond: tx })
-        .await
-        .map_err(session_unavailable)?;
-
-    let running = rx.await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to check running missions".to_string(),
-        )
-    })?;
-
+    let running = get_running_missions(&control).await?;
     let running_ids: Vec<Uuid> = running.iter().map(|m| m.mission_id).collect();
 
     let count = control
@@ -5929,31 +5936,7 @@ pub async fn create_automation(
 
     // Validate the command exists in the library if CommandSource::Library
     if let mission_store::CommandSource::Library { ref name } = req.command_source {
-        if let Some(lib) = state.library.read().await.as_ref() {
-            match lib.get_command(name).await {
-                Ok(_) => {} // Command exists, continue
-                Err(e) => {
-                    // Check if it's a "not found" error
-                    let error_msg = e.to_string();
-                    if error_msg.contains("not found") || error_msg.contains("does not exist") {
-                        return Err((
-                            StatusCode::BAD_REQUEST,
-                            format!("Command '{}' not found in library", name),
-                        ));
-                    } else {
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to validate command: {}", e),
-                        ));
-                    }
-                }
-            }
-        } else {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Library not initialized".to_string(),
-            ));
-        }
+        validate_library_command(&state, name).await?;
     }
 
     // Generate webhook_id if trigger type is Webhook
@@ -6062,15 +6045,7 @@ pub async fn get_automation(
 ) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
-    let automation = control
-        .mission_store
-        .get_automation(automation_id)
-        .await
-        .map_err(internal_error)?
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!("Automation {} not found", automation_id),
-        ))?;
+    let automation = require_automation(&control.mission_store, automation_id).await?;
 
     Ok(Json(automation))
 }
@@ -6084,44 +6059,11 @@ pub async fn update_automation(
 ) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
-    // Verify automation exists
-    let mut automation = control
-        .mission_store
-        .get_automation(automation_id)
-        .await
-        .map_err(internal_error)?
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!("Automation {} not found", automation_id),
-        ))?;
+    let mut automation = require_automation(&control.mission_store, automation_id).await?;
 
     // Validate the command exists in the library if CommandSource::Library is being updated
     if let Some(mission_store::CommandSource::Library { name }) = req.command_source.as_ref() {
-        if let Some(lib) = state.library.read().await.as_ref() {
-            match lib.get_command(name).await {
-                Ok(_) => {} // Command exists, continue
-                Err(e) => {
-                    // Check if it's a "not found" error
-                    let error_msg = e.to_string();
-                    if error_msg.contains("not found") || error_msg.contains("does not exist") {
-                        return Err((
-                            StatusCode::BAD_REQUEST,
-                            format!("Command '{}' not found in library", name),
-                        ));
-                    } else {
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to validate command: {}", e),
-                        ));
-                    }
-                }
-            }
-        } else {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Library not initialized".to_string(),
-            ));
-        }
+        validate_library_command(&state, name).await?;
     }
 
     // Update fields if provided
@@ -6196,16 +6138,7 @@ pub async fn get_automation_executions(
 ) -> Result<Json<Vec<mission_store::AutomationExecution>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
-    // Verify automation exists
-    let _automation = control
-        .mission_store
-        .get_automation(automation_id)
-        .await
-        .map_err(internal_error)?
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!("Automation {} not found", automation_id),
-        ))?;
+    let _automation = require_automation(&control.mission_store, automation_id).await?;
 
     let executions = control
         .mission_store
