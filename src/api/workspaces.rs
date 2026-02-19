@@ -164,6 +164,28 @@ impl From<Workspace> for WorkspaceResponse {
     }
 }
 
+/// Clone the optional library reference out of the shared `RwLock`.
+async fn clone_library(
+    library: &super::library::SharedLibrary,
+) -> Option<Arc<crate::library::LibraryStore>> {
+    let guard = library.read().await;
+    guard.as_ref().map(Arc::clone)
+}
+
+/// Apply build-related fields from a completed build back to the latest stored
+/// workspace, preserving any updates (env vars, init script, etc.) that arrived
+/// while the build was running.
+async fn merge_build_result(store: &workspace::WorkspaceStore, built: Workspace) {
+    if let Some(mut latest) = store.get(built.id).await {
+        latest.status = built.status;
+        latest.error_message = built.error_message;
+        latest.distro = built.distro;
+        store.update(latest).await;
+    } else {
+        store.update(built).await;
+    }
+}
+
 /// Look up a workspace by ID, returning 404 if it does not exist.
 async fn require_workspace(
     store: &workspace::WorkspaceStore,
@@ -284,11 +306,7 @@ async fn create_workspace(
         // Templates always require an isolated (container) workspace
         workspace_type = WorkspaceType::Container;
 
-        let library = {
-            let guard = state.library.read().await;
-            guard.as_ref().map(Arc::clone)
-        }
-        .ok_or_else(|| {
+        let library = clone_library(&state.library).await.ok_or_else(|| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Library not initialized".to_string(),
@@ -487,10 +505,7 @@ async fn create_workspace(
         let working_dir = state.config.working_dir.clone();
         let mut workspace_for_build = workspace.clone();
         // Get library for init script assembly
-        let library = {
-            let guard = state.library.read().await;
-            guard.as_ref().map(Arc::clone)
-        };
+        let library = clone_library(&state.library).await;
 
         tokio::spawn(async move {
             let result = crate::workspace::build_container_workspace(
@@ -510,16 +525,7 @@ async fn create_workspace(
                 );
             }
 
-            // Preserve any workspace updates made while the build was running (env vars, init script, etc.)
-            // by only applying build-related fields to the latest stored workspace.
-            if let Some(mut latest) = workspaces_store.get(workspace_for_build.id).await {
-                latest.status = workspace_for_build.status;
-                latest.error_message = workspace_for_build.error_message;
-                latest.distro = workspace_for_build.distro;
-                workspaces_store.update(latest).await;
-            } else {
-                workspaces_store.update(workspace_for_build).await;
-            }
+            merge_build_result(&workspaces_store, workspace_for_build).await;
         });
 
         tracing::info!(
@@ -862,16 +868,7 @@ async fn build_workspace(
             );
         }
 
-        // Preserve any workspace updates made while the build was running (env vars, init script, etc.)
-        // by only applying build-related fields to the latest stored workspace.
-        if let Some(mut latest) = workspaces_store.get(workspace_for_build.id).await {
-            latest.status = workspace_for_build.status;
-            latest.error_message = workspace_for_build.error_message;
-            latest.distro = workspace_for_build.distro;
-            workspaces_store.update(latest).await;
-        } else {
-            workspaces_store.update(workspace_for_build).await;
-        }
+        merge_build_result(&workspaces_store, workspace_for_build).await;
     });
 
     Ok(Json(workspace.into()))
