@@ -2,13 +2,13 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde_json::Value;
 
-use crate::util::{resolve_config_path, strip_jsonc_comments, strip_trailing_commas};
+use crate::util::{home_dir, resolve_config_path, strip_jsonc_comments, strip_trailing_commas};
 
 fn resolve_claudecode_config_path() -> std::path::PathBuf {
-    let has_env = std::env::var("CLAUDE_CONFIG").is_ok_and(|v| !v.trim().is_empty())
-        || std::env::var("CLAUDE_CONFIG_DIR").is_ok_and(|v| !v.trim().is_empty());
-
-    if has_env {
+    // If an explicit env var is set, honour it (no probing needed).
+    if std::env::var("CLAUDE_CONFIG").is_ok_and(|v| !v.trim().is_empty())
+        || std::env::var("CLAUDE_CONFIG_DIR").is_ok_and(|v| !v.trim().is_empty())
+    {
         return resolve_config_path(
             "CLAUDE_CONFIG",
             "CLAUDE_CONFIG_DIR",
@@ -17,17 +17,13 @@ fn resolve_claudecode_config_path() -> std::path::PathBuf {
         );
     }
 
+    // Container path takes precedence over the home-dir default.
     let opencode_home = std::path::PathBuf::from("/var/lib/opencode/.claude/settings.json");
     if opencode_home.exists() {
         return opencode_home;
     }
 
-    resolve_config_path(
-        "CLAUDE_CONFIG",
-        "CLAUDE_CONFIG_DIR",
-        "settings.json",
-        ".claude/settings.json",
-    )
+    std::path::PathBuf::from(home_dir()).join(".claude/settings.json")
 }
 
 /// GET /api/claudecode/config - Read Claude Code host settings.
