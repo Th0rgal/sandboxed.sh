@@ -4300,12 +4300,17 @@ fn load_opencode_json(config_dir: &std::path::Path) -> (std::path::PathBuf, serd
 }
 
 /// Write a JSON value to a path, logging a warning on failure.
-fn save_json_warn(path: &std::path::Path, value: &serde_json::Value, context: &str) {
-    if let Err(err) = std::fs::write(
+/// Returns `true` if the write succeeded, `false` otherwise.
+fn save_json_warn(path: &std::path::Path, value: &serde_json::Value, context: &str) -> bool {
+    match std::fs::write(
         path,
         serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string()),
     ) {
-        tracing::warn!("Failed to update {context} at {}: {err}", path.display());
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!("Failed to update {context} at {}: {err}", path.display());
+            false
+        }
     }
 }
 
@@ -4938,13 +4943,14 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
         providers_map.insert(provider_id.to_string(), provider_def);
     }
 
-    save_json_warn(&opencode_path, &root, "OpenCode provider config");
-    tracing::info!(
-        "Injected OpenCode provider definition for {}/{} into {}",
-        provider_id,
-        model_id,
-        opencode_path.display()
-    );
+    if save_json_warn(&opencode_path, &root, "OpenCode provider config") {
+        tracing::info!(
+            "Injected OpenCode provider definition for {}/{} into {}",
+            provider_id,
+            model_id,
+            opencode_path.display()
+        );
+    }
 }
 
 /// Scan the oh-my-opencode config for all model references (top-level, agents,
