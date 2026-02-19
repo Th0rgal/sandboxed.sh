@@ -4289,23 +4289,32 @@ fn plugin_module_path(node_modules_dir: &std::path::Path, base: &str) -> std::pa
     node_modules_dir.join(base)
 }
 
+/// Read `opencode.json` from a config directory, returning `{}` on any failure.
+fn load_opencode_json(config_dir: &std::path::Path) -> (std::path::PathBuf, serde_json::Value) {
+    let path = config_dir.join("opencode.json");
+    let value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    (path, value)
+}
+
+/// Write a JSON value to a path, logging a warning on failure.
+fn save_json_warn(path: &std::path::Path, value: &serde_json::Value, context: &str) {
+    if let Err(err) = std::fs::write(
+        path,
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string()),
+    ) {
+        tracing::warn!("Failed to update {context} at {}: {err}", path.display());
+    }
+}
+
 fn ensure_opencode_plugin_specs(opencode_config_dir: &std::path::Path, plugin_specs: &[&str]) {
     if plugin_specs.is_empty() {
         return;
     }
 
-    let opencode_path = opencode_config_dir.join("opencode.json");
-    let mut root = if opencode_path.exists() {
-        match std::fs::read_to_string(&opencode_path)
-            .ok()
-            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        {
-            Some(value) => value,
-            None => serde_json::json!({}),
-        }
-    } else {
-        serde_json::json!({})
-    };
+    let (opencode_path, mut root) = load_opencode_json(opencode_config_dir);
 
     let mut updated = false;
     let plugins = root.as_object_mut().and_then(|obj| {
@@ -4345,16 +4354,7 @@ fn ensure_opencode_plugin_specs(opencode_config_dir: &std::path::Path, plugin_sp
     }
 
     if updated {
-        if let Err(err) = std::fs::write(
-            &opencode_path,
-            serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string()),
-        ) {
-            tracing::warn!(
-                "Failed to update OpenCode plugin config at {}: {}",
-                opencode_path.display(),
-                err
-            );
-        }
+        save_json_warn(&opencode_path, &root, "OpenCode plugin config");
     }
 }
 
@@ -4380,18 +4380,7 @@ fn ensure_opencode_google_project_id(opencode_config_dir: &std::path::Path, proj
         return;
     }
 
-    let opencode_path = opencode_config_dir.join("opencode.json");
-    let mut root = if opencode_path.exists() {
-        match std::fs::read_to_string(&opencode_path)
-            .ok()
-            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        {
-            Some(value) => value,
-            None => serde_json::json!({}),
-        }
-    } else {
-        serde_json::json!({})
-    };
+    let (opencode_path, mut root) = load_opencode_json(opencode_config_dir);
 
     let mut updated = false;
     let provider_obj = root.as_object_mut().and_then(|obj| {
@@ -4434,16 +4423,7 @@ fn ensure_opencode_google_project_id(opencode_config_dir: &std::path::Path, proj
     }
 
     if updated {
-        if let Err(err) = std::fs::write(
-            &opencode_path,
-            serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string()),
-        ) {
-            tracing::warn!(
-                "Failed to update OpenCode Google projectId at {}: {}",
-                opencode_path.display(),
-                err
-            );
-        }
+        save_json_warn(&opencode_path, &root, "OpenCode Google projectId");
     }
 }
 
@@ -4568,18 +4548,7 @@ fn sync_opencode_agent_config(
         return;
     };
 
-    let opencode_path = opencode_config_dir.join("opencode.json");
-    let mut opencode_json = if opencode_path.exists() {
-        match std::fs::read_to_string(&opencode_path)
-            .ok()
-            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        {
-            Some(value) => value,
-            None => serde_json::json!({}),
-        }
-    } else {
-        serde_json::json!({})
-    };
+    let (opencode_path, mut opencode_json) = load_opencode_json(opencode_config_dir);
 
     let provider_allowed = |provider: &str| -> bool {
         match provider {
@@ -4720,16 +4689,7 @@ fn sync_opencode_agent_config(
     }
 
     if updated {
-        if let Err(err) = std::fs::write(
-            &opencode_path,
-            serde_json::to_string_pretty(&opencode_json).unwrap_or_else(|_| "{}".to_string()),
-        ) {
-            tracing::warn!(
-                "Failed to update opencode.json agent config at {}: {}",
-                opencode_path.display(),
-                err
-            );
-        }
+        save_json_warn(&opencode_path, &opencode_json, "opencode.json agent config");
     }
 }
 
@@ -4925,18 +4885,7 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
         return;
     };
 
-    let opencode_path = opencode_config_dir.join("opencode.json");
-    let mut root = if opencode_path.exists() {
-        match std::fs::read_to_string(&opencode_path)
-            .ok()
-            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        {
-            Some(value) => value,
-            None => serde_json::json!({}),
-        }
-    } else {
-        serde_json::json!({})
-    };
+    let (opencode_path, mut root) = load_opencode_json(opencode_config_dir);
 
     let obj = match root.as_object_mut() {
         Some(obj) => obj,
@@ -4989,23 +4938,13 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
         providers_map.insert(provider_id.to_string(), provider_def);
     }
 
-    if let Err(err) = std::fs::write(
-        &opencode_path,
-        serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string()),
-    ) {
-        tracing::warn!(
-            "Failed to update OpenCode provider config at {}: {}",
-            opencode_path.display(),
-            err
-        );
-    } else {
-        tracing::info!(
-            "Injected OpenCode provider definition for {}/{} into {}",
-            provider_id,
-            model_id,
-            opencode_path.display()
-        );
-    }
+    save_json_warn(&opencode_path, &root, "OpenCode provider config");
+    tracing::info!(
+        "Injected OpenCode provider definition for {}/{} into {}",
+        provider_id,
+        model_id,
+        opencode_path.display()
+    );
 }
 
 /// Scan the oh-my-opencode config for all model references (top-level, agents,
@@ -5732,36 +5671,31 @@ fn resolve_opencode_model_from_config(
     opencode_config_dir: &std::path::Path,
     agent: Option<&str>,
 ) -> Option<String> {
-    let opencode_path = opencode_config_dir.join("opencode.json");
-    let opencode_value = std::fs::read_to_string(opencode_path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
+    let (_opencode_path, value) = load_opencode_json(opencode_config_dir);
 
-    if let Some(value) = opencode_value.as_ref() {
-        if let Some(agent_name) = agent {
-            if let Some(model) = value
-                .get("agent")
-                .and_then(|v| v.get(agent_name))
-                .and_then(|v| v.get("model"))
-                .and_then(|v| v.as_str())
-            {
-                return Some(model.to_string());
-            }
-            if let Some(agent_map) = value.get("agent").and_then(|v| v.as_object()) {
-                let agent_lower = agent_name.to_lowercase();
-                for (name, entry) in agent_map {
-                    if name.to_lowercase() == agent_lower {
-                        if let Some(model) = entry.get("model").and_then(|v| v.as_str()) {
-                            return Some(model.to_string());
-                        }
+    if let Some(agent_name) = agent {
+        if let Some(model) = value
+            .get("agent")
+            .and_then(|v| v.get(agent_name))
+            .and_then(|v| v.get("model"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(model.to_string());
+        }
+        if let Some(agent_map) = value.get("agent").and_then(|v| v.as_object()) {
+            let agent_lower = agent_name.to_lowercase();
+            for (name, entry) in agent_map {
+                if name.to_lowercase() == agent_lower {
+                    if let Some(model) = entry.get("model").and_then(|v| v.as_str()) {
+                        return Some(model.to_string());
                     }
                 }
             }
         }
+    }
 
-        if let Some(model) = value.get("model").and_then(|v| v.as_str()) {
-            return Some(model.to_string());
-        }
+    if let Some(model) = value.get("model").and_then(|v| v.as_str()) {
+        return Some(model.to_string());
     }
 
     let omo_path = opencode_config_dir.join("oh-my-opencode.json");
