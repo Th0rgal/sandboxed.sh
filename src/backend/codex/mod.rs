@@ -548,6 +548,10 @@ fn extract_text_field(
         let mut out = String::new();
         let items = value.as_array()?;
         for item in items {
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if matches!(item_type, "reasoning" | "thinking") {
+                continue;
+            }
             if let Some(text) = extract_str(item.get("text")) {
                 out.push_str(&text);
                 continue;
@@ -1200,5 +1204,19 @@ mod tests {
         );
         let result = extract_text_field(&data);
         assert_eq!(result, Some("part one part two".to_string()));
+    }
+
+    #[test]
+    fn extract_text_field_from_content_array_skips_reasoning_blocks() {
+        let mut data = HashMap::new();
+        data.insert(
+            "content".to_string(),
+            json!([
+                {"type": "reasoning", "text": "thinking that should not leak"},
+                {"type": "output_text", "text": "actual answer"}
+            ]),
+        );
+        let result = extract_text_field(&data);
+        assert_eq!(result, Some("actual answer".to_string()));
     }
 }
