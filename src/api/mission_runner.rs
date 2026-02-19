@@ -6983,7 +6983,10 @@ pub async fn check_backend_prerequisites(
             cli_available: false,
             auto_install_possible: false,
             missing_dependencies: vec![format!("unknown backend: {}", backend_id)],
-            message: Some(format!("Unknown backend '{}'. Supported backends: claudecode, opencode, codex, amp", backend_id)),
+            message: Some(format!(
+                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, amp",
+                backend_id
+            )),
         },
     }
 }
