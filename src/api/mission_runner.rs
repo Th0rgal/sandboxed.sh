@@ -7633,6 +7633,11 @@ pub async fn run_opencode_turn(
     let (sse_session_idle_tx, mut sse_session_idle_rx) = tokio::sync::watch::channel(false);
     let (sse_retry_tx, mut sse_retry_rx) = tokio::sync::watch::channel(0u32);
     let last_activity = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    // Track recent OpenCode heartbeats separately from "meaningful" activity.
+    // Some provider chains can spend >120s between message/status updates while
+    // still emitting heartbeats, so treating heartbeat-only periods as hard
+    // inactivity can kill valid runs prematurely.
+    let last_heartbeat = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     let (text_output_tx, mut text_output_rx) = tokio::sync::watch::channel(false);
     // Track active tool call depth: incremented on ToolCall, decremented on ToolResult.
     // Used to skip inactivity timeouts during long tool runs (builds, tests, etc.).
@@ -7900,6 +7905,7 @@ pub async fn run_opencode_turn(
     let stderr_recent_capture = stderr_recent_lines.clone();
     let stderr_text_output_tx = text_output_tx.clone();
     let stderr_last_activity = last_activity.clone();
+    let stderr_last_heartbeat = last_heartbeat.clone();
     let stderr_rate_limit = rate_limit_detected.clone();
     let stderr_events_tx = events_tx.clone();
     let stderr_handle = stderr.map(|stderr| {
@@ -7923,9 +7929,15 @@ pub async fn run_opencode_turn(
                     // real work progress.  Heartbeats and server-internal status
                     // lines are excluded — they fire every ~30s and would keep a
                     // hung LLM call alive forever.
-                    let is_server_noise = clean.contains("server.heartbeat")
+                    let is_heartbeat = clean.contains("server.heartbeat");
+                    let is_server_noise = is_heartbeat
                         || clean.contains("server.connected")
                         || clean.contains("server.listening");
+                    if is_heartbeat {
+                        if let Ok(mut guard) = stderr_last_heartbeat.lock() {
+                            *guard = Some(std::time::Instant::now());
+                        }
+                    }
                     if !is_server_noise {
                         if let Ok(mut guard) = stderr_last_activity.lock() {
                             *guard = std::time::Instant::now();
@@ -8307,18 +8319,40 @@ pub async fn run_opencode_turn(
                 // so treat that as "no tools active".
                 let sse_alive = sse_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
                 let tools_active = sse_alive && *sse_tool_depth_rx.borrow() > 0;
-                let inactive_too_long = !tools_active
-                    && last_activity
-                        .lock()
-                        .map(|g| g.elapsed() >= std::time::Duration::from_secs(120))
-                        .unwrap_or(false);
-                if inactive_too_long {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        "Global inactivity timeout (120s); terminating stuck CLI process"
-                    );
-                    let _ = child.kill().await;
-                    break;
+                let inactivity_elapsed = last_activity
+                    .lock()
+                    .ok()
+                    .map(|g| g.elapsed())
+                    .unwrap_or_default();
+                let recent_heartbeat = last_heartbeat
+                    .lock()
+                    .ok()
+                    .and_then(|g| *g)
+                    .map(|ts| ts.elapsed() <= std::time::Duration::from_secs(45))
+                    .unwrap_or(false);
+                if !tools_active && inactivity_elapsed >= std::time::Duration::from_secs(120) {
+                    // Heartbeat-only grace: avoid killing while the OpenCode server is
+                    // still alive and sending heartbeats. This especially affects smart
+                    // routing chains (e.g. GLM/Minimax fallbacks) that can take longer
+                    // to produce non-heartbeat events.
+                    if recent_heartbeat {
+                        if inactivity_elapsed >= std::time::Duration::from_secs(420) {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                inactivity_secs = inactivity_elapsed.as_secs(),
+                                "Heartbeat-only inactivity timeout (420s); terminating stuck CLI process"
+                            );
+                            let _ = child.kill().await;
+                            break;
+                        }
+                    } else {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            "Global inactivity timeout (120s); terminating stuck CLI process"
+                        );
+                        let _ = child.kill().await;
+                        break;
+                    }
                 }
             }
             line_result = stdout_lines.next_line() => {
