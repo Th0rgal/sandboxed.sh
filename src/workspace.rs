@@ -1333,6 +1333,8 @@ case "$BASE_CMD" in
   cargo)     RTK_SUB="cargo" ;;
   npm)       RTK_SUB="npm" ;;
   npx)       RTK_SUB="npx" ;;
+  bun)       RTK_SUB="npm" ;;
+  bunx)      RTK_SUB="npx" ;;
   pnpm)      RTK_SUB="pnpm" ;;
   docker)    RTK_SUB="docker" ;;
   kubectl)   RTK_SUB="kubectl" ;;
@@ -4034,10 +4036,29 @@ exec >>"$LOG" 2>&1
 
 echo "[sandboxed] Harness bootstrap start"
 
-if command -v npm >/dev/null 2>&1; then
+# Ensure bun is in PATH first (it's our preferred package manager)
+if [ -x /root/.bun/bin/bun ] && ! command -v bun >/dev/null 2>&1; then
+  ln -sf /root/.bun/bin/bun /usr/local/bin/bun || true
+  if [ -x /root/.bun/bin/bunx ]; then
+    ln -sf /root/.bun/bin/bunx /usr/local/bin/bunx || true
+  fi
+  echo "[sandboxed] Linked bun into /usr/local/bin"
+fi
+
+# Detect package manager: prefer bun, fallback to npm
+if command -v bun >/dev/null 2>&1; then
+  PKG_MGR="bun"
+elif command -v npm >/dev/null 2>&1; then
+  PKG_MGR="npm"
+else
+  PKG_MGR=""
+  echo "[sandboxed] No package manager (bun/npm) found; skipping harness install"
+fi
+
+if [ -n "$PKG_MGR" ]; then
   if [ "{install_claudecode}" = "true" ] && ! command -v claude >/dev/null 2>&1; then
-    echo "[sandboxed] Installing Claude Code..."
-    if ! npm install -g @anthropic-ai/claude-code@latest; then
+    echo "[sandboxed] Installing Claude Code via $PKG_MGR..."
+    if ! $PKG_MGR install -g @anthropic-ai/claude-code@latest; then
       echo "[sandboxed] Claude Code install failed"
     fi
   fi
@@ -4060,21 +4081,11 @@ if command -v npm >/dev/null 2>&1; then
     fi
   fi
   if [ "{install_opencode}" = "true" ] && ! command -v oh-my-opencode >/dev/null 2>&1; then
-    echo "[sandboxed] Installing oh-my-opencode..."
-    if ! npm install -g oh-my-opencode@latest; then
+    echo "[sandboxed] Installing oh-my-opencode via $PKG_MGR..."
+    if ! $PKG_MGR install -g oh-my-opencode@latest; then
       echo "[sandboxed] OpenCode plugin install failed"
     fi
   fi
-else
-  echo "[sandboxed] npm not found; skipping harness install"
-fi
-
-if [ -x /root/.bun/bin/bun ] && ! command -v bun >/dev/null 2>&1; then
-  ln -sf /root/.bun/bin/bun /usr/local/bin/bun || true
-  if [ -x /root/.bun/bin/bunx ]; then
-    ln -sf /root/.bun/bin/bunx /usr/local/bin/bunx || true
-  fi
-  echo "[sandboxed] Linked bun into /usr/local/bin"
 fi
 
 echo "[sandboxed] Harness bootstrap done"

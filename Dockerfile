@@ -73,12 +73,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Add plucky (25.04) script for future Ubuntu releases
     && ln -sf gutsy /usr/share/debootstrap/scripts/plucky
 
-# -- Node.js 20 (for Next.js standalone + Claude Code via npm) ---------------
+# -- Node.js 20 (for Next.js standalone runtime) ------------------------------
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# -- Bun (for bunx + OpenCode plugins) ---------------------------------------
+# -- Bun (preferred package manager for global installs + bunx) ---------------
 RUN curl -fsSL https://bun.sh/install | bash \
     && install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun \
     && install -m 0755 /root/.bun/bin/bunx /usr/local/bin/bunx
@@ -102,14 +102,15 @@ COPY --from=dashboard-builder /build/dashboard/.next/static /opt/dashboard/.next
 COPY --from=dashboard-builder /build/dashboard/public /opt/dashboard/public
 
 # -- Pre-install AI harness CLIs (optional — agents still work if these fail) -
-RUN npm install -g @anthropic-ai/claude-code@latest \
+# Uses bun for global installs (faster than npm, and our preferred package manager)
+RUN bun install -g @anthropic-ai/claude-code@latest \
     && echo "[docker] Claude Code CLI installed: $(claude --version 2>/dev/null || echo 'unknown')" \
     || echo "[docker] WARNING: Claude Code CLI install failed (will be installed on first mission)"
 RUN curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path \
     && install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode \
     && echo "[docker] OpenCode CLI installed: $(opencode --version 2>/dev/null || echo 'unknown')" \
     || echo "[docker] WARNING: OpenCode CLI install failed (will be installed on first mission)"
-RUN npm install -g @sourcegraph/amp@latest \
+RUN bun install -g @sourcegraph/amp@latest \
     && echo "[docker] Amp CLI installed: $(amp --version 2>/dev/null || echo 'unknown')" \
     || echo "[docker] WARNING: Amp CLI install failed (will be installed on first mission)"
 

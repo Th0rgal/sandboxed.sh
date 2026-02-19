@@ -1169,21 +1169,16 @@ fn stream_claude_code_update() -> impl Stream<Item = Result<Event, std::convert:
     async_stream::stream! {
         yield sse("log", "Starting Claude Code installation/update...", Some(0));
 
-        // Check if npm is available
-        let npm_ok = Command::new("npm")
-            .arg("--version")
-            .output()
-            .await
-            .is_ok_and(|o| o.status.success());
-        if !npm_ok {
-            yield sse("error", "npm is required to install Claude Code. Please install Node.js first.", None);
+        let pm = crate::pkg_manager::preferred().await;
+        let Some(pm) = pm else {
+            yield sse("error", "No package manager (bun or npm) found. Please install Bun or Node.js first.", None);
             return;
-        }
+        };
 
-        yield sse("log", "Installing @anthropic-ai/claude-code globally...", Some(20));
+        yield sse("log", format!("Installing @anthropic-ai/claude-code globally via {}...", pm.bin()), Some(20));
 
-        match Command::new("npm")
-            .args(["install", "-g", "@anthropic-ai/claude-code@latest"])
+        match Command::new(pm.bin())
+            .args(pm.global_install_args("@anthropic-ai/claude-code@latest"))
             .output()
             .await
         {
@@ -1212,7 +1207,7 @@ fn stream_claude_code_update() -> impl Stream<Item = Result<Event, std::convert:
                 yield sse("error", format!("Failed to install Claude Code: {}", stderr), None);
             }
             Err(e) => {
-                yield sse("error", format!("Failed to run npm install: {}", e), None);
+                yield sse("error", format!("Failed to run {} install: {}", pm.bin(), e), None);
             }
         }
     }
@@ -1222,10 +1217,17 @@ fn stream_claude_code_update() -> impl Stream<Item = Result<Event, std::convert:
 fn stream_amp_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
         yield sse("log", "Starting Amp update...", Some(0));
-        yield sse("log", "Running npm install -g @sourcegraph/amp@latest...", Some(20));
 
-        match Command::new("npm")
-            .args(["install", "-g", "@sourcegraph/amp@latest"])
+        let pm = crate::pkg_manager::preferred().await;
+        let Some(pm) = pm else {
+            yield sse("error", "No package manager (bun or npm) found. Please install Bun or Node.js first.", None);
+            return;
+        };
+
+        yield sse("log", format!("Running {} install -g @sourcegraph/amp@latest...", pm.bin()), Some(20));
+
+        match Command::new(pm.bin())
+            .args(pm.global_install_args("@sourcegraph/amp@latest"))
             .output()
             .await
         {
@@ -1252,21 +1254,16 @@ fn stream_codex_update() -> impl Stream<Item = Result<Event, std::convert::Infal
     async_stream::stream! {
         yield sse("log", "Starting Codex installation/update...", Some(0));
 
-        // Check if npm is available
-        let npm_ok = Command::new("npm")
-            .arg("--version")
-            .output()
-            .await
-            .is_ok_and(|o| o.status.success());
-        if !npm_ok {
-            yield sse("error", "npm is required to install Codex. Please install Node.js first.", None);
+        let pm = crate::pkg_manager::preferred().await;
+        let Some(pm) = pm else {
+            yield sse("error", "No package manager (bun or npm) found. Please install Bun or Node.js first.", None);
             return;
-        }
+        };
 
-        yield sse("log", "Installing @openai/codex@latest globally...", Some(20));
+        yield sse("log", format!("Installing @openai/codex@latest globally via {}...", pm.bin()), Some(20));
 
-        match Command::new("npm")
-            .args(["install", "-g", "@openai/codex@latest"])
+        match Command::new(pm.bin())
+            .args(pm.global_install_args("@openai/codex@latest"))
             .output()
             .await
         {
@@ -1297,7 +1294,7 @@ fn stream_codex_update() -> impl Stream<Item = Result<Event, std::convert::Infal
                 yield sse("error", format!("Failed to install Codex: {}", stderr), None);
             }
             Err(e) => {
-                yield sse("error", format!("Failed to run npm install: {}", e), None);
+                yield sse("error", format!("Failed to run {} install: {}", pm.bin(), e), None);
             }
         }
     }
@@ -1305,7 +1302,7 @@ fn stream_codex_update() -> impl Stream<Item = Result<Event, std::convert::Infal
 
 /// Stream the Codex uninstall process.
 fn stream_codex_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    stream_npm_package_uninstall("@openai/codex", ".codex", "Codex")
+    stream_package_uninstall("@openai/codex", ".codex", "Codex")
 }
 
 /// Stream the oh-my-opencode update process.
@@ -1468,8 +1465,8 @@ fn stream_opencode_uninstall() -> impl Stream<Item = Result<Event, std::convert:
     }
 }
 
-/// Helper function to stream npm package uninstall process.
-fn stream_npm_package_uninstall(
+/// Helper function to stream package uninstall process (bun-first, npm-fallback).
+fn stream_package_uninstall(
     package_name: &'static str,
     config_dir: &'static str,
     display_name: &'static str,
@@ -1477,64 +1474,69 @@ fn stream_npm_package_uninstall(
     async_stream::stream! {
         yield sse("log", format!("Starting {} uninstall...", display_name), Some(0));
 
-        // Check if npm is available
-        let npm_ok = Command::new("npm")
-            .arg("--version")
-            .output()
-            .await
-            .is_ok_and(|o| o.status.success());
-        if !npm_ok {
-            yield sse("error", format!("npm is required to uninstall {}.", display_name), None);
+        let pm = crate::pkg_manager::preferred().await;
+        let Some(pm) = pm else {
+            yield sse("error", format!("No package manager (bun or npm) found to uninstall {}.", display_name), None);
             return;
-        }
+        };
 
-        yield sse("log", format!("Uninstalling {} globally...", package_name), Some(20));
+        yield sse("log", format!("Uninstalling {} globally via {}...", package_name, pm.bin()), Some(20));
 
-        match Command::new("npm")
-            .args(["uninstall", "-g", package_name])
+        match Command::new(pm.bin())
+            .args(pm.global_uninstall_args(package_name))
             .output()
             .await
         {
             Ok(output) if output.status.success() => {
-                yield sse("log", "Package removed from npm", Some(60));
-
-                // Remove configuration directory
-                let home = home_dir();
-                let config_path = format!("{}/{}", home, config_dir);
-                if std::path::Path::new(&config_path).exists() {
-                    yield sse("log", format!("Removing {} configuration...", display_name), Some(80));
-                    let _ = Command::new("rm")
-                        .args(["-rf", &config_path])
-                        .output()
-                        .await;
-                }
-
-                yield sse("complete", format!("{} uninstalled successfully!", display_name), Some(100));
+                yield sse("log", format!("Package removed via {}", pm.bin()), Some(50));
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                if stderr.contains("not installed") || stdout.contains("not installed") {
-                    yield sse("complete", format!("{} was not installed.", display_name), Some(100));
-                } else {
-                    yield sse("error", format!("Failed to uninstall {}: {} {}", display_name, stderr, stdout), None);
+                if !stderr.contains("not installed") && !stdout.contains("not installed") {
+                    yield sse("log", format!("Warning: {} uninstall had issues: {} {}", pm.bin(), stderr, stdout), None);
                 }
             }
             Err(e) => {
-                yield sse("error", format!("Failed to run npm uninstall: {}", e), None);
+                yield sse("log", format!("Warning: {} uninstall failed: {}", pm.bin(), e), None);
             }
         }
+
+        // Also clean up from the other package manager if it was installed there
+        let other = match pm {
+            crate::pkg_manager::PkgManager::Bun => "npm",
+            crate::pkg_manager::PkgManager::Npm => "bun",
+        };
+        let other_args = match pm {
+            crate::pkg_manager::PkgManager::Bun => vec!["uninstall", "-g", package_name],
+            crate::pkg_manager::PkgManager::Npm => vec!["remove", "-g", package_name],
+        };
+        yield sse("log", format!("Cleaning up {} global install if any...", other), Some(60));
+        let _ = Command::new(other).args(&other_args).output().await;
+
+        // Remove configuration directory
+        let home = home_dir();
+        let config_path = format!("{}/{}", home, config_dir);
+        if std::path::Path::new(&config_path).exists() {
+            yield sse("log", format!("Removing {} configuration...", display_name), Some(80));
+            let _ = Command::new("rm")
+                .args(["-rf", &config_path])
+                .output()
+                .await;
+        }
+
+        yield sse("complete", format!("{} uninstalled successfully!", display_name), Some(100));
     }
 }
 
 /// Stream the Claude Code uninstall process.
 fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    stream_npm_package_uninstall("@anthropic-ai/claude-code", ".claude", "Claude Code")
+    stream_package_uninstall("@anthropic-ai/claude-code", ".claude", "Claude Code")
 }
 
 /// Stream the Amp uninstall process.
 fn stream_amp_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    stream_npm_package_uninstall("@sourcegraph/amp", ".agents", "Amp")
+    stream_package_uninstall("@sourcegraph/amp", ".agents", "Amp")
 }
 
 /// Stream the oh-my-opencode uninstall process.

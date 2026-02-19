@@ -45,6 +45,7 @@ pub mod mcp;
 pub mod nspawn;
 pub mod opencode;
 pub mod opencode_config;
+pub mod pkg_manager;
 pub mod provider_health;
 pub mod secrets;
 pub mod settings;

@@ -387,9 +387,9 @@ impl Tool for PrepareProject {
                 "hardhat.config.js",
                 "Solidity (Hardhat)",
                 vec![
-                    "Run `npm install` to install dependencies",
-                    "Run `npx hardhat compile` to compile contracts",
-                    "Run `npx hardhat test` to run tests",
+                    "Run `bun install` or `npm install` to install dependencies",
+                    "Run `bunx hardhat compile` or `npx hardhat compile` to compile contracts",
+                    "Run `bunx hardhat test` or `npx hardhat test` to run tests",
                 ],
             ),
             (
@@ -426,7 +426,7 @@ impl Tool for PrepareProject {
 
         // Check for common tools
         result.push_str("## Environment Check\n\n");
-        let tools_to_check = ["git", "node", "npm", "cargo", "python3", "go", "forge"];
+        let tools_to_check = ["git", "node", "bun", "npm", "cargo", "python3", "go", "forge"];
 
         for tool in tools_to_check {
             let output = tokio::process::Command::new("which")
