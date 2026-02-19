@@ -7000,7 +7000,8 @@ async fn check_claudecode_prerequisites(
     let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
 
     let cli_available = command_available(workspace_exec, cwd, program).await
-        || command_available(workspace_exec, cwd, "/root/.cache/.bun/bin/claude").await;
+        || command_available(workspace_exec, cwd, "/root/.cache/.bun/bin/claude").await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/claude").await;
 
     if cli_available {
         return BackendPreflightResult {
