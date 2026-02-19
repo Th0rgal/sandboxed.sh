@@ -6758,15 +6758,29 @@ fn is_codex_node_wrapper(path: &std::path::Path) -> bool {
 
     let first_line = content.lines().next().unwrap_or("");
     let has_node_shebang = first_line.starts_with("#!/usr/bin/env node")
-        || first_line.starts_with("#!/usr/bin/node")
-        || first_line.contains("node");
+        || first_line.starts_with("#!/usr/bin/node");
 
     if !has_node_shebang {
         return false;
     }
 
     let lower = content.to_lowercase();
-    lower.contains("@openai/codex") || lower.contains("codex-linux-x64")
+    let has_codex_ref = lower.contains("@openai/codex")
+        || lower.contains("codex-linux-x64")
+        || lower.contains("codex-linux-arm64")
+        || lower.contains("codex-darwin-x64")
+        || lower.contains("codex-darwin-arm64");
+    has_codex_ref
+}
+
+fn codex_npm_package_name(triple: &str) -> &'static str {
+    match triple {
+        "x86_64-unknown-linux-musl" => "codex-linux-x64",
+        "aarch64-unknown-linux-musl" => "codex-linux-arm64",
+        "x86_64-apple-darwin" => "codex-darwin-x64",
+        "aarch64-apple-darwin" => "codex-darwin-arm64",
+        _ => "codex-linux-x64",
+    }
 }
 
 fn resolve_codex_native_binary_search_paths(
@@ -6775,6 +6789,7 @@ fn resolve_codex_native_binary_search_paths(
     binary_name: &str,
 ) -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
+    let npm_pkg = codex_npm_package_name(triple);
 
     let binary_path = |base: &std::path::Path| {
         base.join("vendor")
@@ -6790,15 +6805,13 @@ fn resolve_codex_native_binary_search_paths(
             let nested_optional = package_root
                 .join("node_modules")
                 .join("@openai")
-                .join("codex-linux-x64");
+                .join(npm_pkg);
             paths.push(binary_path(&nested_optional));
         }
 
-        if let Some(package_parent) = bin_dir.parent() {
-            if let Some(node_modules) = package_parent.parent() {
-                let sibling_optional = node_modules.join("@openai").join("codex-linux-x64");
-                paths.push(binary_path(&sibling_optional));
-            }
+        if let Some(node_modules) = bin_dir.parent() {
+            let sibling_optional = node_modules.join("@openai").join(npm_pkg);
+            paths.push(binary_path(&sibling_optional));
         }
     }
 
@@ -6810,7 +6823,7 @@ fn resolve_codex_native_binary_search_paths(
             .join("codex")
             .join("node_modules")
             .join("@openai")
-            .join("codex-linux-x64");
+            .join(npm_pkg);
         paths.push(binary_path(&npm_optional));
     }
 
@@ -6822,7 +6835,7 @@ fn resolve_codex_native_binary_search_paths(
             .join("codex")
             .join("node_modules")
             .join("@openai")
-            .join("codex-linux-x64");
+            .join(npm_pkg);
         paths.push(binary_path(&npm_optional));
     }
 
@@ -6833,7 +6846,7 @@ fn resolve_codex_native_binary_search_paths(
             .join("global")
             .join("node_modules")
             .join("@openai")
-            .join("codex-linux-x64");
+            .join(npm_pkg);
         paths.push(binary_path(&bun_optional));
 
         let bun_cache_optional = std::path::PathBuf::from(&home)
@@ -6843,7 +6856,7 @@ fn resolve_codex_native_binary_search_paths(
             .join("global")
             .join("node_modules")
             .join("@openai")
-            .join("codex-linux-x64");
+            .join(npm_pkg);
         paths.push(binary_path(&bun_cache_optional));
     }
 
