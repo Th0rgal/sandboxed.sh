@@ -1392,7 +1392,8 @@ impl MissionStore for SqliteMissionStore {
             | AgentEvent::AgentTree { .. }
             | AgentEvent::Progress { .. }
             | AgentEvent::SessionIdUpdate { .. }
-            | AgentEvent::MissionActivity { .. } => return Ok(()),
+            | AgentEvent::MissionActivity { .. }
+            | AgentEvent::MissionTitleChanged { .. } => return Ok(()),
         };
 
         let event_type = event_type.to_string();
