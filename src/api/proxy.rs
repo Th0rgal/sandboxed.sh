@@ -1073,7 +1073,9 @@ fn extract_rate_limit_snapshot(
                 && tokens_limit.is_none()
                 && tokens_remaining.is_none()
                 && input_tokens_limit.is_none()
+                && input_tokens_remaining.is_none()
                 && output_tokens_limit.is_none()
+                && output_tokens_remaining.is_none()
             {
                 return None;
             }
@@ -1105,6 +1107,9 @@ fn parse_iso_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// Parse a reset timestamp and convert to DateTime.
 /// Handles both ISO 8601 timestamps and duration strings (e.g., "2s", "1m30s").
+///
+/// Note: Uses uncapped duration parsing since rate-limit reset windows can legitimately
+/// span many hours (e.g., OpenAI daily limits reset in ~24h).
 fn parse_reset_timestamp(
     s: &str,
     now: &chrono::DateTime<chrono::Utc>,
@@ -1118,7 +1123,7 @@ fn parse_reset_timestamp(
         return Some(dt.with_timezone(&chrono::Utc));
     }
 
-    if let Some(duration) = parse_duration_string(s) {
+    if let Some(duration) = parse_rate_limit_duration(s) {
         return Some(*now + chrono::Duration::from_std(duration).ok()?);
     }
 
@@ -1238,6 +1243,84 @@ fn parse_duration_string(s: &str) -> Option<std::time::Duration> {
     if total_ms > 0.0 {
         let secs = (total_ms / 1000.0).min(MAX_HEADER_COOLDOWN_SECS);
         Some(std::time::Duration::from_secs_f64(secs))
+    } else {
+        None
+    }
+}
+
+/// Parse a duration string for rate-limit quota tracking (no 1-hour cap).
+///
+/// Unlike `parse_duration_string`, this function does NOT cap durations at 1 hour
+/// because rate-limit reset windows can legitimately span many hours (e.g., OpenAI
+/// daily limits reset in ~24h).
+fn parse_rate_limit_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    if let Ok(secs) = s.parse::<f64>() {
+        if secs <= 0.0 {
+            return None;
+        }
+        if secs > 1_000_000_000.0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            let remaining = secs - now;
+            return if remaining > 0.0 {
+                Some(std::time::Duration::from_secs_f64(remaining))
+            } else {
+                None
+            };
+        }
+        return Some(std::time::Duration::from_secs_f64(secs));
+    }
+
+    let mut total_ms: f64 = 0.0;
+    let mut num_buf = String::new();
+    let mut chars = s.chars().peekable();
+
+    while chars.peek().is_some() {
+        num_buf.clear();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() || c == '.' {
+                num_buf.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        if num_buf.is_empty() {
+            return None;
+        }
+
+        let num: f64 = num_buf.parse().ok()?;
+
+        let mut unit = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_alphabetic() {
+                unit.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        total_ms += match unit.as_str() {
+            "h" => num * 3_600_000.0,
+            "m" => num * 60_000.0,
+            "s" => num * 1_000.0,
+            "ms" => num,
+            "" => num * 1_000.0,
+            _ => return None,
+        };
+    }
+
+    if total_ms > 0.0 {
+        Some(std::time::Duration::from_secs_f64(total_ms / 1000.0))
     } else {
         None
     }
