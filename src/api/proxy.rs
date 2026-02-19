@@ -653,7 +653,8 @@ async fn chat_completions(
             let health_tracker = state.health_tracker.clone();
 
             // Extract rate-limit snapshot to record after stream completes
-            let rate_limit_snapshot = extract_rate_limit_snapshot(upstream_resp.headers(), provider_type);
+            let rate_limit_snapshot =
+                extract_rate_limit_snapshot(upstream_resp.headers(), provider_type);
 
             let mut response_headers = HeaderMap::new();
             response_headers.insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
@@ -973,7 +974,10 @@ fn extract_rate_limit_snapshot(
     let now = chrono::Utc::now();
 
     match provider_type {
-        ProviderType::OpenAI | ProviderType::Xai | ProviderType::Groq | ProviderType::OpenRouter => {
+        ProviderType::OpenAI
+        | ProviderType::Xai
+        | ProviderType::Groq
+        | ProviderType::OpenRouter => {
             let requests_limit = headers
                 .get("x-ratelimit-limit-requests")
                 .and_then(|v| v.to_str().ok())
@@ -1093,7 +1097,10 @@ fn extract_rate_limit_snapshot(
 
 /// Parse a reset timestamp and convert to DateTime.
 /// Handles both ISO 8601 timestamps and duration strings (e.g., "2s", "1m30s").
-fn parse_reset_timestamp(s: &str, now: &chrono::DateTime<chrono::Utc>) -> Option<chrono::DateTime<chrono::Utc>> {
+fn parse_reset_timestamp(
+    s: &str,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let s = s.trim();
     if s.is_empty() {
         return None;
