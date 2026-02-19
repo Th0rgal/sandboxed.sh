@@ -895,7 +895,7 @@ export default function ModelRoutingPage() {
           ) : !rtkStats || rtkStats.commands_processed === 0 ? (
             <div className="text-center py-4">
               <p className="text-xs text-white/30">
-                No RTK data yet. Enable with <code className="text-white/50">SANDBOXED_SH_RTK_ENABLED=1</code>
+                No RTK data yet. Enable RTK in <a href="/settings/data" className="text-white/50 underline">Settings</a>
               </p>
             </div>
           ) : (
