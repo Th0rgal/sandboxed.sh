@@ -251,6 +251,20 @@ pub async fn write_json_config(
     Ok(())
 }
 
+/// Check whether a JSON auth entry contains any recognised credential field.
+///
+/// Looks for API keys (`key`, `api_key`, `apiKey`) and OAuth tokens
+/// (`refresh`, `refresh_token`, `access`, `access_token`).
+pub fn auth_entry_has_credentials(value: &serde_json::Value) -> bool {
+    value.get("key").is_some()
+        || value.get("api_key").is_some()
+        || value.get("apiKey").is_some()
+        || value.get("refresh").is_some()
+        || value.get("refresh_token").is_some()
+        || value.get("access").is_some()
+        || value.get("access_token").is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

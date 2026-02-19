@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 
 use super::routes::AppState;
 use crate::ai_providers::{AIProviderStore, ProviderType};
-use crate::util::{home_dir, AI_PROVIDERS_PATH};
+use crate::util::{auth_entry_has_credentials, home_dir, AI_PROVIDERS_PATH};
 
 /// Cached model lists fetched from provider APIs at startup.
 /// Maps provider ID (e.g. "anthropic") -> Vec<ProviderModel>
@@ -900,19 +900,6 @@ pub async fn fetch_model_catalog(
 }
 
 /// Check if a JSON value contains valid auth credentials.
-fn has_valid_auth(value: &serde_json::Value) -> bool {
-    // Check for OAuth tokens (various field names used by different providers)
-    let has_oauth = value.get("refresh").is_some()
-        || value.get("refresh_token").is_some()
-        || value.get("access").is_some()
-        || value.get("access_token").is_some();
-    // Check for API key (various field names)
-    let has_api_key = value.get("key").is_some()
-        || value.get("api_key").is_some()
-        || value.get("apiKey").is_some();
-    has_oauth || has_api_key
-}
-
 /// Get the set of configured provider IDs from OpenCode's auth files.
 fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String> {
     let mut configured = HashSet::new();
@@ -934,7 +921,7 @@ fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String>
         if let Ok(auth) = serde_json::from_str::<serde_json::Value>(&contents) {
             if let Some(map) = auth.as_object() {
                 for (key, value) in map {
-                    if has_valid_auth(value) {
+                    if auth_entry_has_credentials(value) {
                         tracing::debug!("Found valid auth for provider '{}' in auth.json", key);
                         let normalized = if key == "codex" { "openai" } else { key };
                         configured.insert(normalized.to_string());
@@ -963,7 +950,7 @@ fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String>
                 auth_file
             );
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
-                if has_valid_auth(&value) {
+                if auth_entry_has_credentials(&value) {
                     tracing::debug!(
                         "Found valid auth for provider '{}' in {:?}",
                         provider_type.id(),

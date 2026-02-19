@@ -26,7 +26,9 @@ use crate::mcp::McpRegistry;
 use crate::opencode::{extract_reasoning, extract_text};
 use crate::secrets::SecretsStore;
 use crate::task::{extract_deliverables, DeliverableSet};
-use crate::util::{build_history_context, env_var_bool, home_dir, strip_jsonc_comments};
+use crate::util::{
+    auth_entry_has_credentials, build_history_context, env_var_bool, home_dir, strip_jsonc_comments,
+};
 use crate::workspace::{self, Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
 
@@ -3914,16 +3916,6 @@ struct OpenCodeAuthState {
     has_other: bool,
     /// Tracks which specific provider IDs have been detected as configured.
     configured_providers: std::collections::HashSet<String>,
-}
-
-fn auth_entry_has_credentials(value: &serde_json::Value) -> bool {
-    value.get("key").is_some()
-        || value.get("api_key").is_some()
-        || value.get("apiKey").is_some()
-        || value.get("refresh").is_some()
-        || value.get("refresh_token").is_some()
-        || value.get("access").is_some()
-        || value.get("access_token").is_some()
 }
 
 fn load_provider_auth_entries(
