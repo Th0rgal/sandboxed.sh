@@ -630,10 +630,7 @@ pub enum AgentEvent {
         summary: Option<String>,
     },
     /// Mission title changed (by user)
-    MissionTitleChanged {
-        mission_id: Uuid,
-        title: String,
-    },
+    MissionTitleChanged { mission_id: Uuid, title: String },
     /// Agent phase update (for showing preparation steps)
     AgentPhase {
         /// Phase name: "executing", "delegating", etc.
@@ -765,6 +762,7 @@ impl AgentEvent {
             AgentEvent::Progress { .. } => "progress",
             AgentEvent::SessionIdUpdate { .. } => "session_id_update",
             AgentEvent::MissionActivity { .. } => "mission_activity",
+            AgentEvent::MissionTitleChanged { .. } => "mission_title_changed",
         }
     }
 
@@ -784,6 +782,7 @@ impl AgentEvent {
             AgentEvent::Progress { mission_id, .. } => *mission_id,
             AgentEvent::SessionIdUpdate { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
+            AgentEvent::MissionTitleChanged { mission_id, .. } => Some(*mission_id),
         }
     }
 }
