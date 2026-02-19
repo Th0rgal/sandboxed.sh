@@ -845,10 +845,7 @@ async fn build_workspace(
     let working_dir = state.config.working_dir.clone();
     let mut workspace_for_build = workspace.clone();
     // Get library for init script assembly
-    let library = {
-        let guard = state.library.read().await;
-        guard.as_ref().map(Arc::clone)
-    };
+    let library = clone_library(&state.library).await;
 
     tokio::spawn(async move {
         let result = crate::workspace::build_container_workspace(
