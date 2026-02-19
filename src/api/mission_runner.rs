@@ -26,7 +26,7 @@ use crate::mcp::McpRegistry;
 use crate::opencode::{extract_reasoning, extract_text};
 use crate::secrets::SecretsStore;
 use crate::task::{extract_deliverables, DeliverableSet};
-use crate::util::{build_history_context, env_var_bool, home_dir};
+use crate::util::{build_history_context, env_var_bool, home_dir, strip_jsonc_comments};
 use crate::workspace::{self, Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
 
@@ -3867,64 +3867,6 @@ fn host_oh_my_opencode_config_candidates() -> Vec<std::path::PathBuf> {
         candidates.push(base.join("oh-my-opencode.jsonc"));
     }
     candidates
-}
-
-fn strip_jsonc_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escape = false;
-
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if escape {
-                escape = false;
-            } else if c == '\\' {
-                escape = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            continue;
-        }
-
-        if c == '/' {
-            match chars.peek() {
-                Some('/') => {
-                    chars.next();
-                    for n in chars.by_ref() {
-                        if n == '\n' {
-                            out.push('\n');
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                Some('*') => {
-                    chars.next();
-                    let mut prev = '\0';
-                    for n in chars.by_ref() {
-                        if prev == '*' && n == '/' {
-                            break;
-                        }
-                        prev = n;
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-
-        out.push(c);
-    }
-
-    out
 }
 
 fn omo_config_all_fallback(value: &serde_json::Value) -> bool {

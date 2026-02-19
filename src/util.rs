@@ -53,6 +53,65 @@ pub fn sanitize_skill_list(skills: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Strip `//` and `/* */` comments from a JSONC string, preserving string literals.
+pub fn strip_jsonc_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            continue;
+        }
+
+        if c == '/' {
+            match chars.peek() {
+                Some('/') => {
+                    chars.next();
+                    for n in chars.by_ref() {
+                        if n == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut prev = '\0';
+                    for n in chars.by_ref() {
+                        if prev == '*' && n == '/' {
+                            break;
+                        }
+                        prev = n;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        out.push(c);
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +153,28 @@ mod tests {
         )];
         let result = build_history_context(&history, 5);
         assert!(result.contains("USER: a very long message"));
+    }
+
+    #[test]
+    fn strip_jsonc_comments_removes_line_comments() {
+        let input = r#"{"key": "value" // comment
+}"#;
+        let result = strip_jsonc_comments(input);
+        assert_eq!(result, "{\"key\": \"value\" \n}");
+    }
+
+    #[test]
+    fn strip_jsonc_comments_removes_block_comments() {
+        let input = r#"{"key": /* block */ "value"}"#;
+        let result = strip_jsonc_comments(input);
+        assert_eq!(result, r#"{"key":  "value"}"#);
+    }
+
+    #[test]
+    fn strip_jsonc_comments_preserves_strings() {
+        let input = r#"{"url": "https://example.com"}"#;
+        let result = strip_jsonc_comments(input);
+        assert_eq!(result, input);
     }
 
     #[test]

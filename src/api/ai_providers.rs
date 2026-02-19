@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::ai_providers::{AuthMethod, PendingOAuth, ProviderType};
-use crate::util::home_dir;
+use crate::util::{home_dir, strip_jsonc_comments};
 
 /// Anthropic OAuth client ID (from opencode-anthropic-auth plugin)
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -3389,64 +3389,6 @@ fn get_opencode_config_path(working_dir: &Path) -> PathBuf {
         return PathBuf::from(path);
     }
     working_dir.join("opencode.json")
-}
-
-fn strip_jsonc_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escape = false;
-
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if escape {
-                escape = false;
-            } else if c == '\\' {
-                escape = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            continue;
-        }
-
-        if c == '/' {
-            match chars.peek() {
-                Some('/') => {
-                    chars.next();
-                    for n in chars.by_ref() {
-                        if n == '\n' {
-                            out.push('\n');
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                Some('*') => {
-                    chars.next();
-                    let mut prev = '\0';
-                    for n in chars.by_ref() {
-                        if prev == '*' && n == '/' {
-                            break;
-                        }
-                        prev = n;
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-
-        out.push(c);
-    }
-
-    out
 }
 
 fn strip_sandboxed_key(mut value: serde_json::Value) -> serde_json::Value {

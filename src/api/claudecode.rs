@@ -2,7 +2,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde_json::Value;
 
-use crate::util::home_dir;
+use crate::util::{home_dir, strip_jsonc_comments};
 
 fn resolve_claudecode_config_path() -> std::path::PathBuf {
     if let Ok(path) = std::env::var("CLAUDE_CONFIG") {
@@ -26,64 +26,6 @@ fn resolve_claudecode_config_path() -> std::path::PathBuf {
     std::path::PathBuf::from(home_dir())
         .join(".claude")
         .join("settings.json")
-}
-
-fn strip_jsonc_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escape = false;
-
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if escape {
-                escape = false;
-            } else if c == '\\' {
-                escape = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            continue;
-        }
-
-        if c == '/' {
-            match chars.peek() {
-                Some('/') => {
-                    chars.next();
-                    for n in chars.by_ref() {
-                        if n == '\n' {
-                            out.push('\n');
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                Some('*') => {
-                    chars.next();
-                    let mut prev = '\0';
-                    for n in chars.by_ref() {
-                        if prev == '*' && n == '/' {
-                            break;
-                        }
-                        prev = n;
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-
-        out.push(c);
-    }
-
-    out
 }
 
 fn strip_trailing_commas(input: &str) -> String {
