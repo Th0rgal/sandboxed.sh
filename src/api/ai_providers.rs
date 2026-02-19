@@ -850,17 +850,18 @@ fn get_anthropic_auth_from_ai_providers(working_dir: &Path) -> Option<ClaudeCode
         .next()
 }
 
+/// Load the ai_providers.json array, returning an empty vec on any failure.
+fn load_ai_providers(working_dir: &Path) -> Vec<serde_json::Value> {
+    let path = working_dir.join(AI_PROVIDERS_PATH);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
 /// Get all Anthropic credentials from ai_providers.json, sorted by priority.
 fn get_all_anthropic_auth_from_ai_providers(working_dir: &Path) -> Vec<ClaudeCodeAuth> {
-    let ai_providers_path = working_dir.join(AI_PROVIDERS_PATH);
-    let contents = match std::fs::read_to_string(&ai_providers_path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let providers: Vec<serde_json::Value> = match serde_json::from_str(&contents) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
+    let providers = load_ai_providers(working_dir);
 
     // Collect (priority, insertion_index, auth) for deterministic sorting.
     // The insertion index breaks ties when multiple accounts share the same priority.
@@ -992,15 +993,7 @@ pub fn get_all_openai_keys_for_codex(working_dir: &Path) -> Vec<String> {
 
 /// Get all OpenAI API keys from ai_providers.json, sorted by priority.
 fn get_all_openai_keys_from_ai_providers(working_dir: &Path) -> Vec<String> {
-    let ai_providers_path = working_dir.join(AI_PROVIDERS_PATH);
-    let contents = match std::fs::read_to_string(&ai_providers_path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let providers: Vec<serde_json::Value> = match serde_json::from_str(&contents) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
+    let providers = load_ai_providers(working_dir);
 
     let mut entries: Vec<(u32, usize, String)> = Vec::new();
 
@@ -1073,15 +1066,7 @@ pub fn get_all_amp_api_keys(working_dir: &Path) -> Vec<String> {
 
 /// Get all Amp API keys from ai_providers.json, sorted by priority.
 fn get_all_amp_keys_from_ai_providers(working_dir: &Path) -> Vec<String> {
-    let ai_providers_path = working_dir.join(AI_PROVIDERS_PATH);
-    let contents = match std::fs::read_to_string(&ai_providers_path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let providers: Vec<serde_json::Value> = match serde_json::from_str(&contents) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
+    let providers = load_ai_providers(working_dir);
 
     let mut entries: Vec<(u32, usize, String)> = Vec::new();
 
