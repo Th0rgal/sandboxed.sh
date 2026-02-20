@@ -44,7 +44,8 @@ struct AutomationsView: View {
                                             Task { await setAutomationActive(automation, active: active) }
                                         },
                                         onEdit: {
-                                            guard automation.commandSource.isInline else { return }
+                                            guard automation.commandSource.isInline,
+                                                  automation.trigger.isEditableInIOS else { return }
                                             editingAutomation = automation
                                         },
                                         onDelete: {
@@ -234,9 +235,13 @@ private struct AutomationRow: View {
                 .lineLimit(2)
 
             HStack {
-                if automation.commandSource.isInline {
+                if automation.commandSource.isInline && automation.trigger.isEditableInIOS {
                     Button("Edit") { onEdit() }
                         .font(.caption.weight(.medium))
+                } else if automation.commandSource.isInline {
+                    Text("Webhook trigger editing coming soon")
+                        .font(.caption2)
+                        .foregroundStyle(Theme.textMuted)
                 } else {
                     Text("Non-inline command")
                         .font(.caption2)
@@ -376,5 +381,16 @@ private extension AutomationCommandSource {
             return true
         }
         return false
+    }
+}
+
+private extension AutomationTrigger {
+    var isEditableInIOS: Bool {
+        switch self {
+        case .interval, .agentFinished:
+            return true
+        case .webhook:
+            return false
+        }
     }
 }

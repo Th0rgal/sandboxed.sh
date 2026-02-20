@@ -1494,6 +1494,7 @@ struct ControlView: View {
                 applyViewingMissionWithEvents(mission, events: events)
                 cacheMissionWithEvents(mission, events: events)
             } else {
+                guard fetchingMissionId == id else { return }
                 removeMissionFromCache(mission.id)
                 applyViewingMission(mission)
             }
