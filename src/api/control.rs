@@ -322,15 +322,32 @@ async fn stop_policy_matched_mission_status(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopPolicyDisableOutcome {
+    NotMatched,
+    Deactivated,
+    DeactivationFailed,
+}
+
+impl StopPolicyDisableOutcome {
+    fn should_skip_execution(self) -> bool {
+        !matches!(self, Self::NotMatched)
+    }
+
+    fn was_deactivated(self) -> bool {
+        matches!(self, Self::Deactivated)
+    }
+}
+
 #[must_use]
 async fn disable_automation_when_stop_policy_matches(
     mission_store: &Arc<dyn MissionStore>,
     automation: &mission_store::Automation,
     mission_status: MissionStatus,
     source: &str,
-) -> bool {
+) -> StopPolicyDisableOutcome {
     if !automation.should_auto_disable_for_status(mission_status) {
-        return false;
+        return StopPolicyDisableOutcome::NotMatched;
     }
 
     match mission_store
@@ -346,7 +363,7 @@ async fn disable_automation_when_stop_policy_matches(
                 mission_status,
                 source
             );
-            true
+            StopPolicyDisableOutcome::Deactivated
         }
         Err(err) => {
             tracing::warn!(
@@ -355,7 +372,7 @@ async fn disable_automation_when_stop_policy_matches(
                 source,
                 err
             );
-            true
+            StopPolicyDisableOutcome::DeactivationFailed
         }
     }
 }
@@ -377,24 +394,29 @@ async fn reconcile_automation_stop_policies_for_status(
         }
     };
 
-    let mut disabled_count = 0usize;
+    let mut matched_count = 0usize;
+    let mut deactivated_count = 0usize;
     for automation in automations {
-        if disable_automation_when_stop_policy_matches(
+        let outcome = disable_automation_when_stop_policy_matches(
             mission_store,
             &automation,
             status,
             "stop policy reconciliation",
         )
-        .await
-        {
-            disabled_count += 1;
+        .await;
+        if outcome.should_skip_execution() {
+            matched_count += 1;
+        }
+        if outcome.was_deactivated() {
+            deactivated_count += 1;
         }
     }
 
-    if disabled_count > 0 {
+    if matched_count > 0 {
         tracing::info!(
-            "Disabled {} automation(s) for mission {} after status change to {:?}",
-            disabled_count,
+            "Matched stop policy for {} automation(s) and deactivated {} automation(s) for mission {} after status change to {:?}",
+            matched_count,
+            deactivated_count,
             mission_id,
             status
         );
@@ -2752,6 +2774,7 @@ async fn automation_scheduler_loop(
                 "automation scheduler",
             )
             .await
+            .should_skip_execution()
             {
                 continue;
             }
@@ -3121,6 +3144,7 @@ async fn agent_finished_automation_messages(
             "agent_finished hook",
         )
         .await
+        .should_skip_execution()
         {
             continue;
         }
@@ -6540,14 +6564,15 @@ pub async fn webhook_receiver(
             format!("Mission {} not found", mission_id),
         ))?;
 
-    if automation.should_auto_disable_for_status(mission.status) {
-        let _ = disable_automation_when_stop_policy_matches(
-            &control.mission_store,
-            &automation,
-            mission.status,
-            "webhook trigger",
-        )
-        .await;
+    if disable_automation_when_stop_policy_matches(
+        &control.mission_store,
+        &automation,
+        mission.status,
+        "webhook trigger",
+    )
+    .await
+    .should_skip_execution()
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
@@ -6964,7 +6989,7 @@ Investigate <service/> failures.
         let store = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission_store: Arc<dyn mission_store::MissionStore> = store.clone();
 
-        let disabled = disable_automation_when_stop_policy_matches(
+        let outcome = disable_automation_when_stop_policy_matches(
             &mission_store,
             &automation,
             MissionStatus::Failed,
@@ -6972,7 +6997,25 @@ Investigate <service/> failures.
         )
         .await;
 
-        assert!(disabled);
+        assert_eq!(outcome, StopPolicyDisableOutcome::DeactivationFailed);
+    }
+
+    #[tokio::test]
+    async fn test_disable_automation_when_stop_policy_does_not_match() {
+        let mut automation = sample_test_automation();
+        automation.stop_policy = mission_store::StopPolicy::OnMissionCompleted;
+        let store = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission_store: Arc<dyn mission_store::MissionStore> = store.clone();
+
+        let outcome = disable_automation_when_stop_policy_matches(
+            &mission_store,
+            &automation,
+            MissionStatus::Failed,
+            "test",
+        )
+        .await;
+
+        assert_eq!(outcome, StopPolicyDisableOutcome::NotMatched);
     }
 
     #[test]
