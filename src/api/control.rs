@@ -285,7 +285,7 @@ async fn mission_has_blocking_automation_for_status(
 async fn stop_policy_matched_mission_status(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
-    stop_policy: &mission_store::StopPolicy,
+    stop_policy: mission_store::StopPolicy,
     source: &str,
 ) -> Option<MissionStatus> {
     match mission_store.get_mission(mission_id).await {
@@ -6177,7 +6177,7 @@ pub async fn create_automation(
     let active = stop_policy_matched_mission_status(
         &control.mission_store,
         mission_id,
-        &stop_policy,
+        stop_policy,
         "automation create",
     )
     .await
@@ -6329,7 +6329,7 @@ pub async fn update_automation(
         if let Some(status) = stop_policy_matched_mission_status(
             &control.mission_store,
             automation.mission_id,
-            &automation.stop_policy,
+            automation.stop_policy,
             "automation update",
         )
         .await

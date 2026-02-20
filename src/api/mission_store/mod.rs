@@ -141,7 +141,7 @@ pub enum TriggerType {
 }
 
 /// Stop policy for automation lifecycle.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StopPolicy {
     /// Never auto-disable this automation.
@@ -154,7 +154,7 @@ pub enum StopPolicy {
 
 impl StopPolicy {
     #[must_use]
-    pub fn disables_on_status(&self, status: MissionStatus) -> bool {
+    pub fn disables_on_status(self, status: MissionStatus) -> bool {
         match self {
             Self::Never => false,
             Self::OnMissionCompleted => status == MissionStatus::Completed,
