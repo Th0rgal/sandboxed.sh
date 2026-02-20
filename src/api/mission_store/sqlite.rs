@@ -1306,7 +1306,10 @@ impl MissionStore for SqliteMissionStore {
                 content,
                 success,
                 cost_cents,
+                cost_source,
+                usage,
                 model,
+                model_normalized,
                 shared_files,
                 resumable,
                 ..
@@ -1319,7 +1322,14 @@ impl MissionStore for SqliteMissionStore {
                 serde_json::json!({
                     "success": success,
                     "cost_cents": cost_cents,
+                    "cost": {
+                        "amount_cents": cost_cents,
+                        "currency": "USD",
+                        "source": cost_source,
+                    },
+                    "usage": usage,
                     "model": model,
+                    "model_normalized": model_normalized,
                     "shared_files": shared_files,
                     "resumable": resumable,
                 }),

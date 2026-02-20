@@ -690,6 +690,8 @@ impl Agent for OpenCodeAgent {
             success: true,
             output,
             cost_cents: 0,
+            cost_source: crate::agents::types::CostSource::Unknown,
+            usage: None,
             model_used,
             data: Some(json!({
                 "agent": "OpenCodeAgent",
@@ -775,6 +777,8 @@ impl OpenCodeAgent {
             success: true,
             output,
             cost_cents: 0,
+            cost_source: crate::agents::types::CostSource::Unknown,
+            usage: None,
             model_used,
             data: Some(json!({
                 "agent": "OpenCodeAgent",

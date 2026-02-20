@@ -18,7 +18,7 @@ pub struct ModelPricing {
 }
 
 /// Token usage from an API call.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -69,6 +69,11 @@ fn normalize_model(model: &str) -> &str {
         // Return as-is if no alias found
         _ => trimmed,
     }
+}
+
+/// Normalize model names to the canonical pricing key.
+pub fn normalized_model(model: &str) -> String {
+    normalize_model(model).to_string()
 }
 
 /// Get pricing for a model. Returns None if model is unknown.

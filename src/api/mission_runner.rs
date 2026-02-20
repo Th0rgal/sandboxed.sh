@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::agents::{AgentRef, AgentResult, TerminalReason};
+use crate::agents::{AgentRef, AgentResult, CostSource, TerminalReason};
 use crate::backend::claudecode::client::{ClaudeEvent, ContentBlock, StreamEvent};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
@@ -96,6 +96,29 @@ fn codex_account_semaphore_for_key(api_key: &str) -> Arc<Semaphore> {
     pool.entry(api_key.to_string())
         .or_insert_with(|| Arc::new(Semaphore::new(CODEX_ACCOUNT_CONCURRENCY_LIMIT)))
         .clone()
+}
+
+fn resolve_cost_cents_and_source(
+    actual_cost_cents: Option<u64>,
+    model: Option<&str>,
+    usage: &crate::cost::TokenUsage,
+) -> (u64, CostSource) {
+    if let Some(actual) = actual_cost_cents {
+        if actual > 0 {
+            return (actual, CostSource::Actual);
+        }
+    }
+
+    if usage.has_usage() {
+        if let Some(model_name) = model {
+            return (
+                crate::cost::cost_cents_from_usage(model_name, usage),
+                CostSource::Estimated,
+            );
+        }
+    }
+
+    (actual_cost_cents.unwrap_or(0), CostSource::Unknown)
 }
 
 async fn lease_codex_account(
@@ -2943,6 +2966,10 @@ pub fn run_claudecode_turn<'a>(
         // Track tool calls for result mapping
         let mut pending_tools: HashMap<String, String> = HashMap::new();
         let mut total_cost_usd = 0.0f64;
+        let mut total_input_tokens: u64 = 0;
+        let mut total_output_tokens: u64 = 0;
+        let mut total_cache_creation_tokens: u64 = 0;
+        let mut total_cache_read_tokens: u64 = 0;
         let mut final_result = String::new();
         let mut had_error = false;
 
@@ -3156,6 +3183,14 @@ pub fn run_claudecode_turn<'a>(
                                     }
                                 }
                                 ClaudeEvent::Assistant(evt) => {
+                                    if let Some(usage) = &evt.message.usage {
+                                        total_input_tokens += usage.input_tokens.unwrap_or(0);
+                                        total_output_tokens += usage.output_tokens.unwrap_or(0);
+                                        total_cache_creation_tokens +=
+                                            usage.cache_creation_input_tokens.unwrap_or(0);
+                                        total_cache_read_tokens +=
+                                            usage.cache_read_input_tokens.unwrap_or(0);
+                                    }
                                     for (content_idx, block) in evt.message.content.into_iter().enumerate() {
                                         let content_idx = content_idx as u32;
                                         match block {
@@ -3389,8 +3424,27 @@ pub fn run_claudecode_turn<'a>(
         // Ensure the PTY reader task stops (it should naturally end after process exit).
         let _ = reader_handle.await;
 
-        // Convert cost from USD to cents
-        let cost_cents = (total_cost_usd * 100.0) as u64;
+        let usage = crate::cost::TokenUsage {
+            input_tokens: total_input_tokens,
+            output_tokens: total_output_tokens,
+            cache_creation_input_tokens: if total_cache_creation_tokens > 0 {
+                Some(total_cache_creation_tokens)
+            } else {
+                None
+            },
+            cache_read_input_tokens: if total_cache_read_tokens > 0 {
+                Some(total_cache_read_tokens)
+            } else {
+                None
+            },
+        };
+        let actual_cost_cents = if total_cost_usd > 0.0 {
+            Some((total_cost_usd * 100.0) as u64)
+        } else {
+            None
+        };
+        let (cost_cents, cost_source) =
+            resolve_cost_cents_and_source(actual_cost_cents, model, &usage);
 
         // If no final result from Assistant or Result events, use accumulated text buffer
         // This handles plan mode and other cases where text is streamed incrementally
@@ -3475,6 +3529,10 @@ pub fn run_claudecode_turn<'a>(
         if let Some(model) = model {
             result = result.with_model(model.to_string());
         }
+        if usage.has_usage() {
+            result = result.with_usage(usage);
+        }
+        result = result.with_cost_source(cost_source);
         result
     }) // end Box::pin(async move { ... })
 }
@@ -9680,10 +9738,8 @@ pub async fn run_amp_turn(
             None
         },
     };
-    let cost_cents = model_used
-        .as_deref()
-        .map(|m| crate::cost::cost_cents_from_usage(m, &usage))
-        .unwrap_or(0);
+    let (cost_cents, cost_source) =
+        resolve_cost_cents_and_source(None, model_used.as_deref(), &usage);
 
     tracing::debug!(
         mission_id = %mission_id,
@@ -9791,7 +9847,10 @@ pub async fn run_amp_turn(
         result = result.with_model(model);
     }
 
-    result
+    if usage.has_usage() {
+        result = result.with_usage(usage);
+    }
+    result.with_cost_source(cost_source)
 }
 
 /// Compact info about a running mission (for API responses).
@@ -10256,13 +10315,13 @@ mod tests {
         is_capacity_limited_error, is_codex_node_wrapper, is_rate_limited_error,
         is_session_corruption_error, is_tool_call_only_output, opencode_output_needs_fallback,
         opencode_session_token_from_line, parse_opencode_session_token, parse_opencode_sse_event,
-        parse_opencode_stderr_text_part, running_health, sanitized_opencode_stdout, stall_severity,
-        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
-        summarize_recent_opencode_stderr, sync_opencode_agent_config, MissionHealth,
-        MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
+        parse_opencode_stderr_text_part, resolve_cost_cents_and_source, running_health,
+        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
+        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
+        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
         STALL_WARN_SECS,
     };
-    use crate::agents::{AgentResult, TerminalReason};
+    use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
     use serde_json::json;
     use std::borrow::Cow;
@@ -11324,5 +11383,40 @@ mod tests {
     fn is_codex_node_wrapper_rejects_nonexistent_file() {
         let wrapper_path = std::path::Path::new("/nonexistent/path/codex");
         assert!(!is_codex_node_wrapper(wrapper_path));
+    }
+
+    #[test]
+    fn resolve_cost_cents_prefers_actual_source() {
+        let usage = crate::cost::TokenUsage {
+            input_tokens: 10_000,
+            output_tokens: 2_000,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        let (cost, source) =
+            resolve_cost_cents_and_source(Some(123), Some("claude-sonnet-5"), &usage);
+        assert_eq!(cost, 123);
+        assert_eq!(source, CostSource::Actual);
+    }
+
+    #[test]
+    fn resolve_cost_cents_estimates_when_usage_available() {
+        let usage = crate::cost::TokenUsage {
+            input_tokens: 20_000,
+            output_tokens: 5_000,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        let (cost, source) = resolve_cost_cents_and_source(None, Some("gpt-5"), &usage);
+        assert!(cost > 0);
+        assert_eq!(source, CostSource::Estimated);
+    }
+
+    #[test]
+    fn resolve_cost_cents_unknown_without_usage() {
+        let usage = crate::cost::TokenUsage::default();
+        let (cost, source) = resolve_cost_cents_and_source(None, Some("gpt-5"), &usage);
+        assert_eq!(cost, 0);
+        assert_eq!(source, CostSource::Unknown);
     }
 }

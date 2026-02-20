@@ -193,6 +193,8 @@ import { MissionSwitcher } from "@/components/mission-switcher";
 
 import type { SharedFile } from "@/lib/api";
 
+type CostSource = "actual" | "estimated" | "unknown";
+
 type ChatItem =
   | {
       kind: "user";
@@ -207,6 +209,7 @@ type ChatItem =
       content: string;
       success: boolean;
       costCents: number;
+      costSource: CostSource;
       model: string | null;
       timestamp: number;
       sharedFiles?: SharedFile[];
@@ -472,6 +475,27 @@ function QuestionToolItem({
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function parseCostSource(raw: unknown): CostSource {
+  if (raw === "actual" || raw === "estimated" || raw === "unknown") {
+    return raw;
+  }
+  return "unknown";
+}
+
+function parseCostMetadata(meta: Record<string, unknown>): { costCents: number; costSource: CostSource } {
+  const cost = meta["cost"];
+  if (isRecord(cost)) {
+    return {
+      costCents: Number(cost["amount_cents"] ?? 0),
+      costSource: parseCostSource(cost["source"]),
+    };
+  }
+  return {
+    costCents: Number(meta["cost_cents"] ?? 0),
+    costSource: parseCostSource(meta["cost_source"]),
+  };
 }
 
 /**
@@ -3315,6 +3339,7 @@ export default function ControlClient() {
           content: entry.content,
           success,
           costCents: 0,
+          costSource: "unknown" as const,
           model: null,
           timestamp,
           resumable: isLastAssistant && missionFailed ? mission.resumable : undefined,
@@ -3381,6 +3406,7 @@ export default function ControlClient() {
           finalizePendingThinking(timestamp);
           const meta = event.metadata || {};
           const isFailure = meta.success === false;
+          const { costCents, costSource } = parseCostMetadata(meta);
 
           // When mission fails, mark all pending tool calls as failed
           // This ensures subagent headers don't stay stuck showing "Running for X"
@@ -3408,7 +3434,8 @@ export default function ControlClient() {
             id: assistantId,
             content: event.content,
             success: !isFailure,
-            costCents: typeof meta.cost_cents === "number" ? meta.cost_cents : 0,
+            costCents,
+            costSource,
             model: typeof meta.model === "string" ? meta.model : null,
             timestamp,
           });
@@ -4620,6 +4647,7 @@ export default function ControlClient() {
         // Use strict equality to match eventsToItems behavior:
         // undefined means no explicit status, only false means actual failure
         const isFailure = data["success"] === false;
+        const { costCents, costSource } = parseCostMetadata(data);
         const incomingId = String(data["id"] ?? Date.now());
 
         // Finalize any pending thinking session when an assistant message arrives.
@@ -4673,7 +4701,8 @@ export default function ControlClient() {
               ...existing,
               content: String(data["content"] ?? existing.content),
               success: !isFailure,
-              costCents: Number(data["cost_cents"] ?? existing.costCents ?? 0),
+              costCents,
+              costSource,
               model: data["model"] ? String(data["model"]) : existing.model ?? null,
               timestamp: now,
               sharedFiles: sharedFiles ?? existing.sharedFiles,
@@ -4687,7 +4716,8 @@ export default function ControlClient() {
             id: incomingId,
             content: String(data["content"] ?? ""),
             success: !isFailure,
-            costCents: Number(data["cost_cents"] ?? 0),
+            costCents,
+            costSource,
             model: data["model"] ? String(data["model"]) : null,
             timestamp: now,
             sharedFiles,
@@ -6413,11 +6443,30 @@ export default function ControlClient() {
                               </span>
                             </>
                           )}
-                          {item.costCents > 0 && (
+                          {(item.costSource !== "unknown" || item.costCents > 0) && (
                             <>
                               <span>•</span>
-                              <span className="text-emerald-400">
-                                ${(item.costCents / 100).toFixed(4)}
+                              <span
+                                className={
+                                  item.costSource === "actual"
+                                    ? "text-emerald-400"
+                                    : item.costSource === "estimated"
+                                      ? "text-amber-300"
+                                      : "text-white/50"
+                                }
+                              >
+                                {item.costSource === "unknown"
+                                  ? item.costCents > 0
+                                    ? `$${(item.costCents / 100).toFixed(4)}`
+                                    : "N/A"
+                                  : `$${(item.costCents / 100).toFixed(4)}`}
+                              </span>
+                              <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/60">
+                                {item.costSource === "actual"
+                                  ? "Actual"
+                                  : item.costSource === "estimated"
+                                    ? "Estimated"
+                                    : "Unknown"}
                               </span>
                             </>
                           )}

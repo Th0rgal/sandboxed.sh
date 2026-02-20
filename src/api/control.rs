@@ -640,7 +640,12 @@ pub enum AgentEvent {
         content: String,
         success: bool,
         cost_cents: u64,
+        cost_source: crate::agents::CostSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::cost::TokenUsage>,
         model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_normalized: Option<String>,
         /// Mission this message belongs to (for parallel execution)
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
@@ -4818,12 +4823,18 @@ async fn control_actor_loop(
 
                             // Mark failures as resumable so UI can show a resume button
                             let resumable = !agent_result.success && completed_mission_id.is_some();
+                            let model_used = agent_result.model_used.clone();
                             let _ = events_tx.send(AgentEvent::AssistantMessage {
                                 id: Uuid::new_v4(),
                                 content: agent_result.output.clone(),
                                 success: agent_result.success,
                                 cost_cents: agent_result.cost_cents,
-                                model: agent_result.model_used,
+                                cost_source: agent_result.cost_source,
+                                usage: agent_result.usage.clone(),
+                                model: model_used.clone(),
+                                model_normalized: model_used
+                                    .as_deref()
+                                    .map(crate::cost::normalized_model),
                                 mission_id: completed_mission_id,
                                 shared_files,
                                 resumable,
@@ -5049,7 +5060,13 @@ async fn control_actor_loop(
                                 content: result.output.clone(),
                                 success: result.success,
                                 cost_cents: result.cost_cents,
+                                cost_source: result.cost_source,
+                                usage: result.usage.clone(),
                                 model: result.model_used.clone(),
+                                model_normalized: result
+                                    .model_used
+                                    .as_deref()
+                                    .map(crate::cost::normalized_model),
                                 mission_id: Some(*mission_id),
                                 shared_files,
                                 resumable,

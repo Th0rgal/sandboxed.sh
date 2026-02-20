@@ -56,6 +56,15 @@ impl AgentType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CostSource {
+    Actual,
+    Estimated,
+    #[default]
+    Unknown,
+}
+
 /// Result of an agent executing a task.
 ///
 /// # Invariants
@@ -71,6 +80,12 @@ pub struct AgentResult {
 
     /// Cost incurred in cents
     pub cost_cents: u64,
+
+    /// Cost source provenance
+    pub cost_source: CostSource,
+
+    /// Token usage when available
+    pub usage: Option<crate::cost::TokenUsage>,
 
     /// Model used (if any)
     pub model_used: Option<String>,
@@ -89,6 +104,8 @@ impl AgentResult {
             success: true,
             output: output.into(),
             cost_cents,
+            cost_source: CostSource::Unknown,
+            usage: None,
             model_used: None,
             data: None,
             terminal_reason: None,
@@ -101,6 +118,8 @@ impl AgentResult {
             success: false,
             output: error.into(),
             cost_cents,
+            cost_source: CostSource::Unknown,
+            usage: None,
             model_used: None,
             data: None,
             terminal_reason: None,
@@ -116,6 +135,18 @@ impl AgentResult {
     /// Add additional data to the result.
     pub fn with_data(mut self, data: serde_json::Value) -> Self {
         self.data = Some(data);
+        self
+    }
+
+    /// Add usage information.
+    pub fn with_usage(mut self, usage: crate::cost::TokenUsage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Add cost source metadata.
+    pub fn with_cost_source(mut self, source: CostSource) -> Self {
+        self.cost_source = source;
         self
     }
 
