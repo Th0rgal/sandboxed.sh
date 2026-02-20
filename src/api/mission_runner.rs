@@ -115,11 +115,15 @@ fn resolve_cost_cents_and_source(
                     CostSource::Estimated,
                 );
             }
-            return (actual_cost_cents.unwrap_or(0), CostSource::Unknown);
+            return (0, CostSource::Unknown);
         }
     }
 
-    (actual_cost_cents.unwrap_or(0), CostSource::Unknown)
+    (0, CostSource::Unknown)
+}
+
+fn actual_cost_cents_from_total_cost_usd(total_cost_usd: Option<f64>) -> Option<u64> {
+    total_cost_usd.map(|cost| (cost.max(0.0) * 100.0) as u64)
 }
 
 async fn lease_codex_account(
@@ -2966,7 +2970,7 @@ pub fn run_claudecode_turn<'a>(
 
         // Track tool calls for result mapping
         let mut pending_tools: HashMap<String, String> = HashMap::new();
-        let mut total_cost_usd = 0.0f64;
+        let mut total_cost_usd: Option<f64> = None;
         let mut total_input_tokens: u64 = 0;
         let mut total_output_tokens: u64 = 0;
         let mut total_cache_creation_tokens: u64 = 0;
@@ -3371,7 +3375,7 @@ pub fn run_claudecode_turn<'a>(
                                 }
                                 ClaudeEvent::Result(res) => {
                                     if let Some(cost) = res.total_cost_usd {
-                                        total_cost_usd = cost;
+                                        total_cost_usd = Some(cost);
                                     }
                                     // Check for errors: explicit error flags OR embedded API error payloads.
                                     //
@@ -3396,7 +3400,7 @@ pub fn run_claudecode_turn<'a>(
                                     }
                                     tracing::info!(
                                         mission_id = %mission_id,
-                                        cost_usd = total_cost_usd,
+                                        cost_usd = total_cost_usd.unwrap_or(0.0),
                                         "Claude Code execution completed"
                                     );
                                     break;
@@ -3439,11 +3443,7 @@ pub fn run_claudecode_turn<'a>(
                 None
             },
         };
-        let actual_cost_cents = if total_cost_usd > 0.0 {
-            Some((total_cost_usd * 100.0) as u64)
-        } else {
-            None
-        };
+        let actual_cost_cents = actual_cost_cents_from_total_cost_usd(total_cost_usd);
         let (cost_cents, cost_source) =
             resolve_cost_cents_and_source(actual_cost_cents, model, &usage);
 
@@ -10319,8 +10319,8 @@ mod tests {
         parse_opencode_stderr_text_part, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
         strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
-        STALL_WARN_SECS,
+        actual_cost_cents_from_total_cost_usd, MissionHealth, MissionRunState,
+        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
@@ -11459,5 +11459,15 @@ mod tests {
         let (cost, source) = resolve_cost_cents_and_source(None, Some("claude-sonnet-5"), &usage);
         assert!(cost > 0);
         assert_eq!(source, CostSource::Estimated);
+    }
+
+    #[test]
+    fn actual_cost_cents_from_total_cost_usd_preserves_zero() {
+        assert_eq!(actual_cost_cents_from_total_cost_usd(Some(0.0)), Some(0));
+    }
+
+    #[test]
+    fn actual_cost_cents_from_total_cost_usd_none_stays_none() {
+        assert_eq!(actual_cost_cents_from_total_cost_usd(None), None);
     }
 }
