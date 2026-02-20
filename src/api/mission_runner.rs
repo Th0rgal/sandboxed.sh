@@ -12,10 +12,10 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -64,6 +64,111 @@ struct OpencodeSseParseResult {
     /// The SSE stream indicated the session entered a retry state, meaning
     /// the model API call failed and OpenCode is retrying automatically.
     session_retry: bool,
+}
+
+const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
+const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+struct LeasedCodexAccount {
+    key: String,
+    _permit: OwnedSemaphorePermit,
+}
+
+fn codex_key_fingerprint(key: &str) -> String {
+    let suffix: String = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("***{}", suffix)
+}
+
+fn codex_account_semaphore_for_key(api_key: &str) -> Arc<Semaphore> {
+    let mut pool = CODEX_ACCOUNT_POOL
+        .lock()
+        .expect("Codex account pool mutex poisoned");
+    pool.entry(api_key.to_string())
+        .or_insert_with(|| Arc::new(Semaphore::new(CODEX_ACCOUNT_CONCURRENCY_LIMIT)))
+        .clone()
+}
+
+async fn lease_codex_account(
+    working_dir: &std::path::Path,
+    tried_keys: &HashSet<String>,
+    cancel: &CancellationToken,
+) -> Option<LeasedCodexAccount> {
+    let keys = super::ai_providers::get_all_openai_keys_for_codex(working_dir);
+    if keys.is_empty() {
+        return None;
+    }
+
+    let mut candidates: Vec<(String, Arc<Semaphore>, usize)> = keys
+        .into_iter()
+        .filter(|key| !tried_keys.contains(key))
+        .map(|key| {
+            let sem = codex_account_semaphore_for_key(&key);
+            let available = sem.available_permits();
+            (key, sem, available)
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Prefer the currently least-loaded key (highest available permits).
+    candidates.sort_by(|a, b| b.2.cmp(&a.2));
+
+    for (key, sem, available) in &candidates {
+        if let Ok(permit) = sem.clone().try_acquire_owned() {
+            tracing::debug!(
+                key = %codex_key_fingerprint(key),
+                available_permits_before_acquire = *available,
+                "Leased Codex account slot without waiting"
+            );
+            return Some(LeasedCodexAccount {
+                key: key.clone(),
+                _permit: permit,
+            });
+        }
+    }
+
+    let (key, sem, available) = candidates.into_iter().next()?;
+    tracing::info!(
+        key = %codex_key_fingerprint(&key),
+        available_permits = available,
+        timeout_secs = CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT.as_secs(),
+        "All Codex account slots busy; waiting for lease"
+    );
+
+    let acquire = sem.acquire_owned();
+    tokio::pin!(acquire);
+
+    let permit = tokio::select! {
+        _ = cancel.cancelled() => return None,
+        maybe_permit = tokio::time::timeout(CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT, acquire) => {
+            match maybe_permit {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_closed)) => return None,
+                Err(_elapsed) => return None,
+            }
+        }
+    };
+
+    tracing::debug!(
+        key = %codex_key_fingerprint(&key),
+        "Leased Codex account slot after wait"
+    );
+    Some(LeasedCodexAccount {
+        key,
+        _permit: permit,
+    })
 }
 
 fn extract_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
@@ -1765,97 +1870,100 @@ async fn run_mission_turn(
             result
         }
         "codex" => {
-            let mut result = run_codex_turn(
-                &workspace,
-                &mission_work_dir,
-                &convo,
-                config.default_model.as_deref(),
-                model_effort.as_deref(),
-                effective_agent.as_deref(),
-                mission_id,
-                events_tx.clone(),
-                cancel.clone(),
-                &config.working_dir,
-                session_id.as_deref(),
-                None,
-            )
-            .await;
+            let all_keys = super::ai_providers::get_all_openai_keys_for_codex(&config.working_dir);
+            if all_keys.is_empty() {
+                run_codex_turn(
+                    &workspace,
+                    &mission_work_dir,
+                    &convo,
+                    config.default_model.as_deref(),
+                    model_effort.as_deref(),
+                    effective_agent.as_deref(),
+                    mission_id,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    &config.working_dir,
+                    session_id.as_deref(),
+                    None,
+                )
+                .await
+            } else {
+                let mut attempted_keys = HashSet::new();
+                let mut attempt_idx = 0usize;
+                let mut last_constrained_result: Option<AgentResult> = None;
 
-            // Account rotation: if rate-limited, try alternate OpenAI API keys.
-            // The override key is passed directly to write_codex_credentials_for_workspace
-            // to avoid mutating the process-global OPENAI_API_KEY env var (which would
-            // race with concurrent missions).
-            if matches!(
-                result.terminal_reason,
-                Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
-            ) {
-                let alt_keys =
-                    super::ai_providers::get_all_openai_keys_for_codex(&config.working_dir);
-                if alt_keys.len() > 1 {
-                    let initial_reason = match result.terminal_reason {
-                        Some(TerminalReason::CapacityLimited) => "capacity limited",
-                        _ => "rate limited",
+                loop {
+                    if cancel.is_cancelled() {
+                        break last_constrained_result.unwrap_or_else(|| {
+                            AgentResult::failure("Mission cancelled".to_string(), 0)
+                                .with_terminal_reason(TerminalReason::Cancelled)
+                        });
+                    }
+
+                    let lease =
+                        lease_codex_account(&config.working_dir, &attempted_keys, &cancel).await;
+                    let Some(lease) = lease else {
+                        if let Some(prev) = last_constrained_result {
+                            break prev;
+                        }
+                        break AgentResult::failure(
+                            "All configured Codex accounts are currently at capacity. Try again shortly."
+                                .to_string(),
+                            0,
+                        )
+                        .with_terminal_reason(TerminalReason::CapacityLimited);
                     };
+
+                    attempt_idx += 1;
+                    let key_fingerprint = codex_key_fingerprint(&lease.key);
+                    attempted_keys.insert(lease.key.clone());
+
                     tracing::info!(
                         mission_id = %mission_id,
-                        total_keys = alt_keys.len(),
-                        reason = initial_reason,
-                        "Codex account constrained; trying alternate OpenAI API keys"
+                        attempt = attempt_idx,
+                        key = %key_fingerprint,
+                        total_keys = all_keys.len(),
+                        "Running Codex turn with leased account slot"
                     );
-                    // The first key in alt_keys is typically the default (from env var
-                    // or auth.json), which we already tried above.
-                    let already_tried = super::ai_providers::get_openai_api_key_for_codex_default(
+
+                    let result = run_codex_turn(
+                        &workspace,
+                        &mission_work_dir,
+                        &convo,
+                        config.default_model.as_deref(),
+                        model_effort.as_deref(),
+                        effective_agent.as_deref(),
+                        mission_id,
+                        events_tx.clone(),
+                        cancel.clone(),
                         &config.working_dir,
-                    );
-                    for (idx, alt_key) in alt_keys.into_iter().enumerate() {
-                        if cancel.is_cancelled() {
-                            break;
+                        session_id.as_deref(),
+                        Some(&lease.key),
+                    )
+                    .await;
+
+                    drop(lease);
+
+                    match result.terminal_reason {
+                        Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
+                            if attempted_keys.len() < all_keys.len() =>
+                        {
+                            let reason = match result.terminal_reason {
+                                Some(TerminalReason::CapacityLimited) => "capacity limited",
+                                _ => "rate limited",
+                            };
+                            tracing::info!(
+                                mission_id = %mission_id,
+                                attempt = attempt_idx,
+                                reason,
+                                "Codex account constrained; leasing next account"
+                            );
+                            last_constrained_result = Some(result);
                         }
-                        // Skip the key we already tried
-                        if Some(&alt_key) == already_tried.as_ref() {
-                            continue;
-                        }
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            attempt = idx + 2,
-                            "Rotating to alternate OpenAI API key for Codex"
-                        );
-                        result = run_codex_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            &convo,
-                            config.default_model.as_deref(),
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            &config.working_dir,
-                            session_id.as_deref(),
-                            Some(&alt_key),
-                        )
-                        .await;
-                        match result.terminal_reason {
-                            Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited) => {
-                                let reason = match result.terminal_reason {
-                                    Some(TerminalReason::CapacityLimited) => "capacity limited",
-                                    _ => "rate limited",
-                                };
-                                tracing::info!(
-                                    mission_id = %mission_id,
-                                    attempt = idx + 2,
-                                    reason,
-                                    "Codex account constrained; rotating to next key"
-                                );
-                                continue;
-                            }
-                            _ => break,
-                        }
+                        _ => break result,
                     }
                 }
             }
-
-            result
         }
         _ => {
             // Don't send Error event - the failure will be emitted as an AssistantMessage
@@ -10143,15 +10251,16 @@ fn cleanup_old_debug_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_command_params, extract_model_from_message, extract_opencode_session_id,
-        extract_part_text, extract_str, extract_thought_line, is_capacity_limited_error,
-        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
-        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
-        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
-        sync_opencode_agent_config, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        bind_command_params, codex_key_fingerprint, extract_model_from_message,
+        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
+        is_capacity_limited_error, is_codex_node_wrapper, is_rate_limited_error,
+        is_session_corruption_error, is_tool_call_only_output, opencode_output_needs_fallback,
+        opencode_session_token_from_line, parse_opencode_session_token, parse_opencode_sse_event,
+        parse_opencode_stderr_text_part, running_health, sanitized_opencode_stdout, stall_severity,
+        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
+        summarize_recent_opencode_stderr, sync_opencode_agent_config, MissionHealth,
+        MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
+        STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
     use crate::library::types::CommandParam;
@@ -10322,6 +10431,15 @@ mod tests {
         ));
         assert!(!is_capacity_limited_error("Error: 429 Too Many Requests"));
         assert!(!is_capacity_limited_error("Model finished successfully"));
+    }
+
+    #[test]
+    fn codex_key_fingerprint_masks_secret_and_handles_short_keys() {
+        assert_eq!(
+            codex_key_fingerprint("sk-abcdefghijklmnopqrstuvwxyz"),
+            "***wxyz"
+        );
+        assert_eq!(codex_key_fingerprint("abc"), "***abc");
     }
 
     #[test]
