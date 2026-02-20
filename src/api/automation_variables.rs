@@ -120,12 +120,19 @@ pub fn substitute_variables(command: &str, context: &SubstitutionContext) -> Str
         }
     }
 
-    // Custom variables
-    for (key, value) in &context.custom_variables {
+    substitute_custom_variables(&result, &context.custom_variables)
+}
+
+/// Substitute only custom variables in a command string.
+///
+/// This is shared by mission command execution and automations so both flows
+/// use identical `<var/>` replacement semantics.
+pub fn substitute_custom_variables(command: &str, variables: &HashMap<String, String>) -> String {
+    let mut result = command.to_string();
+    for (key, value) in variables {
         let placeholder = format!("<{}/>", key);
         result = result.replace(&placeholder, value);
     }
-
     result
 }
 
@@ -244,5 +251,15 @@ mod tests {
         let result = substitute_variables(command, &context);
 
         assert_eq!(result, "Deploy v1.2.3 to production");
+    }
+
+    #[test]
+    fn test_substitute_custom_variables_only() {
+        let mut custom_vars = HashMap::new();
+        custom_vars.insert("service".to_string(), "api".to_string());
+        custom_vars.insert("env".to_string(), "staging".to_string());
+        let command = "Deploy <service/> to <env/> now";
+        let result = substitute_custom_variables(command, &custom_vars);
+        assert_eq!(result, "Deploy api to staging now");
     }
 }

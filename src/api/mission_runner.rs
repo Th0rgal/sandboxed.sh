@@ -32,6 +32,7 @@ use crate::util::{
 use crate::workspace::{self, Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
 
+use super::automation_variables::substitute_custom_variables;
 use super::control::{
     resolve_claudecode_default_model, safe_truncate_index, AgentEvent, AgentTreeNode,
     ControlRunState, ControlStatus, ExecutionProgress, FrontendToolHub,
@@ -1168,24 +1169,70 @@ async fn resolve_library_command(library: &SharedLibrary, message: &str) -> Stri
             // Strip frontmatter from content to get the body
             let (_frontmatter, body) = crate::library::types::parse_frontmatter(&command.content);
             let body = body.trim();
+            let bound = bind_command_params(&command.params, args);
+            let substituted = substitute_custom_variables(body, &bound);
+            let missing_required: Vec<&str> = command
+                .params
+                .iter()
+                .filter(|p| p.required && !bound.contains_key(&p.name))
+                .map(|p| p.name.as_str())
+                .collect();
 
             tracing::info!(
                 command_name = command_name,
                 has_args = !args.is_empty(),
+                bound_param_count = bound.len(),
+                missing_required = ?missing_required,
                 "Resolved library command"
             );
-
-            if args.is_empty() {
-                body.to_string()
-            } else {
-                format!("{}\n\nArguments: {}", body, args)
-            }
+            substituted
         }
         Err(_) => {
             // Not a library command, pass through as-is (may be a builtin like /plan)
             message.to_string()
         }
     }
+}
+
+/// Build positional command parameter bindings from raw `/command` arguments.
+///
+/// If more arguments than parameters are provided, overflow is folded into the
+/// last declared parameter to preserve the full argument payload.
+fn bind_command_params(
+    params: &[crate::library::types::CommandParam],
+    raw_args: &str,
+) -> HashMap<String, String> {
+    if params.is_empty() || raw_args.trim().is_empty() {
+        return HashMap::new();
+    }
+
+    let args: Vec<&str> = raw_args.split_whitespace().collect();
+    if args.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut bound = HashMap::new();
+
+    if args.len() > params.len() {
+        for (param, arg) in params
+            .iter()
+            .take(params.len().saturating_sub(1))
+            .zip(args.iter())
+        {
+            bound.insert(param.name.clone(), (*arg).to_string());
+        }
+
+        let last_name = params[params.len() - 1].name.clone();
+        let tail = args[params.len() - 1..].join(" ");
+        bound.insert(last_name, tail);
+        return bound;
+    }
+
+    for (param, arg) in params.iter().zip(args.iter()) {
+        bound.insert(param.name.clone(), (*arg).to_string());
+    }
+
+    bound
 }
 
 /// Check whether a failed turn result indicates a corrupt/stale Claude Code session
@@ -10035,16 +10082,18 @@ fn cleanup_old_debug_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
-        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
-        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
-        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
-        sync_opencode_agent_config, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        bind_command_params, extract_opencode_session_id, extract_part_text, extract_str,
+        extract_thought_line, is_codex_node_wrapper, is_rate_limited_error,
+        is_session_corruption_error, is_tool_call_only_output, opencode_output_needs_fallback,
+        opencode_session_token_from_line, parse_opencode_session_token, parse_opencode_sse_event,
+        parse_opencode_stderr_text_part, running_health, sanitized_opencode_stdout, stall_severity,
+        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
+        summarize_recent_opencode_stderr, sync_opencode_agent_config, MissionHealth,
+        MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
+        STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
+    use crate::library::types::CommandParam;
     use serde_json::json;
     use std::borrow::Cow;
     use std::fs;
@@ -10374,6 +10423,66 @@ mod tests {
             "\x1b[32mStarting opencode server\x1b[0m\n\x1b[33mAll tasks completed.\x1b[0m";
         let result = strip_opencode_banner_lines(ansi_only);
         assert!(result.trim().is_empty());
+    }
+
+    #[test]
+    fn bind_command_params_maps_args_by_declared_order() {
+        let params = vec![
+            CommandParam {
+                name: "env".to_string(),
+                required: true,
+                description: None,
+            },
+            CommandParam {
+                name: "version".to_string(),
+                required: true,
+                description: None,
+            },
+        ];
+        let bound = bind_command_params(&params, "staging 1.2.3");
+        assert_eq!(bound.get("env").map(String::as_str), Some("staging"));
+        assert_eq!(bound.get("version").map(String::as_str), Some("1.2.3"));
+    }
+
+    #[test]
+    fn bind_command_params_folds_overflow_into_last_param() {
+        let params = vec![
+            CommandParam {
+                name: "service".to_string(),
+                required: true,
+                description: None,
+            },
+            CommandParam {
+                name: "details".to_string(),
+                required: false,
+                description: None,
+            },
+        ];
+        let bound = bind_command_params(&params, "api deploy now please");
+        assert_eq!(bound.get("service").map(String::as_str), Some("api"));
+        assert_eq!(
+            bound.get("details").map(String::as_str),
+            Some("deploy now please")
+        );
+    }
+
+    #[test]
+    fn bind_command_params_leaves_missing_trailing_params_unbound() {
+        let params = vec![
+            CommandParam {
+                name: "env".to_string(),
+                required: true,
+                description: None,
+            },
+            CommandParam {
+                name: "version".to_string(),
+                required: true,
+                description: None,
+            },
+        ];
+        let bound = bind_command_params(&params, "staging");
+        assert_eq!(bound.get("env").map(String::as_str), Some("staging"));
+        assert!(!bound.contains_key("version"));
     }
 
     // ── extract_str tests ─────────────────────────────────────────────
