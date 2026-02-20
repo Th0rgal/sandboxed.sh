@@ -316,12 +316,10 @@ async fn disable_automation_when_stop_policy_matches(
     mission_status: MissionStatus,
     source: &str,
 ) -> bool {
-    if !automation.should_auto_disable_for_status(mission_status) {
+    let mut updated = automation.clone();
+    if !updated.deactivate_if_stop_policy_matches(mission_status) {
         return false;
     }
-
-    let mut updated = automation.clone();
-    updated.active = false;
 
     match mission_store.update_automation(updated).await {
         Ok(()) => {
@@ -6326,22 +6324,23 @@ pub async fn update_automation(
     // Enforce stop policy at update-time so persisted active state doesn't
     // remain stale on missions that are already terminal.
     if automation.active {
-        if let Some(status) = stop_policy_matched_mission_status(
+        let matched_status = stop_policy_matched_mission_status(
             &control.mission_store,
             automation.mission_id,
             automation.stop_policy,
             "automation update",
         )
-        .await
-        {
-            tracing::info!(
-                "Disabling automation {} during update due to stop policy {:?} (mission {} status {:?})",
-                automation.id,
-                automation.stop_policy,
-                automation.mission_id,
-                status
-            );
-            automation.active = false;
+        .await;
+        if let Some(status) = matched_status {
+            if automation.deactivate_if_stop_policy_matches(status) {
+                tracing::info!(
+                    "Disabling automation {} during update due to stop policy {:?} (mission {} status {:?})",
+                    automation.id,
+                    automation.stop_policy,
+                    automation.mission_id,
+                    status
+                );
+            }
         }
     }
 
@@ -6927,6 +6926,14 @@ Investigate <service/> failures.
         assert!(automation.should_auto_disable_for_status(MissionStatus::Failed));
         automation.stop_policy = mission_store::StopPolicy::OnMissionCompleted;
         assert!(!automation.should_auto_disable_for_status(MissionStatus::Failed));
+    }
+
+    #[test]
+    fn test_automation_deactivate_if_stop_policy_matches_mutates_active() {
+        let mut automation = sample_test_automation();
+        automation.stop_policy = mission_store::StopPolicy::OnTerminalAny;
+        assert!(automation.deactivate_if_stop_policy_matches(MissionStatus::Failed));
+        assert!(!automation.active);
     }
 
     #[test]
