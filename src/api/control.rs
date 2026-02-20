@@ -301,6 +301,14 @@ fn stop_policy_matches_status(
     }
 }
 
+fn should_disable_automation_for_stop_policy(
+    is_active: bool,
+    stop_policy: &mission_store::StopPolicy,
+    status: MissionStatus,
+) -> bool {
+    is_active && stop_policy_matches_status(stop_policy, status)
+}
+
 pub(crate) async fn resolve_claudecode_default_model(
     library: &SharedLibrary,
     config_profile: Option<&str>,
@@ -6194,6 +6202,41 @@ pub async fn update_automation(
         automation.active = active;
     }
 
+    // Enforce stop policy at update-time so persisted active state doesn't
+    // remain stale on missions that are already terminal.
+    if automation.active {
+        match control
+            .mission_store
+            .get_mission(automation.mission_id)
+            .await
+        {
+            Ok(Some(mission))
+                if should_disable_automation_for_stop_policy(
+                    automation.active,
+                    &automation.stop_policy,
+                    mission.status,
+                ) =>
+            {
+                tracing::info!(
+                    "Disabling automation {} during update due to stop policy {:?} (mission {} status {:?})",
+                    automation.id,
+                    automation.stop_policy,
+                    mission.id,
+                    mission.status
+                );
+                automation.active = false;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load mission {} while enforcing stop policy on automation update: {}",
+                    automation.mission_id,
+                    e
+                );
+            }
+        }
+    }
+
     // Update automation in the store
     control
         .mission_store
@@ -6764,6 +6807,29 @@ Investigate <service/> failures.
         ));
         assert!(!stop_policy_matches_status(
             &mission_store::StopPolicy::Never,
+            MissionStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn test_should_disable_automation_for_stop_policy_requires_active_flag() {
+        assert!(!should_disable_automation_for_stop_policy(
+            false,
+            &mission_store::StopPolicy::OnMissionCompleted,
+            MissionStatus::Completed
+        ));
+    }
+
+    #[test]
+    fn test_should_disable_automation_for_stop_policy_matches_terminal_status() {
+        assert!(should_disable_automation_for_stop_policy(
+            true,
+            &mission_store::StopPolicy::OnTerminalAny,
+            MissionStatus::Failed
+        ));
+        assert!(!should_disable_automation_for_stop_policy(
+            true,
+            &mission_store::StopPolicy::OnMissionCompleted,
             MissionStatus::Failed
         ));
     }
