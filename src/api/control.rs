@@ -2654,7 +2654,7 @@ async fn automation_scheduler_loop(
                 CommandSource::Library { name } => {
                     if let Some(lib) = library.read().await.as_ref() {
                         match lib.get_command(name).await {
-                            Ok(command) => command.content,
+                            Ok(command) => automation_library_command_body(&command.content),
                             Err(e) => {
                                 tracing::warn!(
                                     "Failed to fetch command '{}' for automation {}: {}",
@@ -2858,6 +2858,13 @@ async fn automation_scheduler_loop(
     }
 }
 
+/// Keep automation library command execution consistent with `/command` usage:
+/// frontmatter is metadata and should never be injected into model prompts.
+fn automation_library_command_body(command_content: &str) -> String {
+    let (_frontmatter, body) = crate::library::types::parse_frontmatter(command_content);
+    body.trim().to_string()
+}
+
 /// Resolve the command content for a single automation, applying variable
 /// substitution.  Returns `None` if the command cannot be resolved (e.g.
 /// library unavailable, file not found).
@@ -2877,7 +2884,10 @@ async fn resolve_automation_command(
         CommandSource::Library { name } => {
             let lib = state.library.read().await;
             let lib = lib.as_ref()?;
-            lib.get_command(name).await.ok().map(|c| c.content)?
+            lib.get_command(name)
+                .await
+                .ok()
+                .map(|c| automation_library_command_body(&c.content))?
         }
         CommandSource::LocalFile { path } => {
             let ws = workspace.as_ref()?;
@@ -2954,7 +2964,7 @@ async fn agent_finished_automation_messages(
             CommandSource::Library { name } => {
                 if let Some(lib) = library.read().await.as_ref() {
                     match lib.get_command(name).await {
-                        Ok(command) => command.content,
+                        Ok(command) => automation_library_command_body(&command.content),
                         Err(e) => {
                             tracing::warn!(
                                 "Failed to fetch command '{}' for automation {}: {}",
@@ -6288,7 +6298,7 @@ pub async fn webhook_receiver(
         CommandSource::Library { name } => {
             if let Some(lib) = state.library.read().await.as_ref() {
                 match lib.get_command(name.as_str()).await {
-                    Ok(command) => command.content,
+                    Ok(command) => automation_library_command_body(&command.content),
                     Err(e) => {
                         return Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -6557,6 +6567,29 @@ And the report:
         assert_eq!(
             normalize_model_override_for_backend(Some("codex"), "   "),
             None
+        );
+    }
+
+    #[test]
+    fn test_automation_library_command_body_strips_frontmatter() {
+        let content = r#"---
+description: Analyze failures
+params: [service]
+---
+
+Investigate <service/> failures.
+"#;
+        assert_eq!(
+            automation_library_command_body(content),
+            "Investigate <service/> failures."
+        );
+    }
+
+    #[test]
+    fn test_automation_library_command_body_without_frontmatter() {
+        assert_eq!(
+            automation_library_command_body("  Echo current status. \n"),
+            "Echo current status."
         );
     }
 
