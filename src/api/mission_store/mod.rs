@@ -220,6 +220,16 @@ pub struct Automation {
     pub stop_policy: StopPolicy,
 }
 
+impl Automation {
+    pub fn should_auto_disable_for_status(&self, status: MissionStatus) -> bool {
+        self.active && self.stop_policy.disables_on_status(status)
+    }
+
+    pub fn blocks_transition_to_status(&self, target_status: MissionStatus) -> bool {
+        self.active && !self.stop_policy.disables_on_status(target_status)
+    }
+}
+
 /// Execution status for automation runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]

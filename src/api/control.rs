@@ -270,7 +270,7 @@ async fn mission_has_blocking_automation_for_status(
     match mission_store.get_mission_automations(mission_id).await {
         Ok(automations) => automations
             .iter()
-            .any(|automation| automation_blocks_status_transition(automation, target_status)),
+            .any(|automation| automation.blocks_transition_to_status(target_status)),
         Err(err) => {
             tracing::warn!(
                 "Failed to load automations for mission {}: {}",
@@ -280,28 +280,6 @@ async fn mission_has_blocking_automation_for_status(
             false
         }
     }
-}
-
-fn automation_blocks_status_transition(
-    automation: &mission_store::Automation,
-    target_status: MissionStatus,
-) -> bool {
-    automation.active && !automation.stop_policy.disables_on_status(target_status)
-}
-
-fn should_disable_automation_for_stop_policy(
-    is_active: bool,
-    stop_policy: &mission_store::StopPolicy,
-    status: MissionStatus,
-) -> bool {
-    is_active && stop_policy.disables_on_status(status)
-}
-
-fn should_disable_automation(
-    automation: &mission_store::Automation,
-    status: MissionStatus,
-) -> bool {
-    should_disable_automation_for_stop_policy(automation.active, &automation.stop_policy, status)
 }
 
 async fn reconcile_automation_stop_policies_for_status(
@@ -323,7 +301,7 @@ async fn reconcile_automation_stop_policies_for_status(
 
     let mut disabled_count = 0usize;
     for mut automation in automations {
-        if !should_disable_automation(&automation, status) {
+        if !automation.should_auto_disable_for_status(status) {
             continue;
         }
 
@@ -6324,13 +6302,7 @@ pub async fn update_automation(
             .get_mission(automation.mission_id)
             .await
         {
-            Ok(Some(mission))
-                if should_disable_automation_for_stop_policy(
-                    automation.active,
-                    &automation.stop_policy,
-                    mission.status,
-                ) =>
-            {
+            Ok(Some(mission)) if automation.should_auto_disable_for_status(mission.status) => {
                 tracing::info!(
                     "Disabling automation {} during update due to stop policy {:?} (mission {} status {:?})",
                     automation.id,
@@ -6903,27 +6875,38 @@ Investigate <service/> failures.
         assert!(!mission_store::StopPolicy::Never.disables_on_status(MissionStatus::Failed));
     }
 
-    #[test]
-    fn test_should_disable_automation_for_stop_policy_requires_active_flag() {
-        assert!(!should_disable_automation_for_stop_policy(
-            false,
-            &mission_store::StopPolicy::OnMissionCompleted,
-            MissionStatus::Completed
-        ));
+    fn sample_test_automation() -> mission_store::Automation {
+        mission_store::Automation {
+            id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            command_source: mission_store::CommandSource::Inline {
+                content: "echo run".to_string(),
+            },
+            trigger: mission_store::TriggerType::AgentFinished,
+            variables: std::collections::HashMap::new(),
+            active: true,
+            stop_policy: mission_store::StopPolicy::Never,
+            created_at: mission_store::now_string(),
+            last_triggered_at: None,
+            retry_config: mission_store::RetryConfig::default(),
+        }
     }
 
     #[test]
-    fn test_should_disable_automation_for_stop_policy_matches_terminal_status() {
-        assert!(should_disable_automation_for_stop_policy(
-            true,
-            &mission_store::StopPolicy::OnTerminalAny,
-            MissionStatus::Failed
-        ));
-        assert!(!should_disable_automation_for_stop_policy(
-            true,
-            &mission_store::StopPolicy::OnMissionCompleted,
-            MissionStatus::Failed
-        ));
+    fn test_automation_should_auto_disable_requires_active_flag() {
+        let mut automation = sample_test_automation();
+        automation.active = false;
+        automation.stop_policy = mission_store::StopPolicy::OnMissionCompleted;
+        assert!(!automation.should_auto_disable_for_status(MissionStatus::Completed));
+    }
+
+    #[test]
+    fn test_automation_should_auto_disable_matches_terminal_status() {
+        let mut automation = sample_test_automation();
+        automation.stop_policy = mission_store::StopPolicy::OnTerminalAny;
+        assert!(automation.should_auto_disable_for_status(MissionStatus::Failed));
+        automation.stop_policy = mission_store::StopPolicy::OnMissionCompleted;
+        assert!(!automation.should_auto_disable_for_status(MissionStatus::Failed));
     }
 
     #[test]
@@ -6967,18 +6950,9 @@ Investigate <service/> failures.
             retry_config: mission_store::RetryConfig::default(),
         };
 
-        assert!(should_disable_automation(
-            &webhook_automation,
-            MissionStatus::Failed
-        ));
-        assert!(should_disable_automation(
-            &agent_finished_automation,
-            MissionStatus::Completed
-        ));
-        assert!(!should_disable_automation(
-            &agent_finished_automation,
-            MissionStatus::Failed
-        ));
+        assert!(webhook_automation.should_auto_disable_for_status(MissionStatus::Failed));
+        assert!(agent_finished_automation.should_auto_disable_for_status(MissionStatus::Completed));
+        assert!(!agent_finished_automation.should_auto_disable_for_status(MissionStatus::Failed));
     }
 
     #[test]
@@ -6998,10 +6972,7 @@ Investigate <service/> failures.
             retry_config: mission_store::RetryConfig::default(),
         };
 
-        assert!(automation_blocks_status_transition(
-            &automation,
-            MissionStatus::Completed
-        ));
+        assert!(automation.blocks_transition_to_status(MissionStatus::Completed));
     }
 
     #[test]
@@ -7027,10 +6998,7 @@ Investigate <service/> failures.
             retry_config: mission_store::RetryConfig::default(),
         };
 
-        assert!(!automation_blocks_status_transition(
-            &automation,
-            MissionStatus::Completed
-        ));
+        assert!(!automation.blocks_transition_to_status(MissionStatus::Completed));
     }
 
     #[tokio::test]
