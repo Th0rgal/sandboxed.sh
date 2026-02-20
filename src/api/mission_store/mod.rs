@@ -153,6 +153,7 @@ pub enum StopPolicy {
 }
 
 impl StopPolicy {
+    #[must_use]
     pub fn disables_on_status(&self, status: MissionStatus) -> bool {
         match self {
             Self::Never => false,
@@ -221,10 +222,12 @@ pub struct Automation {
 }
 
 impl Automation {
+    #[must_use]
     pub fn should_auto_disable_for_status(&self, status: MissionStatus) -> bool {
         self.active && self.stop_policy.disables_on_status(status)
     }
 
+    #[must_use]
     pub fn blocks_transition_to_status(&self, target_status: MissionStatus) -> bool {
         self.active && !self.stop_policy.disables_on_status(target_status)
     }

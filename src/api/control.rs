@@ -282,6 +282,43 @@ async fn mission_has_blocking_automation_for_status(
     }
 }
 
+async fn disable_automation_when_stop_policy_matches(
+    mission_store: &Arc<dyn MissionStore>,
+    automation: &mission_store::Automation,
+    mission_status: MissionStatus,
+    source: &str,
+) -> bool {
+    if !automation.should_auto_disable_for_status(mission_status) {
+        return false;
+    }
+
+    let mut updated = automation.clone();
+    updated.active = false;
+
+    match mission_store.update_automation(updated).await {
+        Ok(()) => {
+            tracing::info!(
+                "Disabled automation {} due to stop policy {:?} on mission {} status {:?} ({})",
+                automation.id,
+                automation.stop_policy,
+                automation.mission_id,
+                mission_status,
+                source
+            );
+            true
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Failed to disable automation {} after stop policy match ({}): {}",
+                automation.id,
+                source,
+                err
+            );
+            false
+        }
+    }
+}
+
 async fn reconcile_automation_stop_policies_for_status(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
@@ -300,30 +337,16 @@ async fn reconcile_automation_stop_policies_for_status(
     };
 
     let mut disabled_count = 0usize;
-    for mut automation in automations {
-        if !automation.should_auto_disable_for_status(status) {
-            continue;
-        }
-
-        automation.active = false;
-        match mission_store.update_automation(automation.clone()).await {
-            Ok(()) => {
-                disabled_count += 1;
-                tracing::info!(
-                    "Disabled automation {} due to stop policy {:?} on mission {} status {:?}",
-                    automation.id,
-                    automation.stop_policy,
-                    mission_id,
-                    status
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to disable automation {} during stop policy reconciliation: {}",
-                    automation.id,
-                    err
-                );
-            }
+    for automation in automations {
+        if disable_automation_when_stop_policy_matches(
+            mission_store,
+            &automation,
+            status,
+            "stop policy reconciliation",
+        )
+        .await
+        {
+            disabled_count += 1;
         }
     }
 
@@ -2681,23 +2704,14 @@ async fn automation_scheduler_loop(
                 }
             };
 
-            if automation.stop_policy.disables_on_status(mission.status) {
-                tracing::info!(
-                    "Disabling automation {} due to stop policy {:?} (mission {} status {:?})",
-                    automation.id,
-                    automation.stop_policy,
-                    mission.id,
-                    mission.status
-                );
-                let mut updated = automation.clone();
-                updated.active = false;
-                if let Err(e) = mission_store.update_automation(updated).await {
-                    tracing::warn!(
-                        "Failed to disable automation {} after stop policy match: {}",
-                        automation.id,
-                        e
-                    );
-                }
+            if disable_automation_when_stop_policy_matches(
+                &mission_store,
+                &automation,
+                mission.status,
+                "automation scheduler",
+            )
+            .await
+            {
                 continue;
             }
 
@@ -3059,23 +3073,14 @@ async fn agent_finished_automation_messages(
 
     let mut eligible = Vec::with_capacity(active.len());
     for automation in active {
-        if automation.stop_policy.disables_on_status(mission.status) {
-            tracing::info!(
-                "Disabling automation {} due to stop policy {:?} (mission {} status {:?})",
-                automation.id,
-                automation.stop_policy,
-                mission.id,
-                mission.status
-            );
-            let mut updated = automation.clone();
-            updated.active = false;
-            if let Err(e) = mission_store.update_automation(updated).await {
-                tracing::warn!(
-                    "Failed to disable automation {} after stop policy match: {}",
-                    automation.id,
-                    e
-                );
-            }
+        if disable_automation_when_stop_policy_matches(
+            mission_store,
+            &automation,
+            mission.status,
+            "agent_finished hook",
+        )
+        .await
+        {
             continue;
         }
         if matches!(automation.trigger, TriggerType::AgentFinished) {
@@ -6523,16 +6528,14 @@ pub async fn webhook_receiver(
             format!("Mission {} not found", mission_id),
         ))?;
 
-    if automation.stop_policy.disables_on_status(mission.status) {
-        let mut updated = automation.clone();
-        updated.active = false;
-        if let Err(e) = control.mission_store.update_automation(updated).await {
-            tracing::warn!(
-                "Failed to disable webhook automation {} after stop policy match: {}",
-                automation.id,
-                e
-            );
-        }
+    if automation.should_auto_disable_for_status(mission.status) {
+        let _ = disable_automation_when_stop_policy_matches(
+            &control.mission_store,
+            &automation,
+            mission.status,
+            "webhook trigger",
+        )
+        .await;
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
