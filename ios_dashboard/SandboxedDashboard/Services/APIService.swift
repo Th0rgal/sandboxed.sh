@@ -221,6 +221,24 @@ final class APIService {
     func getParallelConfig() async throws -> ParallelConfig {
         try await get("/api/control/parallel/config")
     }
+
+    // MARK: - Automations
+
+    func listMissionAutomations(missionId: String) async throws -> [Automation] {
+        try await get("/api/control/missions/\(missionId)/automations")
+    }
+
+    func createMissionAutomation(missionId: String, request: CreateAutomationRequest) async throws -> Automation {
+        try await post("/api/control/missions/\(missionId)/automations", body: request)
+    }
+
+    func updateAutomation(id: String, request: UpdateAutomationRequest) async throws -> Automation {
+        try await patch("/api/control/automations/\(id)", body: request)
+    }
+
+    func deleteAutomation(id: String) async throws {
+        let _: EmptyResponse = try await delete("/api/control/automations/\(id)")
+    }
     
     // MARK: - Control
     
@@ -526,6 +544,24 @@ final class APIService {
         if authenticated, let token = jwtToken {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
+
+        return try await execute(request)
+    }
+
+    private func patch<T: Decodable, B: Encodable>(_ path: String, body: B, authenticated: Bool = true) async throws -> T {
+        guard let url = URL(string: "\(baseURL)\(path)") else {
+            throw APIError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        if authenticated, let token = jwtToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
+        request.httpBody = try JSONEncoder().encode(body)
 
         return try await execute(request)
     }

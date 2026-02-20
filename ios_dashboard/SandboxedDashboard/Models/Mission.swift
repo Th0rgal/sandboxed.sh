@@ -8,37 +8,54 @@
 import Foundation
 
 enum MissionStatus: String, Codable, CaseIterable {
+    case pending
     case active
     case completed
     case failed
     case interrupted
     case blocked
     case notFeasible = "not_feasible"
+    case unknown
     
     var statusType: StatusType {
         switch self {
+        case .pending: return .pending
         case .active: return .active
         case .completed: return .completed
         case .failed: return .failed
         case .interrupted: return .interrupted
         case .blocked: return .blocked
         case .notFeasible: return .failed
+        case .unknown: return .failed
         }
     }
     
     var displayLabel: String {
         switch self {
+        case .pending: return "Pending"
         case .active: return "Active"
         case .completed: return "Completed"
         case .failed: return "Failed"
         case .interrupted: return "Interrupted"
         case .blocked: return "Blocked"
         case .notFeasible: return "Not Feasible"
+        case .unknown: return "Unknown"
         }
     }
     
     var canResume: Bool {
         self == .interrupted || self == .blocked
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let rawValue = try container.decode(String.self)
+        self = MissionStatus(rawValue: rawValue) ?? .unknown
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
     }
 }
 

@@ -59,6 +59,7 @@ struct ControlView: View {
     private var workspaceState = WorkspaceState.shared
     @State private var showNewMissionSheet = false
     @State private var showSettings = false
+    @State private var showAutomations = false
 
     @FocusState private var isInputFocused: Bool
     @Environment(\.scenePhase) private var scenePhase
@@ -215,6 +216,12 @@ struct ControlView: View {
                         Label("View Desktop (\(desktopDisplayId))", systemImage: "display")
                     }
 
+                    Button {
+                        showAutomations = true
+                    } label: {
+                        Label("View Automations", systemImage: "bolt.badge.clock")
+                    }
+
                     Divider()
 
                     Button {
@@ -356,6 +363,9 @@ struct ControlView: View {
         }
         .sheet(isPresented: $showSettings) {
             SettingsView()
+        }
+        .sheet(isPresented: $showAutomations) {
+            AutomationsView(missionId: viewingMission?.id ?? currentMission?.id)
         }
         .sheet(isPresented: $showMissionSwitcher) {
             MissionSwitcherSheet(
@@ -1053,8 +1063,7 @@ struct ControlView: View {
             // Try to fetch full event history (optional - fall back to basic history if it fails)
             do {
                 // Fetch all relevant event types including thinking events (matching web dashboard behavior)
-                let eventTypes = ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta", "thinking"]
-                let events = try await api.getMissionEvents(id: id, types: eventTypes)
+                let events = try await api.getMissionEvents(id: id, types: historyEventTypes)
 
                 // Race condition guard after the second await
                 guard fetchingMissionId == id else {
@@ -1120,8 +1129,7 @@ struct ControlView: View {
             }
 
             // Fetch events to get the complete updated history
-            let eventTypes = ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta", "thinking"]
-            if let events = try? await api.getMissionEvents(id: id, types: eventTypes), !events.isEmpty {
+            if let events = try? await api.getMissionEvents(id: id, types: historyEventTypes), !events.isEmpty {
                 // Final check before applying
                 guard viewingMissionId == id else { return }
                 applyViewingMissionWithEvents(mission, events: events, scrollToBottom: false)
@@ -1475,11 +1483,20 @@ struct ControlView: View {
                 return // Another mission was requested, discard this response
             }
 
-            // Update current mission if this is the main mission, and update the viewed mission
+            // Update current mission if this is the main mission.
             if currentMission?.id == mission.id {
                 currentMission = mission
             }
-            applyViewingMission(mission)
+
+            // Fetch full event history to avoid partial history rendering.
+            if let events = try? await api.getMissionEvents(id: id, types: historyEventTypes), !events.isEmpty {
+                guard fetchingMissionId == id else { return }
+                applyViewingMissionWithEvents(mission, events: events)
+                cacheMissionWithEvents(mission, events: events)
+            } else {
+                removeMissionFromCache(mission.id)
+                applyViewingMission(mission)
+            }
 
             isLoading = false
             HapticService.selectionChanged()
@@ -1522,6 +1539,10 @@ struct ControlView: View {
             print("Failed to cancel mission: \(error)")
             HapticService.error()
         }
+    }
+
+    private var historyEventTypes: [String] {
+        ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta", "thinking"]
     }
     
     private func handleStreamEvent(type: String, data: [String: Any], isHistoricalReplay: Bool = false) {
@@ -1838,9 +1859,8 @@ struct ControlView: View {
         case "mission_status_changed":
             // Handle mission status changes (e.g., completed, failed, interrupted)
             if let statusStr = data["status"] as? String,
-               let missionId = data["mission_id"] as? String,
-               let newStatus = MissionStatus(rawValue: statusStr) {
-                // Only process known status values - ignore unknown statuses
+               let missionId = data["mission_id"] as? String {
+                let newStatus = MissionStatus(rawValue: statusStr) ?? .unknown
 
                 // If mission is no longer active AND it's the currently viewed mission,
                 // mark all pending tools as cancelled
@@ -2757,11 +2777,6 @@ private struct ThoughtsSheet: View {
         }
     }
 
-    /// Combined display list (completed + active)
-    private var displayThoughts: [ChatMessage] {
-        completedThoughts + activeThoughts
-    }
-
     private var hasActiveThinking: Bool {
         !activeThoughts.isEmpty
     }
@@ -2769,35 +2784,45 @@ private struct ThoughtsSheet: View {
     var body: some View {
         NavigationStack {
             Group {
-                if displayThoughts.isEmpty {
+                if thinkingMessages.isEmpty {
                     ContentUnavailableView(
                         "No Thoughts Yet",
                         systemImage: "brain",
                         description: Text("Agent thoughts will appear here during execution.")
                     )
                 } else {
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 12) {
-                                ForEach(displayThoughts) { msg in
-                                    ThoughtRow(message: msg)
-                                        .id(msg.id)
+                    ScrollView {
+                        VStack(spacing: 14) {
+                            HStack(spacing: 10) {
+                                ThoughtSummaryCard(
+                                    title: "Active",
+                                    value: "\(activeThoughts.count)",
+                                    tint: hasActiveThinking ? Theme.accent : Theme.textMuted
+                                )
+                                ThoughtSummaryCard(
+                                    title: "Completed",
+                                    value: "\(completedThoughts.count)",
+                                    tint: Theme.success
+                                )
+                            }
+
+                            if !activeThoughts.isEmpty {
+                                ThoughtSection(title: "Thinking Now", icon: "brain") {
+                                    ForEach(activeThoughts) { msg in
+                                        ThoughtTimelineRow(message: msg, emphasize: true)
+                                    }
                                 }
                             }
-                            .padding()
-                        }
-                        .onAppear {
-                            if let last = displayThoughts.last {
-                                proxy.scrollTo(last.id, anchor: .bottom)
-                            }
-                        }
-                        .onChange(of: displayThoughts.count) { _, _ in
-                            if let last = displayThoughts.last {
-                                withAnimation(.easeOut(duration: 0.2)) {
-                                    proxy.scrollTo(last.id, anchor: .bottom)
+
+                            if !completedThoughts.isEmpty {
+                                ThoughtSection(title: "Recent Thoughts", icon: "clock.arrow.circlepath") {
+                                    ForEach(Array(completedThoughts.reversed())) { msg in
+                                        ThoughtTimelineRow(message: msg, emphasize: false)
+                                    }
                                 }
                             }
                         }
+                        .padding()
                     }
                 }
             }
@@ -2812,7 +2837,7 @@ private struct ThoughtsSheet: View {
                                 .foregroundStyle(Theme.accent)
                                 .symbolEffect(.pulse, options: .repeating)
                         }
-                        Text("\(displayThoughts.count)")
+                        Text("\(thinkingMessages.count)")
                             .font(.subheadline.monospacedDigit())
                             .foregroundStyle(Theme.textMuted)
                     }
@@ -2825,52 +2850,106 @@ private struct ThoughtsSheet: View {
     }
 }
 
-private struct ThoughtRow: View {
+private struct ThoughtSummaryCard: View {
+    let title: String
+    let value: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(Theme.textMuted)
+            Text(value)
+                .font(.headline.monospacedDigit())
+                .foregroundStyle(tint)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Theme.backgroundSecondary)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+private struct ThoughtSection<Content: View>: View {
+    let title: String
+    let icon: String
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.caption)
+                    .foregroundStyle(Theme.textSecondary)
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.textSecondary)
+            }
+
+            VStack(spacing: 10) {
+                content()
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ThoughtTimelineRow: View {
     let message: ChatMessage
+    let emphasize: Bool
     @State private var isExpanded = true
     @State private var elapsedSeconds: Int = 0
     @State private var timerTask: Task<Void, Never>?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Header
-            Button {
-                withAnimation(.spring(duration: 0.2)) {
-                    isExpanded.toggle()
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "brain")
-                        .font(.caption)
-                        .foregroundStyle(message.thinkingDone ? Theme.textMuted : Theme.accent)
-                        .symbolEffect(.pulse, options: message.thinkingDone ? .nonRepeating : .repeating)
+        HStack(alignment: .top, spacing: 10) {
+            VStack(spacing: 0) {
+                Circle()
+                    .fill(emphasize ? Theme.accent : Theme.textMuted)
+                    .frame(width: 8, height: 8)
+                Rectangle()
+                    .fill(Theme.border)
+                    .frame(width: 1)
+            }
 
-                    Text(message.thinkingDone ? "Thought for \(formatDurationString(elapsedSeconds))" : "Thinking for \(formatDurationString(elapsedSeconds))")
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    withAnimation(.spring(duration: 0.2)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "brain")
+                            .font(.caption)
+                            .foregroundStyle(message.thinkingDone ? Theme.textMuted : Theme.accent)
+                            .symbolEffect(.pulse, options: message.thinkingDone ? .nonRepeating : .repeating)
+
+                        Text(message.thinkingDone ? "Thought for \(formatDurationString(elapsedSeconds))" : "Thinking for \(formatDurationString(elapsedSeconds))")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Theme.textSecondary)
+
+                        Spacer()
+
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(Theme.textMuted)
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    }
+                }
+
+                if isExpanded && !message.content.isEmpty {
+                    Text(message.content)
                         .font(.caption)
                         .foregroundStyle(Theme.textSecondary)
-
-                    Spacer()
-
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(Theme.textMuted)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .buttonStyle(.plain)
-
-            // Content
-            if isExpanded && !message.content.isEmpty {
-                Text(message.content)
-                    .font(.caption)
-                    .foregroundStyle(Theme.textSecondary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            .padding(10)
+            .background(Theme.backgroundSecondary.opacity(emphasize ? 1 : 0.8))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
-        .padding(10)
-        .background(Theme.backgroundSecondary)
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .onAppear {
             startTimer()
         }
@@ -3080,6 +3159,22 @@ private struct MissionSwitcherSheet: View {
         }
     }
 
+    private var activeOrPendingMissions: [Mission] {
+        filteredRecent.filter { $0.status == .active || $0.status == .pending }
+    }
+
+    private var completedMissions: [Mission] {
+        filteredRecent.filter { $0.status == .completed }
+    }
+
+    private var failedMissions: [Mission] {
+        filteredRecent.filter { $0.status == .failed || $0.status == .notFeasible }
+    }
+
+    private var interruptedMissions: [Mission] {
+        filteredRecent.filter { $0.status == .interrupted || $0.status == .blocked || $0.status == .unknown }
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -3111,10 +3206,60 @@ private struct MissionSwitcherSheet: View {
                     }
                 }
 
-                // Recent missions
-                if !filteredRecent.isEmpty {
-                    Section("Recent") {
-                        ForEach(filteredRecent) { mission in
+                if !activeOrPendingMissions.isEmpty {
+                    Section("Active & Pending") {
+                        ForEach(activeOrPendingMissions) { mission in
+                            MissionRow(
+                                missionId: mission.id,
+                                title: mission.displayTitle,
+                                status: mission.status,
+                                isRunning: false,
+                                runningState: nil,
+                                isViewing: viewingMissionId == mission.id,
+                                onSelect: { onSelectMission(mission.id) },
+                                onCancel: nil
+                            )
+                        }
+                    }
+                }
+
+                if !completedMissions.isEmpty {
+                    Section("Completed") {
+                        ForEach(completedMissions) { mission in
+                            MissionRow(
+                                missionId: mission.id,
+                                title: mission.displayTitle,
+                                status: mission.status,
+                                isRunning: false,
+                                runningState: nil,
+                                isViewing: viewingMissionId == mission.id,
+                                onSelect: { onSelectMission(mission.id) },
+                                onCancel: nil
+                            )
+                        }
+                    }
+                }
+
+                if !failedMissions.isEmpty {
+                    Section("Failed") {
+                        ForEach(failedMissions) { mission in
+                            MissionRow(
+                                missionId: mission.id,
+                                title: mission.displayTitle,
+                                status: mission.status,
+                                isRunning: false,
+                                runningState: nil,
+                                isViewing: viewingMissionId == mission.id,
+                                onSelect: { onSelectMission(mission.id) },
+                                onCancel: nil
+                            )
+                        }
+                    }
+                }
+
+                if !interruptedMissions.isEmpty {
+                    Section("Interrupted") {
+                        ForEach(interruptedMissions) { mission in
                             MissionRow(
                                 missionId: mission.id,
                                 title: mission.displayTitle,
@@ -3170,11 +3315,13 @@ private struct MissionRow: View {
             return Theme.success
         }
         switch status {
+        case .pending: return Theme.warning
         case .active: return Theme.success
         case .completed: return Theme.textMuted
         case .failed: return Theme.error
         case .interrupted, .blocked: return Theme.warning
         case .notFeasible: return Theme.error
+        case .unknown: return Theme.textMuted
         }
     }
 
@@ -3183,12 +3330,14 @@ private struct MissionRow: View {
             return "play.circle.fill"
         }
         switch status {
+        case .pending: return "clock.fill"
         case .active: return "play.circle.fill"
         case .completed: return "checkmark.circle.fill"
         case .failed: return "xmark.circle.fill"
         case .interrupted: return "pause.circle.fill"
         case .blocked: return "exclamationmark.triangle.fill"
         case .notFeasible: return "questionmark.circle.fill"
+        case .unknown: return "questionmark.circle.fill"
         }
     }
 
