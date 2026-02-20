@@ -103,6 +103,7 @@ COPY --from=dashboard-builder /build/dashboard/public /opt/dashboard/public
 
 # -- Pre-install AI harness CLIs (optional — agents still work if these fail) -
 # Uses bun for global installs (faster than npm, and our preferred package manager)
+ENV PATH="/root/.bun/bin:/root/.cache/.bun/bin:${PATH}"
 RUN bun install -g @anthropic-ai/claude-code@latest \
     && echo "[docker] Claude Code CLI installed: $(claude --version 2>/dev/null || echo 'unknown')" \
     || echo "[docker] WARNING: Claude Code CLI install failed (will be installed on first mission)"

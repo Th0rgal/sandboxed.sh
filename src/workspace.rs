@@ -4036,6 +4036,9 @@ exec >>"$LOG" 2>&1
 
 echo "[sandboxed] Harness bootstrap start"
 
+# Keep bun global bin dirs discoverable for command checks and installed CLIs.
+export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH"
+
 # Ensure bun is in PATH first (it's our preferred package manager)
 if [ -x /root/.bun/bin/bun ] && ! command -v bun >/dev/null 2>&1; then
   ln -sf /root/.bun/bin/bun /usr/local/bin/bun || true

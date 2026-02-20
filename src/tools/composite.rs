@@ -426,7 +426,9 @@ impl Tool for PrepareProject {
 
         // Check for common tools
         result.push_str("## Environment Check\n\n");
-        let tools_to_check = ["git", "node", "bun", "npm", "cargo", "python3", "go", "forge"];
+        let tools_to_check = [
+            "git", "node", "bun", "npm", "cargo", "python3", "go", "forge",
+        ];
 
         for tool in tools_to_check {
             let output = tokio::process::Command::new("which")

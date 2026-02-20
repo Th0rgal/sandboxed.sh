@@ -1473,6 +1473,7 @@ fn stream_package_uninstall(
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
         yield sse("log", format!("Starting {} uninstall...", display_name), Some(0));
+        let mut uninstall_failed = false;
 
         let pm = crate::pkg_manager::preferred().await;
         let Some(pm) = pm else {
@@ -1494,10 +1495,12 @@ fn stream_package_uninstall(
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if !stderr.contains("not installed") && !stdout.contains("not installed") {
+                    uninstall_failed = true;
                     yield sse("log", format!("Warning: {} uninstall had issues: {} {}", pm.bin(), stderr, stdout), None);
                 }
             }
             Err(e) => {
+                uninstall_failed = true;
                 yield sse("log", format!("Warning: {} uninstall failed: {}", pm.bin(), e), None);
             }
         }
@@ -1512,7 +1515,21 @@ fn stream_package_uninstall(
             crate::pkg_manager::PkgManager::Npm => vec!["remove", "-g", package_name],
         };
         yield sse("log", format!("Cleaning up {} global install if any...", other), Some(60));
-        let _ = Command::new(other).args(&other_args).output().await;
+        match Command::new(other).args(&other_args).output().await {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !stderr.contains("not installed") && !stdout.contains("not installed") {
+                    uninstall_failed = true;
+                    yield sse("log", format!("Warning: {} uninstall had issues: {} {}", other, stderr, stdout), None);
+                }
+            }
+            Err(e) => {
+                uninstall_failed = true;
+                yield sse("log", format!("Warning: {} uninstall failed: {}", other, e), None);
+            }
+        }
 
         // Remove configuration directory
         let home = home_dir();
@@ -1525,7 +1542,18 @@ fn stream_package_uninstall(
                 .await;
         }
 
-        yield sse("complete", format!("{} uninstalled successfully!", display_name), Some(100));
+        if uninstall_failed {
+            yield sse(
+                "error",
+                format!(
+                    "{} uninstall encountered errors. Some files may remain installed.",
+                    display_name
+                ),
+                None,
+            );
+        } else {
+            yield sse("complete", format!("{} uninstalled successfully!", display_name), Some(100));
+        }
     }
 }
 
