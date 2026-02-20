@@ -282,6 +282,34 @@ async fn mission_has_blocking_automation_for_status(
     }
 }
 
+async fn stop_policy_matched_mission_status(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    stop_policy: &mission_store::StopPolicy,
+    source: &str,
+) -> Option<MissionStatus> {
+    match mission_store.get_mission(mission_id).await {
+        Ok(Some(mission)) => {
+            let status = mission.status;
+            if stop_policy.disables_on_status(status) {
+                Some(status)
+            } else {
+                None
+            }
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to load mission {} while evaluating stop policy ({}): {}",
+                mission_id,
+                source,
+                err
+            );
+            None
+        }
+    }
+}
+
 async fn disable_automation_when_stop_policy_matches(
     mission_store: &Arc<dyn MissionStore>,
     automation: &mission_store::Automation,
@@ -6146,18 +6174,14 @@ pub async fn create_automation(
         };
 
     let stop_policy = req.stop_policy.unwrap_or(mission_store::StopPolicy::Never);
-    let active = match control.mission_store.get_mission(mission_id).await {
-        Ok(Some(mission)) => !stop_policy.disables_on_status(mission.status),
-        Ok(None) => true,
-        Err(e) => {
-            tracing::warn!(
-                "Failed to load mission {} while evaluating stop policy on automation create: {}",
-                mission_id,
-                e
-            );
-            true
-        }
-    };
+    let active = stop_policy_matched_mission_status(
+        &control.mission_store,
+        mission_id,
+        &stop_policy,
+        "automation create",
+    )
+    .await
+    .is_none();
 
     // Build the complete Automation struct
     let automation = mission_store::Automation {
@@ -6302,29 +6326,22 @@ pub async fn update_automation(
     // Enforce stop policy at update-time so persisted active state doesn't
     // remain stale on missions that are already terminal.
     if automation.active {
-        match control
-            .mission_store
-            .get_mission(automation.mission_id)
-            .await
+        if let Some(status) = stop_policy_matched_mission_status(
+            &control.mission_store,
+            automation.mission_id,
+            &automation.stop_policy,
+            "automation update",
+        )
+        .await
         {
-            Ok(Some(mission)) if automation.should_auto_disable_for_status(mission.status) => {
-                tracing::info!(
-                    "Disabling automation {} during update due to stop policy {:?} (mission {} status {:?})",
-                    automation.id,
-                    automation.stop_policy,
-                    mission.id,
-                    mission.status
-                );
-                automation.active = false;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load mission {} while enforcing stop policy on automation update: {}",
-                    automation.mission_id,
-                    e
-                );
-            }
+            tracing::info!(
+                "Disabling automation {} during update due to stop policy {:?} (mission {} status {:?})",
+                automation.id,
+                automation.stop_policy,
+                automation.mission_id,
+                status
+            );
+            automation.active = false;
         }
     }
 
