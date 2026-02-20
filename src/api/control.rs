@@ -2971,10 +2971,8 @@ async fn agent_finished_automation_messages(
         }
     };
 
-    let mut active: Vec<super::mission_store::Automation> = automations
-        .into_iter()
-        .filter(|a| a.active && matches!(a.trigger, TriggerType::AgentFinished))
-        .collect();
+    let mut active: Vec<super::mission_store::Automation> =
+        automations.into_iter().filter(|a| a.active).collect();
 
     if active.is_empty() {
         return Vec::new();
@@ -2997,7 +2995,7 @@ async fn agent_finished_automation_messages(
     for automation in active {
         if stop_policy_matches_status(&automation.stop_policy, mission.status) {
             tracing::info!(
-                "Disabling agent_finished automation {} due to stop policy {:?} (mission {} status {:?})",
+                "Disabling automation {} due to stop policy {:?} (mission {} status {:?})",
                 automation.id,
                 automation.stop_policy,
                 mission.id,
@@ -3014,7 +3012,9 @@ async fn agent_finished_automation_messages(
             }
             continue;
         }
-        eligible.push(automation);
+        if matches!(automation.trigger, TriggerType::AgentFinished) {
+            eligible.push(automation);
+        }
     }
     active = eligible;
 
@@ -6052,15 +6052,12 @@ pub async fn create_automation(
         .await
         .map_err(internal_error)?;
 
-    // If start_immediately is requested for agent_finished triggers, fire the
-    // first execution right away by resolving the command and sending it as a
-    // user message to the control actor.
-    if start_immediately
-        && matches!(
-            automation.trigger,
-            mission_store::TriggerType::AgentFinished
-        )
-    {
+    // For agent_finished triggers, enforce stop policy immediately on create.
+    // This avoids persisting automations that are already terminally ineligible.
+    if matches!(
+        automation.trigger,
+        mission_store::TriggerType::AgentFinished
+    ) {
         if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
             if stop_policy_matches_status(&automation.stop_policy, mission.status) {
                 let mut updated = automation.clone();
@@ -6076,7 +6073,17 @@ pub async fn create_automation(
                 return Ok(Json(automation));
             }
         }
+    }
 
+    // If start_immediately is requested for agent_finished triggers, fire the
+    // first execution right away by resolving the command and sending it as a
+    // user message to the control actor.
+    if start_immediately
+        && matches!(
+            automation.trigger,
+            mission_store::TriggerType::AgentFinished
+        )
+    {
         let cmd_content =
             resolve_automation_command(&automation, mission_id, &state, &control.mission_store)
                 .await;
