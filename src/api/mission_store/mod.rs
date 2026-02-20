@@ -248,6 +248,7 @@ impl Automation {
         self.active && self.stop_policy.disables_on_status(status)
     }
 
+    #[must_use]
     pub fn deactivate_if_stop_policy_matches(&mut self, status: MissionStatus) -> bool {
         if !self.should_auto_disable_for_status(status) {
             return false;

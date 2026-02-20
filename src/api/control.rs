@@ -322,6 +322,7 @@ async fn stop_policy_matched_mission_status(
     }
 }
 
+#[must_use]
 async fn disable_automation_when_stop_policy_matches(
     mission_store: &Arc<dyn MissionStore>,
     automation: &mission_store::Automation,
