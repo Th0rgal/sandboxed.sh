@@ -328,12 +328,14 @@ async fn disable_automation_when_stop_policy_matches(
     mission_status: MissionStatus,
     source: &str,
 ) -> bool {
-    let mut updated = automation.clone();
-    if !updated.deactivate_if_stop_policy_matches(mission_status) {
+    if !automation.should_auto_disable_for_status(mission_status) {
         return false;
     }
 
-    match mission_store.update_automation(updated).await {
+    match mission_store
+        .update_automation_active(automation.id, false)
+        .await
+    {
         Ok(()) => {
             tracing::info!(
                 "Disabled automation {} due to stop policy {:?} on mission {} status {:?} ({})",
@@ -352,7 +354,7 @@ async fn disable_automation_when_stop_policy_matches(
                 source,
                 err
             );
-            false
+            true
         }
     }
 }
@@ -6745,6 +6747,7 @@ pub async fn webhook_receiver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_parse_image_tag() {
@@ -6951,6 +6954,24 @@ Investigate <service/> failures.
         automation.stop_policy = mission_store::StopPolicy::OnTerminalAny;
         assert!(automation.deactivate_if_stop_policy_matches(MissionStatus::Failed));
         assert!(!automation.active);
+    }
+
+    #[tokio::test]
+    async fn test_disable_automation_when_stop_policy_match_skips_on_update_failure() {
+        let mut automation = sample_test_automation();
+        automation.stop_policy = mission_store::StopPolicy::OnTerminalAny;
+        let store = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission_store: Arc<dyn mission_store::MissionStore> = store.clone();
+
+        let disabled = disable_automation_when_stop_policy_matches(
+            &mission_store,
+            &automation,
+            MissionStatus::Failed,
+            "test",
+        )
+        .await;
+
+        assert!(disabled);
     }
 
     #[test]
