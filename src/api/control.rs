@@ -262,12 +262,15 @@ async fn validate_library_command(
     }
 }
 
-async fn mission_has_active_automation(
+async fn mission_has_blocking_automation_for_status(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
+    target_status: MissionStatus,
 ) -> bool {
     match mission_store.get_mission_automations(mission_id).await {
-        Ok(automations) => automations.iter().any(|automation| automation.active),
+        Ok(automations) => automations
+            .iter()
+            .any(|automation| automation_blocks_status_transition(automation, target_status)),
         Err(err) => {
             tracing::warn!(
                 "Failed to load automations for mission {}: {}",
@@ -277,6 +280,13 @@ async fn mission_has_active_automation(
             false
         }
     }
+}
+
+fn automation_blocks_status_transition(
+    automation: &mission_store::Automation,
+    target_status: MissionStatus,
+) -> bool {
+    automation.active && !stop_policy_matches_status(&automation.stop_policy, target_status)
 }
 
 fn mission_is_terminal(status: MissionStatus) -> bool {
@@ -4713,10 +4723,15 @@ async fn control_actor_loop(
                             };
                             let success = matches!(status, crate::tools::mission::MissionStatusValue::Completed);
                             if new_status == MissionStatus::Completed
-                                && mission_has_active_automation(&mission_store, id).await
+                                && mission_has_blocking_automation_for_status(
+                                    &mission_store,
+                                    id,
+                                    new_status,
+                                )
+                                .await
                             {
                                 tracing::info!(
-                                    "Skipping completion for mission {} because active automations are enabled",
+                                    "Skipping completion for mission {} because blocking automations are still active",
                                     id
                                 );
                                 continue;
@@ -4893,10 +4908,15 @@ async fn control_actor_loop(
                                                     TerminalReason::CapacityLimited => "capacity_limited",
                                                 });
                                                 if new_status == MissionStatus::Completed
-                                                    && mission_has_active_automation(&mission_store, mission_id).await
+                                                    && mission_has_blocking_automation_for_status(
+                                                        &mission_store,
+                                                        mission_id,
+                                                        new_status,
+                                                    )
+                                                    .await
                                                 {
                                                     tracing::info!(
-                                                        "Skipping auto-complete for mission {} because active automations are enabled",
+                                                        "Skipping auto-complete for mission {} because blocking automations are still active",
                                                         mission_id
                                                     );
                                                 } else {
@@ -4910,6 +4930,12 @@ async fn control_actor_loop(
                                                     {
                                                         tracing::warn!("Failed to auto-complete mission: {}", e);
                                                     } else {
+                                                        reconcile_automation_stop_policies_for_status(
+                                                            &mission_store,
+                                                            mission_id,
+                                                            new_status,
+                                                        )
+                                                        .await;
                                                         // Send status change event - the actual completion content
                                                         // is already in the assistant_message event, so we just provide
                                                         // a clean summary based on how the mission ended
@@ -5318,10 +5344,15 @@ async fn control_actor_loop(
                                                 MissionStatus::Failed
                                             };
                                             if new_status == MissionStatus::Completed
-                                                && mission_has_active_automation(&mission_store, *mission_id).await
+                                                && mission_has_blocking_automation_for_status(
+                                                    &mission_store,
+                                                    *mission_id,
+                                                    new_status,
+                                                )
+                                                .await
                                             {
                                                 tracing::info!(
-                                                    "Skipping parallel completion for mission {} because active automations are enabled",
+                                                    "Skipping parallel completion for mission {} because blocking automations are still active",
                                                     mission_id
                                                 );
                                             } else if let Err(e) = update_mission_status_and_reconcile_stop_policies(
@@ -6982,6 +7013,58 @@ Investigate <service/> failures.
         assert!(!should_disable_automation(
             &agent_finished_automation,
             MissionStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn test_automation_blocks_status_transition_when_policy_would_not_disable() {
+        let automation = mission_store::Automation {
+            id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            command_source: mission_store::CommandSource::Inline {
+                content: "echo run".to_string(),
+            },
+            trigger: mission_store::TriggerType::AgentFinished,
+            variables: std::collections::HashMap::new(),
+            active: true,
+            stop_policy: mission_store::StopPolicy::Never,
+            created_at: mission_store::now_string(),
+            last_triggered_at: None,
+            retry_config: mission_store::RetryConfig::default(),
+        };
+
+        assert!(automation_blocks_status_transition(
+            &automation,
+            MissionStatus::Completed
+        ));
+    }
+
+    #[test]
+    fn test_automation_does_not_block_transition_when_policy_matches_target_status() {
+        let automation = mission_store::Automation {
+            id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            command_source: mission_store::CommandSource::Inline {
+                content: "echo run".to_string(),
+            },
+            trigger: mission_store::TriggerType::Webhook {
+                config: mission_store::WebhookConfig {
+                    webhook_id: "hook".to_string(),
+                    secret: None,
+                    variable_mappings: std::collections::HashMap::new(),
+                },
+            },
+            variables: std::collections::HashMap::new(),
+            active: true,
+            stop_policy: mission_store::StopPolicy::OnTerminalAny,
+            created_at: mission_store::now_string(),
+            last_triggered_at: None,
+            retry_config: mission_store::RetryConfig::default(),
+        };
+
+        assert!(!automation_blocks_status_transition(
+            &automation,
+            MissionStatus::Completed
         ));
     }
 

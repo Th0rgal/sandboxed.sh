@@ -151,7 +151,7 @@ export function MissionAutomationsDialog({
   const [intervalValue, setIntervalValue] = useState('5');
   const [intervalUnit, setIntervalUnit] = useState<IntervalUnit>('minutes');
   const [startImmediately, setStartImmediately] = useState(true);
-  const [stopPolicy, setStopPolicy] = useState<StopPolicy>('on_mission_completed');
+  const [stopPolicy, setStopPolicy] = useState<StopPolicy>('on_terminal_any');
   const [variables, setVariables] = useState<Array<{ key: string; value: string }>>([]);
   const [creating, setCreating] = useState(false);
   const [togglingId, setTogglingId] = useState<string | null>(null);
@@ -476,7 +476,7 @@ export function MissionAutomationsDialog({
       setInlinePrompt('');
       setIntervalValue('5');
       setIntervalUnit('minutes');
-      setStopPolicy('on_mission_completed');
+      setStopPolicy('on_terminal_any');
       setVariables([]);
       if (promptTimerRef.current) {
         clearTimeout(promptTimerRef.current);
@@ -861,11 +861,11 @@ export function MissionAutomationsDialog({
                     className={cn(selectClass, 'w-full')}
                     style={selectStyle}
                   >
-                    <option value="on_mission_completed" className="bg-[#1a1a1a]">
-                      On mission completed (recommended)
-                    </option>
                     <option value="on_terminal_any" className="bg-[#1a1a1a]">
-                      On any terminal state
+                      On any terminal state (recommended)
+                    </option>
+                    <option value="on_mission_completed" className="bg-[#1a1a1a]">
+                      On mission completed
                     </option>
                     <option value="never" className="bg-[#1a1a1a]">
                       Never
