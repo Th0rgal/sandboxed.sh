@@ -12,7 +12,7 @@ vi.mock("@/lib/api", () => ({
 }));
 
 describe("EnhancedInput file paste handling", () => {
-  it("passes textarea selection to onFilePaste", () => {
+  it("passes textarea selection to onFilePaste", async () => {
     const onFilePaste = vi.fn();
     const file = new File(["img"], "paste.png", { type: "image/png" });
     const fileItem = {
@@ -20,7 +20,7 @@ describe("EnhancedInput file paste handling", () => {
       getAsFile: () => file,
     };
 
-    const { container } = render(
+    const { container, unmount } = render(
       <EnhancedInput
         value={"hello world"}
         onChange={() => {}}
@@ -28,6 +28,10 @@ describe("EnhancedInput file paste handling", () => {
         onFilePaste={onFilePaste}
       />,
     );
+    // Let async command/agent loading effects settle before teardown.
+    await Promise.resolve();
+    await Promise.resolve();
+
     const textarea = container.querySelector("textarea");
     expect(textarea).not.toBeNull();
     textarea!.setSelectionRange(6, 11);
@@ -44,5 +48,8 @@ describe("EnhancedInput file paste handling", () => {
       selectionStart: 6,
       selectionEnd: 11,
     });
+
+    unmount();
+    await Promise.resolve();
   });
 });
