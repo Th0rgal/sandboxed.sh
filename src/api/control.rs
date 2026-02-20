@@ -6134,26 +6134,21 @@ pub async fn create_automation(
         .await
         .map_err(internal_error)?;
 
-    // For agent_finished triggers, enforce stop policy immediately on create.
-    // This avoids persisting automations that are already terminally ineligible.
-    if matches!(
-        automation.trigger,
-        mission_store::TriggerType::AgentFinished
-    ) {
-        if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
-            if stop_policy_matches_status(&automation.stop_policy, mission.status) {
-                let mut updated = automation.clone();
-                updated.active = false;
-                if let Err(e) = control.mission_store.update_automation(updated).await {
-                    tracing::warn!(
-                        "Failed to disable automation {} on create due to stop policy: {}",
-                        automation.id,
-                        e
-                    );
-                }
-                automation.active = false;
-                return Ok(Json(automation));
+    // Enforce stop policy immediately on create for all trigger types so we
+    // don't persist an automation as active when its stop condition is already met.
+    if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
+        if stop_policy_matches_status(&automation.stop_policy, mission.status) {
+            let mut updated = automation.clone();
+            updated.active = false;
+            if let Err(e) = control.mission_store.update_automation(updated).await {
+                tracing::warn!(
+                    "Failed to disable automation {} on create due to stop policy: {}",
+                    automation.id,
+                    e
+                );
             }
+            automation.active = false;
+            return Ok(Json(automation));
         }
     }
 
