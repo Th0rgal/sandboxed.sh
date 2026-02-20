@@ -2782,10 +2782,19 @@ private struct ThoughtsSheet: View {
         !activeThoughts.isEmpty
     }
 
+    /// Count aligned with what is actually rendered in the sheet.
+    private var visibleThoughtCount: Int {
+        activeThoughts.count + completedThoughts.count
+    }
+
+    private var hasVisibleThoughts: Bool {
+        visibleThoughtCount > 0
+    }
+
     var body: some View {
         NavigationStack {
             Group {
-                if thinkingMessages.isEmpty {
+                if !hasVisibleThoughts {
                     ContentUnavailableView(
                         "No Thoughts Yet",
                         systemImage: "brain",
@@ -2838,7 +2847,7 @@ private struct ThoughtsSheet: View {
                                 .foregroundStyle(Theme.accent)
                                 .symbolEffect(.pulse, options: .repeating)
                         }
-                        Text("\(thinkingMessages.count)")
+                        Text("\(visibleThoughtCount)")
                             .font(.subheadline.monospacedDigit())
                             .foregroundStyle(Theme.textMuted)
                     }
@@ -3176,6 +3185,26 @@ private struct MissionSwitcherSheet: View {
         filteredRecent.filter { $0.status == .interrupted || $0.status == .blocked || $0.status == .unknown }
     }
 
+    @ViewBuilder
+    private func missionSection(_ title: String, missions: [Mission]) -> some View {
+        if !missions.isEmpty {
+            Section(title) {
+                ForEach(missions) { mission in
+                    MissionRow(
+                        missionId: mission.id,
+                        title: mission.displayTitle,
+                        status: mission.status,
+                        isRunning: false,
+                        runningState: nil,
+                        isViewing: viewingMissionId == mission.id,
+                        onSelect: { onSelectMission(mission.id) },
+                        onCancel: nil
+                    )
+                }
+            }
+        }
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -3207,73 +3236,10 @@ private struct MissionSwitcherSheet: View {
                     }
                 }
 
-                if !activeOrPendingMissions.isEmpty {
-                    Section("Active & Pending") {
-                        ForEach(activeOrPendingMissions) { mission in
-                            MissionRow(
-                                missionId: mission.id,
-                                title: mission.displayTitle,
-                                status: mission.status,
-                                isRunning: false,
-                                runningState: nil,
-                                isViewing: viewingMissionId == mission.id,
-                                onSelect: { onSelectMission(mission.id) },
-                                onCancel: nil
-                            )
-                        }
-                    }
-                }
-
-                if !completedMissions.isEmpty {
-                    Section("Completed") {
-                        ForEach(completedMissions) { mission in
-                            MissionRow(
-                                missionId: mission.id,
-                                title: mission.displayTitle,
-                                status: mission.status,
-                                isRunning: false,
-                                runningState: nil,
-                                isViewing: viewingMissionId == mission.id,
-                                onSelect: { onSelectMission(mission.id) },
-                                onCancel: nil
-                            )
-                        }
-                    }
-                }
-
-                if !failedMissions.isEmpty {
-                    Section("Failed") {
-                        ForEach(failedMissions) { mission in
-                            MissionRow(
-                                missionId: mission.id,
-                                title: mission.displayTitle,
-                                status: mission.status,
-                                isRunning: false,
-                                runningState: nil,
-                                isViewing: viewingMissionId == mission.id,
-                                onSelect: { onSelectMission(mission.id) },
-                                onCancel: nil
-                            )
-                        }
-                    }
-                }
-
-                if !interruptedMissions.isEmpty {
-                    Section("Interrupted") {
-                        ForEach(interruptedMissions) { mission in
-                            MissionRow(
-                                missionId: mission.id,
-                                title: mission.displayTitle,
-                                status: mission.status,
-                                isRunning: false,
-                                runningState: nil,
-                                isViewing: viewingMissionId == mission.id,
-                                onSelect: { onSelectMission(mission.id) },
-                                onCancel: nil
-                            )
-                        }
-                    }
-                }
+                missionSection("Active & Pending", missions: activeOrPendingMissions)
+                missionSection("Completed", missions: completedMissions)
+                missionSection("Failed", missions: failedMissions)
+                missionSection("Interrupted", missions: interruptedMissions)
 
                 if filteredRunning.isEmpty && filteredRecent.isEmpty && !searchText.isEmpty {
                     ContentUnavailableView(
