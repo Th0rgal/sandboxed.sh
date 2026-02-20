@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -22,12 +23,20 @@ use serde::{Deserialize, Serialize};
 use crate::ai_providers::ProviderType;
 use crate::provider_health::CooldownReason;
 
-static GOOGLE_PROJECT_CACHE: OnceLock<tokio::sync::RwLock<HashMap<(uuid::Uuid, String), String>>> =
-    OnceLock::new();
+#[derive(Clone)]
+struct GoogleProjectCacheEntry {
+    project_id: String,
+    cached_at: Instant,
+}
+
+static GOOGLE_PROJECT_CACHE: OnceLock<
+    tokio::sync::RwLock<HashMap<(uuid::Uuid, String), GoogleProjectCacheEntry>>,
+> = OnceLock::new();
 const GOOGLE_USER_AGENT: &str = "google-api-nodejs-client/9.15.1";
 const GOOGLE_API_CLIENT: &str = "gl-node/22.17.0";
 const GOOGLE_CLIENT_METADATA: &str =
     "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI";
+const GOOGLE_PROJECT_CACHE_TTL: Duration = Duration::from_secs(600);
 
 const TEXT_EVENT_STREAM: &str = "text/event-stream";
 const NO_CACHE: &str = "no-cache";
@@ -110,6 +119,21 @@ fn completions_url(provider_type: ProviderType, account_base_url: Option<&str>) 
     let base = account_base_url.or_else(|| default_base_url(provider_type))?;
     let base = base.trim_end_matches('/');
     Some(format!("{}/chat/completions", base))
+}
+
+fn can_route_without_api_key(provider_type: ProviderType, has_oauth: bool) -> bool {
+    provider_type == ProviderType::Google && has_oauth
+}
+
+fn has_routable_proxy_credentials(
+    provider_type: ProviderType,
+    has_api_key: bool,
+    has_oauth: bool,
+) -> bool {
+    if provider_type == ProviderType::Custom {
+        return true;
+    }
+    has_api_key || can_route_without_api_key(provider_type, has_oauth)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -301,11 +325,12 @@ async fn chat_completions(
 
         // Custom providers may work without an API key (base_url only).
         // Standard providers require credentials (API key or provider OAuth).
-        if entry.api_key.is_none() && !entry.has_oauth && provider_type != ProviderType::Custom {
+        if !has_routable_proxy_credentials(provider_type, entry.api_key.is_some(), entry.has_oauth)
+        {
             continue;
         }
 
-        let use_google_oauth_adapter = provider_type == ProviderType::Google && entry.has_oauth;
+        let use_google_oauth_adapter = can_route_without_api_key(provider_type, entry.has_oauth);
         let (url, upstream_body, extra_headers) = if use_google_oauth_adapter {
             let access_token = match get_google_access_token().await {
                 Ok(token) => token,
@@ -1825,8 +1850,8 @@ fn track_stream_health(
     }
 }
 
-fn get_google_project_cache() -> &'static tokio::sync::RwLock<HashMap<(uuid::Uuid, String), String>>
-{
+fn get_google_project_cache(
+) -> &'static tokio::sync::RwLock<HashMap<(uuid::Uuid, String), GoogleProjectCacheEntry>> {
     GOOGLE_PROJECT_CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
 }
 
@@ -1878,7 +1903,9 @@ async fn get_google_project_id(
         .get(&cache_key)
         .cloned()
     {
-        return Ok(cached);
+        if cached.cached_at.elapsed() < GOOGLE_PROJECT_CACHE_TTL {
+            return Ok(cached.project_id);
+        }
     }
 
     let load_body = serde_json::json!({
@@ -1928,7 +1955,13 @@ async fn get_google_project_id(
 
     let mut cache = get_google_project_cache().write().await;
     cache.retain(|(cached_account_id, _), _| *cached_account_id != account_id);
-    cache.insert(cache_key, project.clone());
+    cache.insert(
+        cache_key,
+        GoogleProjectCacheEntry {
+            project_id: project.clone(),
+            cached_at: Instant::now(),
+        },
+    );
     Ok(project)
 }
 
@@ -2911,5 +2944,34 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("\"finish_reason\":\"tool_calls\""));
+    }
+
+    #[test]
+    fn proxy_credential_gating_is_provider_aware_for_oauth() {
+        assert!(!has_routable_proxy_credentials(
+            ProviderType::OpenAI,
+            false,
+            true
+        ));
+        assert!(!has_routable_proxy_credentials(
+            ProviderType::Anthropic,
+            false,
+            true
+        ));
+        assert!(has_routable_proxy_credentials(
+            ProviderType::Google,
+            false,
+            true
+        ));
+        assert!(has_routable_proxy_credentials(
+            ProviderType::OpenAI,
+            true,
+            false
+        ));
+        assert!(has_routable_proxy_credentials(
+            ProviderType::Custom,
+            false,
+            false
+        ));
     }
 }
