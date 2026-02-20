@@ -55,6 +55,7 @@ struct OpencodeSseParseResult {
     event: Option<AgentEvent>,
     message_complete: bool,
     session_id: Option<String>,
+    model: Option<String>,
     /// The SSE stream indicated the session became idle.  This is a weaker
     /// signal than `message_complete` — it means OpenCode is no longer
     /// processing, but not necessarily that a `response.completed` was sent
@@ -436,6 +437,7 @@ fn parse_opencode_sse_event(
     }
 
     let mut message_complete = false;
+    let mut model: Option<String> = None;
     let event = match event_type {
         "response.output_text.delta" => {
             let delta = props
@@ -580,6 +582,7 @@ fn parse_opencode_sse_event(
                 ) {
                     state.message_roles.insert(id.to_string(), role.to_string());
                 }
+                model = extract_model_from_message(info);
             }
             if props.get("part").is_some() {
                 handle_part_update(&props, state, mission_id)
@@ -690,6 +693,7 @@ fn parse_opencode_sse_event(
         event,
         message_complete,
         session_id,
+        model,
         session_idle,
         session_retry,
     })
@@ -5544,6 +5548,8 @@ fn extract_model_from_message(value: &serde_json::Value) -> Option<String> {
         candidates.push(model);
     }
 
+    let mut model_candidates: Vec<String> = Vec::new();
+
     for candidate in candidates {
         let provider = get_str(
             candidate,
@@ -5552,18 +5558,22 @@ fn extract_model_from_message(value: &serde_json::Value) -> Option<String> {
         let model_id = get_str(candidate, &["modelID", "modelId", "model_id", "model"]);
         if let (Some(provider), Some(model_id)) = (provider, model_id) {
             if !provider.is_empty() && !model_id.is_empty() {
-                return Some(format!("{}/{}", provider, model_id));
+                model_candidates.push(format!("{}/{}", provider, model_id));
             }
         }
 
         if let Some(model) = get_str(candidate, &["model", "model_id", "modelID", "modelId"]) {
-            if model.contains('/') {
-                return Some(model.to_string());
+            if !model.is_empty() {
+                model_candidates.push(model.to_string());
             }
         }
     }
 
-    None
+    model_candidates
+        .iter()
+        .find(|m| !m.starts_with("builtin/"))
+        .cloned()
+        .or_else(|| model_candidates.first().cloned())
 }
 
 fn load_latest_opencode_assistant_message(
@@ -7393,11 +7403,8 @@ pub async fn run_opencode_turn(
         has_anthropic,
         has_google,
     );
-    let mut model_used = resolved_model.clone();
+    let mut model_used: Option<String> = None;
     let agent_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent);
-    if model_used.is_none() {
-        model_used = agent_model.clone();
-    }
     if resolved_model.is_none() {
         resolved_model = agent_model.clone();
     }
@@ -8499,6 +8506,9 @@ pub async fn run_opencode_turn(
                                         *guard = Some(session_id);
                                     }
                                 }
+                                if let Some(model) = parsed.model {
+                                    model_used = Some(model);
+                                }
                                 if let Some(event) = parsed.event {
                                     if let Ok(mut guard) = last_activity.lock() {
                                         *guard = std::time::Instant::now();
@@ -8887,6 +8897,13 @@ pub async fn run_opencode_turn(
     } else {
         AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::Completed)
     };
+    if model_used.is_none() {
+        if let Some(model) = resolved_model.as_deref() {
+            if !model.starts_with("builtin/") {
+                model_used = Some(model.to_string());
+            }
+        }
+    }
     if let Some(model) = model_used {
         result = result.with_model(model);
     }
@@ -10082,15 +10099,15 @@ fn cleanup_old_debug_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_command_params, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_codex_node_wrapper, is_rate_limited_error,
-        is_session_corruption_error, is_tool_call_only_output, opencode_output_needs_fallback,
-        opencode_session_token_from_line, parse_opencode_session_token, parse_opencode_sse_event,
-        parse_opencode_stderr_text_part, running_health, sanitized_opencode_stdout, stall_severity,
-        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
-        summarize_recent_opencode_stderr, sync_opencode_agent_config, MissionHealth,
-        MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
-        STALL_WARN_SECS,
+        bind_command_params, extract_model_from_message, extract_opencode_session_id,
+        extract_part_text, extract_str, extract_thought_line, is_codex_node_wrapper,
+        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
+        opencode_output_needs_fallback, opencode_session_token_from_line,
+        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
+        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
+        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
+        sync_opencode_agent_config, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
     use crate::library::types::CommandParam;
@@ -10505,6 +10522,31 @@ mod tests {
         assert_eq!(extract_str(&val, &["text", "content"]), Some("hello"));
     }
 
+    #[test]
+    fn extract_model_from_message_prefers_non_builtin_model() {
+        let val = json!({
+            "model": "builtin/smart",
+            "info": {
+                "providerID": "zai",
+                "modelID": "glm-5"
+            }
+        });
+        assert_eq!(
+            extract_model_from_message(&val).as_deref(),
+            Some("zai/glm-5")
+        );
+    }
+
+    #[test]
+    fn extract_model_from_message_accepts_model_without_provider_prefix() {
+        let val = json!({
+            "info": {
+                "model": "glm-5"
+            }
+        });
+        assert_eq!(extract_model_from_message(&val).as_deref(), Some("glm-5"));
+    }
+
     // ── extract_part_text tests ───────────────────────────────────────
 
     #[test]
@@ -10542,6 +10584,7 @@ mod tests {
             .expect("event should parse");
         assert!(parsed.event.is_none());
         assert!(!parsed.message_complete);
+        assert!(parsed.model.is_none());
         assert!(!parsed.session_idle);
         assert!(!parsed.session_retry);
     }
@@ -10560,6 +10603,30 @@ mod tests {
             .expect("event should parse");
         assert!(parsed.event.is_none());
         assert!(parsed.message_complete);
+        assert!(parsed.model.is_none());
+    }
+
+    #[test]
+    fn parse_opencode_sse_event_extracts_model_from_message_updated() {
+        let mut state = OpencodeSseState::default();
+        let mission_id = Uuid::new_v4();
+        let data = json!({
+            "type": "message.updated",
+            "properties": {
+                "info": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "providerID": "zai",
+                    "modelID": "glm-5"
+                }
+            }
+        })
+        .to_string();
+
+        let parsed = parse_opencode_sse_event(&data, None, None, &mut state, mission_id)
+            .expect("event should parse");
+        assert!(parsed.event.is_none());
+        assert_eq!(parsed.model.as_deref(), Some("zai/glm-5"));
     }
 
     #[test]
