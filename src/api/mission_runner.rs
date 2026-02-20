@@ -104,9 +104,7 @@ fn resolve_cost_cents_and_source(
     usage: &crate::cost::TokenUsage,
 ) -> (u64, CostSource) {
     if let Some(actual) = actual_cost_cents {
-        if actual > 0 {
-            return (actual, CostSource::Actual);
-        }
+        return (actual, CostSource::Actual);
     }
 
     if usage.has_usage() {
@@ -11399,6 +11397,19 @@ mod tests {
         let (cost, source) =
             resolve_cost_cents_and_source(Some(123), Some("claude-sonnet-5"), &usage);
         assert_eq!(cost, 123);
+        assert_eq!(source, CostSource::Actual);
+    }
+
+    #[test]
+    fn resolve_cost_cents_keeps_actual_source_when_zero() {
+        let usage = crate::cost::TokenUsage {
+            input_tokens: 10_000,
+            output_tokens: 2_000,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        let (cost, source) = resolve_cost_cents_and_source(Some(0), Some("gpt-5"), &usage);
+        assert_eq!(cost, 0);
         assert_eq!(source, CostSource::Actual);
     }
 
