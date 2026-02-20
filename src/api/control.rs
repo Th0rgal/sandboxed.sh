@@ -231,6 +231,18 @@ async fn require_automation(
         ))
 }
 
+fn normalize_automation_trigger(trigger: mission_store::TriggerType) -> mission_store::TriggerType {
+    match trigger {
+        mission_store::TriggerType::Webhook { mut config } => {
+            if config.webhook_id.is_empty() {
+                config.webhook_id = Uuid::new_v4().to_string();
+            }
+            mission_store::TriggerType::Webhook { config }
+        }
+        other => other,
+    }
+}
+
 /// Validate that a command exists in the library.
 async fn validate_library_command(
     state: &AppState,
@@ -6148,17 +6160,7 @@ pub async fn create_automation(
         validate_library_command(&state, name).await?;
     }
 
-    // Generate webhook_id if trigger type is Webhook
-    let trigger = match req.trigger {
-        mission_store::TriggerType::Webhook { mut config } => {
-            // Generate a unique webhook_id if not provided or empty
-            if config.webhook_id.is_empty() {
-                config.webhook_id = Uuid::new_v4().to_string();
-            }
-            mission_store::TriggerType::Webhook { config }
-        }
-        other => other,
-    };
+    let trigger = normalize_automation_trigger(req.trigger);
 
     let start_immediately = req.start_immediately;
 
@@ -6293,16 +6295,7 @@ pub async fn update_automation(
     }
 
     if let Some(trigger) = req.trigger {
-        // Generate webhook_id if trigger type is Webhook and webhook_id is empty
-        automation.trigger = match trigger {
-            mission_store::TriggerType::Webhook { mut config } => {
-                if config.webhook_id.is_empty() {
-                    config.webhook_id = Uuid::new_v4().to_string();
-                }
-                mission_store::TriggerType::Webhook { config }
-            }
-            other => other,
-        };
+        automation.trigger = normalize_automation_trigger(trigger);
     }
 
     if let Some(variables) = req.variables {
@@ -6839,6 +6832,30 @@ And the report:
             normalize_model_override_for_backend(Some("codex"), "   "),
             None
         );
+    }
+
+    #[test]
+    fn test_normalize_automation_trigger_generates_webhook_id_when_empty() {
+        let trigger = mission_store::TriggerType::Webhook {
+            config: mission_store::WebhookConfig {
+                webhook_id: String::new(),
+                secret: None,
+                variable_mappings: std::collections::HashMap::new(),
+            },
+        };
+
+        let normalized = normalize_automation_trigger(trigger);
+        let mission_store::TriggerType::Webhook { config } = normalized else {
+            panic!("expected webhook trigger");
+        };
+        assert!(!config.webhook_id.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_automation_trigger_keeps_non_webhook_triggers_unchanged() {
+        let trigger = mission_store::TriggerType::AgentFinished;
+        let normalized = normalize_automation_trigger(trigger.clone());
+        assert_eq!(normalized, trigger);
     }
 
     #[test]
