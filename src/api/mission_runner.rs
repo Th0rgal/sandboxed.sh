@@ -111,10 +111,13 @@ fn resolve_cost_cents_and_source(
 
     if usage.has_usage() {
         if let Some(model_name) = model {
-            return (
-                crate::cost::cost_cents_from_usage(model_name, usage),
-                CostSource::Estimated,
-            );
+            if crate::cost::pricing_for_model(model_name).is_some() {
+                return (
+                    crate::cost::cost_cents_from_usage(model_name, usage),
+                    CostSource::Estimated,
+                );
+            }
+            return (actual_cost_cents.unwrap_or(0), CostSource::Unknown);
         }
     }
 
@@ -11416,6 +11419,20 @@ mod tests {
     fn resolve_cost_cents_unknown_without_usage() {
         let usage = crate::cost::TokenUsage::default();
         let (cost, source) = resolve_cost_cents_and_source(None, Some("gpt-5"), &usage);
+        assert_eq!(cost, 0);
+        assert_eq!(source, CostSource::Unknown);
+    }
+
+    #[test]
+    fn resolve_cost_cents_unknown_for_unpriced_model_with_usage() {
+        let usage = crate::cost::TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 500,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        let (cost, source) =
+            resolve_cost_cents_and_source(None, Some("provider/new-model"), &usage);
         assert_eq!(cost, 0);
         assert_eq!(source, CostSource::Unknown);
     }
