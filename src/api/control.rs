@@ -298,7 +298,7 @@ async fn stop_policy_matched_mission_status(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
     stop_policy: mission_store::StopPolicy,
-    source: &str,
+    context: StopPolicyContext,
 ) -> Option<MissionStatus> {
     match mission_store.get_mission(mission_id).await {
         Ok(Some(mission)) => {
@@ -314,10 +314,33 @@ async fn stop_policy_matched_mission_status(
             tracing::warn!(
                 "Failed to load mission {} while evaluating stop policy ({}): {}",
                 mission_id,
-                source,
+                context.as_str(),
                 err
             );
             None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopPolicyContext {
+    CreateAutomation,
+    UpdateAutomation,
+    IntervalScheduler,
+    AgentFinishedHook,
+    WebhookTrigger,
+    Reconciliation,
+}
+
+impl StopPolicyContext {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateAutomation => "create_automation",
+            Self::UpdateAutomation => "update_automation",
+            Self::IntervalScheduler => "interval scheduler",
+            Self::AgentFinishedHook => "agent_finished hook",
+            Self::WebhookTrigger => "webhook trigger",
+            Self::Reconciliation => "stop policy reconciliation",
         }
     }
 }
@@ -344,7 +367,7 @@ async fn disable_automation_when_stop_policy_matches(
     mission_store: &Arc<dyn MissionStore>,
     automation: &mission_store::Automation,
     mission_status: MissionStatus,
-    source: &str,
+    context: StopPolicyContext,
 ) -> StopPolicyDisableOutcome {
     if !automation.should_auto_disable_for_status(mission_status) {
         return StopPolicyDisableOutcome::NotMatched;
@@ -361,7 +384,7 @@ async fn disable_automation_when_stop_policy_matches(
                 automation.stop_policy,
                 automation.mission_id,
                 mission_status,
-                source
+                context.as_str()
             );
             StopPolicyDisableOutcome::Deactivated
         }
@@ -369,7 +392,7 @@ async fn disable_automation_when_stop_policy_matches(
             tracing::warn!(
                 "Failed to disable automation {} after stop policy match ({}): {}",
                 automation.id,
-                source,
+                context.as_str(),
                 err
             );
             StopPolicyDisableOutcome::DeactivationFailed
@@ -401,7 +424,7 @@ async fn reconcile_automation_stop_policies_for_status(
             mission_store,
             &automation,
             status,
-            "stop policy reconciliation",
+            StopPolicyContext::Reconciliation,
         )
         .await;
         if outcome.should_skip_execution() {
@@ -2771,7 +2794,7 @@ async fn automation_scheduler_loop(
                 &mission_store,
                 &automation,
                 mission.status,
-                "automation scheduler",
+                StopPolicyContext::IntervalScheduler,
             )
             .await
             .should_skip_execution()
@@ -3141,7 +3164,7 @@ async fn agent_finished_automation_messages(
             mission_store,
             &automation,
             mission.status,
-            "agent_finished hook",
+            StopPolicyContext::AgentFinishedHook,
         )
         .await
         .should_skip_execution()
@@ -6205,7 +6228,7 @@ pub async fn create_automation(
         &control.mission_store,
         mission_id,
         stop_policy,
-        "automation create",
+        StopPolicyContext::CreateAutomation,
     )
     .await
     .is_none();
@@ -6348,7 +6371,7 @@ pub async fn update_automation(
             &control.mission_store,
             automation.mission_id,
             automation.stop_policy,
-            "automation update",
+            StopPolicyContext::UpdateAutomation,
         )
         .await;
         if let Some(status) = matched_status {
@@ -6568,7 +6591,7 @@ pub async fn webhook_receiver(
         &control.mission_store,
         &automation,
         mission.status,
-        "webhook trigger",
+        StopPolicyContext::WebhookTrigger,
     )
     .await
     .should_skip_execution()
@@ -6993,7 +7016,7 @@ Investigate <service/> failures.
             &mission_store,
             &automation,
             MissionStatus::Failed,
-            "test",
+            StopPolicyContext::IntervalScheduler,
         )
         .await;
 
@@ -7011,7 +7034,7 @@ Investigate <service/> failures.
             &mission_store,
             &automation,
             MissionStatus::Failed,
-            "test",
+            StopPolicyContext::IntervalScheduler,
         )
         .await;
 
