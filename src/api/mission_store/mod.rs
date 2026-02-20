@@ -154,6 +154,25 @@ pub enum StopPolicy {
 
 impl StopPolicy {
     #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::OnMissionCompleted => "on_mission_completed",
+            Self::OnTerminalAny => "on_terminal_any",
+        }
+    }
+
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Self {
+        match value {
+            "never" => Self::Never,
+            "on_mission_completed" => Self::OnMissionCompleted,
+            "on_terminal_any" => Self::OnTerminalAny,
+            _ => Self::Never,
+        }
+    }
+
+    #[must_use]
     pub fn disables_on_status(self, status: MissionStatus) -> bool {
         match self {
             Self::Never => false,
@@ -705,5 +724,26 @@ mod tests {
         assert_eq!(format!("{}", MissionStatus::Active), "active");
         assert_eq!(format!("{}", MissionStatus::Completed), "completed");
         assert_eq!(format!("{}", MissionStatus::Interrupted), "interrupted");
+    }
+
+    #[test]
+    fn test_stop_policy_db_mapping() {
+        assert_eq!(StopPolicy::Never.as_db_str(), "never");
+        assert_eq!(
+            StopPolicy::OnMissionCompleted.as_db_str(),
+            "on_mission_completed"
+        );
+        assert_eq!(StopPolicy::OnTerminalAny.as_db_str(), "on_terminal_any");
+
+        assert_eq!(StopPolicy::from_db_str("never"), StopPolicy::Never);
+        assert_eq!(
+            StopPolicy::from_db_str("on_mission_completed"),
+            StopPolicy::OnMissionCompleted
+        );
+        assert_eq!(
+            StopPolicy::from_db_str("on_terminal_any"),
+            StopPolicy::OnTerminalAny
+        );
+        assert_eq!(StopPolicy::from_db_str("invalid"), StopPolicy::Never);
     }
 }

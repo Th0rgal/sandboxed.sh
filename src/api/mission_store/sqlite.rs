@@ -221,12 +221,7 @@ impl SqliteMissionStore {
         // Parse variables
         let variables: HashMap<String, String> =
             serde_json::from_str(&variables_json).unwrap_or_default();
-        let stop_policy = match stop_policy_str.as_str() {
-            "never" => StopPolicy::Never,
-            "on_mission_completed" => StopPolicy::OnMissionCompleted,
-            "on_terminal_any" => StopPolicy::OnTerminalAny,
-            _ => StopPolicy::Never,
-        };
+        let stop_policy = StopPolicy::from_db_str(stop_policy_str.as_str());
 
         Ok(Automation {
             id: Uuid::parse_str(&id)
@@ -1660,11 +1655,7 @@ impl MissionStore for SqliteMissionStore {
                     trigger_data,
                     variables_json,
                     if a.active { 1 } else { 0 },
-                    match a.stop_policy {
-                        StopPolicy::Never => "never",
-                        StopPolicy::OnMissionCompleted => "on_mission_completed",
-                        StopPolicy::OnTerminalAny => "on_terminal_any",
-                    },
+                    a.stop_policy.as_db_str(),
                     a.created_at,
                     a.last_triggered_at,
                     a.retry_config.max_retries as i64,
@@ -1860,11 +1851,7 @@ impl MissionStore for SqliteMissionStore {
                     trigger_data,
                     variables_json,
                     if automation.active { 1 } else { 0 },
-                    match automation.stop_policy {
-                        StopPolicy::Never => "never",
-                        StopPolicy::OnMissionCompleted => "on_mission_completed",
-                        StopPolicy::OnTerminalAny => "on_terminal_any",
-                    },
+                    automation.stop_policy.as_db_str(),
                     automation.last_triggered_at,
                     automation.retry_config.max_retries as i64,
                     automation.retry_config.retry_delay_seconds as i64,
