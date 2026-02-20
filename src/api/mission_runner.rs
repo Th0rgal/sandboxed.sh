@@ -11447,4 +11447,17 @@ mod tests {
         assert_eq!(cost, 0);
         assert_eq!(source, CostSource::Unknown);
     }
+
+    #[test]
+    fn resolve_cost_cents_estimates_when_only_cache_usage_available() {
+        let usage = crate::cost::TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: Some(10_000),
+            cache_read_input_tokens: Some(5_000),
+        };
+        let (cost, source) = resolve_cost_cents_and_source(None, Some("claude-sonnet-5"), &usage);
+        assert!(cost > 0);
+        assert_eq!(source, CostSource::Estimated);
+    }
 }

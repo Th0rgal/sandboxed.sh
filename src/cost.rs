@@ -29,7 +29,10 @@ pub struct TokenUsage {
 impl TokenUsage {
     /// Check if there's any usage to compute cost from.
     pub fn has_usage(&self) -> bool {
-        self.input_tokens > 0 || self.output_tokens > 0
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cache_creation_input_tokens.unwrap_or(0) > 0
+            || self.cache_read_input_tokens.unwrap_or(0) > 0
     }
 }
 
@@ -388,5 +391,16 @@ mod tests {
         };
         let cost = cost_cents_from_usage("completely-unknown-model", &usage);
         assert_eq!(cost, 0);
+    }
+
+    #[test]
+    fn test_has_usage_true_for_cache_only() {
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: Some(1_000),
+            cache_read_input_tokens: Some(2_000),
+        };
+        assert!(usage.has_usage());
     }
 }
