@@ -187,6 +187,7 @@ fn ok_json() -> Json<serde_json::Value> {
 }
 
 /// Unwrap a mission ID or emit an error event and return a failure result.
+#[allow(clippy::result_large_err)]
 fn require_mission_id(
     mission_id: Option<Uuid>,
     backend: &str,
