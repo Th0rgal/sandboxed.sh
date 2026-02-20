@@ -143,6 +143,8 @@ pub enum TerminalReason {
     MaxIterations,
     /// Provider rate-limited all retry attempts
     RateLimited,
+    /// Provider rejected turn due to concurrent mission capacity exhaustion
+    CapacityLimited,
 }
 
 /// Errors that can occur in agent operations.

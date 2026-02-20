@@ -4713,6 +4713,7 @@ async fn control_actor_loop(
                                                     TerminalReason::InfiniteLoop => "infinite_loop",
                                                     TerminalReason::MaxIterations => "max_iterations",
                                                     TerminalReason::RateLimited => "rate_limited",
+                                                    TerminalReason::CapacityLimited => "capacity_limited",
                                                 });
                                                 if new_status == MissionStatus::Completed
                                                     && mission_has_active_automation(&mission_store, mission_id).await
@@ -4743,6 +4744,7 @@ async fn control_actor_loop(
                                                             Some(TerminalReason::InfiniteLoop) => Some("Detected repetitive behavior".to_string()),
                                                             Some(TerminalReason::LlmError) => Some("Model error".to_string()),
                                                             Some(TerminalReason::RateLimited) => Some("Provider rate limited".to_string()),
+                                                            Some(TerminalReason::CapacityLimited) => Some("Provider capacity limit reached".to_string()),
                                                             None if agent_result.success => None,
                                                             None => Some("Unexpected termination".to_string()),
                                                         };

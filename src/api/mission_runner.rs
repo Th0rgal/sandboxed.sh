@@ -1785,14 +1785,22 @@ async fn run_mission_turn(
             // The override key is passed directly to write_codex_credentials_for_workspace
             // to avoid mutating the process-global OPENAI_API_KEY env var (which would
             // race with concurrent missions).
-            if result.terminal_reason == Some(TerminalReason::RateLimited) {
+            if matches!(
+                result.terminal_reason,
+                Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
+            ) {
                 let alt_keys =
                     super::ai_providers::get_all_openai_keys_for_codex(&config.working_dir);
                 if alt_keys.len() > 1 {
+                    let initial_reason = match result.terminal_reason {
+                        Some(TerminalReason::CapacityLimited) => "capacity limited",
+                        _ => "rate limited",
+                    };
                     tracing::info!(
                         mission_id = %mission_id,
                         total_keys = alt_keys.len(),
-                        "Codex rate limited; trying alternate OpenAI API keys"
+                        reason = initial_reason,
+                        "Codex account constrained; trying alternate OpenAI API keys"
                     );
                     // The first key in alt_keys is typically the default (from env var
                     // or auth.json), which we already tried above.
@@ -1828,11 +1836,16 @@ async fn run_mission_turn(
                         )
                         .await;
                         match result.terminal_reason {
-                            Some(TerminalReason::RateLimited) => {
+                            Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited) => {
+                                let reason = match result.terminal_reason {
+                                    Some(TerminalReason::CapacityLimited) => "capacity limited",
+                                    _ => "rate limited",
+                                };
                                 tracing::info!(
                                     mission_id = %mission_id,
                                     attempt = idx + 2,
-                                    "Codex rate limited; rotating to next key"
+                                    reason,
+                                    "Codex account constrained; rotating to next key"
                                 );
                                 continue;
                             }
@@ -3727,6 +3740,35 @@ fn is_rate_limited_error(message: &str) -> bool {
     RATE_LIMIT_MARKERS
         .iter()
         .any(|needle| contains_ascii_case_insensitive(message, needle))
+}
+
+fn is_capacity_limited_error(message: &str) -> bool {
+    const CAPACITY_LIMIT_MARKERS: [&str; 5] = [
+        "already have five missions running",
+        "already have 5 missions running",
+        "too many concurrent missions",
+        "concurrent mission limit",
+        "maximum concurrent missions",
+    ];
+
+    if CAPACITY_LIMIT_MARKERS
+        .iter()
+        .any(|needle| contains_ascii_case_insensitive(message, needle))
+    {
+        return true;
+    }
+
+    let has_already_have = contains_ascii_case_insensitive(message, "already have");
+    let has_missions_running = contains_ascii_case_insensitive(message, "missions running");
+    if has_already_have && has_missions_running {
+        return true;
+    }
+
+    let has_concurrent = contains_ascii_case_insensitive(message, "concurrent");
+    let has_mission = contains_ascii_case_insensitive(message, "mission");
+    let has_limit = contains_ascii_case_insensitive(message, "limit")
+        || contains_ascii_case_insensitive(message, "exceeded");
+    has_concurrent && has_mission && has_limit
 }
 
 fn strip_opencode_banner_lines(output: &str) -> Cow<'_, str> {
@@ -9939,8 +9981,10 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
         AgentResult::success(final_message, 0) // TODO: Calculate cost from Codex usage
             .with_terminal_reason(TerminalReason::Completed)
     } else {
-        // Detect rate limit / overloaded errors for account rotation.
-        let reason = if is_rate_limited_error(&final_message) {
+        // Distinguish provider concurrency exhaustion from classic rate limits.
+        let reason = if is_capacity_limited_error(&final_message) {
+            TerminalReason::CapacityLimited
+        } else if is_rate_limited_error(&final_message) {
             TerminalReason::RateLimited
         } else {
             TerminalReason::LlmError
@@ -10100,9 +10144,9 @@ fn cleanup_old_debug_files(
 mod tests {
     use super::{
         bind_command_params, extract_model_from_message, extract_opencode_session_id,
-        extract_part_text, extract_str, extract_thought_line, is_codex_node_wrapper,
-        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
+        extract_part_text, extract_str, extract_thought_line, is_capacity_limited_error,
+        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
+        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
         strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
@@ -10266,6 +10310,18 @@ mod tests {
         assert!(is_rate_limited_error("Overloaded_Error occurred"));
         assert!(!is_rate_limited_error("Model finished successfully"));
         assert!(!is_rate_limited_error("error: 123"));
+    }
+
+    #[test]
+    fn is_capacity_limited_error_detects_codex_concurrency_markers() {
+        assert!(is_capacity_limited_error(
+            "Error: You already have five missions running for this account."
+        ));
+        assert!(is_capacity_limited_error(
+            "Too many concurrent missions, concurrent mission limit exceeded"
+        ));
+        assert!(!is_capacity_limited_error("Error: 429 Too Many Requests"));
+        assert!(!is_capacity_limited_error("Model finished successfully"));
     }
 
     #[test]
