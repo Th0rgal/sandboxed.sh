@@ -11,6 +11,7 @@
 //! - Working directory (isolated per mission)
 
 use std::borrow::Cow;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -151,7 +152,7 @@ async fn lease_codex_account(
     }
 
     // Prefer the currently least-loaded key (highest available permits).
-    candidates.sort_by(|a, b| b.2.cmp(&a.2));
+    candidates.sort_by_key(|candidate| Reverse(candidate.2));
 
     for (key, sem, available) in &candidates {
         if let Ok(permit) = sem.clone().try_acquire_owned() {

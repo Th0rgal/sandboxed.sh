@@ -1,5 +1,6 @@
 //! HTTP route handlers.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -914,7 +915,7 @@ async fn list_tasks(
         .map(|t| t.values().cloned().collect())
         .unwrap_or_default();
     // Sort by most recent first (by ID since UUIDs are time-ordered)
-    task_list.sort_by(|a, b| b.id.cmp(&a.id));
+    task_list.sort_by_key(|task| Reverse(task.id));
     Json(task_list)
 }
 
