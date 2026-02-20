@@ -484,17 +484,45 @@ function parseCostSource(raw: unknown): CostSource {
   return "unknown";
 }
 
-function parseCostMetadata(meta: Record<string, unknown>): { costCents: number; costSource: CostSource } {
+function parseCostAmount(raw: unknown): number | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return raw;
+  }
+  if (typeof raw === "string") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function parseCostMetadata(
+  meta: Record<string, unknown>,
+  fallback?: { costCents: number; costSource: CostSource }
+): { costCents: number; costSource: CostSource } {
   const cost = meta["cost"];
   if (isRecord(cost)) {
+    const parsedAmount = parseCostAmount(cost["amount_cents"]);
+    const hasSource = cost["source"] !== undefined;
     return {
-      costCents: Number(cost["amount_cents"] ?? 0),
-      costSource: parseCostSource(cost["source"]),
+      costCents: parsedAmount ?? fallback?.costCents ?? 0,
+      costSource: hasSource ? parseCostSource(cost["source"]) : fallback?.costSource ?? "unknown",
     };
   }
+
+  const parsedAmount = parseCostAmount(meta["cost_cents"]);
+  const hasSource = meta["cost_source"] !== undefined;
+  if (parsedAmount !== undefined || hasSource) {
+    return {
+      costCents: parsedAmount ?? fallback?.costCents ?? 0,
+      costSource: hasSource ? parseCostSource(meta["cost_source"]) : fallback?.costSource ?? "unknown",
+    };
+  }
+
   return {
-    costCents: Number(meta["cost_cents"] ?? 0),
-    costSource: parseCostSource(meta["cost_source"]),
+    costCents: fallback?.costCents ?? 0,
+    costSource: fallback?.costSource ?? "unknown",
   };
 }
 
@@ -4647,7 +4675,6 @@ export default function ControlClient() {
         // Use strict equality to match eventsToItems behavior:
         // undefined means no explicit status, only false means actual failure
         const isFailure = data["success"] === false;
-        const { costCents, costSource } = parseCostMetadata(data);
         const incomingId = String(data["id"] ?? Date.now());
 
         // Finalize any pending thinking session when an assistant message arrives.
@@ -4701,8 +4728,10 @@ export default function ControlClient() {
               ...existing,
               content: String(data["content"] ?? existing.content),
               success: !isFailure,
-              costCents,
-              costSource,
+              ...parseCostMetadata(data, {
+                costCents: existing.costCents,
+                costSource: existing.costSource,
+              }),
               model: data["model"] ? String(data["model"]) : existing.model ?? null,
               timestamp: now,
               sharedFiles: sharedFiles ?? existing.sharedFiles,
@@ -4716,8 +4745,7 @@ export default function ControlClient() {
             id: incomingId,
             content: String(data["content"] ?? ""),
             success: !isFailure,
-            costCents,
-            costSource,
+            ...parseCostMetadata(data),
             model: data["model"] ? String(data["model"]) : null,
             timestamp: now,
             sharedFiles,
