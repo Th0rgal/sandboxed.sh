@@ -32,7 +32,7 @@ struct HistoryView: View {
             switch self {
             case .all: return nil
             case .active: return [.pending, .active]
-            case .interrupted: return [.interrupted, .blocked]
+            case .interrupted: return [.interrupted, .blocked, .unknown]
             case .completed: return [.completed]
             case .failed: return [.failed, .notFeasible]
             }
