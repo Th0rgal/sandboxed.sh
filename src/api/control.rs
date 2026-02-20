@@ -6138,16 +6138,24 @@ async fn run_single_control_turn(
 
 // === Automation API handlers ===
 
+fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateAutomationRequest {
     pub command_source: mission_store::CommandSource,
     pub trigger: mission_store::TriggerType,
     #[serde(default)]
     pub variables: HashMap<String, String>,
-    #[serde(default)]
-    pub retry_config: Option<mission_store::RetryConfig>,
-    #[serde(default)]
-    pub stop_policy: Option<mission_store::StopPolicy>,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub retry_config: mission_store::RetryConfig,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub stop_policy: mission_store::StopPolicy,
     /// When true, trigger the first execution immediately after creation.
     #[serde(default)]
     pub start_immediately: bool,
@@ -6223,7 +6231,7 @@ pub async fn create_automation(
             None
         };
 
-    let stop_policy = req.stop_policy.unwrap_or(mission_store::StopPolicy::Never);
+    let stop_policy = req.stop_policy;
     let active = stop_policy_matched_mission_status(
         &control.mission_store,
         mission_id,
@@ -6244,7 +6252,7 @@ pub async fn create_automation(
         stop_policy,
         created_at: mission_store::now_string(),
         last_triggered_at,
-        retry_config: req.retry_config.unwrap_or_default(),
+        retry_config: req.retry_config,
     };
 
     let automation = control
@@ -6908,6 +6916,36 @@ And the report:
         let trigger = mission_store::TriggerType::AgentFinished;
         let normalized = normalize_automation_trigger(trigger.clone());
         assert_eq!(normalized, trigger);
+    }
+
+    #[test]
+    fn test_create_automation_request_defaults_stop_policy_and_retry_config_when_missing() {
+        let req: CreateAutomationRequest = serde_json::from_value(serde_json::json!({
+            "command_source": {"type": "inline", "content": "echo run"},
+            "trigger": {"type": "agent_finished"}
+        }))
+        .expect("request should deserialize");
+
+        assert_eq!(req.stop_policy, mission_store::StopPolicy::Never);
+        assert_eq!(req.retry_config.max_retries, 3);
+        assert_eq!(req.retry_config.retry_delay_seconds, 60);
+        assert_eq!(req.retry_config.backoff_multiplier, 2.0);
+    }
+
+    #[test]
+    fn test_create_automation_request_defaults_stop_policy_and_retry_config_when_null() {
+        let req: CreateAutomationRequest = serde_json::from_value(serde_json::json!({
+            "command_source": {"type": "inline", "content": "echo run"},
+            "trigger": {"type": "agent_finished"},
+            "stop_policy": null,
+            "retry_config": null
+        }))
+        .expect("request should deserialize");
+
+        assert_eq!(req.stop_policy, mission_store::StopPolicy::Never);
+        assert_eq!(req.retry_config.max_retries, 3);
+        assert_eq!(req.retry_config.retry_delay_seconds, 60);
+        assert_eq!(req.retry_config.backoff_multiplier, 2.0);
     }
 
     #[test]
