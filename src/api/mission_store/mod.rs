@@ -163,13 +163,18 @@ impl StopPolicy {
     }
 
     #[must_use]
-    pub fn from_db_str(value: &str) -> Self {
+    pub fn try_from_db_str(value: &str) -> Option<Self> {
         match value {
-            "never" => Self::Never,
-            "on_mission_completed" => Self::OnMissionCompleted,
-            "on_terminal_any" => Self::OnTerminalAny,
-            _ => Self::Never,
+            "never" => Some(Self::Never),
+            "on_mission_completed" => Some(Self::OnMissionCompleted),
+            "on_terminal_any" => Some(Self::OnTerminalAny),
+            _ => None,
         }
+    }
+
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Self {
+        Self::try_from_db_str(value).unwrap_or(Self::Never)
     }
 
     #[must_use]
@@ -753,6 +758,7 @@ mod tests {
             StopPolicy::from_db_str("on_terminal_any"),
             StopPolicy::OnTerminalAny
         );
+        assert_eq!(StopPolicy::try_from_db_str("invalid"), None);
         assert_eq!(StopPolicy::from_db_str("invalid"), StopPolicy::Never);
     }
 }
