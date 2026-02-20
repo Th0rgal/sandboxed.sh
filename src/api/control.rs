@@ -371,6 +371,18 @@ async fn reconcile_automation_stop_policies_for_status(
     }
 }
 
+async fn update_mission_status_and_reconcile_stop_policies(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    status: MissionStatus,
+) -> Result<(), String> {
+    mission_store
+        .update_mission_status(mission_id, status)
+        .await?;
+    reconcile_automation_stop_policies_for_status(mission_store, mission_id, status).await;
+    Ok(())
+}
+
 pub(crate) async fn resolve_claudecode_default_model(
     library: &SharedLibrary,
     config_profile: Option<&str>,
@@ -2408,9 +2420,12 @@ fn spawn_control_session(
                             mission.title.as_deref().unwrap_or("Untitled"),
                             mission.updated_at
                         );
-                        if let Err(e) = store
-                            .update_mission_status(mission.id, MissionStatus::Interrupted)
-                            .await
+                        if let Err(e) = update_mission_status_and_reconcile_stop_policies(
+                            &store,
+                            mission.id,
+                            MissionStatus::Interrupted,
+                        )
+                        .await
                         {
                             tracing::warn!(
                                 "Failed to mark orphaned mission {} as interrupted: {}",
@@ -2551,9 +2566,12 @@ async fn stale_mission_cleanup_loop(
                                 mission.title.as_deref().unwrap_or("Untitled"),
                                 mission.updated_at
                             );
-                            if let Err(e) = mission_store
-                                .update_mission_status(mission.id, MissionStatus::Interrupted)
-                                .await
+                            if let Err(e) = update_mission_status_and_reconcile_stop_policies(
+                                &mission_store,
+                                mission.id,
+                                MissionStatus::Interrupted,
+                            )
+                            .await
                             {
                                 tracing::warn!(
                                     "Failed to mark orphaned mission {} as interrupted: {}",
@@ -2595,9 +2613,12 @@ async fn stale_mission_cleanup_loop(
                         mission.updated_at
                     );
 
-                    if let Err(e) = mission_store
-                        .update_mission_status(mission.id, MissionStatus::Completed)
-                        .await
+                    if let Err(e) = update_mission_status_and_reconcile_stop_policies(
+                        &mission_store,
+                        mission.id,
+                        MissionStatus::Completed,
+                    )
+                    .await
                     {
                         tracing::warn!("Failed to auto-close stale mission {}: {}", mission.id, e);
                     } else {
@@ -4162,16 +4183,13 @@ async fn control_actor_loop(
                             }
                         }
 
-                        let result = mission_store
-                            .update_mission_status(id, new_status)
-                            .await;
+                        let result = update_mission_status_and_reconcile_stop_policies(
+                            &mission_store,
+                            id,
+                            new_status,
+                        )
+                        .await;
                         if result.is_ok() {
-                            reconcile_automation_stop_policies_for_status(
-                                &mission_store,
-                                id,
-                                new_status,
-                            )
-                            .await;
                             let _ = events_tx.send(AgentEvent::MissionStatusChanged {
                                 mission_id: id,
                                 status: new_status,
@@ -4271,9 +4289,12 @@ async fn control_actor_loop(
                             runner.cancel();
                             // Update status to Interrupted so the mission can be
                             // resumed later (fixes #149: cancel left status as pending).
-                            if let Err(e) = mission_store
-                                .update_mission_status(mission_id, MissionStatus::Interrupted)
-                                .await
+                            if let Err(e) = update_mission_status_and_reconcile_stop_policies(
+                                &mission_store,
+                                mission_id,
+                                MissionStatus::Interrupted,
+                            )
+                            .await
                             {
                                 tracing::warn!(
                                     "Failed to update cancelled parallel mission status: {}",
@@ -4535,10 +4556,13 @@ async fn control_actor_loop(
                                 // Note: If missions differ, don't persist - the local history
                                 // belongs to current_mission, not running_mission_id
 
-                                if mission_store
-                                    .update_mission_status(mission_id, MissionStatus::Interrupted)
-                                    .await
-                                    .is_ok()
+                                if update_mission_status_and_reconcile_stop_policies(
+                                    &mission_store,
+                                    mission_id,
+                                    MissionStatus::Interrupted,
+                                )
+                                .await
+                                .is_ok()
                                 {
                                     interrupted_ids.push(mission_id);
                                     tracing::info!("Marked mission {} as interrupted", mission_id);
@@ -4572,10 +4596,13 @@ async fn control_actor_loop(
                                     e
                                 );
                             }
-                            if mission_store
-                                .update_mission_status(*mission_id, MissionStatus::Interrupted)
-                                .await
-                                .is_ok()
+                            if update_mission_status_and_reconcile_stop_policies(
+                                &mission_store,
+                                *mission_id,
+                                MissionStatus::Interrupted,
+                            )
+                            .await
+                            .is_ok()
                             {
                                 interrupted_ids.push(*mission_id);
                                 tracing::info!("Marked parallel mission {} as interrupted", mission_id);
@@ -4703,17 +4730,14 @@ async fn control_actor_loop(
                                 }
                             }
 
-                            if mission_store
-                                .update_mission_status(id, new_status)
-                                .await
-                                .is_ok()
+                            if update_mission_status_and_reconcile_stop_policies(
+                                &mission_store,
+                                id,
+                                new_status,
+                            )
+                            .await
+                            .is_ok()
                             {
-                                reconcile_automation_stop_policies_for_status(
-                                    &mission_store,
-                                    id,
-                                    new_status,
-                                )
-                                .await;
                                 // Generate and store mission summary
                                 if let Some(ref summary_text) = summary {
                                     // Extract key files from conversation (look for paths in assistant messages)
@@ -4999,9 +5023,12 @@ async fn control_actor_loop(
                             if let Some(mission_id) = completed_mission_id {
                                 // Update mission status so it doesn't stay Active forever.
                                 // Mark as Failed (resumable) so the user can retry.
-                                if let Err(e) = mission_store
-                                    .update_mission_status(mission_id, MissionStatus::Failed)
-                                    .await
+                                if let Err(e) = update_mission_status_and_reconcile_stop_policies(
+                                    &mission_store,
+                                    mission_id,
+                                    MissionStatus::Failed,
+                                )
+                                .await
                                 {
                                     tracing::warn!("Failed to update mission status after join error: {}", e);
                                 } else {
@@ -5297,9 +5324,12 @@ async fn control_actor_loop(
                                                     "Skipping parallel completion for mission {} because active automations are enabled",
                                                     mission_id
                                                 );
-                                            } else if let Err(e) = mission_store
-                                                .update_mission_status(*mission_id, new_status)
-                                                .await
+                                            } else if let Err(e) = update_mission_status_and_reconcile_stop_policies(
+                                                &mission_store,
+                                                *mission_id,
+                                                new_status,
+                                            )
+                                            .await
                                             {
                                                 tracing::warn!(
                                                     "Failed to update parallel mission status: {}",
