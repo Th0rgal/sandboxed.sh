@@ -152,6 +152,16 @@ pub enum StopPolicy {
     OnTerminalAny,
 }
 
+impl StopPolicy {
+    pub fn disables_on_status(&self, status: MissionStatus) -> bool {
+        match self {
+            Self::Never => false,
+            Self::OnMissionCompleted => status == MissionStatus::Completed,
+            Self::OnTerminalAny => status.is_terminal(),
+        }
+    }
+}
+
 fn default_stop_policy() -> StopPolicy {
     StopPolicy::Never
 }

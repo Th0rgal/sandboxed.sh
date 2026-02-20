@@ -286,29 +286,7 @@ fn automation_blocks_status_transition(
     automation: &mission_store::Automation,
     target_status: MissionStatus,
 ) -> bool {
-    automation.active && !stop_policy_matches_status(&automation.stop_policy, target_status)
-}
-
-fn mission_is_terminal(status: MissionStatus) -> bool {
-    matches!(
-        status,
-        MissionStatus::Completed
-            | MissionStatus::Failed
-            | MissionStatus::Interrupted
-            | MissionStatus::Blocked
-            | MissionStatus::NotFeasible
-    )
-}
-
-fn stop_policy_matches_status(
-    stop_policy: &mission_store::StopPolicy,
-    status: MissionStatus,
-) -> bool {
-    match stop_policy {
-        mission_store::StopPolicy::Never => false,
-        mission_store::StopPolicy::OnMissionCompleted => status == MissionStatus::Completed,
-        mission_store::StopPolicy::OnTerminalAny => mission_is_terminal(status),
-    }
+    automation.active && !automation.stop_policy.disables_on_status(target_status)
 }
 
 fn should_disable_automation_for_stop_policy(
@@ -316,7 +294,7 @@ fn should_disable_automation_for_stop_policy(
     stop_policy: &mission_store::StopPolicy,
     status: MissionStatus,
 ) -> bool {
-    is_active && stop_policy_matches_status(stop_policy, status)
+    is_active && stop_policy.disables_on_status(status)
 }
 
 fn should_disable_automation(
@@ -1097,6 +1075,15 @@ impl std::fmt::Display for MissionStatus {
             Self::NotFeasible => write!(f, "not_feasible"),
             Self::Interrupted => write!(f, "interrupted"),
         }
+    }
+}
+
+impl MissionStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Interrupted | Self::Blocked | Self::NotFeasible
+        )
     }
 }
 
@@ -2716,7 +2703,7 @@ async fn automation_scheduler_loop(
                 }
             };
 
-            if stop_policy_matches_status(&automation.stop_policy, mission.status) {
+            if automation.stop_policy.disables_on_status(mission.status) {
                 tracing::info!(
                     "Disabling automation {} due to stop policy {:?} (mission {} status {:?})",
                     automation.id,
@@ -3094,7 +3081,7 @@ async fn agent_finished_automation_messages(
 
     let mut eligible = Vec::with_capacity(active.len());
     for automation in active {
-        if stop_policy_matches_status(&automation.stop_policy, mission.status) {
+        if automation.stop_policy.disables_on_status(mission.status) {
             tracing::info!(
                 "Disabling automation {} due to stop policy {:?} (mission {} status {:?})",
                 automation.id,
@@ -6177,7 +6164,7 @@ pub async fn create_automation(
 
     let stop_policy = req.stop_policy.unwrap_or(mission_store::StopPolicy::Never);
     let active = match control.mission_store.get_mission(mission_id).await {
-        Ok(Some(mission)) => !stop_policy_matches_status(&stop_policy, mission.status),
+        Ok(Some(mission)) => !stop_policy.disables_on_status(mission.status),
         Ok(None) => true,
         Err(e) => {
             tracing::warn!(
@@ -6564,7 +6551,7 @@ pub async fn webhook_receiver(
             format!("Mission {} not found", mission_id),
         ))?;
 
-    if stop_policy_matches_status(&automation.stop_policy, mission.status) {
+    if automation.stop_policy.disables_on_status(mission.status) {
         let mut updated = automation.clone();
         updated.active = false;
         if let Err(e) = control.mission_store.update_automation(updated).await {
@@ -6888,54 +6875,32 @@ Investigate <service/> failures.
 
     #[test]
     fn test_stop_policy_matches_completed_only_for_completed_policy() {
-        assert!(stop_policy_matches_status(
-            &mission_store::StopPolicy::OnMissionCompleted,
-            MissionStatus::Completed
-        ));
-        assert!(!stop_policy_matches_status(
-            &mission_store::StopPolicy::OnMissionCompleted,
-            MissionStatus::Failed
-        ));
+        assert!(mission_store::StopPolicy::OnMissionCompleted
+            .disables_on_status(MissionStatus::Completed));
+        assert!(!mission_store::StopPolicy::OnMissionCompleted
+            .disables_on_status(MissionStatus::Failed));
     }
 
     #[test]
     fn test_stop_policy_matches_any_terminal_for_terminal_policy() {
-        assert!(stop_policy_matches_status(
-            &mission_store::StopPolicy::OnTerminalAny,
-            MissionStatus::Completed
-        ));
-        assert!(stop_policy_matches_status(
-            &mission_store::StopPolicy::OnTerminalAny,
-            MissionStatus::Failed
-        ));
-        assert!(stop_policy_matches_status(
-            &mission_store::StopPolicy::OnTerminalAny,
-            MissionStatus::Interrupted
-        ));
-        assert!(stop_policy_matches_status(
-            &mission_store::StopPolicy::OnTerminalAny,
-            MissionStatus::Blocked
-        ));
-        assert!(stop_policy_matches_status(
-            &mission_store::StopPolicy::OnTerminalAny,
-            MissionStatus::NotFeasible
-        ));
-        assert!(!stop_policy_matches_status(
-            &mission_store::StopPolicy::OnTerminalAny,
-            MissionStatus::Active
-        ));
+        assert!(
+            mission_store::StopPolicy::OnTerminalAny.disables_on_status(MissionStatus::Completed)
+        );
+        assert!(mission_store::StopPolicy::OnTerminalAny.disables_on_status(MissionStatus::Failed));
+        assert!(
+            mission_store::StopPolicy::OnTerminalAny.disables_on_status(MissionStatus::Interrupted)
+        );
+        assert!(mission_store::StopPolicy::OnTerminalAny.disables_on_status(MissionStatus::Blocked));
+        assert!(
+            mission_store::StopPolicy::OnTerminalAny.disables_on_status(MissionStatus::NotFeasible)
+        );
+        assert!(!mission_store::StopPolicy::OnTerminalAny.disables_on_status(MissionStatus::Active));
     }
 
     #[test]
     fn test_stop_policy_never_never_matches() {
-        assert!(!stop_policy_matches_status(
-            &mission_store::StopPolicy::Never,
-            MissionStatus::Completed
-        ));
-        assert!(!stop_policy_matches_status(
-            &mission_store::StopPolicy::Never,
-            MissionStatus::Failed
-        ));
+        assert!(!mission_store::StopPolicy::Never.disables_on_status(MissionStatus::Completed));
+        assert!(!mission_store::StopPolicy::Never.disables_on_status(MissionStatus::Failed));
     }
 
     #[test]
