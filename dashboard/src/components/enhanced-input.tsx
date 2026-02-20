@@ -81,6 +81,8 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
 
   // Load commands and agents on mount or when backend changes
   useEffect(() => {
+    let isMounted = true;
+
     async function loadData() {
       // Fetch builtin commands from backend API
       let builtinCommands: CommandSummary[] = [];
@@ -109,23 +111,35 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
       // Fetch library commands
       try {
         const libraryCommands = await listLibraryCommands();
-        setCommands([...builtinCommands, ...libraryCommands]);
+        if (isMounted) {
+          setCommands([...builtinCommands, ...libraryCommands]);
+        }
       } catch {
-        setCommands(builtinCommands);
+        if (isMounted) {
+          setCommands(builtinCommands);
+        }
       }
 
       // Fetch agents
       try {
         const agentsData = await getVisibleAgents();
         const agentNames = parseAgentNames(agentsData);
-        setAgents(agentNames);
+        if (isMounted) {
+          setAgents(agentNames);
+        }
       } catch {
         // Use empty array on failure - backend validates agents anyway
         // This prevents suggesting non-existent agents from stale fallbacks
-        setAgents([]);
+        if (isMounted) {
+          setAgents([]);
+        }
       }
     }
     loadData();
+
+    return () => {
+      isMounted = false;
+    };
   }, [backend]);
 
   const parseAgentNames = (payload: unknown): string[] => {
