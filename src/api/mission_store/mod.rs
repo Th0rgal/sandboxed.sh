@@ -141,10 +141,11 @@ pub enum TriggerType {
 }
 
 /// Stop policy for automation lifecycle.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StopPolicy {
     /// Never auto-disable this automation.
+    #[default]
     Never,
     /// Auto-disable when mission reaches completed status.
     OnMissionCompleted,
@@ -185,10 +186,6 @@ impl StopPolicy {
             Self::OnTerminalAny => status.is_terminal(),
         }
     }
-}
-
-fn default_stop_policy() -> StopPolicy {
-    StopPolicy::Never
 }
 
 /// Retry configuration for automation execution.
@@ -241,7 +238,7 @@ pub struct Automation {
     #[serde(default)]
     pub retry_config: RetryConfig,
     /// Auto-stop behavior when mission reaches terminal state.
-    #[serde(default = "default_stop_policy")]
+    #[serde(default)]
     pub stop_policy: StopPolicy,
 }
 
@@ -760,5 +757,6 @@ mod tests {
         );
         assert_eq!(StopPolicy::try_from_db_str("invalid"), None);
         assert_eq!(StopPolicy::from_db_str("invalid"), StopPolicy::Never);
+        assert_eq!(StopPolicy::default(), StopPolicy::Never);
     }
 }
