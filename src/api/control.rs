@@ -3149,6 +3149,21 @@ async fn resolve_automation_command(
     Some(substitute_variables(&command_content, &context))
 }
 
+fn active_agent_finished_automations(
+    automations: Vec<mission_store::Automation>,
+) -> Vec<mission_store::Automation> {
+    automations
+        .into_iter()
+        .filter(|automation| {
+            automation.active
+                && matches!(
+                    automation.trigger,
+                    mission_store::TriggerType::AgentFinished
+                )
+        })
+        .collect()
+}
+
 async fn agent_finished_automation_messages(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
@@ -3156,7 +3171,7 @@ async fn agent_finished_automation_messages(
     workspaces: &workspace::SharedWorkspaceStore,
 ) -> Vec<String> {
     use super::automation_variables::{substitute_variables, SubstitutionContext};
-    use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus, TriggerType};
+    use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus};
 
     let automations = match mission_store.get_mission_automations(mission_id).await {
         Ok(list) => list,
@@ -3170,8 +3185,7 @@ async fn agent_finished_automation_messages(
         }
     };
 
-    let mut active: Vec<super::mission_store::Automation> =
-        automations.into_iter().filter(|a| a.active).collect();
+    let mut active = active_agent_finished_automations(automations);
 
     if active.is_empty() {
         return Vec::new();
@@ -3203,9 +3217,7 @@ async fn agent_finished_automation_messages(
         {
             continue;
         }
-        if matches!(automation.trigger, TriggerType::AgentFinished) {
-            eligible.push(automation);
-        }
+        eligible.push(automation);
     }
     active = eligible;
 
@@ -7212,6 +7224,49 @@ Investigate <service/> failures.
         assert!(webhook_automation.should_auto_disable_for_status(MissionStatus::Failed));
         assert!(agent_finished_automation.should_auto_disable_for_status(MissionStatus::Completed));
         assert!(!agent_finished_automation.should_auto_disable_for_status(MissionStatus::Failed));
+    }
+
+    #[test]
+    fn test_active_agent_finished_automations_filters_by_active_and_trigger() {
+        let mission_id = Uuid::new_v4();
+        let now = mission_store::now_string();
+        let base = mission_store::Automation {
+            id: Uuid::new_v4(),
+            mission_id,
+            command_source: mission_store::CommandSource::Inline {
+                content: "echo run".to_string(),
+            },
+            trigger: mission_store::TriggerType::AgentFinished,
+            variables: std::collections::HashMap::new(),
+            active: true,
+            stop_policy: mission_store::StopPolicy::Never,
+            created_at: now,
+            last_triggered_at: None,
+            retry_config: mission_store::RetryConfig::default(),
+        };
+
+        let mut inactive_agent_finished = base.clone();
+        inactive_agent_finished.id = Uuid::new_v4();
+        inactive_agent_finished.active = false;
+
+        let mut active_webhook = base.clone();
+        active_webhook.id = Uuid::new_v4();
+        active_webhook.trigger = mission_store::TriggerType::Webhook {
+            config: mission_store::WebhookConfig {
+                webhook_id: "hook-keep-out".to_string(),
+                secret: None,
+                variable_mappings: std::collections::HashMap::new(),
+            },
+        };
+
+        let filtered = active_agent_finished_automations(vec![
+            base.clone(),
+            inactive_agent_finished,
+            active_webhook,
+        ]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, base.id);
     }
 
     #[test]
