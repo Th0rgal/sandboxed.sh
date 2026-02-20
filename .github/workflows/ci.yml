@@ -88,6 +88,17 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  capability-matrix:
+    name: Capability Matrix Contract Check
+    runs-on: ubuntu-latest
+    # Skip CI on draft PRs unless explicitly requested
+    if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate capability matrix and surface contract evidence
+        run: scripts/check-capability-matrix.sh
+
   dashboard-test:
     name: Dashboard Unit Tests
     runs-on: ubuntu-latest

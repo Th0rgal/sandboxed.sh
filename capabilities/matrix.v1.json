@@ -1,0 +1,156 @@
+{
+  "version": 1,
+  "updated_at": "2026-02-20",
+  "capabilities": [
+    {
+      "id": "mission_history",
+      "description": "Mission history is persisted by the backend and consumed by web and iOS clients.",
+      "api": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "src/api/mission_store/mod.rs",
+            "pattern": "pub history: Vec<MissionHistoryEntry>,"
+          }
+        ]
+      },
+      "web": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "dashboard/src/lib/api/missions.ts",
+            "pattern": "history: MissionHistoryEntry[];"
+          }
+        ]
+      },
+      "ios": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "ios_dashboard/SandboxedDashboard/Models/Mission.swift",
+            "pattern": "let history: [MissionHistoryEntry]"
+          }
+        ]
+      }
+    },
+    {
+      "id": "thinking_stream",
+      "description": "Thinking events are exposed by the API and rendered on web and iOS.",
+      "api": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "src/api/control.rs",
+            "pattern": "AgentEvent::Thinking { done, mission_id, .. } => {"
+          }
+        ]
+      },
+      "web": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "dashboard/src/lib/api.ts",
+            "pattern": "| { type: \"thinking\"; content: string; done: boolean; mission_id?: string }"
+          }
+        ]
+      },
+      "ios": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "ios_dashboard/SandboxedDashboard/Views/Control/ControlView.swift",
+            "pattern": "case \"thinking\":"
+          }
+        ]
+      }
+    },
+    {
+      "id": "automations",
+      "description": "Mission automations APIs are available and consumed on web and iOS.",
+      "api": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "src/api/routes.rs",
+            "pattern": "\"/api/control/missions/:id/automations\""
+          }
+        ]
+      },
+      "web": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "dashboard/src/lib/api/automations.ts",
+            "pattern": "/api/control/missions/${missionId}/automations"
+          }
+        ]
+      },
+      "ios": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "ios_dashboard/SandboxedDashboard/Services/APIService.swift",
+            "pattern": "func listMissionAutomations(missionId: String) async throws -> [Automation]"
+          }
+        ]
+      }
+    },
+    {
+      "id": "routing_controls",
+      "description": "Model routing controls are available in API and web dashboard.",
+      "api": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "src/api/routes.rs",
+            "pattern": ".nest(\"/api/model-routing\", model_routing_api::routes())"
+          }
+        ]
+      },
+      "web": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "dashboard/src/lib/api/model-routing.ts",
+            "pattern": "/api/model-routing/chains"
+          }
+        ]
+      },
+      "ios": {
+        "status": "deferred",
+        "note": "No iOS routing controls shipped yet; defer explicitly until iOS parity work lands."
+      }
+    },
+    {
+      "id": "cost_display",
+      "description": "Cost telemetry is exposed by API and displayed on web and iOS clients.",
+      "api": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "src/api/routes.rs",
+            "pattern": "total_cost_cents,"
+          }
+        ]
+      },
+      "web": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "dashboard/src/lib/api.ts",
+            "pattern": "total_cost_cents: number;"
+          }
+        ]
+      },
+      "ios": {
+        "status": "supported",
+        "evidence": [
+          {
+            "path": "ios_dashboard/SandboxedDashboard/Models/ChatMessage.swift",
+            "pattern": "case assistant(success: Bool, costCents: Int, model: String?, sharedFiles: [SharedFile]?)"
+          }
+        ]
+      }
+    }
+  ]
+}
