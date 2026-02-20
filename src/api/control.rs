@@ -400,6 +400,38 @@ async fn disable_automation_when_stop_policy_matches(
     }
 }
 
+async fn enforce_stop_policy_after_create(
+    mission_store: &Arc<dyn MissionStore>,
+    automation: &mut mission_store::Automation,
+) {
+    if !automation.active {
+        return;
+    }
+
+    let Some(mission_status) = stop_policy_matched_mission_status(
+        mission_store,
+        automation.mission_id,
+        automation.stop_policy,
+        StopPolicyContext::CreateAutomation,
+    )
+    .await
+    else {
+        return;
+    };
+
+    if disable_automation_when_stop_policy_matches(
+        mission_store,
+        automation,
+        mission_status,
+        StopPolicyContext::CreateAutomation,
+    )
+    .await
+    .was_deactivated()
+    {
+        automation.active = false;
+    }
+}
+
 async fn reconcile_automation_stop_policies_for_status(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
@@ -6255,11 +6287,13 @@ pub async fn create_automation(
         retry_config: req.retry_config,
     };
 
-    let automation = control
+    let mut automation = control
         .mission_store
         .create_automation(automation)
         .await
         .map_err(internal_error)?;
+
+    enforce_stop_policy_after_create(&control.mission_store, &mut automation).await;
 
     // If start_immediately is requested for agent_finished triggers, fire the
     // first execution right away by resolving the command and sending it as a
@@ -7077,6 +7111,61 @@ Investigate <service/> failures.
         .await;
 
         assert_eq!(outcome, StopPolicyDisableOutcome::NotMatched);
+    }
+
+    #[tokio::test]
+    async fn test_enforce_stop_policy_after_create_deactivates_after_status_change() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            mission_store::SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+                .await
+                .expect("sqlite store"),
+        );
+        let mission = store
+            .create_mission(Some("stop policy race"), None, None, None, None, None, None)
+            .await
+            .expect("mission created");
+
+        let created = store
+            .create_automation(mission_store::Automation {
+                id: Uuid::new_v4(),
+                mission_id: mission.id,
+                command_source: mission_store::CommandSource::Inline {
+                    content: "echo run".to_string(),
+                },
+                trigger: mission_store::TriggerType::Webhook {
+                    config: mission_store::WebhookConfig {
+                        webhook_id: "post-create-check".to_string(),
+                        secret: None,
+                        variable_mappings: std::collections::HashMap::new(),
+                    },
+                },
+                variables: std::collections::HashMap::new(),
+                active: true,
+                stop_policy: mission_store::StopPolicy::OnMissionCompleted,
+                created_at: mission_store::now_string(),
+                last_triggered_at: None,
+                retry_config: mission_store::RetryConfig::default(),
+            })
+            .await
+            .expect("automation created");
+
+        store
+            .update_mission_status(mission.id, MissionStatus::Completed)
+            .await
+            .expect("mission marked completed");
+
+        let mission_store: Arc<dyn mission_store::MissionStore> = store.clone();
+        let mut automation = created;
+        enforce_stop_policy_after_create(&mission_store, &mut automation).await;
+
+        assert!(!automation.active);
+        let persisted = store
+            .get_automation(automation.id)
+            .await
+            .expect("automation lookup should succeed")
+            .expect("automation should exist");
+        assert!(!persisted.active);
     }
 
     #[test]
