@@ -14,11 +14,14 @@ if [[ ! -f "${MATRIX_FILE}" ]]; then
   exit 1
 fi
 
-jq -e '
+if ! jq -e '
   .version == 1 and
   (.capabilities | type == "array") and
   (.capabilities | length > 0)
-' "${MATRIX_FILE}" >/dev/null
+' "${MATRIX_FILE}" >/dev/null; then
+  echo "error: capability matrix must have version=1 and a non-empty capabilities array" >&2
+  exit 1
+fi
 
 for surface in api web ios; do
   supported_count="$(jq -r --arg s "${surface}" '
@@ -56,7 +59,17 @@ while IFS=$'\t' read -r cap_id surface status; do
     exit 1
   fi
 
-  while IFS=$'\t' read -r rel_path pattern; do
+  while IFS= read -r evidence_json; do
+    rel_path="$(jq -r '.path // ""' <<<"${evidence_json}")"
+    pattern="$(jq -r '.pattern // ""' <<<"${evidence_json}")"
+    if [[ -z "${rel_path}" ]]; then
+      echo "error: ${cap_id}/${surface} evidence entry is missing path" >&2
+      exit 1
+    fi
+    if [[ -z "${pattern}" ]]; then
+      echo "error: ${cap_id}/${surface} evidence pattern must be non-empty" >&2
+      exit 1
+    fi
     abs_path="${ROOT_DIR}/${rel_path}"
     if [[ ! -f "${abs_path}" ]]; then
       echo "error: ${cap_id}/${surface} evidence path missing: ${rel_path}" >&2
@@ -66,12 +79,11 @@ while IFS=$'\t' read -r cap_id surface status; do
       echo "error: ${cap_id}/${surface} evidence pattern not found in ${rel_path}" >&2
       exit 1
     fi
-  done < <(jq -r --arg id "${cap_id}" --arg s "${surface}" '
+  done < <(jq -c --arg id "${cap_id}" --arg s "${surface}" '
     .capabilities[]
     | select(.id == $id)
     | .[$s].evidence[]
-    | [.path, .pattern]
-    | @tsv
+    | {path, pattern}
   ' "${MATRIX_FILE}")
 done < <(jq -r '
   .capabilities[]
