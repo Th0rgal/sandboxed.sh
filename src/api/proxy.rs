@@ -121,19 +121,16 @@ fn completions_url(provider_type: ProviderType, account_base_url: Option<&str>) 
     Some(format!("{}/chat/completions", base))
 }
 
-fn can_route_without_api_key(provider_type: ProviderType, has_oauth: bool) -> bool {
-    provider_type == ProviderType::Google && has_oauth
-}
-
 fn has_routable_proxy_credentials(
     provider_type: ProviderType,
     has_api_key: bool,
     has_oauth: bool,
 ) -> bool {
-    if provider_type == ProviderType::Custom {
-        return true;
+    match provider_type {
+        ProviderType::Custom => true,
+        ProviderType::Google => has_api_key || has_oauth,
+        _ => has_api_key,
     }
-    has_api_key || can_route_without_api_key(provider_type, has_oauth)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -330,7 +327,7 @@ async fn chat_completions(
             continue;
         }
 
-        let use_google_oauth_adapter = can_route_without_api_key(provider_type, entry.has_oauth);
+        let use_google_oauth_adapter = provider_type == ProviderType::Google && entry.has_oauth;
         let (url, upstream_body, extra_headers) = if use_google_oauth_adapter {
             let access_token = match get_google_access_token().await {
                 Ok(token) => token,
