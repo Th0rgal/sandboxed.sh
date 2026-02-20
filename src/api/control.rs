@@ -309,6 +309,68 @@ fn should_disable_automation_for_stop_policy(
     is_active && stop_policy_matches_status(stop_policy, status)
 }
 
+fn should_disable_automation(
+    automation: &mission_store::Automation,
+    status: MissionStatus,
+) -> bool {
+    should_disable_automation_for_stop_policy(automation.active, &automation.stop_policy, status)
+}
+
+async fn reconcile_automation_stop_policies_for_status(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    status: MissionStatus,
+) {
+    let automations = match mission_store.get_mission_automations(mission_id).await {
+        Ok(automations) => automations,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to load automations for mission {} during stop policy reconciliation: {}",
+                mission_id,
+                err
+            );
+            return;
+        }
+    };
+
+    let mut disabled_count = 0usize;
+    for mut automation in automations {
+        if !should_disable_automation(&automation, status) {
+            continue;
+        }
+
+        automation.active = false;
+        match mission_store.update_automation(automation.clone()).await {
+            Ok(()) => {
+                disabled_count += 1;
+                tracing::info!(
+                    "Disabled automation {} due to stop policy {:?} on mission {} status {:?}",
+                    automation.id,
+                    automation.stop_policy,
+                    mission_id,
+                    status
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to disable automation {} during stop policy reconciliation: {}",
+                    automation.id,
+                    err
+                );
+            }
+        }
+    }
+
+    if disabled_count > 0 {
+        tracing::info!(
+            "Disabled {} automation(s) for mission {} after status change to {:?}",
+            disabled_count,
+            mission_id,
+            status
+        );
+    }
+}
+
 pub(crate) async fn resolve_claudecode_default_model(
     library: &SharedLibrary,
     config_profile: Option<&str>,
@@ -4104,6 +4166,12 @@ async fn control_actor_loop(
                             .update_mission_status(id, new_status)
                             .await;
                         if result.is_ok() {
+                            reconcile_automation_stop_policies_for_status(
+                                &mission_store,
+                                id,
+                                new_status,
+                            )
+                            .await;
                             let _ = events_tx.send(AgentEvent::MissionStatusChanged {
                                 mission_id: id,
                                 status: new_status,
@@ -4640,6 +4708,12 @@ async fn control_actor_loop(
                                 .await
                                 .is_ok()
                             {
+                                reconcile_automation_stop_policies_for_status(
+                                    &mission_store,
+                                    id,
+                                    new_status,
+                                )
+                                .await;
                                 // Generate and store mission summary
                                 if let Some(ref summary_text) = summary {
                                     // Extract key files from conversation (look for paths in assistant messages)
@@ -6830,6 +6904,61 @@ Investigate <service/> failures.
         assert!(!should_disable_automation_for_stop_policy(
             true,
             &mission_store::StopPolicy::OnMissionCompleted,
+            MissionStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn test_should_disable_automation_applies_to_non_interval_triggers() {
+        let mission_id = Uuid::new_v4();
+        let now = mission_store::now_string();
+
+        let webhook_automation = mission_store::Automation {
+            id: Uuid::new_v4(),
+            mission_id,
+            command_source: mission_store::CommandSource::Inline {
+                content: "echo webhook".to_string(),
+            },
+            trigger: mission_store::TriggerType::Webhook {
+                config: mission_store::WebhookConfig {
+                    webhook_id: "hook-1".to_string(),
+                    secret: None,
+                    variable_mappings: std::collections::HashMap::new(),
+                },
+            },
+            variables: std::collections::HashMap::new(),
+            active: true,
+            stop_policy: mission_store::StopPolicy::OnTerminalAny,
+            created_at: now.clone(),
+            last_triggered_at: None,
+            retry_config: mission_store::RetryConfig::default(),
+        };
+
+        let agent_finished_automation = mission_store::Automation {
+            id: Uuid::new_v4(),
+            mission_id,
+            command_source: mission_store::CommandSource::Inline {
+                content: "echo finished".to_string(),
+            },
+            trigger: mission_store::TriggerType::AgentFinished,
+            variables: std::collections::HashMap::new(),
+            active: true,
+            stop_policy: mission_store::StopPolicy::OnMissionCompleted,
+            created_at: now,
+            last_triggered_at: None,
+            retry_config: mission_store::RetryConfig::default(),
+        };
+
+        assert!(should_disable_automation(
+            &webhook_automation,
+            MissionStatus::Failed
+        ));
+        assert!(should_disable_automation(
+            &agent_finished_automation,
+            MissionStatus::Completed
+        ));
+        assert!(!should_disable_automation(
+            &agent_finished_automation,
             MissionStatus::Failed
         ));
     }
