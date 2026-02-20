@@ -9760,7 +9760,10 @@ pub async fn run_codex_turn(
             Some(event) = event_rx.recv() => {
                 match event {
                     ExecutionEvent::TextDelta { content } => {
-                        assistant_message.push_str(&content);
+                        // For Codex backend, TextDelta is handled as the latest snapshot for
+                        // the currently active assistant message item. Replacing here avoids
+                        // concatenating intermediate assistant updates into the final message.
+                        assistant_message = content;
                         let _ = events_tx.send(AgentEvent::TextDelta {
                             content: assistant_message.clone(),
                             mission_id: Some(mission_id),

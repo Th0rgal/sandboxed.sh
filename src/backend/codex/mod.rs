@@ -159,26 +159,18 @@ fn convert_codex_event(
     event: CodexEvent,
     item_content_cache: &mut std::collections::HashMap<String, String>,
 ) -> Vec<ExecutionEvent> {
-    fn emit_text_delta(
+    fn emit_text_snapshot(
         results: &mut Vec<ExecutionEvent>,
         item_content_cache: &mut std::collections::HashMap<String, String>,
         item_id: &str,
         text: &str,
     ) {
-        let last_content = item_content_cache.get(item_id);
-        let new_content = if let Some(last) = last_content {
-            if text.starts_with(last) {
-                text[last.len()..].to_string()
-            } else {
-                text.to_string()
-            }
-        } else {
-            text.to_string()
-        };
-
-        if !new_content.is_empty() {
+        // Codex message items can represent multiple assistant updates within one turn.
+        // Emit the full per-item snapshot so the caller can treat each item as a standalone
+        // assistant message and avoid concatenating progress updates into the final output.
+        if !text.is_empty() && item_content_cache.get(item_id).map(|v| v.as_str()) != Some(text) {
             results.push(ExecutionEvent::TextDelta {
-                content: new_content,
+                content: text.to_string(),
             });
         }
 
@@ -434,7 +426,7 @@ fn convert_codex_event(
                 "message" | "agent_message" | "assistant_message" => {
                     // Extract message content
                     if let Some(text) = extract_text_field(&item.data) {
-                        emit_text_delta(&mut results, item_content_cache, &item.id, &text);
+                        emit_text_snapshot(&mut results, item_content_cache, &item.id, &text);
                     }
                 }
                 "reasoning" | "thinking" => {
@@ -510,7 +502,7 @@ fn convert_codex_event(
                 }
                 "message" | "agent_message" | "assistant_message" => {
                     if let Some(text) = extract_text_field(&item.data) {
-                        emit_text_delta(&mut results, item_content_cache, &item.id, &text);
+                        emit_text_snapshot(&mut results, item_content_cache, &item.id, &text);
                     }
                 }
                 "reasoning" | "thinking" => {
@@ -997,9 +989,9 @@ mod tests {
     }
 
     #[test]
-    fn convert_codex_event_text_delta_deduplication() {
-        // Two ItemUpdated events where the second text starts with the first.
-        // The second call should only produce the delta suffix.
+    fn convert_codex_event_text_snapshot_updates() {
+        // Two ItemUpdated events where the second text extends the first.
+        // The second call should produce the full updated snapshot.
         let event1: CodexEvent = serde_json::from_value(json!({
             "type": "item.updated",
             "item": {
@@ -1029,9 +1021,37 @@ mod tests {
         let events2 = convert_codex_event(event2, &mut cache);
         assert_eq!(events2.len(), 1);
         match &events2[0] {
-            ExecutionEvent::TextDelta { content } => assert_eq!(content, " world"),
+            ExecutionEvent::TextDelta { content } => assert_eq!(content, "Hello world"),
             other => panic!("Expected TextDelta, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn convert_codex_event_text_snapshot_skips_unchanged() {
+        let event1: CodexEvent = serde_json::from_value(json!({
+            "type": "item.updated",
+            "item": {
+                "id": "msg_same",
+                "type": "message",
+                "text": "No change"
+            }
+        }))
+        .unwrap();
+        let event2: CodexEvent = serde_json::from_value(json!({
+            "type": "item.updated",
+            "item": {
+                "id": "msg_same",
+                "type": "message",
+                "text": "No change"
+            }
+        }))
+        .unwrap();
+
+        let mut cache = HashMap::new();
+        let events1 = convert_codex_event(event1, &mut cache);
+        assert_eq!(events1.len(), 1);
+        let events2 = convert_codex_event(event2, &mut cache);
+        assert!(events2.is_empty());
     }
 
     #[test]
