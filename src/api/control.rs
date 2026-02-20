@@ -6144,6 +6144,20 @@ pub async fn create_automation(
             None
         };
 
+    let stop_policy = req.stop_policy.unwrap_or(mission_store::StopPolicy::Never);
+    let active = match control.mission_store.get_mission(mission_id).await {
+        Ok(Some(mission)) => !stop_policy_matches_status(&stop_policy, mission.status),
+        Ok(None) => true,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to load mission {} while evaluating stop policy on automation create: {}",
+                mission_id,
+                e
+            );
+            true
+        }
+    };
+
     // Build the complete Automation struct
     let automation = mission_store::Automation {
         id: Uuid::new_v4(),
@@ -6151,41 +6165,24 @@ pub async fn create_automation(
         command_source: req.command_source,
         trigger,
         variables: req.variables,
-        active: true,
-        stop_policy: req.stop_policy.unwrap_or(mission_store::StopPolicy::Never),
+        active,
+        stop_policy,
         created_at: mission_store::now_string(),
         last_triggered_at,
         retry_config: req.retry_config.unwrap_or_default(),
     };
 
-    let mut automation = control
+    let automation = control
         .mission_store
         .create_automation(automation)
         .await
         .map_err(internal_error)?;
 
-    // Enforce stop policy immediately on create for all trigger types so we
-    // don't persist an automation as active when its stop condition is already met.
-    if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
-        if stop_policy_matches_status(&automation.stop_policy, mission.status) {
-            let mut updated = automation.clone();
-            updated.active = false;
-            if let Err(e) = control.mission_store.update_automation(updated).await {
-                tracing::warn!(
-                    "Failed to disable automation {} on create due to stop policy: {}",
-                    automation.id,
-                    e
-                );
-            }
-            automation.active = false;
-            return Ok(Json(automation));
-        }
-    }
-
     // If start_immediately is requested for agent_finished triggers, fire the
     // first execution right away by resolving the command and sending it as a
     // user message to the control actor.
     if start_immediately
+        && automation.active
         && matches!(
             automation.trigger,
             mission_store::TriggerType::AgentFinished
