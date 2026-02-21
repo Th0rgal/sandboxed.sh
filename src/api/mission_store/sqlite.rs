@@ -1648,29 +1648,32 @@ impl MissionStore for SqliteMissionStore {
         let conn = self.conn.lock().await;
 
         // Prefer normalized cost.amount_cents while remaining backward-compatible
-        // with legacy flat cost_cents metadata.
+        // with legacy flat cost_cents metadata. Clamp malformed negative values
+        // to zero so aggregate cost invariants remain non-negative.
         let query = r#"
+            WITH assistant_costs AS (
+                SELECT CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) AS raw_cost
+                FROM mission_events
+                WHERE event_type = 'assistant_message'
+            )
             SELECT COALESCE(
-                SUM(
-                    CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    )
-                ),
+                SUM(CASE WHEN raw_cost > 0 THEN raw_cost ELSE 0 END),
                 0
             ) as total_cost
-            FROM mission_events
-            WHERE event_type = 'assistant_message'
+            FROM assistant_costs
         "#;
 
         let total: i64 = conn
             .query_row(query, [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
 
-        Ok(total as u64)
+        u64::try_from(total).map_err(|_| format!("negative aggregate cost is invalid: {total}"))
     }
 
     async fn create_automation(&self, automation: Automation) -> Result<Automation, String> {
@@ -2273,5 +2276,62 @@ mod tests {
             .await
             .expect("total cost should calculate");
         assert_eq!(total, 180);
+    }
+
+    #[tokio::test]
+    async fn get_total_cost_cents_clamps_negative_values_to_zero() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Cost mission"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        let conn = store.conn.lock().await;
+        let query = r#"
+            INSERT INTO mission_events (
+                mission_id, sequence, event_type, timestamp, metadata
+            ) VALUES (?1, ?2, 'assistant_message', ?3, ?4)
+        "#;
+
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                1i64,
+                "2026-02-21T00:00:00Z",
+                json!({ "cost": { "amount_cents": -50 } }).to_string()
+            ],
+        )
+        .expect("insert malformed negative normalized");
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                2i64,
+                "2026-02-21T00:00:01Z",
+                json!({ "cost_cents": -10 }).to_string()
+            ],
+        )
+        .expect("insert malformed negative legacy");
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                3i64,
+                "2026-02-21T00:00:02Z",
+                json!({ "cost": { "amount_cents": 25 } }).to_string()
+            ],
+        )
+        .expect("insert valid normalized");
+        drop(conn);
+
+        let total = store
+            .get_total_cost_cents()
+            .await
+            .expect("total cost should calculate");
+        assert_eq!(total, 25);
     }
 }
