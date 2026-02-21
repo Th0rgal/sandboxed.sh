@@ -10342,9 +10342,10 @@ mod tests {
         is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
         opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        resolve_cost_cents_and_source, running_health, sanitized_opencode_stdout, stall_severity,
-        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
-        summarize_recent_opencode_stderr, sync_opencode_agent_config, MissionHealth,
+        preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
+        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
+        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
+        MissionHealth,
         MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
         STALL_WARN_SECS,
     };
