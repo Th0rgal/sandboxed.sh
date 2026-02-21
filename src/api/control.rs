@@ -426,7 +426,7 @@ async fn enforce_stop_policy_after_create(
         StopPolicyContext::CreateAutomation,
     )
     .await
-    .was_deactivated()
+    .should_skip_execution()
     {
         automation.active = false;
     }
@@ -7178,6 +7178,39 @@ Investigate <service/> failures.
             .expect("automation lookup should succeed")
             .expect("automation should exist");
         assert!(!persisted.active);
+    }
+
+    #[tokio::test]
+    async fn test_enforce_stop_policy_after_create_marks_in_memory_inactive_on_disable_failure() {
+        let store = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(
+                Some("stop policy disable failure"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Completed)
+            .await
+            .expect("mission marked completed");
+
+        // This automation is intentionally not persisted so active-only update fails.
+        let mut automation = mission_store::Automation {
+            mission_id: mission.id,
+            stop_policy: mission_store::StopPolicy::OnMissionCompleted,
+            ..sample_test_automation()
+        };
+        let mission_store: Arc<dyn mission_store::MissionStore> = store.clone();
+
+        enforce_stop_policy_after_create(mission_store.as_ref(), &mut automation).await;
+
+        assert!(!automation.active);
     }
 
     #[test]
