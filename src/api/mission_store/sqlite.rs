@@ -1647,13 +1647,17 @@ impl MissionStore for SqliteMissionStore {
     async fn get_total_cost_cents(&self) -> Result<u64, String> {
         let conn = self.conn.lock().await;
 
-        // Use SQLite JSON1 extension to extract cost_cents from metadata
-        // and sum across all assistant_message events
+        // Prefer normalized cost.amount_cents while remaining backward-compatible
+        // with legacy flat cost_cents metadata.
         let query = r#"
             SELECT COALESCE(
                 SUM(
                     CAST(
-                        COALESCE(json_extract(metadata, '$.cost_cents'), 0) AS INTEGER
+                        COALESCE(
+                            json_extract(metadata, '$.cost.amount_cents'),
+                            json_extract(metadata, '$.cost_cents'),
+                            0
+                        ) AS INTEGER
                     )
                 ),
                 0
@@ -2136,9 +2140,11 @@ impl MissionStore for SqliteMissionStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{assistant_message_metadata, AssistantMessageMetadataInput};
+    use super::{assistant_message_metadata, AssistantMessageMetadataInput, SqliteMissionStore};
     use crate::agents::CostSource;
+    use crate::api::mission_store::MissionStore;
     use crate::cost::TokenUsage;
+    use rusqlite::params;
     use serde_json::json;
 
     #[test]
@@ -2206,5 +2212,66 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[tokio::test]
+    async fn get_total_cost_cents_prefers_normalized_shape_with_legacy_fallback() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Cost mission"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        let conn = store.conn.lock().await;
+        let query = r#"
+            INSERT INTO mission_events (
+                mission_id, sequence, event_type, timestamp, metadata
+            ) VALUES (?1, ?2, 'assistant_message', ?3, ?4)
+        "#;
+
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                1i64,
+                "2026-02-21T00:00:00Z",
+                json!({
+                    "cost": { "amount_cents": 150 },
+                    "cost_cents": 99
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert normalized + legacy");
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                2i64,
+                "2026-02-21T00:00:01Z",
+                json!({ "cost_cents": 25 }).to_string()
+            ],
+        )
+        .expect("insert legacy");
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                3i64,
+                "2026-02-21T00:00:02Z",
+                json!({ "cost": { "amount_cents": 5 } }).to_string()
+            ],
+        )
+        .expect("insert normalized");
+        drop(conn);
+
+        let total = store
+            .get_total_cost_cents()
+            .await
+            .expect("total cost should calculate");
+        assert_eq!(total, 180);
     }
 }

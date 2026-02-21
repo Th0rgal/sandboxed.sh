@@ -436,7 +436,7 @@ pub trait MissionStore: Send + Sync {
     }
 
     /// Get total cost in cents across all missions.
-    /// Aggregates cost_cents from all assistant_message events.
+    /// Aggregates assistant_message metadata cost across all events.
     async fn get_total_cost_cents(&self) -> Result<u64, String> {
         Ok(0)
     }
