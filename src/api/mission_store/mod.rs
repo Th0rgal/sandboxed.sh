@@ -168,16 +168,6 @@ impl StopPolicy {
     }
 
     #[must_use]
-    pub fn try_from_db_str(value: &str) -> Option<Self> {
-        value.parse().ok()
-    }
-
-    #[must_use]
-    pub fn from_db_str(value: &str) -> Self {
-        value.parse().unwrap_or_default()
-    }
-
-    #[must_use]
     pub fn disables_on_status(self, status: MissionStatus) -> bool {
         match self {
             Self::Never => false,
@@ -759,19 +749,20 @@ mod tests {
         );
         assert_eq!(StopPolicy::OnTerminalAny.as_db_str(), "on_terminal_any");
 
-        assert_eq!(StopPolicy::from_db_str("never"), StopPolicy::Never);
-        assert_eq!(
-            StopPolicy::from_db_str("on_mission_completed"),
-            StopPolicy::OnMissionCompleted
-        );
-        assert_eq!(
-            StopPolicy::from_db_str("on_terminal_any"),
-            StopPolicy::OnTerminalAny
-        );
-        assert_eq!(StopPolicy::try_from_db_str("invalid"), None);
-        assert_eq!(StopPolicy::from_db_str("invalid"), StopPolicy::Never);
         assert_eq!("never".parse::<StopPolicy>(), Ok(StopPolicy::Never));
+        assert_eq!(
+            "on_mission_completed".parse::<StopPolicy>(),
+            Ok(StopPolicy::OnMissionCompleted)
+        );
+        assert_eq!(
+            "on_terminal_any".parse::<StopPolicy>(),
+            Ok(StopPolicy::OnTerminalAny)
+        );
         assert!("invalid".parse::<StopPolicy>().is_err());
+        assert_eq!(
+            "invalid".parse::<StopPolicy>().unwrap_or_default(),
+            StopPolicy::Never
+        );
         assert_eq!(StopPolicy::default(), StopPolicy::Never);
     }
 }
