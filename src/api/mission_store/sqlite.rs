@@ -16,6 +16,60 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 type LegacyAutomationRow = (String, String, String, i64, i64, String, Option<String>);
+const COST_CURRENCY_USD: &str = "USD";
+
+#[derive(serde::Serialize)]
+struct AssistantCostMetadata {
+    amount_cents: u64,
+    currency: &'static str,
+    source: crate::agents::CostSource,
+}
+
+#[derive(serde::Serialize)]
+struct AssistantMessageMetadata {
+    success: bool,
+    cost_cents: u64,
+    cost: AssistantCostMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<crate::cost::TokenUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_normalized: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared_files: Option<Vec<crate::api::control::SharedFile>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    resumable: bool,
+}
+
+struct AssistantMessageMetadataInput<'a> {
+    success: bool,
+    cost_cents: u64,
+    cost_source: crate::agents::CostSource,
+    usage: &'a Option<crate::cost::TokenUsage>,
+    model: &'a Option<String>,
+    model_normalized: &'a Option<String>,
+    shared_files: &'a Option<Vec<crate::api::control::SharedFile>>,
+    resumable: bool,
+}
+
+fn assistant_message_metadata(input: AssistantMessageMetadataInput<'_>) -> serde_json::Value {
+    let metadata = AssistantMessageMetadata {
+        success: input.success,
+        cost_cents: input.cost_cents,
+        cost: AssistantCostMetadata {
+            amount_cents: input.cost_cents,
+            currency: COST_CURRENCY_USD,
+            source: input.cost_source,
+        },
+        usage: input.usage.clone(),
+        model: input.model.clone(),
+        model_normalized: input.model_normalized.clone(),
+        shared_files: input.shared_files.clone(),
+        resumable: input.resumable,
+    };
+    serde_json::to_value(metadata).expect("assistant metadata should serialize")
+}
 
 /// Parse a UUID from a database string, logging a warning and falling back to
 /// the nil UUID when the value is malformed.  This prevents silent data
@@ -1346,19 +1400,15 @@ impl MissionStore for SqliteMissionStore {
                 None,
                 None,
                 content.clone(),
-                serde_json::json!({
-                    "success": success,
-                    "cost_cents": cost_cents,
-                    "cost": {
-                        "amount_cents": cost_cents,
-                        "currency": "USD",
-                        "source": cost_source,
-                    },
-                    "usage": usage,
-                    "model": model,
-                    "model_normalized": model_normalized,
-                    "shared_files": shared_files,
-                    "resumable": resumable,
+                assistant_message_metadata(AssistantMessageMetadataInput {
+                    success: *success,
+                    cost_cents: *cost_cents,
+                    cost_source: *cost_source,
+                    usage,
+                    model,
+                    model_normalized,
+                    shared_files,
+                    resumable: *resumable,
                 }),
             ),
             AgentEvent::Thinking { content, done, .. } => (
@@ -2081,5 +2131,80 @@ impl MissionStore for SqliteMissionStore {
         })
         .await
         .map_err(|e| format!("Task join error: {}", e))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{assistant_message_metadata, AssistantMessageMetadataInput};
+    use crate::agents::CostSource;
+    use crate::cost::TokenUsage;
+    use serde_json::json;
+
+    #[test]
+    fn assistant_message_metadata_uses_normalized_cost_shape() {
+        let metadata = assistant_message_metadata(AssistantMessageMetadataInput {
+            success: true,
+            cost_cents: 42,
+            cost_source: CostSource::Estimated,
+            usage: &Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            model: &Some("gpt-4o".to_string()),
+            model_normalized: &Some("gpt-4o".to_string()),
+            shared_files: &None,
+            resumable: false,
+        });
+
+        assert_eq!(
+            metadata,
+            json!({
+                "success": true,
+                "cost_cents": 42,
+                "cost": {
+                    "amount_cents": 42,
+                    "currency": "USD",
+                    "source": "estimated",
+                },
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "cache_creation_input_tokens": null,
+                    "cache_read_input_tokens": null,
+                },
+                "model": "gpt-4o",
+                "model_normalized": "gpt-4o",
+            })
+        );
+    }
+
+    #[test]
+    fn assistant_message_metadata_skips_optional_none_fields() {
+        let metadata = assistant_message_metadata(AssistantMessageMetadataInput {
+            success: false,
+            cost_cents: 0,
+            cost_source: CostSource::Unknown,
+            usage: &None,
+            model: &None,
+            model_normalized: &None,
+            shared_files: &None,
+            resumable: false,
+        });
+
+        assert_eq!(
+            metadata,
+            json!({
+                "success": false,
+                "cost_cents": 0,
+                "cost": {
+                    "amount_cents": 0,
+                    "currency": "USD",
+                    "source": "unknown",
+                },
+            })
+        );
     }
 }
