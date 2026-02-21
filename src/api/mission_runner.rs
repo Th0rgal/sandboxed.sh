@@ -127,7 +127,10 @@ fn preferred_model_for_cost<'a>(
     requested_model: Option<&'a str>,
     observed_model: Option<&'a str>,
 ) -> Option<&'a str> {
-    requested_model.or(observed_model)
+    requested_model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .or_else(|| observed_model.map(str::trim).filter(|m| !m.is_empty()))
 }
 
 fn actual_cost_cents_from_total_cost_usd(total_cost_usd: Option<f64>) -> Option<u64> {
@@ -11518,5 +11521,13 @@ mod tests {
             Some("observed-model")
         );
         assert_eq!(preferred_model_for_cost(None, None), None);
+    }
+
+    #[test]
+    fn preferred_model_for_cost_ignores_blank_requested_model() {
+        assert_eq!(
+            preferred_model_for_cost(Some("   "), Some("observed-model")),
+            Some("observed-model")
+        );
     }
 }
