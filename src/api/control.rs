@@ -433,7 +433,7 @@ async fn enforce_stop_policy_after_create(
 }
 
 async fn reconcile_automation_stop_policies_for_status(
-    mission_store: &Arc<dyn MissionStore>,
+    mission_store: &dyn MissionStore,
     mission_id: Uuid,
     status: MissionStatus,
 ) {
@@ -453,7 +453,7 @@ async fn reconcile_automation_stop_policies_for_status(
     let mut deactivated_count = 0usize;
     for automation in automations {
         let outcome = disable_automation_when_stop_policy_matches(
-            mission_store.as_ref(),
+            mission_store,
             &automation,
             status,
             StopPolicyContext::Reconciliation,
@@ -479,7 +479,7 @@ async fn reconcile_automation_stop_policies_for_status(
 }
 
 async fn update_mission_status_and_reconcile_stop_policies(
-    mission_store: &Arc<dyn MissionStore>,
+    mission_store: &dyn MissionStore,
     mission_id: Uuid,
     status: MissionStatus,
 ) -> Result<(), String> {
@@ -2537,7 +2537,7 @@ fn spawn_control_session(
                             mission.updated_at
                         );
                         if let Err(e) = update_mission_status_and_reconcile_stop_policies(
-                            &store,
+                            store.as_ref(),
                             mission.id,
                             MissionStatus::Interrupted,
                         )
@@ -2683,7 +2683,7 @@ async fn stale_mission_cleanup_loop(
                                 mission.updated_at
                             );
                             if let Err(e) = update_mission_status_and_reconcile_stop_policies(
-                                &mission_store,
+                                mission_store.as_ref(),
                                 mission.id,
                                 MissionStatus::Interrupted,
                             )
@@ -2730,7 +2730,7 @@ async fn stale_mission_cleanup_loop(
                     );
 
                     if let Err(e) = update_mission_status_and_reconcile_stop_policies(
-                        &mission_store,
+                        mission_store.as_ref(),
                         mission.id,
                         MissionStatus::Completed,
                     )
@@ -4296,7 +4296,7 @@ async fn control_actor_loop(
                         }
 
                         let result = update_mission_status_and_reconcile_stop_policies(
-                            &mission_store,
+                            mission_store.as_ref(),
                             id,
                             new_status,
                         )
@@ -4402,7 +4402,7 @@ async fn control_actor_loop(
                             // Update status to Interrupted so the mission can be
                             // resumed later (fixes #149: cancel left status as pending).
                             if let Err(e) = update_mission_status_and_reconcile_stop_policies(
-                                &mission_store,
+                                mission_store.as_ref(),
                                 mission_id,
                                 MissionStatus::Interrupted,
                             )
@@ -4669,7 +4669,7 @@ async fn control_actor_loop(
                                 // belongs to current_mission, not running_mission_id
 
                                 if update_mission_status_and_reconcile_stop_policies(
-                                    &mission_store,
+                                    mission_store.as_ref(),
                                     mission_id,
                                     MissionStatus::Interrupted,
                                 )
@@ -4709,7 +4709,7 @@ async fn control_actor_loop(
                                 );
                             }
                             if update_mission_status_and_reconcile_stop_policies(
-                                &mission_store,
+                                mission_store.as_ref(),
                                 *mission_id,
                                 MissionStatus::Interrupted,
                             )
@@ -4848,7 +4848,7 @@ async fn control_actor_loop(
                             }
 
                             if update_mission_status_and_reconcile_stop_policies(
-                                &mission_store,
+                                mission_store.as_ref(),
                                 id,
                                 new_status,
                             )
@@ -5033,7 +5033,7 @@ async fn control_actor_loop(
                                                         tracing::warn!("Failed to auto-complete mission: {}", e);
                                                     } else {
                                                         reconcile_automation_stop_policies_for_status(
-                                                            &mission_store,
+                                                            mission_store.as_ref(),
                                                             mission_id,
                                                             new_status,
                                                         )
@@ -5152,7 +5152,7 @@ async fn control_actor_loop(
                                 // Update mission status so it doesn't stay Active forever.
                                 // Mark as Failed (resumable) so the user can retry.
                                 if let Err(e) = update_mission_status_and_reconcile_stop_policies(
-                                    &mission_store,
+                                    mission_store.as_ref(),
                                     mission_id,
                                     MissionStatus::Failed,
                                 )
@@ -5458,7 +5458,7 @@ async fn control_actor_loop(
                                                     mission_id
                                                 );
                                             } else if let Err(e) = update_mission_status_and_reconcile_stop_policies(
-                                                &mission_store,
+                                                mission_store.as_ref(),
                                                 *mission_id,
                                                 new_status,
                                             )
