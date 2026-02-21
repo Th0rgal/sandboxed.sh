@@ -123,8 +123,21 @@ fn resolve_cost_cents_and_source(
     (0, CostSource::Unknown)
 }
 
+fn preferred_model_for_cost<'a>(
+    requested_model: Option<&'a str>,
+    observed_model: Option<&'a str>,
+) -> Option<&'a str> {
+    requested_model.or(observed_model)
+}
+
 fn actual_cost_cents_from_total_cost_usd(total_cost_usd: Option<f64>) -> Option<u64> {
-    total_cost_usd.map(|cost| (cost.max(0.0) * 100.0) as u64)
+    total_cost_usd.and_then(|cost| {
+        if cost.is_finite() {
+            Some((cost.max(0.0) * 100.0) as u64)
+        } else {
+            None
+        }
+    })
 }
 
 async fn lease_codex_account(
@@ -2976,6 +2989,7 @@ pub fn run_claudecode_turn<'a>(
         let mut total_output_tokens: u64 = 0;
         let mut total_cache_creation_tokens: u64 = 0;
         let mut total_cache_read_tokens: u64 = 0;
+        let mut observed_model: Option<String> = None;
         let mut final_result = String::new();
         let mut had_error = false;
 
@@ -3099,9 +3113,12 @@ pub fn run_claudecode_turn<'a>(
 
                             match claude_event {
                                 ClaudeEvent::System(sys) => {
+                                    if let Some(m) = sys.model {
+                                        observed_model = Some(m);
+                                    }
                                     tracing::debug!(
                                         "Claude session init: session_id={}, model={:?}",
-                                        sys.session_id, sys.model
+                                        sys.session_id, observed_model
                                     );
                                 }
                                 ClaudeEvent::StreamEvent(wrapper) => {
@@ -3189,6 +3206,9 @@ pub fn run_claudecode_turn<'a>(
                                     }
                                 }
                                 ClaudeEvent::Assistant(evt) => {
+                                    if let Some(m) = evt.message.model.as_ref() {
+                                        observed_model = Some(m.clone());
+                                    }
                                     if let Some(usage) = &evt.message.usage {
                                         total_input_tokens += usage.input_tokens.unwrap_or(0);
                                         total_output_tokens += usage.output_tokens.unwrap_or(0);
@@ -3445,8 +3465,9 @@ pub fn run_claudecode_turn<'a>(
             },
         };
         let actual_cost_cents = actual_cost_cents_from_total_cost_usd(total_cost_usd);
+        let model_for_cost = preferred_model_for_cost(model, observed_model.as_deref());
         let (cost_cents, cost_source) =
-            resolve_cost_cents_and_source(actual_cost_cents, model, &usage);
+            resolve_cost_cents_and_source(actual_cost_cents, model_for_cost, &usage);
 
         // If no final result from Assistant or Result events, use accumulated text buffer
         // This handles plan mode and other cases where text is streamed incrementally
@@ -3528,7 +3549,7 @@ pub fn run_claudecode_turn<'a>(
             AgentResult::success(final_result, cost_cents)
                 .with_terminal_reason(TerminalReason::Completed)
         };
-        if let Some(model) = model {
+        if let Some(model) = model_for_cost {
             result = result.with_model(model.to_string());
         }
         if usage.has_usage() {
@@ -11471,5 +11492,31 @@ mod tests {
     #[test]
     fn actual_cost_cents_from_total_cost_usd_none_stays_none() {
         assert_eq!(actual_cost_cents_from_total_cost_usd(None), None);
+    }
+
+    #[test]
+    fn actual_cost_cents_from_total_cost_usd_rejects_non_finite() {
+        assert_eq!(
+            actual_cost_cents_from_total_cost_usd(Some(f64::INFINITY)),
+            None
+        );
+        assert_eq!(
+            actual_cost_cents_from_total_cost_usd(Some(f64::NEG_INFINITY)),
+            None
+        );
+        assert_eq!(actual_cost_cents_from_total_cost_usd(Some(f64::NAN)), None);
+    }
+
+    #[test]
+    fn preferred_model_for_cost_prefers_requested_then_observed() {
+        assert_eq!(
+            preferred_model_for_cost(Some("requested-model"), Some("observed-model")),
+            Some("requested-model")
+        );
+        assert_eq!(
+            preferred_model_for_cost(None, Some("observed-model")),
+            Some("observed-model")
+        );
+        assert_eq!(preferred_model_for_cost(None, None), None);
     }
 }
