@@ -404,20 +404,53 @@ async fn enforce_stop_policy_after_create(
     mission_store: &dyn MissionStore,
     automation: &mut mission_store::Automation,
 ) {
-    if !automation.active {
+    let mission = match mission_store.get_mission(automation.mission_id).await {
+        Ok(Some(mission)) => mission,
+        Ok(None) => {
+            tracing::warn!(
+                "Mission {} not found while enforcing stop policy after create",
+                automation.mission_id
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Failed to load mission {} while enforcing stop policy after create: {}",
+                automation.mission_id,
+                err
+            );
+            return;
+        }
+    };
+    let mission_status = mission.status;
+
+    if !automation.should_auto_disable_for_status(mission_status) {
+        if !automation.active {
+            match mission_store
+                .update_automation_active(automation.id, true)
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "Re-enabled automation {} after post-create stop policy check found mission {} status {:?} no longer matches {:?}",
+                        automation.id,
+                        automation.mission_id,
+                        mission_status,
+                        automation.stop_policy
+                    );
+                    automation.active = true;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to re-enable automation {} after post-create stop policy check: {}",
+                        automation.id,
+                        err
+                    );
+                }
+            }
+        }
         return;
     }
-
-    let Some(mission_status) = stop_policy_matched_mission_status(
-        mission_store,
-        automation.mission_id,
-        automation.stop_policy,
-        StopPolicyContext::CreateAutomation,
-    )
-    .await
-    else {
-        return;
-    };
 
     if disable_automation_when_stop_policy_matches(
         mission_store,
@@ -7211,6 +7244,73 @@ Investigate <service/> failures.
         enforce_stop_policy_after_create(mission_store.as_ref(), &mut automation).await;
 
         assert!(!automation.active);
+    }
+
+    #[tokio::test]
+    async fn test_enforce_stop_policy_after_create_reactivates_when_status_no_longer_matches() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            mission_store::SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+                .await
+                .expect("sqlite store"),
+        );
+        let mission = store
+            .create_mission(
+                Some("stop policy re-enable"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Completed)
+            .await
+            .expect("mission marked completed");
+
+        let created = store
+            .create_automation(mission_store::Automation {
+                id: Uuid::new_v4(),
+                mission_id: mission.id,
+                command_source: mission_store::CommandSource::Inline {
+                    content: "echo run".to_string(),
+                },
+                trigger: mission_store::TriggerType::Webhook {
+                    config: mission_store::WebhookConfig {
+                        webhook_id: "post-create-reactivate".to_string(),
+                        secret: None,
+                        variable_mappings: std::collections::HashMap::new(),
+                    },
+                },
+                variables: std::collections::HashMap::new(),
+                active: false,
+                stop_policy: mission_store::StopPolicy::OnMissionCompleted,
+                created_at: mission_store::now_string(),
+                last_triggered_at: None,
+                retry_config: mission_store::RetryConfig::default(),
+            })
+            .await
+            .expect("automation created");
+
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("mission marked active");
+
+        let mission_store: Arc<dyn mission_store::MissionStore> = store.clone();
+        let mut automation = created;
+        enforce_stop_policy_after_create(mission_store.as_ref(), &mut automation).await;
+
+        assert!(automation.active);
+        let persisted = store
+            .get_automation(automation.id)
+            .await
+            .expect("automation lookup should succeed")
+            .expect("automation should exist");
+        assert!(persisted.active);
     }
 
     #[test]
