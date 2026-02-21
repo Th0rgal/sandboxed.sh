@@ -218,7 +218,7 @@ async fn get_running_missions(
 
 /// Look up an automation by ID, returning 404 if it does not exist.
 async fn require_automation(
-    store: &Arc<dyn MissionStore>,
+    store: &dyn MissionStore,
     id: Uuid,
 ) -> Result<mission_store::Automation, (StatusCode, String)> {
     store
@@ -6405,7 +6405,7 @@ pub async fn get_automation(
 ) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
-    let automation = require_automation(&control.mission_store, automation_id).await?;
+    let automation = require_automation(control.mission_store.as_ref(), automation_id).await?;
 
     Ok(Json(automation))
 }
@@ -6419,7 +6419,7 @@ pub async fn update_automation(
 ) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
-    let mut automation = require_automation(&control.mission_store, automation_id).await?;
+    let mut automation = require_automation(control.mission_store.as_ref(), automation_id).await?;
 
     // Validate the command exists in the library if CommandSource::Library is being updated
     if let Some(mission_store::CommandSource::Library { name }) = req.command_source.as_ref() {
@@ -6516,7 +6516,7 @@ pub async fn get_automation_executions(
 ) -> Result<Json<Vec<mission_store::AutomationExecution>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
-    let _automation = require_automation(&control.mission_store, automation_id).await?;
+    let _automation = require_automation(control.mission_store.as_ref(), automation_id).await?;
 
     let executions = control
         .mission_store
