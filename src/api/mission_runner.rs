@@ -10345,8 +10345,7 @@ mod tests {
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
         strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        MissionHealth,
-        MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
+        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
         STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
