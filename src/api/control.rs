@@ -424,7 +424,7 @@ async fn enforce_stop_policy_after_create(
     };
     let mission_status = mission.status;
 
-    if !automation.should_auto_disable_for_status(mission_status) {
+    if !automation.stop_policy.disables_on_status(mission_status) {
         if !automation.active {
             match mission_store
                 .update_automation_active(automation.id, true)
@@ -7311,6 +7311,68 @@ Investigate <service/> failures.
             .expect("automation lookup should succeed")
             .expect("automation should exist");
         assert!(persisted.active);
+    }
+
+    #[tokio::test]
+    async fn test_enforce_stop_policy_after_create_keeps_inactive_when_status_still_matches() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            mission_store::SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+                .await
+                .expect("sqlite store"),
+        );
+        let mission = store
+            .create_mission(
+                Some("stop policy remains matched"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Completed)
+            .await
+            .expect("mission marked completed");
+
+        let created = store
+            .create_automation(mission_store::Automation {
+                id: Uuid::new_v4(),
+                mission_id: mission.id,
+                command_source: mission_store::CommandSource::Inline {
+                    content: "echo run".to_string(),
+                },
+                trigger: mission_store::TriggerType::Webhook {
+                    config: mission_store::WebhookConfig {
+                        webhook_id: "post-create-stays-inactive".to_string(),
+                        secret: None,
+                        variable_mappings: std::collections::HashMap::new(),
+                    },
+                },
+                variables: std::collections::HashMap::new(),
+                active: false,
+                stop_policy: mission_store::StopPolicy::OnMissionCompleted,
+                created_at: mission_store::now_string(),
+                last_triggered_at: None,
+                retry_config: mission_store::RetryConfig::default(),
+            })
+            .await
+            .expect("automation created");
+
+        let mission_store: Arc<dyn mission_store::MissionStore> = store.clone();
+        let mut automation = created;
+        enforce_stop_policy_after_create(mission_store.as_ref(), &mut automation).await;
+
+        assert!(!automation.active);
+        let persisted = store
+            .get_automation(automation.id)
+            .await
+            .expect("automation lookup should succeed")
+            .expect("automation should exist");
+        assert!(!persisted.active);
     }
 
     #[test]
