@@ -295,7 +295,7 @@ async fn mission_has_blocking_automation_for_status(
 }
 
 async fn stop_policy_matched_mission_status(
-    mission_store: &Arc<dyn MissionStore>,
+    mission_store: &dyn MissionStore,
     mission_id: Uuid,
     stop_policy: mission_store::StopPolicy,
     context: StopPolicyContext,
@@ -364,7 +364,7 @@ impl StopPolicyDisableOutcome {
 
 #[must_use]
 async fn disable_automation_when_stop_policy_matches(
-    mission_store: &Arc<dyn MissionStore>,
+    mission_store: &dyn MissionStore,
     automation: &mission_store::Automation,
     mission_status: MissionStatus,
     context: StopPolicyContext,
@@ -401,7 +401,7 @@ async fn disable_automation_when_stop_policy_matches(
 }
 
 async fn enforce_stop_policy_after_create(
-    mission_store: &Arc<dyn MissionStore>,
+    mission_store: &dyn MissionStore,
     automation: &mut mission_store::Automation,
 ) {
     if !automation.active {
@@ -453,7 +453,7 @@ async fn reconcile_automation_stop_policies_for_status(
     let mut deactivated_count = 0usize;
     for automation in automations {
         let outcome = disable_automation_when_stop_policy_matches(
-            mission_store,
+            mission_store.as_ref(),
             &automation,
             status,
             StopPolicyContext::Reconciliation,
@@ -2823,7 +2823,7 @@ async fn automation_scheduler_loop(
             };
 
             if disable_automation_when_stop_policy_matches(
-                &mission_store,
+                mission_store.as_ref(),
                 &automation,
                 mission.status,
                 StopPolicyContext::IntervalScheduler,
@@ -3207,7 +3207,7 @@ async fn agent_finished_automation_messages(
     let mut eligible = Vec::with_capacity(active.len());
     for automation in active {
         if disable_automation_when_stop_policy_matches(
-            mission_store,
+            mission_store.as_ref(),
             &automation,
             mission.status,
             StopPolicyContext::AgentFinishedHook,
@@ -6277,7 +6277,7 @@ pub async fn create_automation(
 
     let stop_policy = req.stop_policy;
     let active = stop_policy_matched_mission_status(
-        &control.mission_store,
+        control.mission_store.as_ref(),
         mission_id,
         stop_policy,
         StopPolicyContext::CreateAutomation,
@@ -6305,7 +6305,7 @@ pub async fn create_automation(
         .await
         .map_err(internal_error)?;
 
-    enforce_stop_policy_after_create(&control.mission_store, &mut automation).await;
+    enforce_stop_policy_after_create(control.mission_store.as_ref(), &mut automation).await;
 
     // If start_immediately is requested for agent_finished triggers, fire the
     // first execution right away by resolving the command and sending it as a
@@ -6422,7 +6422,7 @@ pub async fn update_automation(
     // remain stale on missions that are already terminal.
     if automation.active {
         let matched_status = stop_policy_matched_mission_status(
-            &control.mission_store,
+            control.mission_store.as_ref(),
             automation.mission_id,
             automation.stop_policy,
             StopPolicyContext::UpdateAutomation,
@@ -6642,7 +6642,7 @@ pub async fn webhook_receiver(
         ))?;
 
     if disable_automation_when_stop_policy_matches(
-        &control.mission_store,
+        control.mission_store.as_ref(),
         &automation,
         mission.status,
         StopPolicyContext::WebhookTrigger,
@@ -7097,7 +7097,7 @@ Investigate <service/> failures.
         let mission_store: Arc<dyn mission_store::MissionStore> = store.clone();
 
         let outcome = disable_automation_when_stop_policy_matches(
-            &mission_store,
+            mission_store.as_ref(),
             &automation,
             MissionStatus::Failed,
             StopPolicyContext::IntervalScheduler,
@@ -7115,7 +7115,7 @@ Investigate <service/> failures.
         let mission_store: Arc<dyn mission_store::MissionStore> = store.clone();
 
         let outcome = disable_automation_when_stop_policy_matches(
-            &mission_store,
+            mission_store.as_ref(),
             &automation,
             MissionStatus::Failed,
             StopPolicyContext::IntervalScheduler,
@@ -7169,7 +7169,7 @@ Investigate <service/> failures.
 
         let mission_store: Arc<dyn mission_store::MissionStore> = store.clone();
         let mut automation = created;
-        enforce_stop_policy_after_create(&mission_store, &mut automation).await;
+        enforce_stop_policy_after_create(mission_store.as_ref(), &mut automation).await;
 
         assert!(!automation.active);
         let persisted = store
