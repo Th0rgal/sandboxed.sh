@@ -521,7 +521,7 @@ pub(crate) async fn resolve_claudecode_default_model(
 }
 
 async fn close_mission_desktop_sessions(
-    mission_store: &Arc<dyn MissionStore>,
+    mission_store: &dyn MissionStore,
     mission_id: Uuid,
     working_dir: &std::path::Path,
 ) {
@@ -4425,7 +4425,7 @@ async fn control_actor_loop(
                             });
                             parallel_runners.remove(&mission_id);
                             close_mission_desktop_sessions(
-                                &mission_store,
+                                mission_store.as_ref(),
                                 mission_id,
                                 &config.working_dir,
                             )
@@ -4440,7 +4440,7 @@ async fn control_actor_loop(
                                 if let Some(token) = &running_cancel {
                                     token.cancel();
                                     close_mission_desktop_sessions(
-                                        &mission_store,
+                                        mission_store.as_ref(),
                                         mission_id,
                                         &config.working_dir,
                                     )
@@ -5135,7 +5135,7 @@ async fn control_actor_loop(
                             });
                             if let Some(mission_id) = completed_mission_id {
                                 close_mission_desktop_sessions(
-                                    &mission_store,
+                                    mission_store.as_ref(),
                                     mission_id,
                                     &config.working_dir,
                                 )
@@ -5167,7 +5167,7 @@ async fn control_actor_loop(
                                     });
                                 }
                                 close_mission_desktop_sessions(
-                                    &mission_store,
+                                    mission_store.as_ref(),
                                     mission_id,
                                     &config.working_dir,
                                 )
@@ -5488,7 +5488,7 @@ async fn control_actor_loop(
                 for mid in completed_missions {
                     parallel_runners.remove(&mid);
                     close_mission_desktop_sessions(
-                        &mission_store,
+                        mission_store.as_ref(),
                         mid,
                         &config.working_dir,
                     )
