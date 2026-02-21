@@ -3445,7 +3445,7 @@ async fn control_actor_loop(
 
     // Helper to persist history to a specific mission ID
     async fn persist_mission_history_to(
-        mission_store: &Arc<dyn MissionStore>,
+        mission_store: &dyn MissionStore,
         mission_id: Option<Uuid>,
         history: &[(String, String)],
     ) {
@@ -3498,7 +3498,7 @@ async fn control_actor_loop(
 
     // Helper to persist history to current mission (wrapper for backwards compatibility)
     async fn persist_mission_history(
-        mission_store: &Arc<dyn MissionStore>,
+        mission_store: &dyn MissionStore,
         current_mission: &Arc<RwLock<Option<Uuid>>>,
         history: &[(String, String)],
     ) {
@@ -3520,7 +3520,7 @@ async fn control_actor_loop(
 
     // Helper to load a mission and return a Mission struct
     async fn load_mission_record(
-        mission_store: &Arc<dyn MissionStore>,
+        mission_store: &dyn MissionStore,
         id: Uuid,
     ) -> Result<Mission, String> {
         mission_store
@@ -3530,13 +3530,13 @@ async fn control_actor_loop(
     }
 
     // Helper to create a new mission
-    async fn create_new_mission(mission_store: &Arc<dyn MissionStore>) -> Result<Mission, String> {
+    async fn create_new_mission(mission_store: &dyn MissionStore) -> Result<Mission, String> {
         create_new_mission_with_title(mission_store, None, None, None, None, None, None, None).await
     }
 
     // Helper to create a new mission with title
     async fn create_new_mission_with_title(
-        mission_store: &Arc<dyn MissionStore>,
+        mission_store: &dyn MissionStore,
         title: Option<&str>,
         workspace_id: Option<Uuid>,
         agent: Option<&str>,
@@ -3560,7 +3560,7 @@ async fn control_actor_loop(
 
     // Helper to build resume context for an interrupted or blocked mission
     async fn resume_mission_impl(
-        mission_store: &Arc<dyn MissionStore>,
+        mission_store: &dyn MissionStore,
         config: &Config,
         workspaces: &workspace::SharedWorkspaceStore,
         mission_id: Uuid,
@@ -3827,7 +3827,7 @@ async fn control_actor_loop(
                                     continue;
                                 } else {
                                     // Load mission and start in parallel
-                                    match load_mission_record(&mission_store, tid).await {
+                                    match load_mission_record(mission_store.as_ref(), tid).await {
                                         Ok(mission) => {
                                             // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
                                             if matches!(
@@ -3926,7 +3926,7 @@ async fn control_actor_loop(
                                     // Load mission history from DB so continuation detection
                                     // works correctly (e.g., after server restart when
                                     // current_mission is None but the mission has prior turns).
-                                    if let Ok(mission) = load_mission_record(&mission_store, tid).await {
+                                    if let Ok(mission) = load_mission_record(mission_store.as_ref(), tid).await {
                                         if !mission.history.is_empty() {
                                             history.clear();
                                             for entry in &mission.history {
@@ -3963,7 +3963,7 @@ async fn control_actor_loop(
                                     }
                                     *current_mission.write().await = Some(tid);
                                     tracing::info!("Set current mission to target: {}", tid);
-                                } else if let Ok(new_mission) = create_new_mission(&mission_store).await {
+                                } else if let Ok(new_mission) = create_new_mission(mission_store.as_ref()).await {
                                     *current_mission.write().await = Some(new_mission.id);
                                     tracing::info!("Auto-created mission: {}", new_mission.id);
                                 }
@@ -3971,8 +3971,13 @@ async fn control_actor_loop(
                                 if !main_is_running {
                                     if mission_id != Some(tid) {
                                         // Switch main session to target mission
-                                        persist_mission_history(&mission_store, &current_mission, &history).await;
-                                        if let Ok(mission) = load_mission_record(&mission_store, tid).await {
+                                        persist_mission_history(
+                                            mission_store.as_ref(),
+                                            &current_mission,
+                                            &history,
+                                        )
+                                        .await;
+                                        if let Ok(mission) = load_mission_record(mission_store.as_ref(), tid).await {
                                             history.clear();
                                             for entry in &mission.history {
                                                 history.push((entry.role.clone(), entry.content.clone()));
@@ -4007,7 +4012,7 @@ async fn control_actor_loop(
                                         // Same mission but no assistant history in memory
                                         // (e.g., after server restart). Reload from database
                                         // so Claude Code continuation detection works correctly.
-                                        if let Ok(mission) = load_mission_record(&mission_store, tid).await {
+                                        if let Ok(mission) = load_mission_record(mission_store.as_ref(), tid).await {
                                             if !mission.history.is_empty() {
                                                 history.clear();
                                                 for entry in &mission.history {
@@ -4086,7 +4091,7 @@ async fn control_actor_loop(
 
                                 // Immediately persist user message so it's visible when loading mission
                                 history.push(("user".to_string(), msg.clone()));
-                                persist_mission_history_to(&mission_store, msg_target_mid, &history)
+                                persist_mission_history_to(mission_store.as_ref(), msg_target_mid, &history)
                                     .await;
 
                                 let cfg = config.clone();
@@ -4226,18 +4231,14 @@ async fn control_actor_loop(
                     ControlCommand::LoadMission { id, respond } => {
                         // First persist current mission history
                         persist_mission_history(
-                            &mission_store,
+                            mission_store.as_ref(),
                             &current_mission,
                             &history,
                         )
                         .await;
 
                         // Load the new mission
-                        match load_mission_record(
-                            &mission_store,
-                            id,
-                        )
-                        .await {
+                        match load_mission_record(mission_store.as_ref(), id).await {
                             Ok(mission) => {
                                 // Update history from loaded mission
                                 history = mission.history.iter()
@@ -4272,7 +4273,7 @@ async fn control_actor_loop(
                     ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, respond } => {
                         // First persist current mission history
                         persist_mission_history(
-                            &mission_store,
+                            mission_store.as_ref(),
                             &current_mission,
                             &history,
                         )
@@ -4280,7 +4281,7 @@ async fn control_actor_loop(
 
                         // Create a new mission with optional title, workspace, agent, and backend
                         match create_new_mission_with_title(
-                            &mission_store,
+                            mission_store.as_ref(),
                             title.as_deref(),
                             workspace_id,
                             agent.as_deref(),
@@ -4371,7 +4372,7 @@ async fn control_actor_loop(
                             parallel_runners.entry(mission_id)
                         {
                             // Load mission to get existing history
-                            let mission = match load_mission_record(&mission_store, mission_id).await {
+                            let mission = match load_mission_record(mission_store.as_ref(), mission_id).await {
                                 Ok(m) => m,
                                 Err(e) => {
                                     let _ = respond.send(Err(format!("Failed to load mission: {}", e)));
@@ -4543,7 +4544,7 @@ async fn control_actor_loop(
                     ControlCommand::ResumeMission { mission_id, clean_workspace, skip_message, respond } => {
                         // Resume an interrupted mission by building resume context
                         match resume_mission_impl(
-                            &mission_store,
+                            mission_store.as_ref(),
                             &config,
                             &workspaces,
                             mission_id,
@@ -4553,7 +4554,7 @@ async fn control_actor_loop(
                             Ok((mission, resume_prompt)) => {
                                 // First persist current mission history (if any)
                                 persist_mission_history(
-                                    &mission_store,
+                            mission_store.as_ref(),
                                     &current_mission,
                                     &history,
                                 )
@@ -4692,7 +4693,7 @@ async fn control_actor_loop(
                                 let current_mid = *current_mission.read().await;
                                 if current_mid == Some(mission_id) {
                                     persist_mission_history(
-                                        &mission_store,
+                            mission_store.as_ref(),
                                         &current_mission,
                                         &history,
                                     )
@@ -5245,7 +5246,7 @@ async fn control_actor_loop(
 
                     // Immediately persist user message so it's visible when loading mission
                     history.push(("user".to_string(), msg.clone()));
-                    persist_mission_history_to(&mission_store, msg_target_mid, &history)
+                    persist_mission_history_to(mission_store.as_ref(), msg_target_mid, &history)
                         .await;
 
                     let cfg = config.clone();
