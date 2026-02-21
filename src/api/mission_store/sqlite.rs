@@ -221,15 +221,14 @@ impl SqliteMissionStore {
         // Parse variables
         let variables: HashMap<String, String> =
             serde_json::from_str(&variables_json).unwrap_or_default();
-        let stop_policy =
-            StopPolicy::try_from_db_str(stop_policy_str.as_str()).unwrap_or_else(|| {
-                tracing::warn!(
-                    "Unknown stop_policy '{}' for automation {}; defaulting to 'never'",
-                    stop_policy_str,
-                    id
-                );
-                StopPolicy::Never
-            });
+        let stop_policy = stop_policy_str.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                "Unknown stop_policy '{}' for automation {}; defaulting to 'never'",
+                stop_policy_str,
+                id
+            );
+            StopPolicy::Never
+        });
 
         Ok(Automation {
             id: Uuid::parse_str(&id)

@@ -19,6 +19,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use uuid::Uuid;
 
 /// A mission (persistent goal-oriented session).
@@ -153,6 +154,9 @@ pub enum StopPolicy {
     OnTerminalAny,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseStopPolicyError;
+
 impl StopPolicy {
     #[must_use]
     pub const fn as_db_str(self) -> &'static str {
@@ -165,17 +169,12 @@ impl StopPolicy {
 
     #[must_use]
     pub fn try_from_db_str(value: &str) -> Option<Self> {
-        match value {
-            "never" => Some(Self::Never),
-            "on_mission_completed" => Some(Self::OnMissionCompleted),
-            "on_terminal_any" => Some(Self::OnTerminalAny),
-            _ => None,
-        }
+        value.parse().ok()
     }
 
     #[must_use]
     pub fn from_db_str(value: &str) -> Self {
-        Self::try_from_db_str(value).unwrap_or(Self::Never)
+        value.parse().unwrap_or_default()
     }
 
     #[must_use]
@@ -184,6 +183,19 @@ impl StopPolicy {
             Self::Never => false,
             Self::OnMissionCompleted => status == MissionStatus::Completed,
             Self::OnTerminalAny => status.is_terminal(),
+        }
+    }
+}
+
+impl FromStr for StopPolicy {
+    type Err = ParseStopPolicyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "never" => Ok(Self::Never),
+            "on_mission_completed" => Ok(Self::OnMissionCompleted),
+            "on_terminal_any" => Ok(Self::OnTerminalAny),
+            _ => Err(ParseStopPolicyError),
         }
     }
 }
@@ -758,6 +770,8 @@ mod tests {
         );
         assert_eq!(StopPolicy::try_from_db_str("invalid"), None);
         assert_eq!(StopPolicy::from_db_str("invalid"), StopPolicy::Never);
+        assert_eq!("never".parse::<StopPolicy>(), Ok(StopPolicy::Never));
+        assert!("invalid".parse::<StopPolicy>().is_err());
         assert_eq!(StopPolicy::default(), StopPolicy::Never);
     }
 }
