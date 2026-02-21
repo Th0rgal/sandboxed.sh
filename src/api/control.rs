@@ -3146,7 +3146,7 @@ async fn resolve_automation_command(
     automation: &mission_store::Automation,
     mission_id: Uuid,
     state: &Arc<AppState>,
-    store: &Arc<dyn MissionStore>,
+    store: &dyn MissionStore,
 ) -> Option<String> {
     use super::automation_variables::{substitute_variables, SubstitutionContext};
     use super::mission_store::CommandSource;
@@ -3198,7 +3198,7 @@ fn active_agent_finished_automations(
 }
 
 async fn agent_finished_automation_messages(
-    mission_store: &Arc<dyn MissionStore>,
+    mission_store: &dyn MissionStore,
     mission_id: Uuid,
     library: &SharedLibrary,
     workspaces: &workspace::SharedWorkspaceStore,
@@ -3240,7 +3240,7 @@ async fn agent_finished_automation_messages(
     let mut eligible = Vec::with_capacity(active.len());
     for automation in active {
         if disable_automation_when_stop_policy_matches(
-            mission_store.as_ref(),
+            mission_store,
             &automation,
             mission.status,
             StopPolicyContext::AgentFinishedHook,
@@ -5218,7 +5218,7 @@ async fn control_actor_loop(
                             // Small delay so the UI can display the completion before restarting.
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             let messages = agent_finished_automation_messages(
-                                &mission_store,
+                                mission_store.as_ref(),
                                 mission_id,
                                 &library,
                                 &workspaces,
@@ -5421,7 +5421,7 @@ async fn control_actor_loop(
                                 // Small delay so the UI can display the completion before restarting.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                 let messages = agent_finished_automation_messages(
-                                    &mission_store,
+                                    mission_store.as_ref(),
                                     *mission_id,
                                     &library,
                                     &workspaces,
@@ -6350,9 +6350,13 @@ pub async fn create_automation(
             mission_store::TriggerType::AgentFinished
         )
     {
-        let cmd_content =
-            resolve_automation_command(&automation, mission_id, &state, &control.mission_store)
-                .await;
+        let cmd_content = resolve_automation_command(
+            &automation,
+            mission_id,
+            &state,
+            control.mission_store.as_ref(),
+        )
+        .await;
 
         if let Some(content) = cmd_content {
             // Record the execution
