@@ -275,7 +275,7 @@ async fn validate_library_command(
 }
 
 async fn mission_has_blocking_automation_for_status(
-    mission_store: &Arc<dyn MissionStore>,
+    mission_store: &dyn MissionStore,
     mission_id: Uuid,
     target_status: MissionStatus,
 ) -> bool {
@@ -4826,7 +4826,7 @@ async fn control_actor_loop(
                             let success = matches!(status, crate::tools::mission::MissionStatusValue::Completed);
                             if new_status == MissionStatus::Completed
                                 && mission_has_blocking_automation_for_status(
-                                    &mission_store,
+                                    mission_store.as_ref(),
                                     id,
                                     new_status,
                                 )
@@ -5011,7 +5011,7 @@ async fn control_actor_loop(
                                                 });
                                                 if new_status == MissionStatus::Completed
                                                     && mission_has_blocking_automation_for_status(
-                                                        &mission_store,
+                                                        mission_store.as_ref(),
                                                         mission_id,
                                                         new_status,
                                                     )
@@ -5447,7 +5447,7 @@ async fn control_actor_loop(
                                             };
                                             if new_status == MissionStatus::Completed
                                                 && mission_has_blocking_automation_for_status(
-                                                    &mission_store,
+                                                    mission_store.as_ref(),
                                                     *mission_id,
                                                     new_status,
                                                 )
