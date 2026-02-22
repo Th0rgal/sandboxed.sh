@@ -7063,17 +7063,16 @@ async fn detect_opencode_version(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
 ) -> Option<String> {
-    let mut args = Vec::new();
-    args.push("-lc".to_string());
-    args.push(
+    let args = vec![
+        "-lc".to_string(),
         "for candidate in opencode /usr/local/bin/opencode /root/.opencode/bin/opencode \"$HOME/.opencode/bin/opencode\"; do \
           if [ -x \"$candidate\" ] || command -v \"$candidate\" >/dev/null 2>&1; then \
             \"$candidate\" --version 2>&1 && exit 0; \
           fi; \
         done; \
         exit 1"
-            .to_string(),
-    );
+        .to_string(),
+    ];
 
     let output = workspace_exec
         .output(cwd, "/bin/sh", &args, HashMap::new())
