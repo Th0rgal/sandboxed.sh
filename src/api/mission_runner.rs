@@ -6041,7 +6041,17 @@ fn format_exit_status(status: &std::process::ExitStatus) -> String {
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            return format!("signal {}", signal);
+            let signal_name = match signal {
+                1 => "SIGHUP",
+                2 => "SIGINT",
+                3 => "SIGQUIT",
+                6 => "SIGABRT",
+                9 => "SIGKILL",
+                11 => "SIGSEGV",
+                15 => "SIGTERM",
+                _ => "UNKNOWN",
+            };
+            return format!("signal: {} ({})", signal, signal_name);
         }
     }
     "code <unknown>".to_string()
