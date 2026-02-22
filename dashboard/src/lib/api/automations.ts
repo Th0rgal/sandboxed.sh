@@ -21,7 +21,11 @@ export type TriggerType =
       };
     };
 
-export type StopPolicy = "never" | "on_mission_completed" | "on_terminal_any";
+export type StopPolicy = 
+  | "never" 
+  | { type: "on_consecutive_failures"; count: number };
+
+export type FreshSession = "always" | "keep";
 
 export interface Automation {
   id: string;
@@ -31,6 +35,7 @@ export interface Automation {
   variables?: Record<string, string>;
   active: boolean;
   stop_policy?: StopPolicy;
+  fresh_session?: FreshSession;
   created_at: string;
   last_triggered_at?: string | null;
   retry_config?: {
@@ -70,6 +75,7 @@ export interface CreateAutomationInput {
   trigger: TriggerType;
   variables?: Record<string, string>;
   stop_policy?: StopPolicy;
+  fresh_session?: FreshSession;
   start_immediately?: boolean;
 }
 

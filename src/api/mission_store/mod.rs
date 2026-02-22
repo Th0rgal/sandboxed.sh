@@ -146,14 +146,31 @@ pub enum TriggerType {
 pub enum StopPolicy {
     /// Never auto-disable this automation.
     Never,
-    /// Auto-disable when mission reaches completed status.
-    OnMissionCompleted,
-    /// Auto-disable on any terminal status (completed/failed/interrupted/blocked/not_feasible).
-    OnTerminalAny,
+    /// Auto-disable after N consecutive failures.
+    OnConsecutiveFailures {
+        /// Number of consecutive failures before stopping (default: 2)
+        #[serde(default = "default_failure_count")]
+        count: u32,
+    },
+}
+
+/// Whether to start a fresh session for each automation trigger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshSession {
+    /// Always start a fresh session (clear context/history).
+    Always,
+    /// Keep session alive (default behavior).
+    #[default]
+    Keep,
 }
 
 fn default_stop_policy() -> StopPolicy {
     StopPolicy::Never
+}
+
+fn default_failure_count() -> u32 {
+    2
 }
 
 /// Retry configuration for automation execution.
@@ -208,6 +225,13 @@ pub struct Automation {
     /// Auto-stop behavior when mission reaches terminal state.
     #[serde(default = "default_stop_policy")]
     pub stop_policy: StopPolicy,
+    /// Whether to start a fresh session for each trigger (clears context/history).
+    #[serde(default)]
+    pub fresh_session: FreshSession,
+    /// Number of consecutive failures (used for OnConsecutiveFailures policy).
+    /// This is tracked internally and not persisted directly.
+    #[serde(default, skip_serializing)]
+    pub consecutive_failures: u32,
 }
 
 /// Execution status for automation runs.

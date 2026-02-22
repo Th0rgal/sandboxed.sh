@@ -2,7 +2,7 @@
 
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, ExecutionStatus,
-    Mission, MissionHistoryEntry, MissionStatus, MissionStore, RetryConfig, StopPolicy,
+    FreshSession, Mission, MissionHistoryEntry, MissionStatus, MissionStore, RetryConfig, StopPolicy,
     StoredEvent, TriggerType, WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo};
@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS automations (
     variables TEXT NOT NULL DEFAULT '{}',
     active INTEGER NOT NULL DEFAULT 1,
     stop_policy TEXT NOT NULL DEFAULT 'never',
+    fresh_session TEXT NOT NULL DEFAULT 'keep',
     created_at TEXT NOT NULL,
     last_triggered_at TEXT,
     retry_max_retries INTEGER NOT NULL DEFAULT 3,
@@ -160,11 +161,12 @@ impl SqliteMissionStore {
         let variables_json: String = row.get(6)?;
         let active: i64 = row.get(7)?;
         let stop_policy_str: String = row.get(8)?;
-        let created_at: String = row.get(9)?;
-        let last_triggered_at: Option<String> = row.get(10)?;
-        let retry_max_retries: i64 = row.get(11)?;
-        let retry_delay_seconds: i64 = row.get(12)?;
-        let retry_backoff_multiplier: f64 = row.get(13)?;
+        let fresh_session_str: String = row.get(9).unwrap_or_else(|_| "keep".to_string());
+        let created_at: String = row.get(10)?;
+        let last_triggered_at: Option<String> = row.get(11)?;
+        let retry_max_retries: i64 = row.get(12)?;
+        let retry_delay_seconds: i64 = row.get(13)?;
+        let retry_backoff_multiplier: f64 = row.get(14)?;
 
         // Parse command source
         let command_source: CommandSource = match command_source_type.as_str() {
@@ -221,11 +223,25 @@ impl SqliteMissionStore {
         // Parse variables
         let variables: HashMap<String, String> =
             serde_json::from_str(&variables_json).unwrap_or_default();
-        let stop_policy = match stop_policy_str.as_str() {
-            "never" => StopPolicy::Never,
-            "on_mission_completed" => StopPolicy::OnMissionCompleted,
-            "on_terminal_any" => StopPolicy::OnTerminalAny,
-            _ => StopPolicy::Never,
+        // Parse stop_policy - handle both old format and new format
+        let stop_policy = if stop_policy_str.starts_with("consecutive_failures:") {
+            let count = stop_policy_str
+                .split(':')
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2);
+            StopPolicy::OnConsecutiveFailures { count }
+        } else {
+            match stop_policy_str.as_str() {
+                "never" => StopPolicy::Never,
+                _ => StopPolicy::Never,
+            }
+        };
+
+        // Parse fresh_session
+        let fresh_session = match fresh_session_str.as_str() {
+            "always" => FreshSession::Always,
+            _ => FreshSession::Keep,
         };
 
         Ok(Automation {
@@ -238,6 +254,7 @@ impl SqliteMissionStore {
             variables,
             active: active != 0,
             stop_policy,
+            fresh_session,
             created_at,
             last_triggered_at,
             retry_config: RetryConfig {
@@ -245,6 +262,7 @@ impl SqliteMissionStore {
                 retry_delay_seconds: retry_delay_seconds as u64,
                 backoff_multiplier: retry_backoff_multiplier,
             },
+            consecutive_failures: 0,
         })
     }
 
@@ -570,9 +588,9 @@ impl SqliteMissionStore {
                 conn.execute(
                     "INSERT INTO automations (id, mission_id, command_source_type, command_source_data,
                                              trigger_type, trigger_data, variables, active, stop_policy,
-                                             created_at, last_triggered_at, retry_max_retries,
+                                             fresh_session, created_at, last_triggered_at, retry_max_retries,
                                              retry_delay_seconds, retry_backoff_multiplier)
-                     VALUES (?, ?, 'library', ?, 'interval', ?, '{}', ?, 'never', ?, ?, 3, 60, 2.0)",
+                     VALUES (?, ?, 'library', ?, 'interval', ?, '{}', ?, 'never', 'keep', ?, ?, 3, 60, 2.0)",
                     params![id, mission_id, command_source_data, trigger_data, active, created_at, last_triggered_at],
                 )
                 .map_err(|e| format!("Failed to migrate automation: {}", e))?;
@@ -647,6 +665,23 @@ impl SqliteMissionStore {
                 [],
             )
             .map_err(|e| format!("Failed to add stop_policy column: {}", e))?;
+        }
+
+        // Migration: add fresh_session column if it doesn't exist
+        let has_fresh_session: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('automations') WHERE name = 'fresh_session'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_fresh_session {
+            tracing::info!("Running migration: adding 'fresh_session' column to automations table");
+            conn.execute(
+                "ALTER TABLE automations ADD COLUMN fresh_session TEXT NOT NULL DEFAULT 'keep'",
+                [],
+            )
+            .map_err(|e| format!("Failed to add fresh_session column: {}", e))?;
         }
 
         Ok(())
@@ -1645,12 +1680,20 @@ impl MissionStore for SqliteMissionStore {
         let a = automation.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
+            let stop_policy_str = match &a.stop_policy {
+                StopPolicy::Never => "never".to_string(),
+                StopPolicy::OnConsecutiveFailures { count } => format!("consecutive_failures:{}", count),
+            };
+            let fresh_session_str = match a.fresh_session {
+                FreshSession::Always => "always",
+                FreshSession::Keep => "keep",
+            };
             conn.execute(
                 "INSERT INTO automations (id, mission_id, command_source_type, command_source_data,
                                          trigger_type, trigger_data, variables, active, stop_policy,
-                                         created_at, last_triggered_at, retry_max_retries,
+                                         fresh_session, created_at, last_triggered_at, retry_max_retries,
                                          retry_delay_seconds, retry_backoff_multiplier)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     a.id.to_string(),
                     a.mission_id.to_string(),
@@ -1660,11 +1703,8 @@ impl MissionStore for SqliteMissionStore {
                     trigger_data,
                     variables_json,
                     if a.active { 1 } else { 0 },
-                    match a.stop_policy {
-                        StopPolicy::Never => "never",
-                        StopPolicy::OnMissionCompleted => "on_mission_completed",
-                        StopPolicy::OnTerminalAny => "on_terminal_any",
-                    },
+                    stop_policy_str,
+                    fresh_session_str,
                     a.created_at,
                     a.last_triggered_at,
                     a.retry_config.max_retries as i64,
@@ -1847,12 +1887,20 @@ impl MissionStore for SqliteMissionStore {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
+            let stop_policy_str = match &automation.stop_policy {
+                StopPolicy::Never => "never".to_string(),
+                StopPolicy::OnConsecutiveFailures { count } => format!("consecutive_failures:{}", count),
+            };
+            let fresh_session_str = match automation.fresh_session {
+                FreshSession::Always => "always",
+                FreshSession::Keep => "keep",
+            };
             conn.execute(
                 "UPDATE automations SET command_source_type = ?, command_source_data = ?,
                                        trigger_type = ?, trigger_data = ?, variables = ?, active = ?,
-                                       stop_policy = ?, last_triggered_at = ?, retry_max_retries = ?, retry_delay_seconds = ?,
+                                       stop_policy = ?, fresh_session = ?, last_triggered_at = ?, retry_max_retries = ?, retry_delay_seconds = ?,
                                        retry_backoff_multiplier = ?
-                 WHERE id = ?",
+                  WHERE id = ?",
                 params![
                     command_source_type,
                     command_source_data,
@@ -1860,11 +1908,8 @@ impl MissionStore for SqliteMissionStore {
                     trigger_data,
                     variables_json,
                     if automation.active { 1 } else { 0 },
-                    match automation.stop_policy {
-                        StopPolicy::Never => "never",
-                        StopPolicy::OnMissionCompleted => "on_mission_completed",
-                        StopPolicy::OnTerminalAny => "on_terminal_any",
-                    },
+                    stop_policy_str,
+                    fresh_session_str,
                     automation.last_triggered_at,
                     automation.retry_config.max_retries as i64,
                     automation.retry_config.retry_delay_seconds as i64,
