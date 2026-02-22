@@ -2100,6 +2100,33 @@ fn get_backend_bool_setting(backend_id: &str, key: &str) -> Option<bool> {
     None
 }
 
+fn workspace_env_setting(workspace: &Workspace, key: &str) -> Option<String> {
+    workspace
+        .env_vars
+        .get(key)
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_opencode_runner_setting(workspace: &Workspace) -> Option<String> {
+    workspace_env_setting(workspace, "SANDBOXED_SH_OPENCODE_CLI_PATH")
+        .or_else(|| workspace_env_setting(workspace, "OPENCODE_CLI_PATH"))
+        .or_else(|| get_backend_string_setting("opencode", "cli_path"))
+        .or_else(|| std::env::var("OPENCODE_CLI_PATH").ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn resolve_opencode_binary_hint(workspace: &Workspace) -> Option<String> {
+    workspace_env_setting(workspace, "SANDBOXED_SH_OPENCODE_BINARY_PATH")
+        .or_else(|| workspace_env_setting(workspace, "OPENCODE_BINARY_PATH"))
+        .or_else(|| std::env::var("SANDBOXED_SH_OPENCODE_BINARY_PATH").ok())
+        .or_else(|| std::env::var("OPENCODE_BINARY_PATH").ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Read API key from Amp backend config file if available.
 pub fn get_amp_api_key_from_config() -> Option<String> {
     let key = get_backend_string_setting("amp", "api_key")?;
@@ -6996,22 +7023,43 @@ async fn resolve_opencode_installer_fetcher(
     None
 }
 
-async fn opencode_binary_available(workspace_exec: &WorkspaceExec, cwd: &std::path::Path) -> bool {
-    if command_available(workspace_exec, cwd, "opencode").await {
-        return true;
+fn opencode_binary_candidates(
+    workspace_exec: &WorkspaceExec,
+    binary_hint: Option<&str>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(hint) = binary_hint.map(str::trim).filter(|v| !v.is_empty()) {
+        candidates.push(hint.to_string());
     }
-    if command_available(workspace_exec, cwd, "/usr/local/bin/opencode").await {
-        return true;
-    }
+
+    candidates.push("opencode".to_string());
+    candidates.push("/usr/local/bin/opencode".to_string());
+
     if workspace_exec.workspace.workspace_type == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(&workspace_exec.workspace)
     {
-        if command_available(workspace_exec, cwd, "/root/.opencode/bin/opencode").await {
-            return true;
-        }
+        candidates.push("/root/.opencode/bin/opencode".to_string());
     } else if let Ok(home) = std::env::var("HOME") {
-        let path = format!("{}/.opencode/bin/opencode", home);
-        if command_available(workspace_exec, cwd, &path).await {
+        candidates.push(format!("{}/.opencode/bin/opencode", home));
+    }
+
+    let mut deduped = Vec::new();
+    for candidate in candidates {
+        if !deduped.iter().any(|existing| existing == &candidate) {
+            deduped.push(candidate);
+        }
+    }
+
+    deduped
+}
+
+async fn opencode_binary_available(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    binary_hint: Option<&str>,
+) -> bool {
+    for candidate in opencode_binary_candidates(workspace_exec, binary_hint) {
+        if command_available(workspace_exec, cwd, &candidate).await {
             return true;
         }
     }
@@ -7062,37 +7110,41 @@ fn version_is_newer(a: &str, b: &str) -> bool {
 async fn detect_opencode_version(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
+    binary_hint: Option<&str>,
 ) -> Option<String> {
-    let args = vec![
-        "-lc".to_string(),
-        "for candidate in opencode /usr/local/bin/opencode /root/.opencode/bin/opencode \"$HOME/.opencode/bin/opencode\"; do \
-          if [ -x \"$candidate\" ] || command -v \"$candidate\" >/dev/null 2>&1; then \
-            \"$candidate\" --version 2>&1 && exit 0; \
-          fi; \
-        done; \
-        exit 1"
-        .to_string(),
-    ];
+    for candidate in opencode_binary_candidates(workspace_exec, binary_hint) {
+        if !command_available(workspace_exec, cwd, &candidate).await {
+            continue;
+        }
 
-    let output = workspace_exec
-        .output(cwd, "/bin/sh", &args, HashMap::new())
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
+        let output = match workspace_exec
+            .output(cwd, &candidate, &["--version".to_string()], HashMap::new())
+            .await
+        {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = if stdout.trim().is_empty() {
+            stderr.to_string()
+        } else if stderr.trim().is_empty() {
+            stdout.to_string()
+        } else {
+            format!("{}\n{}", stdout, stderr)
+        };
+
+        if let Some(version) = extract_semver_token(&combined) {
+            return Some(version);
+        }
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = if stdout.trim().is_empty() {
-        stderr.to_string()
-    } else if stderr.trim().is_empty() {
-        stdout.to_string()
-    } else {
-        format!("{}\n{}", stdout, stderr)
-    };
-
-    extract_semver_token(&combined)
+    None
 }
 
 fn format_opencode_version_too_old_error(current_version: &str) -> String {
@@ -7175,11 +7227,14 @@ async fn cleanup_opencode_listeners(
 async fn ensure_opencode_cli_available(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
+    binary_hint: Option<&str>,
 ) -> Result<(), String> {
     let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_OPENCODE", true);
-    let has_binary = opencode_binary_available(workspace_exec, cwd).await;
+    let has_binary = opencode_binary_available(workspace_exec, cwd, binary_hint).await;
     if has_binary {
-        if let Some(current_version) = detect_opencode_version(workspace_exec, cwd).await {
+        if let Some(current_version) =
+            detect_opencode_version(workspace_exec, cwd, binary_hint).await
+        {
             if version_is_newer(MIN_SUPPORTED_OPENCODE_VERSION, &current_version) {
                 if !auto_install {
                     return Err(format_opencode_version_too_old_error(&current_version));
@@ -7190,7 +7245,9 @@ async fn ensure_opencode_cli_available(
                     "OpenCode version is below minimum supported, attempting in-place upgrade"
                 );
                 install_or_upgrade_opencode_cli(workspace_exec, cwd).await?;
-                if let Some(updated_version) = detect_opencode_version(workspace_exec, cwd).await {
+                if let Some(updated_version) =
+                    detect_opencode_version(workspace_exec, cwd, binary_hint).await
+                {
                     if version_is_newer(MIN_SUPPORTED_OPENCODE_VERSION, &updated_version) {
                         return Err(format_opencode_version_too_old_error(&updated_version));
                     }
@@ -7198,6 +7255,13 @@ async fn ensure_opencode_cli_available(
             }
         }
         return Ok(());
+    }
+
+    if let Some(custom_path) = binary_hint.map(str::trim).filter(|v| !v.is_empty()) {
+        return Err(format!(
+            "OpenCode CLI not found at configured path '{}'. Update SANDBOXED_SH_OPENCODE_BINARY_PATH / OPENCODE_BINARY_PATH or install OpenCode there.",
+            custom_path
+        ));
     }
 
     if !auto_install {
@@ -7209,14 +7273,14 @@ async fn ensure_opencode_cli_available(
 
     install_or_upgrade_opencode_cli(workspace_exec, cwd).await?;
 
-    if !opencode_binary_available(workspace_exec, cwd).await {
+    if !opencode_binary_available(workspace_exec, cwd, binary_hint).await {
         return Err(
             "OpenCode install completed but 'opencode' is still not available in workspace PATH."
                 .to_string(),
         );
     }
 
-    if let Some(current_version) = detect_opencode_version(workspace_exec, cwd).await {
+    if let Some(current_version) = detect_opencode_version(workspace_exec, cwd, binary_hint).await {
         if version_is_newer(MIN_SUPPORTED_OPENCODE_VERSION, &current_version) {
             return Err(format_opencode_version_too_old_error(&current_version));
         }
@@ -7326,8 +7390,10 @@ async fn check_opencode_prerequisites(
     cwd: &std::path::Path,
 ) -> BackendPreflightResult {
     let mut missing = Vec::new();
+    let binary_hint = resolve_opencode_binary_hint(&workspace_exec.workspace);
 
-    let cli_available = opencode_binary_available(workspace_exec, cwd).await;
+    let cli_available =
+        opencode_binary_available(workspace_exec, cwd, binary_hint.as_deref()).await;
 
     if cli_available {
         return BackendPreflightResult {
@@ -7347,7 +7413,8 @@ async fn check_opencode_prerequisites(
         missing.push("curl or wget".to_string());
     }
 
-    let auto_install_possible = has_curl || has_wget;
+    let custom_binary_configured = binary_hint.is_some();
+    let auto_install_possible = !custom_binary_configured && (has_curl || has_wget);
 
     BackendPreflightResult {
         backend_id: "opencode".to_string(),
@@ -7355,7 +7422,12 @@ async fn check_opencode_prerequisites(
         cli_available: false,
         auto_install_possible,
         missing_dependencies: missing,
-        message: if !auto_install_possible {
+        message: if custom_binary_configured {
+            Some(format!(
+                "OpenCode CLI not found at configured path '{}'. Update SANDBOXED_SH_OPENCODE_BINARY_PATH / OPENCODE_BINARY_PATH in workspace env vars.",
+                binary_hint.unwrap_or_default()
+            ))
+        } else if !auto_install_possible {
             Some("OpenCode CLI not found and neither curl nor wget is available. Install curl/wget in the workspace template.".to_string())
         } else {
             Some("OpenCode CLI not found but can be auto-installed via curl/wget.".to_string())
@@ -7493,10 +7565,15 @@ pub async fn run_opencode_turn(
         "OpenCode turn starting with session_id"
     );
 
-    // Determine CLI runner: prefer backend config, then env var, then try bunx/npx
+    // Determine CLI runner and binary hints from workspace env/config.
     // We use 'bunx oh-my-opencode run' or 'npx oh-my-opencode run' for per-workspace execution.
     let workspace_exec = WorkspaceExec::new(workspace.clone());
-    if let Err(err) = ensure_opencode_cli_available(&workspace_exec, work_dir).await {
+    let configured_runner = resolve_opencode_runner_setting(workspace);
+    let opencode_binary_hint = resolve_opencode_binary_hint(workspace);
+    if let Err(err) =
+        ensure_opencode_cli_available(&workspace_exec, work_dir, opencode_binary_hint.as_deref())
+            .await
+    {
         tracing::error!("{}", err);
         return AgentResult::failure(err, 0).with_terminal_reason(TerminalReason::LlmError);
     }
@@ -7612,9 +7689,6 @@ pub async fn run_opencode_turn(
     // failover — so removing it trades slightly higher 429 rates under heavy
     // concurrency for lower latency in the common case.
 
-    let configured_runner = get_backend_string_setting("opencode", "cli_path")
-        .or_else(|| std::env::var("OPENCODE_CLI_PATH").ok());
-
     let mut runner_is_direct = false;
     let cli_runner = if let Some(path) = configured_runner {
         if command_available(&workspace_exec, work_dir, &path).await {
@@ -7622,7 +7696,7 @@ pub async fn run_opencode_turn(
             path
         } else {
             let err_msg = format!(
-                "OpenCode CLI runner '{}' not found in workspace. Install it or update OPENCODE_CLI_PATH.",
+                "OpenCode CLI runner '{}' not found in workspace. Install it or update workspace OPENCODE_CLI_PATH / SANDBOXED_SH_OPENCODE_CLI_PATH.",
                 path
             );
             tracing::error!("{}", err_msg);
@@ -10409,14 +10483,15 @@ mod tests {
         is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
         is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
-        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
-        sync_opencode_agent_config, version_is_newer, MissionHealth, MissionRunState,
-        MissionStallSeverity, OpencodeSseState, MIN_SUPPORTED_OPENCODE_VERSION, STALL_SEVERE_SECS,
-        STALL_WARN_SECS,
+        resolve_opencode_binary_hint, resolve_opencode_runner_setting, running_health,
+        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
+        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
+        version_is_newer, MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState,
+        MIN_SUPPORTED_OPENCODE_VERSION, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
     use crate::library::types::CommandParam;
+    use crate::workspace::Workspace;
     use serde_json::json;
     use std::borrow::Cow;
     use std::fs;
@@ -11460,6 +11535,34 @@ mod tests {
         assert!(msg.contains("1.1.53"));
         assert!(msg.contains(MIN_SUPPORTED_OPENCODE_VERSION));
         assert!(msg.contains("SIGKILL"));
+    }
+
+    #[test]
+    fn resolve_opencode_runner_setting_prefers_workspace_env() {
+        let mut workspace = Workspace::default_host(std::path::PathBuf::from("/tmp"));
+        workspace.env_vars.insert(
+            "SANDBOXED_SH_OPENCODE_CLI_PATH".to_string(),
+            "/opt/custom/oh-my-opencode".to_string(),
+        );
+
+        assert_eq!(
+            resolve_opencode_runner_setting(&workspace),
+            Some("/opt/custom/oh-my-opencode".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_opencode_binary_hint_prefers_workspace_env() {
+        let mut workspace = Workspace::default_host(std::path::PathBuf::from("/tmp"));
+        workspace.env_vars.insert(
+            "OPENCODE_BINARY_PATH".to_string(),
+            "/opt/custom/opencode".to_string(),
+        );
+
+        assert_eq!(
+            resolve_opencode_binary_hint(&workspace),
+            Some("/opt/custom/opencode".to_string())
+        );
     }
 
     // ── is_codex_node_wrapper tests ─────────────────────────────────────
