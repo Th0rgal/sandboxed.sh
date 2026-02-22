@@ -72,7 +72,7 @@ struct MissionHistoryEntry: Codable, Identifiable {
 struct Mission: Codable, Identifiable, Hashable {
     let id: String
     var status: MissionStatus
-    let title: String?
+    var title: String?
     let workspaceId: String?
     let workspaceName: String?
     let agent: String?
