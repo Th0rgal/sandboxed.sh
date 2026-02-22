@@ -128,8 +128,8 @@ jobs:
           # - Thinking/reasoning content must never appear in final assistant message
           # - Tool calls and results are properly correlated
           # - Error handling is consistent across harnesses
-          cargo test --package sandboxed-sh --lib -- backend::codex:: --nocapture
-          cargo test --package sandboxed-sh --lib -- backend::shared:: --nocapture
+          cargo test --package sandboxed_sh --lib -- backend::codex:: --nocapture
+          cargo test --package sandboxed_sh --lib -- backend::shared:: --nocapture
 
   dashboard-test:
     name: Dashboard Unit Tests
