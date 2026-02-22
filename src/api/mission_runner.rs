@@ -10250,8 +10250,7 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
     };
 
     let model_for_cost = resolved_model.as_deref();
-    let (cost_cents, cost_source) =
-        resolve_cost_cents_and_source(None, model_for_cost, &usage);
+    let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
 
     let mut result = if success {
         AgentResult::success(final_message, cost_cents)
