@@ -2,8 +2,8 @@
 
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, ExecutionStatus,
-    FreshSession, Mission, MissionHistoryEntry, MissionStatus, MissionStore, RetryConfig, StopPolicy,
-    StoredEvent, TriggerType, WebhookConfig,
+    FreshSession, Mission, MissionHistoryEntry, MissionStatus, MissionStore, RetryConfig,
+    StopPolicy, StoredEvent, TriggerType, WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
@@ -1729,7 +1729,7 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let mut stmt = conn
                 .prepare("SELECT id, mission_id, command_source_type, command_source_data,
-                                trigger_type, trigger_data, variables, active, stop_policy, created_at, last_triggered_at,
+                                trigger_type, trigger_data, variables, active, stop_policy, fresh_session, created_at, last_triggered_at,
                                 retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
                          FROM automations WHERE mission_id = ? ORDER BY created_at DESC")
                 .map_err(|e| e.to_string())?;
@@ -1756,7 +1756,7 @@ impl MissionStore for SqliteMissionStore {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, mission_id, command_source_type, command_source_data,
-                            trigger_type, trigger_data, variables, active, stop_policy, created_at, last_triggered_at,
+                            trigger_type, trigger_data, variables, active, stop_policy, fresh_session, created_at, last_triggered_at,
                             retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
                      FROM automations WHERE active = 1 ORDER BY created_at DESC",
                 )
@@ -1785,7 +1785,7 @@ impl MissionStore for SqliteMissionStore {
             let result = conn
                 .query_row(
                     "SELECT id, mission_id, command_source_type, command_source_data,
-                            trigger_type, trigger_data, variables, active, stop_policy, created_at, last_triggered_at,
+                            trigger_type, trigger_data, variables, active, stop_policy, fresh_session, created_at, last_triggered_at,
                             retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
                      FROM automations WHERE id = ?",
                     [id_str],
@@ -1936,7 +1936,7 @@ impl MissionStore for SqliteMissionStore {
             let result = conn
                 .query_row(
                     "SELECT id, mission_id, command_source_type, command_source_data,
-                            trigger_type, trigger_data, variables, active, stop_policy, created_at, last_triggered_at,
+                            trigger_type, trigger_data, variables, active, stop_policy, fresh_session, created_at, last_triggered_at,
                             retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
                      FROM automations
                      WHERE trigger_type = 'webhook' AND json_extract(trigger_data, '$.webhook_id') = ?",

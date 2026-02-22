@@ -21,8 +21,8 @@ export type TriggerType =
       };
     };
 
-export type StopPolicy = 
-  | "never" 
+export type StopPolicy =
+  | { type: "never" }
   | { type: "on_consecutive_failures"; count: number };
 
 export type FreshSession = "always" | "keep";

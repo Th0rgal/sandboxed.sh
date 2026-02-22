@@ -152,7 +152,7 @@ export function MissionAutomationsDialog({
   const [intervalValue, setIntervalValue] = useState('5');
   const [intervalUnit, setIntervalUnit] = useState<IntervalUnit>('minutes');
   const [startImmediately, setStartImmediately] = useState(true);
-  const [stopPolicy, setStopPolicy] = useState<StopPolicy>('never');
+  const [stopPolicy, setStopPolicy] = useState<StopPolicy>({ type: 'never' });
   const [freshSession, setFreshSession] = useState<'always' | 'keep'>('keep');
   const [variables, setVariables] = useState<Array<{ key: string; value: string }>>([]);
   const [creating, setCreating] = useState(false);
@@ -312,8 +312,8 @@ export function MissionAutomationsDialog({
   }, []);
 
   const getStopPolicyLabel = useCallback((policy?: StopPolicy) => {
-    if (!policy || policy === 'never') return 'Never';
-    if (typeof policy === 'object' && policy.type === 'on_consecutive_failures') {
+    if (!policy || policy.type === 'never') return 'Never';
+    if (policy.type === 'on_consecutive_failures') {
       return `After ${policy.count} consecutive failures`;
     }
     return 'Never';
@@ -481,7 +481,7 @@ export function MissionAutomationsDialog({
       setInlinePrompt('');
       setIntervalValue('5');
       setIntervalUnit('minutes');
-      setStopPolicy('never');
+      setStopPolicy({ type: 'never' });
       setFreshSession('keep');
       setVariables([]);
       if (promptTimerRef.current) {
@@ -862,8 +862,14 @@ export function MissionAutomationsDialog({
                 <div>
                   <label className="block text-xs text-white/50 mb-1.5">Stop policy</label>
                   <select
-                    value={typeof stopPolicy === 'string' ? stopPolicy : 'never'}
-                    onChange={(e) => setStopPolicy(e.target.value as StopPolicy)}
+                    value={stopPolicy.type}
+                    onChange={(e) =>
+                      setStopPolicy(
+                        e.target.value === 'on_consecutive_failures'
+                          ? { type: 'on_consecutive_failures', count: 2 }
+                          : { type: 'never' }
+                      )
+                    }
                     className={cn(selectClass, 'w-full')}
                     style={selectStyle}
                   >
@@ -1110,7 +1116,8 @@ export function MissionAutomationsDialog({
                               )}
                               <span>·</span>
                               <span>Last run {lastRunLabel}</span>
-                              {automation.stop_policy && automation.stop_policy !== 'never' && (
+                              {automation.stop_policy &&
+                                automation.stop_policy.type !== 'never' && (
                                 <>
                                   <span>·</span>
                                   <span>Stop: {getStopPolicyLabel(automation.stop_policy)}</span>

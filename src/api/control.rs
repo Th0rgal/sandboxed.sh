@@ -304,6 +304,32 @@ fn stop_policy_matches_status(
     }
 }
 
+async fn consecutive_failure_count_for_automation(
+    mission_store: &Arc<dyn MissionStore>,
+    automation: &mission_store::Automation,
+) -> u32 {
+    if !matches!(
+        automation.stop_policy,
+        mission_store::StopPolicy::OnConsecutiveFailures { .. }
+    ) {
+        return 0;
+    }
+
+    let executions = mission_store
+        .get_automation_executions(automation.id, Some(20))
+        .await
+        .unwrap_or_default();
+    let mut count = 0u32;
+    for exec in executions.iter().take(20) {
+        match exec.status {
+            mission_store::ExecutionStatus::Failed => count += 1,
+            mission_store::ExecutionStatus::Success => break,
+            _ => {}
+        }
+    }
+    count
+}
+
 pub(crate) async fn resolve_claudecode_default_model(
     library: &SharedLibrary,
     config_profile: Option<&str>,
@@ -2618,23 +2644,14 @@ async fn automation_scheduler_loop(
                 }
             };
 
-            // Get recent executions to count consecutive failures
-            let consecutive_failures = if matches!(automation.stop_policy, mission_store::StopPolicy::OnConsecutiveFailures { .. }) {
-                let executions = mission_store.get_automation_executions(automation.id, Some(20)).await.unwrap_or_default();
-                let mut count = 0u32;
-                for exec in executions.iter().take(20) {
-                    match exec.status {
-                        mission_store::ExecutionStatus::Failed => count += 1,
-                        mission_store::ExecutionStatus::Success => break,
-                        _ => {}
-                    }
-                }
-                count
-            } else {
-                0
-            };
+            let consecutive_failures =
+                consecutive_failure_count_for_automation(&mission_store, &automation).await;
 
-            if stop_policy_matches_status(&automation.stop_policy, mission.status, consecutive_failures) {
+            if stop_policy_matches_status(
+                &automation.stop_policy,
+                mission.status,
+                consecutive_failures,
+            ) {
                 tracing::info!(
                     "Disabling automation {} due to stop policy {:?} (mission {} status {:?})",
                     automation.id,
@@ -3014,23 +3031,14 @@ async fn agent_finished_automation_messages(
 
     let mut eligible = Vec::with_capacity(active.len());
     for automation in active {
-        // Get recent executions to count consecutive failures
-        let consecutive_failures = if matches!(automation.stop_policy, mission_store::StopPolicy::OnConsecutiveFailures { .. }) {
-            let executions = mission_store.get_automation_executions(automation.id, Some(20)).await.unwrap_or_default();
-            let mut count = 0u32;
-            for exec in executions.iter().take(20) {
-                match exec.status {
-                    mission_store::ExecutionStatus::Failed => count += 1,
-                    mission_store::ExecutionStatus::Success => break,
-                    _ => {}
-                }
-            }
-            count
-        } else {
-            0
-        };
+        let consecutive_failures =
+            consecutive_failure_count_for_automation(&mission_store, &automation).await;
 
-        if stop_policy_matches_status(&automation.stop_policy, mission.status, consecutive_failures) {
+        if stop_policy_matches_status(
+            &automation.stop_policy,
+            mission.status,
+            consecutive_failures,
+        ) {
             tracing::info!(
                 "Disabling agent_finished automation {} due to stop policy {:?} (mission {} status {:?})",
                 automation.id,
@@ -6079,7 +6087,9 @@ pub async fn create_automation(
         variables: req.variables,
         active: true,
         stop_policy: req.stop_policy.unwrap_or(mission_store::StopPolicy::Never),
-        fresh_session: req.fresh_session.unwrap_or(mission_store::FreshSession::Keep),
+        fresh_session: req
+            .fresh_session
+            .unwrap_or(mission_store::FreshSession::Keep),
         created_at: mission_store::now_string(),
         last_triggered_at,
         retry_config: req.retry_config.unwrap_or_default(),
@@ -6432,23 +6442,14 @@ pub async fn webhook_receiver(
             format!("Mission {} not found", mission_id),
         ))?;
 
-    // Get recent executions to count consecutive failures
-    let consecutive_failures = if matches!(automation.stop_policy, mission_store::StopPolicy::OnConsecutiveFailures { .. }) {
-        let executions = control.mission_store.get_automation_executions(automation.id, Some(20)).await.unwrap_or_default();
-        let mut count = 0u32;
-        for exec in executions.iter().take(20) {
-            match exec.status {
-                mission_store::ExecutionStatus::Failed => count += 1,
-                mission_store::ExecutionStatus::Success => break,
-                _ => {}
-            }
-        }
-        count
-    } else {
-        0
-    };
+    let consecutive_failures =
+        consecutive_failure_count_for_automation(&control.mission_store, &automation).await;
 
-    if stop_policy_matches_status(&automation.stop_policy, mission.status, consecutive_failures) {
+    if stop_policy_matches_status(
+        &automation.stop_policy,
+        mission.status,
+        consecutive_failures,
+    ) {
         let mut updated = automation.clone();
         updated.active = false;
         if let Err(e) = control.mission_store.update_automation(updated).await {

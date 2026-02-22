@@ -142,7 +142,7 @@ pub enum TriggerType {
 
 /// Stop policy for automation lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum StopPolicy {
     /// Never auto-disable this automation.
     Never,
