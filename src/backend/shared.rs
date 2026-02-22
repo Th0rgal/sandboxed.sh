@@ -1121,7 +1121,7 @@ mod tests {
     #[test]
     fn tool_call_stored_for_result_correlation() {
         // Tool calls must be tracked so results can be correlated
-        let mut pending: HashMap<String, PendingToolCall> = HashMap::new();
+        let mut pending: HashMap<String, String> = HashMap::new();
 
         // First, a tool call event
         let tool_call_event: CliEvent = serde_json::from_value(json!({

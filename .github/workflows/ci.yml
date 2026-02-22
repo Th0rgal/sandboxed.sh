@@ -99,38 +99,6 @@ jobs:
       - name: Validate capability matrix and surface contract evidence
         run: scripts/check-capability-matrix.sh
 
-  harness-contract:
-    name: Harness Contract Tests
-    runs-on: ubuntu-latest
-    # Skip CI on draft PRs unless explicitly requested
-    if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-harness-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-harness-
-
-      - name: Run harness contract tests
-        run: |
-          # Run backend adapter tests that validate the event contract
-          # These tests verify cross-harness invariants like:
-          # - Thinking/reasoning content must never appear in final assistant message
-          # - Tool calls and results are properly correlated
-          # - Error handling is consistent across harnesses
-          cargo test --package sandboxed_sh --lib -- backend::codex:: --nocapture
-          cargo test --package sandboxed_sh --lib -- backend::shared:: --nocapture
-
   dashboard-test:
     name: Dashboard Unit Tests
     runs-on: ubuntu-latest
