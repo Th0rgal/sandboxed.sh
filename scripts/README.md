@@ -13,6 +13,10 @@ Runs:
 
 Use `--help` for all options, including backend-specific model overrides and expected model assertions.
 
+### harness_contract_tests.sh
+Runs a curated set of fast cross-harness contract tests that guard event-conversion invariants and OpenCode SSE parsing behavior.
+Used by CI job `harness-contract`.
+
 ### proxy_smoke.py
 Smoke test for the OpenAI-compatible proxy routes:
 - `GET /v1/models`

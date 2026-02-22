@@ -1465,3 +1465,157 @@ fn split_model(model: &str) -> Option<(String, String)> {
         Some((provider.to_string(), model_id.to_string()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn opencode_sse_text_delta_accumulates_by_response() {
+        let mut state = SseState::default();
+        let session_id = "ses_123";
+
+        let event1 = json!({
+            "type": "response.output_text.delta",
+            "properties": {
+                "response": {"id": "resp_1"},
+                "delta": "Hello"
+            }
+        });
+        let parsed1 = parse_sse_event(&event1.to_string(), None, session_id, &mut state);
+        match parsed1 {
+            Some(OpenCodeEvent::TextDelta { content }) => assert_eq!(content, "Hello"),
+            other => panic!("Expected TextDelta, got {:?}", other),
+        }
+
+        let event2 = json!({
+            "type": "response.output_text.delta",
+            "properties": {
+                "response": {"id": "resp_1"},
+                "delta": " world"
+            }
+        });
+        let parsed2 = parse_sse_event(&event2.to_string(), None, session_id, &mut state);
+        match parsed2 {
+            Some(OpenCodeEvent::TextDelta { content }) => assert_eq!(content, "Hello world"),
+            other => panic!("Expected TextDelta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn opencode_sse_empty_text_delta_is_ignored() {
+        let mut state = SseState::default();
+        let session_id = "ses_123";
+        let event = json!({
+            "type": "response.output_text.delta",
+            "properties": {"delta": ""}
+        });
+
+        let parsed = parse_sse_event(&event.to_string(), None, session_id, &mut state);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn opencode_sse_ignores_mismatched_session_id() {
+        let mut state = SseState::default();
+        let session_id = "ses_expected";
+        let event = json!({
+            "type": "response.output_text.delta",
+            "properties": {
+                "sessionID": "ses_other",
+                "delta": "ignored"
+            }
+        });
+
+        let parsed = parse_sse_event(&event.to_string(), None, session_id, &mut state);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn opencode_sse_response_incomplete_emits_message_complete() {
+        let mut state = SseState::default();
+        let session_id = "ses_123";
+        let event = json!({
+            "type": "response.incomplete",
+            "properties": {
+                "response": {
+                    "usage": {"input_tokens": 7, "output_tokens": 11}
+                }
+            }
+        });
+
+        let parsed = parse_sse_event(&event.to_string(), None, session_id, &mut state);
+        match parsed {
+            Some(OpenCodeEvent::MessageComplete { session_id: id }) => assert_eq!(id, session_id),
+            other => panic!("Expected MessageComplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn opencode_sse_function_call_delta_then_done_emits_tool_call_once() {
+        let mut state = SseState::default();
+        let session_id = "ses_123";
+
+        let delta = json!({
+            "type": "response.function_call_arguments.delta",
+            "properties": {
+                "item_id": "call_1",
+                "delta": "{\"path\":\""
+            }
+        });
+        assert!(parse_sse_event(&delta.to_string(), None, session_id, &mut state).is_none());
+
+        let delta2 = json!({
+            "type": "response.function_call_arguments.delta",
+            "properties": {
+                "item_id": "call_1",
+                "delta": "/tmp/file.txt\"}"
+            }
+        });
+        assert!(parse_sse_event(&delta2.to_string(), None, session_id, &mut state).is_none());
+
+        let done = json!({
+            "type": "response.output_item.done",
+            "properties": {
+                "item": {
+                    "type": "function_call",
+                    "id": "call_1",
+                    "name": "Read"
+                }
+            }
+        });
+        let parsed = parse_sse_event(&done.to_string(), None, session_id, &mut state);
+        match parsed {
+            Some(OpenCodeEvent::ToolCall { id, name, args }) => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "Read");
+                assert_eq!(args["path"], "/tmp/file.txt");
+            }
+            other => panic!("Expected ToolCall, got {:?}", other),
+        }
+
+        let duplicate = parse_sse_event(&done.to_string(), None, session_id, &mut state);
+        assert!(duplicate.is_none());
+    }
+
+    #[test]
+    fn opencode_sse_falls_back_to_event_name_header() {
+        let mut state = SseState::default();
+        let session_id = "ses_123";
+        let payload_without_type = json!({
+            "properties": {"message": "bad request"}
+        });
+
+        let parsed = parse_sse_event(
+            &payload_without_type.to_string(),
+            Some("error"),
+            session_id,
+            &mut state,
+        );
+        match parsed {
+            Some(OpenCodeEvent::Error { message }) => assert_eq!(message, "bad request"),
+            other => panic!("Expected Error, got {:?}", other),
+        }
+    }
+}
