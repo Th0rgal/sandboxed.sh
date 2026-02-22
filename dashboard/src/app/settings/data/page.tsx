@@ -120,8 +120,25 @@ export default function DataSettingsPage() {
   const handleToggleRtk = async (enabled: boolean) => {
     setTogglingRtk(true);
     try {
-      await updateRtkEnabled(enabled);
-      mutateSettings();
+      await mutateSettings(
+        async (current) => {
+          await updateRtkEnabled(enabled);
+          return {
+            library_remote: current?.library_remote ?? null,
+            sandboxed_repo_path: current?.sandboxed_repo_path ?? null,
+            rtk_enabled: enabled,
+          };
+        },
+        {
+          optimisticData: (current) => ({
+            library_remote: current?.library_remote ?? null,
+            sandboxed_repo_path: current?.sandboxed_repo_path ?? null,
+            rtk_enabled: enabled,
+          }),
+          rollbackOnError: true,
+          revalidate: true,
+        }
+      );
       toast.success(enabled ? 'RTK enabled' : 'RTK disabled');
     } catch (err) {
       toast.error(
@@ -366,7 +383,10 @@ export default function DataSettingsPage() {
                 </p>
               </div>
               <button
-                onClick={() => handleToggleRtk(!serverSettings?.rtk_enabled)}
+                type="button"
+                aria-label="Toggle RTK compression"
+                aria-pressed={Boolean(serverSettings?.rtk_enabled)}
+                onClick={() => handleToggleRtk(!Boolean(serverSettings?.rtk_enabled))}
                 disabled={togglingRtk || settingsLoading}
                 className={cn(
                   'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
