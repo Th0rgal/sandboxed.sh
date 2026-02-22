@@ -3032,7 +3032,7 @@ async fn agent_finished_automation_messages(
     let mut eligible = Vec::with_capacity(active.len());
     for automation in active {
         let consecutive_failures =
-            consecutive_failure_count_for_automation(&mission_store, &automation).await;
+            consecutive_failure_count_for_automation(mission_store, &automation).await;
 
         if stop_policy_matches_status(
             &automation.stop_policy,
