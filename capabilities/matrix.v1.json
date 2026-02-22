@@ -147,7 +147,7 @@
         "evidence": [
           {
             "path": "ios_dashboard/SandboxedDashboard/Models/ChatMessage.swift",
-            "pattern": "case assistant(success: Bool, costCents: Int, model: String?, sharedFiles: [SharedFile]?)"
+            "pattern": "case assistant(success: Bool, costCents: Int, costSource: CostSource, model: String?, sharedFiles: [SharedFile]?)"
           }
         ]
       }

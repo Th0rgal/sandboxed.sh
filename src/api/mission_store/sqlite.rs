@@ -1758,10 +1758,7 @@ impl MissionStore for SqliteMissionStore {
         u64::try_from(total).map_err(|_| format!("negative aggregate cost is invalid: {total}"))
     }
 
-    async fn get_cost_by_source_since(
-        &self,
-        since: &str,
-    ) -> Result<(u64, u64, u64), String> {
+    async fn get_cost_by_source_since(&self, since: &str) -> Result<(u64, u64, u64), String> {
         let conn = self.conn.lock().await;
         let query = r#"
             WITH source_costs AS (
@@ -2476,7 +2473,15 @@ mod tests {
             .await
             .expect("sqlite store");
         let mission = store
-            .create_mission(Some("Cost source mission"), None, None, None, None, None, None)
+            .create_mission(
+                Some("Cost source mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("mission");
 
@@ -2563,7 +2568,15 @@ mod tests {
             .await
             .expect("sqlite store");
         let mission = store
-            .create_mission(Some("Period cost mission"), None, None, None, None, None, None)
+            .create_mission(
+                Some("Period cost mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("mission");
 
@@ -2620,10 +2633,7 @@ mod tests {
         drop(conn);
 
         // All-time totals
-        let all_total = store
-            .get_total_cost_cents()
-            .await
-            .expect("all-time total");
+        let all_total = store.get_total_cost_cents().await.expect("all-time total");
         assert_eq!(all_total, 245); // 200 + 30 + 15
 
         // Period-filtered: since 2026-02-15 should only include the two recent events

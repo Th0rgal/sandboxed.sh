@@ -416,7 +416,9 @@ fn default_providers_config() -> ProvidersConfig {
                     ProviderModel {
                         id: "gemini-3.1-pro-preview".to_string(),
                         name: "Gemini 3.1 Pro Preview".to_string(),
-                        description: Some("Advanced reasoning with three-tier thinking".to_string()),
+                        description: Some(
+                            "Advanced reasoning with three-tier thinking".to_string(),
+                        ),
                     },
                     ProviderModel {
                         id: "gemini-3-pro-preview".to_string(),

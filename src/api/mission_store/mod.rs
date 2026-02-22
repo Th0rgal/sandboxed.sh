@@ -453,10 +453,7 @@ pub trait MissionStore: Send + Sync {
     }
 
     /// Get cost in cents grouped by source, for events on or after `since` (ISO-8601).
-    async fn get_cost_by_source_since(
-        &self,
-        _since: &str,
-    ) -> Result<(u64, u64, u64), String> {
+    async fn get_cost_by_source_since(&self, _since: &str) -> Result<(u64, u64, u64), String> {
         Ok((0, 0, 0))
     }
 

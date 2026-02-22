@@ -10952,7 +10952,10 @@ mod tests {
         assert!(parsed.event.is_none());
         assert!(parsed.message_complete);
         assert!(parsed.model.is_none());
-        assert!(parsed.usage.is_none(), "no usage when response has no usage field");
+        assert!(
+            parsed.usage.is_none(),
+            "no usage when response has no usage field"
+        );
     }
 
     #[test]

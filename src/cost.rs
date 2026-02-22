@@ -348,7 +348,10 @@ pub fn resolve_cost_cents_and_source(
     if usage.has_usage() {
         if let Some(model_name) = model {
             if pricing_for_model(model_name).is_some() {
-                return (cost_cents_from_usage(model_name, usage), CostSource::Estimated);
+                return (
+                    cost_cents_from_usage(model_name, usage),
+                    CostSource::Estimated,
+                );
             }
             return (0, CostSource::Unknown);
         }
@@ -373,10 +376,7 @@ mod tests {
         );
         assert_eq!(normalize_model("gpt-4o-2024-08-06"), "gpt-4o");
         assert_eq!(normalize_model("gemini-2.5-pro-preview"), "gemini-2.5-pro");
-        assert_eq!(
-            normalize_model("gemini-3.1-pro-preview"),
-            "gemini-3.1-pro"
-        );
+        assert_eq!(normalize_model("gemini-3.1-pro-preview"), "gemini-3.1-pro");
         assert_eq!(normalize_model("gemini-3-1-pro-preview"), "gemini-3.1-pro");
         assert_eq!(normalize_model("gemini-3-pro-preview"), "gemini-3-pro");
     }
