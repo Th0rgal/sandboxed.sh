@@ -6973,6 +6973,8 @@ fn runner_is_oh_my_opencode(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+const MIN_SUPPORTED_OPENCODE_VERSION: &str = "1.1.59";
+
 async fn resolve_opencode_installer_fetcher(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
@@ -7016,6 +7018,139 @@ async fn opencode_binary_available(workspace_exec: &WorkspaceExec, cwd: &std::pa
     false
 }
 
+fn extract_semver_token(input: &str) -> Option<String> {
+    let mut best: Option<String> = None;
+    let mut current = String::new();
+
+    for ch in input.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            current.push(ch);
+            continue;
+        }
+        if current.contains('.') {
+            best = Some(current.clone());
+        }
+        current.clear();
+    }
+
+    if current.contains('.') {
+        best = Some(current);
+    }
+
+    best.map(|v| v.trim_start_matches('v').to_string())
+}
+
+fn version_is_newer(a: &str, b: &str) -> bool {
+    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
+
+    let va = parse(a);
+    let vb = parse(b);
+
+    for i in 0..va.len().max(vb.len()) {
+        let a_part = va.get(i).copied().unwrap_or(0);
+        let b_part = vb.get(i).copied().unwrap_or(0);
+        if a_part > b_part {
+            return true;
+        }
+        if a_part < b_part {
+            return false;
+        }
+    }
+    false
+}
+
+async fn detect_opencode_version(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    let mut args = Vec::new();
+    args.push("-lc".to_string());
+    args.push(
+        "for candidate in opencode /usr/local/bin/opencode /root/.opencode/bin/opencode \"$HOME/.opencode/bin/opencode\"; do \
+          if [ -x \"$candidate\" ] || command -v \"$candidate\" >/dev/null 2>&1; then \
+            \"$candidate\" --version 2>&1 && exit 0; \
+          fi; \
+        done; \
+        exit 1"
+            .to_string(),
+    );
+
+    let output = workspace_exec
+        .output(cwd, "/bin/sh", &args, HashMap::new())
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = if stdout.trim().is_empty() {
+        stderr.to_string()
+    } else if stderr.trim().is_empty() {
+        stdout.to_string()
+    } else {
+        format!("{}\n{}", stdout, stderr)
+    };
+
+    extract_semver_token(&combined)
+}
+
+fn format_opencode_version_too_old_error(current_version: &str) -> String {
+    format!(
+        "OpenCode CLI {} is too old. sandboxed.sh requires OpenCode {} or newer (older versions can crash with SIGKILL). Update OpenCode in this workspace and retry.",
+        current_version, MIN_SUPPORTED_OPENCODE_VERSION
+    )
+}
+
+async fn install_or_upgrade_opencode_cli(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Result<(), String> {
+    let fetcher = resolve_opencode_installer_fetcher(workspace_exec, cwd)
+        .await
+        .ok_or_else(|| {
+            "OpenCode CLI install/upgrade requires curl or wget in the workspace.".to_string()
+        })?;
+
+    let mut args = Vec::new();
+    args.push("-lc".to_string());
+    // Use explicit /root path for container workspaces since $HOME may not be set in nspawn
+    // Try both /root and $HOME to cover both container and host workspaces
+    args.push(format!(
+        "{} | bash -s -- --no-modify-path \
+      && for bindir in /root/.opencode/bin \"$HOME/.opencode/bin\"; do \
+           if [ -x \"$bindir/opencode\" ]; then install -m 0755 \"$bindir/opencode\" /usr/local/bin/opencode && break; fi; \
+         done",
+        fetcher
+    ));
+    let output = workspace_exec
+        .output(cwd, "/bin/sh", &args, HashMap::new())
+        .await
+        .map_err(|e| format!("Failed to run OpenCode installer: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut message = String::new();
+        if !stderr.trim().is_empty() {
+            message.push_str(stderr.trim());
+        }
+        if !stdout.trim().is_empty() {
+            if !message.is_empty() {
+                message.push_str(" | ");
+            }
+            message.push_str(stdout.trim());
+        }
+        if message.is_empty() {
+            message = "OpenCode install failed with no output".to_string();
+        }
+        return Err(format!("OpenCode install failed: {}", message));
+    }
+
+    Ok(())
+}
+
 async fn cleanup_opencode_listeners(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
@@ -7042,11 +7177,30 @@ async fn ensure_opencode_cli_available(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
 ) -> Result<(), String> {
-    if opencode_binary_available(workspace_exec, cwd).await {
+    let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_OPENCODE", true);
+    let has_binary = opencode_binary_available(workspace_exec, cwd).await;
+    if has_binary {
+        if let Some(current_version) = detect_opencode_version(workspace_exec, cwd).await {
+            if version_is_newer(MIN_SUPPORTED_OPENCODE_VERSION, &current_version) {
+                if !auto_install {
+                    return Err(format_opencode_version_too_old_error(&current_version));
+                }
+                tracing::warn!(
+                    current_version = %current_version,
+                    min_supported = MIN_SUPPORTED_OPENCODE_VERSION,
+                    "OpenCode version is below minimum supported, attempting in-place upgrade"
+                );
+                install_or_upgrade_opencode_cli(workspace_exec, cwd).await?;
+                if let Some(updated_version) = detect_opencode_version(workspace_exec, cwd).await {
+                    if version_is_newer(MIN_SUPPORTED_OPENCODE_VERSION, &updated_version) {
+                        return Err(format_opencode_version_too_old_error(&updated_version));
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 
-    let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_OPENCODE", true);
     if !auto_install {
         return Err(
             "OpenCode CLI 'opencode' not found in workspace. Install it or disable OpenCode."
@@ -7054,53 +7208,19 @@ async fn ensure_opencode_cli_available(
         );
     }
 
-    let fetcher = resolve_opencode_installer_fetcher(workspace_exec, cwd).await.ok_or_else(|| {
-        "OpenCode CLI 'opencode' not found and neither curl nor wget is available in the workspace. Install curl/wget in the workspace template or disable OpenCode."
-            .to_string()
-    })?;
-
-    let mut args = Vec::new();
-    args.push("-lc".to_string());
-    // Use explicit /root path for container workspaces since $HOME may not be set in nspawn
-    // Try both /root and $HOME to cover both container and host workspaces
-    args.push(
-        format!(
-            "{} | bash -s -- --no-modify-path \
-        && for bindir in /root/.opencode/bin \"$HOME/.opencode/bin\"; do \
-            if [ -x \"$bindir/opencode\" ]; then install -m 0755 \"$bindir/opencode\" /usr/local/bin/opencode && break; fi; \
-        done"
-            , fetcher
-        ),
-    );
-    let output = workspace_exec
-        .output(cwd, "/bin/sh", &args, HashMap::new())
-        .await
-        .map_err(|e| format!("Failed to run OpenCode installer: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut message = String::new();
-        if !stderr.trim().is_empty() {
-            message.push_str(stderr.trim());
-        }
-        if !stdout.trim().is_empty() {
-            if !message.is_empty() {
-                message.push_str(" | ");
-            }
-            message.push_str(stdout.trim());
-        }
-        if message.is_empty() {
-            message = "OpenCode install failed with no output".to_string();
-        }
-        return Err(format!("OpenCode install failed: {}", message));
-    }
+    install_or_upgrade_opencode_cli(workspace_exec, cwd).await?;
 
     if !opencode_binary_available(workspace_exec, cwd).await {
         return Err(
             "OpenCode install completed but 'opencode' is still not available in workspace PATH."
                 .to_string(),
         );
+    }
+
+    if let Some(current_version) = detect_opencode_version(workspace_exec, cwd).await {
+        if version_is_newer(MIN_SUPPORTED_OPENCODE_VERSION, &current_version) {
+            return Err(format_opencode_version_too_old_error(&current_version));
+        }
     }
 
     Ok(())
@@ -10285,14 +10405,15 @@ fn cleanup_old_debug_files(
 mod tests {
     use super::{
         bind_command_params, codex_key_fingerprint, extract_model_from_message,
-        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
-        is_capacity_limited_error, is_codex_node_wrapper, is_rate_limited_error,
-        is_session_corruption_error, is_tool_call_only_output, opencode_output_needs_fallback,
-        opencode_session_token_from_line, parse_opencode_session_token, parse_opencode_sse_event,
-        parse_opencode_stderr_text_part, running_health, sanitized_opencode_stdout, stall_severity,
-        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
-        summarize_recent_opencode_stderr, sync_opencode_agent_config, MissionHealth,
-        MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
+        extract_opencode_session_id, extract_part_text, extract_semver_token, extract_str,
+        extract_thought_line, format_opencode_version_too_old_error, is_capacity_limited_error,
+        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
+        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
+        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
+        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
+        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
+        sync_opencode_agent_config, version_is_newer, MissionHealth, MissionRunState,
+        MissionStallSeverity, OpencodeSseState, MIN_SUPPORTED_OPENCODE_VERSION, STALL_SEVERE_SECS,
         STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
@@ -11297,6 +11418,49 @@ mod tests {
     fn is_tool_call_only_output_rejects_real_text() {
         let mixed = "{\"name\":\"tool\",\"arguments\":\"{}\"}\nreal answer";
         assert!(!is_tool_call_only_output(mixed));
+    }
+
+    // ── OpenCode version guard tests ───────────────────────────────────
+
+    #[test]
+    fn extract_semver_token_from_opencode_version_output() {
+        assert_eq!(
+            extract_semver_token("opencode version 1.2.10"),
+            Some("1.2.10".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_semver_token_handles_v_prefix() {
+        assert_eq!(
+            extract_semver_token("OpenCode v1.1.59 (build abc)"),
+            Some("1.1.59".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_semver_token_returns_none_when_missing() {
+        assert_eq!(extract_semver_token("opencode unknown"), None);
+    }
+
+    #[test]
+    fn version_is_newer_handles_patch_versions() {
+        assert!(version_is_newer("1.1.59", "1.1.53"));
+        assert!(!version_is_newer("1.1.53", "1.1.59"));
+    }
+
+    #[test]
+    fn version_is_newer_handles_missing_parts() {
+        assert!(version_is_newer("1.2.0", "1.1"));
+        assert!(!version_is_newer("1.1", "1.1.0"));
+    }
+
+    #[test]
+    fn format_opencode_version_too_old_error_mentions_minimum() {
+        let msg = format_opencode_version_too_old_error("1.1.53");
+        assert!(msg.contains("1.1.53"));
+        assert!(msg.contains(MIN_SUPPORTED_OPENCODE_VERSION));
+        assert!(msg.contains("SIGKILL"));
     }
 
     // ── is_codex_node_wrapper tests ─────────────────────────────────────

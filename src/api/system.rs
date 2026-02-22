@@ -25,6 +25,7 @@ use crate::util::home_dir;
 
 /// Git remote used for sandboxed.sh self-updates
 const SANDBOXED_REPO_REMOTE: &str = "https://github.com/Th0rgal/sandboxed.sh.git";
+const MIN_SUPPORTED_OPENCODE_VERSION: &str = "1.1.59";
 
 /// Information about a system component.
 #[derive(Debug, Clone, Serialize)]
@@ -333,8 +334,17 @@ async fn get_opencode_info(_config: &crate::config::Config) -> ComponentInfo {
                     .replace("opencode ", "")
             });
 
-            let update_available = check_opencode_update(version.as_deref()).await;
-            let status = if update_available.is_some() {
+            let is_too_old = version
+                .as_deref()
+                .map(|v| version_is_newer(MIN_SUPPORTED_OPENCODE_VERSION, v))
+                .unwrap_or(false);
+            let mut update_available = check_opencode_update(version.as_deref()).await;
+            if is_too_old && update_available.is_none() {
+                update_available = Some(format!(">= {} required", MIN_SUPPORTED_OPENCODE_VERSION));
+            }
+            let status = if is_too_old {
+                ComponentStatus::Error
+            } else if update_available.is_some() {
                 ComponentStatus::UpdateAvailable
             } else {
                 ComponentStatus::Ok
