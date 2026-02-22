@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
+    extract::Path,
     extract::State,
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures::StreamExt;
@@ -80,6 +81,39 @@ fn error_response(status: StatusCode, message: String, code: &str) -> Response {
     (status, Json(body)).into_response()
 }
 
+#[derive(Serialize)]
+struct DeferredAcceptedResponse {
+    request_id: uuid::Uuid,
+    status: &'static str,
+    next_attempt_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+struct DeferredStatusResponse {
+    request_id: uuid::Uuid,
+    status: crate::api::deferred_proxy::DeferredRequestStatus,
+    attempt_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    next_attempt_at: chrono::DateTime<chrono::Utc>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_payload: Option<crate::api::deferred_proxy::DeferredResponsePayload>,
+}
+
+fn header_truthy(headers: &HeaderMap, key: &str) -> bool {
+    headers
+        .get(key)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+        })
+        .unwrap_or(false)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider Base URLs
 // ─────────────────────────────────────────────────────────────────────────────
@@ -140,6 +174,8 @@ fn has_routable_proxy_credentials(
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
     Router::new()
         .route("/chat/completions", post(chat_completions))
+        .route("/deferred/:id", get(get_deferred_request))
+        .route("/deferred/:id", delete(cancel_deferred_request))
         .route("/models", axum::routing::get(list_models))
 }
 
@@ -229,6 +265,68 @@ async fn list_models(
     .into_response()
 }
 
+async fn get_deferred_request(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(resp) = verify_proxy_auth(&headers, &state).await {
+        return resp;
+    }
+
+    let Some(rec) = state.deferred_requests.get(id).await else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("Deferred request '{}' was not found", id),
+            "not_found",
+        );
+    };
+
+    Json(DeferredStatusResponse {
+        request_id: rec.id,
+        status: rec.status,
+        attempt_count: rec.attempt_count,
+        last_error: rec.last_error,
+        next_attempt_at: rec.next_attempt_at,
+        created_at: rec.created_at,
+        updated_at: rec.updated_at,
+        expires_at: rec.expires_at,
+        response_payload: rec.response_payload,
+    })
+    .into_response()
+}
+
+async fn cancel_deferred_request(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if let Err(resp) = verify_proxy_auth(&headers, &state).await {
+        return resp;
+    }
+
+    let Some(rec) = state.deferred_requests.cancel(id).await else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("Deferred request '{}' was not found", id),
+            "not_found",
+        );
+    };
+
+    Json(DeferredStatusResponse {
+        request_id: rec.id,
+        status: rec.status,
+        attempt_count: rec.attempt_count,
+        last_error: rec.last_error,
+        next_attempt_at: rec.next_attempt_at,
+        created_at: rec.created_at,
+        updated_at: rec.updated_at,
+        expires_at: rec.expires_at,
+        response_payload: rec.response_payload,
+    })
+    .into_response()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Handler
 // ─────────────────────────────────────────────────────────────────────────────
@@ -255,7 +353,18 @@ async fn chat_completions(
         }
     };
 
+    let defer_on_rate_limit = header_truthy(
+        &headers,
+        crate::api::deferred_proxy::DEFER_ON_RATE_LIMIT_HEADER,
+    );
     let is_stream = req.stream.unwrap_or(false);
+    if defer_on_rate_limit && is_stream {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Deferred mode does not support streaming requests".to_string(),
+            "invalid_request_error",
+        );
+    }
     let requested_model = req.model.clone();
 
     // 2. Check if the model name maps to a chain ID.
@@ -297,6 +406,9 @@ async fn chat_completions(
         .await;
 
     if entries.is_empty() {
+        if defer_on_rate_limit {
+            return enqueue_deferred_request(&state, &headers, &chain_id, &body).await;
+        }
         return error_response(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
@@ -1174,6 +1286,9 @@ async fn chat_completions(
             "upstream_unavailable",
         )
     } else {
+        if defer_on_rate_limit {
+            return enqueue_deferred_request(&state, &headers, &chain_id, &body).await;
+        }
         error_response(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
@@ -1189,6 +1304,48 @@ async fn chat_completions(
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+async fn enqueue_deferred_request(
+    state: &super::routes::AppState,
+    headers: &HeaderMap,
+    chain_id: &str,
+    body: &[u8],
+) -> Response {
+    let payload: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(err) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid request body: {}", err),
+                "invalid_request_error",
+            );
+        }
+    };
+    let openai_organization = headers
+        .get("openai-organization")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let next_attempt_at = crate::api::deferred_proxy::estimate_next_attempt_at(state).await;
+    let record = state
+        .deferred_requests
+        .enqueue(
+            chain_id.to_string(),
+            payload,
+            openai_organization,
+            next_attempt_at,
+        )
+        .await;
+
+    (
+        StatusCode::ACCEPTED,
+        Json(DeferredAcceptedResponse {
+            request_id: record.id,
+            status: "queued",
+            next_attempt_at: record.next_attempt_at,
+        }),
+    )
+        .into_response()
+}
 
 /// Rewrite the `model` field in the JSON request body.
 fn rewrite_model(body: &[u8], new_model: &str) -> Result<bytes::Bytes, String> {

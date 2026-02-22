@@ -23,6 +23,7 @@ pub mod backends;
 pub mod claudecode;
 mod console;
 pub mod control;
+pub mod deferred_proxy;
 pub mod desktop;
 mod desktop_stream;
 mod fs;

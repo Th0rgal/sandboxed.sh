@@ -64,6 +64,8 @@ literature. Local inference, isolated containers, nothing leaves your machines.
   single repo
 - **MCP Registry (optional)**: Extra tool servers (desktop/playwright/etc.) when
   needed
+- **OpenAI-compatible Proxy Queue Mode**: Optional deferred execution for
+  `/v1/chat/completions` when all routed providers are temporarily rate-limited
 - **Multi-platform**: Web dashboard (Next.js) and iOS app (SwiftUI) with
   Picture-in-Picture
 

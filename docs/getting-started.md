@@ -53,6 +53,38 @@ Notes:
 - Use `--skip-mission` to run proxy smoke only.
 - Use `--help` to see all options.
 
+## Optional: Deferred Queue Mode for Proxy Routing
+
+If you use `/v1/chat/completions` with model-routing chains, you can opt into deferred mode when every provider in the chain is temporarily rate-limited.
+
+Set this request header:
+
+```text
+x-sandboxed-defer-on-rate-limit: true
+```
+
+Behavior:
+- Normal success path: response is still synchronous (`200`).
+- All providers exhausted by temporary limits/unavailability: returns `202 Accepted` with `request_id`, `status=queued`, and `next_attempt_at`.
+- Background worker retries automatically; no client resubmission needed.
+
+Check status/result:
+
+```bash
+curl -H "Authorization: Bearer $SANDBOXED_PROXY_SECRET" \
+  "http://localhost:3000/v1/deferred/<request_id>"
+```
+
+Cancel queued work:
+
+```bash
+curl -X DELETE \
+  -H "Authorization: Bearer $SANDBOXED_PROXY_SECRET" \
+  "http://localhost:3000/v1/deferred/<request_id>"
+```
+
+Note: deferred mode currently supports non-streaming requests (`stream: false`).
+
 ## Step 1: Initial Dashboard View
 
 When you first access the sandboxed.sh dashboard, you'll see the global monitor overview:

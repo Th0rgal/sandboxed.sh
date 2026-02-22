@@ -49,6 +49,7 @@ use super::backends as backends_api;
 use super::claudecode as claudecode_api;
 use super::console;
 use super::control;
+use super::deferred_proxy as deferred_proxy_api;
 use super::desktop;
 use super::desktop_stream;
 use super::fs;
@@ -110,6 +111,8 @@ pub struct AppState {
     pub proxy_secret: String,
     /// User-generated proxy API keys for external tools
     pub proxy_api_keys: super::proxy_keys::SharedProxyApiKeyStore,
+    /// Deferred queue for proxy requests that opt into async-on-rate-limit mode
+    pub deferred_requests: Arc<deferred_proxy_api::DeferredRequestStore>,
 }
 
 /// Start the HTTP server.
@@ -163,6 +166,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let proxy_api_keys = Arc::new(
         super::proxy_keys::ProxyApiKeyStore::new(
             config.working_dir.join(".sandboxed-sh/proxy_api_keys.json"),
+        )
+        .await,
+    );
+    let deferred_requests = Arc::new(
+        deferred_proxy_api::DeferredRequestStore::new(
+            config
+                .working_dir
+                .join(".sandboxed-sh/deferred_requests.json"),
         )
         .await,
     );
@@ -407,6 +418,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                 secret
             }),
         proxy_api_keys,
+        deferred_requests,
     });
 
     // Start background desktop session cleanup task
@@ -424,6 +436,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             oauth_token_refresher_loop(ai_providers).await;
         });
     }
+
+    // Start deferred proxy queue worker.
+    deferred_proxy_api::start_worker(Arc::clone(&state));
 
     // Fetch model catalog from provider APIs in background
     {
