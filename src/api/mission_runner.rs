@@ -1450,7 +1450,7 @@ async fn run_mission_turn(
 
     // Build context with history
     let max_history_chars = config.context.max_history_total_chars;
-    let history_context = build_history_context(&history, max_history_chars);
+    let mut history_context = build_history_context(&history, max_history_chars);
 
     // Extract deliverables to include in instructions
     let deliverable_set = extract_deliverables(&user_message);
@@ -1602,6 +1602,25 @@ async fn run_mission_turn(
             new_session_id = %new_session_id,
             summary_length = summary.len(),
             "Session rotated successfully"
+        );
+    }
+
+    // Session rotation for OpenCode: Prevent OOM by summarizing history every N turns.
+    // Unlike Claude Code which uses session_id rotation, OpenCode sessions are managed
+    // internally by oh-my-opencode, so we rotate by summarizing history instead.
+    let should_rotate_opencode = should_rotate && backend_id == "opencode";
+    if should_rotate_opencode {
+        tracing::info!(
+            mission_id = %mission_id,
+            turn_count = turn_count,
+            interval = SESSION_ROTATION_INTERVAL,
+            "Rotating OpenCode session to prevent OOM from unbounded context accumulation"
+        );
+        let summary = generate_session_summary(&history, SESSION_ROTATION_INTERVAL);
+        // Replace history_context with summarized version
+        history_context = format!(
+            "## Previous Session Summary ({} turns)\n\n{}\n\n---\n\n",
+            turn_count, summary
         );
     }
 
@@ -6041,7 +6060,17 @@ fn format_exit_status(status: &std::process::ExitStatus) -> String {
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            return format!("signal {}", signal);
+            let signal_name = match signal {
+                1 => "SIGHUP",
+                2 => "SIGINT",
+                3 => "SIGQUIT",
+                6 => "SIGABRT",
+                9 => "SIGKILL",
+                11 => "SIGSEGV",
+                15 => "SIGTERM",
+                _ => "unknown",
+            };
+            return format!("signal: {} ({})", signal, signal_name);
         }
     }
     "code <unknown>".to_string()
@@ -8803,20 +8832,37 @@ pub async fn run_opencode_turn(
     if let Ok(status) = exit_status {
         if !status.success() {
             had_error = true;
+            
+            // Check for SIGKILL specifically - likely OOM or system kill
+            #[cfg(unix)]
+            let is_sigkill = {
+                use std::os::unix::process::ExitStatusExt;
+                status.signal() == Some(9)
+            };
+            #[cfg(not(unix))]
+            let is_sigkill = false;
+            
+            let exit_description = format_exit_status(&status);
+            
             if opencode_output_needs_fallback(&final_result) {
+                let mut error_hint = String::new();
+                if is_sigkill {
+                    error_hint = " The process was killed by the OS (often OOM or sandbox limits). Consider reducing conversation history or breaking into smaller missions.".to_string();
+                }
+                
                 if let Some(err_msg) = stderr_error_message.lock().unwrap().clone() {
-                    final_result = err_msg;
+                    final_result = format!("{}{}", err_msg, error_hint);
                 } else if let Ok(recent_lines) = stderr_recent_lines.lock() {
                     if let Some(last_stderr) = summarize_recent_opencode_stderr(&recent_lines) {
                         final_result = format!(
-                            "OpenCode CLI exited with status: {}. Last stderr: {}",
-                            status, last_stderr
+                            "OpenCode CLI exited with status: {}. Last stderr: {}{}",
+                            exit_description, last_stderr, error_hint
                         );
                     } else {
-                        final_result = format!("OpenCode CLI exited with status: {}", status);
+                        final_result = format!("OpenCode CLI exited with status: {}{}", exit_description, error_hint);
                     }
                 } else {
-                    final_result = format!("OpenCode CLI exited with status: {}", status);
+                    final_result = format!("OpenCode CLI exited with status: {}{}", exit_description, error_hint);
                 }
                 final_result_from_nonzero_exit = true;
             }
