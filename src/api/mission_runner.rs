@@ -2121,7 +2121,6 @@ fn resolve_opencode_runner_setting(workspace: &Workspace) -> Option<String> {
 fn resolve_opencode_binary_hint(workspace: &Workspace) -> Option<String> {
     workspace_env_setting(workspace, "SANDBOXED_SH_OPENCODE_BINARY_PATH")
         .or_else(|| workspace_env_setting(workspace, "OPENCODE_BINARY_PATH"))
-        .or_else(|| std::env::var("SANDBOXED_SH_OPENCODE_BINARY_PATH").ok())
         .or_else(|| std::env::var("OPENCODE_BINARY_PATH").ok())
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
