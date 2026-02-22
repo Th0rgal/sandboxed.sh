@@ -34,3 +34,6 @@ Generates iOS app icons for the SwiftUI dashboard.
 
 ### validate_skill_isolation.sh
 Validates strong workspace skill isolation on the server (checks OpenCode env, global skill dirs, and latest mission skills).
+
+### mission_debug_bundle.sh
+Collects a mission-focused diagnostic bundle from control API endpoints (mission snapshot, events, tree, automations, progress, OpenCode diagnostics) and outputs a `.tar.gz` archive for triage.

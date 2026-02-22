@@ -228,3 +228,62 @@ machinectl list   # For container workspaces
 
 - Thomas uses nginx: `/etc/nginx/sites-available/`
 - Ben uses Caddy: `/etc/caddy/Caddyfile`
+
+## Mission Debug Runbook
+
+When a mission fails or behaves unexpectedly, export a reproducible debug bundle first.
+
+### 1) Export a mission debug bundle
+
+```bash
+scripts/mission_debug_bundle.sh \
+  --base-url "https://agent-backend-dev.thomas.md" \
+  --token "<control-api-token>" \
+  --mission-id "<mission-uuid>"
+```
+
+Optional tuning:
+- `--max-events 5000` for longer missions
+- `--page-size 500` for fewer API round-trips
+- `--out-dir /tmp/mission-bundles` to write elsewhere
+
+Output archive:
+- `output/debug-bundles/mission-debug-<mission-id>-<timestamp>.tar.gz`
+
+### 2) Inspect key files in the bundle
+
+- `bundle_meta.json`: confirms export coverage and request failures.
+- `mission_summary.json`: mission status, backend, and `terminal_reason`.
+- `events_summary.json`: event type counts, first/last timestamps, error excerpts.
+- `raw/mission.json`: full mission object including history metadata.
+- `raw/progress.json`: latest runtime progress snapshot.
+- `raw/opencode_diagnostics.json`: OpenCode runtime diagnostic mode/status.
+- `raw/events/page-*.json`: paginated event history used for replay/triage.
+
+### 3) Triage metrics checklist
+
+Validate these metrics first before deeper log spelunking:
+
+1. `terminal_reason` (`mission_summary.json`)
+2. Event distribution (`events_summary.json.by_type`)
+3. Last protocol activity (`events_summary.json.last_timestamp`)
+4. Presence of `error` events (`events_summary.json.terminal_error_events`)
+5. Active run state (`raw/progress.json`)
+
+### 4) Quick API commands (without bundle)
+
+```bash
+# Mission snapshot
+curl -sS "https://agent-backend-dev.thomas.md/api/control/missions/<mission-id>" \
+  -H "Authorization: Bearer <token>" | jq
+
+# Recent mission events
+curl -sS "https://agent-backend-dev.thomas.md/api/control/missions/<mission-id>/events?limit=100&offset=0" \
+  -H "Authorization: Bearer <token>" | jq
+
+# Runtime progress + diagnostics
+curl -sS "https://agent-backend-dev.thomas.md/api/control/progress" \
+  -H "Authorization: Bearer <token>" | jq
+curl -sS "https://agent-backend-dev.thomas.md/api/control/diagnostics/opencode" \
+  -H "Authorization: Bearer <token>" | jq
+```
