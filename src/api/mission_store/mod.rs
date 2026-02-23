@@ -144,13 +144,18 @@ pub enum TriggerType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StopPolicy {
-    /// Never auto-disable this automation.
+    /// Never auto-disable this automation (default).
     Never,
     /// Auto-disable after N consecutive failures.
-    OnConsecutiveFailures {
+    WhenFailingConsecutively {
         /// Number of consecutive failures before stopping (default: 2)
         #[serde(default = "default_failure_count")]
         count: u32,
+    },
+    /// Auto-disable when all issues are closed and all PRs are merged in a GitHub repo.
+    WhenAllIssuesClosedAndPRsMerged {
+        /// GitHub repository in "owner/repo" format
+        repo: String,
     },
 }
 
@@ -228,7 +233,7 @@ pub struct Automation {
     /// Whether to start a fresh session for each trigger (clears context/history).
     #[serde(default)]
     pub fresh_session: FreshSession,
-    /// Number of consecutive failures (used for OnConsecutiveFailures policy).
+    /// Number of consecutive failures (used for WhenFailingConsecutively policy).
     /// This is tracked internally and not persisted directly.
     #[serde(default, skip_serializing)]
     pub consecutive_failures: u32,
