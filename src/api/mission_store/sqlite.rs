@@ -232,11 +232,7 @@ impl SqliteMissionStore {
                 .unwrap_or(2);
             StopPolicy::WhenFailingConsecutively { count }
         } else if stop_policy_str.starts_with("all_issues_closed_and_prs_merged:") {
-            let repo = stop_policy_str
-                .split(':')
-                .nth(1)
-                .unwrap_or("")
-                .to_string();
+            let repo = stop_policy_str.split(':').nth(1).unwrap_or("").to_string();
             StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo }
         } else {
             match stop_policy_str.as_str() {

@@ -279,17 +279,6 @@ async fn mission_has_active_automation(
     }
 }
 
-fn mission_is_terminal(status: MissionStatus) -> bool {
-    matches!(
-        status,
-        MissionStatus::Completed
-            | MissionStatus::Failed
-            | MissionStatus::Interrupted
-            | MissionStatus::Blocked
-            | MissionStatus::NotFeasible
-    )
-}
-
 async fn stop_policy_matches_status(
     stop_policy: &mission_store::StopPolicy,
     _status: MissionStatus,
@@ -334,43 +323,45 @@ async fn consecutive_failure_count_for_automation(
 
 async fn check_github_all_issues_closed_and_prs_merged(repo: &str) -> bool {
     let client = reqwest::Client::new();
-    
+
     let issues_url = format!("https://api.github.com/repos/{}/issues?state=open", repo);
     let pulls_url = format!("https://api.github.com/repos/{}/pulls?state=open", repo);
-    
-    let check_repo = || async {
+
+    let check_repo = async {
         let issues_resp = client
             .get(&issues_url)
             .header("User-Agent", "sandboxed-sh")
             .header("Accept", "application/vnd.github.v3+json")
             .send()
             .await;
-        
+
         let pulls_resp = client
             .get(&pulls_url)
             .header("User-Agent", "sandboxed-sh")
             .header("Accept", "application/vnd.github.v3+json")
             .send()
             .await;
-        
-        let has_open_issues = issues_resp
-            .as_ref()
-            .ok()
-            .and_then(|r| r.json::<serde_json::Value>().await.ok())
-            .map(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false))
-            .unwrap_or(false);
-        
-        let has_open_prs = pulls_resp
-            .as_ref()
-            .ok()
-            .and_then(|r| r.json::<serde_json::Value>().await.ok())
-            .map(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false))
-            .unwrap_or(false);
-        
+
+        let has_open_issues = match issues_resp {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(value) => value.as_array().map(|arr| !arr.is_empty()).unwrap_or(false),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+
+        let has_open_prs = match pulls_resp {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(value) => value.as_array().map(|arr| !arr.is_empty()).unwrap_or(false),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+
         !has_open_issues && !has_open_prs
     };
-    
-    tokio::time::timeout(std::time::Duration::from_secs(10), check_repo())
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), check_repo)
         .await
         .unwrap_or(false)
 }
@@ -2696,7 +2687,9 @@ async fn automation_scheduler_loop(
                 &automation.stop_policy,
                 mission.status,
                 consecutive_failures,
-            ).await {
+            )
+            .await
+            {
                 tracing::info!(
                     "Disabling automation {} due to stop policy {:?} (mission {} status {:?})",
                     automation.id,
@@ -3083,7 +3076,9 @@ async fn agent_finished_automation_messages(
             &automation.stop_policy,
             mission.status,
             consecutive_failures,
-        ).await {
+        )
+        .await
+        {
             tracing::info!(
                 "Disabling agent_finished automation {} due to stop policy {:?} (mission {} status {:?})",
                 automation.id,
@@ -6495,7 +6490,9 @@ pub async fn webhook_receiver(
         &automation.stop_policy,
         mission.status,
         consecutive_failures,
-    ).await {
+    )
+    .await
+    {
         let mut updated = automation.clone();
         updated.active = false;
         if let Err(e) = control.mission_store.update_automation(updated).await {
@@ -6829,40 +6826,58 @@ Investigate <service/> failures.
 
     #[tokio::test]
     async fn test_stop_policy_matches_consecutive_failures() {
-        assert!(stop_policy_matches_status(
-            &mission_store::StopPolicy::WhenFailingConsecutively { count: 2 },
-            MissionStatus::Failed,
-            2
-        ).await);
-        assert!(!stop_policy_matches_status(
-            &mission_store::StopPolicy::WhenFailingConsecutively { count: 2 },
-            MissionStatus::Failed,
-            1
-        ).await);
-        assert!(stop_policy_matches_status(
-            &mission_store::StopPolicy::WhenFailingConsecutively { count: 3 },
-            MissionStatus::Failed,
-            3
-        ).await);
-        assert!(!stop_policy_matches_status(
-            &mission_store::StopPolicy::WhenFailingConsecutively { count: 3 },
-            MissionStatus::Failed,
-            2
-        ).await);
+        assert!(
+            stop_policy_matches_status(
+                &mission_store::StopPolicy::WhenFailingConsecutively { count: 2 },
+                MissionStatus::Failed,
+                2
+            )
+            .await
+        );
+        assert!(
+            !stop_policy_matches_status(
+                &mission_store::StopPolicy::WhenFailingConsecutively { count: 2 },
+                MissionStatus::Failed,
+                1
+            )
+            .await
+        );
+        assert!(
+            stop_policy_matches_status(
+                &mission_store::StopPolicy::WhenFailingConsecutively { count: 3 },
+                MissionStatus::Failed,
+                3
+            )
+            .await
+        );
+        assert!(
+            !stop_policy_matches_status(
+                &mission_store::StopPolicy::WhenFailingConsecutively { count: 3 },
+                MissionStatus::Failed,
+                2
+            )
+            .await
+        );
     }
 
     #[tokio::test]
     async fn test_stop_policy_never_never_matches() {
-        assert!(!stop_policy_matches_status(
-            &mission_store::StopPolicy::Never,
-            MissionStatus::Completed,
-            0
-        ).await);
-        assert!(!stop_policy_matches_status(
-            &mission_store::StopPolicy::Never,
-            MissionStatus::Failed,
-            5
-        ).await);
+        assert!(
+            !stop_policy_matches_status(
+                &mission_store::StopPolicy::Never,
+                MissionStatus::Completed,
+                0
+            )
+            .await
+        );
+        assert!(
+            !stop_policy_matches_status(
+                &mission_store::StopPolicy::Never,
+                MissionStatus::Failed,
+                5
+            )
+            .await
+        );
     }
 
     #[tokio::test]
