@@ -230,7 +230,10 @@ impl SqliteMissionStore {
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2);
-            StopPolicy::OnConsecutiveFailures { count }
+            StopPolicy::WhenFailingConsecutively { count }
+        } else if stop_policy_str.starts_with("all_issues_closed_and_prs_merged:") {
+            let repo = stop_policy_str.split(':').nth(1).unwrap_or("").to_string();
+            StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo }
         } else {
             match stop_policy_str.as_str() {
                 "never" => StopPolicy::Never,
@@ -1682,7 +1685,8 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let stop_policy_str = match &a.stop_policy {
                 StopPolicy::Never => "never".to_string(),
-                StopPolicy::OnConsecutiveFailures { count } => format!("consecutive_failures:{}", count),
+                StopPolicy::WhenFailingConsecutively { count } => format!("consecutive_failures:{}", count),
+                StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo } => format!("all_issues_closed_and_prs_merged:{}", repo),
             };
             let fresh_session_str = match a.fresh_session {
                 FreshSession::Always => "always",
@@ -1889,7 +1893,8 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let stop_policy_str = match &automation.stop_policy {
                 StopPolicy::Never => "never".to_string(),
-                StopPolicy::OnConsecutiveFailures { count } => format!("consecutive_failures:{}", count),
+                StopPolicy::WhenFailingConsecutively { count } => format!("consecutive_failures:{}", count),
+                StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo } => format!("all_issues_closed_and_prs_merged:{}", repo),
             };
             let fresh_session_str = match automation.fresh_session {
                 FreshSession::Always => "always",
