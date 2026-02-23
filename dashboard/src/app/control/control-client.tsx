@@ -1378,6 +1378,18 @@ function ThinkingPanel({
   basePath?: string;
   missionId?: string | null;
 }) {
+  const hasOpenModalOverlay = useCallback((): boolean => {
+    const overlays = Array.from(document.querySelectorAll("body > div.fixed.inset-0"));
+    return overlays.some((overlay) => {
+      const classText = overlay.className;
+      if (!classText.includes("items-center") && !classText.includes("items-start")) {
+        return false;
+      }
+      const zIndex = Number.parseInt(window.getComputedStyle(overlay).zIndex || "0", 10);
+      return Number.isFinite(zIndex) && zIndex >= 50;
+    });
+  }, []);
+
   const activeItems = useMemo(
     () => items.filter((t) => !t.done),
     [items]
@@ -1422,12 +1434,13 @@ function ThinkingPanel({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        if (hasOpenModalOverlay()) return;
         onClose();
       }
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  }, [hasOpenModalOverlay, onClose]);
 
   return (
     <div className={cn("w-full h-full flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden animate-slide-in-right", className)}>

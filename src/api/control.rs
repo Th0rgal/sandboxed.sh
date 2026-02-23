@@ -6677,6 +6677,16 @@ pub async fn webhook_receiver(
                     e
                 );
             }
+            if let Err(e) = mission_store
+                .update_automation_last_triggered(automation.id)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to update automation last triggered time for {}: {}",
+                    automation.id,
+                    e
+                );
+            }
 
             Ok(StatusCode::OK)
         }

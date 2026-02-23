@@ -34,6 +34,7 @@ import {
   updateAutomation,
   deleteAutomation,
   getAutomationExecutions,
+  getMissionAutomationExecutions,
   getLibraryCommand,
 } from '@/lib/api';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -109,6 +110,37 @@ function formatInterval(seconds: number): string {
 function buildWebhookUrl(missionId: string, webhookId: string): string {
   const base = getRuntimeApiBase();
   return `${base}/api/webhooks/${missionId}/${webhookId}`;
+}
+
+function getLatestRunByAutomation(executions: AutomationExecution[]): Map<string, string> {
+  const latestByAutomation = new Map<string, string>();
+  for (const execution of executions) {
+    const existing = latestByAutomation.get(execution.automation_id);
+    if (!existing || new Date(execution.triggered_at).getTime() > new Date(existing).getTime()) {
+      latestByAutomation.set(execution.automation_id, execution.triggered_at);
+    }
+  }
+  return latestByAutomation;
+}
+
+function mergeLastRunFromExecutions(
+  automations: Automation[],
+  executions: AutomationExecution[]
+): Automation[] {
+  const latestByAutomation = getLatestRunByAutomation(executions);
+  return automations.map((automation) => {
+    const executionLastRun = latestByAutomation.get(automation.id);
+    if (!executionLastRun) return automation;
+
+    const automationLastRun = automation.last_triggered_at;
+    if (!automationLastRun) {
+      return { ...automation, last_triggered_at: executionLastRun };
+    }
+
+    return new Date(executionLastRun).getTime() > new Date(automationLastRun).getTime()
+      ? { ...automation, last_triggered_at: executionLastRun }
+      : automation;
+  });
 }
 
 const STATUS_STYLES: Record<string, string> = {
@@ -347,7 +379,11 @@ export function MissionAutomationsDialog({
     setLoading(true);
     setError(null);
     try {
-      const data = await listMissionAutomations(missionId);
+      const [automationData, executionData] = await Promise.all([
+        listMissionAutomations(missionId),
+        getMissionAutomationExecutions(missionId).catch(() => []),
+      ]);
+      const data = mergeLastRunFromExecutions(automationData, executionData);
       if (requestIdRef.current !== requestId) return;
       setAutomationsForMission(missionId, data);
     } catch (err) {
@@ -387,14 +423,16 @@ export function MissionAutomationsDialog({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || !open) return;
+      e.preventDefault();
+      e.stopPropagation();
       if (pendingDelete) {
         if (!deleting) setPendingDelete(null);
         return;
       }
       onClose();
     };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => document.removeEventListener('keydown', handleKeyDown, true);
   }, [open, onClose, pendingDelete, deleting]);
 
   useEffect(() => {
