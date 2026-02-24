@@ -527,6 +527,18 @@ pub trait MissionStore: Send + Sync {
         let _ = (mission_id, limit);
         Ok(vec![])
     }
+
+    /// Complete all running automation executions for a mission, setting them
+    /// to either Success or Failed based on the agent outcome.
+    async fn complete_running_executions_for_mission(
+        &self,
+        mission_id: Uuid,
+        success: bool,
+        error: Option<String>,
+    ) -> Result<u32, String> {
+        let _ = (mission_id, success, error);
+        Ok(0)
+    }
 }
 
 /// Mission store type selection.

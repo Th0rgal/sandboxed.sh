@@ -2326,6 +2326,33 @@ impl MissionStore for SqliteMissionStore {
         .await
         .map_err(|e| format!("Task join error: {}", e))?
     }
+
+    async fn complete_running_executions_for_mission(
+        &self,
+        mission_id: Uuid,
+        success: bool,
+        error: Option<String>,
+    ) -> Result<u32, String> {
+        let conn = self.conn.clone();
+        let mission_id_str = mission_id.to_string();
+        let new_status = if success { "success" } else { "failed" };
+        let completed_at = now_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let updated = conn
+                .execute(
+                    "UPDATE automation_executions
+                     SET status = ?, completed_at = ?, error = ?
+                     WHERE mission_id = ? AND status IN ('running', 'pending')",
+                    params![new_status, completed_at, error, mission_id_str],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(updated as u32)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
 }
 
 #[cfg(test)]

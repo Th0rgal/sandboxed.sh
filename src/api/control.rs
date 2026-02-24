@@ -2904,15 +2904,15 @@ async fn automation_scheduler_loop(
 
                 match send_result {
                     Ok(_) => {
-                        // Success - update execution status
+                        // Message queued successfully – keep execution in Running
+                        // status. The actual success/failure will be determined
+                        // when the agent finishes processing and
+                        // complete_running_executions_for_mission is called.
                         let mut exec = execution.clone();
-                        exec.status = ExecutionStatus::Success;
-                        exec.completed_at = Some(mission_store::now_string());
                         exec.retry_count = retry_attempt;
-
                         if let Err(e) = mission_store.update_automation_execution(exec).await {
                             tracing::warn!(
-                                "Failed to update execution status to success for {}: {}",
+                                "Failed to update execution retry count for {}: {}",
                                 execution_id,
                                 e
                             );
@@ -3183,7 +3183,9 @@ async fn agent_finished_automation_messages(
 
         let substituted_content = substitute_variables(&command_content, &context);
 
-        // Create an execution record (treat "queued" as success)
+        // Create an execution record in Running status – it will be
+        // completed by complete_running_executions_for_mission when the
+        // agent finishes processing.
         let execution_id = Uuid::new_v4();
         let execution = AutomationExecution {
             id: execution_id,
@@ -3191,10 +3193,10 @@ async fn agent_finished_automation_messages(
             mission_id: mission.id,
             triggered_at: mission_store::now_string(),
             trigger_source: "agent_finished".to_string(),
-            status: ExecutionStatus::Success,
+            status: ExecutionStatus::Running,
             webhook_payload: None,
             variables_used: automation.variables.clone(),
-            completed_at: Some(mission_store::now_string()),
+            completed_at: None,
             error: None,
             retry_count: 0,
         };
@@ -4997,6 +4999,31 @@ async fn control_actor_loop(
                                 resumable,
                             });
                             if let Some(mission_id) = completed_mission_id {
+                                // Update automation executions based on agent outcome
+                                let error_msg = if agent_result.success {
+                                    None
+                                } else {
+                                    Some(
+                                        agent_result.terminal_reason
+                                            .map(|r| format!("{:?}", r))
+                                            .unwrap_or_else(|| "Agent execution failed".to_string()),
+                                    )
+                                };
+                                if let Err(e) = mission_store
+                                    .complete_running_executions_for_mission(
+                                        mission_id,
+                                        agent_result.success,
+                                        error_msg,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to complete running executions for mission {}: {}",
+                                        mission_id,
+                                        e
+                                    );
+                                }
+
                                 close_mission_desktop_sessions(
                                     &mission_store,
                                     mission_id,
@@ -5012,6 +5039,22 @@ async fn control_actor_loop(
                                 resumable: completed_mission_id.is_some(), // Can resume if mission exists
                             });
                             if let Some(mission_id) = completed_mission_id {
+                                // Mark running automation executions as failed
+                                if let Err(e2) = mission_store
+                                    .complete_running_executions_for_mission(
+                                        mission_id,
+                                        false,
+                                        Some(format!("Task join failed: {}", e)),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to complete running executions for mission {}: {}",
+                                        mission_id,
+                                        e2
+                                    );
+                                }
+
                                 // Update mission status so it doesn't stay Active forever.
                                 // Mark as Failed (resumable) so the user can retry.
                                 if let Err(e) = mission_store
@@ -5228,6 +5271,33 @@ async fn control_actor_loop(
                                 shared_files,
                                 resumable,
                             });
+
+                            // Update automation executions based on agent outcome
+                            {
+                                let error_msg = if result.success {
+                                    None
+                                } else {
+                                    Some(
+                                        result.terminal_reason
+                                            .map(|r| format!("{:?}", r))
+                                            .unwrap_or_else(|| "Agent execution failed".to_string()),
+                                    )
+                                };
+                                if let Err(e) = mission_store
+                                    .complete_running_executions_for_mission(
+                                        *mission_id,
+                                        result.success,
+                                        error_msg,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to complete running executions for parallel mission {}: {}",
+                                        mission_id,
+                                        e
+                                    );
+                                }
+                            }
 
                             // Persist history for this mission
                             let entries: Vec<MissionHistoryEntry> = runner
@@ -6193,7 +6263,9 @@ pub async fn create_automation(
                 .await;
 
         if let Some(content) = cmd_content {
-            // Record the execution
+            // Record the execution in Running status – it will be completed
+            // by complete_running_executions_for_mission when the agent
+            // finishes processing.
             let execution_id = Uuid::new_v4();
             let execution = mission_store::AutomationExecution {
                 id: execution_id,
@@ -6201,10 +6273,10 @@ pub async fn create_automation(
                 mission_id,
                 triggered_at: mission_store::now_string(),
                 trigger_source: "start_immediately".to_string(),
-                status: mission_store::ExecutionStatus::Success,
+                status: mission_store::ExecutionStatus::Running,
                 webhook_payload: None,
                 variables_used: automation.variables.clone(),
-                completed_at: Some(mission_store::now_string()),
+                completed_at: None,
                 error: None,
                 retry_count: 0,
             };
@@ -6682,17 +6754,10 @@ pub async fn webhook_receiver(
 
     match send_result {
         Ok(_) => {
-            // Success - update execution status
-            execution.status = ExecutionStatus::Success;
-            execution.completed_at = Some(mission_store::now_string());
-
-            if let Err(e) = mission_store.update_automation_execution(execution).await {
-                tracing::warn!(
-                    "Failed to update execution status to success for {}: {}",
-                    execution_id,
-                    e
-                );
-            }
+            // Message queued successfully – keep execution in Running
+            // status. The actual success/failure will be determined
+            // when the agent finishes processing and
+            // complete_running_executions_for_mission is called.
             if let Err(e) = mission_store
                 .update_automation_last_triggered(automation.id)
                 .await
@@ -6707,7 +6772,7 @@ pub async fn webhook_receiver(
             Ok(StatusCode::OK)
         }
         Err(e) => {
-            // Failed - update execution status
+            // Failed to even send the message – mark as Failed immediately
             execution.status = ExecutionStatus::Failed;
             execution.completed_at = Some(mission_store::now_string());
             execution.error = Some(format!("Failed to send message: {}", e));
