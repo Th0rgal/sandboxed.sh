@@ -273,6 +273,8 @@ type QuestionInfo = {
   question?: string;
   options?: QuestionOption[];
   multiple?: boolean;
+  /** True when the only meaningful option is "Other" (free-text input). */
+  freeTextOnly?: boolean;
 };
 
 function parseQuestionArgs(args: unknown): QuestionInfo[] {
@@ -282,10 +284,8 @@ function parseQuestionArgs(args: unknown): QuestionInfo[] {
   return raw
     .map((entry) => (isRecord(entry) ? entry : null))
     .filter((entry): entry is Record<string, unknown> => Boolean(entry))
-    .map((entry) => ({
-      header: typeof entry["header"] === "string" ? entry["header"] : undefined,
-      question: typeof entry["question"] === "string" ? entry["question"] : undefined,
-      options: Array.isArray(entry["options"])
+    .map((entry) => {
+      const options = Array.isArray(entry["options"])
         ? entry["options"]
             .map((opt) => (isRecord(opt) ? opt : null))
             .filter((opt): opt is Record<string, unknown> => Boolean(opt))
@@ -295,9 +295,20 @@ function parseQuestionArgs(args: unknown): QuestionInfo[] {
                 typeof opt["description"] === "string" ? opt["description"] : undefined,
             }))
             .filter((opt) => opt.label.length > 0)
-        : [],
-      multiple: Boolean(entry["multiple"] ?? entry["multiSelect"]),
-    }))
+        : [];
+      // Detect when the only meaningful options are "Other"-like entries,
+      // meaning the question expects free-text input.
+      const nonOtherOptions = options.filter(
+        (opt) => !opt.label.toLowerCase().includes("other")
+      );
+      return {
+        header: typeof entry["header"] === "string" ? entry["header"] : undefined,
+        question: typeof entry["question"] === "string" ? entry["question"] : undefined,
+        options,
+        multiple: Boolean(entry["multiple"] ?? entry["multiSelect"]),
+        freeTextOnly: nonOtherOptions.length === 0,
+      };
+    })
     .filter((q) => (q.question?.length ?? 0) > 0);
 }
 
@@ -324,8 +335,11 @@ function QuestionToolItem({
 
   const canSubmit = useMemo(() => {
     if (questions.length === 0) return false;
-    return questions.every((_, idx) => (answers[idx] ?? []).length > 0);
-  }, [answers, questions]);
+    return questions.every((q, idx) => {
+      if (q.freeTextOnly) return (otherText[idx] ?? "").trim().length > 0;
+      return (answers[idx] ?? []).length > 0;
+    });
+  }, [answers, questions, otherText]);
 
   const handleToggle = (idx: number, label: string, multiple: boolean) => {
     setAnswers((prev) => {
@@ -351,6 +365,11 @@ function QuestionToolItem({
     setSubmitting(true);
     try {
       const payload = questions.map((q, idx) => {
+        // Free-text only: return the typed text directly
+        if (q.freeTextOnly) {
+          const text = (otherText[idx] ?? "").trim();
+          return text ? [text] : [];
+        }
         const selections = answers[idx] ?? [];
         if (!selections.length) return [];
         const otherLabel = q.options?.find((opt) =>
@@ -388,66 +407,126 @@ function QuestionToolItem({
             {questions.map((q, idx) => {
               const multiple = Boolean(q.multiple);
               const selections = new Set(answers[idx] ?? []);
+              const hasOtherOption = (q.options ?? []).some((opt) =>
+                opt.label.toLowerCase().includes("other")
+              );
+              const otherLabel = hasOtherOption
+                ? (q.options ?? []).find((opt) =>
+                    opt.label.toLowerCase().includes("other")
+                  )?.label ?? ""
+                : "";
+              // Non-Other options to render as buttons
+              const regularOptions = (q.options ?? []).filter(
+                (opt) => !opt.label.toLowerCase().includes("other")
+              );
               return (
                 <div key={`${item.toolCallId}-q-${idx}`} className="space-y-2">
                   <div className="text-sm font-medium text-white/90">
                     {q.header ? `${q.header}: ` : ""}
                     {q.question}
                   </div>
-                  <div className="space-y-2">
-                    {(q.options ?? []).map((opt) => {
-                      const checked = selections.has(opt.label);
-                      return (
-                        <label
-                          key={`${item.toolCallId}-q-${idx}-${opt.label}`}
-                          className={cn(
-                            "flex items-start gap-2 rounded-lg border px-3 py-2 text-sm transition-colors cursor-pointer",
-                            checked
-                              ? "border-indigo-500/40 bg-indigo-500/10"
-                              : "border-white/10 hover:border-white/20"
-                          )}
-                        >
-                          <input
-                            type={multiple ? "checkbox" : "radio"}
-                            checked={checked}
-                            disabled={hasResult || submitting}
-                            onChange={() => handleToggle(idx, opt.label, multiple)}
-                            className="mt-0.5"
-                          />
-                          <div>
-                            <div className="text-white/90">{opt.label}</div>
-                            {opt.description && (
-                              <div className="text-xs text-white/50">
-                                {opt.description}
+                  {q.freeTextOnly ? (
+                    /* Free-text only: render a text input directly */
+                    <input
+                      type="text"
+                      value={otherText[idx] ?? ""}
+                      onChange={(e) =>
+                        setOtherText((prev) => ({
+                          ...prev,
+                          [idx]: e.target.value,
+                        }))
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && canSubmit && !submitting && !hasResult) {
+                          handleSubmit();
+                        }
+                      }}
+                      placeholder="Type your answer…"
+                      disabled={hasResult || submitting}
+                      autoFocus
+                      className="w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-white/80 focus:border-indigo-500/40 focus:outline-none"
+                    />
+                  ) : (
+                    /* Options mode: render option buttons + optional text input */
+                    <>
+                      <div className="space-y-2">
+                        {regularOptions.map((opt) => {
+                          const checked = selections.has(opt.label);
+                          return (
+                            <label
+                              key={`${item.toolCallId}-q-${idx}-${opt.label}`}
+                              className={cn(
+                                "flex items-start gap-2 rounded-lg border px-3 py-2 text-sm transition-colors cursor-pointer",
+                                checked
+                                  ? "border-indigo-500/40 bg-indigo-500/10"
+                                  : "border-white/10 hover:border-white/20"
+                              )}
+                            >
+                              <input
+                                type={multiple ? "checkbox" : "radio"}
+                                checked={checked}
+                                disabled={hasResult || submitting}
+                                onChange={() => handleToggle(idx, opt.label, multiple)}
+                                className="mt-0.5"
+                              />
+                              <div>
+                                <div className="text-white/90">{opt.label}</div>
+                                {opt.description && (
+                                  <div className="text-xs text-white/50">
+                                    {opt.description}
+                                  </div>
+                                )}
                               </div>
+                            </label>
+                          );
+                        })}
+                      </div>
+                      {hasOtherOption && (
+                        <div className="space-y-2">
+                          <label
+                            className={cn(
+                              "flex items-start gap-2 rounded-lg border px-3 py-2 text-sm transition-colors cursor-pointer",
+                              selections.has(otherLabel)
+                                ? "border-indigo-500/40 bg-indigo-500/10"
+                                : "border-white/10 hover:border-white/20"
                             )}
-                          </div>
-                        </label>
-                      );
-                    })}
-                  </div>
-                  {(q.options ?? []).some((opt) =>
-                    opt.label.toLowerCase().includes("other")
-                  ) &&
-                    selections.has(
-                      (q.options ?? []).find((opt) =>
-                        opt.label.toLowerCase().includes("other")
-                      )?.label ?? ""
-                    ) && (
-                        <input
-                          type="text"
-                          value={otherText[idx] ?? ""}
-                          onChange={(e) =>
-                            setOtherText((prev) => ({
-                              ...prev,
-                              [idx]: e.target.value,
-                            }))
-                          }
-                          placeholder="Add details…"
-                          disabled={hasResult || submitting}
-                          className="w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-white/80 focus:border-indigo-500/40 focus:outline-none"
-                        />
-                    )}
+                          >
+                            <input
+                              type={multiple ? "checkbox" : "radio"}
+                              checked={selections.has(otherLabel)}
+                              disabled={hasResult || submitting}
+                              onChange={() => handleToggle(idx, otherLabel, multiple)}
+                              className="mt-0.5"
+                            />
+                            <div className="flex-1">
+                              <div className="text-white/90">Other</div>
+                            </div>
+                          </label>
+                          {selections.has(otherLabel) && (
+                            <input
+                              type="text"
+                              value={otherText[idx] ?? ""}
+                              onChange={(e) =>
+                                setOtherText((prev) => ({
+                                  ...prev,
+                                  [idx]: e.target.value,
+                                }))
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" && canSubmit && !submitting && !hasResult) {
+                                  handleSubmit();
+                                }
+                              }}
+                              placeholder="Type your answer…"
+                              disabled={hasResult || submitting}
+                              autoFocus
+                              className="w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-white/80 focus:border-indigo-500/40 focus:outline-none"
+                            />
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
                 </div>
               );
             })}
