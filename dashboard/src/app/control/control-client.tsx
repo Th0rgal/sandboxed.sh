@@ -306,7 +306,7 @@ function parseQuestionArgs(args: unknown): QuestionInfo[] {
         question: typeof entry["question"] === "string" ? entry["question"] : undefined,
         options,
         multiple: Boolean(entry["multiple"] ?? entry["multiSelect"]),
-        freeTextOnly: nonOtherOptions.length === 0,
+        freeTextOnly: options.length > 0 && nonOtherOptions.length === 0,
       };
     })
     .filter((q) => (q.question?.length ?? 0) > 0);
@@ -443,7 +443,7 @@ function QuestionToolItem({
                       }}
                       placeholder="Type your answer…"
                       disabled={hasResult || submitting}
-                      autoFocus
+                      autoFocus={idx === 0}
                       className="w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-white/80 focus:border-indigo-500/40 focus:outline-none"
                     />
                   ) : (
@@ -519,7 +519,6 @@ function QuestionToolItem({
                               }}
                               placeholder="Type your answer…"
                               disabled={hasResult || submitting}
-                              autoFocus
                               className="w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-white/80 focus:border-indigo-500/40 focus:outline-none"
                             />
                           )}
