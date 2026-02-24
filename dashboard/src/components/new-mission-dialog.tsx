@@ -543,10 +543,13 @@ export function NewMissionDialog({
         resetForm();
         onClose?.();
       } else {
-        router.push(url);
+        // Close dialog state first, then navigate.
+        // Do NOT call onClose here – it would trigger router.replace('/')
+        // which overwrites the router.push below and prevents navigation
+        // to the control page.
         setOpen(false);
         resetForm();
-        onClose?.();
+        router.push(url);
       }
     } finally {
       setSubmitting(false);
