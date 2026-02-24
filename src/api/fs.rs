@@ -835,6 +835,8 @@ pub async fn upload_finalize(
         std::env::temp_dir().join(format!("sandboxed_sh_assembled_{}", safe_upload_id));
 
     // Inner block so that temp files are cleaned up on both success and error paths.
+    // Returns the resolved remote_path on success so the response matches the
+    // non-chunked upload handler (which returns the full destination path).
     let result = async {
         // Assemble chunks into single file
         let mut assembled = tokio::fs::File::create(&assembled_path)
@@ -880,7 +882,7 @@ pub async fn upload_finalize(
 
         move_file(&assembled_path, &remote_path).await?;
 
-        Ok::<_, (StatusCode, String)>(())
+        Ok::<_, (StatusCode, String)>(remote_path)
     }
     .await;
 
@@ -888,10 +890,10 @@ pub async fn upload_finalize(
     let _ = tokio::fs::remove_dir_all(&chunk_dir).await;
     let _ = tokio::fs::remove_file(&assembled_path).await;
 
-    result?;
+    let remote_path = result?;
 
     Ok(Json(
-        serde_json::json!({ "ok": true, "path": req.path, "name": safe_file_name }),
+        serde_json::json!({ "ok": true, "path": remote_path, "name": safe_file_name }),
     ))
 }
 
