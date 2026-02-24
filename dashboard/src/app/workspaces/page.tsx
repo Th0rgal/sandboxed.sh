@@ -1164,7 +1164,7 @@ export default function WorkspacesPage() {
               </div>
             </div>
 
-            <div className="px-6 py-5 space-y-4">
+            <div className="px-6 py-5 space-y-5">
               <div>
                 <label className="text-xs text-white/40 mb-2 block">Workspace Name</label>
                 <input
