@@ -3561,7 +3561,7 @@ pub fn run_claudecode_turn<'a>(
             AgentResult::failure(final_result, cost_cents).with_terminal_reason(reason)
         } else {
             AgentResult::success(final_result, cost_cents)
-                .with_terminal_reason(TerminalReason::Completed)
+                .with_terminal_reason(TerminalReason::TurnComplete)
         };
         if let Some(model) = model_for_cost {
             result = result.with_model(model.to_string());
@@ -9164,7 +9164,7 @@ pub async fn run_opencode_turn(
         };
         AgentResult::failure(final_result, 0).with_terminal_reason(reason)
     } else {
-        AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::Completed)
+        AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::TurnComplete)
     };
     if model_used.is_none() {
         if let Some(model) = resolved_model.as_deref() {
@@ -9924,7 +9924,7 @@ pub async fn run_amp_turn(
 
     let mut result = if success {
         AgentResult::success(final_result, cost_cents)
-            .with_terminal_reason(TerminalReason::Completed)
+            .with_terminal_reason(TerminalReason::TurnComplete)
     } else {
         // Detect rate limit / overloaded errors for account rotation.
         let reason = if is_rate_limited_error(&final_result) {
@@ -10254,7 +10254,7 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
 
     let mut result = if success {
         AgentResult::success(final_message, cost_cents)
-            .with_terminal_reason(TerminalReason::Completed)
+            .with_terminal_reason(TerminalReason::TurnComplete)
     } else {
         // Distinguish provider concurrency exhaustion from classic rate limits.
         let reason = if is_capacity_limited_error(&final_message) {

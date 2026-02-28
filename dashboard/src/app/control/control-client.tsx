@@ -7108,7 +7108,7 @@ export default function ControlClient() {
                               item.success ? "text-emerald-400" : "text-red-400"
                             )}
                           />
-                          <span>{item.success ? "Completed" : "Failed"}</span>
+                          <span>{item.success ? "Turn complete" : "Failed"}</span>
                           {displayModel && (
                             <>
                               <span>•</span>

@@ -160,6 +160,8 @@ impl AgentResult {
 /// Reason why agent execution terminated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalReason {
+    /// A single assistant turn ended successfully, but mission may continue
+    TurnComplete,
     /// Task completed successfully
     Completed,
     /// Task was cancelled by user
