@@ -2116,6 +2116,25 @@ impl LibraryStore {
         serde_json::from_str(&content).context("Failed to parse claudecode config")
     }
 
+    /// Get Claude Code raw settings.json from a profile as untyped JSON.
+    /// Unlike `get_claudecode_config_for_profile`, returns the full file without
+    /// deserializing into ClaudeCodeConfig, preserving all fields including hooks.
+    pub async fn get_claudecode_raw_settings_for_profile(
+        &self,
+        profile: &str,
+    ) -> Result<serde_json::Value> {
+        Self::validate_name(profile)?;
+        let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
+        let path = profile_dir.join(".claudecode").join("settings.json");
+        if !path.exists() {
+            return Ok(serde_json::json!({}));
+        }
+        let content = fs::read_to_string(&path)
+            .await
+            .context("Failed to read claudecode settings")?;
+        serde_json::from_str(&content).context("Failed to parse claudecode settings")
+    }
+
     /// Save Claude Code config to a specific profile.
     pub async fn save_claudecode_config_for_profile(
         &self,

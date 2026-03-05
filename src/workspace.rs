@@ -1402,6 +1402,24 @@ jq -n --arg cmd "$NEW_CMD" '{
     })))
 }
 
+/// Deep-merge `overlay` into `base`.
+/// - Objects: recurse; overlay scalar wins on conflict
+/// - Arrays: concatenate (base first, then overlay)
+/// - Scalars / type mismatch: overlay replaces base
+fn merge_json(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            for (k, v) in o {
+                merge_json(b.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (serde_json::Value::Array(b), serde_json::Value::Array(o)) => {
+            b.extend(o.iter().cloned());
+        }
+        (base, overlay) => *base = overlay.clone(),
+    }
+}
+
 /// Write Claude Code configuration to the workspace.
 /// Generates `.claude/settings.local.json` and `CLAUDE.md` files.
 #[allow(clippy::too_many_arguments)]
@@ -1414,6 +1432,7 @@ async fn write_claudecode_config(
     skill_contents: Option<&[SkillContent]>,
     command_contents: Option<&[CommandContent]>,
     shared_network: Option<bool>,
+    profile_overlay: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     // Create .claude directory
     let claude_dir = workspace_dir.join(".claude");
@@ -1485,6 +1504,14 @@ async fn write_claudecode_config(
             .as_object_mut()
             .unwrap()
             .insert("hooks".to_string(), hooks);
+    }
+
+    // Apply config profile settings: profile is the base, generated settings win on top.
+    // Arrays (e.g. hooks) are concatenated — profile hooks + RTK hooks both survive.
+    if let Some(profile) = profile_overlay {
+        let mut merged = profile.clone();
+        merge_json(&mut merged, &settings);
+        settings = merged;
     }
 
     let settings_path = claude_dir.join("settings.local.json");
@@ -2135,6 +2162,7 @@ pub async fn write_backend_config(
     command_contents: Option<&[CommandContent]>,
     shared_network: Option<bool>,
     custom_providers: Option<&[AIProvider]>,
+    claudecode_profile_overlay: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     match backend_id {
         "opencode" => {
@@ -2174,6 +2202,7 @@ pub async fn write_backend_config(
                 skill_contents,
                 command_contents,
                 shared_network,
+                claudecode_profile_overlay,
             )
             .await
         }
@@ -3255,6 +3284,39 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         );
     }
 
+    // Load Claude Code config profile settings (hooks, custom defaults).
+    // Profile is base; generated settings (MCPs, permissions, RTK) win on top.
+    let claudecode_profile_overlay: Option<serde_json::Value> =
+        if backend_id == "claudecode" {
+            if let Some(lib) = library {
+                let profile = config_profile.unwrap_or("default");
+                tracing::info!(
+                    mission = %mission_id,
+                    workspace = %workspace.name,
+                    profile = %profile,
+                    "Loading Claude Code settings from profile"
+                );
+                match lib.get_claudecode_raw_settings_for_profile(profile).await {
+                    Ok(s) if !s.as_object().map(|o| o.is_empty()).unwrap_or(true) => Some(s),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            mission = %mission_id,
+                            workspace = %workspace.name,
+                            profile = %profile,
+                            error = %e,
+                            "Failed to load Claude Code settings from profile, skipping"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
     write_backend_config(
         &dir,
         backend_id,
@@ -3267,6 +3329,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         command_contents.as_deref(),
         workspace.shared_network,
         effective_custom_providers,
+        claudecode_profile_overlay.as_ref(),
     )
     .await?;
 
@@ -4460,5 +4523,57 @@ fn patch_opencode_agent_models_for_oauth(content: &str) -> String {
         serde_json::to_string_pretty(&json).unwrap_or_else(|_| content.to_string())
     } else {
         content.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_merge_json_objects() {
+        let mut base = json!({"a": 1, "b": 2});
+        let overlay = json!({"b": 99, "c": 3});
+        merge_json(&mut base, &overlay);
+        assert_eq!(base, json!({"a": 1, "b": 99, "c": 3}));
+    }
+
+    #[test]
+    fn test_merge_json_arrays_concatenate() {
+        let mut base = json!({"hooks": [1, 2]});
+        let overlay = json!({"hooks": [3, 4]});
+        merge_json(&mut base, &overlay);
+        assert_eq!(base, json!({"hooks": [1, 2, 3, 4]}));
+    }
+
+    #[test]
+    fn test_merge_json_nested_objects() {
+        let mut base = json!({"permissions": {"allow": ["Bash"]}, "x": 1});
+        let overlay = json!({"permissions": {"allow": ["Edit"], "deny": []}, "y": 2});
+        merge_json(&mut base, &overlay);
+        assert_eq!(
+            base,
+            json!({"permissions": {"allow": ["Bash", "Edit"], "deny": []}, "x": 1, "y": 2})
+        );
+    }
+
+    #[test]
+    fn test_merge_json_scalar_overlay_wins() {
+        let mut base = json!({"key": "profile-value"});
+        let overlay = json!({"key": "generated-value"});
+        merge_json(&mut base, &overlay);
+        assert_eq!(base, json!({"key": "generated-value"}));
+    }
+
+    #[test]
+    fn test_merge_json_profile_key_survives_when_not_in_overlay() {
+        let mut base = json!({"hooks": {"Stop": [{"matcher": ""}]}, "mcpServers": {}});
+        let overlay = json!({"mcpServers": {"workspace-mcp": {}}, "permissions": {"allow": ["Bash"]}});
+        merge_json(&mut base, &overlay);
+        // hooks from profile survive; mcpServers and permissions come from overlay
+        assert!(base["hooks"]["Stop"].is_array());
+        assert!(base["mcpServers"]["workspace-mcp"].is_object());
+        assert_eq!(base["permissions"]["allow"][0], "Bash");
     }
 }
