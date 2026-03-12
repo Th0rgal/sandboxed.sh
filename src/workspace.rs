@@ -1724,6 +1724,7 @@ async fn write_codex_config(
     workspace_env: &HashMap<String, String>,
     skill_contents: Option<&[SkillContent]>,
     shared_network: Option<bool>,
+    profile_base: Option<&str>,
 ) -> anyhow::Result<()> {
     let codex_dir = resolve_codex_dir(workspace_dir, workspace_root, workspace_type, workspace_env);
     tokio::fs::create_dir_all(&codex_dir).await?;
@@ -1732,9 +1733,15 @@ async fn write_codex_config(
 
     // Write MCP config for Codex so tools are available.
     let config_path = codex_dir.join("config.toml");
-    let existing = tokio::fs::read_to_string(&config_path)
+    let file_existing = tokio::fs::read_to_string(&config_path)
         .await
         .unwrap_or_default();
+    // Profile TOML replaces file as base when provided (profile is authoritative
+    // for non-MCP sections like [otel]). MCP sections are always regenerated.
+    let existing = match profile_base {
+        Some(toml) if !toml.is_empty() => toml.to_string(),
+        _ => file_existing,
+    };
 
     let mut entries = Vec::new();
     let mut existing_names = std::collections::HashSet::new();
@@ -2183,6 +2190,7 @@ pub async fn write_backend_config(
     shared_network: Option<bool>,
     custom_providers: Option<&[AIProvider]>,
     claudecode_profile_overlay: Option<&serde_json::Value>,
+    codex_profile_base: Option<&str>,
 ) -> anyhow::Result<()> {
     match backend_id {
         "opencode" => {
@@ -2247,6 +2255,7 @@ pub async fn write_backend_config(
                 workspace_env,
                 skill_contents,
                 shared_network,
+                codex_profile_base,
             )
             .await
         }
@@ -3336,6 +3345,37 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         None
     };
 
+    // Load Codex config profile (TOML with [otel], model defaults, etc.).
+    // Profile TOML becomes the base; MCP sections are regenerated on top.
+    let codex_profile_base: Option<String> = if backend_id == "codex" {
+        if let Some(lib) = library {
+            let profile = config_profile.unwrap_or("default");
+            tracing::info!(
+                mission = %mission_id,
+                workspace = %workspace.name,
+                profile = %profile,
+                "Loading Codex config from profile"
+            );
+            match lib.get_codex_raw_config_for_profile(profile).await {
+                Ok(s) if !s.trim().is_empty() => Some(s),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        mission = %mission_id,
+                        profile = %profile,
+                        error = %e,
+                        "Failed to load Codex config from profile, skipping"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     write_backend_config(
         &dir,
         backend_id,
@@ -3349,6 +3389,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         workspace.shared_network,
         effective_custom_providers,
         claudecode_profile_overlay.as_ref(),
+        codex_profile_base.as_deref(),
     )
     .await?;
 
@@ -4595,5 +4636,47 @@ mod tests {
         assert!(base["hooks"]["Stop"].is_array());
         assert!(base["mcpServers"]["workspace-mcp"].is_object());
         assert_eq!(base["permissions"]["allow"][0], "Bash");
+    }
+
+    #[test]
+    fn test_codex_profile_preserves_otel_sections() {
+        let profile = "[otel]\nenvironment = \"production\"\n\n[otel.exporter.otlp-http]\nendpoint = \"http://localhost:3100\"\n";
+        let entries = vec![CodexMcpEntry {
+            name: "workspace".to_string(),
+            command: Some("/usr/local/bin/workspace-mcp".to_string()),
+            args: vec![],
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+        }];
+        let result = update_codex_mcp_config(profile, &entries);
+        assert!(result.contains("[otel]"));
+        assert!(result.contains("[otel.exporter.otlp-http]"));
+        assert!(result.contains("[mcp_servers.workspace]"));
+    }
+
+    #[test]
+    fn test_codex_profile_replaces_stale_mcp() {
+        let profile = "[otel]\nenv = \"prod\"\n\n[mcp_servers.old]\ncommand = \"old\"\n";
+        let entries = vec![CodexMcpEntry {
+            name: "old".to_string(),
+            command: Some("new".to_string()),
+            args: vec![],
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+        }];
+        let result = update_codex_mcp_config(profile, &entries);
+        assert!(result.contains("[otel]"));
+        assert!(result.contains("\"new\""));
+        assert!(!result.contains("\"old\""));
+    }
+
+    #[test]
+    fn test_codex_empty_profile_preserves_existing() {
+        // Empty profile string falls through to existing file content
+        let existing = "[mcp_servers.ws]\ncommand = \"ws-mcp\"\n";
+        let result = update_codex_mcp_config(existing, &[]);
+        assert!(result.contains("[mcp_servers.ws]"));
     }
 }

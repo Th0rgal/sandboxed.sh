@@ -156,6 +156,14 @@ const HARNESS_CONFIG = {
       { name: 'settings.json', description: 'Default mode (smart/rush)', libraryName: 'config.json' },
     ],
   },
+  codex: {
+    name: 'Codex',
+    dir: '.codex',
+    libraryDir: 'codex',
+    files: [
+      { name: 'config.toml', description: 'Codex configuration (OTel tracing, model defaults)', libraryName: 'config.toml' },
+    ],
+  },
   openagent: {
     name: 'Sandboxed.sh',
     dir: '.sandboxed-sh',
@@ -178,6 +186,9 @@ const EMPTY_FALLBACKS: Record<string, Record<string, string>> = {
   },
   ampcode: {
     'settings.json': '{}',
+  },
+  codex: {
+    'config.toml': '',
   },
   openagent: {
     'config.json': '{}',
@@ -253,11 +264,15 @@ export default function SettingsPage() {
   const { data: ampConfig } = useSWR('backend-amp-config', () => getBackendConfig('amp'), {
     revalidateOnFocus: false,
   });
+  const { data: codexConfig } = useSWR('backend-codex-config', () => getBackendConfig('codex'), {
+    revalidateOnFocus: false,
+  });
 
   // Filter to only enabled backends
-  const enabledHarnesses: HarnessId[] = ['opencode', 'claudecode', 'ampcode', 'openagent'].filter((id) => {
+  const enabledHarnesses: HarnessId[] = ['opencode', 'claudecode', 'codex', 'ampcode', 'openagent'].filter((id) => {
     if (id === 'opencode') return opencodeConfig?.enabled !== false;
     if (id === 'claudecode') return claudecodeConfig?.enabled !== false;
+    if (id === 'codex') return codexConfig?.enabled !== false;
     if (id === 'ampcode') return ampConfig?.enabled !== false;
     return true; // openagent is always enabled
   }) as HarnessId[];
@@ -445,9 +460,15 @@ export default function SettingsPage() {
     void loadHostFile();
   }, [loadHostFile, selectedFile, activeHarness, selectedProfile]);
 
-  // Validate JSON on change
+  const isTomlFile = selectedFile?.endsWith('.toml') ?? false;
+
+  // Validate content on change (JSON validation for JSON files, skip for TOML)
   useEffect(() => {
     if (!fileContent.trim()) {
+      setParseError(null);
+      return;
+    }
+    if (isTomlFile) {
       setParseError(null);
       return;
     }
@@ -458,7 +479,7 @@ export default function SettingsPage() {
     } catch (err) {
       setParseError(err instanceof Error ? err.message : 'Invalid JSON');
     }
-  }, [fileContent]);
+  }, [fileContent, isTomlFile]);
 
   useEffect(() => {
     if (!hostSyncSuccess) return;
@@ -1298,12 +1319,12 @@ export default function SettingsPage() {
             <ConfigCodeEditor
               value={fileContent}
               onChange={setFileContent}
-              placeholder='{\n  "key": "value"\n}'
+              placeholder={isTomlFile ? '[section]\nkey = "value"' : '{\n  "key": "value"\n}'}
               disabled={saving || !selectedFile}
               className="h-full"
               height="100%"
               padding={16}
-              language="json"
+              language={isTomlFile ? 'toml' : 'json'}
             />
           </div>
         </div>

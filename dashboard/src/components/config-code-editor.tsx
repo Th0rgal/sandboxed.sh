@@ -10,13 +10,14 @@ import { StreamLanguage } from '@codemirror/language';
 import { json as jsonLanguage } from '@codemirror/lang-json';
 import { markdown as markdownLanguage } from '@codemirror/lang-markdown';
 import { shell } from '@codemirror/legacy-modes/mode/shell';
+import { toml } from '@codemirror/legacy-modes/mode/toml';
 
 const CodeMirror = dynamic(() => import('@uiw/react-codemirror').then(mod => mod.default), {
   ssr: false,
   loading: () => <div className="animate-pulse bg-white/5 rounded h-32" />,
 });
 
-type Language = 'json' | 'markdown' | 'bash' | 'plain';
+type Language = 'json' | 'markdown' | 'bash' | 'toml' | 'plain';
 
 interface ConfigCodeEditorProps {
   value: string;
@@ -194,6 +195,9 @@ export function ConfigCodeEditor({
         break;
       case 'bash':
         list.push(StreamLanguage.define(shell));
+        break;
+      case 'toml':
+        list.push(StreamLanguage.define(toml));
         break;
       default:
         break;
