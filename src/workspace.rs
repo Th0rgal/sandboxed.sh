@@ -1736,11 +1736,13 @@ async fn write_codex_config(
     let file_existing = tokio::fs::read_to_string(&config_path)
         .await
         .unwrap_or_default();
-    // Profile TOML replaces file as base when provided (profile is authoritative
-    // for non-MCP sections like [otel]). MCP sections are always regenerated.
+    // Profile is authoritative for non-MCP sections like [otel].
+    // When a profile is selected (Some), use its content even if empty —
+    // this clears stale config from previous missions/profiles.
+    // Only fall back to existing file when no profile system is active (None).
     let existing = match profile_base {
-        Some(toml) if !toml.is_empty() => toml.to_string(),
-        _ => file_existing,
+        Some(toml) => toml.to_string(),
+        None => file_existing,
     };
 
     let mut entries = Vec::new();
@@ -3358,7 +3360,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
             );
             match lib.get_codex_raw_config_for_profile(profile).await {
                 Ok(s) if !s.trim().is_empty() => Some(s),
-                Ok(_) => None,
+                Ok(_) => Some(String::new()),
                 Err(e) => {
                     tracing::warn!(
                         mission = %mission_id,
@@ -4673,10 +4675,10 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_empty_profile_preserves_existing() {
-        // Empty profile string falls through to existing file content
-        let existing = "[mcp_servers.ws]\ncommand = \"ws-mcp\"\n";
-        let result = update_codex_mcp_config(existing, &[]);
-        assert!(result.contains("[mcp_servers.ws]"));
+    fn test_codex_empty_profile_clears_stale_config() {
+        // Empty profile is authoritative — stale non-MCP sections must not survive
+        let result = update_codex_mcp_config("", &[]);
+        assert!(!result.contains("[otel]"));
+        assert!(!result.contains("[mcp_servers"));
     }
 }

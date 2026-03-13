@@ -1932,7 +1932,11 @@ impl LibraryStore {
         // Save Codex config (TOML) if present in files list
         let codex_dir = profile_dir.join(".codex");
         fs::create_dir_all(&codex_dir).await?;
-        if let Some(codex_file) = profile.files.iter().find(|f| f.path == ".codex/config.toml") {
+        if let Some(codex_file) = profile
+            .files
+            .iter()
+            .find(|f| f.path == ".codex/config.toml")
+        {
             fs::write(codex_dir.join("config.toml"), &codex_file.content)
                 .await
                 .context("Failed to write codex config")?;
