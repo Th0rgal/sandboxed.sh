@@ -9,14 +9,23 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use sandboxed_sh::tools::desktop::find_browser_command;
 
-/// Global counter for display numbers to avoid conflicts
-static DISPLAY_COUNTER: AtomicU32 = AtomicU32::new(99);
+/// Global counter for display numbers to avoid conflicts.
+/// Seeds from $DISPLAY env var so each workspace gets its own display range,
+/// preventing collisions on the shared /tmp/.X11-unix socket directory.
+static DISPLAY_COUNTER: LazyLock<AtomicU32> = LazyLock::new(|| {
+    let start = std::env::var("DISPLAY")
+        .ok()
+        .and_then(|d| d.trim_start_matches(':').parse::<u32>().ok())
+        .unwrap_or(99);
+    AtomicU32::new(start)
+});
 
 // =============================================================================
 // JSON-RPC Types
