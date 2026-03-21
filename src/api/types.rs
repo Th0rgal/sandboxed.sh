@@ -158,6 +158,22 @@ pub struct TaskState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<TaskStep>,
 
+    /// When the task was created (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+
+    /// When the task started running (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+
+    /// When the task reached a terminal state (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+
+    /// Wall-clock seconds from started_at to completed_at
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<f64>,
+
     /// Cancel signal sender — used by stop_task to abort command-mode tasks.
     /// Not serialized; consumed once when cancel is requested.
     #[serde(skip)]

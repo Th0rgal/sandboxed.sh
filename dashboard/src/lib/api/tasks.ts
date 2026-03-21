@@ -40,7 +40,11 @@ export interface Task {
   workspace_name?: string;
   result?: string;
   log: TaskLogEntry[];
-  steps: TaskStep[];
+  steps?: TaskStep[];
+  created_at?: string;
+  started_at?: string;
+  completed_at?: string;
+  duration_secs?: number;
 }
 
 export interface CreateCommandTaskRequest {

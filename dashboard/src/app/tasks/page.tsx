@@ -216,11 +216,17 @@ function TaskRow({ task, onStop, stopping }: { task: Task; onStop: (id: string) 
             {task.iterations > 0 && (
               <span>Iterations: <span className="text-white/30">{task.iterations}</span></span>
             )}
-            {task.steps.length > 0 && (
-              <span>Steps: <span className="text-white/30">{task.steps.length}</span></span>
+            {(task.steps?.length ?? 0) > 0 && (
+              <span>Steps: <span className="text-white/30">{task.steps!.length}</span></span>
+            )}
+            {task.started_at && (
+              <span>Started: <span className="text-white/30">{new Date(task.started_at).toLocaleTimeString("en-GB", { hour12: false })}</span></span>
+            )}
+            {task.duration_secs != null && (
+              <span>Duration: <span className="text-white/30">{task.duration_secs.toFixed(1)}s</span></span>
             )}
           </div>
-          <StepTimeline steps={task.steps} />
+          <StepTimeline steps={task.steps ?? []} />
           <div className="mt-3">
             <p className="text-[10px] uppercase tracking-widest text-white/30 mb-2">Log</p>
             <LogViewer task={task} />

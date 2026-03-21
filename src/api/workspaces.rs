@@ -832,7 +832,7 @@ pub fn build_nspawn_command(
         }
         WorkspaceType::Container => {
             let container_root = workspace.path.clone();
-            let chdir = cwd.unwrap_or("/root/work");
+            let chdir = cwd.unwrap_or("/root");
 
             let mut nspawn_args = vec![
                 "-D".to_string(),
