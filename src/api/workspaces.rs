@@ -816,7 +816,7 @@ fn shell_escape(s: &str) -> String {
 /// For host workspaces, env vars should be set via `cmd.env()` on the returned Command —
 /// the caller is responsible for that since we can't inject them into `args` for bash -c.
 ///
-/// `cwd` sets the working directory inside the container (defaults to `/root/work`).
+/// `cwd` sets the working directory inside the container (defaults to `/root`).
 pub fn build_nspawn_command(
     workspace: &crate::workspace::Workspace,
     command: &str,

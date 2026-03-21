@@ -147,7 +147,7 @@ function LogViewer({ task }: { task: Task }) {
 function TaskRow({ task, onStop, stopping }: { task: Task; onStop: (id: string) => void; stopping: boolean }) {
   const [expanded, setExpanded] = useState(false);
 
-  const started = task.log[0]?.timestamp;
+  const started = task.started_at ?? task.log[0]?.timestamp;
   const elapsed = started
     ? Math.round((Date.now() - new Date(started).getTime()) / 1000)
     : null;

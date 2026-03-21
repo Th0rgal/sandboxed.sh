@@ -1091,6 +1091,7 @@ async fn run_command_task(
     task_id: Uuid,
     command: String,
     workspace: crate::workspace::Workspace,
+    working_dir: Option<String>,
     timeout: Option<std::time::Duration>,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
@@ -1132,30 +1133,33 @@ async fn run_command_task(
     // Missions run claude on the HOST — it reads ~/.claude/.credentials.json on every API call
     // and always sees the current token, even after the 15-min OAuth refresher rotates it.
     //
-    // Command tasks run inside nspawn. If we inject the token as an env var, it's a
-    // snapshot: the moment the refresher rotates the token, the injected one is revoked
-    // and all subsequent claude calls inside the container fail.
-    //
-    // Fix: bind-mount the host credentials file read-only into the container. Claude CLI
-    // reads the file on every call — same behaviour as missions on the host.
-    // For host workspaces no injection is needed; the process reads the host file directly.
+    // Command tasks run inside nspawn. Bind-mount the host credentials file read-only so
+    // claude CLI reads it on every call. The refresher rewrites the file in-place (same
+    // inode via std::fs::write), so the bind-ro always reflects the current token.
     let (program, mut args) =
-        super::workspaces::build_nspawn_command(&workspace, &command, None, None);
+        super::workspaces::build_nspawn_command(&workspace, &command, None, working_dir.as_deref());
 
-    if workspace.workspace_type == crate::workspace::WorkspaceType::Container {
-        let host_creds = std::path::Path::new("/root/.claude/.credentials.json");
-        if host_creds.exists() {
-            // Ensure /root/.claude/ exists in the container rootfs before bind-mounting.
-            let container_creds_dir = workspace.path.join("root/.claude");
-            if !container_creds_dir.exists() {
-                let _ = std::fs::create_dir_all(&container_creds_dir);
+    // Give the nspawn process a unique machine name so orphaned processes (e.g. after
+    // a sandboxed restart mid-task) are identifiable by name and can be terminated:
+    //   machinectl terminate task-<uuid>
+    // Also insert the credentials bind-ro before the shell invocation.
+    // We insert before the last 3 args ("/bin/bash", "-c", command) to stay robust
+    // against future changes to the nspawn option list built by build_nspawn_command.
+    let insert_pos = args.len().saturating_sub(3);
+    args.insert(insert_pos, format!("--machine=task-{}", task_id));
+
+    let host_creds = std::path::Path::new("/root/.claude/.credentials.json");
+    if host_creds.exists() {
+        let container_creds_dir = workspace.path.join("root/.claude");
+        if !container_creds_dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(&container_creds_dir) {
+                tracing::warn!("Failed to create container .claude dir: {} — claude -p may fail", e);
             }
-            // Insert --bind-ro after the "-D <container_path>" args (index 2).
-            // nspawn accepts options in any order before the command.
-            args.insert(2, "--bind-ro=/root/.claude/.credentials.json:/root/.claude/.credentials.json".to_string());
-        } else {
-            tracing::warn!("No Claude credentials file at /root/.claude/.credentials.json — claude -p will fail");
         }
+        // Insert before the machine name (order doesn't matter to nspawn)
+        args.insert(insert_pos, "--bind-ro=/root/.claude/.credentials.json:/root/.claude/.credentials.json".to_string());
+    } else {
+        tracing::warn!("No Claude credentials file at /root/.claude/.credentials.json — claude -p will fail");
     }
 
     let mut cmd = tokio::process::Command::new(&program);
@@ -1163,13 +1167,6 @@ async fn run_command_task(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-
-    // For host workspaces, env vars are passed via cmd.env() (not via --setenv args).
-    if workspace.workspace_type == crate::workspace::WorkspaceType::Host {
-        for (k, v) in &workspace.env_vars {
-            cmd.env(k, v);
-        }
-    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1287,35 +1284,22 @@ async fn run_command_task(
     };
 
     // Wait for child exit, optional timeout, or cancel signal.
-    // Two separate select! blocks because timeout() cannot be conditionally included
-    // in a single select! arm — it must be present or absent at compile time.
-    let exit_result: Result<std::process::ExitStatus, String> = match timeout {
-        Some(t) => {
-            tokio::select! {
-                r = tokio::time::timeout(t, child.wait()) => {
-                    match r {
-                        Ok(Ok(status)) => Ok(status),
-                        Ok(Err(e)) => Err(e.to_string()),
-                        Err(_) => {
-                            let _ = child.kill().await;
-                            Err(format!("Timed out after {}s", t.as_secs()))
-                        }
-                    }
-                }
-                _ = cancel_rx => {
+    // Duration::MAX (~584 years) serves as "no timeout" — avoids duplicate select! blocks.
+    let effective_timeout = timeout.unwrap_or(std::time::Duration::MAX);
+    let exit_result: Result<std::process::ExitStatus, String> = tokio::select! {
+        r = tokio::time::timeout(effective_timeout, child.wait()) => {
+            match r {
+                Ok(Ok(status)) => Ok(status),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => {
                     let _ = child.kill().await;
-                    Err("Cancelled".to_string())
+                    Err(format!("Timed out after {}s", effective_timeout.as_secs()))
                 }
             }
         }
-        None => {
-            tokio::select! {
-                r = child.wait() => r.map_err(|e| e.to_string()),
-                _ = cancel_rx => {
-                    let _ = child.kill().await;
-                    Err("Cancelled".to_string())
-                }
-            }
+        _ = cancel_rx => {
+            let _ = child.kill().await;
+            Err("Cancelled".to_string())
         }
     };
 
@@ -1336,7 +1320,10 @@ async fn run_command_task(
     let mut tasks = state.tasks.write().await;
     if let Some(ut) = tasks.get_mut(&user_id) {
         if let Some(ts) = ut.get_mut(&task_id) {
-            // Don't overwrite if already marked Cancelled by stop_task
+            // Don't overwrite if already marked Cancelled by stop_task.
+            // The Err("Cancelled") case is handled by the outer guard — stop_task
+            // sets status=Cancelled before firing the channel, so by the time we
+            // reach here the condition is already false.
             if ts.status != TaskStatus::Cancelled {
                 match exit_result {
                     Ok(status) if status.success() => {
@@ -1347,10 +1334,6 @@ async fn run_command_task(
                         ts.status = TaskStatus::Failed;
                         ts.result =
                             Some(format!("exit {}", status.code().unwrap_or(-1)));
-                    }
-                    Err(msg) if msg == "Cancelled" => {
-                        ts.status = TaskStatus::Cancelled;
-                        ts.result = Some("Cancelled".to_string());
                     }
                     Err(msg) => {
                         ts.status = TaskStatus::Failed;
@@ -1388,6 +1371,15 @@ async fn create_task(
                 format!("Workspace {} not found", workspace_id),
             ))?;
 
+        // Command mode runs inside nspawn containers. Host workspaces execute directly
+        // on the host as root — too broad a security surface for arbitrary commands.
+        if workspace.workspace_type == crate::workspace::WorkspaceType::Host {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Command-mode tasks are not supported for Host workspaces".to_string(),
+            ));
+        }
+
         let timeout = match req.timeout_secs {
             Some(s) if s > 0 => Some(std::time::Duration::from_secs(s)),
             _ => Some(std::time::Duration::from_secs(1800)), // 30 min default
@@ -1420,8 +1412,9 @@ async fn create_task(
         }
 
         let state_clone = Arc::clone(&state);
+        let working_dir = req.working_dir.clone();
         tokio::spawn(async move {
-            run_command_task(state_clone, user.id, id, command, workspace, timeout, cancel_rx).await;
+            run_command_task(state_clone, user.id, id, command, workspace, working_dir, timeout, cancel_rx).await;
         });
 
         return Ok(Json(CreateTaskResponse {
