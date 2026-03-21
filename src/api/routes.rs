@@ -998,7 +998,15 @@ async fn list_tasks(
         .get(&user.id)
         .map(|t| {
             t.iter()
-                .map(|(id, ts)| (*id, serde_json::to_value(ts).unwrap_or_default()))
+                .filter_map(|(id, ts)| {
+                    match serde_json::to_value(ts) {
+                        Ok(v) => Some((*id, v)),
+                        Err(e) => {
+                            tracing::error!("Failed to serialize task {}: {}", id, e);
+                            None
+                        }
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1041,7 +1049,11 @@ async fn stop_task(
     }
 }
 
+/// Maximum log entries per task. Prevents unbounded memory growth from verbose scripts.
+const LOG_MAX_ENTRIES: usize = 10_000;
+
 /// Append a log entry to a task. Shared by agent-mode and command-mode paths.
+/// Silently drops entries beyond LOG_MAX_ENTRIES (with a sentinel at the cap).
 async fn append_log(
     state: &Arc<AppState>,
     user_id: &str,
@@ -1053,11 +1065,21 @@ async fn append_log(
     let mut tasks = state.tasks.write().await;
     if let Some(user_tasks) = tasks.get_mut(user_id) {
         if let Some(task_state) = user_tasks.get_mut(&task_id) {
-            task_state.log.push(TaskLogEntry {
-                timestamp,
-                entry_type,
-                content: content.to_string(),
-            });
+            let len = task_state.log.len();
+            if len < LOG_MAX_ENTRIES {
+                task_state.log.push(TaskLogEntry {
+                    timestamp,
+                    entry_type,
+                    content: content.to_string(),
+                });
+            } else if len == LOG_MAX_ENTRIES {
+                task_state.log.push(TaskLogEntry {
+                    timestamp,
+                    entry_type: LogEntryType::Error,
+                    content: "[log truncated — 10,000 line limit reached]".to_string(),
+                });
+            }
+            // Beyond the cap: drop silently
         }
     }
 }
@@ -1104,7 +1126,7 @@ async fn run_command_task(
     }
 
     let (program, args) =
-        super::workspaces::build_nspawn_command(&workspace, &command, None);
+        super::workspaces::build_nspawn_command(&workspace, &command, None, None);
 
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args)
@@ -1135,21 +1157,20 @@ async fn run_command_task(
         }
     };
 
-    // Stream stdout line-by-line; parse JSON step annotations
-    if let Some(stdout) = child.stdout.take() {
+    // Stream stdout line-by-line; parse JSON step annotations.
+    // Readers are kept as joinable handles so we can drain them after the child exits/is killed,
+    // preventing post-cancel log entries from appearing after the terminal status is written.
+    let stdout_handle: Option<tokio::task::JoinHandle<()>> = if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
         let state_clone = Arc::clone(&state);
         let user_id_clone = user_id.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
-                // Try to parse as a structured step annotation
                 // Try to parse JSON step annotations; emit readable summary and skip raw line.
-                let mut is_step = false;
                 if line.trim_start().starts_with('{') {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                         if v.get("step").is_some() {
-                            is_step = true;
                             let now = chrono::Utc::now().to_rfc3339();
                             let status = v["status"].as_str().unwrap_or("unknown").to_string();
                             let step = TaskStep {
@@ -1191,31 +1212,32 @@ async fn run_command_task(
                                     .unwrap_or_default(),
                             );
                             append_log(&state_clone, &user_id_clone, task_id, LogEntryType::Response, &label).await;
+                            continue; // skip plain-line branch
                         }
                     }
                 }
-                if !is_step {
-                    // Plain stdout line — emit as-is
-                    append_log(
-                        &state_clone,
-                        &user_id_clone,
-                        task_id,
-                        LogEntryType::Response,
-                        &line,
-                    )
-                    .await;
-                }
+                // Plain stdout line — emit as-is
+                append_log(
+                    &state_clone,
+                    &user_id_clone,
+                    task_id,
+                    LogEntryType::Response,
+                    &line,
+                )
+                .await;
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     // Stream stderr to log as errors
-    if let Some(stderr) = child.stderr.take() {
+    let stderr_handle: Option<tokio::task::JoinHandle<()>> = if let Some(stderr) = child.stderr.take() {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
         let state_clone = Arc::clone(&state);
         let user_id_clone = user_id.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
                 append_log(
                     &state_clone,
@@ -1226,12 +1248,16 @@ async fn run_command_task(
                 )
                 .await;
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
-    // Wait for child exit, optional timeout, or cancel signal
+    // Wait for child exit, optional timeout, or cancel signal.
+    // Two separate select! blocks because timeout() cannot be conditionally included
+    // in a single select! arm — it must be present or absent at compile time.
     let exit_result: Result<std::process::ExitStatus, String> = match timeout {
-        Some(t) if !t.is_zero() => {
+        Some(t) => {
             tokio::select! {
                 r = tokio::time::timeout(t, child.wait()) => {
                     match r {
@@ -1249,7 +1275,7 @@ async fn run_command_task(
                 }
             }
         }
-        _ => {
+        None => {
             tokio::select! {
                 r = child.wait() => r.map_err(|e| e.to_string()),
                 _ = cancel_rx => {
@@ -1259,6 +1285,17 @@ async fn run_command_task(
             }
         }
     };
+
+    // Drain reader tasks before writing terminal status.
+    // After kill/exit the pipe closes and readers exit naturally; 2-second guard covers
+    // the edge case of a grandchild process that inherited the pipe descriptor.
+    let drain = std::time::Duration::from_secs(2);
+    if let Some(h) = stdout_handle {
+        let _ = tokio::time::timeout(drain, h).await;
+    }
+    if let Some(h) = stderr_handle {
+        let _ = tokio::time::timeout(drain, h).await;
+    }
 
     // Update final task status
     let mut tasks = state.tasks.write().await;
@@ -1315,9 +1352,8 @@ async fn create_task(
             ))?;
 
         let timeout = match req.timeout_secs {
-            Some(0) => None,
-            Some(s) => Some(std::time::Duration::from_secs(s)),
-            None => Some(std::time::Duration::from_secs(1800)), // 30 min default
+            Some(s) if s > 0 => Some(std::time::Duration::from_secs(s)),
+            _ => Some(std::time::Duration::from_secs(1800)), // 30 min default
         };
 
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
@@ -1326,7 +1362,7 @@ async fn create_task(
             id,
             status: TaskStatus::Pending,
             task: req.task.clone(),
-            mode: "command".to_string(),
+            mode: crate::api::types::TaskMode::Command,
             model: String::new(),
             iterations: 0,
             workspace_id: Some(workspace_id),
@@ -1363,7 +1399,7 @@ async fn create_task(
         id,
         status: TaskStatus::Pending,
         task: req.task.clone(),
-        mode: "agent".to_string(),
+        mode: crate::api::types::TaskMode::Agent,
         model: model.clone(),
         iterations: 0,
         workspace_id: None,
@@ -1544,8 +1580,15 @@ async fn get_task(
     tasks
         .get(&user.id)
         .and_then(|t| t.get(&id))
-        .map(|ts| Json(serde_json::to_value(ts).unwrap_or_default()))
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task {} not found", id)))
+        .and_then(|ts| {
+            serde_json::to_value(ts)
+                .map(Json)
+                .map_err(|e| {
+                    tracing::error!("Failed to serialize task {}: {}", id, e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize task".to_string())
+                })
+        })
 }
 
 /// Stream task progress via SSE.

@@ -2,7 +2,7 @@
  * Tasks API — command-mode and agent-mode task management.
  */
 
-import { apiGet, apiPost, apiFetch } from "./core";
+import { apiGet, apiPost } from "./core";
 
 // ---------------------------------------------------------------------------
 // Types

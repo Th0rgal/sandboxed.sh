@@ -815,10 +815,13 @@ fn shell_escape(s: &str) -> String {
 /// Returns `(program, args)` ready for `tokio::process::Command::new(program).args(args)`.
 /// For host workspaces, env vars should be set via `cmd.env()` on the returned Command —
 /// the caller is responsible for that since we can't inject them into `args` for bash -c.
+///
+/// `cwd` sets the working directory inside the container (defaults to `/root/work`).
 pub fn build_nspawn_command(
     workspace: &crate::workspace::Workspace,
     command: &str,
     extra_env: Option<&HashMap<String, String>>,
+    cwd: Option<&str>,
 ) -> (String, Vec<String>) {
     use crate::workspace::WorkspaceType;
 
@@ -829,6 +832,7 @@ pub fn build_nspawn_command(
         }
         WorkspaceType::Container => {
             let container_root = workspace.path.clone();
+            let chdir = cwd.unwrap_or("/root/work");
 
             let mut nspawn_args = vec![
                 "-D".to_string(),
@@ -836,7 +840,7 @@ pub fn build_nspawn_command(
                 "--quiet".to_string(),
                 "--timezone=off".to_string(),
                 "--chdir".to_string(),
-                "/root/work".to_string(),
+                chdir.to_string(),
             ];
 
             let use_shared_network = workspace.shared_network.unwrap_or(true);
@@ -1135,122 +1139,24 @@ async fn exec_workspace_command(
         None => workspace.path.clone(),
     };
 
-    let (program, args) = match workspace.workspace_type {
-        WorkspaceType::Host => {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-            (shell, vec!["-c".to_string(), req.command.clone()])
+    let container_root = workspace.path.clone();
+    let rel_cwd = if cwd.starts_with(&container_root) {
+        let rel = cwd.strip_prefix(&container_root).unwrap_or(Path::new(""));
+        if rel.as_os_str().is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", rel.to_string_lossy())
         }
-        WorkspaceType::Container => {
-            // For container workspaces, use systemd-nspawn
-            let container_root = workspace.path.clone();
-            let rel_cwd = if cwd.starts_with(&container_root) {
-                let rel = cwd.strip_prefix(&container_root).unwrap_or(Path::new(""));
-                if rel.as_os_str().is_empty() {
-                    "/".to_string()
-                } else {
-                    format!("/{}", rel.to_string_lossy())
-                }
-            } else {
-                "/root/work".to_string()
-            };
-
-            let mut nspawn_args = vec![
-                "-D".to_string(),
-                container_root.to_string_lossy().to_string(),
-                "--quiet".to_string(),
-                "--timezone=off".to_string(),
-                "--chdir".to_string(),
-                rel_cwd.clone(),
-            ];
-
-            // Check network isolation settings
-            let use_shared_network = workspace.shared_network.unwrap_or(true);
-            let tailscale_mode = workspace.tailscale_mode.unwrap_or(TailscaleMode::ExitNode);
-            let tailscale_requested = crate::nspawn::tailscale_enabled(&workspace.env_vars);
-
-            // Add network isolation flags if shared_network is false
-            let tailscale_enabled = if use_shared_network {
-                // Shared network: bind DNS from host
-                nspawn_args.push("--bind-ro=/etc/resolv.conf".to_string());
-                false
-            } else if tailscale_requested {
-                // Isolated network with Tailscale
-                nspawn_args.push("--network-veth".to_string());
-                nspawn_args.push("--capability=CAP_NET_ADMIN,CAP_NET_RAW".to_string());
-                if Path::new("/dev/net/tun").exists() {
-                    nspawn_args.push("--bind=/dev/net/tun".to_string());
-                }
-                true
-            } else {
-                // Isolated network without Tailscale - still bind DNS
-                nspawn_args.push("--bind-ro=/etc/resolv.conf".to_string());
-                false
-            };
-
-            // Add workspace env vars
-            for (key, value) in &workspace.env_vars {
-                nspawn_args.push(format!("--setenv={}={}", key, value));
-            }
-
-            // Add request env vars
-            if let Some(env) = &req.env {
-                for (key, value) in env {
-                    nspawn_args.push(format!("--setenv={}={}", key, value));
-                }
-            }
-
-            // Build the command to run
-            let final_command = if tailscale_enabled {
-                // Wrap command with Tailscale bootstrap script
-                let tailnet_only = tailscale_mode == TailscaleMode::TailnetOnly;
-                let mut bootstrap_cmd = String::new();
-
-                // Export TS_* env vars for the bootstrap script
-                for (k, v) in &workspace.env_vars {
-                    if k.starts_with("TS_") && !v.trim().is_empty() {
-                        bootstrap_cmd.push_str(&format!("export {}={}; ", k, shell_escape(v)));
-                    }
-                }
-
-                // Run the Tailscale bootstrap script
-                bootstrap_cmd.push_str(
-                    "if [ -x /usr/local/bin/sandboxed-tailscale-up ]; then \
-                     /usr/local/bin/sandboxed-tailscale-up >/dev/null 2>&1 || true; \
-                     fi; ",
-                );
-
-                // For tailnet_only mode, set up host gateway routing for internet
-                if tailnet_only {
-                    bootstrap_cmd.push_str(
-                        "_oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
-                         _oa_gw=\"${_oa_ip%.*}.1\"; \
-                         if [ -n \"$_oa_ip\" ]; then \
-                           ip route del default 2>/dev/null || true; \
-                           ip route add default via \"$_oa_gw\" 2>/dev/null || true; \
-                         fi; \
-                         if [ ! -s /etc/resolv.conf ]; then \
-                           printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf 2>/dev/null || true; \
-                         fi; "
-                    );
-                }
-
-                // Change to working directory and run the actual command
-                bootstrap_cmd.push_str(&format!(
-                    "cd {} 2>/dev/null || true; ",
-                    shell_escape(&rel_cwd)
-                ));
-                bootstrap_cmd.push_str(&req.command);
-
-                bootstrap_cmd
-            } else {
-                req.command.clone()
-            };
-
-            nspawn_args.extend(["/bin/bash".to_string(), "-c".to_string(), final_command]);
-
-            ("systemd-nspawn".to_string(), nspawn_args)
-        }
+    } else {
+        "/root/work".to_string()
     };
+
+    let (program, args) = build_nspawn_command(
+        &workspace,
+        &req.command,
+        req.env.as_ref(),
+        Some(&rel_cwd),
+    );
 
     let mut cmd = Command::new(&program);
     cmd.args(&args)

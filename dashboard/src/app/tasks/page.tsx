@@ -144,7 +144,7 @@ function LogViewer({ task }: { task: Task }) {
 // Task row
 // ---------------------------------------------------------------------------
 
-function TaskRow({ task, onStop }: { task: Task; onStop: (id: string) => void }) {
+function TaskRow({ task, onStop, stopping }: { task: Task; onStop: (id: string) => void; stopping: boolean }) {
   const [expanded, setExpanded] = useState(false);
 
   const started = task.log[0]?.timestamp;
@@ -193,10 +193,13 @@ function TaskRow({ task, onStop }: { task: Task; onStop: (id: string) => void })
           {task.status === "running" && (
             <button
               onClick={(e) => { e.stopPropagation(); onStop(task.id); }}
-              className="p-1 rounded hover:bg-red-500/10 text-white/30 hover:text-red-400 transition-colors"
-              title="Stop task"
+              disabled={stopping}
+              className="p-1 rounded hover:bg-red-500/10 text-white/30 hover:text-red-400 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              title={stopping ? "Stopping…" : "Stop task"}
             >
-              <Square className="w-3.5 h-3.5" />
+              {stopping
+                ? <Loader className="w-3.5 h-3.5 animate-spin" />
+                : <Square className="w-3.5 h-3.5" />}
             </button>
           )}
         </div>
@@ -289,7 +292,7 @@ export default function TasksPage() {
             <p className="text-[10px] uppercase tracking-widest text-white/30 mb-2">Active</p>
             <div className="space-y-2">
               {running.map((t) => (
-                <TaskRow key={t.id} task={t} onStop={handleStop} />
+                <TaskRow key={t.id} task={t} onStop={handleStop} stopping={stoppingIds.has(t.id)} />
               ))}
             </div>
           </section>
@@ -300,7 +303,7 @@ export default function TasksPage() {
             <p className="text-[10px] uppercase tracking-widest text-white/30 mb-2">History</p>
             <div className="space-y-2">
               {done.map((t) => (
-                <TaskRow key={t.id} task={t} onStop={handleStop} />
+                <TaskRow key={t.id} task={t} onStop={handleStop} stopping={stoppingIds.has(t.id)} />
               ))}
             </div>
           </section>

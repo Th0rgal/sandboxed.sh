@@ -27,7 +27,7 @@ pub struct CreateTaskRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<Uuid>,
 
-    /// Timeout in seconds for command mode (default: 1800 = 30 min, 0 = no limit).
+    /// Timeout in seconds for command mode (default: 1800 = 30 min; 0 or absent → default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
 }
@@ -67,6 +67,14 @@ pub struct CreateTaskResponse {
 
     /// Current task status
     pub status: TaskStatus,
+}
+
+/// Task execution mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskMode {
+    Agent,
+    Command,
 }
 
 /// Task status enumeration.
@@ -123,8 +131,8 @@ pub struct TaskState {
     /// Original task description / label
     pub task: String,
 
-    /// "agent" or "command"
-    pub mode: String,
+    /// Task execution mode
+    pub mode: TaskMode,
 
     /// Model used for this task (agent mode only)
     pub model: String,
