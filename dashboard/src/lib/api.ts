@@ -2386,6 +2386,7 @@ export interface SettingsResponse {
   sandboxed_repo_path: string | null;
   rtk_enabled: boolean | null;
   max_parallel_missions: number | null;
+  max_concurrent_tasks: number | null;
 }
 
 export interface UpdateLibraryRemoteResponse {

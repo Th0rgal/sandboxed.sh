@@ -15,6 +15,9 @@ static RTK_ENABLED_CACHED: AtomicBool = AtomicBool::new(false);
 /// Global cached max parallel missions value.
 /// A value of 0 means "unset" and callers should fall back to their default.
 static MAX_PARALLEL_MISSIONS_CACHED: AtomicUsize = AtomicUsize::new(0);
+/// Global cached max concurrent command tasks value.
+/// A value of 0 means "unset" and callers should fall back to their default.
+static MAX_CONCURRENT_TASKS_CACHED: AtomicUsize = AtomicUsize::new(0);
 
 /// Default repo path for sandboxed.sh source (used for self-updates).
 pub const DEFAULT_SANDBOXED_REPO_PATH: &str = "/opt/sandboxed-sh/vaduz-v1";
@@ -50,6 +53,10 @@ pub struct Settings {
     /// When None, falls back to the MAX_PARALLEL_MISSIONS env var (default: 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_missions: Option<usize>,
+    /// Maximum number of command-mode tasks that can run concurrently.
+    /// When None, falls back to the MAX_CONCURRENT_TASKS env var (default: 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_tasks: Option<usize>,
 }
 
 /// In-memory store for global settings with disk persistence.
@@ -111,6 +118,10 @@ impl SettingsStore {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v >= 1);
+        let max_concurrent_tasks = std::env::var("MAX_CONCURRENT_TASKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 1);
 
         Settings {
             library_remote: std::env::var("LIBRARY_REMOTE").ok().or_else(|| {
@@ -123,6 +134,7 @@ impl SettingsStore {
             auth: None,
             rtk_enabled,
             max_parallel_missions,
+            max_concurrent_tasks,
         }
     }
 
@@ -278,6 +290,29 @@ impl SettingsStore {
         Ok(())
     }
 
+    /// Update the max concurrent tasks setting.
+    ///
+    /// Returns `(changed, previous_value)`.
+    pub async fn set_max_concurrent_tasks(
+        &self,
+        max_concurrent_tasks: Option<usize>,
+    ) -> Result<(bool, Option<usize>), std::io::Error> {
+        let mut settings = self.settings.write().await;
+        let previous = settings.max_concurrent_tasks;
+
+        if previous != max_concurrent_tasks {
+            settings.max_concurrent_tasks = max_concurrent_tasks;
+            if let Some(limit) = max_concurrent_tasks {
+                set_max_concurrent_tasks_cached(limit);
+            }
+            drop(settings);
+            self.save_to_disk().await?;
+            Ok((true, previous))
+        } else {
+            Ok((false, previous))
+        }
+    }
+
     /// Initialize cached values from loaded settings.
     /// Must be called after creating the settings store, before any workspace operations.
     pub fn init_cached_values(&self) {
@@ -289,6 +324,9 @@ impl SettingsStore {
             }
             if let Some(limit) = settings.max_parallel_missions {
                 set_max_parallel_missions_cached(limit);
+            }
+            if let Some(limit) = settings.max_concurrent_tasks {
+                set_max_concurrent_tasks_cached(limit);
             }
         }
     }
@@ -325,4 +363,22 @@ pub fn max_parallel_missions_cached_or(default: usize) -> usize {
 /// Values less than 1 are normalized to 1.
 pub fn set_max_parallel_missions_cached(max_parallel_missions: usize) {
     MAX_PARALLEL_MISSIONS_CACHED.store(max_parallel_missions.max(1), Ordering::Relaxed);
+}
+
+/// Get the effective max concurrent command tasks limit from cache, with a fallback default.
+pub fn max_concurrent_tasks_cached_or(default: usize) -> usize {
+    let cached = MAX_CONCURRENT_TASKS_CACHED.load(Ordering::Relaxed);
+    if cached >= 1 {
+        cached
+    } else if default >= 1 {
+        default
+    } else {
+        5
+    }
+}
+
+/// Update the cached max concurrent tasks value.
+/// Values less than 1 are normalized to 1.
+pub fn set_max_concurrent_tasks_cached(max_concurrent_tasks: usize) {
+    MAX_CONCURRENT_TASKS_CACHED.store(max_concurrent_tasks.max(1), Ordering::Relaxed);
 }

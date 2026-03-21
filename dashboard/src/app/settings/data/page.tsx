@@ -128,6 +128,7 @@ export default function DataSettingsPage() {
             sandboxed_repo_path: current?.sandboxed_repo_path ?? null,
             rtk_enabled: enabled,
             max_parallel_missions: current?.max_parallel_missions ?? 1,
+            max_concurrent_tasks: current?.max_concurrent_tasks ?? null,
           };
         },
         {
@@ -136,6 +137,7 @@ export default function DataSettingsPage() {
             sandboxed_repo_path: current?.sandboxed_repo_path ?? null,
             rtk_enabled: enabled,
             max_parallel_missions: current?.max_parallel_missions ?? 1,
+            max_concurrent_tasks: current?.max_concurrent_tasks ?? null,
           }),
           rollbackOnError: true,
           revalidate: true,

@@ -36,6 +36,7 @@ pub struct SettingsResponse {
     pub sandboxed_repo_path: Option<String>,
     pub rtk_enabled: Option<bool>,
     pub max_parallel_missions: Option<usize>,
+    pub max_concurrent_tasks: Option<usize>,
 }
 
 impl From<Settings> for SettingsResponse {
@@ -45,6 +46,7 @@ impl From<Settings> for SettingsResponse {
             sandboxed_repo_path: settings.sandboxed_repo_path,
             rtk_enabled: settings.rtk_enabled,
             max_parallel_missions: settings.max_parallel_missions,
+            max_concurrent_tasks: settings.max_concurrent_tasks,
         }
     }
 }
@@ -60,6 +62,8 @@ pub struct UpdateSettingsRequest {
     pub rtk_enabled: Option<bool>,
     #[serde(default)]
     pub max_parallel_missions: Option<usize>,
+    #[serde(default)]
+    pub max_concurrent_tasks: Option<usize>,
 }
 
 /// Request to update library remote specifically.
@@ -114,6 +118,16 @@ async fn update_settings(
         }
         new_settings.max_parallel_missions = Some(value);
         crate::settings::set_max_parallel_missions_cached(value);
+    }
+    if let Some(value) = req.max_concurrent_tasks {
+        if value < 1 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "max_concurrent_tasks must be at least 1".to_string(),
+            ));
+        }
+        new_settings.max_concurrent_tasks = Some(value);
+        crate::settings::set_max_concurrent_tasks_cached(value);
     }
 
     state

@@ -22,8 +22,10 @@ export default function BackendsPage() {
   const [activeBackendTab, setActiveBackendTab] = useState<'opencode' | 'claudecode' | 'amp'>('opencode');
   const [savingBackend, setSavingBackend] = useState(false);
   const [savingMissionLimit, setSavingMissionLimit] = useState(false);
+  const [savingTaskLimit, setSavingTaskLimit] = useState(false);
   const [testingConnection, setTestingConnection] = useState(false);
   const [maxParallelMissionsValue, setMaxParallelMissionsValue] = useState('1');
+  const [maxConcurrentTasksValue, setMaxConcurrentTasksValue] = useState('5');
 
   // Server connection state
   const [apiUrl, setApiUrl] = useState(() => getRuntimeApiBase());
@@ -153,6 +155,10 @@ export default function BackendsPage() {
     if (typeof limit === 'number' && limit >= 1) {
       setMaxParallelMissionsValue(String(limit));
     }
+    const taskLimit = serverSettings?.max_concurrent_tasks;
+    if (typeof taskLimit === 'number' && taskLimit >= 1) {
+      setMaxConcurrentTasksValue(String(taskLimit));
+    }
   }, [serverSettings]);
 
   const handleSaveMissionLimit = async () => {
@@ -175,6 +181,29 @@ export default function BackendsPage() {
       );
     } finally {
       setSavingMissionLimit(false);
+    }
+  };
+
+  const handleSaveTaskLimit = async () => {
+    const parsed = Number.parseInt(maxConcurrentTasksValue, 10);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      toast.error('Max concurrent tasks must be at least 1');
+      return;
+    }
+
+    setSavingTaskLimit(true);
+    try {
+      await updateSettings({ max_concurrent_tasks: parsed });
+      await mutateSettings();
+      toast.success('Task concurrency limit updated');
+    } catch (err) {
+      toast.error(
+        `Failed to update task concurrency limit: ${
+          err instanceof Error ? err.message : 'Unknown error'
+        }`
+      );
+    } finally {
+      setSavingTaskLimit(false);
     }
   };
 
@@ -332,6 +361,37 @@ export default function BackendsPage() {
             </div>
             <p className="mt-1.5 text-xs text-white/30">
               Global limit across all backends. Controls how many missions can run at the same time.
+            </p>
+          </div>
+
+          <div className="mb-4 rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+            <label className="block text-xs text-white/60 mb-1.5">
+              Max Concurrent Tasks
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={1}
+                step={1}
+                value={maxConcurrentTasksValue}
+                onChange={(e) => setMaxConcurrentTasksValue(e.target.value)}
+                className="w-32 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
+              />
+              <button
+                onClick={handleSaveTaskLimit}
+                disabled={savingTaskLimit}
+                className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+              >
+                {savingTaskLimit ? (
+                  <Loader className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Save className="h-3.5 w-3.5" />
+                )}
+                Save Limit
+              </button>
+            </div>
+            <p className="mt-1.5 text-xs text-white/30">
+              Max command-mode tasks that can run simultaneously. Returns 429 when the limit is reached. Default: 5. Env: MAX_CONCURRENT_TASKS.
             </p>
           </div>
 

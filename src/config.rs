@@ -206,6 +206,9 @@ pub struct Config {
     /// Maximum number of missions that can run in parallel (1 = sequential only)
     pub max_parallel_missions: usize,
 
+    /// Maximum number of command-mode tasks that can run concurrently (default: 5)
+    pub max_concurrent_tasks: usize,
+
     /// Development mode (disables auth; more permissive defaults)
     pub dev_mode: bool,
 
@@ -369,6 +372,14 @@ impl Config {
                 ConfigError::InvalidValue("MAX_PARALLEL_MISSIONS".to_string(), format!("{}", e))
             })?;
 
+        // Maximum concurrent command-mode tasks (default: 5)
+        let max_concurrent_tasks = std::env::var("MAX_CONCURRENT_TASKS")
+            .unwrap_or_else(|_| "5".to_string())
+            .parse()
+            .map_err(|e| {
+                ConfigError::InvalidValue("MAX_CONCURRENT_TASKS".to_string(), format!("{}", e))
+            })?;
+
         let dev_mode = std::env::var("DEV_MODE")
             .ok()
             .map(|v| {
@@ -500,6 +511,7 @@ impl Config {
             max_iterations,
             stale_mission_hours,
             max_parallel_missions,
+            max_concurrent_tasks,
             dev_mode,
             auth,
             context,
@@ -523,6 +535,7 @@ impl Config {
             max_iterations: 50,
             stale_mission_hours: 2,
             max_parallel_missions: 1,
+            max_concurrent_tasks: 5,
             dev_mode: true,
             auth: AuthConfig::default(),
             context: ContextConfig::default(),

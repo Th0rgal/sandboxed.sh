@@ -1317,6 +1317,9 @@ async fn run_command_task(
     // Update final task status
     let task_end = chrono::Utc::now();
     let duration_secs = (task_end - task_start).num_milliseconds() as f64 / 1000.0;
+    // Maximum completed tasks to retain per user (oldest are dropped first).
+    const MAX_COMPLETED_TASKS: usize = 500;
+
     let mut tasks = state.tasks.write().await;
     if let Some(ut) = tasks.get_mut(&user_id) {
         if let Some(ts) = ut.get_mut(&task_id) {
@@ -1343,6 +1346,27 @@ async fn run_command_task(
             }
             ts.completed_at = Some(task_end.to_rfc3339());
             ts.duration_secs = Some(duration_secs);
+        }
+
+        // Evict oldest completed tasks if over the retention cap.
+        let completed_count = ut
+            .values()
+            .filter(|t| !matches!(t.status, TaskStatus::Running | TaskStatus::Pending))
+            .count();
+        if completed_count > MAX_COMPLETED_TASKS {
+            let mut completed: Vec<(Uuid, String)> = ut
+                .iter()
+                .filter(|(_, t)| !matches!(t.status, TaskStatus::Running | TaskStatus::Pending))
+                .map(|(id, t)| {
+                    (*id, t.completed_at.clone().unwrap_or_default())
+                })
+                .collect();
+            // Sort oldest-first by completed_at (ISO 8601 sorts lexicographically).
+            completed.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+            let to_remove = completed_count - MAX_COMPLETED_TASKS;
+            for (evict_id, _) in completed.into_iter().take(to_remove) {
+                ut.remove(&evict_id);
+            }
         }
     }
 }
@@ -1378,6 +1402,29 @@ async fn create_task(
                 StatusCode::BAD_REQUEST,
                 "Command-mode tasks are not supported for Host workspaces".to_string(),
             ));
+        }
+
+        // Enforce concurrent task limit.
+        let max_concurrent = crate::settings::max_concurrent_tasks_cached_or(state.config.max_concurrent_tasks);
+        {
+            let tasks = state.tasks.read().await;
+            let running = tasks
+                .get(&user.id)
+                .map(|ut| {
+                    ut.values()
+                        .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Pending))
+                        .count()
+                })
+                .unwrap_or(0);
+            if running >= max_concurrent {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Too many concurrent tasks ({}/{}). Stop a running task or wait for one to finish.",
+                        running, max_concurrent
+                    ),
+                ));
+            }
         }
 
         let timeout = match req.timeout_secs {

@@ -40,6 +40,7 @@ describe('DataSettingsPage RTK toggle', () => {
       sandboxed_repo_path: null,
       rtk_enabled: false,
       max_parallel_missions: 1,
+      max_concurrent_tasks: null,
     });
   });
 
