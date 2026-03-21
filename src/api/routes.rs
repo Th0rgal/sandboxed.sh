@@ -992,15 +992,20 @@ async fn get_stats(
 async fn list_tasks(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
-) -> Json<Vec<TaskState>> {
+) -> Json<serde_json::Value> {
     let tasks = state.tasks.read().await;
-    let mut task_list: Vec<_> = tasks
+    let mut task_list: Vec<(Uuid, serde_json::Value)> = tasks
         .get(&user.id)
-        .map(|t| t.values().cloned().collect())
+        .map(|t| {
+            t.iter()
+                .map(|(id, ts)| (*id, serde_json::to_value(ts).unwrap_or_default()))
+                .collect()
+        })
         .unwrap_or_default();
     // Sort by most recent first (by ID since UUIDs are time-ordered)
-    task_list.sort_by_key(|task| Reverse(task.id));
-    Json(task_list)
+    task_list.sort_by_key(|(id, _)| Reverse(*id));
+    let values: Vec<_> = task_list.into_iter().map(|(_, v)| v).collect();
+    Json(serde_json::Value::Array(values))
 }
 
 /// Stop a running task.
@@ -1014,6 +1019,11 @@ async fn stop_task(
 
     if let Some(task) = user_tasks.get_mut(&id) {
         if task.status == TaskStatus::Running {
+            // For command-mode tasks, fire the cancel channel so run_command_task
+            // can abort the child process cleanly via tokio::select!.
+            if let Some(tx) = task.cancel_tx.take() {
+                let _ = tx.send(());
+            }
             task.status = TaskStatus::Cancelled;
             task.result = Some("Task was cancelled by user".to_string());
             Ok(Json(serde_json::json!({
@@ -1031,6 +1041,238 @@ async fn stop_task(
     }
 }
 
+/// Append a log entry to a task. Shared by agent-mode and command-mode paths.
+async fn append_log(
+    state: &Arc<AppState>,
+    user_id: &str,
+    task_id: Uuid,
+    entry_type: LogEntryType,
+    content: &str,
+) {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let mut tasks = state.tasks.write().await;
+    if let Some(user_tasks) = tasks.get_mut(user_id) {
+        if let Some(task_state) = user_tasks.get_mut(&task_id) {
+            task_state.log.push(TaskLogEntry {
+                timestamp,
+                entry_type,
+                content: content.to_string(),
+            });
+        }
+    }
+}
+
+/// Run a shell command as a background task inside a workspace container.
+async fn run_command_task(
+    state: Arc<AppState>,
+    user_id: String,
+    task_id: Uuid,
+    command: String,
+    workspace: crate::workspace::Workspace,
+    timeout: Option<std::time::Duration>,
+    cancel_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Check container readiness
+    if workspace.workspace_type == crate::workspace::WorkspaceType::Container
+        && workspace.status != crate::workspace::WorkspaceStatus::Ready
+    {
+        let msg = format!(
+            "Workspace '{}' is not ready (status: {:?}). Build it first.",
+            workspace.name, workspace.status
+        );
+        append_log(&state, &user_id, task_id, LogEntryType::Error, &msg).await;
+        let mut tasks = state.tasks.write().await;
+        if let Some(ut) = tasks.get_mut(&user_id) {
+            if let Some(ts) = ut.get_mut(&task_id) {
+                ts.status = TaskStatus::Failed;
+                ts.result = Some(msg);
+            }
+        }
+        return;
+    }
+
+    // Transition to Running and store workspace info
+    {
+        let mut tasks = state.tasks.write().await;
+        if let Some(ut) = tasks.get_mut(&user_id) {
+            if let Some(ts) = ut.get_mut(&task_id) {
+                ts.status = TaskStatus::Running;
+                ts.workspace_id = Some(workspace.id);
+                ts.workspace_name = Some(workspace.name.clone());
+            }
+        }
+    }
+
+    let (program, args) =
+        super::workspaces::build_nspawn_command(&workspace, &command, None);
+
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // For host workspaces, env vars are passed via cmd.env() (not via --setenv args)
+    if workspace.workspace_type == crate::workspace::WorkspaceType::Host {
+        for (k, v) in &workspace.env_vars {
+            cmd.env(k, v);
+        }
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("Failed to spawn command: {}", e);
+            append_log(&state, &user_id, task_id, LogEntryType::Error, &msg).await;
+            let mut tasks = state.tasks.write().await;
+            if let Some(ut) = tasks.get_mut(&user_id) {
+                if let Some(ts) = ut.get_mut(&task_id) {
+                    ts.status = TaskStatus::Failed;
+                    ts.result = Some(msg);
+                }
+            }
+            return;
+        }
+    };
+
+    // Stream stdout line-by-line; parse JSON step annotations
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        let state_clone = Arc::clone(&state);
+        let user_id_clone = user_id.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                // Try to parse as a structured step annotation
+                if line.trim_start().starts_with('{') {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if v.get("step").is_some() {
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let status = v["status"].as_str().unwrap_or("unknown").to_string();
+                            let step = TaskStep {
+                                name: v["step"].as_str().unwrap_or("").to_string(),
+                                iteration: v
+                                    .get("iteration")
+                                    .and_then(|x| x.as_u64())
+                                    .map(|x| x as u32),
+                                status: status.clone(),
+                                started_at: if status == "started" {
+                                    Some(now.clone())
+                                } else {
+                                    None
+                                },
+                                completed_at: if status != "started" {
+                                    Some(now)
+                                } else {
+                                    None
+                                },
+                                duration_s: v.get("duration_s").and_then(|x| x.as_f64()),
+                                metadata: v.get("metadata").cloned(),
+                            };
+                            let mut tasks = state_clone.tasks.write().await;
+                            if let Some(ut) = tasks.get_mut(&user_id_clone) {
+                                if let Some(ts) = ut.get_mut(&task_id) {
+                                    ts.steps.push(step);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Always emit to log
+                append_log(
+                    &state_clone,
+                    &user_id_clone,
+                    task_id,
+                    LogEntryType::Response,
+                    &line,
+                )
+                .await;
+            }
+        });
+    }
+
+    // Stream stderr to log as errors
+    if let Some(stderr) = child.stderr.take() {
+        let reader = BufReader::new(stderr);
+        let mut lines = reader.lines();
+        let state_clone = Arc::clone(&state);
+        let user_id_clone = user_id.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                append_log(
+                    &state_clone,
+                    &user_id_clone,
+                    task_id,
+                    LogEntryType::Error,
+                    &line,
+                )
+                .await;
+            }
+        });
+    }
+
+    // Wait for child exit, optional timeout, or cancel signal
+    let exit_result: Result<std::process::ExitStatus, String> = match timeout {
+        Some(t) if !t.is_zero() => {
+            tokio::select! {
+                r = tokio::time::timeout(t, child.wait()) => {
+                    match r {
+                        Ok(Ok(status)) => Ok(status),
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(_) => {
+                            let _ = child.kill().await;
+                            Err(format!("Timed out after {}s", t.as_secs()))
+                        }
+                    }
+                }
+                _ = cancel_rx => {
+                    let _ = child.kill().await;
+                    Err("Cancelled".to_string())
+                }
+            }
+        }
+        _ => {
+            tokio::select! {
+                r = child.wait() => r.map_err(|e| e.to_string()),
+                _ = cancel_rx => {
+                    let _ = child.kill().await;
+                    Err("Cancelled".to_string())
+                }
+            }
+        }
+    };
+
+    // Update final task status
+    let mut tasks = state.tasks.write().await;
+    if let Some(ut) = tasks.get_mut(&user_id) {
+        if let Some(ts) = ut.get_mut(&task_id) {
+            // Don't overwrite if already marked Cancelled by stop_task
+            if ts.status != TaskStatus::Cancelled {
+                match exit_result {
+                    Ok(status) if status.success() => {
+                        ts.status = TaskStatus::Completed;
+                        ts.result = Some("exit 0".to_string());
+                    }
+                    Ok(status) => {
+                        ts.status = TaskStatus::Failed;
+                        ts.result =
+                            Some(format!("exit {}", status.code().unwrap_or(-1)));
+                    }
+                    Err(msg) if msg == "Cancelled" => {
+                        ts.status = TaskStatus::Cancelled;
+                        ts.result = Some("Cancelled".to_string());
+                    }
+                    Err(msg) => {
+                        ts.status = TaskStatus::Failed;
+                        ts.result = Some(msg);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Create a new task.
 async fn create_task(
     State(state): State<Arc<AppState>>,
@@ -1038,6 +1280,63 @@ async fn create_task(
     Json(req): Json<CreateTaskRequest>,
 ) -> Result<Json<CreateTaskResponse>, (StatusCode, String)> {
     let id = Uuid::new_v4();
+
+    // --- Command mode ---
+    if let Some(command) = req.command.clone() {
+        let workspace_id = req.workspace_id.ok_or((
+            StatusCode::BAD_REQUEST,
+            "workspace_id is required when command is set".to_string(),
+        ))?;
+
+        let workspace = state
+            .workspaces
+            .get(workspace_id)
+            .await
+            .ok_or((
+                StatusCode::NOT_FOUND,
+                format!("Workspace {} not found", workspace_id),
+            ))?;
+
+        let timeout = match req.timeout_secs {
+            Some(0) => None,
+            Some(s) => Some(std::time::Duration::from_secs(s)),
+            None => Some(std::time::Duration::from_secs(1800)), // 30 min default
+        };
+
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+
+        let task_state = TaskState {
+            id,
+            status: TaskStatus::Pending,
+            task: req.task.clone(),
+            mode: "command".to_string(),
+            model: String::new(),
+            iterations: 0,
+            workspace_id: Some(workspace_id),
+            workspace_name: Some(workspace.name.clone()),
+            result: None,
+            log: Vec::new(),
+            steps: Vec::new(),
+            cancel_tx: Some(cancel_tx),
+        };
+
+        {
+            let mut tasks = state.tasks.write().await;
+            tasks.entry(user.id.clone()).or_default().insert(id, task_state);
+        }
+
+        let state_clone = Arc::clone(&state);
+        tokio::spawn(async move {
+            run_command_task(state_clone, user.id, id, command, workspace, timeout, cancel_rx).await;
+        });
+
+        return Ok(Json(CreateTaskResponse {
+            id,
+            status: TaskStatus::Pending,
+        }));
+    }
+
+    // --- Agent mode (existing behaviour) ---
     let model = req
         .model
         .or(state.config.default_model.clone())
@@ -1047,13 +1346,17 @@ async fn create_task(
         id,
         status: TaskStatus::Pending,
         task: req.task.clone(),
+        mode: "agent".to_string(),
         model: model.clone(),
         iterations: 0,
+        workspace_id: None,
+        workspace_name: None,
         result: None,
         log: Vec::new(),
+        steps: Vec::new(),
+        cancel_tx: None,
     };
 
-    // Store task
     {
         let mut tasks = state.tasks.write().await;
         tasks
@@ -1062,7 +1365,6 @@ async fn create_task(
             .insert(id, task_state);
     }
 
-    // Spawn background task to run the agent
     let state_clone = Arc::clone(&state);
     let task_description = req.task.clone();
     let budget_cents = req.budget_cents;
@@ -1220,12 +1522,12 @@ async fn get_task(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(id): Path<Uuid>,
-) -> Result<Json<TaskState>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let tasks = state.tasks.read().await;
     tasks
         .get(&user.id)
-        .and_then(|t| t.get(&id).cloned())
-        .map(Json)
+        .and_then(|t| t.get(&id))
+        .map(|ts| Json(serde_json::to_value(ts).unwrap_or_default()))
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task {} not found", id)))
 }
 

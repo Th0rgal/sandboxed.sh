@@ -147,3 +147,19 @@ export {
   getAutomationExecutions,
   getMissionAutomationExecutions,
 } from "./automations";
+
+// Tasks
+export {
+  type Task,
+  type TaskStatus,
+  type TaskMode,
+  type TaskLogEntry,
+  type TaskStep,
+  type CreateCommandTaskRequest,
+  type CreateAgentTaskRequest,
+  listTasks,
+  getTask,
+  createTask,
+  stopTask,
+  streamTask,
+} from "./tasks";

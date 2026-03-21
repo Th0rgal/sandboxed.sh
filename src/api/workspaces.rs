@@ -809,6 +809,107 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Build a systemd-nspawn (or host bash) invocation for running a shell command
+/// in a workspace. Used by both exec (synchronous) and tasks (background).
+///
+/// Returns `(program, args)` ready for `tokio::process::Command::new(program).args(args)`.
+/// For host workspaces, env vars should be set via `cmd.env()` on the returned Command —
+/// the caller is responsible for that since we can't inject them into `args` for bash -c.
+pub fn build_nspawn_command(
+    workspace: &crate::workspace::Workspace,
+    command: &str,
+    extra_env: Option<&HashMap<String, String>>,
+) -> (String, Vec<String>) {
+    use crate::workspace::WorkspaceType;
+
+    match workspace.workspace_type {
+        WorkspaceType::Host => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            (shell, vec!["-c".to_string(), command.to_string()])
+        }
+        WorkspaceType::Container => {
+            let container_root = workspace.path.clone();
+
+            let mut nspawn_args = vec![
+                "-D".to_string(),
+                container_root.to_string_lossy().to_string(),
+                "--quiet".to_string(),
+                "--timezone=off".to_string(),
+                "--chdir".to_string(),
+                "/root/work".to_string(),
+            ];
+
+            let use_shared_network = workspace.shared_network.unwrap_or(true);
+            let tailscale_mode = workspace
+                .tailscale_mode
+                .unwrap_or(crate::workspace::TailscaleMode::ExitNode);
+            let tailscale_requested = crate::nspawn::tailscale_enabled(&workspace.env_vars);
+
+            let tailscale_enabled = if use_shared_network {
+                nspawn_args.push("--bind-ro=/etc/resolv.conf".to_string());
+                false
+            } else if tailscale_requested {
+                nspawn_args.push("--network-veth".to_string());
+                nspawn_args.push("--capability=CAP_NET_ADMIN,CAP_NET_RAW".to_string());
+                if Path::new("/dev/net/tun").exists() {
+                    nspawn_args.push("--bind=/dev/net/tun".to_string());
+                }
+                true
+            } else {
+                nspawn_args.push("--bind-ro=/etc/resolv.conf".to_string());
+                false
+            };
+
+            // Inject workspace env vars
+            for (key, value) in &workspace.env_vars {
+                nspawn_args.push(format!("--setenv={}={}", key, value));
+            }
+            // Inject any caller-supplied extra env vars
+            if let Some(env) = extra_env {
+                for (key, value) in env {
+                    nspawn_args.push(format!("--setenv={}={}", key, value));
+                }
+            }
+
+            let final_command = if tailscale_enabled {
+                let tailnet_only =
+                    tailscale_mode == crate::workspace::TailscaleMode::TailnetOnly;
+                let mut bootstrap_cmd = String::new();
+                for (k, v) in &workspace.env_vars {
+                    if k.starts_with("TS_") && !v.trim().is_empty() {
+                        bootstrap_cmd.push_str(&format!("export {}={}; ", k, shell_escape(v)));
+                    }
+                }
+                bootstrap_cmd.push_str(
+                    "if [ -x /usr/local/bin/sandboxed-tailscale-up ]; then \
+                     /usr/local/bin/sandboxed-tailscale-up >/dev/null 2>&1 || true; \
+                     fi; ",
+                );
+                if tailnet_only {
+                    bootstrap_cmd.push_str(
+                        "_oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
+                         _oa_gw=\"${_oa_ip%.*}.1\"; \
+                         if [ -n \"$_oa_ip\" ]; then \
+                           ip route del default 2>/dev/null || true; \
+                           ip route add default via \"$_oa_gw\" 2>/dev/null || true; \
+                         fi; \
+                         if [ ! -s /etc/resolv.conf ]; then \
+                           printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf 2>/dev/null || true; \
+                         fi; "
+                    );
+                }
+                bootstrap_cmd.push_str(command);
+                bootstrap_cmd
+            } else {
+                command.to_string()
+            };
+
+            nspawn_args.extend(["/bin/bash".to_string(), "-c".to_string(), final_command]);
+            ("systemd-nspawn".to_string(), nspawn_args)
+        }
+    }
+}
+
 /// POST /api/workspaces/:id/build - Build a container workspace.
 async fn build_workspace(
     State(state): State<Arc<super::routes::AppState>>,

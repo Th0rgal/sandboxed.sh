@@ -6,17 +6,30 @@ use uuid::Uuid;
 /// Request to submit a new task.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateTaskRequest {
-    /// The task description / user prompt
+    /// The task description / user prompt (displayed as label in dashboard)
     pub task: String,
 
-    /// Optional model override (uses default if not specified)
+    /// Optional model override (uses default if not specified, agent mode only)
     pub model: Option<String>,
 
     /// Optional working directory for relative paths (agent has full system access regardless)
     pub working_dir: Option<String>,
 
-    /// Optional budget limit in cents (default: 1000 = $10, tracking only)
+    /// Optional budget limit in cents (default: 1000 = $10, tracking only, agent mode only)
     pub budget_cents: Option<u64>,
+
+    /// Shell command to run in a workspace container (command mode).
+    /// When present, runs the command directly instead of an OpenCode agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+
+    /// Workspace to run the command in (required when command is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<Uuid>,
+
+    /// Timeout in seconds for command mode (default: 1800 = 30 min, 0 = no limit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Statistics response.
@@ -72,8 +85,34 @@ pub enum TaskStatus {
     Cancelled,
 }
 
-/// Full task state including results.
+/// A structured step annotation emitted by a command-mode script.
+/// Scripts can print {"step": "name", "status": "started"|"completed"|"failed", ...}
+/// JSON lines to stdout and the dashboard will render them as a timeline.
 #[derive(Debug, Clone, Serialize)]
+pub struct TaskStep {
+    /// Step name (e.g. "generate_draft", "llm_judge")
+    pub name: String,
+    /// Iteration index (for looping eval scripts)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u32>,
+    /// "started" | "completed" | "failed"
+    pub status: String,
+    /// ISO 8601 timestamp when step started
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// ISO 8601 timestamp when step finished
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    /// Duration in seconds (from script annotation or computed)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_s: Option<f64>,
+    /// Arbitrary metadata (score, pass_rate, feedback, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Full task state including results.
+#[derive(Debug, Serialize)]
 pub struct TaskState {
     /// Unique task identifier
     pub id: Uuid,
@@ -81,20 +120,40 @@ pub struct TaskState {
     /// Current status
     pub status: TaskStatus,
 
-    /// Original task description
+    /// Original task description / label
     pub task: String,
 
-    /// Model used for this task
+    /// "agent" or "command"
+    pub mode: String,
+
+    /// Model used for this task (agent mode only)
     pub model: String,
 
-    /// Number of iterations completed
+    /// Number of iterations completed (agent mode)
     pub iterations: usize,
+
+    /// Workspace the command runs in (command mode)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<Uuid>,
+
+    /// Workspace name resolved for display (command mode)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
 
     /// Final result or error message
     pub result: Option<String>,
 
     /// Detailed execution log
     pub log: Vec<TaskLogEntry>,
+
+    /// Structured steps parsed from stdout JSON annotations (command mode)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<TaskStep>,
+
+    /// Cancel signal sender — used by stop_task to abort command-mode tasks.
+    /// Not serialized; consumed once when cancel is requested.
+    #[serde(skip)]
+    pub cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// A single entry in the task execution log.
