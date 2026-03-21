@@ -280,11 +280,22 @@ impl SettingsStore {
     /// Reload settings from disk.
     ///
     /// Used after restoring a backup to pick up the restored settings.
+    /// Also refreshes all atomic caches so the new values take effect immediately.
     pub async fn reload(&self) -> Result<(), std::io::Error> {
         if self.storage_path.exists() {
             let loaded = Self::load_from_path(&self.storage_path)?;
             let mut settings = self.settings.write().await;
             *settings = loaded;
+            // Refresh atomic caches from the reloaded settings.
+            if let Some(enabled) = settings.rtk_enabled {
+                set_rtk_enabled_cached(enabled);
+            }
+            if let Some(limit) = settings.max_parallel_missions {
+                set_max_parallel_missions_cached(limit);
+            }
+            if let Some(limit) = settings.max_concurrent_tasks {
+                set_max_concurrent_tasks_cached(limit);
+            }
             tracing::info!("Reloaded settings from {}", self.storage_path.display());
         }
         Ok(())

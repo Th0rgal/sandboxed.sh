@@ -202,6 +202,34 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let settings = Arc::new(crate::settings::SettingsStore::new(&config.working_dir).await);
     settings.init_cached_values();
 
+    // Sweep orphaned command-task nspawn containers from a previous process lifetime.
+    // Containers are named task-{uuid} via --machine=, so machinectl can find them.
+    tokio::spawn(async {
+        match tokio::process::Command::new("machinectl")
+            .args(["list", "--no-legend", "--no-pager"])
+            .output()
+            .await
+        {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if let Some(name) = line.split_whitespace().next() {
+                        if name.starts_with("task-") {
+                            tracing::warn!(machine = %name, "Terminating orphaned task container from previous process");
+                            let _ = tokio::process::Command::new("machinectl")
+                                .args(["terminate", name])
+                                .output()
+                                .await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("machinectl not available for orphan sweep: {}", e);
+            }
+        }
+    });
+
     // Initialize backend config store (persisted settings).
     // Probe each CLI binary so backends whose CLI is missing default to disabled.
     // Persisted configs are preserved — this only affects fresh installs or new backends.
@@ -1052,6 +1080,9 @@ async fn stop_task(
 /// Maximum log entries per task. Prevents unbounded memory growth from verbose scripts.
 const LOG_MAX_ENTRIES: usize = 10_000;
 
+/// Maximum completed tasks to retain per user. Oldest are evicted first on completion.
+const MAX_COMPLETED_TASKS: usize = 500;
+
 /// Append a log entry to a task. Shared by agent-mode and command-mode paths.
 /// Silently drops entries beyond LOG_MAX_ENTRIES (with a sentinel at the cap).
 async fn append_log(
@@ -1127,6 +1158,11 @@ async fn run_command_task(
             }
         }
     }
+    tracing::info!(
+        task_id = %task_id,
+        workspace = %workspace.name,
+        "Command task started"
+    );
 
     // Claude auth for command tasks:
     //
@@ -1317,9 +1353,8 @@ async fn run_command_task(
     // Update final task status
     let task_end = chrono::Utc::now();
     let duration_secs = (task_end - task_start).num_milliseconds() as f64 / 1000.0;
-    // Maximum completed tasks to retain per user (oldest are dropped first).
-    const MAX_COMPLETED_TASKS: usize = 500;
 
+    let final_status;
     let mut tasks = state.tasks.write().await;
     if let Some(ut) = tasks.get_mut(&user_id) {
         if let Some(ts) = ut.get_mut(&task_id) {
@@ -1346,29 +1381,41 @@ async fn run_command_task(
             }
             ts.completed_at = Some(task_end.to_rfc3339());
             ts.duration_secs = Some(duration_secs);
+            final_status = ts.status.clone();
+        } else {
+            final_status = TaskStatus::Failed;
         }
 
-        // Evict oldest completed tasks if over the retention cap.
-        let completed_count = ut
-            .values()
-            .filter(|t| !matches!(t.status, TaskStatus::Running | TaskStatus::Pending))
-            .count();
-        if completed_count > MAX_COMPLETED_TASKS {
-            let mut completed: Vec<(Uuid, String)> = ut
-                .iter()
-                .filter(|(_, t)| !matches!(t.status, TaskStatus::Running | TaskStatus::Pending))
-                .map(|(id, t)| {
-                    (*id, t.completed_at.clone().unwrap_or_default())
-                })
-                .collect();
+        // Evict oldest completed tasks if over the retention cap (single pass).
+        let mut completed: Vec<(Uuid, String)> = ut
+            .iter()
+            .filter(|(_, t)| !matches!(t.status, TaskStatus::Running | TaskStatus::Pending))
+            .map(|(id, t)| (*id, t.completed_at.clone().unwrap_or_default()))
+            .collect();
+        if completed.len() > MAX_COMPLETED_TASKS {
             // Sort oldest-first by completed_at (ISO 8601 sorts lexicographically).
             completed.sort_unstable_by(|a, b| a.1.cmp(&b.1));
-            let to_remove = completed_count - MAX_COMPLETED_TASKS;
+            let to_remove = completed.len() - MAX_COMPLETED_TASKS;
             for (evict_id, _) in completed.into_iter().take(to_remove) {
                 ut.remove(&evict_id);
             }
+            tracing::debug!(
+                user_id = %user_id,
+                evicted = to_remove,
+                cap = MAX_COMPLETED_TASKS,
+                "Evicted oldest completed tasks"
+            );
         }
+    } else {
+        final_status = TaskStatus::Failed;
     }
+
+    tracing::info!(
+        task_id = %task_id,
+        status = ?final_status,
+        duration_secs = duration_secs,
+        "Command task finished"
+    );
 }
 
 /// Create a new task.
@@ -1404,29 +1451,6 @@ async fn create_task(
             ));
         }
 
-        // Enforce concurrent task limit.
-        let max_concurrent = crate::settings::max_concurrent_tasks_cached_or(state.config.max_concurrent_tasks);
-        {
-            let tasks = state.tasks.read().await;
-            let running = tasks
-                .get(&user.id)
-                .map(|ut| {
-                    ut.values()
-                        .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Pending))
-                        .count()
-                })
-                .unwrap_or(0);
-            if running >= max_concurrent {
-                return Err((
-                    StatusCode::TOO_MANY_REQUESTS,
-                    format!(
-                        "Too many concurrent tasks ({}/{}). Stop a running task or wait for one to finish.",
-                        running, max_concurrent
-                    ),
-                ));
-            }
-        }
-
         let timeout = match req.timeout_secs {
             Some(s) if s > 0 => Some(std::time::Duration::from_secs(s)),
             _ => Some(std::time::Duration::from_secs(1800)), // 30 min default
@@ -1453,9 +1477,32 @@ async fn create_task(
             cancel_tx: Some(cancel_tx),
         };
 
+        // Check concurrent limit and insert atomically under one write lock
+        // to prevent TOCTOU races where multiple requests pass the check simultaneously.
         {
+            let max_concurrent = crate::settings::max_concurrent_tasks_cached_or(state.config.max_concurrent_tasks);
             let mut tasks = state.tasks.write().await;
-            tasks.entry(user.id.clone()).or_default().insert(id, task_state);
+            let user_tasks = tasks.entry(user.id.clone()).or_default();
+            let running = user_tasks
+                .values()
+                .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Pending))
+                .count();
+            if running >= max_concurrent {
+                tracing::warn!(
+                    user_id = %user.id,
+                    running = running,
+                    limit = max_concurrent,
+                    "Command task rejected: concurrent limit reached"
+                );
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Too many concurrent tasks ({}/{}). Stop a running task or wait for one to finish.",
+                        running, max_concurrent
+                    ),
+                ));
+            }
+            user_tasks.insert(id, task_state);
         }
 
         let state_clone = Arc::clone(&state);
