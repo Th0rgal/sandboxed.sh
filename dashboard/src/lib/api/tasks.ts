@@ -78,9 +78,3 @@ export async function createTask(
 export async function stopTask(id: string): Promise<void> {
   await apiPost(`/api/task/${id}/stop`, {});
 }
-
-export function streamTask(id: string, apiBase: string, token: string): EventSource {
-  const url = `${apiBase}/api/task/${id}/stream`;
-  // EventSource doesn't support custom headers — pass token as query param
-  return new EventSource(`${url}?token=${encodeURIComponent(token)}`);
-}

@@ -1093,14 +1093,12 @@ async fn run_command_task(
         return;
     }
 
-    // Transition to Running and store workspace info
+    // Transition to Running
     {
         let mut tasks = state.tasks.write().await;
         if let Some(ut) = tasks.get_mut(&user_id) {
             if let Some(ts) = ut.get_mut(&task_id) {
                 ts.status = TaskStatus::Running;
-                ts.workspace_id = Some(workspace.id);
-                ts.workspace_name = Some(workspace.name.clone());
             }
         }
     }
@@ -1110,6 +1108,7 @@ async fn run_command_task(
 
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
@@ -1145,9 +1144,12 @@ async fn run_command_task(
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
                 // Try to parse as a structured step annotation
+                // Try to parse JSON step annotations; emit readable summary and skip raw line.
+                let mut is_step = false;
                 if line.trim_start().starts_with('{') {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                         if v.get("step").is_some() {
+                            is_step = true;
                             let now = chrono::Utc::now().to_rfc3339();
                             let status = v["status"].as_str().unwrap_or("unknown").to_string();
                             let step = TaskStep {
@@ -1170,24 +1172,39 @@ async fn run_command_task(
                                 duration_s: v.get("duration_s").and_then(|x| x.as_f64()),
                                 metadata: v.get("metadata").cloned(),
                             };
-                            let mut tasks = state_clone.tasks.write().await;
-                            if let Some(ut) = tasks.get_mut(&user_id_clone) {
-                                if let Some(ts) = ut.get_mut(&task_id) {
-                                    ts.steps.push(step);
+                            {
+                                let mut tasks = state_clone.tasks.write().await;
+                                if let Some(ut) = tasks.get_mut(&user_id_clone) {
+                                    if let Some(ts) = ut.get_mut(&task_id) {
+                                        ts.steps.push(step);
+                                    }
                                 }
                             }
+                            // Emit a readable one-liner instead of the raw JSON blob
+                            let label = format!(
+                                "[step] {} {}{}",
+                                v["step"].as_str().unwrap_or("?"),
+                                v["status"].as_str().unwrap_or("?"),
+                                v.get("iteration")
+                                    .and_then(|x| x.as_u64())
+                                    .map(|i| format!(" (iter {})", i))
+                                    .unwrap_or_default(),
+                            );
+                            append_log(&state_clone, &user_id_clone, task_id, LogEntryType::Response, &label).await;
                         }
                     }
                 }
-                // Always emit to log
-                append_log(
-                    &state_clone,
-                    &user_id_clone,
-                    task_id,
-                    LogEntryType::Response,
-                    &line,
-                )
-                .await;
+                if !is_step {
+                    // Plain stdout line — emit as-is
+                    append_log(
+                        &state_clone,
+                        &user_id_clone,
+                        task_id,
+                        LogEntryType::Response,
+                        &line,
+                    )
+                    .await;
+                }
             }
         });
     }
