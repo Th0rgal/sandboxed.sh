@@ -1026,13 +1026,11 @@ async fn list_tasks(
         .get(&user.id)
         .map(|t| {
             t.iter()
-                .filter_map(|(id, ts)| {
-                    match serde_json::to_value(ts) {
-                        Ok(v) => Some((*id, v)),
-                        Err(e) => {
-                            tracing::error!("Failed to serialize task {}: {}", id, e);
-                            None
-                        }
+                .filter_map(|(id, ts)| match serde_json::to_value(ts) {
+                    Ok(v) => Some((*id, v)),
+                    Err(e) => {
+                        tracing::error!("Failed to serialize task {}: {}", id, e);
+                        None
                     }
                 })
                 .collect()
@@ -1116,6 +1114,7 @@ async fn append_log(
 }
 
 /// Run a shell command as a background task inside a workspace container.
+#[allow(clippy::too_many_arguments)]
 async fn run_command_task(
     state: Arc<AppState>,
     user_id: String,
@@ -1189,13 +1188,21 @@ async fn run_command_task(
         let container_creds_dir = workspace.path.join("root/.claude");
         if !container_creds_dir.exists() {
             if let Err(e) = std::fs::create_dir_all(&container_creds_dir) {
-                tracing::warn!("Failed to create container .claude dir: {} — claude -p may fail", e);
+                tracing::warn!(
+                    "Failed to create container .claude dir: {} — claude -p may fail",
+                    e
+                );
             }
         }
         // Insert before the machine name (order doesn't matter to nspawn)
-        args.insert(insert_pos, "--bind-ro=/root/.claude/.credentials.json:/root/.claude/.credentials.json".to_string());
+        args.insert(
+            insert_pos,
+            "--bind-ro=/root/.claude/.credentials.json:/root/.claude/.credentials.json".to_string(),
+        );
     } else {
-        tracing::warn!("No Claude credentials file at /root/.claude/.credentials.json — claude -p will fail");
+        tracing::warn!(
+            "No Claude credentials file at /root/.claude/.credentials.json — claude -p will fail"
+        );
     }
 
     let mut cmd = tokio::process::Command::new(&program);
@@ -1216,7 +1223,8 @@ async fn run_command_task(
                     ts.status = TaskStatus::Failed;
                     ts.result = Some(msg);
                     ts.completed_at = Some(task_end.to_rfc3339());
-                    ts.duration_secs = Some((task_end - task_start).num_milliseconds() as f64 / 1000.0);
+                    ts.duration_secs =
+                        Some((task_end - task_start).num_milliseconds() as f64 / 1000.0);
                 }
             }
             return;
@@ -1226,7 +1234,9 @@ async fn run_command_task(
     // Stream stdout line-by-line; parse JSON step annotations.
     // Readers are kept as joinable handles so we can drain them after the child exits/is killed,
     // preventing post-cancel log entries from appearing after the terminal status is written.
-    let stdout_handle: Option<tokio::task::JoinHandle<()>> = if let Some(stdout) = child.stdout.take() {
+    let stdout_handle: Option<tokio::task::JoinHandle<()>> = if let Some(stdout) =
+        child.stdout.take()
+    {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
         let state_clone = Arc::clone(&state);
@@ -1251,11 +1261,7 @@ async fn run_command_task(
                                 } else {
                                     None
                                 },
-                                completed_at: if status != "started" {
-                                    Some(now)
-                                } else {
-                                    None
-                                },
+                                completed_at: if status != "started" { Some(now) } else { None },
                                 duration_s: v.get("duration_s").and_then(|x| x.as_f64()),
                                 metadata: v.get("metadata").cloned(),
                             };
@@ -1277,7 +1283,14 @@ async fn run_command_task(
                                     .map(|i| format!(" (iter {})", i))
                                     .unwrap_or_default(),
                             );
-                            append_log(&state_clone, &user_id_clone, task_id, LogEntryType::Response, &label).await;
+                            append_log(
+                                &state_clone,
+                                &user_id_clone,
+                                task_id,
+                                LogEntryType::Response,
+                                &label,
+                            )
+                            .await;
                             continue; // skip plain-line branch
                         }
                     }
@@ -1298,26 +1311,27 @@ async fn run_command_task(
     };
 
     // Stream stderr to log as errors
-    let stderr_handle: Option<tokio::task::JoinHandle<()>> = if let Some(stderr) = child.stderr.take() {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
-        let state_clone = Arc::clone(&state);
-        let user_id_clone = user_id.clone();
-        Some(tokio::spawn(async move {
-            while let Ok(Some(line)) = lines.next_line().await {
-                append_log(
-                    &state_clone,
-                    &user_id_clone,
-                    task_id,
-                    LogEntryType::Error,
-                    &line,
-                )
-                .await;
-            }
-        }))
-    } else {
-        None
-    };
+    let stderr_handle: Option<tokio::task::JoinHandle<()>> =
+        if let Some(stderr) = child.stderr.take() {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            let state_clone = Arc::clone(&state);
+            let user_id_clone = user_id.clone();
+            Some(tokio::spawn(async move {
+                while let Ok(Some(line)) = lines.next_line().await {
+                    append_log(
+                        &state_clone,
+                        &user_id_clone,
+                        task_id,
+                        LogEntryType::Error,
+                        &line,
+                    )
+                    .await;
+                }
+            }))
+        } else {
+            None
+        };
 
     // Wait for child exit, optional timeout, or cancel signal.
     // Duration::MAX (~584 years) serves as "no timeout" — avoids duplicate select! blocks.
@@ -1370,8 +1384,7 @@ async fn run_command_task(
                     }
                     Ok(status) => {
                         ts.status = TaskStatus::Failed;
-                        ts.result =
-                            Some(format!("exit {}", status.code().unwrap_or(-1)));
+                        ts.result = Some(format!("exit {}", status.code().unwrap_or(-1)));
                     }
                     Err(msg) => {
                         ts.status = TaskStatus::Failed;
@@ -1433,14 +1446,10 @@ async fn create_task(
             "workspace_id is required when command is set".to_string(),
         ))?;
 
-        let workspace = state
-            .workspaces
-            .get(workspace_id)
-            .await
-            .ok_or((
-                StatusCode::NOT_FOUND,
-                format!("Workspace {} not found", workspace_id),
-            ))?;
+        let workspace = state.workspaces.get(workspace_id).await.ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Workspace {} not found", workspace_id),
+        ))?;
 
         // Command mode runs inside nspawn containers. Host workspaces execute directly
         // on the host as root — too broad a security surface for arbitrary commands.
@@ -1480,7 +1489,8 @@ async fn create_task(
         // Check concurrent limit and insert atomically under one write lock
         // to prevent TOCTOU races where multiple requests pass the check simultaneously.
         {
-            let max_concurrent = crate::settings::max_concurrent_tasks_cached_or(state.config.max_concurrent_tasks);
+            let max_concurrent =
+                crate::settings::max_concurrent_tasks_cached_or(state.config.max_concurrent_tasks);
             let mut tasks = state.tasks.write().await;
             let user_tasks = tasks.entry(user.id.clone()).or_default();
             let running = user_tasks
@@ -1508,7 +1518,17 @@ async fn create_task(
         let state_clone = Arc::clone(&state);
         let working_dir = req.working_dir.clone();
         tokio::spawn(async move {
-            run_command_task(state_clone, user.id, id, command, workspace, working_dir, timeout, cancel_rx).await;
+            run_command_task(
+                state_clone,
+                user.id,
+                id,
+                command,
+                workspace,
+                working_dir,
+                timeout,
+                cancel_rx,
+            )
+            .await;
         });
 
         return Ok(Json(CreateTaskResponse {
@@ -1714,12 +1734,13 @@ async fn get_task(
         .and_then(|t| t.get(&id))
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task {} not found", id)))
         .and_then(|ts| {
-            serde_json::to_value(ts)
-                .map(Json)
-                .map_err(|e| {
-                    tracing::error!("Failed to serialize task {}: {}", id, e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize task".to_string())
-                })
+            serde_json::to_value(ts).map(Json).map_err(|e| {
+                tracing::error!("Failed to serialize task {}: {}", id, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to serialize task".to_string(),
+                )
+            })
         })
 }
 

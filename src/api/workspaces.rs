@@ -876,8 +876,7 @@ pub fn build_nspawn_command(
             }
 
             let final_command = if tailscale_enabled {
-                let tailnet_only =
-                    tailscale_mode == crate::workspace::TailscaleMode::TailnetOnly;
+                let tailnet_only = tailscale_mode == crate::workspace::TailscaleMode::TailnetOnly;
                 let mut bootstrap_cmd = String::new();
                 for (k, v) in &workspace.env_vars {
                     if k.starts_with("TS_") && !v.trim().is_empty() {
@@ -1151,12 +1150,8 @@ async fn exec_workspace_command(
         "/root/work".to_string()
     };
 
-    let (program, args) = build_nspawn_command(
-        &workspace,
-        &req.command,
-        req.env.as_ref(),
-        Some(&rel_cwd),
-    );
+    let (program, args) =
+        build_nspawn_command(&workspace, &req.command, req.env.as_ref(), Some(&rel_cwd));
 
     let mut cmd = Command::new(&program);
     cmd.args(&args)
