@@ -4,6 +4,7 @@ import { useEffect, useState, useRef } from "react";
 import useSWR from "swr";
 import { cn } from "@/lib/utils";
 import { listTasks, stopTask, type Task, type TaskStep } from "@/lib/api/tasks";
+import { RelativeTime } from "@/components/ui/relative-time";
 import {
   Clock,
   Loader,
@@ -189,6 +190,9 @@ function TaskRow({ task, onStop, stopping }: { task: Task; onStop: (id: string) 
               {elapsed}s
             </span>
           )}
+          {task.status !== "running" && task.status !== "pending" && (task.completed_at ?? task.started_at) && (
+            <RelativeTime date={(task.completed_at ?? task.started_at)!} className="text-white/30 text-xs" />
+          )}
           <StatusBadge status={task.status} />
           {task.status === "running" && (
             <button
@@ -220,7 +224,10 @@ function TaskRow({ task, onStop, stopping }: { task: Task; onStop: (id: string) 
               <span>Steps: <span className="text-white/30">{task.steps!.length}</span></span>
             )}
             {task.started_at && (
-              <span>Started: <span className="text-white/30">{new Date(task.started_at).toLocaleTimeString("en-GB", { hour12: false })}</span></span>
+              <span>Started: <RelativeTime date={task.started_at} className="text-white/30" /></span>
+            )}
+            {task.completed_at && (
+              <span>Completed: <RelativeTime date={task.completed_at} className="text-white/30" /></span>
             )}
             {task.duration_secs != null && (
               <span>Duration: <span className="text-white/30">{task.duration_secs.toFixed(1)}s</span></span>
@@ -261,7 +268,13 @@ export default function TasksPage() {
   };
 
   const running = tasks.filter((t) => t.status === "running" || t.status === "pending");
-  const done    = tasks.filter((t) => t.status !== "running" && t.status !== "pending");
+  const done    = tasks
+    .filter((t) => t.status !== "running" && t.status !== "pending")
+    .sort((a, b) => {
+      const ta = new Date(a.completed_at ?? a.started_at ?? a.created_at ?? 0).getTime();
+      const tb = new Date(b.completed_at ?? b.started_at ?? b.created_at ?? 0).getTime();
+      return tb - ta;
+    });
 
   return (
     <div className="flex flex-col h-full">
