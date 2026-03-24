@@ -3631,6 +3631,19 @@ pub async fn write_runtime_workspace_state(
     if let Some(target) = mission_context.as_ref() {
         tokio::fs::create_dir_all(target).await?;
     }
+    // For container workspaces, also create the context directory inside the container
+    // rootfs so files are accessible without relying on bind-mounts (which are
+    // unreliable when using nsenter into an already-running container).
+    if workspace.workspace_type == WorkspaceType::Container {
+        if let Some(mid) = mission_id {
+            let container_context = workspace
+                .path
+                .join("root")
+                .join(context_dir_name)
+                .join(mid.to_string());
+            let _ = tokio::fs::create_dir_all(&container_context).await;
+        }
+    }
     let context_link = working_dir.join(context_dir_name);
     if let Some(target) = mission_context.as_ref() {
         // Use symlink_metadata to avoid following symlinks (prevents ELOOP errors)

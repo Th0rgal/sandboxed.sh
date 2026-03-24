@@ -182,6 +182,24 @@ pub fn content_type_for_path(path: &Path) -> &'static str {
     }
 }
 
+/// For container workspaces, translate a host path to the container-internal path.
+/// E.g. /root/.sandboxed-sh/containers/foo/root/context/abc/file.pdf → /root/context/abc/file.pdf
+/// For host workspaces, returns the path unchanged.
+fn translate_to_container_display_path(
+    host_path: &Path,
+    workspace: &crate::workspace::Workspace,
+) -> PathBuf {
+    if workspace.workspace_type != WorkspaceType::Container {
+        return host_path.to_path_buf();
+    }
+    // Strip the workspace root prefix to get the container-internal path
+    if let Ok(rel) = host_path.strip_prefix(&workspace.path) {
+        PathBuf::from("/").join(rel)
+    } else {
+        host_path.to_path_buf()
+    }
+}
+
 /// Resolve a path relative to a specific workspace.
 /// If mission_id is provided and path is a context path, resolves to mission-specific context.
 pub async fn resolve_path_for_workspace(
@@ -228,10 +246,24 @@ pub async fn resolve_path_for_workspace(
         // If mission_id is provided, use mission-specific context directory
         // This ensures uploaded files go to the right place for the agent to find them
         let context_path = if let Some(mid) = mission_id {
-            // Mission context is at /root/context/{mission_id} (or workspace equivalent)
-            // For host workspaces, the global context root is typically at working_dir/context
-            let context_root = state.config.working_dir.join("context");
-            context_root.join(mid.to_string())
+            if workspace.workspace_type == WorkspaceType::Container {
+                // For container workspaces, store inside the container rootfs so
+                // the file is always accessible at /root/context/{mission_id}/
+                // without depending on bind-mounts (which are unreliable when the
+                // container is already running and we use nsenter).
+                let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "context".to_string());
+                workspace_root
+                    .join("root")
+                    .join(context_dir_name)
+                    .join(mid.to_string())
+            } else {
+                // For host workspaces, use the global context root
+                let context_root = state.config.working_dir.join("context");
+                context_root.join(mid.to_string())
+            }
         } else {
             workspace_root.join("context")
         };
@@ -744,10 +776,12 @@ pub async fn upload(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // If workspace_id is provided, resolve path relative to that workspace
     // If mission_id is also provided, context paths resolve to mission-specific directory
-    let base = if let Some(workspace_id) = q.workspace_id {
-        resolve_path_for_workspace(&state, workspace_id, &q.path, q.mission_id).await?
+    let (base, workspace_for_display) = if let Some(workspace_id) = q.workspace_id {
+        let ws = state.workspaces.get(workspace_id).await;
+        let base = resolve_path_for_workspace(&state, workspace_id, &q.path, q.mission_id).await?;
+        (base, ws)
     } else {
-        resolve_upload_base(&q.path)?
+        (resolve_upload_base(&q.path)?, None)
     };
 
     // Expect one file field.
@@ -794,9 +828,16 @@ pub async fn upload(
         // Try rename first (fast), fall back to copy+delete if across filesystems
         move_file(&tmp, &remote_path).await?;
 
+        // For container workspaces, return the container-internal path so the
+        // [Uploaded: ...] tag points to a path the agent can actually access.
+        let display_path = match &workspace_for_display {
+            Some(ws) => translate_to_container_display_path(&remote_path, ws),
+            None => remote_path,
+        };
+
         return Ok(Json(serde_json::json!({
             "ok": true,
-            "path": remote_path,
+            "path": display_path,
             "name": file_name
         })));
     }
@@ -889,10 +930,13 @@ pub async fn upload_finalize(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // If workspace_id is provided, resolve path relative to that workspace
     // If mission_id is also provided, context paths resolve to mission-specific directory
-    let base = if let Some(workspace_id) = req.workspace_id {
-        resolve_path_for_workspace(&state, workspace_id, &req.path, req.mission_id).await?
+    let (base, workspace_for_display) = if let Some(workspace_id) = req.workspace_id {
+        let ws = state.workspaces.get(workspace_id).await;
+        let base =
+            resolve_path_for_workspace(&state, workspace_id, &req.path, req.mission_id).await?;
+        (base, ws)
     } else {
-        resolve_upload_base(&req.path)?
+        (resolve_upload_base(&req.path)?, None)
     };
 
     // Sanitize upload_id and file_name to prevent path traversal attacks
@@ -967,8 +1011,13 @@ pub async fn upload_finalize(
 
     let remote_path = result?;
 
+    let display_path = match &workspace_for_display {
+        Some(ws) => translate_to_container_display_path(&remote_path, ws),
+        None => remote_path,
+    };
+
     Ok(Json(
-        serde_json::json!({ "ok": true, "path": remote_path, "name": safe_file_name }),
+        serde_json::json!({ "ok": true, "path": display_path, "name": safe_file_name }),
     ))
 }
 
@@ -1097,10 +1146,13 @@ pub async fn download_from_url(
 
     // Move to destination
     // If mission_id is provided, context paths resolve to mission-specific directory
-    let base = if let Some(workspace_id) = req.workspace_id {
-        resolve_path_for_workspace(&state, workspace_id, &req.path, req.mission_id).await?
+    let (base, workspace_for_display) = if let Some(workspace_id) = req.workspace_id {
+        let ws = state.workspaces.get(workspace_id).await;
+        let base =
+            resolve_path_for_workspace(&state, workspace_id, &req.path, req.mission_id).await?;
+        (base, ws)
     } else {
-        resolve_upload_base(&req.path)?
+        (resolve_upload_base(&req.path)?, None)
     };
     let remote_path = base.join(&file_name);
     let target_dir = remote_path
@@ -1117,7 +1169,12 @@ pub async fn download_from_url(
 
     move_file(&tmp, &remote_path).await?;
 
+    let display_path = match &workspace_for_display {
+        Some(ws) => translate_to_container_display_path(&remote_path, ws),
+        None => remote_path,
+    };
+
     Ok(Json(
-        serde_json::json!({ "ok": true, "path": remote_path, "name": file_name }),
+        serde_json::json!({ "ok": true, "path": display_path, "name": file_name }),
     ))
 }
