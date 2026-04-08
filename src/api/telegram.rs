@@ -30,13 +30,14 @@ use uuid::Uuid;
 
 /// Shared handle to the Telegram bridge manager.
 pub type SharedTelegramBridge = Arc<TelegramBridge>;
+type TelegramChatLockMap = HashMap<(Uuid, i64), Arc<Mutex<()>>>;
 
 /// Manages Telegram webhook registrations and channel routing context.
 pub struct TelegramBridge {
     /// Routing context for each active channel (needed to forward webhook messages).
     active_channels: RwLock<HashMap<Uuid, ChannelContext>>,
     /// Per-chat locks to serialize auto-create mission resolution.
-    chat_locks: RwLock<HashMap<(Uuid, i64), Arc<Mutex<()>>>>,
+    chat_locks: RwLock<TelegramChatLockMap>,
     /// Recently seen Telegram update IDs for webhook idempotence.
     recent_updates: RwLock<HashMap<(Uuid, i64), Instant>>,
     /// Sent outbound reply messages keyed by the inbound Telegram message they reply to.
@@ -1069,6 +1070,7 @@ async fn upsert_telegram_conversation(
         .ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log_telegram_conversation_message(
     mission_store: &Arc<dyn MissionStore>,
     conversation_id: Uuid,
@@ -2046,6 +2048,7 @@ fn telegram_action_target_parts(target: &str) -> (String, String) {
     ("chat_title".to_string(), trimmed.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log_telegram_action_execution(
     mission_store: &Arc<dyn MissionStore>,
     channel_id: Uuid,
@@ -2613,6 +2616,7 @@ async fn relay_workflow_reply_to_origin(
 /// 2. On first `TextDelta`, sends an initial message and captures `message_id`
 /// 3. Accumulates subsequent deltas and calls `editMessageText` every ~1s
 /// 4. On `AssistantMessage`, sends final edit with full content
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_response(
     mut events_rx: broadcast::Receiver<AgentEvent>,
     http: &Client,

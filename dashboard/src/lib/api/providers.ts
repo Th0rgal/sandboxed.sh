@@ -83,8 +83,6 @@ export interface AIProvider {
   use_for_backends: string[];
   /** Account identifier (email) from the connected OAuth account */
   account_email?: string | null;
-  /** Temporary access token for client-side userinfo fetch (only set during OAuth callback) */
-  userinfo_access_token?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -258,23 +256,6 @@ export async function oauthCallback(
     throw new Error(error || "Failed to complete OAuth");
   }
   return res.json();
-}
-
-/**
- * Fetch account email from Anthropic's userinfo endpoint (browser-side).
- * Used when the server can't reach console.anthropic.com due to Cloudflare.
- */
-export async function fetchAnthropicUserinfo(accessToken: string): Promise<string | null> {
-  try {
-    const resp = await fetch("https://console.anthropic.com/v1/oauth/userinfo", {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    return data.email || data.name || null;
-  } catch {
-    return null;
-  }
 }
 
 // ---------------------------------------------------------------------------

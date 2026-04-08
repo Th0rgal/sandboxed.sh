@@ -865,6 +865,139 @@ impl SqliteMissionStore {
         Ok(())
     }
 
+    fn upsert_telegram_memory_search_index_entry(
+        conn: &Connection,
+        entry: &TelegramStructuredMemoryEntry,
+    ) -> Result<(), String> {
+        Self::ensure_telegram_memory_search_index(conn)?;
+
+        conn.execute(
+            "DELETE FROM telegram_structured_memory_fts WHERE entry_id = ?1",
+            params![entry.id.to_string()],
+        )
+        .map_err(|e| {
+            format!(
+                "Failed to replace telegram memory search index entry: {}",
+                e
+            )
+        })?;
+
+        conn.execute(
+            "INSERT INTO telegram_structured_memory_fts (
+                entry_id, channel_id, chat_id, scope, subject_user_id, search_text
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                entry.id.to_string(),
+                entry.channel_id.to_string(),
+                entry.chat_id,
+                match entry.scope {
+                    TelegramStructuredMemoryScope::Chat => "chat",
+                    TelegramStructuredMemoryScope::User => "user",
+                    TelegramStructuredMemoryScope::Channel => "channel",
+                },
+                entry.subject_user_id,
+                build_telegram_memory_search_text(entry),
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert telegram memory search index entry: {}", e))?;
+
+        Ok(())
+    }
+
+    fn load_telegram_structured_memory_for_upsert(
+        conn: &Connection,
+        entry: &TelegramStructuredMemoryEntry,
+        scope: &str,
+        kind: &str,
+        normalized_label: &str,
+    ) -> Result<Option<TelegramStructuredMemoryEntry>, String> {
+        let sql = match entry.scope {
+            TelegramStructuredMemoryScope::User if entry.subject_user_id.is_some() => {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1
+                   AND scope = ?2
+                   AND subject_user_id = ?3
+                   AND kind = ?4
+                   AND normalized_label = ?5
+                 LIMIT 1"
+            }
+            TelegramStructuredMemoryScope::Channel => {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1
+                   AND scope = ?2
+                   AND kind = ?3
+                   AND normalized_label = ?4
+                 LIMIT 1"
+            }
+            _ => {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1
+                   AND scope = ?2
+                   AND chat_id = ?3
+                   AND kind = ?4
+                   AND normalized_label = ?5
+                 LIMIT 1"
+            }
+        };
+
+        let mut stmt = conn.prepare(sql).map_err(|e| {
+            format!(
+                "Failed to prepare telegram structured memory lookup after upsert: {}",
+                e
+            )
+        })?;
+
+        let entry = match entry.scope {
+            TelegramStructuredMemoryScope::User if entry.subject_user_id.is_some() => stmt
+                .query_row(
+                    params![
+                        entry.channel_id.to_string(),
+                        scope,
+                        entry.subject_user_id,
+                        kind,
+                        normalized_label
+                    ],
+                    row_to_telegram_structured_memory,
+                )
+                .optional(),
+            TelegramStructuredMemoryScope::Channel => stmt
+                .query_row(
+                    params![entry.channel_id.to_string(), scope, kind, normalized_label],
+                    row_to_telegram_structured_memory,
+                )
+                .optional(),
+            _ => stmt
+                .query_row(
+                    params![
+                        entry.channel_id.to_string(),
+                        scope,
+                        entry.chat_id,
+                        kind,
+                        normalized_label
+                    ],
+                    row_to_telegram_structured_memory,
+                )
+                .optional(),
+        }
+        .map_err(|e| {
+            format!(
+                "Failed to load telegram structured memory row after upsert: {}",
+                e
+            )
+        })?;
+
+        Ok(entry)
+    }
+
     /// Run database migrations for existing databases.
     /// CREATE TABLE IF NOT EXISTS doesn't add columns to existing tables,
     /// so we need to handle schema changes manually.
@@ -1300,7 +1433,26 @@ impl SqliteMissionStore {
         )
         .map_err(|e| format!("Failed to create telegram_structured_memory indexes: {}", e))?;
 
-        Self::rebuild_telegram_memory_search_index(conn)?;
+        Self::ensure_telegram_memory_search_index(conn)?;
+        let memory_row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_structured_memory",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to count telegram structured memory rows: {}", e))?;
+        if memory_row_count > 0 {
+            let search_row_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM telegram_structured_memory_fts",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to count telegram memory search rows: {}", e))?;
+            if search_row_count == 0 {
+                Self::rebuild_telegram_memory_search_index(conn)?;
+            }
+        }
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS telegram_action_executions (
@@ -4236,7 +4388,17 @@ impl MissionStore for SqliteMissionStore {
                 };
 
                 if updated {
-                    Self::rebuild_telegram_memory_search_index(&conn)?;
+                    let updated_entry = Self::load_telegram_structured_memory_for_upsert(
+                        &conn,
+                        &entry_clone,
+                        scope,
+                        kind,
+                        normalized_label.as_deref().unwrap_or_default(),
+                    )?
+                    .ok_or_else(|| {
+                        "Updated telegram structured memory row could not be reloaded".to_string()
+                    })?;
+                    Self::upsert_telegram_memory_search_index_entry(&conn, &updated_entry)?;
                     return Ok::<_, String>(());
                 }
             }
@@ -4267,7 +4429,7 @@ impl MissionStore for SqliteMissionStore {
                 ],
             )
             .map_err(|e| e.to_string())?;
-            Self::rebuild_telegram_memory_search_index(&conn)?;
+            Self::upsert_telegram_memory_search_index_entry(&conn, &entry_clone)?;
             Ok::<_, String>(())
         })
         .await
@@ -6699,5 +6861,160 @@ mod tests {
             .expect("hybrid search");
 
         assert_eq!(hits[0].entry.value, "ASTRA-43");
+    }
+
+    #[tokio::test]
+    async fn telegram_memory_fts_upsert_replaces_existing_entry_in_place() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                1,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("code universel"),
+                "ASTRA-42",
+                Some(42),
+            ))
+            .await
+            .expect("initial fact");
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                1,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("code universel"),
+                "ASTRA-43",
+                Some(42),
+            ))
+            .await
+            .expect("updated fact");
+
+        let conn = store.conn.lock().await;
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_structured_memory_fts",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts row count");
+        let search_text: String = conn
+            .query_row(
+                "SELECT search_text FROM telegram_structured_memory_fts LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts search text");
+        drop(conn);
+
+        assert_eq!(row_count, 1);
+        assert!(search_text.contains("astra 43"));
+        assert!(!search_text.contains("astra 42"));
+    }
+
+    #[tokio::test]
+    async fn telegram_memory_migration_bootstraps_empty_fts_index_only_when_needed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().to_path_buf();
+        let channel_id;
+
+        {
+            let store = SqliteMissionStore::new(db_path.clone(), "test-user")
+                .await
+                .expect("sqlite store");
+            channel_id = create_test_channel(&store).await;
+            store
+                .upsert_telegram_structured_memory(test_memory_entry(
+                    channel_id,
+                    1,
+                    TelegramStructuredMemoryScope::User,
+                    TelegramStructuredMemoryKind::Fact,
+                    Some("code universel"),
+                    "ASTRA-42",
+                    Some(42),
+                ))
+                .await
+                .expect("user fact");
+
+            let conn = store.conn.lock().await;
+            conn.execute("DELETE FROM telegram_structured_memory_fts", [])
+                .expect("clear fts rows");
+        }
+
+        let store = SqliteMissionStore::new(db_path.clone(), "test-user")
+            .await
+            .expect("sqlite store reopen");
+        let conn = store.conn.lock().await;
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_structured_memory_fts",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts row count");
+        drop(conn);
+
+        assert_eq!(row_count, 1);
+
+        let hits = store
+            .search_telegram_memory_context_hybrid(channel_id, 1, Some(42), "code universel", 5)
+            .await
+            .expect("hybrid search");
+        assert_eq!(hits[0].entry.value, "ASTRA-42");
+    }
+
+    #[tokio::test]
+    async fn telegram_memory_migration_does_not_rebuild_populated_fts_index() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().to_path_buf();
+
+        {
+            let store = SqliteMissionStore::new(db_path.clone(), "test-user")
+                .await
+                .expect("sqlite store");
+            let channel_id = create_test_channel(&store).await;
+            store
+                .upsert_telegram_structured_memory(test_memory_entry(
+                    channel_id,
+                    1,
+                    TelegramStructuredMemoryScope::User,
+                    TelegramStructuredMemoryKind::Fact,
+                    Some("code universel"),
+                    "ASTRA-42",
+                    Some(42),
+                ))
+                .await
+                .expect("user fact");
+
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE telegram_structured_memory_fts SET search_text = 'stale marker' WHERE rowid IN (
+                    SELECT rowid FROM telegram_structured_memory_fts LIMIT 1
+                )",
+                [],
+            )
+            .expect("overwrite fts search text");
+        }
+
+        let store = SqliteMissionStore::new(db_path, "test-user")
+            .await
+            .expect("sqlite store reopen");
+        let conn = store.conn.lock().await;
+        let search_text: String = conn
+            .query_row(
+                "SELECT search_text FROM telegram_structured_memory_fts LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts search text");
+        drop(conn);
+
+        assert_eq!(search_text, "stale marker");
     }
 }

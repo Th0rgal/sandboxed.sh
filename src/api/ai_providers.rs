@@ -1764,10 +1764,6 @@ pub struct ProviderResponse {
     /// Account identifier (email or username) from the connected OAuth account
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
-    /// Temporary access token for client-side userinfo fetch when server-side
-    /// fetch fails (e.g. Cloudflare blocks). Only set during OAuth callback.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub userinfo_access_token: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1888,7 +1884,6 @@ fn build_provider_response(
         status,
         use_for_backends,
         account_email,
-        userinfo_access_token: None,
         created_at: now,
         updated_at: now,
     }
@@ -1931,7 +1926,6 @@ fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> Prov
         status,
         use_for_backends,
         account_email: provider.account_email.clone(),
-        userinfo_access_token: None,
         created_at: provider.created_at,
         updated_at: provider.updated_at,
     }
@@ -6161,14 +6155,7 @@ async fn oauth_callback(
                 let store_id = state.ai_providers.add(provider.clone()).await;
                 // Return a response with the store UUID so the frontend can reference it
                 let stored = state.ai_providers.get(store_id).await.unwrap_or(provider);
-                let mut store_response = build_response_from_store(&stored);
-                // Preserve the userinfo_access_token from the inner response
-                // so the frontend can fetch the email client-side when the server
-                // can't (e.g. Cloudflare blocks console.anthropic.com).
-                if store_response.account_email.is_none() {
-                    store_response.userinfo_access_token = json.0.userinfo_access_token.clone();
-                }
-                return Json(store_response).into_response();
+                return Json(build_response_from_store(&stored)).into_response();
             }
             json.into_response()
         }
@@ -6412,7 +6399,7 @@ async fn oauth_callback_inner(
                 let backends_state = read_provider_backends_state(&state.config.working_dir);
                 let config_entry = get_provider_config_entry(&opencode_config, provider_type);
                 let backends = backends_state.get(provider_type.id()).cloned();
-                let mut response = build_provider_response(
+                let response = build_provider_response(
                     provider_type,
                     config_entry,
                     Some(AuthKind::ApiKey),
@@ -6420,12 +6407,6 @@ async fn oauth_callback_inner(
                     backends,
                     account_email.clone(),
                 );
-
-                if account_email.is_none() {
-                    if let Some(at) = token_data["access_token"].as_str() {
-                        response.userinfo_access_token = Some(at.to_string());
-                    }
-                }
 
                 tracing::info!("Created API key for provider: {} ({})", response.name, id);
 
@@ -6539,7 +6520,7 @@ async fn oauth_callback_inner(
                 let backends_state = read_provider_backends_state(&state.config.working_dir);
                 let config_entry = get_provider_config_entry(&opencode_config, provider_type);
                 let backends = backends_state.get(provider_type.id()).cloned();
-                let mut response = build_provider_response(
+                let response = build_provider_response(
                     provider_type,
                     config_entry,
                     Some(AuthKind::OAuth),
@@ -6547,15 +6528,6 @@ async fn oauth_callback_inner(
                     backends,
                     account_email.clone(),
                 );
-
-                // If email fetch failed (e.g. Cloudflare blocks server-side
-                // requests to console.anthropic.com), pass the access token to
-                // the frontend so it can fetch the email from the browser.
-                if account_email.is_none() {
-                    if let Some(at) = token_data["access_token"].as_str() {
-                        response.userinfo_access_token = Some(at.to_string());
-                    }
-                }
 
                 Ok(Json(response))
             }

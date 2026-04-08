@@ -10141,7 +10141,7 @@ pub async fn list_bot_scheduled_messages(
     let control = control_for_user(&state, &user).await;
     let mut messages = control
         .mission_store
-        .list_telegram_scheduled_messages(channel_id, query.limit.max(1).min(100))
+        .list_telegram_scheduled_messages(channel_id, query.limit.clamp(1, 100))
         .await
         .map_err(internal_error)?;
     if let Some(chat_id) = query.chat_id {
@@ -10159,7 +10159,7 @@ pub async fn list_bot_action_executions(
     let control = control_for_user(&state, &user).await;
     let mut executions = control
         .mission_store
-        .list_telegram_action_executions(channel_id, query.limit.max(1).min(100))
+        .list_telegram_action_executions(channel_id, query.limit.clamp(1, 100))
         .await
         .map_err(internal_error)?;
     if let Some(chat_id) = query.chat_id {
@@ -10177,7 +10177,7 @@ pub async fn list_bot_conversations(
     let control = control_for_user(&state, &user).await;
     let conversations = control
         .mission_store
-        .list_telegram_conversations(channel_id, query.limit.max(1).min(100))
+        .list_telegram_conversations(channel_id, query.limit.clamp(1, 100))
         .await
         .map_err(internal_error)?;
     Ok(Json(conversations))
@@ -10192,7 +10192,7 @@ pub async fn list_bot_workflows(
     let control = control_for_user(&state, &user).await;
     let workflows = control
         .mission_store
-        .list_telegram_workflows(channel_id, query.limit.max(1).min(100))
+        .list_telegram_workflows(channel_id, query.limit.clamp(1, 100))
         .await
         .map_err(internal_error)?;
     Ok(Json(workflows))
@@ -10207,7 +10207,7 @@ pub async fn list_telegram_conversation_messages(
     let control = control_for_user(&state, &user).await;
     let messages = control
         .mission_store
-        .list_telegram_conversation_messages(conversation_id, query.limit.max(1).min(200))
+        .list_telegram_conversation_messages(conversation_id, query.limit.clamp(1, 200))
         .await
         .map_err(internal_error)?;
     Ok(Json(messages))
@@ -10222,7 +10222,7 @@ pub async fn list_telegram_workflow_events(
     let control = control_for_user(&state, &user).await;
     let events = control
         .mission_store
-        .list_telegram_workflow_events(workflow_id, query.limit.max(1).min(200))
+        .list_telegram_workflow_events(workflow_id, query.limit.clamp(1, 200))
         .await
         .map_err(internal_error)?;
     Ok(Json(events))
@@ -10247,7 +10247,7 @@ pub async fn list_bot_structured_memory(
     Query(query): Query<TelegramMemoryQuery>,
 ) -> Result<Json<Vec<super::mission_store::TelegramStructuredMemoryEntry>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
-    let limit = query.limit.max(1).min(100);
+    let limit = query.limit.clamp(1, 100);
     let entries = if let Some(q) = query.q.as_deref().filter(|q| !q.trim().is_empty()) {
         let mut entries = control
             .mission_store
@@ -10299,7 +10299,7 @@ pub async fn search_bot_structured_memory(
             query.chat_id,
             query.subject_user_id,
             q,
-            query.limit.max(1).min(100),
+            query.limit.clamp(1, 100),
         )
         .await
         .map_err(internal_error)?;

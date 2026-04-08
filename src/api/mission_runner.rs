@@ -9398,7 +9398,7 @@ pub async fn run_opencode_turn(
         "OpenCode CLI args prepared (shell wrapper)"
     );
 
-    write_telegram_action_cli_helpers(&work_dir);
+    write_telegram_action_cli_helpers(work_dir);
 
     // Build environment variables
     let mut env: HashMap<String, String> = HashMap::new();

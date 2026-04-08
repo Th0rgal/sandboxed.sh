@@ -106,7 +106,6 @@ export {
   getAuthMethods,
   oauthAuthorize,
   oauthCallback,
-  fetchAnthropicUserinfo,
   listProviders,
   listBackendModelOptions,
   type ProviderUsage,
