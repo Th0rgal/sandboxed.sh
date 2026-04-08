@@ -3193,7 +3193,8 @@ impl ControlHub {
             .join(".sandboxed-sh")
             .join("missions");
 
-        match create_mission_store(store_type, base_dir, "default").await {
+        let user = crate::api::auth::implicit_single_tenant_user(&self.config);
+        match create_mission_store(store_type, base_dir, &user.id).await {
             Ok(store) => Arc::from(store),
             Err(err) => {
                 tracing::warn!(

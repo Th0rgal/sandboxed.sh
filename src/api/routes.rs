@@ -478,21 +478,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Eagerly boot the control session so Telegram webhooks are re-registered
     // immediately on server start (rather than waiting for the first
-    // authenticated API call). Use the same user ID that the auth middleware
-    // would assign — "dev" in dev mode, "default" otherwise — so that
-    // Telegram channels and missions are visible in the dashboard.
+    // authenticated API call). Use the same implicit single-tenant identity
+    // that the auth middleware would assign so Telegram channels and missions
+    // are visible in the dashboard.
     {
         let state_clone = Arc::clone(&state);
-        let boot_user_id = if config.dev_mode {
-            "dev".to_string()
-        } else {
-            "default".to_string()
-        };
         tokio::spawn(async move {
-            let default_user = super::auth::AuthUser {
-                id: boot_user_id.clone(),
-                username: boot_user_id,
-            };
+            let default_user = super::auth::implicit_single_tenant_user(&state_clone.config);
             let _ = state_clone.control.get_or_spawn(&default_user).await;
             tracing::info!("Eagerly booted default control session (Telegram webhooks registered)");
         });
