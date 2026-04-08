@@ -3,14 +3,16 @@
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, ExecutionStatus,
     FreshSession, Mission, MissionHistoryEntry, MissionMode, MissionStatus, MissionStore,
-    RetryConfig, StopPolicy, StoredEvent, TelegramChannel, TelegramChatMission, TriggerType,
-    WebhookConfig,
+    RetryConfig, StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
+    TelegramActionExecutionStatus, TelegramChannel, TelegramChatMission, TelegramScheduledMessage,
+    TelegramScheduledMessageStatus, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
+    TelegramStructuredMemoryScope, TelegramStructuredMemorySearchHit, TriggerType, WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -19,6 +21,83 @@ use uuid::Uuid;
 type LegacyAutomationRow = (String, String, String, i64, i64, String, Option<String>);
 const COST_CURRENCY_USD: &str = "USD";
 const METADATA_SOURCE_USER: &str = "user";
+const TELEGRAM_MEMORY_SEARCH_MAX_CANDIDATES: usize = 256;
+const TELEGRAM_MEMORY_SEARCH_STOPWORDS: &[&str] = &[
+    "a",
+    "ai",
+    "alors",
+    "and",
+    "au",
+    "aux",
+    "avec",
+    "ce",
+    "ces",
+    "comment",
+    "dans",
+    "de",
+    "des",
+    "do",
+    "does",
+    "du",
+    "elle",
+    "en",
+    "est",
+    "et",
+    "for",
+    "how",
+    "i",
+    "il",
+    "is",
+    "je",
+    "la",
+    "le",
+    "les",
+    "ma",
+    "me",
+    "mes",
+    "mi",
+    "mon",
+    "my",
+    "of",
+    "on",
+    "ou",
+    "où",
+    "par",
+    "pas",
+    "pour",
+    "prefere",
+    "préféré",
+    "prefere",
+    "preference",
+    "preferences",
+    "preference",
+    "preferences",
+    "que",
+    "quel",
+    "quelle",
+    "quelles",
+    "quels",
+    "qui",
+    "remember",
+    "rappelle",
+    "rappelle-moi",
+    "souviens",
+    "sur",
+    "the",
+    "to",
+    "toi",
+    "tu",
+    "un",
+    "une",
+    "user",
+    "veux",
+    "veux-tu",
+    "what",
+    "when",
+    "where",
+    "with",
+    "you",
+];
 
 #[derive(serde::Serialize)]
 struct AssistantCostMetadata {
@@ -71,6 +150,233 @@ fn assistant_message_metadata(input: AssistantMessageMetadataInput<'_>) -> serde
         resumable: input.resumable,
     };
     serde_json::to_value(metadata).expect("assistant metadata should serialize")
+}
+
+fn fold_search_char(ch: char) -> char {
+    match ch {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+        'ç' => 'c',
+        'è' | 'é' | 'ê' | 'ë' => 'e',
+        'ì' | 'í' | 'î' | 'ï' => 'i',
+        'ñ' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' => 'o',
+        'ù' | 'ú' | 'û' | 'ü' => 'u',
+        'ý' | 'ÿ' => 'y',
+        _ => ch,
+    }
+}
+
+fn normalize_search_text(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut prev_space = true;
+    for ch in value.chars().flat_map(|ch| ch.to_lowercase()) {
+        let folded = fold_search_char(ch);
+        if folded.is_ascii_alphanumeric() {
+            normalized.push(folded);
+            prev_space = false;
+        } else if !prev_space {
+            normalized.push(' ');
+            prev_space = true;
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn tokenize_search_text(value: &str) -> Vec<String> {
+    normalize_search_text(value)
+        .split_whitespace()
+        .filter(|token| token.len() >= 2 && !TELEGRAM_MEMORY_SEARCH_STOPWORDS.contains(token))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn build_telegram_memory_search_text(entry: &TelegramStructuredMemoryEntry) -> String {
+    let mut parts = Vec::new();
+    if let Some(label) = entry.label.as_deref() {
+        parts.push(label);
+    }
+    parts.push(entry.value.as_str());
+    if let Some(display_name) = entry.subject_display_name.as_deref() {
+        parts.push(display_name);
+    }
+    if let Some(username) = entry.subject_username.as_deref() {
+        parts.push(username);
+    }
+    match entry.kind {
+        TelegramStructuredMemoryKind::Fact => parts.push("fact"),
+        TelegramStructuredMemoryKind::Preference => parts.push("preference"),
+        TelegramStructuredMemoryKind::Task => parts.push("task"),
+        TelegramStructuredMemoryKind::Note => parts.push("note"),
+    }
+    normalize_search_text(&parts.join(" "))
+}
+
+fn build_fts_query_from_tokens(tokens: &[String], normalized_query: &str) -> Option<String> {
+    if !tokens.is_empty() {
+        return Some(
+            tokens
+                .iter()
+                .map(|token| format!("\"{}\"*", token.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+
+    if normalized_query.is_empty() {
+        None
+    } else {
+        Some(format!("\"{}\"", normalized_query.replace('"', "\"\"")))
+    }
+}
+
+fn scope_rank(scope: &TelegramStructuredMemoryScope) -> i32 {
+    match scope {
+        TelegramStructuredMemoryScope::User => 0,
+        TelegramStructuredMemoryScope::Chat => 1,
+        TelegramStructuredMemoryScope::Channel => 2,
+    }
+}
+
+fn scope_score(scope: &TelegramStructuredMemoryScope) -> f64 {
+    match scope {
+        TelegramStructuredMemoryScope::User => 6.0,
+        TelegramStructuredMemoryScope::Chat => 5.0,
+        TelegramStructuredMemoryScope::Channel => 3.0,
+    }
+}
+
+fn recency_score(updated_at: &str) -> f64 {
+    let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+        return 0.0;
+    };
+    let age_hours = (Utc::now() - updated_at.with_timezone(&Utc))
+        .num_hours()
+        .max(0) as f64;
+    if age_hours <= 24.0 {
+        4.0
+    } else if age_hours <= 24.0 * 7.0 {
+        2.0
+    } else if age_hours <= 24.0 * 30.0 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn score_memory_entry(
+    entry: &TelegramStructuredMemoryEntry,
+    normalized_query: &str,
+    core_query: &str,
+    query_tokens: &[String],
+    fts_score: Option<f64>,
+) -> Option<TelegramStructuredMemorySearchHit> {
+    if normalized_query.is_empty() {
+        return None;
+    }
+
+    let normalized_label = entry
+        .label
+        .as_deref()
+        .map(normalize_search_text)
+        .unwrap_or_default();
+    let normalized_value = normalize_search_text(&entry.value);
+    let normalized_subject = normalize_search_text(
+        &[
+            entry.subject_display_name.as_deref().unwrap_or_default(),
+            entry.subject_username.as_deref().unwrap_or_default(),
+        ]
+        .join(" "),
+    );
+    let search_text = build_telegram_memory_search_text(entry);
+    let entry_tokens: HashSet<String> = tokenize_search_text(&search_text).into_iter().collect();
+
+    let mut score = 0.0;
+    let mut reasons = Vec::new();
+    let mut matched_terms = Vec::new();
+
+    if !core_query.is_empty() {
+        if !normalized_label.is_empty() && normalized_label == core_query {
+            score += 95.0;
+            reasons.push("exact_core_label".to_string());
+        } else if !normalized_label.is_empty() && normalized_label.contains(core_query) {
+            score += 48.0;
+            reasons.push("label_contains_core_query".to_string());
+        }
+
+        if normalized_value == core_query {
+            score += 80.0;
+            reasons.push("exact_core_value".to_string());
+        } else if normalized_value.contains(core_query) {
+            score += 42.0;
+            reasons.push("value_contains_core_query".to_string());
+        }
+    }
+
+    if !normalized_label.is_empty() && normalized_label == normalized_query {
+        score += 80.0;
+        reasons.push("exact_label".to_string());
+    } else if !normalized_label.is_empty() && normalized_label.contains(normalized_query) {
+        score += 40.0;
+        reasons.push("label_contains_query".to_string());
+    }
+
+    if normalized_value == normalized_query {
+        score += 70.0;
+        reasons.push("exact_value".to_string());
+    } else if normalized_value.contains(normalized_query) {
+        score += 35.0;
+        reasons.push("value_contains_query".to_string());
+    }
+
+    if !normalized_subject.is_empty() && normalized_subject.contains(normalized_query) {
+        score += 24.0;
+        reasons.push("subject_contains_query".to_string());
+    }
+
+    if !normalized_label.is_empty()
+        && normalized_label.split_whitespace().count() == 1
+        && TELEGRAM_MEMORY_SEARCH_STOPWORDS.contains(&normalized_label.as_str())
+    {
+        score -= 36.0;
+        reasons.push("suspicious_label".to_string());
+    }
+
+    let mut token_matches = 0usize;
+    for token in query_tokens {
+        if entry_tokens.contains(token) {
+            token_matches += 1;
+            matched_terms.push(token.clone());
+        }
+    }
+    if token_matches > 0 {
+        let ratio = token_matches as f64 / query_tokens.len().max(1) as f64;
+        score += 30.0 * ratio;
+        reasons.push("token_overlap".to_string());
+    }
+
+    if let Some(fts_score) = fts_score {
+        score += fts_score;
+        reasons.push("full_text".to_string());
+    }
+
+    score += scope_score(&entry.scope);
+    score += recency_score(&entry.updated_at);
+
+    if score <= 0.0 {
+        return None;
+    }
+
+    matched_terms.sort();
+    matched_terms.dedup();
+    reasons.sort();
+    reasons.dedup();
+
+    Some(TelegramStructuredMemorySearchHit {
+        entry: entry.clone(),
+        score,
+        matched_terms,
+        reasons,
+    })
 }
 
 /// Parse a UUID from a database string, logging a warning and falling back to
@@ -226,6 +532,7 @@ CREATE TABLE IF NOT EXISTS telegram_channels (
 
 CREATE INDEX IF NOT EXISTS idx_telegram_channels_mission ON telegram_channels(mission_id);
 CREATE INDEX IF NOT EXISTS idx_telegram_channels_active ON telegram_channels(active);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_channels_bot_token ON telegram_channels(bot_token);
 "#;
 
 /// Content size threshold for inline storage (64KB).
@@ -489,6 +796,72 @@ impl SqliteMissionStore {
         }
     }
 
+    fn ensure_telegram_memory_search_index(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS telegram_structured_memory_fts
+             USING fts5(
+                entry_id UNINDEXED,
+                channel_id UNINDEXED,
+                chat_id UNINDEXED,
+                scope UNINDEXED,
+                subject_user_id UNINDEXED,
+                search_text,
+                tokenize = 'unicode61 remove_diacritics 2'
+             );",
+        )
+        .map_err(|e| {
+            format!(
+                "Failed to create telegram_structured_memory_fts table: {}",
+                e
+            )
+        })
+    }
+
+    fn rebuild_telegram_memory_search_index(conn: &Connection) -> Result<(), String> {
+        Self::ensure_telegram_memory_search_index(conn)?;
+
+        conn.execute("DELETE FROM telegram_structured_memory_fts", [])
+            .map_err(|e| format!("Failed to clear telegram memory search index: {}", e))?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory",
+            )
+            .map_err(|e| format!("Failed to scan telegram structured memory: {}", e))?;
+
+        let entries = stmt
+            .query_map([], row_to_telegram_structured_memory)
+            .map_err(|e| format!("Failed to query telegram structured memory: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect telegram structured memory rows: {}", e))?;
+
+        for entry in entries {
+            conn.execute(
+                "INSERT INTO telegram_structured_memory_fts (
+                    entry_id, channel_id, chat_id, scope, subject_user_id, search_text
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    entry.id.to_string(),
+                    entry.channel_id.to_string(),
+                    entry.chat_id,
+                    match entry.scope {
+                        TelegramStructuredMemoryScope::Chat => "chat",
+                        TelegramStructuredMemoryScope::User => "user",
+                        TelegramStructuredMemoryScope::Channel => "channel",
+                    },
+                    entry.subject_user_id,
+                    build_telegram_memory_search_text(&entry),
+                ],
+            )
+            .map_err(|e| format!("Failed to populate telegram memory search index: {}", e))?;
+        }
+
+        Ok(())
+    }
+
     /// Run database migrations for existing databases.
     /// CREATE TABLE IF NOT EXISTS doesn't add columns to existing tables,
     /// so we need to handle schema changes manually.
@@ -722,7 +1095,8 @@ impl SqliteMissionStore {
                     FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_telegram_channels_mission ON telegram_channels(mission_id);
-                CREATE INDEX IF NOT EXISTS idx_telegram_channels_active ON telegram_channels(active);",
+                CREATE INDEX IF NOT EXISTS idx_telegram_channels_active ON telegram_channels(active);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_channels_bot_token ON telegram_channels(bot_token);",
             )
             .map_err(|e| format!("Failed to create telegram_channels table: {}", e))?;
         } else {
@@ -805,6 +1179,16 @@ impl SqliteMissionStore {
             }
         }
 
+        if let Err(e) = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_channels_bot_token ON telegram_channels(bot_token)",
+            [],
+        ) {
+            tracing::warn!(
+                "Failed to enforce unique Telegram bot tokens at the database layer: {}",
+                e
+            );
+        }
+
         // Create telegram_chat_missions table if it doesn't exist
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS telegram_chat_missions (
@@ -821,6 +1205,128 @@ impl SqliteMissionStore {
             CREATE INDEX IF NOT EXISTS idx_tcm_mission ON telegram_chat_missions(mission_id);",
         )
         .map_err(|e| format!("Failed to create telegram_chat_missions table: {}", e))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_scheduled_messages (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                source_mission_id TEXT,
+                chat_id INTEGER NOT NULL,
+                chat_title TEXT,
+                text TEXT NOT NULL,
+                send_at TEXT NOT NULL,
+                sent_at TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_mission_id) REFERENCES missions(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tsm_due
+                ON telegram_scheduled_messages(status, send_at);
+            CREATE INDEX IF NOT EXISTS idx_tsm_channel
+                ON telegram_scheduled_messages(channel_id, status, send_at);",
+        )
+        .map_err(|e| format!("Failed to create telegram_scheduled_messages table: {}", e))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_structured_memory (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                mission_id TEXT,
+                scope TEXT NOT NULL DEFAULT 'chat',
+                kind TEXT NOT NULL,
+                label TEXT,
+                normalized_label TEXT,
+                value TEXT NOT NULL,
+                subject_user_id INTEGER,
+                subject_username TEXT,
+                subject_display_name TEXT,
+                source_message_id INTEGER,
+                source_role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tmem_channel_search
+                ON telegram_structured_memory(channel_id, normalized_label, updated_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_structured_memory table: {}", e))?;
+
+        let telegram_memory_cols = [
+            ("scope", "TEXT NOT NULL DEFAULT 'chat'"),
+            ("subject_user_id", "INTEGER"),
+            ("subject_username", "TEXT"),
+            ("subject_display_name", "TEXT"),
+        ];
+        for (col_name, col_type) in &telegram_memory_cols {
+            let has_col: bool = conn
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('telegram_structured_memory') WHERE name='{}'",
+                    col_name
+                ))
+                .map_err(|e| format!("Failed to check for {} column: {}", col_name, e))?
+                .exists([])
+                .map_err(|e| format!("Failed to query pragma_table_info: {}", e))?;
+            if !has_col {
+                tracing::info!(
+                    "Running migration: adding '{}' column to telegram_structured_memory",
+                    col_name
+                );
+                match conn.execute(
+                    &format!(
+                        "ALTER TABLE telegram_structured_memory ADD COLUMN {} {}",
+                        col_name, col_type
+                    ),
+                    [],
+                ) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("duplicate column") => {}
+                    Err(e) => return Err(format!("Failed to add {} column: {}", col_name, e)),
+                }
+            }
+        }
+
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tmem_channel_chat_updated
+                ON telegram_structured_memory(channel_id, scope, chat_id, updated_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_tmem_channel_user_updated
+                ON telegram_structured_memory(channel_id, scope, subject_user_id, updated_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_structured_memory indexes: {}", e))?;
+
+        Self::rebuild_telegram_memory_search_index(conn)?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_action_executions (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                source_mission_id TEXT,
+                source_chat_id INTEGER,
+                target_chat_id INTEGER NOT NULL,
+                target_chat_title TEXT,
+                action_kind TEXT NOT NULL,
+                target_kind TEXT NOT NULL,
+                target_value TEXT NOT NULL,
+                text TEXT NOT NULL,
+                delay_seconds INTEGER NOT NULL DEFAULT 0,
+                scheduled_message_id TEXT,
+                status TEXT NOT NULL,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_mission_id) REFERENCES missions(id) ON DELETE SET NULL,
+                FOREIGN KEY (scheduled_message_id) REFERENCES telegram_scheduled_messages(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tae_channel_updated
+                ON telegram_action_executions(channel_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tae_scheduled
+                ON telegram_action_executions(scheduled_message_id);",
+        )
+        .map_err(|e| format!("Failed to create telegram_action_executions table: {}", e))?;
 
         // Migrate automations table to new schema
         Self::migrate_automations_table(conn)?;
@@ -3255,6 +3761,29 @@ impl MissionStore for SqliteMissionStore {
         Ok(mapping)
     }
 
+    async fn update_telegram_chat_mission_title(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        chat_title: Option<String>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_chat_missions
+                 SET chat_title = ?3
+                 WHERE channel_id = ?1 AND chat_id = ?2",
+                params![channel_id_str, chat_id, chat_title],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn get_telegram_chat_mission_by_mission_id(
         &self,
         mission_id: Uuid,
@@ -3324,6 +3853,861 @@ impl MissionStore for SqliteMissionStore {
         .await
         .map_err(|e| e.to_string())?
     }
+
+    async fn create_telegram_scheduled_message(
+        &self,
+        message: TelegramScheduledMessage,
+    ) -> Result<TelegramScheduledMessage, String> {
+        let conn = self.conn.clone();
+        let msg = message.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_scheduled_messages (
+                    id, channel_id, source_mission_id, chat_id, chat_title, text,
+                    send_at, sent_at, status, last_error, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    msg.id.to_string(),
+                    msg.channel_id.to_string(),
+                    msg.source_mission_id.map(|id| id.to_string()),
+                    msg.chat_id,
+                    msg.chat_title,
+                    msg.text,
+                    msg.send_at,
+                    msg.sent_at,
+                    match msg.status {
+                        TelegramScheduledMessageStatus::Pending => "pending",
+                        TelegramScheduledMessageStatus::Sent => "sent",
+                        TelegramScheduledMessageStatus::Failed => "failed",
+                    },
+                    msg.last_error,
+                    msg.created_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(message)
+    }
+
+    async fn list_due_telegram_scheduled_messages(
+        &self,
+        send_at: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramScheduledMessage>, String> {
+        let conn = self.conn.clone();
+        let send_at = send_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, source_mission_id, chat_id, chat_title, text,
+                            send_at, sent_at, status, last_error, created_at
+                     FROM telegram_scheduled_messages
+                     WHERE status = 'pending' AND send_at <= ?1
+                     ORDER BY send_at ASC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let messages = stmt
+                .query_map(
+                    params![send_at, limit as i64],
+                    row_to_telegram_scheduled_message,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(messages)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_scheduled_messages(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramScheduledMessage>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, source_mission_id, chat_id, chat_title, text,
+                            send_at, sent_at, status, last_error, created_at
+                     FROM telegram_scheduled_messages
+                     WHERE channel_id = ?1
+                     ORDER BY created_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let messages = stmt
+                .query_map(
+                    params![channel_id_str, limit as i64],
+                    row_to_telegram_scheduled_message,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(messages)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn mark_telegram_scheduled_message_sent(
+        &self,
+        id: Uuid,
+        sent_at: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let sent_at = sent_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_scheduled_messages
+                 SET status = 'sent', sent_at = ?1, last_error = NULL
+                 WHERE id = ?2",
+                params![sent_at, id_str],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn mark_telegram_scheduled_message_failed(
+        &self,
+        id: Uuid,
+        error: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let error = error.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_scheduled_messages
+                 SET status = 'failed', last_error = ?1
+                 WHERE id = ?2",
+                params![error, id_str],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn upsert_telegram_structured_memory(
+        &self,
+        entry: TelegramStructuredMemoryEntry,
+    ) -> Result<TelegramStructuredMemoryEntry, String> {
+        let conn = self.conn.clone();
+        let entry_clone = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let normalized_label = entry_clone
+                .label
+                .as_deref()
+                .map(|label| label.trim().to_lowercase())
+                .filter(|label| !label.is_empty());
+            let kind = match entry_clone.kind {
+                TelegramStructuredMemoryKind::Fact => "fact",
+                TelegramStructuredMemoryKind::Note => "note",
+                TelegramStructuredMemoryKind::Task => "task",
+                TelegramStructuredMemoryKind::Preference => "preference",
+            };
+            let scope = match entry_clone.scope {
+                TelegramStructuredMemoryScope::Chat => "chat",
+                TelegramStructuredMemoryScope::User => "user",
+                TelegramStructuredMemoryScope::Channel => "channel",
+            };
+
+            let is_upsertable_kind = matches!(
+                entry_clone.kind,
+                TelegramStructuredMemoryKind::Fact | TelegramStructuredMemoryKind::Preference
+            ) && normalized_label.is_some();
+
+            if is_upsertable_kind {
+                let updated = match entry_clone.scope.clone() {
+                    TelegramStructuredMemoryScope::User
+                        if entry_clone.subject_user_id.is_some() =>
+                    {
+                        conn.execute(
+                            "UPDATE telegram_structured_memory
+                             SET mission_id = ?1,
+                                 chat_id = ?2,
+                                 value = ?3,
+                                 subject_username = ?4,
+                                 subject_display_name = ?5,
+                                 source_message_id = ?6,
+                                 source_role = ?7,
+                                 updated_at = ?8
+                             WHERE channel_id = ?9
+                               AND scope = ?10
+                               AND subject_user_id = ?11
+                               AND kind = ?12
+                               AND normalized_label = ?13",
+                            params![
+                                entry_clone.mission_id.map(|id| id.to_string()),
+                                entry_clone.chat_id,
+                                entry_clone.value.clone(),
+                                entry_clone.subject_username.clone(),
+                                entry_clone.subject_display_name.clone(),
+                                entry_clone.source_message_id,
+                                entry_clone.source_role.clone(),
+                                entry_clone.updated_at.clone(),
+                                entry_clone.channel_id.to_string(),
+                                scope,
+                                entry_clone.subject_user_id,
+                                kind,
+                                normalized_label,
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        conn.changes() > 0
+                    }
+                    TelegramStructuredMemoryScope::Channel => {
+                        conn.execute(
+                            "UPDATE telegram_structured_memory
+                             SET mission_id = ?1,
+                                 chat_id = ?2,
+                                 value = ?3,
+                                 source_message_id = ?4,
+                                 source_role = ?5,
+                                 updated_at = ?6
+                             WHERE channel_id = ?7
+                               AND scope = ?8
+                               AND kind = ?9
+                               AND normalized_label = ?10",
+                            params![
+                                entry_clone.mission_id.map(|id| id.to_string()),
+                                entry_clone.chat_id,
+                                entry_clone.value.clone(),
+                                entry_clone.source_message_id,
+                                entry_clone.source_role.clone(),
+                                entry_clone.updated_at.clone(),
+                                entry_clone.channel_id.to_string(),
+                                scope,
+                                kind,
+                                normalized_label,
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        conn.changes() > 0
+                    }
+                    _ => {
+                        conn.execute(
+                            "UPDATE telegram_structured_memory
+                             SET mission_id = ?1,
+                                 value = ?2,
+                                 source_message_id = ?3,
+                                 source_role = ?4,
+                                 updated_at = ?5
+                             WHERE channel_id = ?6
+                               AND scope = ?7
+                               AND chat_id = ?8
+                               AND kind = ?9
+                               AND normalized_label = ?10",
+                            params![
+                                entry_clone.mission_id.map(|id| id.to_string()),
+                                entry_clone.value.clone(),
+                                entry_clone.source_message_id,
+                                entry_clone.source_role.clone(),
+                                entry_clone.updated_at.clone(),
+                                entry_clone.channel_id.to_string(),
+                                scope,
+                                entry_clone.chat_id,
+                                kind,
+                                normalized_label,
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        conn.changes() > 0
+                    }
+                };
+
+                if updated {
+                    Self::rebuild_telegram_memory_search_index(&conn)?;
+                    return Ok::<_, String>(());
+                }
+            }
+
+            conn.execute(
+                "INSERT INTO telegram_structured_memory (
+                    id, channel_id, chat_id, mission_id, scope, kind, label, normalized_label, value,
+                    subject_user_id, subject_username, subject_display_name,
+                    source_message_id, source_role, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    entry_clone.id.to_string(),
+                    entry_clone.channel_id.to_string(),
+                    entry_clone.chat_id,
+                    entry_clone.mission_id.map(|id| id.to_string()),
+                    scope,
+                    kind,
+                    entry_clone.label,
+                    normalized_label,
+                    entry_clone.value,
+                    entry_clone.subject_user_id,
+                    entry_clone.subject_username,
+                    entry_clone.subject_display_name,
+                    entry_clone.source_message_id,
+                    entry_clone.source_role,
+                    entry_clone.created_at,
+                    entry_clone.updated_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Self::rebuild_telegram_memory_search_index(&conn)?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(entry)
+    }
+
+    async fn list_telegram_structured_memory(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let sql = if chat_id.is_some() {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1 AND chat_id = ?2
+                 ORDER BY updated_at DESC
+                 LIMIT ?3"
+            } else {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1
+                 ORDER BY updated_at DESC
+                 LIMIT ?2"
+            };
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let entries = if let Some(chat_id) = chat_id {
+                stmt.query_map(
+                    params![channel_id_str, chat_id, limit as i64],
+                    row_to_telegram_structured_memory,
+                )
+            } else {
+                stmt.query_map(
+                    params![channel_id_str, limit as i64],
+                    row_to_telegram_structured_memory,
+                )
+            }
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn search_telegram_structured_memory(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        let query = query.trim().to_lowercase();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let sql = if chat_id.is_some() {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1
+                   AND chat_id = ?2
+                   AND (
+                     instr(lower(coalesce(label, '')), ?3) > 0
+                     OR instr(lower(value), ?3) > 0
+                   )
+                 ORDER BY updated_at DESC
+                 LIMIT ?4"
+            } else {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1
+                   AND (
+                     instr(lower(coalesce(label, '')), ?2) > 0
+                     OR instr(lower(value), ?2) > 0
+                   )
+                 ORDER BY updated_at DESC
+                 LIMIT ?3"
+            };
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let entries = if let Some(chat_id) = chat_id {
+                stmt.query_map(
+                    params![channel_id_str, chat_id, query, limit as i64],
+                    row_to_telegram_structured_memory,
+                )
+            } else {
+                stmt.query_map(
+                    params![channel_id_str, query, limit as i64],
+                    row_to_telegram_structured_memory,
+                )
+            }
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn search_telegram_structured_memory_hybrid(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        subject_user_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemorySearchHit>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        let normalized_query = normalize_search_text(query.trim());
+        let query_tokens = tokenize_search_text(query);
+        let core_query = query_tokens.join(" ");
+        let fts_query = build_fts_query_from_tokens(&query_tokens, &normalized_query);
+
+        tokio::task::spawn_blocking(move || {
+            if normalized_query.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let conn = conn.blocking_lock();
+            let candidate_limit = (limit.max(8) * 8).min(TELEGRAM_MEMORY_SEARCH_MAX_CANDIDATES);
+
+            let mut stmt = match chat_id {
+                Some(_) => conn.prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE channel_id = ?1
+                       AND (
+                         scope = 'channel'
+                         OR (scope = 'chat' AND chat_id = ?2)
+                         OR (?3 IS NOT NULL AND scope = 'user' AND subject_user_id = ?3)
+                       )
+                     ORDER BY updated_at DESC
+                     LIMIT ?4",
+                ),
+                None if subject_user_id.is_some() => conn.prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE channel_id = ?1
+                       AND (
+                         scope = 'channel'
+                         OR (scope = 'user' AND subject_user_id = ?2)
+                       )
+                     ORDER BY updated_at DESC
+                     LIMIT ?3",
+                ),
+                None => conn.prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE channel_id = ?1
+                     ORDER BY updated_at DESC
+                     LIMIT ?2",
+                ),
+            }
+            .map_err(|e| e.to_string())?;
+
+            let candidates = match (chat_id, subject_user_id) {
+                (Some(chat_id), subject_user_id) => stmt.query_map(
+                    params![
+                        channel_id_str.as_str(),
+                        chat_id,
+                        subject_user_id,
+                        candidate_limit as i64
+                    ],
+                    row_to_telegram_structured_memory,
+                ),
+                (None, Some(subject_user_id)) => stmt.query_map(
+                    params![
+                        channel_id_str.as_str(),
+                        subject_user_id,
+                        candidate_limit as i64
+                    ],
+                    row_to_telegram_structured_memory,
+                ),
+                (None, None) => stmt.query_map(
+                    params![channel_id_str.as_str(), candidate_limit as i64],
+                    row_to_telegram_structured_memory,
+                ),
+            }
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+
+            let mut fts_scores: HashMap<Uuid, f64> = HashMap::new();
+            if let Some(fts_query) = fts_query {
+                let mut stmt = match chat_id {
+                    Some(_) => conn.prepare(
+                        "SELECT entry_id, bm25(telegram_structured_memory_fts) AS rank
+                         FROM telegram_structured_memory_fts
+                         WHERE channel_id = ?1
+                           AND (
+                             scope = 'channel'
+                             OR (scope = 'chat' AND chat_id = ?2)
+                             OR (?3 IS NOT NULL AND scope = 'user' AND subject_user_id = ?3)
+                           )
+                           AND telegram_structured_memory_fts MATCH ?4
+                         ORDER BY rank
+                         LIMIT ?5",
+                    ),
+                    None if subject_user_id.is_some() => conn.prepare(
+                        "SELECT entry_id, bm25(telegram_structured_memory_fts) AS rank
+                         FROM telegram_structured_memory_fts
+                         WHERE channel_id = ?1
+                           AND (
+                             scope = 'channel'
+                             OR (scope = 'user' AND subject_user_id = ?2)
+                           )
+                           AND telegram_structured_memory_fts MATCH ?3
+                         ORDER BY rank
+                         LIMIT ?4",
+                    ),
+                    None => conn.prepare(
+                        "SELECT entry_id, bm25(telegram_structured_memory_fts) AS rank
+                         FROM telegram_structured_memory_fts
+                         WHERE channel_id = ?1
+                           AND telegram_structured_memory_fts MATCH ?2
+                         ORDER BY rank
+                         LIMIT ?3",
+                    ),
+                }
+                .map_err(|e| e.to_string())?;
+
+                let rows = match (chat_id, subject_user_id) {
+                    (Some(chat_id), subject_user_id) => stmt.query_map(
+                        params![
+                            channel_id_str.as_str(),
+                            chat_id,
+                            subject_user_id,
+                            fts_query.as_str(),
+                            limit.max(8) as i64
+                        ],
+                        row_to_telegram_memory_search_rank,
+                    ),
+                    (None, Some(subject_user_id)) => stmt.query_map(
+                        params![
+                            channel_id_str.as_str(),
+                            subject_user_id,
+                            fts_query.as_str(),
+                            limit.max(8) as i64
+                        ],
+                        row_to_telegram_memory_search_rank,
+                    ),
+                    (None, None) => stmt.query_map(
+                        params![
+                            channel_id_str.as_str(),
+                            fts_query.as_str(),
+                            limit.max(8) as i64
+                        ],
+                        row_to_telegram_memory_search_rank,
+                    ),
+                }
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+                for (entry_id, rank) in rows {
+                    let entry_uuid = parse_uuid_or_nil(&entry_id);
+                    if entry_uuid.is_nil() {
+                        continue;
+                    }
+                    let weight = 18.0 / (1.0 + rank.abs());
+                    fts_scores.insert(entry_uuid, weight);
+                }
+            }
+
+            let mut hits = candidates
+                .into_iter()
+                .filter_map(|entry| {
+                    score_memory_entry(
+                        &entry,
+                        &normalized_query,
+                        &core_query,
+                        &query_tokens,
+                        fts_scores.get(&entry.id).copied(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            hits.sort_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| {
+                        scope_rank(&left.entry.scope).cmp(&scope_rank(&right.entry.scope))
+                    })
+                    .then_with(|| right.entry.updated_at.cmp(&left.entry.updated_at))
+            });
+            hits.truncate(limit);
+            Ok(hits)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_memory_context(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        subject_user_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE channel_id = ?1
+                       AND (
+                         scope = 'channel'
+                         OR (scope = 'chat' AND chat_id = ?2)
+                         OR (?3 IS NOT NULL AND scope = 'user' AND subject_user_id = ?3)
+                       )
+                     ORDER BY
+                       CASE scope
+                         WHEN 'chat' THEN 0
+                         WHEN 'user' THEN 1
+                         ELSE 2
+                       END,
+                       updated_at DESC
+                     LIMIT ?4",
+                )
+                .map_err(|e| e.to_string())?;
+            let entries = stmt
+                .query_map(
+                    params![channel_id_str, chat_id, subject_user_id, limit as i64],
+                    row_to_telegram_structured_memory,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn search_telegram_memory_context(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        subject_user_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        let query = query.trim().to_lowercase();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE channel_id = ?1
+                       AND (
+                         scope = 'channel'
+                         OR (scope = 'chat' AND chat_id = ?2)
+                         OR (?3 IS NOT NULL AND scope = 'user' AND subject_user_id = ?3)
+                       )
+                       AND (
+                         instr(lower(coalesce(label, '')), ?4) > 0
+                         OR instr(lower(value), ?4) > 0
+                         OR instr(lower(coalesce(subject_display_name, '')), ?4) > 0
+                         OR instr(lower(coalesce(subject_username, '')), ?4) > 0
+                       )
+                     ORDER BY
+                       CASE scope
+                         WHEN 'chat' THEN 0
+                         WHEN 'user' THEN 1
+                         ELSE 2
+                       END,
+                       updated_at DESC
+                     LIMIT ?5",
+                )
+                .map_err(|e| e.to_string())?;
+            let entries = stmt
+                .query_map(
+                    params![
+                        channel_id_str,
+                        chat_id,
+                        subject_user_id,
+                        query,
+                        limit as i64
+                    ],
+                    row_to_telegram_structured_memory,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_telegram_action_execution(
+        &self,
+        execution: TelegramActionExecution,
+    ) -> Result<TelegramActionExecution, String> {
+        let conn = self.conn.clone();
+        let execution_clone = execution.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_action_executions (
+                    id, channel_id, source_mission_id, source_chat_id, target_chat_id, target_chat_title,
+                    action_kind, target_kind, target_value, text, delay_seconds, scheduled_message_id,
+                    status, last_error, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    execution_clone.id.to_string(),
+                    execution_clone.channel_id.to_string(),
+                    execution_clone.source_mission_id.map(|id| id.to_string()),
+                    execution_clone.source_chat_id,
+                    execution_clone.target_chat_id,
+                    execution_clone.target_chat_title,
+                    match execution_clone.action_kind {
+                        TelegramActionExecutionKind::Send => "send",
+                        TelegramActionExecutionKind::Reminder => "reminder",
+                    },
+                    execution_clone.target_kind,
+                    execution_clone.target_value,
+                    execution_clone.text,
+                    execution_clone.delay_seconds as i64,
+                    execution_clone.scheduled_message_id.map(|id| id.to_string()),
+                    match execution_clone.status {
+                        TelegramActionExecutionStatus::Pending => "pending",
+                        TelegramActionExecutionStatus::Sent => "sent",
+                        TelegramActionExecutionStatus::Failed => "failed",
+                    },
+                    execution_clone.last_error,
+                    execution_clone.created_at,
+                    execution_clone.updated_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(execution)
+    }
+
+    async fn list_telegram_action_executions(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramActionExecution>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, source_mission_id, source_chat_id, target_chat_id,
+                            target_chat_title, action_kind, target_kind, target_value, text,
+                            delay_seconds, scheduled_message_id, status, last_error, created_at, updated_at
+                     FROM telegram_action_executions
+                     WHERE channel_id = ?1
+                     ORDER BY updated_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let entries = stmt
+                .query_map(
+                    params![channel_id_str, limit as i64],
+                    row_to_telegram_action_execution,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn mark_telegram_action_execution_by_scheduled_message(
+        &self,
+        scheduled_message_id: Uuid,
+        status: TelegramActionExecutionStatus,
+        last_error: Option<&str>,
+        updated_at: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let scheduled_message_id = scheduled_message_id.to_string();
+        let updated_at = updated_at.to_string();
+        let last_error = last_error.map(ToOwned::to_owned);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_action_executions
+                 SET status = ?1,
+                     last_error = ?2,
+                     updated_at = ?3
+                 WHERE scheduled_message_id = ?4",
+                params![
+                    match status {
+                        TelegramActionExecutionStatus::Pending => "pending",
+                        TelegramActionExecutionStatus::Sent => "sent",
+                        TelegramActionExecutionStatus::Failed => "failed",
+                    },
+                    last_error,
+                    updated_at,
+                    scheduled_message_id,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
 }
 
 /// Parse a Telegram channel from a SQLite row.
@@ -3363,14 +4747,224 @@ fn row_to_telegram_channel(row: &rusqlite::Row<'_>) -> TelegramChannel {
     }
 }
 
+fn parse_telegram_scheduled_status(raw: String) -> TelegramScheduledMessageStatus {
+    match raw.as_str() {
+        "sent" => TelegramScheduledMessageStatus::Sent,
+        "failed" => TelegramScheduledMessageStatus::Failed,
+        _ => TelegramScheduledMessageStatus::Pending,
+    }
+}
+
+fn row_to_telegram_scheduled_message(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramScheduledMessage, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let channel_id_str: String = row.get(1)?;
+    let source_mission_id_str: Option<String> = row.get(2)?;
+    let status_str: String = row.get(8)?;
+
+    Ok(TelegramScheduledMessage {
+        id: parse_uuid_or_nil(&id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        source_mission_id: source_mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        chat_id: row.get(3)?,
+        chat_title: row.get(4)?,
+        text: row.get(5)?,
+        send_at: row.get(6)?,
+        sent_at: row.get(7)?,
+        status: parse_telegram_scheduled_status(status_str),
+        last_error: row.get(9)?,
+        created_at: row.get(10)?,
+    })
+}
+
+fn parse_telegram_structured_memory_kind(raw: String) -> TelegramStructuredMemoryKind {
+    match raw.as_str() {
+        "fact" => TelegramStructuredMemoryKind::Fact,
+        "task" => TelegramStructuredMemoryKind::Task,
+        "preference" => TelegramStructuredMemoryKind::Preference,
+        _ => TelegramStructuredMemoryKind::Note,
+    }
+}
+
+fn parse_telegram_structured_memory_scope(raw: String) -> TelegramStructuredMemoryScope {
+    match raw.as_str() {
+        "user" => TelegramStructuredMemoryScope::User,
+        "channel" => TelegramStructuredMemoryScope::Channel,
+        _ => TelegramStructuredMemoryScope::Chat,
+    }
+}
+
+fn parse_telegram_action_execution_kind(raw: String) -> TelegramActionExecutionKind {
+    match raw.as_str() {
+        "reminder" => TelegramActionExecutionKind::Reminder,
+        _ => TelegramActionExecutionKind::Send,
+    }
+}
+
+fn parse_telegram_action_execution_status(raw: String) -> TelegramActionExecutionStatus {
+    match raw.as_str() {
+        "sent" => TelegramActionExecutionStatus::Sent,
+        "failed" => TelegramActionExecutionStatus::Failed,
+        _ => TelegramActionExecutionStatus::Pending,
+    }
+}
+
+fn row_to_telegram_structured_memory(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramStructuredMemoryEntry, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let channel_id_str: String = row.get(1)?;
+    let mission_id_str: Option<String> = row.get(3)?;
+    let scope_str: String = row.get(4)?;
+    let kind_str: String = row.get(5)?;
+    Ok(TelegramStructuredMemoryEntry {
+        id: parse_uuid_or_nil(&id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        chat_id: row.get(2)?,
+        mission_id: mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        scope: parse_telegram_structured_memory_scope(scope_str),
+        kind: parse_telegram_structured_memory_kind(kind_str),
+        label: row.get(6)?,
+        value: row.get(7)?,
+        subject_user_id: row.get(8)?,
+        subject_username: row.get(9)?,
+        subject_display_name: row.get(10)?,
+        source_message_id: row.get(11)?,
+        source_role: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+    })
+}
+
+fn row_to_telegram_memory_search_rank(
+    row: &rusqlite::Row<'_>,
+) -> Result<(String, f64), rusqlite::Error> {
+    Ok((row.get(0)?, row.get(1)?))
+}
+
+fn row_to_telegram_action_execution(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramActionExecution, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let channel_id_str: String = row.get(1)?;
+    let source_mission_id_str: Option<String> = row.get(2)?;
+    let action_kind_str: String = row.get(6)?;
+    let scheduled_message_id_str: Option<String> = row.get(11)?;
+    let status_str: String = row.get(12)?;
+
+    Ok(TelegramActionExecution {
+        id: parse_uuid_or_nil(&id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        source_mission_id: source_mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        source_chat_id: row.get(3)?,
+        target_chat_id: row.get(4)?,
+        target_chat_title: row.get(5)?,
+        action_kind: parse_telegram_action_execution_kind(action_kind_str),
+        target_kind: row.get(7)?,
+        target_value: row.get(8)?,
+        text: row.get(9)?,
+        delay_seconds: row.get::<_, i64>(10)?.max(0) as u64,
+        scheduled_message_id: scheduled_message_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        status: parse_telegram_action_execution_status(status_str),
+        last_error: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{assistant_message_metadata, AssistantMessageMetadataInput, SqliteMissionStore};
     use crate::agents::CostSource;
-    use crate::api::mission_store::MissionStore;
+    use crate::api::mission_store::{
+        MissionStore, TelegramChannel, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
+        TelegramStructuredMemoryScope, TelegramTriggerMode,
+    };
     use crate::cost::TokenUsage;
     use rusqlite::params;
     use serde_json::json;
+    use uuid::Uuid;
+
+    fn test_memory_entry(
+        channel_id: Uuid,
+        chat_id: i64,
+        scope: TelegramStructuredMemoryScope,
+        kind: TelegramStructuredMemoryKind,
+        label: Option<&str>,
+        value: &str,
+        subject_user_id: Option<i64>,
+    ) -> TelegramStructuredMemoryEntry {
+        TelegramStructuredMemoryEntry {
+            id: Uuid::new_v4(),
+            channel_id,
+            chat_id,
+            mission_id: None,
+            scope,
+            kind,
+            label: label.map(|value| value.to_string()),
+            value: value.to_string(),
+            subject_user_id,
+            subject_username: subject_user_id.map(|_| "th0rgal".to_string()),
+            subject_display_name: subject_user_id.map(|_| "@th0rgal".to_string()),
+            source_message_id: Some(1),
+            source_role: "user".to_string(),
+            created_at: "2026-04-08T10:00:00Z".to_string(),
+            updated_at: "2026-04-08T10:00:00Z".to_string(),
+        }
+    }
+
+    async fn create_test_channel(store: &SqliteMissionStore) -> Uuid {
+        let mission = store
+            .create_mission(
+                Some("Telegram memory tests"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission");
+        let channel = TelegramChannel {
+            id: Uuid::new_v4(),
+            mission_id: mission.id,
+            bot_token: format!("test-token-{}", Uuid::new_v4()),
+            bot_username: Some("ana_lfgbot_test".to_string()),
+            allowed_chat_ids: vec![],
+            trigger_mode: TelegramTriggerMode::MentionOrDm,
+            active: true,
+            webhook_secret: None,
+            instructions: None,
+            auto_create_missions: true,
+            default_backend: Some("claudecode".to_string()),
+            default_model_override: None,
+            default_model_effort: None,
+            default_workspace_id: None,
+            default_config_profile: None,
+            default_agent: None,
+            created_at: "2026-04-08T10:00:00Z".to_string(),
+            updated_at: "2026-04-08T10:00:00Z".to_string(),
+        };
+        store
+            .create_telegram_channel(channel.clone())
+            .await
+            .expect("telegram channel");
+        channel.id
+    }
 
     #[test]
     fn assistant_message_metadata_uses_normalized_cost_shape() {
@@ -4066,5 +5660,133 @@ mod tests {
                 ("assistant".to_string(), "reply B".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn hybrid_memory_search_prioritizes_specific_fact_matches() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                10,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("identifiant prod"),
+                "POLARIS-19",
+                Some(42),
+            ))
+            .await
+            .expect("user fact");
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                10,
+                TelegramStructuredMemoryScope::Chat,
+                TelegramStructuredMemoryKind::Note,
+                None,
+                "Les logs prod sont sur le serveur principal",
+                None,
+            ))
+            .await
+            .expect("chat note");
+
+        let hits = store
+            .search_telegram_memory_context_hybrid(
+                channel_id,
+                10,
+                Some(42),
+                "Quel est mon identifiant prod ?",
+                5,
+            )
+            .await
+            .expect("hybrid search");
+
+        assert!(!hits.is_empty(), "expected at least one hybrid hit");
+        assert_eq!(hits[0].entry.label.as_deref(), Some("identifiant prod"));
+        assert_eq!(hits[0].entry.value, "POLARIS-19");
+        assert!(hits[0].score > hits.last().map(|hit| hit.score).unwrap_or(0.0));
+    }
+
+    #[tokio::test]
+    async fn hybrid_memory_search_keeps_user_scope_across_chat_contexts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                1,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("code universel"),
+                "ASTRA-42",
+                Some(42),
+            ))
+            .await
+            .expect("user fact");
+
+        let hits = store
+            .search_telegram_memory_context_hybrid(
+                channel_id,
+                999,
+                Some(42),
+                "Quel est mon code universel ?",
+                5,
+            )
+            .await
+            .expect("hybrid search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.scope, TelegramStructuredMemoryScope::User);
+        assert_eq!(hits[0].entry.value, "ASTRA-42");
+    }
+
+    #[tokio::test]
+    async fn hybrid_memory_search_reflects_updated_fact_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                1,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("code universel"),
+                "ASTRA-42",
+                Some(42),
+            ))
+            .await
+            .expect("initial fact");
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                1,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("code universel"),
+                "ASTRA-43",
+                Some(42),
+            ))
+            .await
+            .expect("updated fact");
+
+        let hits = store
+            .search_telegram_memory_context_hybrid(channel_id, 1, Some(42), "mon code universel", 5)
+            .await
+            .expect("hybrid search");
+
+        assert_eq!(hits[0].entry.value, "ASTRA-43");
     }
 }

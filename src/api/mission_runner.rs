@@ -13,6 +13,7 @@
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -67,6 +68,134 @@ struct OpencodeSseParseResult {
     session_retry: bool,
     /// Token usage extracted from response.completed events (input, output).
     usage: Option<(u64, u64)>,
+}
+
+fn write_telegram_action_cli_helpers(work_dir: &Path) {
+    let path = work_dir.join(".sandboxed-sh-telegram-action.py");
+    const SCRIPT: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+
+def usage() -> int:
+    print(
+        "usage: telegram-action-cli reply <text> | remind <delay_seconds> <text> | "
+        "send-title <chat_title> <text> | remind-title <delay_seconds> <chat_title> <text>",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def main() -> int:
+    if len(sys.argv) < 3:
+        return usage()
+
+    mission_id = os.environ.get("MISSION_ID")
+    token = os.environ.get("TELEGRAM_ACTION_TOKEN")
+    action_url = os.environ.get("TELEGRAM_ACTION_URL")
+    if not mission_id or not token or not action_url:
+        print("telegram action environment is not configured", file=sys.stderr)
+        return 2
+
+    command = sys.argv[1]
+    payload = {"mission_id": mission_id}
+
+    if command == "reply":
+        payload["text"] = sys.argv[2]
+    elif command == "remind" and len(sys.argv) >= 4:
+        payload["delay_seconds"] = int(sys.argv[2])
+        payload["text"] = sys.argv[3]
+    elif command == "send-title" and len(sys.argv) >= 4:
+        payload["target"] = {"kind": "chat_title", "value": sys.argv[2]}
+        payload["text"] = sys.argv[3]
+    elif command == "remind-title" and len(sys.argv) >= 5:
+        payload["delay_seconds"] = int(sys.argv[2])
+        payload["target"] = {"kind": "chat_title", "value": sys.argv[3]}
+        payload["text"] = sys.argv[4]
+    else:
+        return usage()
+
+    request = urllib.request.Request(
+        action_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "content-type": "application/json",
+            "x-sandboxed-mission-token": token,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            print(body)
+            return 0 if response.status < 400 else 1
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        print(body or str(exc), file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"#;
+
+    if let Err(error) = std::fs::write(&path, SCRIPT) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "Failed to write Telegram action CLI helper"
+        );
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "Failed to mark Telegram action CLI helper executable"
+            );
+        }
+    }
+
+    let wrapper_path = work_dir.join("telegram-action");
+    const WRAPPER: &str = r#"#!/bin/sh
+set -eu
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+exec python3 "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
+"#;
+
+    if let Err(error) = std::fs::write(&wrapper_path, WRAPPER) {
+        tracing::warn!(
+            path = %wrapper_path.display(),
+            error = %error,
+            "Failed to write Telegram action wrapper"
+        );
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) =
+            std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))
+        {
+            tracing::warn!(
+                path = %wrapper_path.display(),
+                error = %error,
+                "Failed to mark Telegram action wrapper executable"
+            );
+        }
+    }
 }
 
 const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
@@ -9260,17 +9389,52 @@ pub async fn run_opencode_turn(
         "OpenCode CLI args prepared (shell wrapper)"
     );
 
+    write_telegram_action_cli_helpers(&work_dir);
+
     // Build environment variables
     let mut env: HashMap<String, String> = HashMap::new();
+    env.insert("MISSION_ID".to_string(), mission_id.to_string());
+    if let Ok(public_url) = std::env::var("SANDBOXED_PUBLIC_URL") {
+        if !public_url.trim().is_empty() {
+            env.insert("API_URL".to_string(), public_url);
+        }
+    } else if let Ok(port) = std::env::var("PORT") {
+        env.insert("API_URL".to_string(), format!("http://127.0.0.1:{}", port));
+    }
+    if let Some(token) = crate::api::telegram::build_internal_telegram_action_token(mission_id) {
+        env.insert("TELEGRAM_ACTION_TOKEN".to_string(), token);
+    }
+    let internal_api_url = std::env::var("PORT")
+        .ok()
+        .filter(|port| !port.trim().is_empty())
+        .map(|port| format!("http://127.0.0.1:{}", port))
+        .or_else(|| env.get("API_URL").cloned());
+    if let Some(api_url) = internal_api_url {
+        env.insert(
+            "TELEGRAM_ACTION_URL".to_string(),
+            format!("{}/api/control/telegram/actions/internal", api_url),
+        );
+    }
+    env.insert(
+        "TELEGRAM_ACTION_CLI".to_string(),
+        ".sandboxed-sh-telegram-action.py".to_string(),
+    );
+    env.insert(
+        "TELEGRAM_ACTION_COMMAND".to_string(),
+        "telegram-action".to_string(),
+    );
 
     // Ensure bun's global bin directories are in PATH so that oh-my-opencode
     // can find the `opencode` binary installed via `bun install -g opencode-ai`.
     {
         let current_path = std::env::var("PATH").unwrap_or_default();
         let bun_bins = "/root/.bun/bin:/root/.cache/.bun/bin";
+        let mut path_parts = vec![work_dir_arg.clone()];
         if !current_path.contains("/root/.bun/bin") {
-            env.insert("PATH".to_string(), format!("{}:{}", bun_bins, current_path));
+            path_parts.push(bun_bins.to_string());
         }
+        path_parts.push(current_path);
+        env.insert("PATH".to_string(), path_parts.join(":"));
     }
 
     let opencode_auth = sync_opencode_auth_to_workspace(workspace, app_working_dir);

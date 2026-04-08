@@ -8,10 +8,19 @@ import {
   updateTelegramChannel,
   deleteTelegramChannel,
   listBotChats,
+  listBotActionExecutions,
+  listBotScheduledMessages,
+  listBotStructuredMemory,
+  searchBotStructuredMemory,
   listMissions,
   type Mission,
+  type TelegramActionExecution,
   type TelegramChannel,
   type TelegramChatMission,
+  type TelegramScheduledMessage,
+  type TelegramStructuredMemoryEntry,
+  type TelegramStructuredMemorySearchHit,
+  type TelegramStructuredMemoryScope,
   type TelegramTriggerMode,
   type CreateTelegramBotInput,
 } from '@/lib/api';
@@ -47,6 +56,12 @@ const BACKEND_LABELS: Record<string, string> = {
   amp: 'Amp',
 };
 
+const MEMORY_SCOPE_LABELS: Record<TelegramStructuredMemoryScope, string> = {
+  chat: 'chat',
+  user: 'user',
+  channel: 'channel',
+};
+
 export default function TelegramSettingsPage() {
   const { data: bots = [], mutate: mutateBots } = useSWR('telegram-bots', listTelegramBots, {
     revalidateOnFocus: false,
@@ -76,8 +91,17 @@ export default function TelegramSettingsPage() {
 
   // Chat mappings keyed by bot ID
   const [chatsByBot, setChatsByBot] = useState<Record<string, TelegramChatMission[]>>({});
+  const [actionsByBot, setActionsByBot] = useState<Record<string, TelegramActionExecution[]>>({});
+  const [scheduledByBot, setScheduledByBot] = useState<Record<string, TelegramScheduledMessage[]>>({});
+  const [memoryByBot, setMemoryByBot] = useState<Record<string, TelegramStructuredMemoryEntry[]>>({});
+  const [memorySearchByBot, setMemorySearchByBot] = useState<Record<string, TelegramStructuredMemorySearchHit[]>>({});
+  const [memorySearchQueryByBot, setMemorySearchQueryByBot] = useState<Record<string, string>>({});
   const [expandedBots, setExpandedBots] = useState<Set<string>>(new Set());
   const [loadingChats, setLoadingChats] = useState<Set<string>>(new Set());
+  const [loadingActions, setLoadingActions] = useState<Set<string>>(new Set());
+  const [loadingScheduled, setLoadingScheduled] = useState<Set<string>>(new Set());
+  const [loadingMemory, setLoadingMemory] = useState<Set<string>>(new Set());
+  const [loadingMemorySearch, setLoadingMemorySearch] = useState<Set<string>>(new Set());
 
   // Create dialog
   const [showCreateDialog, setShowCreateDialog] = useState(false);
@@ -148,6 +172,78 @@ export default function TelegramSettingsPage() {
     }
   };
 
+  const loadScheduled = async (botId: string) => {
+    if (scheduledByBot[botId]) return;
+    setLoadingScheduled((prev) => new Set(prev).add(botId));
+    try {
+      const scheduled = await listBotScheduledMessages(botId, { limit: 8 });
+      setScheduledByBot((prev) => ({ ...prev, [botId]: scheduled }));
+    } catch {
+      // ignore
+    } finally {
+      setLoadingScheduled((prev) => {
+        const next = new Set(prev);
+        next.delete(botId);
+        return next;
+      });
+    }
+  };
+
+  const loadActions = async (botId: string) => {
+    if (actionsByBot[botId]) return;
+    setLoadingActions((prev) => new Set(prev).add(botId));
+    try {
+      const actions = await listBotActionExecutions(botId, { limit: 8 });
+      setActionsByBot((prev) => ({ ...prev, [botId]: actions }));
+    } catch {
+      // ignore
+    } finally {
+      setLoadingActions((prev) => {
+        const next = new Set(prev);
+        next.delete(botId);
+        return next;
+      });
+    }
+  };
+
+  const loadMemory = async (botId: string) => {
+    if (memoryByBot[botId]) return;
+    setLoadingMemory((prev) => new Set(prev).add(botId));
+    try {
+      const memory = await listBotStructuredMemory(botId, { limit: 8 });
+      setMemoryByBot((prev) => ({ ...prev, [botId]: memory }));
+    } catch {
+      // ignore
+    } finally {
+      setLoadingMemory((prev) => {
+        const next = new Set(prev);
+        next.delete(botId);
+        return next;
+      });
+    }
+  };
+
+  const loadMemorySearch = async (botId: string) => {
+    const query = memorySearchQueryByBot[botId]?.trim();
+    if (!query) {
+      setMemorySearchByBot((prev) => ({ ...prev, [botId]: [] }));
+      return;
+    }
+    setLoadingMemorySearch((prev) => new Set(prev).add(botId));
+    try {
+      const hits = await searchBotStructuredMemory(botId, { q: query, limit: 6 });
+      setMemorySearchByBot((prev) => ({ ...prev, [botId]: hits }));
+    } catch {
+      // ignore
+    } finally {
+      setLoadingMemorySearch((prev) => {
+        const next = new Set(prev);
+        next.delete(botId);
+        return next;
+      });
+    }
+  };
+
   const toggleExpand = (botId: string) => {
     setExpandedBots((prev) => {
       const next = new Set(prev);
@@ -156,6 +252,9 @@ export default function TelegramSettingsPage() {
       } else {
         next.add(botId);
         loadChats(botId);
+        loadActions(botId);
+        loadScheduled(botId);
+        loadMemory(botId);
       }
       return next;
     });
@@ -499,6 +598,200 @@ export default function TelegramSettingsPage() {
                               </div>
                               <p className="text-[10px] text-white/20 shrink-0">
                                 {new Date(chat.created_at).toLocaleDateString()}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div>
+                      <p className="text-[10px] text-white/30 mb-2">Recent Telegram Actions</p>
+                      {loadingActions.has(bot.id) ? (
+                        <div className="flex items-center gap-2 text-xs text-white/40">
+                          <Loader className="h-3 w-3 animate-spin" /> Loading...
+                        </div>
+                      ) : (actionsByBot[bot.id] || []).length === 0 ? (
+                        <p className="text-xs text-white/30 italic">
+                          No native Telegram actions recorded yet.
+                        </p>
+                      ) : (
+                        <div className="space-y-1">
+                          {(actionsByBot[bot.id] || []).map((action) => (
+                            <div
+                              key={action.id}
+                              className="px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04]"
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span className="inline-flex items-center rounded bg-sky-500/10 border border-sky-500/20 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">
+                                    {action.action_kind}
+                                  </span>
+                                  <p className="text-xs text-white/60 truncate">
+                                    {action.target_chat_title || `Chat ${action.target_chat_id}`}
+                                    {action.delay_seconds > 0 ? ` · +${action.delay_seconds}s` : ''}
+                                  </p>
+                                </div>
+                                <span className={cn(
+                                  'inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium',
+                                  action.status === 'sent'
+                                    ? 'bg-emerald-500/10 text-emerald-400'
+                                    : action.status === 'failed'
+                                      ? 'bg-red-500/10 text-red-400'
+                                      : 'bg-amber-500/10 text-amber-300'
+                                )}>
+                                  {action.status}
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-white/40 mt-1 line-clamp-2">{action.text}</p>
+                              <p className="text-[10px] text-white/25 mt-1">
+                                Target: {action.target_kind} {action.target_value}
+                                {action.last_error ? ` · ${action.last_error}` : ''}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div>
+                      <p className="text-[10px] text-white/30 mb-2">Scheduled Telegram Actions</p>
+                      {loadingScheduled.has(bot.id) ? (
+                        <div className="flex items-center gap-2 text-xs text-white/40">
+                          <Loader className="h-3 w-3 animate-spin" /> Loading...
+                        </div>
+                      ) : (scheduledByBot[bot.id] || []).length === 0 ? (
+                        <p className="text-xs text-white/30 italic">
+                          No scheduled Telegram messages for this bot.
+                        </p>
+                      ) : (
+                        <div className="space-y-1">
+                          {(scheduledByBot[bot.id] || []).map((message) => (
+                            <div
+                              key={message.id}
+                              className="px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04]"
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <p className="text-xs text-white/60 truncate">
+                                  {message.chat_title || `Chat ${message.chat_id}`}
+                                </p>
+                                <span className={cn(
+                                  'inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium',
+                                  message.status === 'sent'
+                                    ? 'bg-emerald-500/10 text-emerald-400'
+                                    : message.status === 'failed'
+                                      ? 'bg-red-500/10 text-red-400'
+                                      : 'bg-amber-500/10 text-amber-300'
+                                )}>
+                                  {message.status}
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-white/40 mt-1 line-clamp-2">{message.text}</p>
+                              <p className="text-[10px] text-white/25 mt-1">
+                                Send at {new Date(message.send_at).toLocaleString()}
+                                {message.sent_at ? ` · Sent ${new Date(message.sent_at).toLocaleString()}` : ''}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div>
+                      <p className="text-[10px] text-white/30 mb-2">Structured Memory</p>
+                      <div className="flex items-center gap-2 mb-3">
+                        <input
+                          type="text"
+                          placeholder="Search what Ana would recall..."
+                          value={memorySearchQueryByBot[bot.id] || ''}
+                          onChange={(e) =>
+                            setMemorySearchQueryByBot((prev) => ({
+                              ...prev,
+                              [bot.id]: e.target.value,
+                            }))
+                          }
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              void loadMemorySearch(bot.id);
+                            }
+                          }}
+                          className="flex-1 px-3 py-2 rounded-lg bg-white/[0.03] border border-white/[0.06] text-xs text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void loadMemorySearch(bot.id)}
+                          className="px-3 py-2 rounded-lg border border-white/[0.08] bg-white/[0.03] text-xs text-white/70 hover:text-white hover:border-white/[0.16] transition-colors"
+                        >
+                          Search
+                        </button>
+                      </div>
+                      {loadingMemorySearch.has(bot.id) ? (
+                        <div className="flex items-center gap-2 text-xs text-white/40 mb-3">
+                          <Loader className="h-3 w-3 animate-spin" /> Searching...
+                        </div>
+                      ) : (memorySearchByBot[bot.id] || []).length > 0 ? (
+                        <div className="space-y-1 mb-3">
+                          {(memorySearchByBot[bot.id] || []).map((hit) => (
+                            <div
+                              key={`${bot.id}-${hit.entry.id}-search`}
+                              className="px-3 py-2 rounded-lg bg-indigo-500/5 border border-indigo-500/15"
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <p className="text-xs text-indigo-200 truncate">
+                                  {hit.entry.label ? `${hit.entry.label} · ` : ''}{hit.entry.value}
+                                </p>
+                                <span className="text-[10px] text-indigo-200/70 shrink-0">
+                                  {hit.score.toFixed(1)}
+                                </span>
+                              </div>
+                              <p className="text-[10px] text-indigo-100/50 mt-1">
+                                {hit.reasons.join(' · ')}
+                                {hit.matched_terms.length > 0 ? ` · terms: ${hit.matched_terms.join(', ')}` : ''}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : memorySearchQueryByBot[bot.id]?.trim() ? (
+                        <p className="text-xs text-white/30 italic mb-3">
+                          No ranked memory matches for this query.
+                        </p>
+                      ) : null}
+                      {loadingMemory.has(bot.id) ? (
+                        <div className="flex items-center gap-2 text-xs text-white/40">
+                          <Loader className="h-3 w-3 animate-spin" /> Loading...
+                        </div>
+                      ) : (memoryByBot[bot.id] || []).length === 0 ? (
+                        <p className="text-xs text-white/30 italic">
+                          No structured memory captured yet.
+                        </p>
+                      ) : (
+                        <div className="space-y-1">
+                          {(memoryByBot[bot.id] || []).map((entry) => (
+                            <div
+                              key={entry.id}
+                              className="px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04]"
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span className="inline-flex items-center rounded bg-indigo-500/10 border border-indigo-500/20 px-1.5 py-0.5 text-[10px] font-medium text-indigo-300">
+                                    {entry.kind}
+                                  </span>
+                                  <span className="inline-flex items-center rounded bg-white/[0.04] border border-white/[0.06] px-1.5 py-0.5 text-[10px] font-medium text-white/50">
+                                    {MEMORY_SCOPE_LABELS[entry.scope]}
+                                  </span>
+                                  <p className="text-xs text-white/60 truncate">
+                                    {entry.scope === 'user'
+                                      ? entry.subject_display_name || entry.subject_username || `User ${entry.subject_user_id}`
+                                      : `Chat ${entry.chat_id}`}
+                                    {entry.label ? ` · ${entry.label}` : ''}
+                                  </p>
+                                </div>
+                                <p className="text-[10px] text-white/20 shrink-0">
+                                  {new Date(entry.updated_at).toLocaleDateString()}
+                                </p>
+                              </div>
+                              <p className="text-[11px] text-white/40 mt-1 line-clamp-2">
+                                {entry.value}
                               </p>
                             </div>
                           ))}

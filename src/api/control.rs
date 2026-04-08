@@ -5194,7 +5194,10 @@ async fn automation_scheduler_loop(
                                             &ctx.channel.bot_token,
                                             mapping.chat_id,
                                             0, // no reply_to for proactive messages
+                                            None,
                                             mission_id,
+                                            Some(Arc::clone(&bridge)),
+                                            Some(mapping.channel_id),
                                         )
                                         .await
                                         {
@@ -10116,6 +10119,132 @@ pub async fn list_bot_chats(
     Ok(Json(mappings))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TelegramBotListQuery {
+    #[serde(default = "default_telegram_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub chat_id: Option<i64>,
+}
+
+fn default_telegram_limit() -> usize {
+    20
+}
+
+pub async fn list_bot_scheduled_messages(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramScheduledMessage>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mut messages = control
+        .mission_store
+        .list_telegram_scheduled_messages(channel_id, query.limit.max(1).min(100))
+        .await
+        .map_err(internal_error)?;
+    if let Some(chat_id) = query.chat_id {
+        messages.retain(|message| message.chat_id == chat_id);
+    }
+    Ok(Json(messages))
+}
+
+pub async fn list_bot_action_executions(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramActionExecution>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mut executions = control
+        .mission_store
+        .list_telegram_action_executions(channel_id, query.limit.max(1).min(100))
+        .await
+        .map_err(internal_error)?;
+    if let Some(chat_id) = query.chat_id {
+        executions.retain(|execution| execution.target_chat_id == chat_id);
+    }
+    Ok(Json(executions))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramMemoryQuery {
+    #[serde(default = "default_telegram_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub chat_id: Option<i64>,
+    #[serde(default)]
+    pub subject_user_id: Option<i64>,
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
+pub async fn list_bot_structured_memory(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramMemoryQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramStructuredMemoryEntry>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let limit = query.limit.max(1).min(100);
+    let entries = if let Some(q) = query.q.as_deref().filter(|q| !q.trim().is_empty()) {
+        let mut entries = control
+            .mission_store
+            .search_telegram_structured_memory_hybrid(
+                channel_id,
+                query.chat_id,
+                query.subject_user_id,
+                q,
+                limit,
+            )
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .map(|hit| hit.entry)
+            .collect::<Vec<_>>();
+        if let Some(subject_user_id) = query.subject_user_id {
+            entries.retain(|entry| entry.subject_user_id == Some(subject_user_id));
+        }
+        entries
+    } else {
+        let mut entries = control
+            .mission_store
+            .list_telegram_structured_memory(channel_id, query.chat_id, limit)
+            .await
+            .map_err(internal_error)?;
+        if let Some(subject_user_id) = query.subject_user_id {
+            entries.retain(|entry| entry.subject_user_id == Some(subject_user_id));
+        }
+        entries
+    };
+    Ok(Json(entries))
+}
+
+pub async fn search_bot_structured_memory(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramMemoryQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramStructuredMemorySearchHit>>, (StatusCode, String)>
+{
+    let control = control_for_user(&state, &user).await;
+    let Some(q) = query.q.as_deref().filter(|q| !q.trim().is_empty()) else {
+        return Ok(Json(Vec::new()));
+    };
+    let hits = control
+        .mission_store
+        .search_telegram_structured_memory_hybrid(
+            channel_id,
+            query.chat_id,
+            query.subject_user_id,
+            q,
+            query.limit.max(1).min(100),
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(hits))
+}
+
 /// Send a message to a Telegram chat via the bot and optionally dispatch it to
 /// the associated mission. Used by agents (e.g. Ana) to proactively message users.
 #[derive(Debug, Deserialize)]
@@ -10130,6 +10259,115 @@ pub struct SendTelegramMessageRequest {
     /// Also dispatch as a user message to the chat's associated mission
     #[serde(default)]
     pub dispatch_to_mission: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramActionRequest {
+    pub mission_id: Uuid,
+    pub text: String,
+    #[serde(default)]
+    pub delay_seconds: Option<u64>,
+    #[serde(default)]
+    pub target: Option<super::telegram::TelegramActionTarget>,
+}
+
+pub async fn execute_telegram_action_api(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<TelegramActionRequest>,
+) -> Result<Json<super::telegram::TelegramActionExecutionResult>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let result = super::telegram::execute_native_telegram_action(
+        &state.telegram_bridge,
+        &control.mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
+        req.delay_seconds.unwrap_or(0),
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(result))
+}
+
+fn internal_telegram_action_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-sandboxed-mission-token")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+async fn mission_store_for_telegram_mission(
+    state: &Arc<AppState>,
+    mission_id: Uuid,
+) -> Option<Arc<dyn MissionStore>> {
+    let sessions = state.control.all_sessions().await;
+    for session in sessions {
+        if session
+            .mission_store
+            .get_telegram_chat_mission_by_mission_id(mission_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Some(Arc::clone(&session.mission_store));
+        }
+    }
+    None
+}
+
+pub async fn execute_telegram_action_internal_api(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TelegramActionRequest>,
+) -> Result<Json<super::telegram::TelegramActionExecutionResult>, (StatusCode, String)> {
+    let token = internal_telegram_action_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Missing mission token".to_string(),
+        )
+    })?;
+    if !super::telegram::verify_internal_telegram_action_token(req.mission_id, token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid mission token".to_string(),
+        ));
+    }
+
+    let mission_store = mission_store_for_telegram_mission(&state, req.mission_id)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Mission {} is not linked to an active Telegram conversation",
+                    req.mission_id
+                ),
+            )
+        })?;
+
+    let result = super::telegram::execute_native_telegram_action(
+        &state.telegram_bridge,
+        &mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
+        req.delay_seconds.unwrap_or(0),
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
+    Ok(Json(result))
 }
 
 pub async fn send_telegram_message_api(
@@ -10239,9 +10477,22 @@ pub async fn telegram_webhook_receiver(
     }
 
     // Process the message
+    if !state
+        .telegram_bridge
+        .register_update_once(channel_id, update.update_id)
+        .await
+    {
+        tracing::info!(
+            channel_id = %channel_id,
+            update_id = update.update_id,
+            "Ignoring duplicate Telegram webhook update"
+        );
+        return StatusCode::OK;
+    }
+
     if let Some(ref msg) = update.message {
         let http = state.telegram_bridge.http().clone();
-        super::telegram::process_webhook_message(&ctx, msg, &http).await;
+        super::telegram::process_webhook_message(&ctx, msg, &http, &state.telegram_bridge).await;
     }
 
     StatusCode::OK

@@ -397,6 +397,128 @@ pub struct TelegramChatMission {
     pub created_at: String,
 }
 
+/// A Telegram message queued for immediate or delayed delivery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelegramScheduledMessage {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mission_id: Option<Uuid>,
+    pub chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_title: Option<String>,
+    pub text: String,
+    pub send_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<String>,
+    pub status: TelegramScheduledMessageStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramScheduledMessageStatus {
+    Pending,
+    Sent,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramStructuredMemoryKind {
+    Fact,
+    Note,
+    Task,
+    Preference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramStructuredMemoryScope {
+    #[default]
+    Chat,
+    User,
+    Channel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramStructuredMemoryEntry {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    pub chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<Uuid>,
+    #[serde(default)]
+    pub scope: TelegramStructuredMemoryScope,
+    pub kind: TelegramStructuredMemoryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_user_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<i64>,
+    pub source_role: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelegramStructuredMemorySearchHit {
+    pub entry: TelegramStructuredMemoryEntry,
+    pub score: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_terms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramActionExecutionStatus {
+    Pending,
+    Sent,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramActionExecutionKind {
+    Send,
+    Reminder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramActionExecution {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mission_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chat_id: Option<i64>,
+    pub target_chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_chat_title: Option<String>,
+    pub action_kind: TelegramActionExecutionKind,
+    pub target_kind: String,
+    pub target_value: String,
+    pub text: String,
+    pub delay_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_message_id: Option<Uuid>,
+    pub status: TelegramActionExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// How Telegram messages trigger the assistant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -813,6 +935,17 @@ pub trait MissionStore: Send + Sync {
         Err("Not supported".to_string())
     }
 
+    /// Update the cached title/label for a Telegram chat mapping.
+    async fn update_telegram_chat_mission_title(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        chat_title: Option<String>,
+    ) -> Result<(), String> {
+        let _ = (channel_id, chat_id, chat_title);
+        Ok(())
+    }
+
     /// Look up the Telegram chat mapping for a given mission_id (reverse lookup).
     async fn get_telegram_chat_mission_by_mission_id(
         &self,
@@ -829,6 +962,175 @@ pub trait MissionStore: Send + Sync {
     ) -> Result<Vec<TelegramChatMission>, String> {
         let _ = channel_id;
         Ok(vec![])
+    }
+
+    /// Queue a Telegram message for immediate or delayed delivery.
+    async fn create_telegram_scheduled_message(
+        &self,
+        message: TelegramScheduledMessage,
+    ) -> Result<TelegramScheduledMessage, String> {
+        let _ = message;
+        Err("Not supported".to_string())
+    }
+
+    /// List pending Telegram messages that should be delivered at or before `send_at`.
+    async fn list_due_telegram_scheduled_messages(
+        &self,
+        send_at: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramScheduledMessage>, String> {
+        let _ = (send_at, limit);
+        Ok(vec![])
+    }
+
+    /// List recent Telegram scheduled messages for a channel.
+    async fn list_telegram_scheduled_messages(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramScheduledMessage>, String> {
+        let _ = (channel_id, limit);
+        Ok(vec![])
+    }
+
+    /// Mark a scheduled Telegram message as sent.
+    async fn mark_telegram_scheduled_message_sent(
+        &self,
+        id: Uuid,
+        sent_at: &str,
+    ) -> Result<(), String> {
+        let _ = (id, sent_at);
+        Err("Not supported".to_string())
+    }
+
+    /// Mark a scheduled Telegram message as failed.
+    async fn mark_telegram_scheduled_message_failed(
+        &self,
+        id: Uuid,
+        error: &str,
+    ) -> Result<(), String> {
+        let _ = (id, error);
+        Err("Not supported".to_string())
+    }
+
+    /// Upsert a Telegram structured memory entry.
+    async fn upsert_telegram_structured_memory(
+        &self,
+        entry: TelegramStructuredMemoryEntry,
+    ) -> Result<TelegramStructuredMemoryEntry, String> {
+        let _ = entry;
+        Err("Not supported".to_string())
+    }
+
+    /// List recent Telegram structured memory entries for a channel/chat.
+    async fn list_telegram_structured_memory(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let _ = (channel_id, chat_id, limit);
+        Ok(vec![])
+    }
+
+    /// Search Telegram structured memory for a channel/chat.
+    async fn search_telegram_structured_memory(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let _ = (channel_id, chat_id, query, limit);
+        Ok(vec![])
+    }
+
+    /// Hybrid-search Telegram structured memory with scored matches.
+    async fn search_telegram_structured_memory_hybrid(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        subject_user_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemorySearchHit>, String> {
+        let _ = (channel_id, chat_id, subject_user_id, query, limit);
+        Ok(vec![])
+    }
+
+    /// Load memory context relevant to a Telegram chat and optional sender identity.
+    async fn list_telegram_memory_context(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        subject_user_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let _ = (channel_id, chat_id, subject_user_id, limit);
+        Ok(vec![])
+    }
+
+    /// Search memory context relevant to a Telegram chat and optional sender identity.
+    async fn search_telegram_memory_context(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        subject_user_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let _ = (channel_id, chat_id, subject_user_id, query, limit);
+        Ok(vec![])
+    }
+
+    /// Hybrid-search memory context relevant to a Telegram chat and optional sender identity.
+    async fn search_telegram_memory_context_hybrid(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        subject_user_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemorySearchHit>, String> {
+        self.search_telegram_structured_memory_hybrid(
+            channel_id,
+            Some(chat_id),
+            subject_user_id,
+            query,
+            limit,
+        )
+        .await
+    }
+
+    /// Record a Telegram action execution for observability/admin tooling.
+    async fn create_telegram_action_execution(
+        &self,
+        execution: TelegramActionExecution,
+    ) -> Result<TelegramActionExecution, String> {
+        let _ = execution;
+        Err("Not supported".to_string())
+    }
+
+    /// List recent Telegram action executions for a channel.
+    async fn list_telegram_action_executions(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramActionExecution>, String> {
+        let _ = (channel_id, limit);
+        Ok(vec![])
+    }
+
+    /// Update action execution status by the linked scheduled message.
+    async fn mark_telegram_action_execution_by_scheduled_message(
+        &self,
+        scheduled_message_id: Uuid,
+        status: TelegramActionExecutionStatus,
+        last_error: Option<&str>,
+        updated_at: &str,
+    ) -> Result<(), String> {
+        let _ = (scheduled_message_id, status, last_error, updated_at);
+        Err("Not supported".to_string())
     }
 }
 

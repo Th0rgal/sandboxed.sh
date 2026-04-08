@@ -11,13 +11,19 @@
 
 use crate::api::control::{AgentEvent, ControlCommand};
 use crate::api::mission_store::{
-    MissionMode, MissionStore, TelegramChannel, TelegramChatMission, TelegramTriggerMode,
+    now_string, MissionMode, MissionStore, TelegramActionExecution, TelegramActionExecutionKind,
+    TelegramActionExecutionStatus, TelegramChannel, TelegramChatMission, TelegramScheduledMessage,
+    TelegramScheduledMessageStatus, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
+    TelegramStructuredMemoryScope, TelegramTriggerMode,
 };
+use chrono::{Duration as ChronoDuration, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
 /// Shared handle to the Telegram bridge manager.
@@ -27,7 +33,107 @@ pub type SharedTelegramBridge = Arc<TelegramBridge>;
 pub struct TelegramBridge {
     /// Routing context for each active channel (needed to forward webhook messages).
     active_channels: RwLock<HashMap<Uuid, ChannelContext>>,
+    /// Per-chat locks to serialize auto-create mission resolution.
+    chat_locks: RwLock<HashMap<(Uuid, i64), Arc<Mutex<()>>>>,
+    /// Recently seen Telegram update IDs for webhook idempotence.
+    recent_updates: RwLock<HashMap<(Uuid, i64), Instant>>,
+    /// Sent outbound reply messages keyed by the inbound Telegram message they reply to.
+    recent_replies: RwLock<HashMap<TelegramReplyKey, TelegramReplyRecord>>,
+    scheduler_started: AtomicBool,
     http: Client,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TelegramReplyKey {
+    channel_id: Uuid,
+    chat_id: i64,
+    reply_to_message_id: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TelegramReplyRecord {
+    message_id: i64,
+    created_at: Instant,
+}
+
+const TELEGRAM_UPDATE_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
+const TELEGRAM_REPLY_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
+const TELEGRAM_SCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TelegramActionKind {
+    Send,
+    Reminder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramAction {
+    kind: TelegramActionKind,
+    target: String,
+    delay_seconds: u64,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractedTelegramMemory {
+    kind: TelegramStructuredMemoryKind,
+    label: Option<String>,
+    value: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TelegramMemorySubject {
+    user_id: Option<i64>,
+    username: Option<String>,
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum TelegramActionTarget {
+    Current,
+    ChatId(i64),
+    ChatTitle(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramActionExecutionResult {
+    pub channel_id: Uuid,
+    pub chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_message_id: Option<Uuid>,
+    pub immediate: bool,
+}
+
+fn telegram_internal_action_secret() -> Option<String> {
+    std::env::var("SANDBOXED_INTERNAL_ACTION_SECRET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("JWT_SECRET")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+pub fn build_internal_telegram_action_token(mission_id: Uuid) -> Option<String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let secret = telegram_internal_action_secret()?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(b"telegram-action:");
+    mac.update(mission_id.as_bytes());
+    Some(hex::encode(mac.finalize().into_bytes()))
+}
+
+pub fn verify_internal_telegram_action_token(mission_id: Uuid, token: &str) -> bool {
+    let Some(expected) = build_internal_telegram_action_token(mission_id) else {
+        return false;
+    };
+    super::auth::constant_time_eq(&expected, token.trim())
 }
 
 /// Context needed to route incoming webhook messages to a mission.
@@ -50,13 +156,102 @@ impl TelegramBridge {
     pub fn new() -> Self {
         Self {
             active_channels: RwLock::new(HashMap::new()),
+            chat_locks: RwLock::new(HashMap::new()),
+            recent_updates: RwLock::new(HashMap::new()),
+            recent_replies: RwLock::new(HashMap::new()),
+            scheduler_started: AtomicBool::new(false),
             http: Client::new(),
         }
     }
 
+    fn purge_recent_updates(map: &mut HashMap<(Uuid, i64), Instant>, now: Instant) {
+        map.retain(|_, seen_at| now.duration_since(*seen_at) <= TELEGRAM_UPDATE_DEDUP_TTL);
+    }
+
+    fn purge_recent_replies(
+        map: &mut HashMap<TelegramReplyKey, TelegramReplyRecord>,
+        now: Instant,
+    ) {
+        map.retain(|_, record| now.duration_since(record.created_at) <= TELEGRAM_REPLY_DEDUP_TTL);
+    }
+
+    /// Returns true if this update has not been seen recently for the channel.
+    pub async fn register_update_once(&self, channel_id: Uuid, update_id: i64) -> bool {
+        let now = Instant::now();
+        let mut updates = self.recent_updates.write().await;
+        Self::purge_recent_updates(&mut updates, now);
+        updates.insert((channel_id, update_id), now).is_none()
+    }
+
+    /// Return a previously sent Telegram message for this inbound reply target, if any.
+    pub async fn get_sent_reply_message(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        reply_to_message_id: i64,
+    ) -> Option<i64> {
+        if reply_to_message_id <= 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let mut replies = self.recent_replies.write().await;
+        Self::purge_recent_replies(&mut replies, now);
+        replies
+            .get(&TelegramReplyKey {
+                channel_id,
+                chat_id,
+                reply_to_message_id,
+            })
+            .map(|record| record.message_id)
+    }
+
+    /// Remember which outbound bot message corresponds to an inbound Telegram message.
+    pub async fn remember_sent_reply_message(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        reply_to_message_id: i64,
+        message_id: i64,
+    ) {
+        if reply_to_message_id <= 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut replies = self.recent_replies.write().await;
+        Self::purge_recent_replies(&mut replies, now);
+        replies.insert(
+            TelegramReplyKey {
+                channel_id,
+                chat_id,
+                reply_to_message_id,
+            },
+            TelegramReplyRecord {
+                message_id,
+                created_at: now,
+            },
+        );
+    }
+
+    /// Get or create the per-chat mutex used to serialize mission auto-creation.
+    pub async fn chat_lock(&self, channel_id: Uuid, chat_id: i64) -> Arc<Mutex<()>> {
+        {
+            let locks = self.chat_locks.read().await;
+            if let Some(lock) = locks.get(&(channel_id, chat_id)) {
+                return Arc::clone(lock);
+            }
+        }
+
+        let mut locks = self.chat_locks.write().await;
+        Arc::clone(
+            locks
+                .entry((channel_id, chat_id))
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
     /// Register a webhook for a Telegram channel and store routing context.
     pub async fn start_channel(
-        &self,
+        self: &Arc<Self>,
         channel: TelegramChannel,
         cmd_tx: mpsc::Sender<ControlCommand>,
         events_tx: broadcast::Sender<AgentEvent>,
@@ -117,7 +312,7 @@ impl TelegramBridge {
             bot_username,
             cmd_tx,
             events_tx,
-            mission_store,
+            mission_store: Arc::clone(&mission_store),
         };
 
         self.active_channels
@@ -125,7 +320,100 @@ impl TelegramBridge {
             .await
             .insert(ctx.channel.id, ctx);
 
+        self.ensure_scheduler_started(mission_store).await;
+
         Ok(())
+    }
+
+    async fn ensure_scheduler_started(self: &Arc<Self>, mission_store: Arc<dyn MissionStore>) {
+        if self
+            .scheduler_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let bridge = Arc::clone(self);
+        tokio::spawn(async move {
+            bridge.run_scheduler_loop(mission_store).await;
+        });
+    }
+
+    async fn run_scheduler_loop(self: Arc<Self>, mission_store: Arc<dyn MissionStore>) {
+        let mut interval = tokio::time::interval(TELEGRAM_SCHEDULE_POLL_INTERVAL);
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+            let due = match mission_store
+                .list_due_telegram_scheduled_messages(&now_string(), 32)
+                .await
+            {
+                Ok(messages) => messages,
+                Err(err) => {
+                    tracing::warn!("Failed to load due Telegram scheduled messages: {}", err);
+                    continue;
+                }
+            };
+
+            for message in due {
+                let Some(ctx) = self.get_channel_context(message.channel_id).await else {
+                    continue;
+                };
+
+                let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+                match send_chunked_message(
+                    &self.http,
+                    &base_url,
+                    message.chat_id,
+                    &message.text,
+                    None,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if let Err(err) = mission_store
+                            .mark_telegram_scheduled_message_sent(message.id, &now_string())
+                            .await
+                        {
+                            tracing::warn!(
+                                scheduled_message_id = %message.id,
+                                "Failed to mark Telegram scheduled message as sent: {}",
+                                err
+                            );
+                        }
+                        let _ = mission_store
+                            .mark_telegram_action_execution_by_scheduled_message(
+                                message.id,
+                                TelegramActionExecutionStatus::Sent,
+                                None,
+                                &now_string(),
+                            )
+                            .await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            scheduled_message_id = %message.id,
+                            chat_id = message.chat_id,
+                            "Failed to deliver scheduled Telegram message: {}",
+                            err
+                        );
+                        let _ = mission_store
+                            .mark_telegram_scheduled_message_failed(message.id, &err)
+                            .await;
+                        let _ = mission_store
+                            .mark_telegram_action_execution_by_scheduled_message(
+                                message.id,
+                                TelegramActionExecutionStatus::Failed,
+                                Some(&err),
+                                &now_string(),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
     }
 
     /// Remove webhook and routing context for a channel.
@@ -165,7 +453,7 @@ impl TelegramBridge {
 
     /// Boot all active channels from the store.
     pub async fn boot_from_store(
-        &self,
+        self: &Arc<Self>,
         store: &Arc<dyn MissionStore>,
         cmd_tx: mpsc::Sender<ControlCommand>,
         events_tx: broadcast::Sender<AgentEvent>,
@@ -282,6 +570,14 @@ pub struct Chat {
     pub id: i64,
     #[serde(rename = "type")]
     pub chat_type: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub first_name: Option<String>,
+    #[serde(default)]
+    pub last_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -499,7 +795,8 @@ async fn set_webhook(
     let mut params = serde_json::json!({
         "url": webhook_url,
         "allowed_updates": ["message"],
-        "drop_pending_updates": true,
+        // Keep pending updates when re-registering webhooks so we don't drop real user messages.
+        "drop_pending_updates": false,
     });
     if let Some(secret) = secret_token {
         params["secret_token"] = serde_json::Value::String(secret.to_string());
@@ -559,7 +856,12 @@ async fn resolve_or_create_mission(
     ctx: &ChannelContext,
     chat_id: i64,
     sender_name: &str,
+    chat_title: Option<&str>,
+    bridge: &SharedTelegramBridge,
 ) -> Option<Uuid> {
+    let chat_lock = bridge.chat_lock(ctx.channel.id, chat_id).await;
+    let _guard = chat_lock.lock().await;
+
     // 1. Look up existing mapping
     if let Ok(Some(mapping)) = ctx
         .mission_store
@@ -616,7 +918,7 @@ async fn resolve_or_create_mission(
                 channel_id: ctx.channel.id,
                 chat_id,
                 mission_id,
-                chat_title: None,
+                chat_title: chat_title.map(|title| title.to_string()),
                 created_at: crate::api::mission_store::now_string(),
             };
             // Handle race condition: if another message already created the mapping, look it up
@@ -662,9 +964,317 @@ async fn resolve_or_create_mission(
     }
 }
 
+fn normalize_optional_telegram_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn telegram_chat_display_title(chat: &Chat) -> Option<String> {
+    if let Some(title) = normalize_optional_telegram_value(chat.title.as_deref()) {
+        return Some(title);
+    }
+
+    normalize_optional_telegram_value(chat.username.as_deref()).map(|username| {
+        if username.starts_with('@') {
+            username
+        } else {
+            format!("@{}", username)
+        }
+    })
+}
+
+async fn remember_telegram_chat_title(ctx: &ChannelContext, chat: &Chat) {
+    let Some(chat_title) = telegram_chat_display_title(chat) else {
+        return;
+    };
+
+    if let Err(error) = ctx
+        .mission_store
+        .update_telegram_chat_mission_title(ctx.channel.id, chat.id, Some(chat_title.clone()))
+        .await
+    {
+        tracing::debug!(
+            "Failed to update Telegram chat title cache for channel {} chat {}: {}",
+            ctx.channel.id,
+            chat.id,
+            error
+        );
+    }
+}
+
+fn telegram_memory_subject(msg: &Message, sender_name: &str) -> TelegramMemorySubject {
+    let Some(from) = msg.from.as_ref() else {
+        return TelegramMemorySubject::default();
+    };
+
+    TelegramMemorySubject {
+        user_id: Some(from.id),
+        username: normalize_optional_telegram_value(from.username.as_deref()),
+        display_name: Some(sender_name.to_string()).filter(|value| !value.trim().is_empty()),
+    }
+}
+
+fn scope_for_extracted_memory(
+    entry: &ExtractedTelegramMemory,
+    subject: &TelegramMemorySubject,
+) -> TelegramStructuredMemoryScope {
+    if subject.user_id.is_some()
+        && matches!(
+            entry.kind,
+            TelegramStructuredMemoryKind::Fact | TelegramStructuredMemoryKind::Preference
+        )
+    {
+        TelegramStructuredMemoryScope::User
+    } else {
+        TelegramStructuredMemoryScope::Chat
+    }
+}
+
+fn normalize_memory_text(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '.' | '!' | '?' | '"' | '\'' | ' '))
+        .to_string()
+}
+
+fn strip_memory_follow_up_directives(value: &str) -> String {
+    let re = regex::Regex::new(
+        r"(?is)^(?P<body>.*?)(?:[.!?\n]+\s*(?:réponds?|reponds?|reply|respond|answer|say)\b.*)?$",
+    )
+    .expect("telegram memory directive stripping regex must compile");
+
+    re.captures(value.trim())
+        .and_then(|captures| captures.name("body").map(|m| m.as_str().trim().to_string()))
+        .unwrap_or_else(|| value.trim().to_string())
+}
+
+fn extract_fact_memory(clause: &str) -> Option<ExtractedTelegramMemory> {
+    let clause = strip_memory_follow_up_directives(clause);
+    let re = regex::Regex::new(
+        r"(?i)^(?:(?:mon|ma|mes|my)\s+)?(?P<label>.+?)\s+(?:est|is)\s+(?P<value>.+)$",
+    )
+    .expect("telegram fact extraction regex must compile");
+    let captures = re.captures(clause.trim())?;
+    let label = normalize_memory_text(captures.name("label")?.as_str());
+    let value = normalize_memory_text(captures.name("value")?.as_str());
+    if label.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some(ExtractedTelegramMemory {
+        kind: TelegramStructuredMemoryKind::Fact,
+        label: Some(label),
+        value,
+    })
+}
+
+fn extract_structured_memory_from_text(text: &str) -> Vec<ExtractedTelegramMemory> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::new();
+    let remember_re = regex::Regex::new(r"(?i)^(?:souviens[- ]toi que|remember that)\s+(.+)$")
+        .expect("telegram remember extraction regex must compile");
+
+    if let Some(captures) = remember_re.captures(trimmed) {
+        let body = normalize_memory_text(&strip_memory_follow_up_directives(
+            captures.get(1).map(|m| m.as_str()).unwrap_or(""),
+        ));
+        if let Some(fact) = extract_fact_memory(&body) {
+            entries.push(fact);
+        } else if !body.is_empty() {
+            entries.push(ExtractedTelegramMemory {
+                kind: TelegramStructuredMemoryKind::Note,
+                label: None,
+                value: body,
+            });
+        }
+        return entries;
+    }
+
+    if trimmed.ends_with('?') {
+        return entries;
+    }
+
+    if let Some(fact) = extract_fact_memory(trimmed) {
+        entries.push(fact);
+    }
+
+    let preference_re = regex::Regex::new(r"(?i)^(?:j'aime|i like|i prefer)\s+(.+)$")
+        .expect("telegram preference extraction regex must compile");
+    if let Some(captures) = preference_re.captures(trimmed) {
+        let value = normalize_memory_text(captures.get(1).map(|m| m.as_str()).unwrap_or(""));
+        if !value.is_empty() {
+            entries.push(ExtractedTelegramMemory {
+                kind: TelegramStructuredMemoryKind::Preference,
+                label: None,
+                value,
+            });
+        }
+    }
+
+    entries
+}
+
+async fn persist_structured_memory_for_message(
+    ctx: &ChannelContext,
+    chat_id: i64,
+    mission_id: Uuid,
+    source_message_id: i64,
+    subject: &TelegramMemorySubject,
+    clean_text: &str,
+) {
+    let entries = extract_structured_memory_from_text(clean_text);
+    for entry in entries {
+        let now = now_string();
+        let scope = scope_for_extracted_memory(&entry, subject);
+        let stored = TelegramStructuredMemoryEntry {
+            id: Uuid::new_v4(),
+            channel_id: ctx.channel.id,
+            chat_id,
+            mission_id: Some(mission_id),
+            scope: scope.clone(),
+            kind: entry.kind,
+            label: entry.label,
+            value: entry.value,
+            subject_user_id: match scope {
+                TelegramStructuredMemoryScope::User => subject.user_id,
+                _ => None,
+            },
+            subject_username: match scope {
+                TelegramStructuredMemoryScope::User => subject.username.clone(),
+                _ => None,
+            },
+            subject_display_name: match scope {
+                TelegramStructuredMemoryScope::User => subject.display_name.clone(),
+                _ => None,
+            },
+            source_message_id: Some(source_message_id),
+            source_role: "user".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        if let Err(error) = ctx
+            .mission_store
+            .upsert_telegram_structured_memory(stored)
+            .await
+        {
+            tracing::warn!(
+                "Failed to persist structured Telegram memory for chat {}: {}",
+                chat_id,
+                error
+            );
+        }
+    }
+}
+
+fn format_memory_entry(entry: &TelegramStructuredMemoryEntry) -> String {
+    match entry.kind {
+        TelegramStructuredMemoryKind::Fact => {
+            if let Some(label) = entry.label.as_deref() {
+                format!("- Fact: {} = {}", label, entry.value)
+            } else {
+                format!("- Fact: {}", entry.value)
+            }
+        }
+        TelegramStructuredMemoryKind::Preference => {
+            format!("- Preference: {}", entry.value)
+        }
+        TelegramStructuredMemoryKind::Task => {
+            format!("- Task: {}", entry.value)
+        }
+        TelegramStructuredMemoryKind::Note => {
+            format!("- Note: {}", entry.value)
+        }
+    }
+}
+
+fn format_structured_memory_context(entries: &[TelegramStructuredMemoryEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut chat_lines = Vec::new();
+    let mut user_lines = Vec::new();
+    let mut channel_lines = Vec::new();
+
+    for entry in entries {
+        let formatted = format_memory_entry(entry);
+        match entry.scope {
+            TelegramStructuredMemoryScope::Chat => chat_lines.push(formatted),
+            TelegramStructuredMemoryScope::User => user_lines.push(formatted),
+            TelegramStructuredMemoryScope::Channel => channel_lines.push(formatted),
+        }
+    }
+
+    let mut sections = Vec::new();
+    if !user_lines.is_empty() {
+        sections.push(format!("User memory:\n{}", user_lines.join("\n")));
+    }
+    if !chat_lines.is_empty() {
+        sections.push(format!("Chat memory:\n{}", chat_lines.join("\n")));
+    }
+    if !channel_lines.is_empty() {
+        sections.push(format!("Channel memory:\n{}", channel_lines.join("\n")));
+    }
+
+    Some(format!("[Structured memory]\n{}", sections.join("\n")))
+}
+
+async fn load_structured_memory_context(
+    ctx: &ChannelContext,
+    chat_id: i64,
+    subject_user_id: Option<i64>,
+    query: &str,
+) -> Option<String> {
+    let trimmed_query = query.trim();
+    let mut entries = if trimmed_query.len() >= 4 {
+        ctx.mission_store
+            .search_telegram_memory_context_hybrid(
+                ctx.channel.id,
+                chat_id,
+                subject_user_id,
+                trimmed_query,
+                5,
+            )
+            .await
+            .ok()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|hit| hit.entry)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    if entries.len() < 3 {
+        let recent = ctx
+            .mission_store
+            .list_telegram_memory_context(ctx.channel.id, chat_id, subject_user_id, 6)
+            .await
+            .ok()
+            .unwrap_or_default();
+        for entry in recent {
+            if !entries.iter().any(|existing| existing.id == entry.id) {
+                entries.push(entry);
+            }
+        }
+    }
+
+    format_structured_memory_context(&entries)
+}
+
 /// Process an incoming Telegram message from a webhook.
 /// Called by the axum route handler.
-pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: &Client) {
+pub async fn process_webhook_message(
+    ctx: &ChannelContext,
+    msg: &Message,
+    http: &Client,
+    bridge: &SharedTelegramBridge,
+) {
     // Accept text, caption (on media), or file-only messages
     let text = msg.text.as_deref().or(msg.caption.as_deref()).unwrap_or("");
 
@@ -688,15 +1298,27 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
             }
         })
         .unwrap_or_else(|| "Unknown".to_string());
+    let chat_title = telegram_chat_display_title(&msg.chat);
+
+    remember_telegram_chat_title(ctx, &msg.chat).await;
 
     let clean_text = strip_bot_mention(text, &ctx.bot_username);
+    let memory_subject = telegram_memory_subject(msg, &sender_name);
 
     // Resolve target mission: auto-create per chat or legacy single-mission
     // For context-only messages (should_respond=false), only look up existing
     // missions — don't create new ones just to store context.
     let target_mission_id = if ctx.channel.auto_create_missions {
         if should_respond {
-            match resolve_or_create_mission(ctx, msg.chat.id, &sender_name).await {
+            match resolve_or_create_mission(
+                ctx,
+                msg.chat.id,
+                &sender_name,
+                chat_title.as_deref(),
+                bridge,
+            )
+            .await
+            {
                 Some(id) => id,
                 None => {
                     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
@@ -725,6 +1347,16 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
     } else {
         ctx.channel.mission_id
     };
+
+    persist_structured_memory_for_message(
+        ctx,
+        msg.chat.id,
+        target_mission_id,
+        msg.message_id,
+        &memory_subject,
+        &clean_text,
+    )
+    .await;
 
     // Download attached file if present
     let file_annotation = if let Some((file_id, filename, mime)) = extract_file_info(msg) {
@@ -765,6 +1397,11 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
     ));
     if let Some(ref instructions) = ctx.channel.instructions {
         parts.push(format!("[Instructions: {}]", instructions));
+    }
+    if let Some(memory_context) =
+        load_structured_memory_context(ctx, msg.chat.id, memory_subject.user_id, &clean_text).await
+    {
+        parts.push(memory_context);
     }
     if let Some(ref file_info) = file_annotation {
         parts.push(file_info.clone());
@@ -829,6 +1466,8 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
     let chat_id = msg.chat.id;
     let reply_to = msg.message_id;
     let mission_id = target_mission_id;
+    let bridge_clone = Arc::clone(bridge);
+    let channel_id = ctx.channel.id;
 
     tokio::spawn(async move {
         if let Err(e) = stream_response(
@@ -837,7 +1476,10 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
             &bot_token,
             chat_id,
             reply_to,
+            Some(msg_id),
             mission_id,
+            Some(bridge_clone),
+            Some(channel_id),
         )
         .await
         {
@@ -923,6 +1565,615 @@ fn strip_bot_mention(text: &str, bot_username: &str) -> String {
     trimmed.to_string()
 }
 
+fn parse_telegram_action_attrs(raw: &str) -> HashMap<String, String> {
+    let mut attrs = HashMap::new();
+    let attr_re = regex::Regex::new(r#"([a-z_]+)\s*=\s*"([^"]*)""#)
+        .expect("telegram action attr regex must compile");
+    for caps in attr_re.captures_iter(raw) {
+        if let (Some(key), Some(value)) = (caps.get(1), caps.get(2)) {
+            attrs.insert(key.as_str().to_string(), value.as_str().to_string());
+        }
+    }
+    attrs
+}
+
+fn extract_telegram_actions(content: &str) -> (Vec<TelegramAction>, String) {
+    let mut actions = Vec::new();
+    let send_patterns = [
+        regex::Regex::new(r#"(?s)<telegram-send(?P<attrs>[^>]*)>(?P<text>.*?)</telegram-send>"#)
+            .expect("telegram send regex must compile"),
+        regex::Regex::new(
+            r#"(?s)\[telegram-send(?P<attrs>[^\]]*)\](?P<text>.*?)\[/telegram-send\]"#,
+        )
+        .expect("telegram send bracket regex must compile"),
+    ];
+    let reminder_patterns = [
+        regex::Regex::new(
+            r#"(?s)<telegram-reminder(?P<attrs>[^>]*)>(?P<text>.*?)</telegram-reminder>"#,
+        )
+        .expect("telegram reminder regex must compile"),
+        regex::Regex::new(
+            r#"(?s)\[telegram-reminder(?P<attrs>[^\]]*)\](?P<text>.*?)\[/telegram-reminder\]"#,
+        )
+        .expect("telegram reminder bracket regex must compile"),
+    ];
+
+    for send_re in &send_patterns {
+        for caps in send_re.captures_iter(content) {
+            let attrs =
+                parse_telegram_action_attrs(caps.name("attrs").map(|m| m.as_str()).unwrap_or(""));
+            let text = caps
+                .name("text")
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default();
+            if !text.is_empty() {
+                actions.push(TelegramAction {
+                    kind: TelegramActionKind::Send,
+                    target: attrs
+                        .get("target")
+                        .cloned()
+                        .unwrap_or_else(|| "current".to_string()),
+                    delay_seconds: attrs
+                        .get("delay_seconds")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0),
+                    text,
+                });
+            }
+        }
+    }
+
+    for reminder_re in &reminder_patterns {
+        for caps in reminder_re.captures_iter(content) {
+            let attrs =
+                parse_telegram_action_attrs(caps.name("attrs").map(|m| m.as_str()).unwrap_or(""));
+            let text = caps
+                .name("text")
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default();
+            if !text.is_empty() {
+                actions.push(TelegramAction {
+                    kind: TelegramActionKind::Reminder,
+                    target: attrs
+                        .get("target")
+                        .cloned()
+                        .unwrap_or_else(|| "current".to_string()),
+                    delay_seconds: attrs
+                        .get("delay_seconds")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(60),
+                    text,
+                });
+            }
+        }
+    }
+
+    let without_send = send_patterns.iter().fold(content.to_string(), |acc, re| {
+        re.replace_all(&acc, "").into_owned()
+    });
+    let visible = reminder_patterns
+        .iter()
+        .fold(without_send, |acc, re| {
+            re.replace_all(&acc, "").into_owned()
+        })
+        .trim()
+        .to_string();
+    (actions, visible)
+}
+
+fn strip_leading_telegram_meta_block<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix(prefix)?;
+    let closing = rest.find(']')?;
+    Some(rest[closing + 1..].trim_start())
+}
+
+fn sanitize_telegram_visible_text(text: &str) -> String {
+    let mut current = text.trim().to_string();
+
+    loop {
+        if let Some(rest) = strip_leading_telegram_meta_block(&current, "[Telegram from ") {
+            current = rest.to_string();
+            continue;
+        }
+        if let Some(rest) = strip_leading_telegram_meta_block(&current, "[Instructions:") {
+            current = rest.to_string();
+            continue;
+        }
+        break;
+    }
+
+    current
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TelegramActionChatLookup {
+    id: i64,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    first_name: Option<String>,
+    #[serde(default)]
+    last_name: Option<String>,
+}
+
+fn telegram_action_target_matches(
+    target: &str,
+    title: Option<&str>,
+    username: Option<&str>,
+) -> bool {
+    let target = target.trim();
+    let wanted = target
+        .strip_prefix("title:")
+        .or_else(|| target.strip_prefix("username:"))
+        .unwrap_or(target)
+        .trim()
+        .trim_start_matches('@')
+        .to_lowercase();
+
+    if wanted.is_empty() {
+        return false;
+    }
+
+    let title_match = normalize_optional_telegram_value(title)
+        .map(|value| value.trim_start_matches('@').to_lowercase() == wanted)
+        .unwrap_or(false);
+    let username_match = normalize_optional_telegram_value(username)
+        .map(|value| value.trim_start_matches('@').to_lowercase() == wanted)
+        .unwrap_or(false);
+
+    if target.starts_with("title:") {
+        return title_match;
+    }
+    if target.starts_with("username:") || target.starts_with('@') {
+        return username_match;
+    }
+
+    title_match || username_match
+}
+
+async fn fetch_telegram_chat_lookup(
+    http: &Client,
+    base_url: &str,
+    chat_id: i64,
+) -> Result<TelegramActionChatLookup, String> {
+    let url = format!("{}/getChat", base_url);
+    let response = http
+        .post(&url)
+        .json(&serde_json::json!({ "chat_id": chat_id }))
+        .send()
+        .await
+        .map_err(|e| format!("getChat failed for {}: {}", chat_id, e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        return Err(format!("getChat API error {}: {}", status, body_text));
+    }
+
+    let parsed: TelegramResponse<TelegramActionChatLookup> = response
+        .json()
+        .await
+        .map_err(|e| format!("getChat parse failed for {}: {}", chat_id, e))?;
+
+    parsed
+        .result
+        .ok_or_else(|| format!("getChat returned no result for {}", chat_id))
+}
+
+async fn resolve_telegram_action_chat_id(
+    ctx: &ChannelContext,
+    http: &Client,
+    current_chat_id: i64,
+    target: &str,
+) -> Result<(i64, Option<String>), String> {
+    let target = target.trim();
+    if target.is_empty() || target.eq_ignore_ascii_case("current") {
+        return Ok((current_chat_id, None));
+    }
+    if let Some(chat_id) = target.strip_prefix("chat:") {
+        let parsed = chat_id
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| format!("Invalid Telegram chat target '{}'", target))?;
+        return Ok((parsed, None));
+    }
+
+    let mappings = ctx
+        .mission_store
+        .list_telegram_chat_missions(ctx.channel.id)
+        .await?;
+    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+
+    for mapping in mappings {
+        if telegram_action_target_matches(
+            target,
+            mapping.chat_title.as_deref(),
+            mapping.chat_title.as_deref(),
+        ) {
+            return Ok((mapping.chat_id, mapping.chat_title));
+        }
+
+        let lookup = match fetch_telegram_chat_lookup(http, &base_url, mapping.chat_id).await {
+            Ok(lookup) => lookup,
+            Err(error) => {
+                tracing::debug!(
+                    "Failed to backfill Telegram chat {} on channel {}: {}",
+                    mapping.chat_id,
+                    ctx.channel.id,
+                    error
+                );
+                continue;
+            }
+        };
+
+        let resolved_title = normalize_optional_telegram_value(lookup.title.as_deref())
+            .or_else(|| {
+                normalize_optional_telegram_value(lookup.username.as_deref())
+                    .map(|u| format!("@{}", u.trim_start_matches('@')))
+            })
+            .or_else(|| {
+                let first = normalize_optional_telegram_value(lookup.first_name.as_deref());
+                let last = normalize_optional_telegram_value(lookup.last_name.as_deref());
+                match (first, last) {
+                    (Some(first), Some(last)) => Some(format!("{} {}", first, last)),
+                    (Some(first), None) => Some(first),
+                    _ => None,
+                }
+            });
+
+        if resolved_title != mapping.chat_title {
+            let _ = ctx
+                .mission_store
+                .update_telegram_chat_mission_title(
+                    ctx.channel.id,
+                    mapping.chat_id,
+                    resolved_title.clone(),
+                )
+                .await;
+        }
+
+        if telegram_action_target_matches(
+            target,
+            resolved_title.as_deref(),
+            lookup.username.as_deref(),
+        ) {
+            return Ok((lookup.id, resolved_title));
+        }
+    }
+
+    Err(format!("Unknown Telegram chat target '{}'", target))
+}
+
+fn telegram_action_target_parts(target: &str) -> (String, String) {
+    let trimmed = target.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("current") {
+        return ("current".to_string(), "current".to_string());
+    }
+    if let Some(value) = trimmed.strip_prefix("chat:") {
+        return ("chat_id".to_string(), value.trim().to_string());
+    }
+    if let Some(value) = trimmed.strip_prefix("title:") {
+        return ("chat_title".to_string(), value.trim().to_string());
+    }
+    if let Some(value) = trimmed.strip_prefix("username:") {
+        return (
+            "username".to_string(),
+            value.trim().trim_start_matches('@').to_string(),
+        );
+    }
+    if let Some(value) = trimmed.strip_prefix('@') {
+        return ("username".to_string(), value.trim().to_string());
+    }
+    ("chat_title".to_string(), trimmed.to_string())
+}
+
+async fn log_telegram_action_execution(
+    mission_store: &Arc<dyn MissionStore>,
+    channel_id: Uuid,
+    source_mission_id: Uuid,
+    source_chat_id: Option<i64>,
+    target_chat_id: i64,
+    target_chat_title: Option<String>,
+    action_kind: TelegramActionExecutionKind,
+    target_kind: String,
+    target_value: String,
+    text: &str,
+    delay_seconds: u64,
+    scheduled_message_id: Option<Uuid>,
+    status: TelegramActionExecutionStatus,
+    last_error: Option<String>,
+) {
+    let now = now_string();
+    let execution = TelegramActionExecution {
+        id: Uuid::new_v4(),
+        channel_id,
+        source_mission_id: Some(source_mission_id),
+        source_chat_id,
+        target_chat_id,
+        target_chat_title,
+        action_kind,
+        target_kind,
+        target_value,
+        text: text.to_string(),
+        delay_seconds,
+        scheduled_message_id,
+        status,
+        last_error,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    if let Err(error) = mission_store
+        .create_telegram_action_execution(execution)
+        .await
+    {
+        tracing::warn!(
+            channel_id = %channel_id,
+            mission_id = %source_mission_id,
+            "Failed to record Telegram action execution: {}",
+            error
+        );
+    }
+}
+
+async fn execute_telegram_actions(
+    bridge: &SharedTelegramBridge,
+    channel_id: Uuid,
+    current_chat_id: i64,
+    source_mission_id: Uuid,
+    actions: &[TelegramAction],
+) -> Result<(), String> {
+    if actions.is_empty() {
+        return Ok(());
+    }
+
+    let ctx = bridge
+        .get_channel_context(channel_id)
+        .await
+        .ok_or_else(|| format!("Telegram channel {} is not active", channel_id))?;
+    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+
+    for action in actions {
+        let (chat_id, chat_title) =
+            resolve_telegram_action_chat_id(&ctx, &bridge.http, current_chat_id, &action.target)
+                .await?;
+        let (target_kind, target_value) = telegram_action_target_parts(&action.target);
+        let execution_kind = match action.kind {
+            TelegramActionKind::Send => TelegramActionExecutionKind::Send,
+            TelegramActionKind::Reminder => TelegramActionExecutionKind::Reminder,
+        };
+
+        let delay_seconds = match action.kind {
+            TelegramActionKind::Send => action.delay_seconds,
+            TelegramActionKind::Reminder => action.delay_seconds.max(1),
+        };
+
+        if delay_seconds == 0 {
+            match send_chunked_message(&bridge.http, &base_url, chat_id, &action.text, None).await {
+                Ok(()) => {
+                    log_telegram_action_execution(
+                        &ctx.mission_store,
+                        channel_id,
+                        source_mission_id,
+                        Some(current_chat_id),
+                        chat_id,
+                        chat_title.clone(),
+                        execution_kind,
+                        target_kind,
+                        target_value,
+                        &action.text,
+                        0,
+                        None,
+                        TelegramActionExecutionStatus::Sent,
+                        None,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    log_telegram_action_execution(
+                        &ctx.mission_store,
+                        channel_id,
+                        source_mission_id,
+                        Some(current_chat_id),
+                        chat_id,
+                        chat_title.clone(),
+                        execution_kind,
+                        target_kind,
+                        target_value,
+                        &action.text,
+                        0,
+                        None,
+                        TelegramActionExecutionStatus::Failed,
+                        Some(error.clone()),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+            continue;
+        }
+
+        let scheduled = TelegramScheduledMessage {
+            id: Uuid::new_v4(),
+            channel_id,
+            source_mission_id: Some(source_mission_id),
+            chat_id,
+            chat_title: chat_title.clone(),
+            text: action.text.clone(),
+            send_at: (Utc::now() + ChronoDuration::seconds(delay_seconds as i64)).to_rfc3339(),
+            sent_at: None,
+            status: TelegramScheduledMessageStatus::Pending,
+            last_error: None,
+            created_at: now_string(),
+        };
+        ctx.mission_store
+            .create_telegram_scheduled_message(scheduled.clone())
+            .await?;
+        log_telegram_action_execution(
+            &ctx.mission_store,
+            channel_id,
+            source_mission_id,
+            Some(current_chat_id),
+            chat_id,
+            chat_title,
+            execution_kind,
+            target_kind,
+            target_value,
+            &action.text,
+            delay_seconds,
+            Some(scheduled.id),
+            TelegramActionExecutionStatus::Pending,
+            None,
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+pub async fn execute_native_telegram_action(
+    bridge: &SharedTelegramBridge,
+    mission_store: &Arc<dyn MissionStore>,
+    source_mission_id: Uuid,
+    target: TelegramActionTarget,
+    text: &str,
+    delay_seconds: u64,
+) -> Result<TelegramActionExecutionResult, String> {
+    let mapping = mission_store
+        .get_telegram_chat_mission_by_mission_id(source_mission_id)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "Mission {} is not linked to an active Telegram chat",
+                source_mission_id
+            )
+        })?;
+
+    let ctx = bridge
+        .get_channel_context(mapping.channel_id)
+        .await
+        .ok_or_else(|| format!("Telegram channel {} is not active", mapping.channel_id))?;
+    let (target_spec, target_kind, target_value) = match target {
+        TelegramActionTarget::Current => (
+            "current".to_string(),
+            "current".to_string(),
+            "current".to_string(),
+        ),
+        TelegramActionTarget::ChatId(chat_id) => (
+            format!("chat:{}", chat_id),
+            "chat_id".to_string(),
+            chat_id.to_string(),
+        ),
+        TelegramActionTarget::ChatTitle(title) => {
+            (format!("title:{}", title), "chat_title".to_string(), title)
+        }
+    };
+    let (chat_id, chat_title) =
+        resolve_telegram_action_chat_id(&ctx, bridge.http(), mapping.chat_id, &target_spec).await?;
+
+    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+    let execution_kind = if delay_seconds > 0 && target_spec == "current" {
+        TelegramActionExecutionKind::Reminder
+    } else {
+        TelegramActionExecutionKind::Send
+    };
+    if delay_seconds == 0 {
+        match send_chunked_message(bridge.http(), &base_url, chat_id, text, None).await {
+            Ok(()) => {
+                log_telegram_action_execution(
+                    mission_store,
+                    mapping.channel_id,
+                    source_mission_id,
+                    Some(mapping.chat_id),
+                    chat_id,
+                    chat_title.clone(),
+                    execution_kind.clone(),
+                    target_kind,
+                    target_value,
+                    text,
+                    0,
+                    None,
+                    TelegramActionExecutionStatus::Sent,
+                    None,
+                )
+                .await;
+            }
+            Err(error) => {
+                log_telegram_action_execution(
+                    mission_store,
+                    mapping.channel_id,
+                    source_mission_id,
+                    Some(mapping.chat_id),
+                    chat_id,
+                    chat_title.clone(),
+                    execution_kind,
+                    target_kind,
+                    target_value,
+                    text,
+                    0,
+                    None,
+                    TelegramActionExecutionStatus::Failed,
+                    Some(error.clone()),
+                )
+                .await;
+                return Err(error);
+            }
+        }
+        return Ok(TelegramActionExecutionResult {
+            channel_id: mapping.channel_id,
+            chat_id,
+            chat_title,
+            scheduled_message_id: None,
+            immediate: true,
+        });
+    }
+
+    let scheduled = TelegramScheduledMessage {
+        id: Uuid::new_v4(),
+        channel_id: mapping.channel_id,
+        source_mission_id: Some(source_mission_id),
+        chat_id,
+        chat_title: chat_title.clone(),
+        text: text.to_string(),
+        send_at: (Utc::now() + ChronoDuration::seconds(delay_seconds as i64)).to_rfc3339(),
+        sent_at: None,
+        status: TelegramScheduledMessageStatus::Pending,
+        last_error: None,
+        created_at: now_string(),
+    };
+    ctx.mission_store
+        .create_telegram_scheduled_message(scheduled.clone())
+        .await?;
+    log_telegram_action_execution(
+        mission_store,
+        mapping.channel_id,
+        source_mission_id,
+        Some(mapping.chat_id),
+        chat_id,
+        chat_title.clone(),
+        execution_kind,
+        target_kind,
+        target_value,
+        text,
+        delay_seconds,
+        Some(scheduled.id),
+        TelegramActionExecutionStatus::Pending,
+        None,
+    )
+    .await;
+
+    Ok(TelegramActionExecutionResult {
+        channel_id: mapping.channel_id,
+        chat_id,
+        chat_title,
+        scheduled_message_id: Some(scheduled.id),
+        immediate: false,
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Streaming response (typing indicator + progressive edits)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -939,14 +2190,14 @@ pub async fn stream_response(
     bot_token: &str,
     chat_id: i64,
     reply_to: i64,
+    expected_user_message_id: Option<Uuid>,
     mission_id: Uuid,
+    bridge: Option<SharedTelegramBridge>,
+    channel_id: Option<Uuid>,
 ) -> Result<(), String> {
     let base_url = format!("https://api.telegram.org/bot{}", bot_token);
     let timeout = tokio::time::Duration::from_secs(300);
     let deadline = tokio::time::Instant::now() + timeout;
-
-    // Send typing indicator immediately
-    send_chat_action(http, &base_url, chat_id).await;
 
     let mut sent_message_id: Option<i64> = None;
     let mut accumulated_text = String::new();
@@ -954,6 +2205,10 @@ pub async fn stream_response(
     let edit_interval = tokio::time::Duration::from_millis(1500);
     let mut typing_interval = tokio::time::interval(tokio::time::Duration::from_secs(4));
     typing_interval.tick().await; // consume the first immediate tick
+    let mut request_started = expected_user_message_id.is_none();
+    if request_started {
+        send_chat_action(http, &base_url, chat_id).await;
+    }
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -961,7 +2216,10 @@ pub async fn stream_response(
             // If we sent a partial message, finalize it
             if let Some(msg_id) = sent_message_id {
                 if !accumulated_text.is_empty() {
-                    let final_text = format!("{}...\n\n_(timed out)_", accumulated_text);
+                    let final_text = format!(
+                        "{}...\n\n_(timed out)_",
+                        sanitize_telegram_visible_text(&accumulated_text)
+                    );
                     let display = truncate_for_telegram(&final_text);
                     let _ = edit_message(http, &base_url, chat_id, msg_id, &display.html).await;
                 }
@@ -972,17 +2230,41 @@ pub async fn stream_response(
         tokio::select! {
             event = events_rx.recv() => {
                 match event {
+                    Ok(AgentEvent::UserMessage {
+                        id,
+                        queued,
+                        mission_id: Some(mid),
+                        ..
+                    }) if Some(id) == expected_user_message_id && mid == mission_id => {
+                        if !queued && !request_started {
+                            request_started = true;
+                            send_chat_action(http, &base_url, chat_id).await;
+                        }
+                    }
                     Ok(AgentEvent::TextDelta {
                         content,
                         mission_id: Some(mid),
                         ..
-                    }) if mid == mission_id => {
+                    }) if request_started && mid == mission_id => {
                         accumulated_text = content;
+
+                        if accumulated_text.contains("<telegram-send")
+                            || accumulated_text.contains("<telegram-reminder")
+                            || accumulated_text.contains("[telegram-send")
+                            || accumulated_text.contains("[telegram-reminder")
+                        {
+                            continue;
+                        }
+
+                        let display_text = sanitize_telegram_visible_text(&accumulated_text);
+                        if display_text.is_empty() {
+                            continue;
+                        }
 
                         if let Some(msg_id) = sent_message_id {
                             if last_edit.elapsed() >= edit_interval {
                                 // Throttled edit
-                                let display = truncate_for_telegram(&accumulated_text);
+                                let display = truncate_for_telegram(&display_text);
                                 if let Err(e) = edit_message(http, &base_url, chat_id, msg_id, &display.html).await {
                                     tracing::warn!(
                                         mission_id = %mission_id,
@@ -995,14 +2277,64 @@ pub async fn stream_response(
                         } else {
                             // Send initial message
                             let reply = if reply_to > 0 { Some(reply_to) } else { None };
-                            match send_message(http, &base_url, chat_id, &accumulated_text, reply).await {
-                                Ok(msg_id) => {
+                            let existing_message_id = if let (Some(bridge), Some(channel_id)) =
+                                (bridge.as_ref(), channel_id)
+                            {
+                                bridge
+                                    .get_sent_reply_message(channel_id, chat_id, reply_to)
+                                    .await
+                            } else {
+                                None
+                            };
+
+                            match existing_message_id {
+                                Some(msg_id) => {
                                     sent_message_id = Some(msg_id);
+                                    let display = truncate_for_telegram(&display_text);
+                                    if let Err(e) =
+                                        edit_message(http, &base_url, chat_id, msg_id, &display.html).await
+                                    {
+                                        tracing::warn!(
+                                            mission_id = %mission_id,
+                                            message_id = msg_id,
+                                            "Failed to edit deduplicated Telegram message during streaming: {}",
+                                            e
+                                        );
+                                    }
                                     last_edit = tokio::time::Instant::now();
                                 }
-                                Err(e) => {
-                                    tracing::warn!("Failed to send initial Telegram message: {}", e);
-                                }
+                                None => match send_message(
+                                    http,
+                                    &base_url,
+                                    chat_id,
+                                    &display_text,
+                                    reply,
+                                )
+                                .await
+                                {
+                                    Ok(msg_id) => {
+                                        sent_message_id = Some(msg_id);
+                                        if let (Some(bridge), Some(channel_id)) =
+                                            (bridge.as_ref(), channel_id)
+                                        {
+                                            bridge
+                                                .remember_sent_reply_message(
+                                                    channel_id,
+                                                    chat_id,
+                                                    reply_to,
+                                                    msg_id,
+                                                )
+                                                .await;
+                                        }
+                                        last_edit = tokio::time::Instant::now();
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to send initial Telegram message: {}",
+                                            e
+                                        );
+                                    }
+                                },
                             }
                         }
                     }
@@ -1011,11 +2343,51 @@ pub async fn stream_response(
                         mission_id: Some(mid),
                         shared_files,
                         ..
-                    }) if mid == mission_id => {
+                    }) if request_started && mid == mission_id => {
+                        let (actions, visible_content) = extract_telegram_actions(&content);
+                        let mut delivery_text = if actions.is_empty() {
+                            content.clone()
+                        } else {
+                            visible_content
+                        };
+                        delivery_text = sanitize_telegram_visible_text(&delivery_text);
+
+                        if !actions.is_empty() {
+                            if let (Some(bridge), Some(channel_id)) = (bridge.as_ref(), channel_id) {
+                                if let Err(err) = execute_telegram_actions(
+                                    bridge,
+                                    channel_id,
+                                    chat_id,
+                                    mission_id,
+                                    &actions,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        "Failed to execute Telegram actions: {}",
+                                        err
+                                    );
+                                    if delivery_text.trim().is_empty() {
+                                        delivery_text = format!(
+                                            "I couldn't complete the Telegram action: {}",
+                                            err
+                                        );
+                                    }
+                                }
+                            } else if delivery_text.trim().is_empty() {
+                                delivery_text =
+                                    "Telegram action requested, but no active bridge was available."
+                                        .to_string();
+                            }
+                        }
+
                         // Final response — send or edit with complete text
-                        if let Some(msg_id) = sent_message_id {
+                        if delivery_text.trim().is_empty() {
+                            return Ok(());
+                        } else if let Some(msg_id) = sent_message_id {
                             // Edit existing message with final content
-                            let display = truncate_for_telegram(&content);
+                            let display = truncate_for_telegram(&delivery_text);
                             if let Err(e) = edit_message(http, &base_url, chat_id, msg_id, &display.html).await {
                                 tracing::warn!(
                                     mission_id = %mission_id,
@@ -1024,21 +2396,21 @@ pub async fn stream_response(
                                 );
                                 // Fallback: send entire content as new chunked messages.
                                 // Skip overflow below since chunked send handles the full content.
-                                let _ = send_chunked_message(http, &base_url, chat_id, &content, None).await;
+                                let _ = send_chunked_message(http, &base_url, chat_id, &delivery_text, None).await;
                             } else {
                                 // Edit succeeded — send overflow chunks for content beyond the first 4096 chars
                                 send_overflow_chunks(
                                     http,
                                     &base_url,
                                     chat_id,
-                                    &content,
+                                    &delivery_text,
                                     display.source_boundary,
                                 )
                                 .await;
                             }
                         } else {
                             // No streaming happened, send the full response directly
-                            send_chunked_message(http, &base_url, chat_id, &content, Some(reply_to)).await?;
+                            send_chunked_message(http, &base_url, chat_id, &delivery_text, Some(reply_to)).await?;
                         }
 
                         // Send shared files as Telegram documents/photos
@@ -1056,7 +2428,7 @@ pub async fn stream_response(
                         message,
                         mission_id: Some(mid),
                         ..
-                    }) if mid == mission_id => {
+                    }) if request_started && mid == mission_id => {
                         let error_msg = format!("Error: {}", message);
                         if let Some(msg_id) = sent_message_id {
                             let final_text = if accumulated_text.is_empty() {
@@ -1074,7 +2446,7 @@ pub async fn stream_response(
                     Ok(AgentEvent::Thinking {
                         mission_id: Some(mid),
                         ..
-                    }) if mid == mission_id => {
+                    }) if request_started && mid == mission_id => {
                         // Keep sending typing indicator while agent is thinking
                         send_chat_action(http, &base_url, chat_id).await;
                     }
@@ -1091,7 +2463,7 @@ pub async fn stream_response(
             }
             _ = typing_interval.tick() => {
                 // Keep typing indicator alive every 4s while waiting
-                if sent_message_id.is_none() {
+                if request_started && sent_message_id.is_none() {
                     send_chat_action(http, &base_url, chat_id).await;
                 }
             }
@@ -1629,7 +3001,16 @@ async fn send_chunked_message(
 
 #[cfg(test)]
 mod tests {
-    use super::{markdown_to_telegram_html, render_telegram_chunk, truncate_for_telegram};
+    use super::{
+        build_internal_telegram_action_token, extract_structured_memory_from_text,
+        extract_telegram_actions, format_structured_memory_context, markdown_to_telegram_html,
+        render_telegram_chunk, sanitize_telegram_visible_text, scope_for_extracted_memory,
+        telegram_action_target_matches, telegram_chat_display_title, truncate_for_telegram,
+        verify_internal_telegram_action_token, Chat, ExtractedTelegramMemory, TelegramAction,
+        TelegramActionKind, TelegramBridge, TelegramMemorySubject, TelegramStructuredMemoryEntry,
+        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
+    };
+    use uuid::Uuid;
 
     #[test]
     fn truncate_for_telegram_preserves_valid_html_boundaries() {
@@ -1659,6 +3040,288 @@ mod tests {
             rendered.html,
             markdown_to_telegram_html(&text[..rendered.source_boundary])
         );
+    }
+
+    #[tokio::test]
+    async fn telegram_bridge_deduplicates_updates_per_channel() {
+        let bridge = TelegramBridge::new();
+        let channel_id = Uuid::new_v4();
+
+        assert!(bridge.register_update_once(channel_id, 42).await);
+        assert!(!bridge.register_update_once(channel_id, 42).await);
+        assert!(bridge.register_update_once(channel_id, 43).await);
+        assert!(bridge.register_update_once(Uuid::new_v4(), 42).await);
+    }
+
+    #[tokio::test]
+    async fn telegram_bridge_reuses_sent_reply_message_for_same_inbound_message() {
+        let bridge = TelegramBridge::new();
+        let channel_id = Uuid::new_v4();
+
+        assert_eq!(
+            bridge.get_sent_reply_message(channel_id, 123, 456).await,
+            None
+        );
+
+        bridge
+            .remember_sent_reply_message(channel_id, 123, 456, 789)
+            .await;
+
+        assert_eq!(
+            bridge.get_sent_reply_message(channel_id, 123, 456).await,
+            Some(789)
+        );
+        assert_eq!(
+            bridge.get_sent_reply_message(channel_id, 123, 999).await,
+            None
+        );
+    }
+
+    #[test]
+    fn extract_telegram_actions_strips_tags_from_visible_response() {
+        let content = concat!(
+            "<telegram-reminder delay_seconds=\"60\">RAPPEL_TEST_1_OK</telegram-reminder>\n",
+            "<telegram-send target=\"title:LFG Labs\">CROSS_CHANNEL_OK</telegram-send>\n",
+            "DONE"
+        );
+
+        let (actions, visible) = extract_telegram_actions(content);
+
+        assert_eq!(visible, "DONE");
+        assert_eq!(
+            actions,
+            vec![
+                TelegramAction {
+                    kind: TelegramActionKind::Send,
+                    target: "title:LFG Labs".to_string(),
+                    delay_seconds: 0,
+                    text: "CROSS_CHANNEL_OK".to_string(),
+                },
+                TelegramAction {
+                    kind: TelegramActionKind::Reminder,
+                    target: "current".to_string(),
+                    delay_seconds: 60,
+                    text: "RAPPEL_TEST_1_OK".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_telegram_actions_accepts_bracket_syntax() {
+        let content = concat!(
+            "[telegram-reminder delay_seconds=\"60\"]RAPPEL_TEST_2_OK[/telegram-reminder]\n",
+            "DONE"
+        );
+
+        let (actions, visible) = extract_telegram_actions(content);
+
+        assert_eq!(visible, "DONE");
+        assert_eq!(
+            actions,
+            vec![TelegramAction {
+                kind: TelegramActionKind::Reminder,
+                target: "current".to_string(),
+                delay_seconds: 60,
+                text: "RAPPEL_TEST_2_OK".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn telegram_chat_display_title_prefers_title_then_username() {
+        let group_chat = Chat {
+            id: -100,
+            chat_type: "group".to_string(),
+            title: Some("LFG Labs".to_string()),
+            username: Some("lfg_labs".to_string()),
+            first_name: None,
+            last_name: None,
+        };
+        let private_chat = Chat {
+            id: 42,
+            chat_type: "private".to_string(),
+            title: None,
+            username: Some("th0rgal".to_string()),
+            first_name: Some("Thomas".to_string()),
+            last_name: None,
+        };
+
+        assert_eq!(
+            telegram_chat_display_title(&group_chat).as_deref(),
+            Some("LFG Labs")
+        );
+        assert_eq!(
+            telegram_chat_display_title(&private_chat).as_deref(),
+            Some("@th0rgal")
+        );
+    }
+
+    #[test]
+    fn telegram_action_target_matches_title_and_username_variants() {
+        assert!(telegram_action_target_matches(
+            "title:LFG Labs",
+            Some("LFG Labs"),
+            Some("lfg_labs")
+        ));
+        assert!(telegram_action_target_matches(
+            "username:lfg_labs",
+            Some("LFG Labs"),
+            Some("lfg_labs")
+        ));
+        assert!(telegram_action_target_matches(
+            "@lfg_labs",
+            Some("LFG Labs"),
+            Some("lfg_labs")
+        ));
+        assert!(telegram_action_target_matches(
+            "LFG Labs",
+            Some("LFG Labs"),
+            Some("lfg_labs")
+        ));
+        assert!(!telegram_action_target_matches(
+            "title:Other",
+            Some("LFG Labs"),
+            Some("lfg_labs")
+        ));
+    }
+
+    #[test]
+    fn sanitize_telegram_visible_text_strips_internal_prefixes() {
+        let raw =
+            "[Telegram from @th0rgal in chat 1139694048] [Instructions: Do the thing] BETA-99";
+        assert_eq!(sanitize_telegram_visible_text(raw), "BETA-99");
+    }
+
+    #[test]
+    fn extract_structured_memory_captures_fact_from_remember_clause() {
+        let entries =
+            extract_structured_memory_from_text("Souviens-toi que mon surnom est ORION-5.");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, TelegramStructuredMemoryKind::Fact);
+        assert_eq!(entries[0].label.as_deref(), Some("surnom"));
+        assert_eq!(entries[0].value, "ORION-5");
+    }
+
+    #[test]
+    fn extract_structured_memory_falls_back_to_note() {
+        let entries = extract_structured_memory_from_text(
+            "Remember that I prefer sharp, direct answers in French.",
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, TelegramStructuredMemoryKind::Note);
+        assert_eq!(entries[0].label, None);
+        assert_eq!(entries[0].value, "I prefer sharp, direct answers in French");
+    }
+
+    #[test]
+    fn extract_structured_memory_captures_preference() {
+        let entries = extract_structured_memory_from_text("J'aime les réponses courtes.");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, TelegramStructuredMemoryKind::Preference);
+        assert_eq!(entries[0].label, None);
+        assert_eq!(entries[0].value, "les réponses courtes");
+    }
+
+    #[test]
+    fn extract_structured_memory_ignores_follow_up_reply_instruction() {
+        let entries = extract_structured_memory_from_text(
+            "Souviens-toi que mon surnom est ORION-9. Réponds DONE.",
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, TelegramStructuredMemoryKind::Fact);
+        assert_eq!(entries[0].label.as_deref(), Some("surnom"));
+        assert_eq!(entries[0].value, "ORION-9");
+    }
+
+    #[test]
+    fn extract_structured_memory_does_not_store_questions() {
+        let entries = extract_structured_memory_from_text("Quel est mon surnom ?");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn user_facts_are_scoped_to_the_sender_when_available() {
+        let scope = scope_for_extracted_memory(
+            &ExtractedTelegramMemory {
+                kind: TelegramStructuredMemoryKind::Fact,
+                label: Some("surnom".to_string()),
+                value: "ORION-10".to_string(),
+            },
+            &TelegramMemorySubject {
+                user_id: Some(42),
+                username: Some("th0rgal".to_string()),
+                display_name: Some("@th0rgal".to_string()),
+            },
+        );
+
+        assert_eq!(scope, TelegramStructuredMemoryScope::User);
+    }
+
+    #[test]
+    fn structured_memory_context_groups_user_and_chat_scopes() {
+        let entries = vec![
+            TelegramStructuredMemoryEntry {
+                id: Uuid::new_v4(),
+                channel_id: Uuid::new_v4(),
+                chat_id: 1,
+                mission_id: None,
+                scope: TelegramStructuredMemoryScope::User,
+                kind: TelegramStructuredMemoryKind::Fact,
+                label: Some("surnom".to_string()),
+                value: "ORION-10".to_string(),
+                subject_user_id: Some(42),
+                subject_username: Some("th0rgal".to_string()),
+                subject_display_name: Some("@th0rgal".to_string()),
+                source_message_id: Some(10),
+                source_role: "user".to_string(),
+                created_at: "2026-04-07T00:00:00Z".to_string(),
+                updated_at: "2026-04-07T00:00:00Z".to_string(),
+            },
+            TelegramStructuredMemoryEntry {
+                id: Uuid::new_v4(),
+                channel_id: Uuid::new_v4(),
+                chat_id: 1,
+                mission_id: None,
+                scope: TelegramStructuredMemoryScope::Chat,
+                kind: TelegramStructuredMemoryKind::Note,
+                label: None,
+                value: "Projet lié à LFG".to_string(),
+                subject_user_id: None,
+                subject_username: None,
+                subject_display_name: None,
+                source_message_id: Some(11),
+                source_role: "user".to_string(),
+                created_at: "2026-04-07T00:00:00Z".to_string(),
+                updated_at: "2026-04-07T00:00:00Z".to_string(),
+            },
+        ];
+
+        let rendered = format_structured_memory_context(&entries).expect("memory context");
+        assert!(rendered.contains("User memory:"));
+        assert!(rendered.contains("Chat memory:"));
+        assert!(rendered.contains("surnom = ORION-10"));
+        assert!(rendered.contains("Projet lié à LFG"));
+    }
+
+    #[test]
+    fn internal_telegram_action_token_round_trip() {
+        let mission_id = Uuid::new_v4();
+        std::env::set_var("SANDBOXED_INTERNAL_ACTION_SECRET", "telegram-test-secret");
+        let token = build_internal_telegram_action_token(mission_id)
+            .expect("token should be derived when internal secret is configured");
+
+        assert!(verify_internal_telegram_action_token(mission_id, &token));
+        assert!(!verify_internal_telegram_action_token(
+            Uuid::new_v4(),
+            &token
+        ));
+
+        std::env::remove_var("SANDBOXED_INTERNAL_ACTION_SECRET");
     }
 }
 

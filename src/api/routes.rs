@@ -529,6 +529,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/telegram/webhook/:channel_id",
             post(control::telegram_webhook_receiver),
         )
+        .route(
+            "/api/control/telegram/actions/internal",
+            post(control::execute_telegram_action_internal_api),
+        )
         // WebSocket console uses subprotocol-based auth (browser can't set Authorization header)
         .route("/api/console/ws", get(console::console_ws))
         // WebSocket workspace shell uses subprotocol-based auth
@@ -711,8 +715,28 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(control::list_bot_chats),
         )
         .route(
+            "/api/control/telegram/bots/:id/scheduled",
+            get(control::list_bot_scheduled_messages),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/actions",
+            get(control::list_bot_action_executions),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/memory",
+            get(control::list_bot_structured_memory),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/memory-search",
+            get(control::search_bot_structured_memory),
+        )
+        .route(
             "/api/control/telegram/send",
             post(control::send_telegram_message_api),
+        )
+        .route(
+            "/api/control/telegram/actions",
+            post(control::execute_telegram_action_api),
         )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))

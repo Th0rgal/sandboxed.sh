@@ -38,6 +38,85 @@ export interface TelegramChatMission {
   created_at: string;
 }
 
+export type TelegramScheduledMessageStatus = "pending" | "sent" | "failed";
+
+export interface TelegramScheduledMessage {
+  id: string;
+  channel_id: string;
+  source_mission_id: string | null;
+  chat_id: number;
+  chat_title: string | null;
+  text: string;
+  send_at: string;
+  sent_at: string | null;
+  status: TelegramScheduledMessageStatus;
+  last_error: string | null;
+  created_at: string;
+}
+
+export type TelegramStructuredMemoryKind = "fact" | "note" | "task" | "preference";
+export type TelegramStructuredMemoryScope = "chat" | "user" | "channel";
+
+export interface TelegramStructuredMemoryEntry {
+  id: string;
+  channel_id: string;
+  chat_id: number;
+  mission_id: string | null;
+  scope: TelegramStructuredMemoryScope;
+  kind: TelegramStructuredMemoryKind;
+  label: string | null;
+  value: string;
+  subject_user_id: number | null;
+  subject_username: string | null;
+  subject_display_name: string | null;
+  source_message_id: number | null;
+  source_role: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TelegramStructuredMemorySearchHit {
+  entry: TelegramStructuredMemoryEntry;
+  score: number;
+  matched_terms: string[];
+  reasons: string[];
+}
+
+export type TelegramActionExecutionStatus = "pending" | "sent" | "failed";
+export type TelegramActionExecutionKind = "send" | "reminder";
+
+export interface TelegramActionExecution {
+  id: string;
+  channel_id: string;
+  source_mission_id: string | null;
+  source_chat_id: number | null;
+  target_chat_id: number;
+  target_chat_title: string | null;
+  action_kind: TelegramActionExecutionKind;
+  target_kind: string;
+  target_value: string;
+  text: string;
+  delay_seconds: number;
+  scheduled_message_id: string | null;
+  status: TelegramActionExecutionStatus;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type TelegramActionTarget =
+  | { kind: "current" }
+  | { kind: "chat_id"; value: number }
+  | { kind: "chat_title"; value: string };
+
+export interface TelegramActionExecutionResult {
+  channel_id: string;
+  chat_id: number;
+  chat_title: string | null;
+  scheduled_message_id?: string | null;
+  immediate: boolean;
+}
+
 export interface CreateTelegramChannelInput {
   bot_token: string;
   bot_username?: string;
@@ -138,3 +217,78 @@ export async function listBotChats(botId: string): Promise<TelegramChatMission[]
   );
 }
 
+export async function listBotScheduledMessages(
+  botId: string,
+  options?: { chat_id?: number; limit?: number }
+): Promise<TelegramScheduledMessage[]> {
+  const params = new URLSearchParams();
+  if (options?.chat_id !== undefined) params.set("chat_id", String(options.chat_id));
+  if (options?.limit !== undefined) params.set("limit", String(options.limit));
+  const qs = params.toString();
+  return apiGet<TelegramScheduledMessage[]>(
+    `/api/control/telegram/bots/${botId}/scheduled${qs ? `?${qs}` : ""}`,
+    "Failed to fetch scheduled Telegram messages"
+  );
+}
+
+export async function listBotStructuredMemory(
+  botId: string,
+  options?: { chat_id?: number; limit?: number; q?: string; subject_user_id?: number }
+): Promise<TelegramStructuredMemoryEntry[]> {
+  const params = new URLSearchParams();
+  if (options?.chat_id !== undefined) params.set("chat_id", String(options.chat_id));
+  if (options?.limit !== undefined) params.set("limit", String(options.limit));
+  if (options?.q) params.set("q", options.q);
+  if (options?.subject_user_id !== undefined) {
+    params.set("subject_user_id", String(options.subject_user_id));
+  }
+  const qs = params.toString();
+  return apiGet<TelegramStructuredMemoryEntry[]>(
+    `/api/control/telegram/bots/${botId}/memory${qs ? `?${qs}` : ""}`,
+    "Failed to fetch Telegram structured memory"
+  );
+}
+
+export async function searchBotStructuredMemory(
+  botId: string,
+  options: { q: string; chat_id?: number; limit?: number; subject_user_id?: number }
+): Promise<TelegramStructuredMemorySearchHit[]> {
+  const params = new URLSearchParams();
+  params.set("q", options.q);
+  if (options.chat_id !== undefined) params.set("chat_id", String(options.chat_id));
+  if (options.limit !== undefined) params.set("limit", String(options.limit));
+  if (options.subject_user_id !== undefined) {
+    params.set("subject_user_id", String(options.subject_user_id));
+  }
+  return apiGet<TelegramStructuredMemorySearchHit[]>(
+    `/api/control/telegram/bots/${botId}/memory-search?${params.toString()}`,
+    "Failed to search Telegram structured memory"
+  );
+}
+
+export async function listBotActionExecutions(
+  botId: string,
+  options?: { chat_id?: number; limit?: number }
+): Promise<TelegramActionExecution[]> {
+  const params = new URLSearchParams();
+  if (options?.chat_id !== undefined) params.set("chat_id", String(options.chat_id));
+  if (options?.limit !== undefined) params.set("limit", String(options.limit));
+  const qs = params.toString();
+  return apiGet<TelegramActionExecution[]>(
+    `/api/control/telegram/bots/${botId}/actions${qs ? `?${qs}` : ""}`,
+    "Failed to fetch Telegram action executions"
+  );
+}
+
+export async function executeTelegramAction(input: {
+  mission_id: string;
+  text: string;
+  delay_seconds?: number;
+  target?: TelegramActionTarget;
+}): Promise<TelegramActionExecutionResult> {
+  return apiPost<TelegramActionExecutionResult>(
+    `/api/control/telegram/actions`,
+    input,
+    "Failed to execute Telegram action"
+  );
+}
