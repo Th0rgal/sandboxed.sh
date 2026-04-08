@@ -178,7 +178,7 @@ if __name__ == "__main__":
     const WRAPPER: &str = r#"#!/bin/sh
 set -eu
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-exec python3 "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
+exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
 "#;
 
     if let Err(error) = std::fs::write(&wrapper_path, WRAPPER) {
@@ -5184,7 +5184,7 @@ fn is_rate_limited_error(message: &str) -> bool {
         "status code: 429",
         "status code: 529",
         "out of extra usage",
-        "out of usage",
+        "out of regular usage",
     ];
 
     RATE_LIMIT_MARKERS
@@ -9398,7 +9398,11 @@ pub async fn run_opencode_turn(
         "OpenCode CLI args prepared (shell wrapper)"
     );
 
-    write_telegram_action_cli_helpers(work_dir);
+    let telegram_action_helpers_enabled =
+        message.contains("[Telegram from ") || message.contains("[Telegram workflow reply ");
+    if telegram_action_helpers_enabled {
+        write_telegram_action_cli_helpers(work_dir);
+    }
 
     // Build environment variables
     let mut env: HashMap<String, String> = HashMap::new();
@@ -9410,42 +9414,45 @@ pub async fn run_opencode_turn(
     } else if let Ok(port) = std::env::var("PORT") {
         env.insert("API_URL".to_string(), format!("http://127.0.0.1:{}", port));
     }
-    if let Some(token) = crate::api::telegram::build_internal_telegram_action_token(mission_id) {
-        env.insert("TELEGRAM_ACTION_TOKEN".to_string(), token);
-    }
-    let internal_api_url = std::env::var("PORT")
-        .ok()
-        .filter(|port| !port.trim().is_empty())
-        .map(|port| format!("http://127.0.0.1:{}", port))
-        .or_else(|| env.get("API_URL").cloned());
-    if let Some(api_url) = internal_api_url {
+    if telegram_action_helpers_enabled {
+        if let Some(token) = crate::api::telegram::build_internal_telegram_action_token(mission_id)
+        {
+            env.insert("TELEGRAM_ACTION_TOKEN".to_string(), token);
+        }
+        let internal_api_url = std::env::var("PORT")
+            .ok()
+            .filter(|port| !port.trim().is_empty())
+            .map(|port| format!("http://127.0.0.1:{}", port))
+            .or_else(|| env.get("API_URL").cloned());
+        if let Some(api_url) = internal_api_url {
+            env.insert(
+                "TELEGRAM_ACTION_URL".to_string(),
+                format!("{}/api/control/telegram/actions/internal", api_url),
+            );
+            env.insert(
+                "TELEGRAM_WORKFLOW_URL".to_string(),
+                format!(
+                    "{}/api/control/telegram/workflows/request/internal",
+                    api_url
+                ),
+            );
+        }
         env.insert(
-            "TELEGRAM_ACTION_URL".to_string(),
-            format!("{}/api/control/telegram/actions/internal", api_url),
+            "TELEGRAM_ACTION_CLI".to_string(),
+            format!("{}/.sandboxed-sh-telegram-action.py", work_dir_arg),
         );
         env.insert(
-            "TELEGRAM_WORKFLOW_URL".to_string(),
-            format!(
-                "{}/api/control/telegram/workflows/request/internal",
-                api_url
-            ),
+            "TELEGRAM_ACTION_COMMAND".to_string(),
+            format!("{}/telegram-action", work_dir_arg),
         );
     }
-    env.insert(
-        "TELEGRAM_ACTION_CLI".to_string(),
-        ".sandboxed-sh-telegram-action.py".to_string(),
-    );
-    env.insert(
-        "TELEGRAM_ACTION_COMMAND".to_string(),
-        "telegram-action".to_string(),
-    );
 
     // Ensure bun's global bin directories are in PATH so that oh-my-opencode
     // can find the `opencode` binary installed via `bun install -g opencode-ai`.
     {
         let current_path = std::env::var("PATH").unwrap_or_default();
         let bun_bins = "/root/.bun/bin:/root/.cache/.bun/bin";
-        let mut path_parts = vec![work_dir_arg.clone()];
+        let mut path_parts = Vec::new();
         if !current_path.contains("/root/.bun/bin") {
             path_parts.push(bun_bins.to_string());
         }

@@ -120,13 +120,8 @@ pub struct TelegramWorkflowRequestResult {
     pub target_chat_title: Option<String>,
 }
 
-fn workflow_request_delivery_text(
-    request_text: &str,
-    target_chat_id: i64,
-    target_chat_type: Option<&str>,
-) -> String {
-    let requires_reply =
-        target_chat_id < 0 || matches!(target_chat_type, Some("group") | Some("supergroup"));
+fn workflow_request_delivery_text(request_text: &str, target_chat_type: Option<&str>) -> String {
+    let requires_reply = matches!(target_chat_type, Some("group") | Some("supergroup"));
     if !requires_reply {
         return request_text.to_string();
     }
@@ -134,6 +129,13 @@ fn workflow_request_delivery_text(
     format!(
         "{}\n\nReply directly to this message so I can route your answer back to the originating chat.",
         request_text.trim()
+    )
+}
+
+fn workflow_requires_direct_reply(workflow: &TelegramWorkflow) -> bool {
+    matches!(
+        workflow.target_chat_type.as_deref(),
+        Some("group") | Some("supergroup")
     )
 }
 
@@ -370,76 +372,90 @@ impl TelegramBridge {
         });
     }
 
-    async fn run_scheduler_loop(self: Arc<Self>, mission_store: Arc<dyn MissionStore>) {
+    async fn run_scheduler_loop(self: Arc<Self>, _mission_store: Arc<dyn MissionStore>) {
         let mut interval = tokio::time::interval(TELEGRAM_SCHEDULE_POLL_INTERVAL);
         interval.tick().await;
 
         loop {
             interval.tick().await;
-            let due = match mission_store
-                .list_due_telegram_scheduled_messages(&now_string(), 32)
+            let channels: Vec<_> = self
+                .active_channels
+                .read()
                 .await
-            {
-                Ok(messages) => messages,
-                Err(err) => {
-                    tracing::warn!("Failed to load due Telegram scheduled messages: {}", err);
-                    continue;
-                }
-            };
-
-            for message in due {
-                let Some(ctx) = self.get_channel_context(message.channel_id).await else {
-                    continue;
-                };
-
-                let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
-                match send_chunked_message(
-                    &self.http,
-                    &base_url,
-                    message.chat_id,
-                    &message.text,
-                    None,
-                )
-                .await
+                .values()
+                .cloned()
+                .collect();
+            for ctx in channels {
+                let due = match ctx
+                    .mission_store
+                    .list_due_telegram_scheduled_messages(ctx.channel.id, &now_string(), 32)
+                    .await
                 {
-                    Ok(()) => {
-                        if let Err(err) = mission_store
-                            .mark_telegram_scheduled_message_sent(message.id, &now_string())
-                            .await
-                        {
-                            tracing::warn!(
-                                scheduled_message_id = %message.id,
-                                "Failed to mark Telegram scheduled message as sent: {}",
-                                err
-                            );
-                        }
-                        let _ = mission_store
-                            .mark_telegram_action_execution_by_scheduled_message(
-                                message.id,
-                                TelegramActionExecutionStatus::Sent,
-                                None,
-                                &now_string(),
-                            )
-                            .await;
-                    }
+                    Ok(messages) => messages,
                     Err(err) => {
                         tracing::warn!(
-                            scheduled_message_id = %message.id,
-                            chat_id = message.chat_id,
-                            "Failed to deliver scheduled Telegram message: {}",
+                            channel_id = %ctx.channel.id,
+                            "Failed to load due Telegram scheduled messages: {}",
                             err
                         );
-                        let _ = mission_store
-                            .mark_telegram_scheduled_message_failed(message.id, &err)
-                            .await;
-                        let _ = mission_store
-                            .mark_telegram_action_execution_by_scheduled_message(
-                                message.id,
-                                TelegramActionExecutionStatus::Failed,
-                                Some(&err),
-                                &now_string(),
-                            )
-                            .await;
+                        continue;
+                    }
+                };
+
+                for message in due {
+                    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+                    match send_chunked_message(
+                        &self.http,
+                        &base_url,
+                        message.chat_id,
+                        &message.text,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if let Err(err) = ctx
+                                .mission_store
+                                .mark_telegram_scheduled_message_sent(message.id, &now_string())
+                                .await
+                            {
+                                tracing::warn!(
+                                    scheduled_message_id = %message.id,
+                                    "Failed to mark Telegram scheduled message as sent: {}",
+                                    err
+                                );
+                            }
+                            let _ = ctx
+                                .mission_store
+                                .mark_telegram_action_execution_by_scheduled_message(
+                                    message.id,
+                                    TelegramActionExecutionStatus::Sent,
+                                    None,
+                                    &now_string(),
+                                )
+                                .await;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                scheduled_message_id = %message.id,
+                                chat_id = message.chat_id,
+                                "Failed to deliver scheduled Telegram message: {}",
+                                err
+                            );
+                            let _ = ctx
+                                .mission_store
+                                .mark_telegram_scheduled_message_failed(message.id, &err)
+                                .await;
+                            let _ = ctx
+                                .mission_store
+                                .mark_telegram_action_execution_by_scheduled_message(
+                                    message.id,
+                                    TelegramActionExecutionStatus::Failed,
+                                    Some(&err),
+                                    &now_string(),
+                                )
+                                .await;
+                        }
                     }
                 }
             }
@@ -1547,13 +1563,31 @@ pub async fn process_webhook_message(
     }
     let content = parts.join(" ");
 
-    if let Some(mut workflow) = ctx
-        .mission_store
-        .get_pending_telegram_workflow_for_target_chat(ctx.channel.id, msg.chat.id)
-        .await
-        .ok()
-        .flatten()
-    {
+    let reply_to_message_id = msg.reply_to_message.as_ref().map(|reply| reply.message_id);
+    let mut matched_workflow = match reply_to_message_id {
+        Some(reply_to_message_id) => ctx
+            .mission_store
+            .get_pending_telegram_workflow_for_target_message(
+                ctx.channel.id,
+                msg.chat.id,
+                reply_to_message_id,
+            )
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    if matched_workflow.is_none() {
+        matched_workflow = ctx
+            .mission_store
+            .get_pending_telegram_workflow_for_target_chat(ctx.channel.id, msg.chat.id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|workflow| !workflow_requires_direct_reply(workflow));
+    }
+
+    if let Some(mut workflow) = matched_workflow {
         let conversation_id = conversation.as_ref().map(|item| item.id);
         let _ = ctx
             .mission_store
@@ -1566,6 +1600,7 @@ pub async fn process_webhook_message(
                     "sender_name": sender_name,
                     "chat_id": msg.chat.id,
                     "message_id": msg.message_id,
+                    "reply_to_message_id": reply_to_message_id,
                     "text": clean_text,
                 })
                 .to_string(),
@@ -1867,6 +1902,8 @@ fn sanitize_telegram_visible_text(text: &str) -> String {
 #[derive(Debug, Clone, Deserialize)]
 struct TelegramActionChatLookup {
     id: i64,
+    #[serde(rename = "type")]
+    chat_type: String,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -1946,17 +1983,17 @@ async fn resolve_telegram_action_chat_id(
     http: &Client,
     current_chat_id: i64,
     target: &str,
-) -> Result<(i64, Option<String>), String> {
+) -> Result<(i64, Option<String>, Option<String>), String> {
     let target = target.trim();
     if target.is_empty() || target.eq_ignore_ascii_case("current") {
-        return Ok((current_chat_id, None));
+        return Ok((current_chat_id, None, None));
     }
     if let Some(chat_id) = target.strip_prefix("chat:") {
         let parsed = chat_id
             .trim()
             .parse::<i64>()
             .map_err(|_| format!("Invalid Telegram chat target '{}'", target))?;
-        return Ok((parsed, None));
+        return Ok((parsed, None, None));
     }
 
     let mappings = ctx
@@ -1971,7 +2008,14 @@ async fn resolve_telegram_action_chat_id(
             mapping.chat_title.as_deref(),
             mapping.chat_title.as_deref(),
         ) {
-            return Ok((mapping.chat_id, mapping.chat_title));
+            let chat_type = ctx
+                .mission_store
+                .get_telegram_conversation_by_chat(ctx.channel.id, mapping.chat_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|conversation| conversation.chat_type);
+            return Ok((mapping.chat_id, mapping.chat_title, chat_type));
         }
 
         let lookup = match fetch_telegram_chat_lookup(http, &base_url, mapping.chat_id).await {
@@ -2018,7 +2062,7 @@ async fn resolve_telegram_action_chat_id(
             resolved_title.as_deref(),
             lookup.username.as_deref(),
         ) {
-            return Ok((lookup.id, resolved_title));
+            return Ok((lookup.id, resolved_title, Some(lookup.chat_type)));
         }
     }
 
@@ -2116,7 +2160,7 @@ async fn execute_telegram_actions(
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
 
     for action in actions {
-        let (chat_id, chat_title) =
+        let (chat_id, chat_title, _) =
             resolve_telegram_action_chat_id(&ctx, &bridge.http, current_chat_id, &action.target)
                 .await?;
         let (target_kind, target_value) = telegram_action_target_parts(&action.target);
@@ -2250,7 +2294,7 @@ pub async fn execute_native_telegram_action(
             (format!("title:{}", title), "chat_title".to_string(), title)
         }
     };
-    let (chat_id, chat_title) =
+    let (chat_id, chat_title, _) =
         resolve_telegram_action_chat_id(&ctx, bridge.http(), mapping.chat_id, &target_spec).await?;
 
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
@@ -2382,36 +2426,50 @@ pub async fn execute_native_telegram_request_workflow(
             (format!("title:{}", title), Some(hint))
         }
     };
-    let (target_chat_id, target_chat_title) =
-        resolve_telegram_action_chat_id(&ctx, bridge.http(), mapping.chat_id, &target_spec).await?;
-    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
-
-    let origin_conversation = ctx
+    let mut origin_conversation = ctx
         .mission_store
         .get_telegram_conversation_by_chat(mapping.channel_id, mapping.chat_id)
         .await?
-        .ok_or_else(|| {
-            format!(
-                "Source Telegram conversation {} is missing",
-                mapping.chat_id
-            )
-        })?;
+        .unwrap_or_else(|| TelegramConversation {
+            id: Uuid::new_v4(),
+            channel_id: mapping.channel_id,
+            chat_id: mapping.chat_id,
+            mission_id: Some(source_mission_id),
+            chat_title: mapping.chat_title.clone(),
+            chat_type: None,
+            last_message_at: Some(now_string()),
+            created_at: now_string(),
+            updated_at: now_string(),
+        });
+    origin_conversation = ctx
+        .mission_store
+        .upsert_telegram_conversation(origin_conversation)
+        .await?;
+
+    let (target_chat_id, target_chat_title, resolved_target_chat_type) =
+        resolve_telegram_action_chat_id(&ctx, bridge.http(), mapping.chat_id, &target_spec).await?;
+    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
     let target_conversation = ctx
         .mission_store
         .get_telegram_conversation_by_chat(mapping.channel_id, target_chat_id)
         .await
         .ok()
         .flatten();
-    let delivery_text = workflow_request_delivery_text(
-        text,
-        target_chat_id,
+    let target_chat_type = if target_chat_id == mapping.chat_id {
+        origin_conversation.chat_type.clone()
+    } else {
         target_conversation
             .as_ref()
-            .and_then(|item| item.chat_type.as_deref()),
-    );
+            .and_then(|item| item.chat_type.clone())
+            .or(resolved_target_chat_type)
+    };
+    if matches!(target_chat_type.as_deref(), Some("channel")) {
+        return Err("Telegram request workflows are not supported for channel chats".to_string());
+    }
+    let delivery_text = workflow_request_delivery_text(text, target_chat_type.as_deref());
 
     let now = now_string();
-    let workflow = TelegramWorkflow {
+    let mut workflow = TelegramWorkflow {
         id: Uuid::new_v4(),
         channel_id: mapping.channel_id,
         origin_conversation_id: origin_conversation.id,
@@ -2420,6 +2478,8 @@ pub async fn execute_native_telegram_request_workflow(
         target_conversation_id: target_conversation.as_ref().map(|item| item.id),
         target_chat_id: Some(target_chat_id),
         target_chat_title: target_chat_title.clone().or(target_title_hint),
+        target_chat_type: target_chat_type.clone(),
+        target_request_message_id: None,
         initiated_by_user_id: None,
         initiated_by_username: None,
         kind: TelegramWorkflowKind::RequestReply,
@@ -2453,14 +2513,44 @@ pub async fn execute_native_telegram_request_workflow(
         })
         .await;
 
-    let message_id = send_telegram_text(
+    let message_id = match send_telegram_text(
         bridge.http(),
         &base_url,
         target_chat_id,
         &delivery_text,
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(message_id) => message_id,
+        Err(err) => {
+            workflow.status = TelegramWorkflowStatus::Failed;
+            workflow.last_error = Some(err.clone());
+            workflow.updated_at = now_string();
+            workflow.completed_at = Some(workflow.updated_at.clone());
+            let _ = ctx
+                .mission_store
+                .update_telegram_workflow(workflow.clone())
+                .await;
+            let _ = ctx
+                .mission_store
+                .create_telegram_workflow_event(TelegramWorkflowEvent {
+                    id: Uuid::new_v4(),
+                    workflow_id: workflow.id,
+                    conversation_id: Some(origin_conversation.id),
+                    event_type: "delivery_failed".to_string(),
+                    payload_json: serde_json::json!({
+                        "target_chat_id": target_chat_id,
+                        "error": err,
+                    })
+                    .to_string(),
+                    created_at: now_string(),
+                })
+                .await;
+            return Err(err);
+        }
+    };
+    workflow.target_request_message_id = Some(message_id);
     let target_conversation_id = if let Some(existing) = target_conversation {
         existing.id
     } else {
@@ -2471,7 +2561,7 @@ pub async fn execute_native_telegram_request_workflow(
                 chat_id: target_chat_id,
                 mission_id: None,
                 chat_title: target_chat_title.clone(),
-                chat_type: None,
+                chat_type: target_chat_type.clone(),
                 last_message_at: Some(now_string()),
                 created_at: now_string(),
                 updated_at: now_string(),
@@ -2479,6 +2569,11 @@ pub async fn execute_native_telegram_request_workflow(
             .await?
             .id
     };
+    workflow.target_conversation_id = Some(target_conversation_id);
+    workflow.updated_at = now_string();
+    ctx.mission_store
+        .update_telegram_workflow(workflow.clone())
+        .await?;
 
     log_telegram_conversation_message(
         &ctx.mission_store,
@@ -2817,80 +2912,99 @@ pub async fn stream_response(
                         }
 
                         // Final response — send or edit with complete text
-                        if delivery_text.trim().is_empty() {
-                            return Ok(());
-                        } else if let Some(msg_id) = sent_message_id {
+                        if !delivery_text.trim().is_empty() {
+                            if let Some(msg_id) = sent_message_id {
                             // Edit existing message with final content
-                            let display = truncate_for_telegram(&delivery_text);
-                            if let Err(e) = edit_message(http, &base_url, chat_id, msg_id, &display.html).await {
-                                tracing::warn!(
-                                    mission_id = %mission_id,
-                                    "Failed to edit Telegram message with final response, sending as new message: {}",
-                                    e
-                                );
-                                // Fallback: send entire content as new chunked messages.
-                                // Skip overflow below since chunked send handles the full content.
-                                let _ = send_chunked_message(http, &base_url, chat_id, &delivery_text, None).await;
+                                let display = truncate_for_telegram(&delivery_text);
+                                if let Err(e) =
+                                    edit_message(http, &base_url, chat_id, msg_id, &display.html)
+                                        .await
+                                {
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        "Failed to edit Telegram message with final response, sending as new message: {}",
+                                        e
+                                    );
+                                    // Fallback: send entire content as new chunked messages.
+                                    // Skip overflow below since chunked send handles the full content.
+                                    let _ = send_chunked_message(
+                                        http,
+                                        &base_url,
+                                        chat_id,
+                                        &delivery_text,
+                                        None,
+                                    )
+                                    .await;
+                                } else {
+                                    // Edit succeeded — send overflow chunks for content beyond the first 4096 chars
+                                    send_overflow_chunks(
+                                        http,
+                                        &base_url,
+                                        chat_id,
+                                        &delivery_text,
+                                        display.source_boundary,
+                                    )
+                                    .await;
+                                }
                             } else {
-                                // Edit succeeded — send overflow chunks for content beyond the first 4096 chars
-                                send_overflow_chunks(
+                                // No streaming happened, send the full response directly
+                                send_chunked_message(
                                     http,
                                     &base_url,
                                     chat_id,
                                     &delivery_text,
-                                    display.source_boundary,
+                                    Some(reply_to),
                                 )
-                                .await;
+                                .await?;
                             }
-                        } else {
-                            // No streaming happened, send the full response directly
-                            send_chunked_message(http, &base_url, chat_id, &delivery_text, Some(reply_to)).await?;
                         }
 
-                        if let (Some(mission_store), Some(channel_id)) =
-                            (mission_store.as_ref(), channel_id)
-                        {
-                            let conversation_id = match mission_store
-                                .get_telegram_conversation_by_chat(channel_id, chat_id)
-                                .await
+                        if !delivery_text.trim().is_empty() {
+                            if let (Some(mission_store), Some(channel_id)) =
+                                (mission_store.as_ref(), channel_id)
                             {
-                                Ok(Some(conversation)) => conversation.id,
-                                _ => match mission_store
-                                    .upsert_telegram_conversation(TelegramConversation {
-                                        id: Uuid::new_v4(),
-                                        channel_id,
-                                        chat_id,
-                                        mission_id: Some(mission_id),
-                                        chat_title: None,
-                                        chat_type: None,
-                                        last_message_at: Some(now_string()),
-                                        created_at: now_string(),
-                                        updated_at: now_string(),
-                                    })
+                                let conversation_id = match mission_store
+                                    .get_telegram_conversation_by_chat(channel_id, chat_id)
                                     .await
                                 {
-                                    Ok(conversation) => conversation.id,
-                                    Err(_) => Uuid::nil(),
-                                },
-                            };
-                            if !conversation_id.is_nil() {
-                                log_telegram_conversation_message(
-                                    mission_store,
-                                    conversation_id,
-                                    channel_id,
-                                    chat_id,
-                                    Some(mission_id),
-                                    None,
-                                    sent_message_id,
-                                    TelegramConversationMessageDirection::Outbound,
-                                    "assistant",
-                                    None,
-                                    None,
-                                    None,
-                                    if reply_to > 0 { Some(reply_to) } else { None },
-                                    &delivery_text,
-                                )
-                                .await;
+                                    Ok(Some(conversation)) => conversation.id,
+                                    _ => match mission_store
+                                        .upsert_telegram_conversation(TelegramConversation {
+                                            id: Uuid::new_v4(),
+                                            channel_id,
+                                            chat_id,
+                                            mission_id: Some(mission_id),
+                                            chat_title: None,
+                                            chat_type: None,
+                                            last_message_at: Some(now_string()),
+                                            created_at: now_string(),
+                                            updated_at: now_string(),
+                                        })
+                                        .await
+                                    {
+                                        Ok(conversation) => conversation.id,
+                                        Err(_) => Uuid::nil(),
+                                    },
+                                };
+                                if !conversation_id.is_nil() {
+                                    log_telegram_conversation_message(
+                                        mission_store,
+                                        conversation_id,
+                                        channel_id,
+                                        chat_id,
+                                        Some(mission_id),
+                                        None,
+                                        sent_message_id,
+                                        TelegramConversationMessageDirection::Outbound,
+                                        "assistant",
+                                        None,
+                                        None,
+                                        None,
+                                        if reply_to > 0 { Some(reply_to) } else { None },
+                                        &delivery_text,
+                                    )
+                                    .await;
+                                }
                             }
                         }
 
@@ -3643,7 +3757,6 @@ mod tests {
     fn workflow_request_delivery_text_adds_reply_instruction_for_groups() {
         let text = workflow_request_delivery_text(
             "Liste des leads et leur contexte ?",
-            -1001730152948,
             Some("supergroup"),
         );
 
@@ -3653,11 +3766,8 @@ mod tests {
 
     #[test]
     fn workflow_request_delivery_text_keeps_private_dm_requests_clean() {
-        let text = workflow_request_delivery_text(
-            "Can you send me the latest leads?",
-            42,
-            Some("private"),
-        );
+        let text =
+            workflow_request_delivery_text("Can you send me the latest leads?", Some("private"));
 
         assert_eq!(text, "Can you send me the latest leads?");
     }

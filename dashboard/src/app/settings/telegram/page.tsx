@@ -245,19 +245,22 @@ export default function TelegramSettingsPage() {
   };
 
   const toggleExpand = (botId: string) => {
+    const willExpand = !expandedBots.has(botId);
     setExpandedBots((prev) => {
       const next = new Set(prev);
       if (next.has(botId)) {
         next.delete(botId);
       } else {
         next.add(botId);
-        loadChats(botId);
-        loadActions(botId);
-        loadScheduled(botId);
-        loadMemory(botId);
       }
       return next;
     });
+    if (willExpand) {
+      void loadChats(botId);
+      void loadActions(botId);
+      void loadScheduled(botId);
+      void loadMemory(botId);
+    }
   };
 
   const handleCreate = async () => {

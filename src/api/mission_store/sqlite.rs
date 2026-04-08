@@ -1542,6 +1542,8 @@ impl SqliteMissionStore {
                 target_conversation_id TEXT,
                 target_chat_id INTEGER,
                 target_chat_title TEXT,
+                target_chat_type TEXT,
+                target_request_message_id INTEGER,
                 initiated_by_user_id INTEGER,
                 initiated_by_username TEXT,
                 kind TEXT NOT NULL,
@@ -1564,6 +1566,33 @@ impl SqliteMissionStore {
                 ON telegram_workflows(channel_id, target_chat_id, status, updated_at DESC);",
         )
         .map_err(|e| format!("Failed to create telegram_workflows table: {}", e))?;
+        for (col_name, col_type) in [
+            ("target_chat_type", "TEXT"),
+            ("target_request_message_id", "INTEGER"),
+        ] {
+            let has_col: bool = conn
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('telegram_workflows') WHERE name='{}'",
+                    col_name
+                ))
+                .map_err(|e| format!("Failed to check for {} column: {}", col_name, e))?
+                .exists([])
+                .map_err(|e| format!("Failed to query pragma_table_info: {}", e))?;
+            if !has_col {
+                tracing::info!(
+                    "Running migration: adding '{}' column to telegram_workflows",
+                    col_name
+                );
+                conn.execute(
+                    &format!(
+                        "ALTER TABLE telegram_workflows ADD COLUMN {} {}",
+                        col_name, col_type
+                    ),
+                    [],
+                )
+                .map_err(|e| format!("Failed to add {} column: {}", col_name, e))?;
+            }
+        }
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS telegram_workflow_events (
@@ -4148,10 +4177,12 @@ impl MissionStore for SqliteMissionStore {
 
     async fn list_due_telegram_scheduled_messages(
         &self,
+        channel_id: Uuid,
         send_at: &str,
         limit: usize,
     ) -> Result<Vec<TelegramScheduledMessage>, String> {
         let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
         let send_at = send_at.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -4160,14 +4191,16 @@ impl MissionStore for SqliteMissionStore {
                     "SELECT id, channel_id, source_mission_id, chat_id, chat_title, text,
                             send_at, sent_at, status, last_error, created_at
                      FROM telegram_scheduled_messages
-                     WHERE status = 'pending' AND send_at <= ?1
+                     WHERE channel_id = ?1
+                       AND status = 'pending'
+                       AND send_at <= ?2
                      ORDER BY send_at ASC
-                     LIMIT ?2",
+                     LIMIT ?3",
                 )
                 .map_err(|e| e.to_string())?;
             let messages = stmt
                 .query_map(
-                    params![send_at, limit as i64],
+                    params![channel_id_str, send_at, limit as i64],
                     row_to_telegram_scheduled_message,
                 )
                 .map_err(|e| e.to_string())?
@@ -4182,30 +4215,47 @@ impl MissionStore for SqliteMissionStore {
     async fn list_telegram_scheduled_messages(
         &self,
         channel_id: Uuid,
+        chat_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<TelegramScheduledMessage>, String> {
         let conn = self.conn.clone();
         let channel_id_str = channel_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, channel_id, source_mission_id, chat_id, chat_title, text,
-                            send_at, sent_at, status, last_error, created_at
-                     FROM telegram_scheduled_messages
-                     WHERE channel_id = ?1
-                     ORDER BY created_at DESC
-                     LIMIT ?2",
-                )
-                .map_err(|e| e.to_string())?;
-            let messages = stmt
-                .query_map(
-                    params![channel_id_str, limit as i64],
+            let sql = if chat_id.is_some() {
+                "SELECT id, channel_id, source_mission_id, chat_id, chat_title, text,
+                        send_at, sent_at, status, last_error, created_at
+                 FROM telegram_scheduled_messages
+                 WHERE channel_id = ?1 AND chat_id = ?2
+                 ORDER BY created_at DESC
+                 LIMIT ?3"
+            } else {
+                "SELECT id, channel_id, source_mission_id, chat_id, chat_title, text,
+                        send_at, sent_at, status, last_error, created_at
+                 FROM telegram_scheduled_messages
+                 WHERE channel_id = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2"
+            };
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let limit_i64 = limit as i64;
+            let messages = if let Some(chat_id) = chat_id {
+                stmt.query_map(
+                    params![channel_id_str, chat_id, limit_i64],
                     row_to_telegram_scheduled_message,
                 )
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+            } else {
+                stmt.query_map(
+                    params![channel_id_str, limit_i64],
+                    row_to_telegram_scheduled_message,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+            };
             Ok(messages)
         })
         .await
@@ -4904,31 +4954,49 @@ impl MissionStore for SqliteMissionStore {
     async fn list_telegram_action_executions(
         &self,
         channel_id: Uuid,
+        chat_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<TelegramActionExecution>, String> {
         let conn = self.conn.clone();
         let channel_id_str = channel_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, channel_id, source_mission_id, source_chat_id, target_chat_id,
-                            target_chat_title, action_kind, target_kind, target_value, text,
-                            delay_seconds, scheduled_message_id, status, last_error, created_at, updated_at
-                     FROM telegram_action_executions
-                     WHERE channel_id = ?1
-                     ORDER BY updated_at DESC
-                     LIMIT ?2",
-                )
-                .map_err(|e| e.to_string())?;
-            let entries = stmt
-                .query_map(
-                    params![channel_id_str, limit as i64],
+            let sql = if chat_id.is_some() {
+                "SELECT id, channel_id, source_mission_id, source_chat_id, target_chat_id,
+                        target_chat_title, action_kind, target_kind, target_value, text,
+                        delay_seconds, scheduled_message_id, status, last_error, created_at, updated_at
+                 FROM telegram_action_executions
+                 WHERE channel_id = ?1 AND target_chat_id = ?2
+                 ORDER BY updated_at DESC
+                 LIMIT ?3"
+            } else {
+                "SELECT id, channel_id, source_mission_id, source_chat_id, target_chat_id,
+                        target_chat_title, action_kind, target_kind, target_value, text,
+                        delay_seconds, scheduled_message_id, status, last_error, created_at, updated_at
+                 FROM telegram_action_executions
+                 WHERE channel_id = ?1
+                 ORDER BY updated_at DESC
+                 LIMIT ?2"
+            };
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let limit_i64 = limit as i64;
+            let entries = if let Some(chat_id) = chat_id {
+                stmt.query_map(
+                    params![channel_id_str, chat_id, limit_i64],
                     row_to_telegram_action_execution,
                 )
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+            } else {
+                stmt.query_map(
+                    params![channel_id_str, limit_i64],
+                    row_to_telegram_action_execution,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+            };
             Ok(entries)
         })
         .await
@@ -5170,10 +5238,11 @@ impl MissionStore for SqliteMissionStore {
             conn.execute(
                 "INSERT INTO telegram_workflows (
                     id, channel_id, origin_conversation_id, origin_chat_id, origin_mission_id,
-                    target_conversation_id, target_chat_id, target_chat_title,
-                    initiated_by_user_id, initiated_by_username, kind, status, request_text,
-                    latest_reply_text, summary, last_error, created_at, updated_at, completed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                    target_conversation_id, target_chat_id, target_chat_title, target_chat_type,
+                    target_request_message_id, initiated_by_user_id, initiated_by_username, kind,
+                    status, request_text, latest_reply_text, summary, last_error, created_at,
+                    updated_at, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     workflow_clone.id.to_string(),
                     workflow_clone.channel_id.to_string(),
@@ -5183,6 +5252,8 @@ impl MissionStore for SqliteMissionStore {
                     workflow_clone.target_conversation_id.map(|id| id.to_string()),
                     workflow_clone.target_chat_id,
                     workflow_clone.target_chat_title.clone(),
+                    workflow_clone.target_chat_type.clone(),
+                    workflow_clone.target_request_message_id,
                     workflow_clone.initiated_by_user_id,
                     workflow_clone.initiated_by_username.clone(),
                     match workflow_clone.kind {
@@ -5220,17 +5291,21 @@ impl MissionStore for SqliteMissionStore {
                  SET target_conversation_id = ?1,
                      target_chat_id = ?2,
                      target_chat_title = ?3,
-                     status = ?4,
-                     latest_reply_text = ?5,
-                     summary = ?6,
-                     last_error = ?7,
-                     updated_at = ?8,
-                     completed_at = ?9
-                 WHERE id = ?10",
+                     target_chat_type = ?4,
+                     target_request_message_id = ?5,
+                     status = ?6,
+                     latest_reply_text = ?7,
+                     summary = ?8,
+                     last_error = ?9,
+                     updated_at = ?10,
+                     completed_at = ?11
+                 WHERE id = ?12",
                 params![
                     workflow.target_conversation_id.map(|id| id.to_string()),
                     workflow.target_chat_id,
                     workflow.target_chat_title,
+                    workflow.target_chat_type,
+                    workflow.target_request_message_id,
                     match workflow.status {
                         TelegramWorkflowStatus::WaitingExternal => "waiting_external",
                         TelegramWorkflowStatus::RelayedToOrigin => "relayed_to_origin",
@@ -5264,9 +5339,10 @@ impl MissionStore for SqliteMissionStore {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, channel_id, origin_conversation_id, origin_chat_id, origin_mission_id,
-                            target_conversation_id, target_chat_id, target_chat_title,
-                            initiated_by_user_id, initiated_by_username, kind, status, request_text,
-                            latest_reply_text, summary, last_error, created_at, updated_at, completed_at
+                            target_conversation_id, target_chat_id, target_chat_title, target_chat_type,
+                            target_request_message_id, initiated_by_user_id, initiated_by_username,
+                            kind, status, request_text, latest_reply_text, summary, last_error,
+                            created_at, updated_at, completed_at
                      FROM telegram_workflows
                      WHERE channel_id = ?1
                      ORDER BY updated_at DESC
@@ -5296,9 +5372,10 @@ impl MissionStore for SqliteMissionStore {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, channel_id, origin_conversation_id, origin_chat_id, origin_mission_id,
-                            target_conversation_id, target_chat_id, target_chat_title,
-                            initiated_by_user_id, initiated_by_username, kind, status, request_text,
-                            latest_reply_text, summary, last_error, created_at, updated_at, completed_at
+                            target_conversation_id, target_chat_id, target_chat_title, target_chat_type,
+                            target_request_message_id, initiated_by_user_id, initiated_by_username,
+                            kind, status, request_text, latest_reply_text, summary, last_error,
+                            created_at, updated_at, completed_at
                      FROM telegram_workflows
                      WHERE channel_id = ?1
                        AND target_chat_id = ?2
@@ -5309,6 +5386,42 @@ impl MissionStore for SqliteMissionStore {
                 .map_err(|e| e.to_string())?;
             stmt.query_row(
                 params![channel_id.to_string(), target_chat_id],
+                row_to_telegram_workflow,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_pending_telegram_workflow_for_target_message(
+        &self,
+        channel_id: Uuid,
+        target_chat_id: i64,
+        request_message_id: i64,
+    ) -> Result<Option<TelegramWorkflow>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, origin_conversation_id, origin_chat_id, origin_mission_id,
+                            target_conversation_id, target_chat_id, target_chat_title, target_chat_type,
+                            target_request_message_id, initiated_by_user_id, initiated_by_username,
+                            kind, status, request_text, latest_reply_text, summary, last_error,
+                            created_at, updated_at, completed_at
+                     FROM telegram_workflows
+                     WHERE channel_id = ?1
+                       AND target_chat_id = ?2
+                       AND target_request_message_id = ?3
+                       AND status = 'waiting_external'
+                     ORDER BY updated_at DESC
+                     LIMIT 1",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_row(
+                params![channel_id.to_string(), target_chat_id, request_message_id],
                 row_to_telegram_workflow,
             )
             .optional()
@@ -5640,8 +5753,8 @@ fn row_to_telegram_workflow(row: &rusqlite::Row<'_>) -> Result<TelegramWorkflow,
     let origin_conversation_id_str: String = row.get(2)?;
     let origin_mission_id_str: Option<String> = row.get(4)?;
     let target_conversation_id_str: Option<String> = row.get(5)?;
-    let kind_str: String = row.get(10)?;
-    let status_str: String = row.get(11)?;
+    let kind_str: String = row.get(12)?;
+    let status_str: String = row.get(13)?;
     Ok(TelegramWorkflow {
         id: parse_uuid_or_nil(&id_str),
         channel_id: parse_uuid_or_nil(&channel_id_str),
@@ -5657,17 +5770,19 @@ fn row_to_telegram_workflow(row: &rusqlite::Row<'_>) -> Result<TelegramWorkflow,
             .filter(|id| !id.is_nil()),
         target_chat_id: row.get(6)?,
         target_chat_title: row.get(7)?,
-        initiated_by_user_id: row.get(8)?,
-        initiated_by_username: row.get(9)?,
+        target_chat_type: row.get(8)?,
+        target_request_message_id: row.get(9)?,
+        initiated_by_user_id: row.get(10)?,
+        initiated_by_username: row.get(11)?,
         kind: parse_telegram_workflow_kind(kind_str),
         status: parse_telegram_workflow_status(status_str),
-        request_text: row.get(12)?,
-        latest_reply_text: row.get(13)?,
-        summary: row.get(14)?,
-        last_error: row.get(15)?,
-        created_at: row.get(16)?,
-        updated_at: row.get(17)?,
-        completed_at: row.get(18)?,
+        request_text: row.get(14)?,
+        latest_reply_text: row.get(15)?,
+        summary: row.get(16)?,
+        last_error: row.get(17)?,
+        created_at: row.get(18)?,
+        updated_at: row.get(19)?,
+        completed_at: row.get(20)?,
     })
 }
 
@@ -5972,6 +6087,8 @@ mod tests {
                 target_conversation_id: Some(target.id),
                 target_chat_id: Some(404),
                 target_chat_title: Some("Marilyn".to_string()),
+                target_chat_type: Some("private".to_string()),
+                target_request_message_id: Some(9001),
                 initiated_by_user_id: Some(7),
                 initiated_by_username: Some("th0rgal".to_string()),
                 kind: TelegramWorkflowKind::RequestReply,
@@ -5993,6 +6110,14 @@ mod tests {
             .expect("pending workflow")
             .expect("workflow exists");
         assert_eq!(pending.id, workflow.id);
+        assert_eq!(pending.target_request_message_id, Some(9001));
+
+        let pending_by_request = store
+            .get_pending_telegram_workflow_for_target_message(channel_id, 404, 9001)
+            .await
+            .expect("pending workflow by request")
+            .expect("workflow exists by request");
+        assert_eq!(pending_by_request.id, workflow.id);
 
         store
             .create_telegram_workflow_event(TelegramWorkflowEvent {

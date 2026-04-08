@@ -600,6 +600,10 @@ pub struct TelegramWorkflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_chat_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_chat_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_request_message_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiated_by_user_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiated_by_username: Option<String>,
@@ -1086,10 +1090,11 @@ pub trait MissionStore: Send + Sync {
     /// List pending Telegram messages that should be delivered at or before `send_at`.
     async fn list_due_telegram_scheduled_messages(
         &self,
+        channel_id: Uuid,
         send_at: &str,
         limit: usize,
     ) -> Result<Vec<TelegramScheduledMessage>, String> {
-        let _ = (send_at, limit);
+        let _ = (channel_id, send_at, limit);
         Ok(vec![])
     }
 
@@ -1097,9 +1102,10 @@ pub trait MissionStore: Send + Sync {
     async fn list_telegram_scheduled_messages(
         &self,
         channel_id: Uuid,
+        chat_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<TelegramScheduledMessage>, String> {
-        let _ = (channel_id, limit);
+        let _ = (channel_id, chat_id, limit);
         Ok(vec![])
     }
 
@@ -1225,9 +1231,10 @@ pub trait MissionStore: Send + Sync {
     async fn list_telegram_action_executions(
         &self,
         channel_id: Uuid,
+        chat_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<TelegramActionExecution>, String> {
-        let _ = (channel_id, limit);
+        let _ = (channel_id, chat_id, limit);
         Ok(vec![])
     }
 
@@ -1323,6 +1330,17 @@ pub trait MissionStore: Send + Sync {
         target_chat_id: i64,
     ) -> Result<Option<TelegramWorkflow>, String> {
         let _ = (channel_id, target_chat_id);
+        Ok(None)
+    }
+
+    /// Get a pending Telegram workflow for a target chat that expects a reply to a specific request message.
+    async fn get_pending_telegram_workflow_for_target_message(
+        &self,
+        channel_id: Uuid,
+        target_chat_id: i64,
+        request_message_id: i64,
+    ) -> Result<Option<TelegramWorkflow>, String> {
+        let _ = (channel_id, target_chat_id, request_message_id);
         Ok(None)
     }
 

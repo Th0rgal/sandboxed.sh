@@ -10140,14 +10140,11 @@ pub async fn list_bot_scheduled_messages(
     Query(query): Query<TelegramBotListQuery>,
 ) -> Result<Json<Vec<super::mission_store::TelegramScheduledMessage>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
-    let mut messages = control
+    let messages = control
         .mission_store
-        .list_telegram_scheduled_messages(channel_id, query.limit.clamp(1, 100))
+        .list_telegram_scheduled_messages(channel_id, query.chat_id, query.limit.clamp(1, 100))
         .await
         .map_err(internal_error)?;
-    if let Some(chat_id) = query.chat_id {
-        messages.retain(|message| message.chat_id == chat_id);
-    }
     Ok(Json(messages))
 }
 
@@ -10158,14 +10155,11 @@ pub async fn list_bot_action_executions(
     Query(query): Query<TelegramBotListQuery>,
 ) -> Result<Json<Vec<super::mission_store::TelegramActionExecution>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
-    let mut executions = control
+    let executions = control
         .mission_store
-        .list_telegram_action_executions(channel_id, query.limit.clamp(1, 100))
+        .list_telegram_action_executions(channel_id, query.chat_id, query.limit.clamp(1, 100))
         .await
         .map_err(internal_error)?;
-    if let Some(chat_id) = query.chat_id {
-        executions.retain(|execution| execution.target_chat_id == chat_id);
-    }
     Ok(Json(executions))
 }
 
