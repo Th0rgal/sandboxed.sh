@@ -8,6 +8,8 @@ import {
   createAIProvider,
   oauthAuthorize,
   oauthCallback,
+  updateAIProvider,
+  fetchAnthropicUserinfo,
   AIProviderType,
   AIProviderTypeInfo,
   AIProviderAuthMethod,
@@ -289,7 +291,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
 
     setLoading(true);
     try {
-      await oauthCallback(
+      const provider = await oauthCallback(
         selectedProvider,
         selectedMethodIndex,
         oauthCode,
@@ -298,6 +300,16 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
           ? selectedBackends
           : undefined
       );
+
+      // If the server couldn't fetch the account email (e.g. Cloudflare blocks),
+      // try from the browser and patch it back.
+      if (!provider.account_email && provider.userinfo_access_token) {
+        const email = await fetchAnthropicUserinfo(provider.userinfo_access_token);
+        if (email) {
+          await updateAIProvider(provider.id, { account_email: email });
+        }
+      }
+
       toast.success('Provider connected');
       onSuccess();
       onClose();

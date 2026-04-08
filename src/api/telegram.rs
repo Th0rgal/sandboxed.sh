@@ -12,9 +12,11 @@
 use crate::api::control::{AgentEvent, ControlCommand};
 use crate::api::mission_store::{
     now_string, MissionMode, MissionStore, TelegramActionExecution, TelegramActionExecutionKind,
-    TelegramActionExecutionStatus, TelegramChannel, TelegramChatMission, TelegramScheduledMessage,
+    TelegramActionExecutionStatus, TelegramChannel, TelegramChatMission, TelegramConversation,
+    TelegramConversationMessage, TelegramConversationMessageDirection, TelegramScheduledMessage,
     TelegramScheduledMessageStatus, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
-    TelegramStructuredMemoryScope, TelegramTriggerMode,
+    TelegramStructuredMemoryScope, TelegramTriggerMode, TelegramWorkflow, TelegramWorkflowEvent,
+    TelegramWorkflowKind, TelegramWorkflowStatus,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use reqwest::Client;
@@ -105,6 +107,33 @@ pub struct TelegramActionExecutionResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_message_id: Option<Uuid>,
     pub immediate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramWorkflowRequestResult {
+    pub workflow_id: Uuid,
+    pub channel_id: Uuid,
+    pub origin_chat_id: i64,
+    pub target_chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_chat_title: Option<String>,
+}
+
+fn workflow_request_delivery_text(
+    request_text: &str,
+    target_chat_id: i64,
+    target_chat_type: Option<&str>,
+) -> String {
+    let requires_reply =
+        target_chat_id < 0 || matches!(target_chat_type, Some("group") | Some("supergroup"));
+    if !requires_reply {
+        return request_text.to_string();
+    }
+
+    format!(
+        "{}\n\nReply directly to this message so I can route your answer back to the originating chat.",
+        request_text.trim()
+    )
 }
 
 fn telegram_internal_action_secret() -> Option<String> {
@@ -1004,6 +1033,88 @@ async fn remember_telegram_chat_title(ctx: &ChannelContext, chat: &Chat) {
     }
 }
 
+async fn upsert_telegram_conversation(
+    ctx: &ChannelContext,
+    chat: &Chat,
+    mission_id: Uuid,
+    last_message_at: Option<String>,
+) -> Option<TelegramConversation> {
+    let now = now_string();
+    let existing = ctx
+        .mission_store
+        .get_telegram_conversation_by_chat(ctx.channel.id, chat.id)
+        .await
+        .ok()
+        .flatten();
+    let conversation = TelegramConversation {
+        id: existing
+            .as_ref()
+            .map(|item| item.id)
+            .unwrap_or_else(Uuid::new_v4),
+        channel_id: ctx.channel.id,
+        chat_id: chat.id,
+        mission_id: Some(mission_id),
+        chat_title: telegram_chat_display_title(chat),
+        chat_type: Some(chat.chat_type.clone()),
+        last_message_at,
+        created_at: existing
+            .as_ref()
+            .map(|item| item.created_at.clone())
+            .unwrap_or_else(|| now.clone()),
+        updated_at: now,
+    };
+    ctx.mission_store
+        .upsert_telegram_conversation(conversation)
+        .await
+        .ok()
+}
+
+async fn log_telegram_conversation_message(
+    mission_store: &Arc<dyn MissionStore>,
+    conversation_id: Uuid,
+    channel_id: Uuid,
+    chat_id: i64,
+    mission_id: Option<Uuid>,
+    workflow_id: Option<Uuid>,
+    telegram_message_id: Option<i64>,
+    direction: TelegramConversationMessageDirection,
+    role: &str,
+    sender_user_id: Option<i64>,
+    sender_username: Option<String>,
+    sender_display_name: Option<String>,
+    reply_to_message_id: Option<i64>,
+    text: &str,
+) {
+    let message = TelegramConversationMessage {
+        id: Uuid::new_v4(),
+        conversation_id,
+        channel_id,
+        chat_id,
+        mission_id,
+        workflow_id,
+        telegram_message_id,
+        direction,
+        role: role.to_string(),
+        sender_user_id,
+        sender_username,
+        sender_display_name,
+        reply_to_message_id,
+        text: text.to_string(),
+        created_at: now_string(),
+    };
+    if let Err(error) = mission_store
+        .create_telegram_conversation_message(message)
+        .await
+    {
+        tracing::debug!(
+            channel_id = %channel_id,
+            chat_id,
+            "Failed to append Telegram conversation message: {}",
+            error
+        );
+    }
+}
+
 fn telegram_memory_subject(msg: &Message, sender_name: &str) -> TelegramMemorySubject {
     let Some(from) = msg.from.as_ref() else {
         return TelegramMemorySubject::default();
@@ -1348,6 +1459,29 @@ pub async fn process_webhook_message(
         ctx.channel.mission_id
     };
 
+    let conversation =
+        upsert_telegram_conversation(ctx, &msg.chat, target_mission_id, Some(now_string())).await;
+
+    if let Some(conversation) = conversation.as_ref() {
+        log_telegram_conversation_message(
+            &ctx.mission_store,
+            conversation.id,
+            ctx.channel.id,
+            msg.chat.id,
+            Some(target_mission_id),
+            None,
+            Some(msg.message_id),
+            TelegramConversationMessageDirection::Inbound,
+            "user",
+            memory_subject.user_id,
+            memory_subject.username.clone(),
+            memory_subject.display_name.clone(),
+            msg.reply_to_message.as_ref().map(|reply| reply.message_id),
+            &clean_text,
+        )
+        .await;
+    }
+
     persist_structured_memory_for_message(
         ctx,
         msg.chat.id,
@@ -1411,6 +1545,46 @@ pub async fn process_webhook_message(
     }
     let content = parts.join(" ");
 
+    if let Some(mut workflow) = ctx
+        .mission_store
+        .get_pending_telegram_workflow_for_target_chat(ctx.channel.id, msg.chat.id)
+        .await
+        .ok()
+        .flatten()
+    {
+        let conversation_id = conversation.as_ref().map(|item| item.id);
+        let _ = ctx
+            .mission_store
+            .create_telegram_workflow_event(TelegramWorkflowEvent {
+                id: Uuid::new_v4(),
+                workflow_id: workflow.id,
+                conversation_id,
+                event_type: "external_reply_received".to_string(),
+                payload_json: serde_json::json!({
+                    "sender_name": sender_name,
+                    "chat_id": msg.chat.id,
+                    "message_id": msg.message_id,
+                    "text": clean_text,
+                })
+                .to_string(),
+                created_at: now_string(),
+            })
+            .await;
+
+        workflow.target_conversation_id = conversation_id;
+        workflow.latest_reply_text = Some(clean_text.clone());
+        workflow.status = TelegramWorkflowStatus::Completed;
+        workflow.updated_at = now_string();
+        workflow.completed_at = Some(workflow.updated_at.clone());
+        let _ = ctx
+            .mission_store
+            .update_telegram_workflow(workflow.clone())
+            .await;
+
+        relay_workflow_reply_to_origin(ctx, bridge, &workflow, &sender_name, &clean_text).await;
+        return;
+    }
+
     if !should_respond {
         // Context-only: store the message in mission history without triggering
         // the agent. This lets the agent see full chat context when it IS triggered.
@@ -1468,6 +1642,7 @@ pub async fn process_webhook_message(
     let mission_id = target_mission_id;
     let bridge_clone = Arc::clone(bridge);
     let channel_id = ctx.channel.id;
+    let mission_store = Arc::clone(&ctx.mission_store);
 
     tokio::spawn(async move {
         if let Err(e) = stream_response(
@@ -1480,6 +1655,7 @@ pub async fn process_webhook_message(
             mission_id,
             Some(bridge_clone),
             Some(channel_id),
+            Some(mission_store),
         )
         .await
         {
@@ -2174,6 +2350,259 @@ pub async fn execute_native_telegram_action(
     })
 }
 
+pub async fn execute_native_telegram_request_workflow(
+    bridge: &SharedTelegramBridge,
+    mission_store: &Arc<dyn MissionStore>,
+    source_mission_id: Uuid,
+    target: TelegramActionTarget,
+    text: &str,
+) -> Result<TelegramWorkflowRequestResult, String> {
+    let mapping = mission_store
+        .get_telegram_chat_mission_by_mission_id(source_mission_id)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "Mission {} is not linked to an active Telegram chat",
+                source_mission_id
+            )
+        })?;
+
+    let ctx = bridge
+        .get_channel_context(mapping.channel_id)
+        .await
+        .ok_or_else(|| format!("Telegram channel {} is not active", mapping.channel_id))?;
+    let (target_spec, target_title_hint) = match target {
+        TelegramActionTarget::Current => ("current".to_string(), None),
+        TelegramActionTarget::ChatId(chat_id) => (format!("chat:{}", chat_id), None),
+        TelegramActionTarget::ChatTitle(title) => {
+            let hint = title.clone();
+            (format!("title:{}", title), Some(hint))
+        }
+    };
+    let (target_chat_id, target_chat_title) =
+        resolve_telegram_action_chat_id(&ctx, bridge.http(), mapping.chat_id, &target_spec).await?;
+    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+
+    let origin_conversation = ctx
+        .mission_store
+        .get_telegram_conversation_by_chat(mapping.channel_id, mapping.chat_id)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "Source Telegram conversation {} is missing",
+                mapping.chat_id
+            )
+        })?;
+    let target_conversation = ctx
+        .mission_store
+        .get_telegram_conversation_by_chat(mapping.channel_id, target_chat_id)
+        .await
+        .ok()
+        .flatten();
+    let delivery_text = workflow_request_delivery_text(
+        text,
+        target_chat_id,
+        target_conversation
+            .as_ref()
+            .and_then(|item| item.chat_type.as_deref()),
+    );
+
+    let now = now_string();
+    let workflow = TelegramWorkflow {
+        id: Uuid::new_v4(),
+        channel_id: mapping.channel_id,
+        origin_conversation_id: origin_conversation.id,
+        origin_chat_id: mapping.chat_id,
+        origin_mission_id: Some(source_mission_id),
+        target_conversation_id: target_conversation.as_ref().map(|item| item.id),
+        target_chat_id: Some(target_chat_id),
+        target_chat_title: target_chat_title.clone().or(target_title_hint),
+        initiated_by_user_id: None,
+        initiated_by_username: None,
+        kind: TelegramWorkflowKind::RequestReply,
+        status: TelegramWorkflowStatus::WaitingExternal,
+        request_text: text.to_string(),
+        latest_reply_text: None,
+        summary: None,
+        last_error: None,
+        created_at: now.clone(),
+        updated_at: now,
+        completed_at: None,
+    };
+    ctx.mission_store
+        .create_telegram_workflow(workflow.clone())
+        .await?;
+
+    let _ = ctx
+        .mission_store
+        .create_telegram_workflow_event(TelegramWorkflowEvent {
+            id: Uuid::new_v4(),
+            workflow_id: workflow.id,
+            conversation_id: Some(origin_conversation.id),
+            event_type: "workflow_created".to_string(),
+            payload_json: serde_json::json!({
+                "origin_chat_id": mapping.chat_id,
+                "target_chat_id": target_chat_id,
+                "text": text,
+            })
+            .to_string(),
+            created_at: now_string(),
+        })
+        .await;
+
+    let message_id = send_telegram_text(
+        bridge.http(),
+        &base_url,
+        target_chat_id,
+        &delivery_text,
+        None,
+    )
+    .await?;
+    let target_conversation_id = if let Some(existing) = target_conversation {
+        existing.id
+    } else {
+        ctx.mission_store
+            .upsert_telegram_conversation(TelegramConversation {
+                id: Uuid::new_v4(),
+                channel_id: mapping.channel_id,
+                chat_id: target_chat_id,
+                mission_id: None,
+                chat_title: target_chat_title.clone(),
+                chat_type: None,
+                last_message_at: Some(now_string()),
+                created_at: now_string(),
+                updated_at: now_string(),
+            })
+            .await?
+            .id
+    };
+
+    log_telegram_conversation_message(
+        &ctx.mission_store,
+        target_conversation_id,
+        mapping.channel_id,
+        target_chat_id,
+        None,
+        Some(workflow.id),
+        Some(message_id),
+        TelegramConversationMessageDirection::Outbound,
+        "assistant",
+        None,
+        None,
+        ctx.channel
+            .bot_username
+            .clone()
+            .map(|value| format!("@{}", value)),
+        None,
+        &delivery_text,
+    )
+    .await;
+
+    Ok(TelegramWorkflowRequestResult {
+        workflow_id: workflow.id,
+        channel_id: mapping.channel_id,
+        origin_chat_id: mapping.chat_id,
+        target_chat_id,
+        target_chat_title,
+    })
+}
+
+async fn relay_workflow_reply_to_origin(
+    ctx: &ChannelContext,
+    bridge: &SharedTelegramBridge,
+    workflow: &TelegramWorkflow,
+    sender_name: &str,
+    reply_text: &str,
+) {
+    let Some(origin_mission_id) = workflow.origin_mission_id else {
+        return;
+    };
+
+    let events_rx = ctx.events_tx.subscribe();
+    let relay_message_id = Uuid::new_v4();
+    let content = format!(
+        "[Telegram workflow reply from {} in chat {}]\n[Original request: {}]\n{}\nReply in the origin Telegram chat with a concise summary and next step if useful.",
+        sender_name,
+        workflow.target_chat_id.unwrap_or_default(),
+        workflow.request_text,
+        reply_text
+    );
+    let (queued_tx, _queued_rx) = tokio::sync::oneshot::channel();
+    let _ = ctx
+        .cmd_tx
+        .send(ControlCommand::UserMessage {
+            id: relay_message_id,
+            content,
+            agent: None,
+            target_mission_id: Some(origin_mission_id),
+            respond: queued_tx,
+        })
+        .await;
+
+    let http = bridge.http().clone();
+    let bot_token = ctx.channel.bot_token.clone();
+    let mission_store = Arc::clone(&ctx.mission_store);
+    let channel_id = ctx.channel.id;
+    let origin_chat_id = workflow.origin_chat_id;
+    let workflow_id = workflow.id;
+    let bridge = Arc::clone(bridge);
+    let mut updated = workflow.clone();
+    tokio::spawn(async move {
+        let result = stream_response(
+            events_rx,
+            &http,
+            &bot_token,
+            origin_chat_id,
+            0,
+            Some(relay_message_id),
+            origin_mission_id,
+            Some(bridge),
+            Some(channel_id),
+            Some(Arc::clone(&mission_store)),
+        )
+        .await;
+
+        updated.updated_at = now_string();
+        match result {
+            Ok(()) => {
+                updated.status = TelegramWorkflowStatus::RelayedToOrigin;
+                updated.summary = Some("Relayed origin summary".to_string());
+                let _ = mission_store
+                    .create_telegram_workflow_event(TelegramWorkflowEvent {
+                        id: Uuid::new_v4(),
+                        workflow_id,
+                        conversation_id: Some(updated.origin_conversation_id),
+                        event_type: "relayed_to_origin".to_string(),
+                        payload_json: serde_json::json!({
+                            "origin_chat_id": origin_chat_id,
+                        })
+                        .to_string(),
+                        created_at: now_string(),
+                    })
+                    .await;
+            }
+            Err(error) => {
+                updated.status = TelegramWorkflowStatus::Failed;
+                updated.last_error = Some(error.clone());
+                let _ = mission_store
+                    .create_telegram_workflow_event(TelegramWorkflowEvent {
+                        id: Uuid::new_v4(),
+                        workflow_id,
+                        conversation_id: Some(updated.origin_conversation_id),
+                        event_type: "relay_failed".to_string(),
+                        payload_json: serde_json::json!({
+                            "error": error,
+                        })
+                        .to_string(),
+                        created_at: now_string(),
+                    })
+                    .await;
+            }
+        }
+        let _ = mission_store.update_telegram_workflow(updated).await;
+    });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Streaming response (typing indicator + progressive edits)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2194,6 +2623,7 @@ pub async fn stream_response(
     mission_id: Uuid,
     bridge: Option<SharedTelegramBridge>,
     channel_id: Option<Uuid>,
+    mission_store: Option<Arc<dyn MissionStore>>,
 ) -> Result<(), String> {
     let base_url = format!("https://api.telegram.org/bot{}", bot_token);
     let timeout = tokio::time::Duration::from_secs(300);
@@ -2411,6 +2841,53 @@ pub async fn stream_response(
                         } else {
                             // No streaming happened, send the full response directly
                             send_chunked_message(http, &base_url, chat_id, &delivery_text, Some(reply_to)).await?;
+                        }
+
+                        if let (Some(mission_store), Some(channel_id)) =
+                            (mission_store.as_ref(), channel_id)
+                        {
+                            let conversation_id = match mission_store
+                                .get_telegram_conversation_by_chat(channel_id, chat_id)
+                                .await
+                            {
+                                Ok(Some(conversation)) => conversation.id,
+                                _ => match mission_store
+                                    .upsert_telegram_conversation(TelegramConversation {
+                                        id: Uuid::new_v4(),
+                                        channel_id,
+                                        chat_id,
+                                        mission_id: Some(mission_id),
+                                        chat_title: None,
+                                        chat_type: None,
+                                        last_message_at: Some(now_string()),
+                                        created_at: now_string(),
+                                        updated_at: now_string(),
+                                    })
+                                    .await
+                                {
+                                    Ok(conversation) => conversation.id,
+                                    Err(_) => Uuid::nil(),
+                                },
+                            };
+                            if !conversation_id.is_nil() {
+                                log_telegram_conversation_message(
+                                    mission_store,
+                                    conversation_id,
+                                    channel_id,
+                                    chat_id,
+                                    Some(mission_id),
+                                    None,
+                                    sent_message_id,
+                                    TelegramConversationMessageDirection::Outbound,
+                                    "assistant",
+                                    None,
+                                    None,
+                                    None,
+                                    if reply_to > 0 { Some(reply_to) } else { None },
+                                    &delivery_text,
+                                )
+                                .await;
+                            }
                         }
 
                         // Send shared files as Telegram documents/photos
@@ -3006,9 +3483,10 @@ mod tests {
         extract_telegram_actions, format_structured_memory_context, markdown_to_telegram_html,
         render_telegram_chunk, sanitize_telegram_visible_text, scope_for_extracted_memory,
         telegram_action_target_matches, telegram_chat_display_title, truncate_for_telegram,
-        verify_internal_telegram_action_token, Chat, ExtractedTelegramMemory, TelegramAction,
-        TelegramActionKind, TelegramBridge, TelegramMemorySubject, TelegramStructuredMemoryEntry,
-        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
+        verify_internal_telegram_action_token, workflow_request_delivery_text, Chat,
+        ExtractedTelegramMemory, TelegramAction, TelegramActionKind, TelegramBridge,
+        TelegramMemorySubject, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
+        TelegramStructuredMemoryScope,
     };
     use uuid::Uuid;
 
@@ -3155,6 +3633,29 @@ mod tests {
             telegram_chat_display_title(&private_chat).as_deref(),
             Some("@th0rgal")
         );
+    }
+
+    #[test]
+    fn workflow_request_delivery_text_adds_reply_instruction_for_groups() {
+        let text = workflow_request_delivery_text(
+            "Liste des leads et leur contexte ?",
+            -1001730152948,
+            Some("supergroup"),
+        );
+
+        assert!(text.contains("Liste des leads et leur contexte ?"));
+        assert!(text.contains("Reply directly to this message"));
+    }
+
+    #[test]
+    fn workflow_request_delivery_text_keeps_private_dm_requests_clean() {
+        let text = workflow_request_delivery_text(
+            "Can you send me the latest leads?",
+            42,
+            Some("private"),
+        );
+
+        assert_eq!(text, "Can you send me the latest leads?");
     }
 
     #[test]

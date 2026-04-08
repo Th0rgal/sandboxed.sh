@@ -83,7 +83,8 @@ import urllib.request
 def usage() -> int:
     print(
         "usage: telegram-action-cli reply <text> | remind <delay_seconds> <text> | "
-        "send-title <chat_title> <text> | remind-title <delay_seconds> <chat_title> <text>",
+        "send-title <chat_title> <text> | remind-title <delay_seconds> <chat_title> <text> | "
+        "ask-title <chat_title> <text>",
         file=sys.stderr,
     )
     return 2
@@ -96,12 +97,14 @@ def main() -> int:
     mission_id = os.environ.get("MISSION_ID")
     token = os.environ.get("TELEGRAM_ACTION_TOKEN")
     action_url = os.environ.get("TELEGRAM_ACTION_URL")
+    workflow_url = os.environ.get("TELEGRAM_WORKFLOW_URL")
     if not mission_id or not token or not action_url:
         print("telegram action environment is not configured", file=sys.stderr)
         return 2
 
     command = sys.argv[1]
     payload = {"mission_id": mission_id}
+    url = action_url
 
     if command == "reply":
         payload["text"] = sys.argv[2]
@@ -115,11 +118,15 @@ def main() -> int:
         payload["delay_seconds"] = int(sys.argv[2])
         payload["target"] = {"kind": "chat_title", "value": sys.argv[3]}
         payload["text"] = sys.argv[4]
+    elif command == "ask-title" and len(sys.argv) >= 4 and workflow_url:
+        payload["target"] = {"kind": "chat_title", "value": sys.argv[2]}
+        payload["text"] = sys.argv[3]
+        url = workflow_url
     else:
         return usage()
 
     request = urllib.request.Request(
-        action_url,
+        url,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "content-type": "application/json",
@@ -5166,7 +5173,7 @@ fn is_auth_error(message: &str) -> bool {
 }
 
 fn is_rate_limited_error(message: &str) -> bool {
-    const RATE_LIMIT_MARKERS: [&str; 9] = [
+    const RATE_LIMIT_MARKERS: [&str; 11] = [
         "overloaded_error",
         "rate limit",
         "rate_limit",
@@ -5176,6 +5183,8 @@ fn is_rate_limited_error(message: &str) -> bool {
         "error: 529",
         "status code: 429",
         "status code: 529",
+        "out of extra usage",
+        "out of usage",
     ];
 
     RATE_LIMIT_MARKERS
@@ -9413,6 +9422,13 @@ pub async fn run_opencode_turn(
         env.insert(
             "TELEGRAM_ACTION_URL".to_string(),
             format!("{}/api/control/telegram/actions/internal", api_url),
+        );
+        env.insert(
+            "TELEGRAM_WORKFLOW_URL".to_string(),
+            format!(
+                "{}/api/control/telegram/workflows/request/internal",
+                api_url
+            ),
         );
     }
     env.insert(

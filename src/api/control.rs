@@ -5198,6 +5198,7 @@ async fn automation_scheduler_loop(
                                             mission_id,
                                             Some(Arc::clone(&bridge)),
                                             Some(mapping.channel_id),
+                                            Some(Arc::clone(&store)),
                                         )
                                         .await
                                         {
@@ -10167,6 +10168,66 @@ pub async fn list_bot_action_executions(
     Ok(Json(executions))
 }
 
+pub async fn list_bot_conversations(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramConversation>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let conversations = control
+        .mission_store
+        .list_telegram_conversations(channel_id, query.limit.max(1).min(100))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(conversations))
+}
+
+pub async fn list_bot_workflows(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramWorkflow>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let workflows = control
+        .mission_store
+        .list_telegram_workflows(channel_id, query.limit.max(1).min(100))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(workflows))
+}
+
+pub async fn list_telegram_conversation_messages(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(conversation_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramConversationMessage>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let messages = control
+        .mission_store
+        .list_telegram_conversation_messages(conversation_id, query.limit.max(1).min(200))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(messages))
+}
+
+pub async fn list_telegram_workflow_events(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(workflow_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramWorkflowEvent>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let events = control
+        .mission_store
+        .list_telegram_workflow_events(workflow_id, query.limit.max(1).min(200))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(events))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TelegramMemoryQuery {
     #[serde(default = "default_telegram_limit")]
@@ -10271,6 +10332,14 @@ pub struct TelegramActionRequest {
     pub target: Option<super::telegram::TelegramActionTarget>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TelegramWorkflowRequest {
+    pub mission_id: Uuid,
+    pub text: String,
+    #[serde(default)]
+    pub target: Option<super::telegram::TelegramActionTarget>,
+}
+
 pub async fn execute_telegram_action_api(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -10285,6 +10354,25 @@ pub async fn execute_telegram_action_api(
             .unwrap_or(super::telegram::TelegramActionTarget::Current),
         &req.text,
         req.delay_seconds.unwrap_or(0),
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(result))
+}
+
+pub async fn execute_telegram_workflow_request_api(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<TelegramWorkflowRequest>,
+) -> Result<Json<super::telegram::TelegramWorkflowRequestResult>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let result = super::telegram::execute_native_telegram_request_workflow(
+        &state.telegram_bridge,
+        &control.mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
     )
     .await
     .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
@@ -10363,6 +10451,50 @@ pub async fn execute_telegram_action_internal_api(
             .unwrap_or(super::telegram::TelegramActionTarget::Current),
         &req.text,
         req.delay_seconds.unwrap_or(0),
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
+    Ok(Json(result))
+}
+
+pub async fn execute_telegram_workflow_request_internal_api(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TelegramWorkflowRequest>,
+) -> Result<Json<super::telegram::TelegramWorkflowRequestResult>, (StatusCode, String)> {
+    let token = internal_telegram_action_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Missing mission token".to_string(),
+        )
+    })?;
+    if !super::telegram::verify_internal_telegram_action_token(req.mission_id, token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid mission token".to_string(),
+        ));
+    }
+
+    let mission_store = mission_store_for_telegram_mission(&state, req.mission_id)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Mission {} is not linked to an active Telegram conversation",
+                    req.mission_id
+                ),
+            )
+        })?;
+
+    let result = super::telegram::execute_native_telegram_request_workflow(
+        &state.telegram_bridge,
+        &mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
     )
     .await
     .map_err(|error| (StatusCode::BAD_REQUEST, error))?;

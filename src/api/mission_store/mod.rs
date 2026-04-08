@@ -519,6 +519,116 @@ pub struct TelegramActionExecution {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramConversationMessageDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramConversation {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    pub chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramConversationMessage {
+    pub id: Uuid,
+    pub conversation_id: Uuid,
+    pub channel_id: Uuid,
+    pub chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_message_id: Option<i64>,
+    pub direction: TelegramConversationMessageDirection,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_user_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<i64>,
+    pub text: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramWorkflowKind {
+    RequestReply,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramWorkflowStatus {
+    WaitingExternal,
+    RelayedToOrigin,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramWorkflow {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    pub origin_conversation_id: Uuid,
+    pub origin_chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_mission_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_conversation_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_chat_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_chat_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiated_by_user_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiated_by_username: Option<String>,
+    pub kind: TelegramWorkflowKind,
+    pub status: TelegramWorkflowStatus,
+    pub request_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_reply_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramWorkflowEvent {
+    pub id: Uuid,
+    pub workflow_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<Uuid>,
+    pub event_type: String,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
 /// How Telegram messages trigger the assistant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1131,6 +1241,108 @@ pub trait MissionStore: Send + Sync {
     ) -> Result<(), String> {
         let _ = (scheduled_message_id, status, last_error, updated_at);
         Err("Not supported".to_string())
+    }
+
+    /// Upsert a Telegram conversation (one per channel/chat).
+    async fn upsert_telegram_conversation(
+        &self,
+        conversation: TelegramConversation,
+    ) -> Result<TelegramConversation, String> {
+        let _ = conversation;
+        Err("Not supported".to_string())
+    }
+
+    /// Get a Telegram conversation by (channel, chat).
+    async fn get_telegram_conversation_by_chat(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+    ) -> Result<Option<TelegramConversation>, String> {
+        let _ = (channel_id, chat_id);
+        Ok(None)
+    }
+
+    /// List recent Telegram conversations for a channel.
+    async fn list_telegram_conversations(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramConversation>, String> {
+        let _ = (channel_id, limit);
+        Ok(vec![])
+    }
+
+    /// Append a message to the Telegram conversation log.
+    async fn create_telegram_conversation_message(
+        &self,
+        message: TelegramConversationMessage,
+    ) -> Result<TelegramConversationMessage, String> {
+        let _ = message;
+        Err("Not supported".to_string())
+    }
+
+    /// List recent messages for a Telegram conversation.
+    async fn list_telegram_conversation_messages(
+        &self,
+        conversation_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramConversationMessage>, String> {
+        let _ = (conversation_id, limit);
+        Ok(vec![])
+    }
+
+    /// Create a Telegram workflow.
+    async fn create_telegram_workflow(
+        &self,
+        workflow: TelegramWorkflow,
+    ) -> Result<TelegramWorkflow, String> {
+        let _ = workflow;
+        Err("Not supported".to_string())
+    }
+
+    /// Update a Telegram workflow.
+    async fn update_telegram_workflow(&self, workflow: TelegramWorkflow) -> Result<(), String> {
+        let _ = workflow;
+        Err("Not supported".to_string())
+    }
+
+    /// List recent Telegram workflows for a channel.
+    async fn list_telegram_workflows(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramWorkflow>, String> {
+        let _ = (channel_id, limit);
+        Ok(vec![])
+    }
+
+    /// Find the newest workflow waiting on a specific target chat.
+    async fn get_pending_telegram_workflow_for_target_chat(
+        &self,
+        channel_id: Uuid,
+        target_chat_id: i64,
+    ) -> Result<Option<TelegramWorkflow>, String> {
+        let _ = (channel_id, target_chat_id);
+        Ok(None)
+    }
+
+    /// Append an event to a Telegram workflow.
+    async fn create_telegram_workflow_event(
+        &self,
+        event: TelegramWorkflowEvent,
+    ) -> Result<TelegramWorkflowEvent, String> {
+        let _ = event;
+        Err("Not supported".to_string())
+    }
+
+    /// List recent events for a Telegram workflow.
+    async fn list_telegram_workflow_events(
+        &self,
+        workflow_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramWorkflowEvent>, String> {
+        let _ = (workflow_id, limit);
+        Ok(vec![])
     }
 }
 

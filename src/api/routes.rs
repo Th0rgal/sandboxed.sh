@@ -533,6 +533,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/telegram/actions/internal",
             post(control::execute_telegram_action_internal_api),
         )
+        .route(
+            "/api/control/telegram/workflows/request/internal",
+            post(control::execute_telegram_workflow_request_internal_api),
+        )
         // WebSocket console uses subprotocol-based auth (browser can't set Authorization header)
         .route("/api/console/ws", get(console::console_ws))
         // WebSocket workspace shell uses subprotocol-based auth
@@ -723,6 +727,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(control::list_bot_action_executions),
         )
         .route(
+            "/api/control/telegram/bots/:id/conversations",
+            get(control::list_bot_conversations),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/workflows",
+            get(control::list_bot_workflows),
+        )
+        .route(
             "/api/control/telegram/bots/:id/memory",
             get(control::list_bot_structured_memory),
         )
@@ -731,12 +743,24 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(control::search_bot_structured_memory),
         )
         .route(
+            "/api/control/telegram/conversations/:id/messages",
+            get(control::list_telegram_conversation_messages),
+        )
+        .route(
+            "/api/control/telegram/workflows/:id/events",
+            get(control::list_telegram_workflow_events),
+        )
+        .route(
             "/api/control/telegram/send",
             post(control::send_telegram_message_api),
         )
         .route(
             "/api/control/telegram/actions",
             post(control::execute_telegram_action_api),
+        )
+        .route(
+            "/api/control/telegram/workflows/request",
+            post(control::execute_telegram_workflow_request_api),
         )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))

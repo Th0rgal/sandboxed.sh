@@ -1161,7 +1161,7 @@ fn get_all_amp_keys_from_ai_providers(working_dir: &Path) -> Vec<String> {
 ///     "accessToken": "sk-ant-oat01-...",
 ///     "expiresAt": 1769395897294,
 ///     "refreshToken": "sk-ant-ort01-...",
-///     "scopes": ["user:inference", "user:profile"]
+///     "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
 ///   }
 /// }
 /// ```
@@ -1725,6 +1725,8 @@ pub struct UpdateProviderRequest {
     pub enabled: Option<bool>,
     /// Which backends this provider is used for (e.g., ["opencode", "claudecode"])
     pub use_for_backends: Option<Vec<String>>,
+    /// Account identifier (email) — set by frontend when server-side userinfo fails
+    pub account_email: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1762,6 +1764,10 @@ pub struct ProviderResponse {
     /// Account identifier (email or username) from the connected OAuth account
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
+    /// Temporary access token for client-side userinfo fetch when server-side
+    /// fetch fails (e.g. Cloudflare blocks). Only set during OAuth callback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub userinfo_access_token: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1882,6 +1888,7 @@ fn build_provider_response(
         status,
         use_for_backends,
         account_email,
+        userinfo_access_token: None,
         created_at: now,
         updated_at: now,
     }
@@ -1924,6 +1931,7 @@ fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> Prov
         status,
         use_for_backends,
         account_email: provider.account_email.clone(),
+        userinfo_access_token: None,
         created_at: provider.created_at,
         updated_at: provider.updated_at,
     }
@@ -2308,7 +2316,7 @@ pub(crate) fn write_claudecode_credentials_from_entry(
         "accessToken": access_token,
         "refreshToken": refresh_token,
         "expiresAt": expires_at,
-        "scopes": ["user:inference", "user:profile"]
+        "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
     });
 
     let contents = serde_json::to_string_pretty(&credentials)
@@ -3339,7 +3347,7 @@ pub async fn ensure_google_oauth_token_valid() -> Result<(), String> {
 ///     "accessToken": "sk-ant-oat01-...",
 ///     "refreshToken": "sk-ant-ort01-...",
 ///     "expiresAt": 1748658860401,
-///     "scopes": ["user:inference", "user:profile"]
+///     "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
 ///   }
 /// }
 /// ```
@@ -3370,7 +3378,7 @@ pub fn write_claudecode_credentials_to_path(
         "accessToken": entry.access_token,
         "refreshToken": entry.refresh_token,
         "expiresAt": entry.expires_at,
-        "scopes": ["user:inference", "user:profile"]
+        "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
     });
 
     let contents = serde_json::to_string_pretty(&credentials)
@@ -4046,29 +4054,70 @@ fn extract_email_from_jwt(token: &str) -> Option<String> {
 /// Anthropic's OAuth token response doesn't include an `id_token` or email claim.
 pub async fn fetch_anthropic_account_email(access_token: &str) -> Option<String> {
     let client = reqwest::Client::new();
-    let resp = client
-        .get("https://console.anthropic.com/v1/oauth/userinfo")
-        .header("Authorization", format!("Bearer {}", access_token))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        tracing::debug!(
-            status = %resp.status(),
-            "Anthropic userinfo endpoint returned non-success"
-        );
-        return None;
+
+    // Try GET first, then POST if Cloudflare blocks GET
+    for method in &["GET", "POST"] {
+        let req = if *method == "GET" {
+            client
+                .get("https://console.anthropic.com/v1/oauth/userinfo")
+                .header("Authorization", format!("Bearer {}", access_token))
+        } else {
+            client
+                .post("https://console.anthropic.com/v1/oauth/userinfo")
+                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Content-Type", "application/json")
+                .body("{}")
+        };
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    method = method,
+                    error = %e,
+                    "Anthropic userinfo request failed (network error)"
+                );
+                continue;
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body_preview = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>();
+            tracing::warn!(
+                method = method,
+                status = %status,
+                body_preview = %body_preview,
+                "Anthropic userinfo endpoint returned non-success (Cloudflare block?)"
+            );
+            continue;
+        }
+        let data: serde_json::Value = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(method = method, error = %e, "Failed to parse userinfo response");
+                continue;
+            }
+        };
+        let email = data
+            .get("email")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                data.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+        if email.is_some() {
+            return email;
+        }
     }
-    let data: serde_json::Value = resp.json().await.ok()?;
-    data.get("email")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            // Some providers use "name" or "id" as fallback identifier
-            data.get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
+    None
 }
 
 /// Fetch account email from Google's userinfo endpoint using an access token.
@@ -4121,6 +4170,14 @@ fn extract_and_save_account_email(
         .or_else(|| {
             token_data
                 .get("email")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            // Anthropic token responses include account.email_address
+            token_data
+                .get("account")
+                .and_then(|a| a.get("email_address"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         });
@@ -5605,6 +5662,15 @@ async fn update_provider(
     if let Some(ref backends) = req.use_for_backends {
         updated.use_for_backends = Some(backends.clone());
     }
+    if let Some(ref email) = req.account_email {
+        updated.account_email = Some(email.clone());
+        // Also persist to provider_accounts.json for list endpoint
+        let _ = update_provider_account(
+            &state.config.working_dir,
+            updated.provider_type.id(),
+            email.clone(),
+        );
+    }
 
     let result = state
         .ai_providers
@@ -6095,7 +6161,14 @@ async fn oauth_callback(
                 let store_id = state.ai_providers.add(provider.clone()).await;
                 // Return a response with the store UUID so the frontend can reference it
                 let stored = state.ai_providers.get(store_id).await.unwrap_or(provider);
-                return Json(build_response_from_store(&stored)).into_response();
+                let mut store_response = build_response_from_store(&stored);
+                // Preserve the userinfo_access_token from the inner response
+                // so the frontend can fetch the email client-side when the server
+                // can't (e.g. Cloudflare blocks console.anthropic.com).
+                if store_response.account_email.is_none() {
+                    store_response.userinfo_access_token = json.0.userinfo_access_token.clone();
+                }
+                return Json(store_response).into_response();
             }
             json.into_response()
         }
@@ -6339,14 +6412,20 @@ async fn oauth_callback_inner(
                 let backends_state = read_provider_backends_state(&state.config.working_dir);
                 let config_entry = get_provider_config_entry(&opencode_config, provider_type);
                 let backends = backends_state.get(provider_type.id()).cloned();
-                let response = build_provider_response(
+                let mut response = build_provider_response(
                     provider_type,
                     config_entry,
                     Some(AuthKind::ApiKey),
                     default_provider,
                     backends,
-                    account_email,
+                    account_email.clone(),
                 );
+
+                if account_email.is_none() {
+                    if let Some(at) = token_data["access_token"].as_str() {
+                        response.userinfo_access_token = Some(at.to_string());
+                    }
+                }
 
                 tracing::info!("Created API key for provider: {} ({})", response.name, id);
 
@@ -6460,14 +6539,23 @@ async fn oauth_callback_inner(
                 let backends_state = read_provider_backends_state(&state.config.working_dir);
                 let config_entry = get_provider_config_entry(&opencode_config, provider_type);
                 let backends = backends_state.get(provider_type.id()).cloned();
-                let response = build_provider_response(
+                let mut response = build_provider_response(
                     provider_type,
                     config_entry,
                     Some(AuthKind::OAuth),
                     default_provider,
                     backends,
-                    account_email,
+                    account_email.clone(),
                 );
+
+                // If email fetch failed (e.g. Cloudflare blocks server-side
+                // requests to console.anthropic.com), pass the access token to
+                // the frontend so it can fetch the email from the browser.
+                if account_email.is_none() {
+                    if let Some(at) = token_data["access_token"].as_str() {
+                        response.userinfo_access_token = Some(at.to_string());
+                    }
+                }
 
                 Ok(Json(response))
             }

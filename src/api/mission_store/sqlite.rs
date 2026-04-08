@@ -4,9 +4,12 @@ use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, ExecutionStatus,
     FreshSession, Mission, MissionHistoryEntry, MissionMode, MissionStatus, MissionStore,
     RetryConfig, StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
-    TelegramActionExecutionStatus, TelegramChannel, TelegramChatMission, TelegramScheduledMessage,
+    TelegramActionExecutionStatus, TelegramChannel, TelegramChatMission, TelegramConversation,
+    TelegramConversationMessage, TelegramConversationMessageDirection, TelegramScheduledMessage,
     TelegramScheduledMessageStatus, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
-    TelegramStructuredMemoryScope, TelegramStructuredMemorySearchHit, TriggerType, WebhookConfig,
+    TelegramStructuredMemoryScope, TelegramStructuredMemorySearchHit, TelegramWorkflow,
+    TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus, TriggerType,
+    WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
@@ -1327,6 +1330,104 @@ impl SqliteMissionStore {
                 ON telegram_action_executions(scheduled_message_id);",
         )
         .map_err(|e| format!("Failed to create telegram_action_executions table: {}", e))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_conversations (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                mission_id TEXT,
+                chat_title TEXT,
+                chat_type TEXT,
+                last_message_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE SET NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tconv_channel_chat
+                ON telegram_conversations(channel_id, chat_id);
+            CREATE INDEX IF NOT EXISTS idx_tconv_channel_updated
+                ON telegram_conversations(channel_id, updated_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_conversations table: {}", e))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_conversation_messages (
+                id TEXT PRIMARY KEY NOT NULL,
+                conversation_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                mission_id TEXT,
+                workflow_id TEXT,
+                telegram_message_id INTEGER,
+                direction TEXT NOT NULL,
+                role TEXT NOT NULL,
+                sender_user_id INTEGER,
+                sender_username TEXT,
+                sender_display_name TEXT,
+                reply_to_message_id INTEGER,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES telegram_conversations(id) ON DELETE CASCADE,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tconv_msg_conversation_created
+                ON telegram_conversation_messages(conversation_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tconv_msg_chat_created
+                ON telegram_conversation_messages(channel_id, chat_id, created_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_conversation_messages table: {}", e))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_workflows (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                origin_conversation_id TEXT NOT NULL,
+                origin_chat_id INTEGER NOT NULL,
+                origin_mission_id TEXT,
+                target_conversation_id TEXT,
+                target_chat_id INTEGER,
+                target_chat_title TEXT,
+                initiated_by_user_id INTEGER,
+                initiated_by_username TEXT,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                request_text TEXT NOT NULL,
+                latest_reply_text TEXT,
+                summary TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (origin_conversation_id) REFERENCES telegram_conversations(id) ON DELETE CASCADE,
+                FOREIGN KEY (target_conversation_id) REFERENCES telegram_conversations(id) ON DELETE SET NULL,
+                FOREIGN KEY (origin_mission_id) REFERENCES missions(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_twf_channel_updated
+                ON telegram_workflows(channel_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_twf_target_status
+                ON telegram_workflows(channel_id, target_chat_id, status, updated_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_workflows table: {}", e))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_workflow_events (
+                id TEXT PRIMARY KEY NOT NULL,
+                workflow_id TEXT NOT NULL,
+                conversation_id TEXT,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (workflow_id) REFERENCES telegram_workflows(id) ON DELETE CASCADE,
+                FOREIGN KEY (conversation_id) REFERENCES telegram_conversations(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_twf_events_workflow_created
+                ON telegram_workflow_events(workflow_id, created_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_workflow_events table: {}", e))?;
 
         // Migrate automations table to new schema
         Self::migrate_automations_table(conn)?;
@@ -4708,6 +4809,410 @@ impl MissionStore for SqliteMissionStore {
         .await
         .map_err(|e| e.to_string())?
     }
+
+    async fn upsert_telegram_conversation(
+        &self,
+        conversation: TelegramConversation,
+    ) -> Result<TelegramConversation, String> {
+        let conn = self.conn.clone();
+        let conversation_clone = conversation.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_conversations (
+                    id, channel_id, chat_id, mission_id, chat_title, chat_type, last_message_at, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(channel_id, chat_id) DO UPDATE SET
+                    mission_id = excluded.mission_id,
+                    chat_title = coalesce(excluded.chat_title, telegram_conversations.chat_title),
+                    chat_type = coalesce(excluded.chat_type, telegram_conversations.chat_type),
+                    last_message_at = coalesce(excluded.last_message_at, telegram_conversations.last_message_at),
+                    updated_at = excluded.updated_at",
+                params![
+                    conversation_clone.id.to_string(),
+                    conversation_clone.channel_id.to_string(),
+                    conversation_clone.chat_id,
+                    conversation_clone.mission_id.map(|id| id.to_string()),
+                    conversation_clone.chat_title.clone(),
+                    conversation_clone.chat_type.clone(),
+                    conversation_clone.last_message_at.clone(),
+                    conversation_clone.created_at.clone(),
+                    conversation_clone.updated_at.clone(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, chat_title, chat_type, last_message_at, created_at, updated_at
+                     FROM telegram_conversations
+                     WHERE channel_id = ?1 AND chat_id = ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_row(
+                params![
+                    conversation_clone.channel_id.to_string(),
+                    conversation_clone.chat_id
+                ],
+                row_to_telegram_conversation,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_telegram_conversation_by_chat(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+    ) -> Result<Option<TelegramConversation>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, chat_title, chat_type, last_message_at, created_at, updated_at
+                     FROM telegram_conversations
+                     WHERE channel_id = ?1 AND chat_id = ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_row(
+                params![channel_id.to_string(), chat_id],
+                row_to_telegram_conversation,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_conversations(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramConversation>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, chat_title, chat_type, last_message_at, created_at, updated_at
+                     FROM telegram_conversations
+                     WHERE channel_id = ?1
+                     ORDER BY coalesce(last_message_at, updated_at) DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                params![channel_id.to_string(), limit as i64],
+                row_to_telegram_conversation,
+            )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_telegram_conversation_message(
+        &self,
+        message: TelegramConversationMessage,
+    ) -> Result<TelegramConversationMessage, String> {
+        let conn = self.conn.clone();
+        let message_clone = message.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_conversation_messages (
+                    id, conversation_id, channel_id, chat_id, mission_id, workflow_id, telegram_message_id,
+                    direction, role, sender_user_id, sender_username, sender_display_name,
+                    reply_to_message_id, text, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    message_clone.id.to_string(),
+                    message_clone.conversation_id.to_string(),
+                    message_clone.channel_id.to_string(),
+                    message_clone.chat_id,
+                    message_clone.mission_id.map(|id| id.to_string()),
+                    message_clone.workflow_id.map(|id| id.to_string()),
+                    message_clone.telegram_message_id,
+                    match message_clone.direction {
+                        TelegramConversationMessageDirection::Inbound => "inbound",
+                        TelegramConversationMessageDirection::Outbound => "outbound",
+                    },
+                    message_clone.role.clone(),
+                    message_clone.sender_user_id,
+                    message_clone.sender_username.clone(),
+                    message_clone.sender_display_name.clone(),
+                    message_clone.reply_to_message_id,
+                    message_clone.text.clone(),
+                    message_clone.created_at.clone(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE telegram_conversations
+                 SET last_message_at = ?1, updated_at = ?1
+                 WHERE id = ?2",
+                params![message_clone.created_at, message_clone.conversation_id.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(message_clone)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_conversation_messages(
+        &self,
+        conversation_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramConversationMessage>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, conversation_id, channel_id, chat_id, mission_id, workflow_id, telegram_message_id,
+                            direction, role, sender_user_id, sender_username, sender_display_name,
+                            reply_to_message_id, text, created_at
+                     FROM telegram_conversation_messages
+                     WHERE conversation_id = ?1
+                     ORDER BY created_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                params![conversation_id.to_string(), limit as i64],
+                row_to_telegram_conversation_message,
+            )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_telegram_workflow(
+        &self,
+        workflow: TelegramWorkflow,
+    ) -> Result<TelegramWorkflow, String> {
+        let conn = self.conn.clone();
+        let workflow_clone = workflow.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_workflows (
+                    id, channel_id, origin_conversation_id, origin_chat_id, origin_mission_id,
+                    target_conversation_id, target_chat_id, target_chat_title,
+                    initiated_by_user_id, initiated_by_username, kind, status, request_text,
+                    latest_reply_text, summary, last_error, created_at, updated_at, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                params![
+                    workflow_clone.id.to_string(),
+                    workflow_clone.channel_id.to_string(),
+                    workflow_clone.origin_conversation_id.to_string(),
+                    workflow_clone.origin_chat_id,
+                    workflow_clone.origin_mission_id.map(|id| id.to_string()),
+                    workflow_clone.target_conversation_id.map(|id| id.to_string()),
+                    workflow_clone.target_chat_id,
+                    workflow_clone.target_chat_title.clone(),
+                    workflow_clone.initiated_by_user_id,
+                    workflow_clone.initiated_by_username.clone(),
+                    match workflow_clone.kind {
+                        TelegramWorkflowKind::RequestReply => "request_reply",
+                    },
+                    match workflow_clone.status {
+                        TelegramWorkflowStatus::WaitingExternal => "waiting_external",
+                        TelegramWorkflowStatus::RelayedToOrigin => "relayed_to_origin",
+                        TelegramWorkflowStatus::Completed => "completed",
+                        TelegramWorkflowStatus::Failed => "failed",
+                        TelegramWorkflowStatus::Cancelled => "cancelled",
+                    },
+                    workflow_clone.request_text.clone(),
+                    workflow_clone.latest_reply_text.clone(),
+                    workflow_clone.summary.clone(),
+                    workflow_clone.last_error.clone(),
+                    workflow_clone.created_at.clone(),
+                    workflow_clone.updated_at.clone(),
+                    workflow_clone.completed_at.clone(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(workflow_clone)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn update_telegram_workflow(&self, workflow: TelegramWorkflow) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_workflows
+                 SET target_conversation_id = ?1,
+                     target_chat_id = ?2,
+                     target_chat_title = ?3,
+                     status = ?4,
+                     latest_reply_text = ?5,
+                     summary = ?6,
+                     last_error = ?7,
+                     updated_at = ?8,
+                     completed_at = ?9
+                 WHERE id = ?10",
+                params![
+                    workflow.target_conversation_id.map(|id| id.to_string()),
+                    workflow.target_chat_id,
+                    workflow.target_chat_title,
+                    match workflow.status {
+                        TelegramWorkflowStatus::WaitingExternal => "waiting_external",
+                        TelegramWorkflowStatus::RelayedToOrigin => "relayed_to_origin",
+                        TelegramWorkflowStatus::Completed => "completed",
+                        TelegramWorkflowStatus::Failed => "failed",
+                        TelegramWorkflowStatus::Cancelled => "cancelled",
+                    },
+                    workflow.latest_reply_text,
+                    workflow.summary,
+                    workflow.last_error,
+                    workflow.updated_at,
+                    workflow.completed_at,
+                    workflow.id.to_string(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_workflows(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramWorkflow>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, origin_conversation_id, origin_chat_id, origin_mission_id,
+                            target_conversation_id, target_chat_id, target_chat_title,
+                            initiated_by_user_id, initiated_by_username, kind, status, request_text,
+                            latest_reply_text, summary, last_error, created_at, updated_at, completed_at
+                     FROM telegram_workflows
+                     WHERE channel_id = ?1
+                     ORDER BY updated_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                params![channel_id.to_string(), limit as i64],
+                row_to_telegram_workflow,
+            )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_pending_telegram_workflow_for_target_chat(
+        &self,
+        channel_id: Uuid,
+        target_chat_id: i64,
+    ) -> Result<Option<TelegramWorkflow>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, origin_conversation_id, origin_chat_id, origin_mission_id,
+                            target_conversation_id, target_chat_id, target_chat_title,
+                            initiated_by_user_id, initiated_by_username, kind, status, request_text,
+                            latest_reply_text, summary, last_error, created_at, updated_at, completed_at
+                     FROM telegram_workflows
+                     WHERE channel_id = ?1
+                       AND target_chat_id = ?2
+                       AND status = 'waiting_external'
+                     ORDER BY updated_at DESC
+                     LIMIT 1",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_row(
+                params![channel_id.to_string(), target_chat_id],
+                row_to_telegram_workflow,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_telegram_workflow_event(
+        &self,
+        event: TelegramWorkflowEvent,
+    ) -> Result<TelegramWorkflowEvent, String> {
+        let conn = self.conn.clone();
+        let event_clone = event.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_workflow_events (
+                    id, workflow_id, conversation_id, event_type, payload_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event_clone.id.to_string(),
+                    event_clone.workflow_id.to_string(),
+                    event_clone.conversation_id.map(|id| id.to_string()),
+                    event_clone.event_type.clone(),
+                    event_clone.payload_json.clone(),
+                    event_clone.created_at.clone(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(event_clone)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_workflow_events(
+        &self,
+        workflow_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramWorkflowEvent>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, workflow_id, conversation_id, event_type, payload_json, created_at
+                     FROM telegram_workflow_events
+                     WHERE workflow_id = ?1
+                     ORDER BY created_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    params![workflow_id.to_string(), limit as i64],
+                    row_to_telegram_workflow_event,
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
 }
 
 /// Parse a Telegram channel from a SQLite row.
@@ -4813,6 +5318,32 @@ fn parse_telegram_action_execution_status(raw: String) -> TelegramActionExecutio
     }
 }
 
+fn parse_telegram_conversation_message_direction(
+    raw: String,
+) -> TelegramConversationMessageDirection {
+    match raw.as_str() {
+        "outbound" => TelegramConversationMessageDirection::Outbound,
+        _ => TelegramConversationMessageDirection::Inbound,
+    }
+}
+
+fn parse_telegram_workflow_kind(raw: String) -> TelegramWorkflowKind {
+    match raw.as_str() {
+        "request_reply" => TelegramWorkflowKind::RequestReply,
+        _ => TelegramWorkflowKind::RequestReply,
+    }
+}
+
+fn parse_telegram_workflow_status(raw: String) -> TelegramWorkflowStatus {
+    match raw.as_str() {
+        "relayed_to_origin" => TelegramWorkflowStatus::RelayedToOrigin,
+        "completed" => TelegramWorkflowStatus::Completed,
+        "failed" => TelegramWorkflowStatus::Failed,
+        "cancelled" => TelegramWorkflowStatus::Cancelled,
+        _ => TelegramWorkflowStatus::WaitingExternal,
+    }
+}
+
 fn row_to_telegram_structured_memory(
     row: &rusqlite::Row<'_>,
 ) -> Result<TelegramStructuredMemoryEntry, rusqlite::Error> {
@@ -4885,13 +5416,127 @@ fn row_to_telegram_action_execution(
     })
 }
 
+fn row_to_telegram_conversation(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramConversation, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let channel_id_str: String = row.get(1)?;
+    let mission_id_str: Option<String> = row.get(3)?;
+    Ok(TelegramConversation {
+        id: parse_uuid_or_nil(&id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        chat_id: row.get(2)?,
+        mission_id: mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        chat_title: row.get(4)?,
+        chat_type: row.get(5)?,
+        last_message_at: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn row_to_telegram_conversation_message(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramConversationMessage, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let conversation_id_str: String = row.get(1)?;
+    let channel_id_str: String = row.get(2)?;
+    let mission_id_str: Option<String> = row.get(4)?;
+    let workflow_id_str: Option<String> = row.get(5)?;
+    let direction_str: String = row.get(7)?;
+    Ok(TelegramConversationMessage {
+        id: parse_uuid_or_nil(&id_str),
+        conversation_id: parse_uuid_or_nil(&conversation_id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        chat_id: row.get(3)?,
+        mission_id: mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        workflow_id: workflow_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        telegram_message_id: row.get(6)?,
+        direction: parse_telegram_conversation_message_direction(direction_str),
+        role: row.get(8)?,
+        sender_user_id: row.get(9)?,
+        sender_username: row.get(10)?,
+        sender_display_name: row.get(11)?,
+        reply_to_message_id: row.get(12)?,
+        text: row.get(13)?,
+        created_at: row.get(14)?,
+    })
+}
+
+fn row_to_telegram_workflow(row: &rusqlite::Row<'_>) -> Result<TelegramWorkflow, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let channel_id_str: String = row.get(1)?;
+    let origin_conversation_id_str: String = row.get(2)?;
+    let origin_mission_id_str: Option<String> = row.get(4)?;
+    let target_conversation_id_str: Option<String> = row.get(5)?;
+    let kind_str: String = row.get(10)?;
+    let status_str: String = row.get(11)?;
+    Ok(TelegramWorkflow {
+        id: parse_uuid_or_nil(&id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        origin_conversation_id: parse_uuid_or_nil(&origin_conversation_id_str),
+        origin_chat_id: row.get(3)?,
+        origin_mission_id: origin_mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        target_conversation_id: target_conversation_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        target_chat_id: row.get(6)?,
+        target_chat_title: row.get(7)?,
+        initiated_by_user_id: row.get(8)?,
+        initiated_by_username: row.get(9)?,
+        kind: parse_telegram_workflow_kind(kind_str),
+        status: parse_telegram_workflow_status(status_str),
+        request_text: row.get(12)?,
+        latest_reply_text: row.get(13)?,
+        summary: row.get(14)?,
+        last_error: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+        completed_at: row.get(18)?,
+    })
+}
+
+fn row_to_telegram_workflow_event(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramWorkflowEvent, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let workflow_id_str: String = row.get(1)?;
+    let conversation_id_str: Option<String> = row.get(2)?;
+    Ok(TelegramWorkflowEvent {
+        id: parse_uuid_or_nil(&id_str),
+        workflow_id: parse_uuid_or_nil(&workflow_id_str),
+        conversation_id: conversation_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        event_type: row.get(3)?,
+        payload_json: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{assistant_message_metadata, AssistantMessageMetadataInput, SqliteMissionStore};
     use crate::agents::CostSource;
     use crate::api::mission_store::{
-        MissionStore, TelegramChannel, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
-        TelegramStructuredMemoryScope, TelegramTriggerMode,
+        MissionStore, TelegramChannel, TelegramConversation, TelegramConversationMessage,
+        TelegramConversationMessageDirection, TelegramStructuredMemoryEntry,
+        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope, TelegramTriggerMode,
+        TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus,
     };
     use crate::cost::TokenUsage;
     use rusqlite::params;
@@ -4964,6 +5609,272 @@ mod tests {
             .await
             .expect("telegram channel");
         channel.id
+    }
+
+    #[tokio::test]
+    async fn telegram_conversation_upsert_preserves_row_and_lists_latest_first() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+        let mission = store
+            .create_mission(Some("Origin"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        let created = store
+            .upsert_telegram_conversation(TelegramConversation {
+                id: Uuid::new_v4(),
+                channel_id,
+                chat_id: 101,
+                mission_id: Some(mission.id),
+                chat_title: Some("Ana DM".to_string()),
+                chat_type: Some("private".to_string()),
+                last_message_at: Some("2026-04-08T10:00:00Z".to_string()),
+                created_at: "2026-04-08T10:00:00Z".to_string(),
+                updated_at: "2026-04-08T10:00:00Z".to_string(),
+            })
+            .await
+            .expect("create conversation");
+
+        let updated = store
+            .upsert_telegram_conversation(TelegramConversation {
+                id: Uuid::new_v4(),
+                channel_id,
+                chat_id: 101,
+                mission_id: Some(mission.id),
+                chat_title: None,
+                chat_type: None,
+                last_message_at: Some("2026-04-08T10:05:00Z".to_string()),
+                created_at: "2026-04-08T10:05:00Z".to_string(),
+                updated_at: "2026-04-08T10:05:00Z".to_string(),
+            })
+            .await
+            .expect("update conversation");
+
+        assert_eq!(updated.id, created.id);
+        assert_eq!(updated.chat_title.as_deref(), Some("Ana DM"));
+        assert_eq!(updated.chat_type.as_deref(), Some("private"));
+        assert_eq!(
+            updated.last_message_at.as_deref(),
+            Some("2026-04-08T10:05:00Z")
+        );
+
+        let listed = store
+            .list_telegram_conversations(channel_id, 10)
+            .await
+            .expect("list conversations");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, created.id);
+    }
+
+    #[tokio::test]
+    async fn telegram_conversation_messages_round_trip_and_bump_last_message_at() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+        let mission = store
+            .create_mission(Some("Origin"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        let conversation = store
+            .upsert_telegram_conversation(TelegramConversation {
+                id: Uuid::new_v4(),
+                channel_id,
+                chat_id: 202,
+                mission_id: Some(mission.id),
+                chat_title: Some("Thread".to_string()),
+                chat_type: Some("private".to_string()),
+                last_message_at: Some("2026-04-08T10:00:00Z".to_string()),
+                created_at: "2026-04-08T10:00:00Z".to_string(),
+                updated_at: "2026-04-08T10:00:00Z".to_string(),
+            })
+            .await
+            .expect("conversation");
+
+        store
+            .create_telegram_conversation_message(TelegramConversationMessage {
+                id: Uuid::new_v4(),
+                conversation_id: conversation.id,
+                channel_id,
+                chat_id: 202,
+                mission_id: Some(mission.id),
+                workflow_id: None,
+                telegram_message_id: Some(11),
+                direction: TelegramConversationMessageDirection::Inbound,
+                role: "user".to_string(),
+                sender_user_id: Some(1),
+                sender_username: Some("marilyn".to_string()),
+                sender_display_name: Some("Marilyn".to_string()),
+                reply_to_message_id: None,
+                text: "First".to_string(),
+                created_at: "2026-04-08T10:01:00Z".to_string(),
+            })
+            .await
+            .expect("inbound message");
+
+        store
+            .create_telegram_conversation_message(TelegramConversationMessage {
+                id: Uuid::new_v4(),
+                conversation_id: conversation.id,
+                channel_id,
+                chat_id: 202,
+                mission_id: Some(mission.id),
+                workflow_id: None,
+                telegram_message_id: Some(12),
+                direction: TelegramConversationMessageDirection::Outbound,
+                role: "assistant".to_string(),
+                sender_user_id: None,
+                sender_username: Some("ana_lfgbot_test".to_string()),
+                sender_display_name: Some("@ana_lfgbot_test".to_string()),
+                reply_to_message_id: Some(11),
+                text: "Reply".to_string(),
+                created_at: "2026-04-08T10:02:00Z".to_string(),
+            })
+            .await
+            .expect("outbound message");
+
+        let messages = store
+            .list_telegram_conversation_messages(conversation.id, 10)
+            .await
+            .expect("list messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "Reply");
+        assert_eq!(
+            messages[0].direction,
+            TelegramConversationMessageDirection::Outbound
+        );
+        assert_eq!(messages[1].text, "First");
+
+        let refreshed = store
+            .get_telegram_conversation_by_chat(channel_id, 202)
+            .await
+            .expect("get conversation")
+            .expect("conversation exists");
+        assert_eq!(
+            refreshed.last_message_at.as_deref(),
+            Some("2026-04-08T10:02:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_workflow_round_trip_supports_pending_lookup_and_events() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+        let mission = store
+            .create_mission(Some("Origin"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        let origin = store
+            .upsert_telegram_conversation(TelegramConversation {
+                id: Uuid::new_v4(),
+                channel_id,
+                chat_id: 303,
+                mission_id: Some(mission.id),
+                chat_title: Some("Origin".to_string()),
+                chat_type: Some("private".to_string()),
+                last_message_at: Some("2026-04-08T10:00:00Z".to_string()),
+                created_at: "2026-04-08T10:00:00Z".to_string(),
+                updated_at: "2026-04-08T10:00:00Z".to_string(),
+            })
+            .await
+            .expect("origin conversation");
+        let target = store
+            .upsert_telegram_conversation(TelegramConversation {
+                id: Uuid::new_v4(),
+                channel_id,
+                chat_id: 404,
+                mission_id: None,
+                chat_title: Some("Marilyn".to_string()),
+                chat_type: Some("private".to_string()),
+                last_message_at: Some("2026-04-08T10:00:00Z".to_string()),
+                created_at: "2026-04-08T10:00:00Z".to_string(),
+                updated_at: "2026-04-08T10:00:00Z".to_string(),
+            })
+            .await
+            .expect("target conversation");
+
+        let workflow = store
+            .create_telegram_workflow(TelegramWorkflow {
+                id: Uuid::new_v4(),
+                channel_id,
+                origin_conversation_id: origin.id,
+                origin_chat_id: 303,
+                origin_mission_id: Some(mission.id),
+                target_conversation_id: Some(target.id),
+                target_chat_id: Some(404),
+                target_chat_title: Some("Marilyn".to_string()),
+                initiated_by_user_id: Some(7),
+                initiated_by_username: Some("th0rgal".to_string()),
+                kind: TelegramWorkflowKind::RequestReply,
+                status: TelegramWorkflowStatus::WaitingExternal,
+                request_text: "Ask Marilyn for leads".to_string(),
+                latest_reply_text: None,
+                summary: None,
+                last_error: None,
+                created_at: "2026-04-08T10:00:00Z".to_string(),
+                updated_at: "2026-04-08T10:00:00Z".to_string(),
+                completed_at: None,
+            })
+            .await
+            .expect("create workflow");
+
+        let pending = store
+            .get_pending_telegram_workflow_for_target_chat(channel_id, 404)
+            .await
+            .expect("pending workflow")
+            .expect("workflow exists");
+        assert_eq!(pending.id, workflow.id);
+
+        store
+            .create_telegram_workflow_event(TelegramWorkflowEvent {
+                id: Uuid::new_v4(),
+                workflow_id: workflow.id,
+                conversation_id: Some(target.id),
+                event_type: "external_reply_received".to_string(),
+                payload_json: "{\"text\":\"Lead A\"}".to_string(),
+                created_at: "2026-04-08T10:03:00Z".to_string(),
+            })
+            .await
+            .expect("create workflow event");
+
+        let mut completed = workflow.clone();
+        completed.status = TelegramWorkflowStatus::RelayedToOrigin;
+        completed.latest_reply_text = Some("Lead A".to_string());
+        completed.summary = Some("Lead A relayed".to_string());
+        completed.updated_at = "2026-04-08T10:04:00Z".to_string();
+        completed.completed_at = Some("2026-04-08T10:04:00Z".to_string());
+        store
+            .update_telegram_workflow(completed.clone())
+            .await
+            .expect("update workflow");
+
+        let pending_after = store
+            .get_pending_telegram_workflow_for_target_chat(channel_id, 404)
+            .await
+            .expect("pending lookup after completion");
+        assert!(pending_after.is_none());
+
+        let listed = store
+            .list_telegram_workflows(channel_id, 10)
+            .await
+            .expect("list workflows");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, TelegramWorkflowStatus::RelayedToOrigin);
+        assert_eq!(listed[0].summary.as_deref(), Some("Lead A relayed"));
+
+        let events = store
+            .list_telegram_workflow_events(workflow.id, 10)
+            .await
+            .expect("list workflow events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "external_reply_received");
     }
 
     #[test]
