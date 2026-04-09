@@ -705,7 +705,7 @@ export default function TelegramSettingsPage() {
                       <div className="flex items-center gap-2 mb-3">
                         <input
                           type="text"
-                          placeholder="Search what Ana would recall..."
+                          placeholder="Search what Paloma would recall..."
                           value={memorySearchQueryByBot[bot.id] || ''}
                           onChange={(e) =>
                             setMemorySearchQueryByBot((prev) => ({
@@ -983,7 +983,7 @@ export default function TelegramSettingsPage() {
               <div>
                 <label className="block text-sm text-white/60 mb-1">Instructions (optional)</label>
                 <textarea
-                  placeholder="You are Ana, a helpful assistant. Respond in plain text without markdown."
+                  placeholder="You are Paloma, a helpful assistant. Respond in plain text without markdown."
                   value={createInstructions}
                   onChange={(e) => setCreateInstructions(e.target.value)}
                   rows={3}

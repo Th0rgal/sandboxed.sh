@@ -10302,7 +10302,7 @@ pub async fn search_bot_structured_memory(
 }
 
 /// Send a message to a Telegram chat via the bot and optionally dispatch it to
-/// the associated mission. Used by agents (e.g. Ana) to proactively message users.
+/// the associated mission. Used by agents (e.g. Paloma) to proactively message users.
 #[derive(Debug, Deserialize)]
 pub struct SendTelegramMessageRequest {
     /// Telegram chat ID to send to

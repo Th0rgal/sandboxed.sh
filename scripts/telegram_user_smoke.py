@@ -7,7 +7,7 @@ from the client side without depending on a bot token or webhook injection.
 Typical flow:
 1. Set TELEGRAM_API_ID / TELEGRAM_API_HASH from https://my.telegram.org
 2. Run the script once to authorize the session with your phone number
-3. Send a message to a target chat and optionally watch for Ana's reply
+3. Send a message to a target chat and optionally watch for Paloma's reply
 """
 
 from __future__ import annotations

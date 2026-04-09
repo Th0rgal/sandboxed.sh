@@ -5906,7 +5906,7 @@ mod tests {
                 channel_id,
                 chat_id: 101,
                 mission_id: Some(mission.id),
-                chat_title: Some("Ana DM".to_string()),
+                chat_title: Some("Paloma DM".to_string()),
                 chat_type: Some("private".to_string()),
                 last_message_at: Some("2026-04-08T10:00:00Z".to_string()),
                 created_at: "2026-04-08T10:00:00Z".to_string(),
@@ -5931,7 +5931,7 @@ mod tests {
             .expect("update conversation");
 
         assert_eq!(updated.id, created.id);
-        assert_eq!(updated.chat_title.as_deref(), Some("Ana DM"));
+        assert_eq!(updated.chat_title.as_deref(), Some("Paloma DM"));
         assert_eq!(updated.chat_type.as_deref(), Some("private"));
         assert_eq!(
             updated.last_message_at.as_deref(),
