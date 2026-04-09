@@ -2528,6 +2528,17 @@ pub async fn execute_native_telegram_request_workflow(
             created_at: now_string(),
             updated_at: now_string(),
         });
+    // Backfill chat_type when missing so workflow routing decisions have the
+    // correct chat type (group vs private vs supergroup).
+    if origin_conversation.chat_type.is_none() {
+        let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+        if let Ok(lookup) = fetch_telegram_chat_lookup(bridge.http(), &base_url, source_chat_id).await {
+            if origin_conversation.chat_title.is_none() {
+                origin_conversation.chat_title = telegram_action_lookup_title(&lookup);
+            }
+            origin_conversation.chat_type = Some(lookup.chat_type);
+        }
+    }
     origin_conversation = ctx
         .mission_store
         .upsert_telegram_conversation(origin_conversation)
