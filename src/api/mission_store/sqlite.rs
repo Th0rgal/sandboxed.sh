@@ -612,10 +612,7 @@ impl SqliteMissionStore {
                         .as_str()
                         .unwrap_or("0 * * * *")
                         .to_string(),
-                    timezone: data["timezone"]
-                        .as_str()
-                        .unwrap_or("UTC")
-                        .to_string(),
+                    timezone: data["timezone"].as_str().unwrap_or("UTC").to_string(),
                 }
             }
             "webhook" => {
@@ -3230,7 +3227,10 @@ impl MissionStore for SqliteMissionStore {
                 "interval",
                 serde_json::json!({ "seconds": seconds }).to_string(),
             ),
-            TriggerType::Cron { expression, timezone } => (
+            TriggerType::Cron {
+                expression,
+                timezone,
+            } => (
                 "cron",
                 serde_json::json!({ "expression": expression, "timezone": timezone }).to_string(),
             ),
@@ -3448,7 +3448,10 @@ impl MissionStore for SqliteMissionStore {
                 "interval",
                 serde_json::json!({ "seconds": seconds }).to_string(),
             ),
-            TriggerType::Cron { expression, timezone } => (
+            TriggerType::Cron {
+                expression,
+                timezone,
+            } => (
                 "cron",
                 serde_json::json!({ "expression": expression, "timezone": timezone }).to_string(),
             ),

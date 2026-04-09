@@ -4876,28 +4876,52 @@ fn resolve_tz_offset(tz: &str, now_utc: chrono::DateTime<chrono::Utc>) -> chrono
         "Europe/London" => {
             // BST Mar-Oct +1, GMT otherwise
             let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=10).contains(&month) { 3600 } else { 0 }
+            if (3..=10).contains(&month) {
+                3600
+            } else {
+                0
+            }
         }
-        "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid"
-        | "Europe/Amsterdam" | "Europe/Brussels" | "CET" => {
+        "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid" | "Europe/Amsterdam"
+        | "Europe/Brussels" | "CET" => {
             let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=10).contains(&month) { 7200 } else { 3600 } // CEST / CET
+            if (3..=10).contains(&month) {
+                7200
+            } else {
+                3600
+            } // CEST / CET
         }
         "America/New_York" | "US/Eastern" | "EST" => {
             let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=11).contains(&month) { -4 * 3600 } else { -5 * 3600 }
+            if (3..=11).contains(&month) {
+                -4 * 3600
+            } else {
+                -5 * 3600
+            }
         }
         "America/Chicago" | "US/Central" | "CST" => {
             let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=11).contains(&month) { -5 * 3600 } else { -6 * 3600 }
+            if (3..=11).contains(&month) {
+                -5 * 3600
+            } else {
+                -6 * 3600
+            }
         }
         "America/Denver" | "US/Mountain" | "MST" => {
             let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=11).contains(&month) { -6 * 3600 } else { -7 * 3600 }
+            if (3..=11).contains(&month) {
+                -6 * 3600
+            } else {
+                -7 * 3600
+            }
         }
         "America/Los_Angeles" | "US/Pacific" | "PST" => {
             let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=11).contains(&month) { -7 * 3600 } else { -8 * 3600 }
+            if (3..=11).contains(&month) {
+                -7 * 3600
+            } else {
+                -8 * 3600
+            }
         }
         "Asia/Tokyo" | "JST" => 9 * 3600,
         "Asia/Shanghai" | "Asia/Hong_Kong" | "Asia/Singapore" => 8 * 3600,
@@ -4906,7 +4930,11 @@ fn resolve_tz_offset(tz: &str, now_utc: chrono::DateTime<chrono::Utc>) -> chrono
         "Australia/Sydney" | "AEST" => {
             let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
             // AEDT Oct-Mar, AEST Apr-Sep (southern hemisphere)
-            if (1..=3).contains(&month) || (10..=12).contains(&month) { 11 * 3600 } else { 10 * 3600 }
+            if (1..=3).contains(&month) || (10..=12).contains(&month) {
+                11 * 3600
+            } else {
+                10 * 3600
+            }
         }
         "America/Sao_Paulo" => -3 * 3600,
         _ => {
@@ -4915,7 +4943,8 @@ fn resolve_tz_offset(tz: &str, now_utc: chrono::DateTime<chrono::Utc>) -> chrono
         }
     };
 
-    chrono::FixedOffset::east_opt(offset_secs).unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap())
+    chrono::FixedOffset::east_opt(offset_secs)
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap())
 }
 
 /// Background task that checks for automations and triggers them at their intervals.
@@ -4960,11 +4989,17 @@ async fn automation_scheduler_loop(
             // Telegram via the Telegram bridge.
             enum ScheduleKind {
                 Interval(u64),
-                Cron { expression: String, timezone: String },
+                Cron {
+                    expression: String,
+                    timezone: String,
+                },
             }
             let schedule = match &automation.trigger {
                 TriggerType::Interval { seconds } => ScheduleKind::Interval(*seconds),
-                TriggerType::Cron { expression, timezone } => ScheduleKind::Cron {
+                TriggerType::Cron {
+                    expression,
+                    timezone,
+                } => ScheduleKind::Cron {
                     expression: expression.clone(),
                     timezone: timezone.clone(),
                 },
@@ -5039,7 +5074,10 @@ async fn automation_scheduler_loop(
                         true // Never triggered before
                     }
                 }
-                ScheduleKind::Cron { expression, timezone } => {
+                ScheduleKind::Cron {
+                    expression,
+                    timezone,
+                } => {
                     match croner::Cron::new(expression).parse() {
                         Ok(cron) => {
                             // Determine "now" in the configured timezone.
@@ -8566,7 +8604,10 @@ async fn run_single_control_turn(
             "Telegram message detected in control path, attempting CLAUDE.md injection"
         );
         if claude_md_path.exists() {
-            super::mission_runner::inject_telegram_identity_into_claude_md(&claude_md_path, &user_message);
+            super::mission_runner::inject_telegram_identity_into_claude_md(
+                &claude_md_path,
+                &user_message,
+            );
         }
     }
 
