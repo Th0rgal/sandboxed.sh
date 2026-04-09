@@ -3454,10 +3454,10 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                     env.entry("API_URL".to_string())
                         .or_insert_with(|| format!("http://127.0.0.1:{}", port));
                 }
-                // Only forward JWT_SECRET to the orchestrator MCP so it can
+                // Forward JWT_SECRET to trusted internal MCPs so they can
                 // mint service tokens.  Other MCPs (including third-party ones)
                 // must not receive this secret.
-                if cfg.name == "orchestrator" {
+                if cfg.name == "orchestrator" || cfg.name == "automation-manager" {
                     if let Ok(secret) = std::env::var("JWT_SECRET") {
                         env.entry("JWT_SECRET".to_string()).or_insert(secret);
                     }

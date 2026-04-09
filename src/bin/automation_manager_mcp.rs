@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
+use chrono::Utc;
+use jsonwebtoken::{EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -15,6 +17,35 @@ use sandboxed_sh::api::mission_store::{
     Automation, AutomationExecution, CommandSource, FreshSession, RetryConfig, StopPolicy,
     TriggerType,
 };
+
+// =============================================================================
+// Service JWT minting (same pattern as orchestrator MCP)
+// =============================================================================
+
+#[derive(Debug, Serialize)]
+struct JwtClaims {
+    sub: String,
+    usr: String,
+    iat: i64,
+    exp: i64,
+}
+
+fn mint_service_jwt(secret: &str) -> Option<String> {
+    let now = Utc::now();
+    let exp = now + chrono::Duration::hours(24);
+    let claims = JwtClaims {
+        sub: "automation-manager-mcp".to_string(),
+        usr: "automation-manager-mcp".to_string(),
+        iat: now.timestamp(),
+        exp: exp.timestamp(),
+    };
+    jsonwebtoken::encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .ok()
+}
 
 // =============================================================================
 // JSON-RPC Types
@@ -576,7 +607,14 @@ async fn main() {
 
     let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
 
-    let api_token = std::env::var("API_TOKEN").ok();
+    let api_token = std::env::var("API_TOKEN")
+        .ok()
+        .or_else(|| {
+            // Mint a service JWT from the shared secret when no explicit token is set.
+            std::env::var("JWT_SECRET")
+                .ok()
+                .and_then(|s| mint_service_jwt(&s))
+        });
 
     let server = Arc::new(AutomationManagerMcp::new(mission_id, api_url, api_token));
 
