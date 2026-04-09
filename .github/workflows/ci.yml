@@ -140,6 +140,14 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Cache dashboard dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            dashboard/node_modules
+          key: ${{ runner.os }}-dashboard-bun-${{ hashFiles('dashboard/bun.lock', 'dashboard/package.json') }}
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
