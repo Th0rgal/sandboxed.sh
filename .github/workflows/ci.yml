@@ -27,13 +27,13 @@ jobs:
     # Skip CI on draft PRs unless explicitly requested
     if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -52,7 +52,7 @@ jobs:
     # Skip CI on draft PRs unless explicitly requested
     if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -60,7 +60,7 @@ jobs:
           components: clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -79,7 +79,7 @@ jobs:
     # Skip CI on draft PRs unless explicitly requested
     if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -95,13 +95,13 @@ jobs:
     # Skip CI on draft PRs unless explicitly requested
     if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -120,7 +120,7 @@ jobs:
     # Skip CI on draft PRs unless explicitly requested
     if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Validate capability matrix and surface contract evidence
         run: scripts/check-capability-matrix.sh
@@ -134,7 +134,7 @@ jobs:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -142,7 +142,7 @@ jobs:
           bun-version: latest
 
       - name: Cache dashboard dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.bun/install/cache
@@ -150,7 +150,7 @@ jobs:
           key: ${{ runner.os }}-dashboard-bun-${{ hashFiles('dashboard/bun.lock', 'dashboard/package.json') }}
 
       - name: Cache Next.js build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: dashboard/.next/cache
           key: ${{ runner.os }}-dashboard-next-${{ hashFiles('dashboard/bun.lock', 'dashboard/package.json', 'dashboard/next.config.ts', 'dashboard/src/**/*', 'dashboard/public/**/*') }}
