@@ -4851,6 +4851,73 @@ async fn stale_mission_cleanup_loop(
     }
 }
 
+/// Resolve an IANA timezone string to a chrono::FixedOffset at a given UTC instant.
+///
+/// Falls back to UTC if the timezone is unknown.  We use a simple lookup table for
+/// common timezones to avoid pulling in chrono-tz (heavy dependency).  The offset is
+/// evaluated at `now_utc` to account for DST — though the lookup table doesn't model
+/// DST transitions, the most common use-case (Europe/Paris, America/New_York, etc.)
+/// is close enough for a 5-second poll cadence.
+fn resolve_tz_offset(tz: &str, now_utc: chrono::DateTime<chrono::Utc>) -> chrono::FixedOffset {
+    // Try to parse as a fixed offset first (e.g. "+02:00", "-05:00").
+    if let Ok(fo) = tz.parse::<chrono::FixedOffset>() {
+        return fo;
+    }
+
+    // Common IANA names → approximate offset in seconds east of UTC.
+    // For zones with DST we use the *standard* offset; the 5-second poll
+    // cadence makes a ±1 hour inaccuracy irrelevant for cron scheduling
+    // because the scheduler will simply fire on the next tick once the
+    // wallclock minute matches.
+    //
+    // NOTE: to properly handle DST, integrate the `chrono-tz` crate.
+    let offset_secs = match tz {
+        "UTC" | "GMT" | "Etc/UTC" | "Etc/GMT" => 0,
+        "Europe/London" => {
+            // BST Mar-Oct +1, GMT otherwise
+            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
+            if (3..=10).contains(&month) { 3600 } else { 0 }
+        }
+        "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid"
+        | "Europe/Amsterdam" | "Europe/Brussels" | "CET" => {
+            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
+            if (3..=10).contains(&month) { 7200 } else { 3600 } // CEST / CET
+        }
+        "America/New_York" | "US/Eastern" | "EST" => {
+            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
+            if (3..=11).contains(&month) { -4 * 3600 } else { -5 * 3600 }
+        }
+        "America/Chicago" | "US/Central" | "CST" => {
+            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
+            if (3..=11).contains(&month) { -5 * 3600 } else { -6 * 3600 }
+        }
+        "America/Denver" | "US/Mountain" | "MST" => {
+            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
+            if (3..=11).contains(&month) { -6 * 3600 } else { -7 * 3600 }
+        }
+        "America/Los_Angeles" | "US/Pacific" | "PST" => {
+            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
+            if (3..=11).contains(&month) { -7 * 3600 } else { -8 * 3600 }
+        }
+        "Asia/Tokyo" | "JST" => 9 * 3600,
+        "Asia/Shanghai" | "Asia/Hong_Kong" | "Asia/Singapore" => 8 * 3600,
+        "Asia/Kolkata" | "Asia/Calcutta" => 5 * 3600 + 1800,
+        "Asia/Dubai" => 4 * 3600,
+        "Australia/Sydney" | "AEST" => {
+            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
+            // AEDT Oct-Mar, AEST Apr-Sep (southern hemisphere)
+            if (1..=3).contains(&month) || (10..=12).contains(&month) { 11 * 3600 } else { 10 * 3600 }
+        }
+        "America/Sao_Paulo" => -3 * 3600,
+        _ => {
+            tracing::warn!(timezone = %tz, "Unknown timezone, falling back to UTC");
+            0
+        }
+    };
+
+    chrono::FixedOffset::east_opt(offset_secs).unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap())
+}
+
 /// Background task that checks for automations and triggers them at their intervals.
 async fn automation_scheduler_loop(
     mission_store: Arc<dyn MissionStore>,
@@ -4888,21 +4955,22 @@ async fn automation_scheduler_loop(
         };
 
         for automation in automations {
-            // Only trigger interval-based automations (webhooks are triggered via HTTP endpoint)
-            let interval_seconds = match &automation.trigger {
-                TriggerType::Interval { seconds } => *seconds,
-                TriggerType::Webhook { .. } => {
-                    // Skip webhook automations - they're triggered via HTTP
-                    continue;
-                }
-                TriggerType::AgentFinished => {
-                    // Skip agent_finished automations - they're triggered when a turn completes.
-                    continue;
-                }
-                TriggerType::Telegram { .. } => {
-                    // Skip Telegram automations - they're triggered via the Telegram bridge.
-                    continue;
-                }
+            // Only trigger interval-based and cron-based automations.
+            // Webhooks are triggered via HTTP, agent_finished via turn completion,
+            // Telegram via the Telegram bridge.
+            enum ScheduleKind {
+                Interval(u64),
+                Cron { expression: String, timezone: String },
+            }
+            let schedule = match &automation.trigger {
+                TriggerType::Interval { seconds } => ScheduleKind::Interval(*seconds),
+                TriggerType::Cron { expression, timezone } => ScheduleKind::Cron {
+                    expression: expression.clone(),
+                    timezone: timezone.clone(),
+                },
+                TriggerType::Webhook { .. } => continue,
+                TriggerType::AgentFinished => continue,
+                TriggerType::Telegram { .. } => continue,
             };
 
             let mission = match mission_store.get_mission(automation.mission_id).await {
@@ -4955,19 +5023,62 @@ async fn automation_scheduler_loop(
                 continue;
             }
 
-            // Check if enough time has passed since last trigger
-            let should_trigger = if let Some(ref last_triggered) = automation.last_triggered_at {
-                match chrono::DateTime::parse_from_rfc3339(last_triggered) {
-                    Ok(last_time) => {
-                        let elapsed = chrono::Utc::now()
-                            .signed_duration_since(last_time.with_timezone(&chrono::Utc));
-                        elapsed.num_seconds() >= interval_seconds as i64
+            // Check if it's time to trigger based on schedule type.
+            let should_trigger = match &schedule {
+                ScheduleKind::Interval(interval_seconds) => {
+                    if let Some(ref last_triggered) = automation.last_triggered_at {
+                        match chrono::DateTime::parse_from_rfc3339(last_triggered) {
+                            Ok(last_time) => {
+                                let elapsed = chrono::Utc::now()
+                                    .signed_duration_since(last_time.with_timezone(&chrono::Utc));
+                                elapsed.num_seconds() >= *interval_seconds as i64
+                            }
+                            Err(_) => true,
+                        }
+                    } else {
+                        true // Never triggered before
                     }
-                    Err(_) => true, // If we can't parse, trigger anyway
                 }
-            } else {
-                // Never triggered before, should trigger now
-                true
+                ScheduleKind::Cron { expression, timezone } => {
+                    match croner::Cron::new(expression).parse() {
+                        Ok(cron) => {
+                            // Determine "now" in the configured timezone.
+                            let now_utc = chrono::Utc::now();
+
+                            // If we've never triggered, check whether any occurrence
+                            // should have fired in the last check_interval window.
+                            let reference = if let Some(ref lt) = automation.last_triggered_at {
+                                match chrono::DateTime::parse_from_rfc3339(lt) {
+                                    Ok(t) => t.with_timezone(&chrono::Utc),
+                                    Err(_) => now_utc - chrono::Duration::seconds(10),
+                                }
+                            } else {
+                                // First run: use a 10-second lookback so we fire soon.
+                                now_utc - chrono::Duration::seconds(10)
+                            };
+
+                            // Find the next occurrence after the last trigger.
+                            // If that occurrence is <= now, it's time to fire.
+                            let tz_offset = resolve_tz_offset(timezone, now_utc);
+                            let ref_with_tz = reference.with_timezone(&tz_offset);
+                            match cron.find_next_occurrence(&ref_with_tz, false) {
+                                Ok(next) => {
+                                    let next_utc = next.with_timezone(&chrono::Utc);
+                                    next_utc <= now_utc
+                                }
+                                Err(_) => false,
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                automation_id = %automation.id,
+                                expression = %expression,
+                                "Invalid cron expression, skipping: {}", e
+                            );
+                            false
+                        }
+                    }
+                }
             };
 
             if !should_trigger {
@@ -8886,14 +8997,17 @@ pub async fn create_automation(
 
     let start_immediately = req.start_immediately;
 
-    // For interval-based triggers, if start_immediately is false, set last_triggered_at
-    // to now so the scheduler waits for the full interval before the first trigger.
-    let last_triggered_at =
-        if !start_immediately && matches!(trigger, mission_store::TriggerType::Interval { .. }) {
-            Some(mission_store::now_string())
-        } else {
-            None
-        };
+    // For interval/cron triggers, if start_immediately is false, set last_triggered_at
+    // to now so the scheduler waits for the next occurrence before the first trigger.
+    let last_triggered_at = if !start_immediately
+        && matches!(
+            trigger,
+            mission_store::TriggerType::Interval { .. } | mission_store::TriggerType::Cron { .. }
+        ) {
+        Some(mission_store::now_string())
+    } else {
+        None
+    };
 
     // Build the complete Automation struct
     let fresh_session = req

@@ -604,6 +604,20 @@ impl SqliteMissionStore {
                     seconds: data["seconds"].as_u64().unwrap_or(60),
                 }
             }
+            "cron" => {
+                let data: serde_json::Value = serde_json::from_str(&trigger_data)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                TriggerType::Cron {
+                    expression: data["expression"]
+                        .as_str()
+                        .unwrap_or("0 * * * *")
+                        .to_string(),
+                    timezone: data["timezone"]
+                        .as_str()
+                        .unwrap_or("UTC")
+                        .to_string(),
+                }
+            }
             "webhook" => {
                 let config: WebhookConfig = serde_json::from_str(&trigger_data)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -3216,6 +3230,10 @@ impl MissionStore for SqliteMissionStore {
                 "interval",
                 serde_json::json!({ "seconds": seconds }).to_string(),
             ),
+            TriggerType::Cron { expression, timezone } => (
+                "cron",
+                serde_json::json!({ "expression": expression, "timezone": timezone }).to_string(),
+            ),
             TriggerType::Webhook { config } => (
                 "webhook",
                 serde_json::to_string(config).map_err(|e| e.to_string())?,
@@ -3429,6 +3447,10 @@ impl MissionStore for SqliteMissionStore {
             TriggerType::Interval { seconds } => (
                 "interval",
                 serde_json::json!({ "seconds": seconds }).to_string(),
+            ),
+            TriggerType::Cron { expression, timezone } => (
+                "cron",
+                serde_json::json!({ "expression": expression, "timezone": timezone }).to_string(),
             ),
             TriggerType::Webhook { config } => (
                 "webhook",

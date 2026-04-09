@@ -153,6 +153,14 @@ pub struct WebhookConfig {
 pub enum TriggerType {
     /// Fixed interval in seconds
     Interval { seconds: u64 },
+    /// Cron expression (e.g. "0 8 * * *" for daily at 8:00 UTC)
+    Cron {
+        /// Standard 5-field cron expression: minute hour day-of-month month day-of-week
+        expression: String,
+        /// IANA timezone (e.g. "Europe/Paris"). Defaults to UTC.
+        #[serde(default = "default_timezone")]
+        timezone: String,
+    },
     /// Webhook trigger
     Webhook { config: WebhookConfig },
     /// Trigger immediately after an agent turn finishes for the mission
@@ -199,6 +207,10 @@ pub enum FreshSession {
     /// Keep session alive (default behavior).
     #[default]
     Keep,
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
 }
 
 fn default_stop_policy() -> StopPolicy {

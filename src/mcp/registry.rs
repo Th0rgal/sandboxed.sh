@@ -254,7 +254,7 @@ impl McpRegistry {
             HashMap::new(),
         );
         automation_manager.scope = McpScope::Workspace;
-        automation_manager.default_enabled = false;
+        automation_manager.default_enabled = true;
 
         let mut engram = McpServerConfig::new_stdio(
             "engram".to_string(),

@@ -186,102 +186,53 @@ impl AutomationManagerMcp {
             },
             ToolDefinition {
                 name: "create_automation".to_string(),
-                description: "Create a new automation for the current mission".to_string(),
+                description: concat!(
+                    "Create a scheduled automation. ",
+                    "IMPORTANT — use exactly this JSON structure:\n",
+                    "{\n",
+                    "  \"command_source\": { \"type\": \"inline\", \"content\": \"your prompt here\" },\n",
+                    "  \"trigger\": { \"type\": \"cron\", \"expression\": \"0 8 * * *\", \"timezone\": \"Europe/Paris\" },\n",
+                    "  \"fresh_session\": \"always\"\n",
+                    "}\n",
+                    "Trigger types: cron (expression + timezone), interval (seconds).\n",
+                    "Command source types: inline (content), library (name), local_file (path).\n",
+                    "Cron examples: '0 8 * * *' daily 8am, '0 9 * * 1' Mon 9am, '*/30 * * * *' every 30min."
+                ).to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["command_source", "trigger"],
                     "properties": {
                         "command_source": {
                             "type": "object",
-                            "description": "Source of the command to execute",
-                            "oneOf": [
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": {"const": "library"},
-                                        "name": {"type": "string", "description": "Command name from library"}
-                                    },
-                                    "required": ["type", "name"]
-                                },
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": {"const": "local_file"},
-                                        "path": {"type": "string", "description": "Path to command file (relative to workspace)"}
-                                    },
-                                    "required": ["type", "path"]
-                                },
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": {"const": "inline"},
-                                        "content": {"type": "string", "description": "Inline command content"}
-                                    },
-                                    "required": ["type", "content"]
-                                }
-                            ]
+                            "description": "Command to execute. Use {\"type\": \"inline\", \"content\": \"prompt text\"} for inline prompts.",
+                            "properties": {
+                                "type": {"type": "string", "description": "One of: inline, library, local_file"},
+                                "content": {"type": "string", "description": "The prompt/command text (when type=inline)"},
+                                "name": {"type": "string", "description": "Library command name (when type=library)"},
+                                "path": {"type": "string", "description": "File path (when type=local_file)"}
+                            },
+                            "required": ["type"]
                         },
                         "trigger": {
                             "type": "object",
-                            "description": "When to trigger this automation",
-                            "oneOf": [
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": {"const": "interval"},
-                                        "seconds": {"type": "number", "description": "Interval in seconds"}
-                                    },
-                                    "required": ["type", "seconds"]
-                                },
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": {"const": "agent_finished"}
-                                    },
-                                    "required": ["type"]
-                                },
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": {"const": "webhook"},
-                                        "config": {
-                                            "type": "object",
-                                            "properties": {
-                                                "webhook_id": {"type": "string", "description": "Unique webhook ID (optional, generated if not provided)"},
-                                                "secret": {"type": "string", "description": "Optional HMAC secret for webhook validation"},
-                                                "variable_mappings": {
-                                                    "type": "object",
-                                                    "description": "Map webhook payload fields to variables"
-                                                }
-                                            }
-                                        }
-                                    },
-                                    "required": ["type", "config"]
-                                }
-                            ]
-                        },
-                        "variables": {
-                            "type": "object",
-                            "description": "Variable substitutions (e.g., {'env': 'production'})",
-                            "additionalProperties": {"type": "string"}
-                        },
-                        "retry_config": {
-                            "type": "object",
+                            "description": "When to trigger. Use {\"type\": \"cron\", \"expression\": \"0 8 * * *\", \"timezone\": \"Europe/Paris\"} for cron schedules.",
                             "properties": {
-                                "max_retries": {"type": "number", "description": "Maximum retry attempts"},
-                                "retry_delay_seconds": {"type": "number", "description": "Initial delay between retries"},
-                                "backoff_multiplier": {"type": "number", "description": "Exponential backoff multiplier"}
-                            }
+                                "type": {"type": "string", "description": "One of: cron, interval, agent_finished, webhook"},
+                                "expression": {"type": "string", "description": "Cron expression: minute hour day-of-month month day-of-week (when type=cron)"},
+                                "timezone": {"type": "string", "description": "IANA timezone like Europe/Paris (when type=cron, defaults to UTC)"},
+                                "seconds": {"type": "number", "description": "Interval in seconds (when type=interval)"}
+                            },
+                            "required": ["type"]
                         },
                         "fresh_session": {
                             "type": "string",
                             "enum": ["keep", "always", "switch"],
-                            "description": "Session mode; 'switch' requires variables.nextSessionId"
+                            "description": "Use 'always' for scheduled tasks (fresh context each run). Default: keep."
                         },
-                        "stop_policy": {
-                            "type": "string",
-                            "description": "Auto-stop behavior for this automation",
-                            "enum": ["never", "on_mission_completed", "on_terminal_any"]
+                        "variables": {
+                            "type": "object",
+                            "description": "Optional variable substitutions",
+                            "additionalProperties": {"type": "string"}
                         }
                     }
                 }),
