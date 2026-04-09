@@ -135,6 +135,28 @@ fn inject_telegram_identity_into_claude_md(claude_md_path: &Path, user_message: 
     let _ = std::fs::write(claude_md_path, format!("{}{}", existing, extra));
 }
 
+fn public_api_base_url(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn localhost_api_base_url(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|port| format!("http://127.0.0.1:{}", port))
+}
+
+fn public_api_base_url_from_env() -> Option<String> {
+    public_api_base_url(std::env::var("SANDBOXED_PUBLIC_URL").ok().as_deref())
+}
+
+fn localhost_api_base_url_from_env() -> Option<String> {
+    localhost_api_base_url(std::env::var("PORT").ok().as_deref())
+}
+
 fn write_telegram_action_cli_helpers(work_dir: &Path) {
     let path = work_dir.join(".sandboxed-sh-telegram-action.py");
     const SCRIPT: &str = r#"#!/usr/bin/env python3
@@ -9481,23 +9503,17 @@ pub async fn run_opencode_turn(
     // Build environment variables
     let mut env: HashMap<String, String> = HashMap::new();
     env.insert("MISSION_ID".to_string(), mission_id.to_string());
-    if let Ok(public_url) = std::env::var("SANDBOXED_PUBLIC_URL") {
-        if !public_url.trim().is_empty() {
-            env.insert("API_URL".to_string(), public_url);
-        }
-    } else if let Ok(port) = std::env::var("PORT") {
-        env.insert("API_URL".to_string(), format!("http://127.0.0.1:{}", port));
+    if let Some(public_url) = public_api_base_url_from_env() {
+        env.insert("API_URL".to_string(), public_url);
+    } else if let Some(local_url) = localhost_api_base_url_from_env() {
+        env.insert("API_URL".to_string(), local_url);
     }
     if telegram_action_helpers_enabled {
         if let Some(token) = crate::api::telegram::build_internal_telegram_action_token(mission_id)
         {
             env.insert("TELEGRAM_ACTION_TOKEN".to_string(), token);
         }
-        let internal_api_url = std::env::var("PORT")
-            .ok()
-            .filter(|port| !port.trim().is_empty())
-            .map(|port| format!("http://127.0.0.1:{}", port))
-            .or_else(|| env.get("API_URL").cloned());
+        let internal_api_url = localhost_api_base_url_from_env();
         if let Some(api_url) = internal_api_url {
             env.insert(
                 "TELEGRAM_ACTION_URL".to_string(),
@@ -12895,7 +12911,10 @@ mod tests {
         ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
         OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
-    use super::{extract_telegram_instructions, inject_telegram_identity_into_claude_md};
+    use super::{
+        extract_telegram_instructions, inject_telegram_identity_into_claude_md,
+        localhost_api_base_url, public_api_base_url,
+    };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
     use serde_json::json;
@@ -14705,5 +14724,24 @@ mod tests {
         // Should still add the memory awareness section even without instructions
         assert!(content.contains("# Telegram Structured Memory"));
         assert!(!content.contains("# Bot Instructions"));
+    }
+
+    #[test]
+    fn public_api_base_url_rejects_blank_values() {
+        assert_eq!(public_api_base_url(Some("")), None);
+        assert_eq!(public_api_base_url(Some("   ")), None);
+        assert_eq!(
+            public_api_base_url(Some(" https://example.com ")).as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn localhost_api_base_url_formats_non_blank_port() {
+        assert_eq!(localhost_api_base_url(Some("")), None);
+        assert_eq!(
+            localhost_api_base_url(Some(" 3000 ")).as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
     }
 }

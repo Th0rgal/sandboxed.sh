@@ -279,16 +279,3 @@ export async function listBotActionExecutions(
     "Failed to fetch Telegram action executions"
   );
 }
-
-export async function executeTelegramAction(input: {
-  mission_id: string;
-  text: string;
-  delay_seconds?: number;
-  target?: TelegramActionTarget;
-}): Promise<TelegramActionExecutionResult> {
-  return apiPost<TelegramActionExecutionResult>(
-    `/api/control/telegram/actions`,
-    input,
-    "Failed to execute Telegram action"
-  );
-}

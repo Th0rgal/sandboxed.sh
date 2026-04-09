@@ -176,5 +176,4 @@ export {
   listBotStructuredMemory,
   searchBotStructuredMemory,
   listBotActionExecutions,
-  executeTelegramAction,
 } from "./telegram";

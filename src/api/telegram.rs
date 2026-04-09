@@ -1989,6 +1989,92 @@ async fn fetch_telegram_chat_lookup(
         .ok_or_else(|| format!("getChat returned no result for {}", chat_id))
 }
 
+fn telegram_action_lookup_title(lookup: &TelegramActionChatLookup) -> Option<String> {
+    normalize_optional_telegram_value(lookup.title.as_deref())
+        .or_else(|| {
+            normalize_optional_telegram_value(lookup.username.as_deref())
+                .map(|u| format!("@{}", u.trim_start_matches('@')))
+        })
+        .or_else(|| {
+            let first = normalize_optional_telegram_value(lookup.first_name.as_deref());
+            let last = normalize_optional_telegram_value(lookup.last_name.as_deref());
+            match (first, last) {
+                (Some(first), Some(last)) => Some(format!("{} {}", first, last)),
+                (Some(first), None) => Some(first),
+                _ => None,
+            }
+        })
+}
+
+fn merge_telegram_chat_metadata(
+    cached_title: Option<String>,
+    stored_title: Option<String>,
+    stored_type: Option<String>,
+    fetched_title: Option<String>,
+    fetched_type: Option<String>,
+) -> (Option<String>, Option<String>) {
+    (
+        fetched_title.or(stored_title).or(cached_title),
+        stored_type.or(fetched_type),
+    )
+}
+
+async fn resolve_telegram_chat_metadata(
+    ctx: &ChannelContext,
+    http: &Client,
+    base_url: &str,
+    chat_id: i64,
+    cached_title: Option<String>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let conversation = ctx
+        .mission_store
+        .get_telegram_conversation_by_chat(ctx.channel.id, chat_id)
+        .await
+        .ok()
+        .flatten();
+    let stored_title = conversation
+        .as_ref()
+        .and_then(|item| item.chat_title.clone());
+    let stored_type = conversation
+        .as_ref()
+        .and_then(|item| item.chat_type.clone());
+
+    if stored_type.is_some() {
+        return Ok(merge_telegram_chat_metadata(
+            cached_title,
+            stored_title,
+            stored_type,
+            None,
+            None,
+        ));
+    }
+
+    match fetch_telegram_chat_lookup(http, base_url, chat_id).await {
+        Ok(lookup) => Ok(merge_telegram_chat_metadata(
+            cached_title,
+            stored_title,
+            None,
+            telegram_action_lookup_title(&lookup),
+            Some(lookup.chat_type),
+        )),
+        Err(error) => {
+            let fallback =
+                merge_telegram_chat_metadata(cached_title, stored_title, None, None, None);
+            if fallback.0.is_some() {
+                tracing::debug!(
+                    "Failed to backfill Telegram chat {} metadata on channel {}: {}",
+                    chat_id,
+                    ctx.channel.id,
+                    error
+                );
+                Ok(fallback)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 async fn resolve_telegram_action_chat_id(
     ctx: &ChannelContext,
     http: &Client,
@@ -1996,6 +2082,7 @@ async fn resolve_telegram_action_chat_id(
     target: &str,
 ) -> Result<(i64, Option<String>, Option<String>), String> {
     let target = target.trim();
+    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
     if target.is_empty() || target.eq_ignore_ascii_case("current") {
         return Ok((current_chat_id, None, None));
     }
@@ -2004,25 +2091,37 @@ async fn resolve_telegram_action_chat_id(
             .trim()
             .parse::<i64>()
             .map_err(|_| format!("Invalid Telegram chat target '{}'", target))?;
-        return Ok((parsed, None, None));
+        let (chat_title, chat_type) =
+            resolve_telegram_chat_metadata(ctx, http, &base_url, parsed, None).await?;
+        return Ok((parsed, chat_title, chat_type));
     }
 
     let mappings = ctx
         .mission_store
         .list_telegram_chat_missions(ctx.channel.id)
         .await?;
-    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
 
     for mapping in mappings {
         if telegram_action_target_matches(target, mapping.chat_title.as_deref(), None) {
-            let chat_type = ctx
-                .mission_store
-                .get_telegram_conversation_by_chat(ctx.channel.id, mapping.chat_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|conversation| conversation.chat_type);
-            return Ok((mapping.chat_id, mapping.chat_title, chat_type));
+            let (resolved_title, chat_type) = resolve_telegram_chat_metadata(
+                ctx,
+                http,
+                &base_url,
+                mapping.chat_id,
+                mapping.chat_title.clone(),
+            )
+            .await?;
+            if resolved_title != mapping.chat_title {
+                let _ = ctx
+                    .mission_store
+                    .update_telegram_chat_mission_title(
+                        ctx.channel.id,
+                        mapping.chat_id,
+                        resolved_title.clone(),
+                    )
+                    .await;
+            }
+            return Ok((mapping.chat_id, resolved_title, chat_type));
         }
 
         let lookup = match fetch_telegram_chat_lookup(http, &base_url, mapping.chat_id).await {
@@ -2038,20 +2137,7 @@ async fn resolve_telegram_action_chat_id(
             }
         };
 
-        let resolved_title = normalize_optional_telegram_value(lookup.title.as_deref())
-            .or_else(|| {
-                normalize_optional_telegram_value(lookup.username.as_deref())
-                    .map(|u| format!("@{}", u.trim_start_matches('@')))
-            })
-            .or_else(|| {
-                let first = normalize_optional_telegram_value(lookup.first_name.as_deref());
-                let last = normalize_optional_telegram_value(lookup.last_name.as_deref());
-                match (first, last) {
-                    (Some(first), Some(last)) => Some(format!("{} {}", first, last)),
-                    (Some(first), None) => Some(first),
-                    _ => None,
-                }
-            });
+        let resolved_title = telegram_action_lookup_title(&lookup);
 
         if resolved_title != mapping.chat_title {
             let _ = ctx
@@ -2451,7 +2537,10 @@ pub async fn execute_native_telegram_request_workflow(
         .ok()
         .flatten();
     let target_chat_type = if target_chat_id == source_chat_id {
-        origin_conversation.chat_type.clone()
+        origin_conversation
+            .chat_type
+            .clone()
+            .or(resolved_target_chat_type.clone())
     } else {
         target_conversation
             .as_ref()
@@ -3651,12 +3740,12 @@ mod tests {
     use super::{
         build_internal_telegram_action_token, extract_structured_memory_from_text,
         extract_telegram_actions, format_structured_memory_context, markdown_to_telegram_html,
-        render_telegram_chunk, sanitize_telegram_visible_text, scope_for_extracted_memory,
-        telegram_action_target_matches, telegram_chat_display_title, truncate_for_telegram,
-        verify_internal_telegram_action_token, workflow_reply_text, workflow_request_delivery_text,
-        Chat, ExtractedTelegramMemory, TelegramAction, TelegramActionKind, TelegramBridge,
-        TelegramMemorySubject, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
-        TelegramStructuredMemoryScope,
+        merge_telegram_chat_metadata, render_telegram_chunk, sanitize_telegram_visible_text,
+        scope_for_extracted_memory, telegram_action_target_matches, telegram_chat_display_title,
+        truncate_for_telegram, verify_internal_telegram_action_token, workflow_reply_text,
+        workflow_request_delivery_text, Chat, ExtractedTelegramMemory, TelegramAction,
+        TelegramActionKind, TelegramBridge, TelegramMemorySubject, TelegramStructuredMemoryEntry,
+        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
     };
     use uuid::Uuid;
 
@@ -3865,6 +3954,34 @@ mod tests {
             Some("LFG Labs"),
             Some("lfg_labs")
         ));
+    }
+
+    #[test]
+    fn merge_telegram_chat_metadata_backfills_type_from_lookup() {
+        let (title, chat_type) = merge_telegram_chat_metadata(
+            Some("LFG Labs".to_string()),
+            None,
+            None,
+            Some("@lfg_labs".to_string()),
+            Some("supergroup".to_string()),
+        );
+
+        assert_eq!(title.as_deref(), Some("@lfg_labs"));
+        assert_eq!(chat_type.as_deref(), Some("supergroup"));
+    }
+
+    #[test]
+    fn merge_telegram_chat_metadata_keeps_stored_type_without_lookup() {
+        let (title, chat_type) = merge_telegram_chat_metadata(
+            Some("Cached".to_string()),
+            Some("Stored".to_string()),
+            Some("private".to_string()),
+            None,
+            None,
+        );
+
+        assert_eq!(title.as_deref(), Some("Stored"));
+        assert_eq!(chat_type.as_deref(), Some("private"));
     }
 
     #[test]
