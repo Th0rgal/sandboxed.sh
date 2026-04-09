@@ -38,10 +38,17 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.toml', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-${{ github.job }}-${{ hashFiles('Cargo.toml', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-${{ github.job }}-
 
       - name: Run tests
         run: cargo test --workspace
@@ -65,10 +72,17 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.toml', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-${{ github.job }}-${{ hashFiles('Cargo.toml', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-${{ github.job }}-
 
       - name: Run clippy
         run: cargo clippy --workspace -- -D clippy::all
@@ -106,10 +120,17 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.toml', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-${{ github.job }}-${{ hashFiles('Cargo.toml', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-${{ github.job }}-
 
       - name: Run harness contract tests
         run: scripts/harness_contract_tests.sh
