@@ -8596,13 +8596,16 @@ async fn run_single_control_turn(
             claude_md_exists = claude_md_path.exists(),
             "Telegram message detected in control path, attempting CLAUDE.md injection"
         );
-        if claude_md_path.exists() {
-            super::mission_runner::inject_telegram_identity_into_claude_md(
-                &claude_md_path,
-                &user_message,
-                true,
-            );
+        // Create the file if it doesn't exist so that non-Claude-Code
+        // backends (e.g. opencode) also get the identity injection.
+        if !claude_md_path.exists() {
+            let _ = std::fs::write(&claude_md_path, "");
         }
+        super::mission_runner::inject_telegram_identity_into_claude_md(
+            &claude_md_path,
+            &user_message,
+            true,
+        );
     }
 
     // Build a task prompt that includes conversation context with size limits.
