@@ -8444,6 +8444,21 @@ async fn run_single_control_turn(
         }
     }
 
+    // For Telegram missions, append channel instructions and memory awareness
+    // to CLAUDE.md so the backend LLM adopts the bot persona.
+    if user_message.contains("[Telegram from ") {
+        let claude_md_path = working_dir_path.join("CLAUDE.md");
+        tracing::info!(
+            mission_id = ?mission_id,
+            claude_md_path = %claude_md_path.display(),
+            claude_md_exists = claude_md_path.exists(),
+            "Telegram message detected in control path, attempting CLAUDE.md injection"
+        );
+        if claude_md_path.exists() {
+            super::mission_runner::inject_telegram_identity_into_claude_md(&claude_md_path, &user_message);
+        }
+    }
+
     // Build a task prompt that includes conversation context with size limits.
     let history_for_prompt = match history.last() {
         Some((role, content)) if role == "user" && content == &user_message => {

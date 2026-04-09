@@ -413,6 +413,22 @@ impl TelegramBridge {
                 };
 
                 for message in due {
+                    // Mark as sent BEFORE the API call to prevent the next scheduler tick
+                    // from picking up the same message while the HTTP request is in flight.
+                    // If the send fails, we'll mark it as failed below.
+                    if let Err(err) = ctx
+                        .mission_store
+                        .mark_telegram_scheduled_message_sent(message.id, &now_string())
+                        .await
+                    {
+                        tracing::warn!(
+                            scheduled_message_id = %message.id,
+                            "Failed to pre-mark Telegram scheduled message as sent: {}",
+                            err
+                        );
+                        continue;
+                    }
+
                     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
                     match send_chunked_message(
                         &self.http,
@@ -424,17 +440,7 @@ impl TelegramBridge {
                     .await
                     {
                         Ok(()) => {
-                            if let Err(err) = ctx
-                                .mission_store
-                                .mark_telegram_scheduled_message_sent(message.id, &now_string())
-                                .await
-                            {
-                                tracing::warn!(
-                                    scheduled_message_id = %message.id,
-                                    "Failed to mark Telegram scheduled message as sent: {}",
-                                    err
-                                );
-                            }
+                            // mark_telegram_scheduled_message_sent already called above.
                             let _ = ctx
                                 .mission_store
                                 .mark_telegram_action_execution_by_scheduled_message(

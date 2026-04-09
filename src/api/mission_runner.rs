@@ -99,19 +99,35 @@ fn extract_telegram_instructions(user_message: &str) -> Option<String> {
 ///
 /// The function is idempotent — it only writes once (checks for the `# Telegram Structured Memory`
 /// marker).
-fn inject_telegram_identity_into_claude_md(claude_md_path: &Path, user_message: &str) {
+pub fn inject_telegram_identity_into_claude_md(claude_md_path: &Path, user_message: &str) {
+    tracing::info!(
+        path = %claude_md_path.display(),
+        "Injecting Telegram identity into CLAUDE.md"
+    );
     let existing = match std::fs::read_to_string(claude_md_path) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            tracing::warn!(
+                path = %claude_md_path.display(),
+                error = %e,
+                "Failed to read CLAUDE.md for Telegram identity injection"
+            );
+            return;
+        }
     };
     // Already injected on a previous turn — skip.
     if existing.contains("# Telegram Structured Memory") {
+        tracing::info!("CLAUDE.md already has Telegram identity injection, skipping");
         return;
     }
 
     let mut extra = String::new();
 
     if let Some(instructions) = extract_telegram_instructions(user_message) {
+        tracing::info!(
+            instructions_len = instructions.len(),
+            "Extracted Telegram instructions for CLAUDE.md injection"
+        );
         extra.push_str("\n\n# Bot Instructions\n\n");
         extra.push_str(
             "IMPORTANT: these instructions OVERRIDE any default behavior \
@@ -119,6 +135,8 @@ fn inject_telegram_identity_into_claude_md(claude_md_path: &Path, user_message: 
         );
         extra.push_str(&instructions);
         extra.push('\n');
+    } else {
+        tracing::warn!("No [Instructions: ...] tag found in Telegram message for CLAUDE.md injection");
     }
 
     extra.push_str("\n# Telegram Structured Memory\n\n");
@@ -132,7 +150,18 @@ fn inject_telegram_identity_into_claude_md(claude_md_path: &Path, user_message: 
          currently know based on the structured memory block.\n",
     );
 
-    let _ = std::fs::write(claude_md_path, format!("{}{}", existing, extra));
+    match std::fs::write(claude_md_path, format!("{}{}", existing, extra)) {
+        Ok(()) => tracing::info!(
+            path = %claude_md_path.display(),
+            extra_len = extra.len(),
+            "Successfully injected Telegram identity into CLAUDE.md"
+        ),
+        Err(e) => tracing::error!(
+            path = %claude_md_path.display(),
+            error = %e,
+            "Failed to write Telegram identity injection to CLAUDE.md"
+        ),
+    }
 }
 
 fn public_api_base_url(value: Option<&str>) -> Option<String> {
@@ -2353,9 +2382,21 @@ async fn run_mission_turn(
     // to CLAUDE.md so the backend LLM adopts the bot persona.
     if user_message.contains("[Telegram from ") {
         let claude_md_path = mission_work_dir.join("CLAUDE.md");
+        tracing::info!(
+            mission_id = %mission_id,
+            claude_md_path = %claude_md_path.display(),
+            claude_md_exists = claude_md_path.exists(),
+            "Telegram message detected, attempting CLAUDE.md injection"
+        );
         if claude_md_path.exists() {
             inject_telegram_identity_into_claude_md(&claude_md_path, &user_message);
         }
+    } else {
+        tracing::debug!(
+            mission_id = %mission_id,
+            user_message_prefix = &user_message[..user_message.len().min(100)],
+            "Not a Telegram message, skipping CLAUDE.md injection"
+        );
     }
 
     // Session rotation: Prevent OOM by resetting sessions every N turns
@@ -3863,6 +3904,76 @@ pub fn run_claudecode_turn<'a>(
             tracing::debug!("Using Claude CLI credentials from mission directory");
         } else {
             tracing::warn!("No authentication available for Claude Code!");
+        }
+
+        // Inject Telegram action environment variables when processing a Telegram message.
+        // These are needed by the telegram-action CLI helper inside the container to schedule
+        // reminders, send replies, etc.
+        let telegram_action_helpers_enabled =
+            message.contains("[Telegram from ") || message.contains("[Telegram workflow reply ");
+        if telegram_action_helpers_enabled {
+            write_telegram_action_cli_helpers(work_dir);
+
+            env.insert("MISSION_ID".to_string(), mission_id.to_string());
+
+            if let Some(token) =
+                crate::api::telegram::build_internal_telegram_action_token(mission_id)
+            {
+                env.insert("TELEGRAM_ACTION_TOKEN".to_string(), token);
+            }
+
+            let internal_api_url = std::env::var("PORT")
+                .ok()
+                .filter(|port| !port.trim().is_empty())
+                .map(|port| format!("http://127.0.0.1:{}", port))
+                .or_else(|| {
+                    std::env::var("SANDBOXED_PUBLIC_URL")
+                        .ok()
+                        .filter(|u| !u.trim().is_empty())
+                });
+            if let Some(api_url) = internal_api_url {
+                env.insert(
+                    "TELEGRAM_ACTION_URL".to_string(),
+                    format!("{}/api/control/telegram/actions/internal", api_url),
+                );
+                env.insert(
+                    "TELEGRAM_WORKFLOW_URL".to_string(),
+                    format!(
+                        "{}/api/control/telegram/workflows/request/internal",
+                        api_url
+                    ),
+                );
+            }
+
+            let container_work_dir =
+                workspace_exec.translate_path_for_container(work_dir);
+            env.insert(
+                "TELEGRAM_ACTION_CLI".to_string(),
+                format!("{}/.sandboxed-sh-telegram-action.py", container_work_dir),
+            );
+            env.insert(
+                "TELEGRAM_ACTION_COMMAND".to_string(),
+                format!("{}/telegram-action", container_work_dir),
+            );
+
+            // Add the workspace directory to PATH so `telegram-action` is discoverable.
+            // The CLAUDE.md instructions tell the bot the command is in PATH.
+            if let Some(existing_path) = env.get("PATH") {
+                env.insert(
+                    "PATH".to_string(),
+                    format!("{}:{}", container_work_dir, existing_path),
+                );
+            } else {
+                env.insert(
+                    "PATH".to_string(),
+                    format!("{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", container_work_dir),
+                );
+            }
+
+            tracing::info!(
+                mission_id = %mission_id,
+                "Telegram action env vars injected for Claude Code backend"
+            );
         }
 
         // Handle case where cli_path might be a wrapper command like "bun /path/to/claude"
