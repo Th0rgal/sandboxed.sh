@@ -51,7 +51,7 @@ jobs:
             ${{ runner.os }}-cargo-target-test-harness-
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   clippy:
     name: Clippy
@@ -85,7 +85,7 @@ jobs:
             ${{ runner.os }}-cargo-target-${{ github.job }}-
 
       - name: Run clippy
-        run: cargo clippy --workspace -- -D clippy::all
+        run: cargo clippy --locked --workspace -- -D clippy::all
 
   fmt:
     name: Format
