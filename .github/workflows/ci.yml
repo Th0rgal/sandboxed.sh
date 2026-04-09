@@ -174,8 +174,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: dashboard/.next/cache
-          key: ${{ runner.os }}-dashboard-next-${{ hashFiles('dashboard/bun.lock', 'dashboard/package.json', 'dashboard/next.config.ts', 'dashboard/src/**/*', 'dashboard/public/**/*') }}
+          key: ${{ runner.os }}-dashboard-next-${{ hashFiles('dashboard/bun.lock', 'dashboard/package.json') }}-${{ hashFiles('dashboard/next.config.ts', 'dashboard/src/**/*', 'dashboard/public/**/*') }}
           restore-keys: |
+            ${{ runner.os }}-dashboard-next-${{ hashFiles('dashboard/bun.lock', 'dashboard/package.json') }}-
             ${{ runner.os }}-dashboard-next-
 
       - name: Install dependencies
