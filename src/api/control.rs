@@ -3152,19 +3152,19 @@ impl ControlHub {
         );
         sessions.insert(user.id.clone(), state.clone());
 
-        // Boot Telegram channels for this user's missions
+        // Boot Telegram channels for this user's missions (synchronous —
+        // ensures channels are registered before we start serving requests).
         if let Some(ref bridge) = self.telegram_bridge {
-            let bridge = Arc::clone(bridge);
-            let store = Arc::clone(&state.mission_store);
-            let cmd_tx = state.cmd_tx.clone();
-            let events_tx = state.events_tx.clone();
             let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
                 .unwrap_or_else(|_| format!("http://{}:{}", self.config.host, self.config.port));
-            tokio::spawn(async move {
-                bridge
-                    .boot_from_store(&store, cmd_tx, events_tx, &public_url)
-                    .await;
-            });
+            bridge
+                .boot_from_store(
+                    &state.mission_store,
+                    state.cmd_tx.clone(),
+                    state.events_tx.clone(),
+                    &public_url,
+                )
+                .await;
         }
 
         state
@@ -4968,9 +4968,39 @@ async fn automation_scheduler_loop(
     );
 
     let mut logged_unsupported = false;
+    let mut tick_count: u64 = 0;
 
     loop {
         tokio::time::sleep(check_interval).await;
+        tick_count += 1;
+
+        // Every ~60 seconds (12 ticks × 5s), run housekeeping sweeps.
+        if tick_count % 12 == 0 {
+            // Timeout stale WaitingExternal workflows (older than 30 minutes).
+            match mission_store
+                .timeout_stale_telegram_workflows(30 * 60)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    tracing::info!("Timed out {} stale WaitingExternal Telegram workflows", n);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to timeout stale Telegram workflows: {}", e);
+                }
+                _ => {}
+            }
+
+            // Clean up old webhook dedup entries (older than 15 minutes).
+            match mission_store.cleanup_webhook_dedup(15 * 60).await {
+                Ok(n) if n > 0 => {
+                    tracing::debug!("Cleaned up {} expired webhook dedup entries", n);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to cleanup webhook dedup entries: {}", e);
+                }
+                _ => {}
+            }
+        }
 
         let automations = match mission_store.list_active_automations().await {
             Ok(automations) => automations,
@@ -10779,12 +10809,23 @@ pub async fn telegram_webhook_receiver(
         }
     }
 
-    // Process the message
-    if !state
-        .telegram_bridge
-        .register_update_once(channel_id, update.update_id)
+    // Deduplicate using SQLite-backed store (survives restarts).
+    // Falls back to in-memory dedup if the mission store is unavailable.
+    let mission_store = state.control.get_mission_store().await;
+    let is_new = match mission_store
+        .register_webhook_update(channel_id, update.update_id)
         .await
     {
+        Ok(new) => new,
+        Err(_) => {
+            // Fallback to in-memory dedup if SQLite fails
+            state
+                .telegram_bridge
+                .register_update_once(channel_id, update.update_id)
+                .await
+        }
+    };
+    if !is_new {
         tracing::info!(
             channel_id = %channel_id,
             update_id = update.update_id,

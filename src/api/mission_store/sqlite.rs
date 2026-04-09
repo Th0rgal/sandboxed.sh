@@ -1621,6 +1621,19 @@ impl SqliteMissionStore {
         )
         .map_err(|e| format!("Failed to create telegram_workflow_events table: {}", e))?;
 
+        // Telegram webhook dedup table (persists across restarts)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_webhook_dedup (
+                channel_id TEXT NOT NULL,
+                update_id INTEGER NOT NULL,
+                seen_at TEXT NOT NULL,
+                PRIMARY KEY (channel_id, update_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tg_dedup_seen
+                ON telegram_webhook_dedup(seen_at);",
+        )
+        .map_err(|e| format!("Failed to create telegram_webhook_dedup table: {}", e))?;
+
         // Migrate automations table to new schema
         Self::migrate_automations_table(conn)?;
         Self::ensure_automation_indexes(conn)?;
@@ -5351,6 +5364,78 @@ impl MissionStore for SqliteMissionStore {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+
+    async fn timeout_stale_telegram_workflows(&self, max_age_secs: i64) -> Result<u32, String> {
+        let conn = self.conn.clone();
+        let now = now_string();
+        // Calculate the cutoff timestamp in Rust (RFC 3339 format sorts lexicographically)
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::seconds(max_age_secs);
+        let cutoff_str = cutoff.to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let updated = conn
+                .execute(
+                    "UPDATE telegram_workflows
+                     SET status = 'failed',
+                         last_error = 'Timed out waiting for external reply',
+                         updated_at = ?1,
+                         completed_at = ?1
+                     WHERE status = 'waiting_external'
+                       AND updated_at < ?2",
+                    params![now, cutoff_str],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(updated as u32)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn register_webhook_update(
+        &self,
+        channel_id: Uuid,
+        update_id: i64,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            // INSERT OR IGNORE: if the row already exists, nothing happens
+            // and changes() returns 0.
+            let inserted = conn
+                .execute(
+                    "INSERT OR IGNORE INTO telegram_webhook_dedup (channel_id, update_id, seen_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![channel_id_str, update_id, now],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(inserted > 0)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn cleanup_webhook_dedup(&self, max_age_secs: i64) -> Result<u32, String> {
+        let conn = self.conn.clone();
+        let cutoff = (chrono::Utc::now()
+            - chrono::Duration::seconds(max_age_secs))
+            .to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let deleted = conn
+                .execute(
+                    "DELETE FROM telegram_webhook_dedup
+                     WHERE seen_at < ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(deleted as u32)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
     }
 
     async fn list_telegram_workflows(

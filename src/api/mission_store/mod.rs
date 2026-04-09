@@ -1310,6 +1310,30 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Timeout stale WaitingExternal Telegram workflows older than `max_age_secs`.
+    /// Returns the number of workflows timed out.
+    async fn timeout_stale_telegram_workflows(&self, max_age_secs: i64) -> Result<u32, String> {
+        let _ = max_age_secs;
+        Ok(0)
+    }
+
+    /// Register a Telegram webhook update for dedup. Returns true if the
+    /// update was not seen before (first occurrence).
+    async fn register_webhook_update(
+        &self,
+        channel_id: Uuid,
+        update_id: i64,
+    ) -> Result<bool, String> {
+        let _ = (channel_id, update_id);
+        Ok(true)
+    }
+
+    /// Remove webhook dedup entries older than `max_age_secs`.
+    async fn cleanup_webhook_dedup(&self, max_age_secs: i64) -> Result<u32, String> {
+        let _ = max_age_secs;
+        Ok(0)
+    }
+
     /// Create a Telegram workflow.
     async fn create_telegram_workflow(
         &self,
