@@ -2003,11 +2003,7 @@ async fn resolve_telegram_action_chat_id(
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
 
     for mapping in mappings {
-        if telegram_action_target_matches(
-            target,
-            mapping.chat_title.as_deref(),
-            None,
-        ) {
+        if telegram_action_target_matches(target, mapping.chat_title.as_deref(), None) {
             let chat_type = ctx
                 .mission_store
                 .get_telegram_conversation_by_chat(ctx.channel.id, mapping.chat_id)
