@@ -159,10 +159,12 @@ pub fn inject_telegram_identity_into_claude_md(claude_md_path: &Path, user_messa
     // (user-configured in channel.instructions), so channel instructions can
     // stay focused on the bot's persona.
     if telegram_actions_available {
-        let action_cmd = "telegram-action".to_string();
+        // Use $TELEGRAM_ACTION_COMMAND so the bot invokes the full path set by
+        // the runner; the workspace dir is intentionally NOT on PATH.
+        let action_cmd = "$TELEGRAM_ACTION_COMMAND";
         extra.push_str("\n# Telegram Actions\n\n");
         extra.push_str(&format!(
-            "A CLI tool is available at `{cmd}` for sending Telegram messages \
+            "A CLI tool is available via `{cmd}` for sending Telegram messages \
              and scheduling reminders. Use it ONLY when the user explicitly asks \
              you to send a message, set a reminder, post in another chat, or ask \
              someone in another chat for information. For normal replies, \

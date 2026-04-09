@@ -4753,7 +4753,7 @@ impl MissionStore for SqliteMissionStore {
             }
             .map_err(|e| e.to_string())?;
 
-            let candidates = match (chat_id, subject_user_id) {
+            let mut candidates = match (chat_id, subject_user_id) {
                 (Some(chat_id), subject_user_id) => stmt.query_map(
                     params![
                         channel_id_str.as_str(),
@@ -4859,6 +4859,30 @@ impl MissionStore for SqliteMissionStore {
                     }
                     let weight = 18.0 / (1.0 + rank.abs());
                     fts_scores.insert(entry_uuid, weight);
+                }
+            }
+
+            // Inject FTS-matched entries that fell outside the recency window
+            // so older but highly relevant memories are not silently dropped.
+            let candidate_ids: std::collections::HashSet<Uuid> =
+                candidates.iter().map(|e| e.id).collect();
+            for fts_id in fts_scores.keys() {
+                if candidate_ids.contains(fts_id) {
+                    continue;
+                }
+                let id_str = fts_id.to_string();
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE id = ?1",
+                ) {
+                    if let Ok(mut rows) = stmt.query_map(params![id_str], row_to_telegram_structured_memory) {
+                        if let Some(Ok(entry)) = rows.next() {
+                            candidates.push(entry);
+                        }
+                    }
                 }
             }
 

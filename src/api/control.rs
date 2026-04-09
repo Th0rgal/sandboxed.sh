@@ -10781,7 +10781,17 @@ pub async fn telegram_webhook_receiver(
         .register_webhook_update(channel_id, update.update_id)
         .await
     {
-        Ok(new) => new,
+        Ok(new) => {
+            if new {
+                // Keep in-memory map in sync so a later SQLite failure
+                // doesn't cause duplicate processing.
+                state
+                    .telegram_bridge
+                    .register_update_once(channel_id, update.update_id)
+                    .await;
+            }
+            new
+        }
         Err(_) => {
             // Fallback to in-memory dedup if SQLite fails
             state
