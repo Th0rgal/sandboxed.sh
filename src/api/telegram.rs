@@ -413,20 +413,23 @@ impl TelegramBridge {
                 };
 
                 for message in due {
-                    // Mark as sent BEFORE the API call to prevent the next scheduler tick
-                    // from picking up the same message while the HTTP request is in flight.
-                    // If the send fails, we'll mark it as failed below.
-                    if let Err(err) = ctx
+                    // Claim this message atomically: UPDATE … WHERE status='pending'
+                    // so concurrent ticks cannot pick up the same message.
+                    let claimed = ctx
                         .mission_store
-                        .mark_telegram_scheduled_message_sent(message.id, &now_string())
-                        .await
-                    {
-                        tracing::warn!(
-                            scheduled_message_id = %message.id,
-                            "Failed to pre-mark Telegram scheduled message as sent: {}",
-                            err
-                        );
-                        continue;
+                        .claim_telegram_scheduled_message(message.id)
+                        .await;
+                    match claimed {
+                        Ok(false) => continue, // Another tick already claimed it
+                        Err(err) => {
+                            tracing::warn!(
+                                scheduled_message_id = %message.id,
+                                "Failed to claim Telegram scheduled message: {}",
+                                err
+                            );
+                            continue;
+                        }
+                        Ok(true) => {} // Claimed successfully, proceed
                     }
 
                     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
@@ -440,7 +443,11 @@ impl TelegramBridge {
                     .await
                     {
                         Ok(()) => {
-                            // mark_telegram_scheduled_message_sent already called above.
+                            // Mark as sent AFTER successful delivery.
+                            let _ = ctx
+                                .mission_store
+                                .mark_telegram_scheduled_message_sent(message.id, &now_string())
+                                .await;
                             let _ = ctx
                                 .mission_store
                                 .mark_telegram_action_execution_by_scheduled_message(
@@ -2750,18 +2757,19 @@ async fn resolve_native_telegram_source(
         .get_channel_context(channel.id)
         .await
         .ok_or_else(|| format!("Telegram channel {} is not active", channel.id))?;
+    // Find the most recently updated conversation for this mission on this
+    // channel. Using updated_at ordering ensures we pick the chat that
+    // triggered the current turn (already sorted DESC by the store query).
     let conversation = mission_store
-        .list_telegram_conversations(channel.id, 16)
+        .list_telegram_conversations(channel.id, 64)
         .await?
         .into_iter()
-        .find(|conversation| conversation.mission_id == Some(source_mission_id));
+        .find(|c| c.mission_id == Some(source_mission_id));
 
     Ok(NativeTelegramSource {
         ctx,
-        source_chat_id: conversation
-            .as_ref()
-            .map(|conversation| conversation.chat_id),
-        source_chat_title: conversation.and_then(|conversation| conversation.chat_title),
+        source_chat_id: conversation.as_ref().map(|c| c.chat_id),
+        source_chat_title: conversation.and_then(|c| c.chat_title),
     })
 }
 

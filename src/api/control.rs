@@ -4864,87 +4864,31 @@ fn resolve_tz_offset(tz: &str, now_utc: chrono::DateTime<chrono::Utc>) -> chrono
         return fo;
     }
 
-    // Common IANA names → approximate offset in seconds east of UTC.
-    // For zones with DST we use the *standard* offset; the 5-second poll
-    // cadence makes a ±1 hour inaccuracy irrelevant for cron scheduling
-    // because the scheduler will simply fire on the next tick once the
-    // wallclock minute matches.
-    //
-    // NOTE: to properly handle DST, integrate the `chrono-tz` crate.
-    let offset_secs = match tz {
-        "UTC" | "GMT" | "Etc/UTC" | "Etc/GMT" => 0,
-        "Europe/London" => {
-            // BST Mar-Oct +1, GMT otherwise
-            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=10).contains(&month) {
-                3600
-            } else {
-                0
-            }
-        }
-        "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid" | "Europe/Amsterdam"
-        | "Europe/Brussels" | "CET" => {
-            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=10).contains(&month) {
-                7200
-            } else {
-                3600
-            } // CEST / CET
-        }
-        "America/New_York" | "US/Eastern" | "EST" => {
-            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=11).contains(&month) {
-                -4 * 3600
-            } else {
-                -5 * 3600
-            }
-        }
-        "America/Chicago" | "US/Central" | "CST" => {
-            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=11).contains(&month) {
-                -5 * 3600
-            } else {
-                -6 * 3600
-            }
-        }
-        "America/Denver" | "US/Mountain" | "MST" => {
-            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=11).contains(&month) {
-                -6 * 3600
-            } else {
-                -7 * 3600
-            }
-        }
-        "America/Los_Angeles" | "US/Pacific" | "PST" => {
-            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            if (3..=11).contains(&month) {
-                -7 * 3600
-            } else {
-                -8 * 3600
-            }
-        }
-        "Asia/Tokyo" | "JST" => 9 * 3600,
-        "Asia/Shanghai" | "Asia/Hong_Kong" | "Asia/Singapore" => 8 * 3600,
-        "Asia/Kolkata" | "Asia/Calcutta" => 5 * 3600 + 1800,
-        "Asia/Dubai" => 4 * 3600,
-        "Australia/Sydney" | "AEST" => {
-            let month = now_utc.format("%m").to_string().parse::<u32>().unwrap_or(1);
-            // AEDT Oct-Mar, AEST Apr-Sep (southern hemisphere)
-            if (1..=3).contains(&month) || (10..=12).contains(&month) {
-                11 * 3600
-            } else {
-                10 * 3600
-            }
-        }
-        "America/Sao_Paulo" => -3 * 3600,
-        _ => {
-            tracing::warn!(timezone = %tz, "Unknown timezone, falling back to UTC");
-            0
-        }
+    // Handle common abbreviations that chrono-tz doesn't know about.
+    let canonical = match tz {
+        "UTC" | "GMT" => "Etc/UTC",
+        "EST" => "America/New_York",
+        "CST" => "America/Chicago",
+        "MST" => "America/Denver",
+        "PST" => "America/Los_Angeles",
+        "CET" => "Europe/Paris",
+        "JST" => "Asia/Tokyo",
+        "AEST" => "Australia/Sydney",
+        other => other,
     };
 
-    chrono::FixedOffset::east_opt(offset_secs)
-        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap())
+    // Use chrono-tz for proper IANA timezone resolution (handles DST correctly).
+    use chrono::Offset;
+    match canonical.parse::<chrono_tz::Tz>() {
+        Ok(timezone) => {
+            let local_dt = now_utc.with_timezone(&timezone);
+            local_dt.offset().fix()
+        }
+        Err(_) => {
+            tracing::warn!(timezone = %tz, "Unknown timezone, falling back to UTC");
+            chrono::FixedOffset::east_opt(0).unwrap()
+        }
+    }
 }
 
 /// Background task that checks for automations and triggers them at their intervals.
@@ -4986,6 +4930,23 @@ async fn automation_scheduler_loop(
                 }
                 Err(e) => {
                     tracing::warn!("Failed to timeout stale Telegram workflows: {}", e);
+                }
+                _ => {}
+            }
+
+            // Recover stale 'sending' scheduled messages (stuck >5 min after crash).
+            match mission_store
+                .recover_stale_sending_scheduled_messages(5 * 60)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    tracing::info!(
+                        "Recovered {} stale 'sending' scheduled messages back to 'pending'",
+                        n
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to recover stale sending messages: {}", e);
                 }
                 _ => {}
             }
@@ -5113,16 +5074,18 @@ async fn automation_scheduler_loop(
                             // Determine "now" in the configured timezone.
                             let now_utc = chrono::Utc::now();
 
-                            // If we've never triggered, check whether any occurrence
-                            // should have fired in the last check_interval window.
+                            // If we've never triggered (start_immediately=true sets
+                            // last_triggered_at to None), fire right away.
                             let reference = if let Some(ref lt) = automation.last_triggered_at {
                                 match chrono::DateTime::parse_from_rfc3339(lt) {
                                     Ok(t) => t.with_timezone(&chrono::Utc),
                                     Err(_) => now_utc - chrono::Duration::seconds(10),
                                 }
                             } else {
-                                // First run: use a 10-second lookback so we fire soon.
-                                now_utc - chrono::Duration::seconds(10)
+                                // Never triggered → fire immediately on next tick.
+                                // Using a very large lookback ensures the next cron
+                                // occurrence after this reference is in the past.
+                                now_utc - chrono::Duration::days(366)
                             };
 
                             // Find the next occurrence after the last trigger.
@@ -8637,6 +8600,7 @@ async fn run_single_control_turn(
             super::mission_runner::inject_telegram_identity_into_claude_md(
                 &claude_md_path,
                 &user_message,
+                true,
             );
         }
     }
@@ -10463,15 +10427,16 @@ pub async fn list_bot_structured_memory(
         }
         entries
     } else {
-        let mut entries = control
+        control
             .mission_store
-            .list_telegram_structured_memory(channel_id, query.chat_id, limit)
+            .list_telegram_structured_memory(
+                channel_id,
+                query.chat_id,
+                query.subject_user_id,
+                limit,
+            )
             .await
-            .map_err(internal_error)?;
-        if let Some(subject_user_id) = query.subject_user_id {
-            entries.retain(|entry| entry.subject_user_id == Some(subject_user_id));
-        }
-        entries
+            .map_err(internal_error)?
     };
     Ok(Json(entries))
 }

@@ -362,12 +362,15 @@ fn score_memory_entry(
         reasons.push("full_text".to_string());
     }
 
-    score += scope_score(&entry.scope);
-    score += recency_score(&entry.updated_at);
-
+    // Require at least one relevance signal (token overlap or FTS match)
+    // before adding scope/recency bonuses. Without this gate, every
+    // candidate receives a positive base score from scope+recency alone.
     if score <= 0.0 {
         return None;
     }
+
+    score += scope_score(&entry.scope);
+    score += recency_score(&entry.updated_at);
 
     matched_terms.sort();
     matched_terms.dedup();
@@ -4300,6 +4303,50 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn claim_telegram_scheduled_message(&self, id: Uuid) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let updated = conn
+                .execute(
+                    "UPDATE telegram_scheduled_messages
+                     SET status = 'sending'
+                     WHERE id = ?1 AND status = 'pending'",
+                    params![id_str],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(updated > 0)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn recover_stale_sending_scheduled_messages(
+        &self,
+        max_age_secs: i64,
+    ) -> Result<u32, String> {
+        let conn = self.conn.clone();
+        let cutoff = (chrono::Utc::now()
+            - chrono::Duration::seconds(max_age_secs))
+            .to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let updated = conn
+                .execute(
+                    "UPDATE telegram_scheduled_messages
+                     SET status = 'pending'
+                     WHERE status = 'sending'
+                       AND send_at < ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(updated as u32)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
     async fn mark_telegram_scheduled_message_sent(
         &self,
         id: Uuid,
@@ -4529,44 +4576,55 @@ impl MissionStore for SqliteMissionStore {
         &self,
         channel_id: Uuid,
         chat_id: Option<i64>,
+        subject_user_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
         let conn = self.conn.clone();
         let channel_id_str = channel_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let sql = if chat_id.is_some() {
-                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
-                        subject_user_id, subject_username, subject_display_name,
-                        source_message_id, source_role, created_at, updated_at
-                 FROM telegram_structured_memory
-                 WHERE channel_id = ?1 AND chat_id = ?2
-                 ORDER BY updated_at DESC
-                 LIMIT ?3"
-            } else {
-                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
-                        subject_user_id, subject_username, subject_display_name,
-                        source_message_id, source_role, created_at, updated_at
-                 FROM telegram_structured_memory
-                 WHERE channel_id = ?1
-                 ORDER BY updated_at DESC
-                 LIMIT ?2"
-            };
-            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-            let entries = if let Some(chat_id) = chat_id {
-                stmt.query_map(
-                    params![channel_id_str, chat_id, limit as i64],
-                    row_to_telegram_structured_memory,
-                )
-            } else {
-                stmt.query_map(
-                    params![channel_id_str, limit as i64],
-                    row_to_telegram_structured_memory,
-                )
+            // Build WHERE clause dynamically so all filters are applied
+            // before the LIMIT truncation.
+            let mut where_clauses = vec!["channel_id = ?1".to_string()];
+            let mut param_idx = 2u32;
+            if chat_id.is_some() {
+                where_clauses.push(format!("chat_id = ?{}", param_idx));
+                param_idx += 1;
             }
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+            if subject_user_id.is_some() {
+                where_clauses.push(format!("subject_user_id = ?{}", param_idx));
+                param_idx += 1;
+            }
+            let sql = format!(
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE {}
+                 ORDER BY updated_at DESC
+                 LIMIT ?{}",
+                where_clauses.join(" AND "),
+                param_idx,
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            // Build params vec dynamically matching the WHERE clause above.
+            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+                Box::new(channel_id_str),
+            ];
+            if let Some(cid) = chat_id {
+                params_vec.push(Box::new(cid));
+            }
+            if let Some(suid) = subject_user_id {
+                params_vec.push(Box::new(suid));
+            }
+            params_vec.push(Box::new(limit as i64));
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+            let entries = stmt
+                .query_map(param_refs.as_slice(), row_to_telegram_structured_memory)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
             Ok(entries)
         })
         .await

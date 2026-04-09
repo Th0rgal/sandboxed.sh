@@ -43,6 +43,7 @@ async-recursion = "1"
 
 # For memory/storage
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 croner = "2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 

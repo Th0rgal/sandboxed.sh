@@ -112,7 +112,7 @@ fn extract_telegram_instructions(user_message: &str) -> Option<String> {
 ///
 /// The function is idempotent — it only writes once (checks for the `# Telegram Structured Memory`
 /// marker).
-pub fn inject_telegram_identity_into_claude_md(claude_md_path: &Path, user_message: &str) {
+pub fn inject_telegram_identity_into_claude_md(claude_md_path: &Path, user_message: &str, telegram_actions_available: bool) {
     tracing::info!(
         path = %claude_md_path.display(),
         "Injecting Telegram identity into CLAUDE.md"
@@ -152,6 +152,32 @@ pub fn inject_telegram_identity_into_claude_md(claude_md_path: &Path, user_messa
         tracing::warn!(
             "No [Instructions: ...] tag found in Telegram message for CLAUDE.md injection"
         );
+    }
+
+    // Inject telegram-action CLI documentation when actions are available.
+    // This separates tooling docs (system-managed) from personality
+    // (user-configured in channel.instructions), so channel instructions can
+    // stay focused on the bot's persona.
+    if telegram_actions_available {
+        let action_cmd = "telegram-action".to_string();
+        extra.push_str("\n# Telegram Actions\n\n");
+        extra.push_str(&format!(
+            "A CLI tool is available at `{cmd}` for sending Telegram messages \
+             and scheduling reminders. Use it ONLY when the user explicitly asks \
+             you to send a message, set a reminder, post in another chat, or ask \
+             someone in another chat for information. For normal replies, \
+             acknowledgements, and factual answers, do NOT use it.\n\n\
+             Commands:\n\
+             - `{cmd} reply \"MESSAGE\"` — immediate message to the current chat\n\
+             - `{cmd} remind SECONDS \"MESSAGE\"` — delayed reminder in the current chat\n\
+             - `{cmd} send-title \"CHAT TITLE\" \"MESSAGE\"` — immediate message to another chat by title\n\
+             - `{cmd} remind-title SECONDS \"CHAT TITLE\" \"MESSAGE\"` — delayed message to another chat\n\
+             - `{cmd} ask-title \"CHAT TITLE\" \"MESSAGE\"` — cross-chat request: ask another chat, wait for reply, summarize back\n\n\
+             The task is incomplete until the command succeeds. Never simulate an action \
+             by merely replying with the text or saying you will do it later.\n\
+             Never echo internal prefixes like `[Telegram from ...]` or `[Instructions: ...]`.\n",
+            cmd = action_cmd,
+        ));
     }
 
     extra.push_str("\n# Telegram Structured Memory\n\n");
@@ -2410,7 +2436,7 @@ async fn run_mission_turn(
             "Telegram message detected, attempting CLAUDE.md injection"
         );
         if claude_md_path.exists() {
-            inject_telegram_identity_into_claude_md(&claude_md_path, &user_message);
+            inject_telegram_identity_into_claude_md(&claude_md_path, &user_message, true);
         }
     } else {
         tracing::debug!(
@@ -14817,11 +14843,12 @@ mod tests {
         .unwrap();
 
         let msg = "[Telegram from Alice in chat 123] [Instructions: You are Paloma] [Structured memory] hi";
-        inject_telegram_identity_into_claude_md(&claude_md, msg);
+        inject_telegram_identity_into_claude_md(&claude_md, msg, true);
 
         let content = fs::read_to_string(&claude_md).unwrap();
         assert!(content.contains("# Bot Instructions"));
         assert!(content.contains("You are Paloma"));
+        assert!(content.contains("# Telegram Actions"));
         assert!(content.contains("# Telegram Structured Memory"));
         assert!(content.starts_with("# sandboxed.sh Workspace"));
     }
@@ -14833,11 +14860,11 @@ mod tests {
         fs::write(&claude_md, "# sandboxed.sh Workspace\n").unwrap();
 
         let msg = "[Telegram from Alice in chat 123] [Instructions: You are Paloma] hi";
-        inject_telegram_identity_into_claude_md(&claude_md, msg);
+        inject_telegram_identity_into_claude_md(&claude_md, msg, true);
         let first = fs::read_to_string(&claude_md).unwrap();
 
         // Call again — should NOT double-append
-        inject_telegram_identity_into_claude_md(&claude_md, msg);
+        inject_telegram_identity_into_claude_md(&claude_md, msg, true);
         let second = fs::read_to_string(&claude_md).unwrap();
 
         assert_eq!(first, second);
@@ -14850,7 +14877,7 @@ mod tests {
         fs::write(&claude_md, "# sandboxed.sh Workspace\n").unwrap();
 
         let msg = "[Telegram from Alice in chat 123] hello";
-        inject_telegram_identity_into_claude_md(&claude_md, msg);
+        inject_telegram_identity_into_claude_md(&claude_md, msg, true);
 
         let content = fs::read_to_string(&claude_md).unwrap();
         // Should still add the memory awareness section even without instructions

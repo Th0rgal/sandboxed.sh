@@ -1121,6 +1121,25 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Atomically claim a pending scheduled message for delivery by setting
+    /// status to `'sending'`. Returns `true` if the row was claimed (was
+    /// still `'pending'`), `false` if another caller already claimed it.
+    async fn claim_telegram_scheduled_message(&self, id: Uuid) -> Result<bool, String> {
+        let _ = id;
+        Err("Not supported".to_string())
+    }
+
+    /// Recover stale `'sending'` scheduled messages back to `'pending'`
+    /// (e.g. after a crash). Messages in `'sending'` for longer than
+    /// `max_age_secs` are reset.
+    async fn recover_stale_sending_scheduled_messages(
+        &self,
+        max_age_secs: i64,
+    ) -> Result<u32, String> {
+        let _ = max_age_secs;
+        Ok(0)
+    }
+
     /// Mark a scheduled Telegram message as sent.
     async fn mark_telegram_scheduled_message_sent(
         &self,
@@ -1155,9 +1174,10 @@ pub trait MissionStore: Send + Sync {
         &self,
         channel_id: Uuid,
         chat_id: Option<i64>,
+        subject_user_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
-        let _ = (channel_id, chat_id, limit);
+        let _ = (channel_id, chat_id, subject_user_id, limit);
         Ok(vec![])
     }
 
