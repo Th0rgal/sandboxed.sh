@@ -132,6 +132,16 @@ fn workflow_request_delivery_text(request_text: &str, target_chat_type: Option<&
     )
 }
 
+fn workflow_reply_text(clean_text: &str, file_annotation: Option<&str>) -> String {
+    match (clean_text.trim(), file_annotation.map(str::trim)) {
+        ("", Some(file_info)) if !file_info.is_empty() => file_info.to_string(),
+        (text, Some(file_info)) if !text.is_empty() && !file_info.is_empty() => {
+            format!("{}\n{}", text, file_info)
+        }
+        (text, _) => text.to_string(),
+    }
+}
+
 fn workflow_requires_direct_reply(workflow: &TelegramWorkflow) -> bool {
     matches!(
         workflow.target_chat_type.as_deref(),
@@ -1588,6 +1598,7 @@ pub async fn process_webhook_message(
     }
 
     if let Some(mut workflow) = matched_workflow {
+        let workflow_reply = workflow_reply_text(&clean_text, file_annotation.as_deref());
         let conversation_id = conversation.as_ref().map(|item| item.id);
         let _ = ctx
             .mission_store
@@ -1601,7 +1612,7 @@ pub async fn process_webhook_message(
                     "chat_id": msg.chat.id,
                     "message_id": msg.message_id,
                     "reply_to_message_id": reply_to_message_id,
-                    "text": clean_text,
+                    "text": workflow_reply,
                 })
                 .to_string(),
                 created_at: now_string(),
@@ -1609,7 +1620,7 @@ pub async fn process_webhook_message(
             .await;
 
         workflow.target_conversation_id = conversation_id;
-        workflow.latest_reply_text = Some(clean_text.clone());
+        workflow.latest_reply_text = Some(workflow_reply.clone());
         workflow.status = TelegramWorkflowStatus::Completed;
         workflow.updated_at = now_string();
         workflow.completed_at = Some(workflow.updated_at.clone());
@@ -1618,7 +1629,8 @@ pub async fn process_webhook_message(
             .update_telegram_workflow(workflow.clone())
             .await;
 
-        relay_workflow_reply_to_origin(ctx, bridge, &workflow, &sender_name, &clean_text).await;
+        relay_workflow_reply_to_origin(ctx, bridge, &workflow, &sender_name, &workflow_reply)
+            .await;
         return;
     }
 
@@ -2261,20 +2273,8 @@ pub async fn execute_native_telegram_action(
     text: &str,
     delay_seconds: u64,
 ) -> Result<TelegramActionExecutionResult, String> {
-    let mapping = mission_store
-        .get_telegram_chat_mission_by_mission_id(source_mission_id)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "Mission {} is not linked to an active Telegram chat",
-                source_mission_id
-            )
-        })?;
-
-    let ctx = bridge
-        .get_channel_context(mapping.channel_id)
-        .await
-        .ok_or_else(|| format!("Telegram channel {} is not active", mapping.channel_id))?;
+    let source = resolve_native_telegram_source(bridge, mission_store, source_mission_id).await?;
+    let ctx = source.ctx;
     let (target_spec, target_kind, target_value) = match target {
         TelegramActionTarget::Current => (
             "current".to_string(),
@@ -2290,8 +2290,15 @@ pub async fn execute_native_telegram_action(
             (format!("title:{}", title), "chat_title".to_string(), title)
         }
     };
+    let current_chat_id = source.source_chat_id.ok_or_else(|| {
+        format!(
+            "Mission {} has no active Telegram conversation context",
+            source_mission_id
+        )
+    })?;
     let (chat_id, chat_title, _) =
-        resolve_telegram_action_chat_id(&ctx, bridge.http(), mapping.chat_id, &target_spec).await?;
+        resolve_telegram_action_chat_id(&ctx, bridge.http(), current_chat_id, &target_spec)
+            .await?;
 
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
     let execution_kind = if delay_seconds > 0 && target_spec == "current" {
@@ -2304,9 +2311,9 @@ pub async fn execute_native_telegram_action(
             Ok(()) => {
                 log_telegram_action_execution(
                     mission_store,
-                    mapping.channel_id,
+                    ctx.channel.id,
                     source_mission_id,
-                    Some(mapping.chat_id),
+                    source.source_chat_id,
                     chat_id,
                     chat_title.clone(),
                     execution_kind.clone(),
@@ -2323,9 +2330,9 @@ pub async fn execute_native_telegram_action(
             Err(error) => {
                 log_telegram_action_execution(
                     mission_store,
-                    mapping.channel_id,
+                    ctx.channel.id,
                     source_mission_id,
-                    Some(mapping.chat_id),
+                    source.source_chat_id,
                     chat_id,
                     chat_title.clone(),
                     execution_kind,
@@ -2342,7 +2349,7 @@ pub async fn execute_native_telegram_action(
             }
         }
         return Ok(TelegramActionExecutionResult {
-            channel_id: mapping.channel_id,
+            channel_id: ctx.channel.id,
             chat_id,
             chat_title,
             scheduled_message_id: None,
@@ -2352,7 +2359,7 @@ pub async fn execute_native_telegram_action(
 
     let scheduled = TelegramScheduledMessage {
         id: Uuid::new_v4(),
-        channel_id: mapping.channel_id,
+        channel_id: ctx.channel.id,
         source_mission_id: Some(source_mission_id),
         chat_id,
         chat_title: chat_title.clone(),
@@ -2368,9 +2375,9 @@ pub async fn execute_native_telegram_action(
         .await?;
     log_telegram_action_execution(
         mission_store,
-        mapping.channel_id,
+        ctx.channel.id,
         source_mission_id,
-        Some(mapping.chat_id),
+        source.source_chat_id,
         chat_id,
         chat_title.clone(),
         execution_kind,
@@ -2385,7 +2392,7 @@ pub async fn execute_native_telegram_action(
     .await;
 
     Ok(TelegramActionExecutionResult {
-        channel_id: mapping.channel_id,
+        channel_id: ctx.channel.id,
         chat_id,
         chat_title,
         scheduled_message_id: Some(scheduled.id),
@@ -2400,20 +2407,14 @@ pub async fn execute_native_telegram_request_workflow(
     target: TelegramActionTarget,
     text: &str,
 ) -> Result<TelegramWorkflowRequestResult, String> {
-    let mapping = mission_store
-        .get_telegram_chat_mission_by_mission_id(source_mission_id)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "Mission {} is not linked to an active Telegram chat",
-                source_mission_id
-            )
-        })?;
-
-    let ctx = bridge
-        .get_channel_context(mapping.channel_id)
-        .await
-        .ok_or_else(|| format!("Telegram channel {} is not active", mapping.channel_id))?;
+    let source = resolve_native_telegram_source(bridge, mission_store, source_mission_id).await?;
+    let ctx = source.ctx;
+    let source_chat_id = source.source_chat_id.ok_or_else(|| {
+        format!(
+            "Mission {} has no active Telegram conversation context",
+            source_mission_id
+        )
+    })?;
     let (target_spec, target_title_hint) = match target {
         TelegramActionTarget::Current => ("current".to_string(), None),
         TelegramActionTarget::ChatId(chat_id) => (format!("chat:{}", chat_id), None),
@@ -2424,14 +2425,14 @@ pub async fn execute_native_telegram_request_workflow(
     };
     let mut origin_conversation = ctx
         .mission_store
-        .get_telegram_conversation_by_chat(mapping.channel_id, mapping.chat_id)
+        .get_telegram_conversation_by_chat(ctx.channel.id, source_chat_id)
         .await?
         .unwrap_or_else(|| TelegramConversation {
             id: Uuid::new_v4(),
-            channel_id: mapping.channel_id,
-            chat_id: mapping.chat_id,
+            channel_id: ctx.channel.id,
+            chat_id: source_chat_id,
             mission_id: Some(source_mission_id),
-            chat_title: mapping.chat_title.clone(),
+            chat_title: source.source_chat_title.clone(),
             chat_type: None,
             last_message_at: Some(now_string()),
             created_at: now_string(),
@@ -2443,15 +2444,15 @@ pub async fn execute_native_telegram_request_workflow(
         .await?;
 
     let (target_chat_id, target_chat_title, resolved_target_chat_type) =
-        resolve_telegram_action_chat_id(&ctx, bridge.http(), mapping.chat_id, &target_spec).await?;
+        resolve_telegram_action_chat_id(&ctx, bridge.http(), source_chat_id, &target_spec).await?;
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
     let target_conversation = ctx
         .mission_store
-        .get_telegram_conversation_by_chat(mapping.channel_id, target_chat_id)
+        .get_telegram_conversation_by_chat(ctx.channel.id, target_chat_id)
         .await
         .ok()
         .flatten();
-    let target_chat_type = if target_chat_id == mapping.chat_id {
+    let target_chat_type = if target_chat_id == source_chat_id {
         origin_conversation.chat_type.clone()
     } else {
         target_conversation
@@ -2467,9 +2468,9 @@ pub async fn execute_native_telegram_request_workflow(
     let now = now_string();
     let mut workflow = TelegramWorkflow {
         id: Uuid::new_v4(),
-        channel_id: mapping.channel_id,
+        channel_id: ctx.channel.id,
         origin_conversation_id: origin_conversation.id,
-        origin_chat_id: mapping.chat_id,
+        origin_chat_id: source_chat_id,
         origin_mission_id: Some(source_mission_id),
         target_conversation_id: target_conversation.as_ref().map(|item| item.id),
         target_chat_id: Some(target_chat_id),
@@ -2500,7 +2501,7 @@ pub async fn execute_native_telegram_request_workflow(
             conversation_id: Some(origin_conversation.id),
             event_type: "workflow_created".to_string(),
             payload_json: serde_json::json!({
-                "origin_chat_id": mapping.chat_id,
+                "origin_chat_id": source_chat_id,
                 "target_chat_id": target_chat_id,
                 "text": text,
             })
@@ -2553,7 +2554,7 @@ pub async fn execute_native_telegram_request_workflow(
         ctx.mission_store
             .upsert_telegram_conversation(TelegramConversation {
                 id: Uuid::new_v4(),
-                channel_id: mapping.channel_id,
+                channel_id: ctx.channel.id,
                 chat_id: target_chat_id,
                 mission_id: None,
                 chat_title: target_chat_title.clone(),
@@ -2574,7 +2575,7 @@ pub async fn execute_native_telegram_request_workflow(
     log_telegram_conversation_message(
         &ctx.mission_store,
         target_conversation_id,
-        mapping.channel_id,
+        ctx.channel.id,
         target_chat_id,
         None,
         Some(workflow.id),
@@ -2594,10 +2595,65 @@ pub async fn execute_native_telegram_request_workflow(
 
     Ok(TelegramWorkflowRequestResult {
         workflow_id: workflow.id,
-        channel_id: mapping.channel_id,
-        origin_chat_id: mapping.chat_id,
+        channel_id: ctx.channel.id,
+        origin_chat_id: source_chat_id,
         target_chat_id,
         target_chat_title,
+    })
+}
+
+#[derive(Clone)]
+struct NativeTelegramSource {
+    ctx: ChannelContext,
+    source_chat_id: Option<i64>,
+    source_chat_title: Option<String>,
+}
+
+async fn resolve_native_telegram_source(
+    bridge: &SharedTelegramBridge,
+    mission_store: &Arc<dyn MissionStore>,
+    source_mission_id: Uuid,
+) -> Result<NativeTelegramSource, String> {
+    if let Some(mapping) = mission_store
+        .get_telegram_chat_mission_by_mission_id(source_mission_id)
+        .await?
+    {
+        let ctx = bridge
+            .get_channel_context(mapping.channel_id)
+            .await
+            .ok_or_else(|| format!("Telegram channel {} is not active", mapping.channel_id))?;
+        return Ok(NativeTelegramSource {
+            ctx,
+            source_chat_id: Some(mapping.chat_id),
+            source_chat_title: mapping.chat_title,
+        });
+    }
+
+    let channel = mission_store
+        .list_telegram_channels(source_mission_id)
+        .await?
+        .into_iter()
+        .find(|channel| channel.active)
+        .ok_or_else(|| {
+            format!(
+                "Mission {} is not linked to an active Telegram chat",
+                source_mission_id
+            )
+        })?;
+    let ctx = bridge
+        .get_channel_context(channel.id)
+        .await
+        .ok_or_else(|| format!("Telegram channel {} is not active", channel.id))?;
+    let conversation = mission_store
+        .list_telegram_conversations(channel.id, 16)
+        .await?
+        .into_iter()
+        .find(|conversation| conversation.mission_id == Some(source_mission_id));
+
+    Ok(NativeTelegramSource {
+        ctx,
+        source_chat_id: conversation.as_ref().map(|conversation| conversation.chat_id),
+        source_chat_title: conversation.and_then(|conversation| conversation.chat_title),
     })
 }
 
@@ -3597,10 +3653,10 @@ mod tests {
         extract_telegram_actions, format_structured_memory_context, markdown_to_telegram_html,
         render_telegram_chunk, sanitize_telegram_visible_text, scope_for_extracted_memory,
         telegram_action_target_matches, telegram_chat_display_title, truncate_for_telegram,
-        verify_internal_telegram_action_token, workflow_request_delivery_text, Chat,
-        ExtractedTelegramMemory, TelegramAction, TelegramActionKind, TelegramBridge,
-        TelegramMemorySubject, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
-        TelegramStructuredMemoryScope,
+        verify_internal_telegram_action_token, workflow_reply_text,
+        workflow_request_delivery_text, Chat, ExtractedTelegramMemory, TelegramAction,
+        TelegramActionKind, TelegramBridge, TelegramMemorySubject, TelegramStructuredMemoryEntry,
+        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
     };
     use uuid::Uuid;
 
@@ -3766,6 +3822,20 @@ mod tests {
             workflow_request_delivery_text("Can you send me the latest leads?", Some("private"));
 
         assert_eq!(text, "Can you send me the latest leads?");
+    }
+
+    #[test]
+    fn workflow_reply_text_preserves_file_only_replies() {
+        let text = workflow_reply_text("", Some("[Attached file: report.pdf (application/pdf)]"));
+
+        assert_eq!(text, "[Attached file: report.pdf (application/pdf)]");
+    }
+
+    #[test]
+    fn workflow_reply_text_appends_file_annotation_to_caption() {
+        let text = workflow_reply_text("Here is the report", Some("[Attached file: report.pdf]"));
+
+        assert_eq!(text, "Here is the report\n[Attached file: report.pdf]");
     }
 
     #[test]

@@ -14659,7 +14659,11 @@ mod tests {
     fn inject_telegram_identity_writes_to_claude_md() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let claude_md = temp_dir.path().join("CLAUDE.md");
-        fs::write(&claude_md, "# sandboxed.sh Workspace\n\nOriginal content.\n").unwrap();
+        fs::write(
+            &claude_md,
+            "# sandboxed.sh Workspace\n\nOriginal content.\n",
+        )
+        .unwrap();
 
         let msg = "[Telegram from Alice in chat 123] [Instructions: You are Paloma] [Structured memory] hi";
         inject_telegram_identity_into_claude_md(&claude_md, msg);

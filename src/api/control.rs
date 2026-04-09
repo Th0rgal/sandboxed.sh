@@ -10394,14 +10394,20 @@ async fn mission_store_for_telegram_mission(
 ) -> Option<Arc<dyn MissionStore>> {
     let sessions = state.control.all_sessions().await;
     for session in sessions {
-        if session
+        let has_chat_mapping = session
             .mission_store
             .get_telegram_chat_mission_by_mission_id(mission_id)
             .await
             .ok()
             .flatten()
-            .is_some()
-        {
+            .is_some();
+        let has_attached_channel = session
+            .mission_store
+            .list_telegram_channels(mission_id)
+            .await
+            .map(|channels| !channels.is_empty())
+            .unwrap_or(false);
+        if has_chat_mapping || has_attached_channel {
             return Some(Arc::clone(&session.mission_store));
         }
     }

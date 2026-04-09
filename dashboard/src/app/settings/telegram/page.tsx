@@ -245,13 +245,14 @@ export default function TelegramSettingsPage() {
   };
 
   const toggleExpand = (botId: string) => {
-    const willExpand = !expandedBots.has(botId);
+    let willExpand = false;
     setExpandedBots((prev) => {
       const next = new Set(prev);
       if (next.has(botId)) {
         next.delete(botId);
       } else {
         next.add(botId);
+        willExpand = true;
       }
       return next;
     });
