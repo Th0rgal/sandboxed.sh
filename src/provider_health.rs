@@ -689,6 +689,21 @@ impl ModelChainStore {
             changed = true;
         }
 
+        if !chains.iter().any(|c| c.id == "builtin/assistant") {
+            chains.push(ModelChain {
+                id: "builtin/assistant".to_string(),
+                name: "Assistant (GLM-5.1)".to_string(),
+                entries: vec![ChainEntry {
+                    provider_id: "zai".to_string(),
+                    model_id: "glm-5.1".to_string(),
+                }],
+                is_default: false,
+                created_at: now,
+                updated_at: now,
+            });
+            changed = true;
+        }
+
         if changed {
             if let Err(e) = self.save_chains_to_disk(&chains) {
                 tracing::error!("Failed to save default model chains: {}", e);
