@@ -1629,8 +1629,7 @@ pub async fn process_webhook_message(
             .update_telegram_workflow(workflow.clone())
             .await;
 
-        relay_workflow_reply_to_origin(ctx, bridge, &workflow, &sender_name, &workflow_reply)
-            .await;
+        relay_workflow_reply_to_origin(ctx, bridge, &workflow, &sender_name, &workflow_reply).await;
         return;
     }
 
@@ -2297,8 +2296,7 @@ pub async fn execute_native_telegram_action(
         )
     })?;
     let (chat_id, chat_title, _) =
-        resolve_telegram_action_chat_id(&ctx, bridge.http(), current_chat_id, &target_spec)
-            .await?;
+        resolve_telegram_action_chat_id(&ctx, bridge.http(), current_chat_id, &target_spec).await?;
 
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
     let execution_kind = if delay_seconds > 0 && target_spec == "current" {
