@@ -2652,7 +2652,9 @@ async fn resolve_native_telegram_source(
 
     Ok(NativeTelegramSource {
         ctx,
-        source_chat_id: conversation.as_ref().map(|conversation| conversation.chat_id),
+        source_chat_id: conversation
+            .as_ref()
+            .map(|conversation| conversation.chat_id),
         source_chat_title: conversation.and_then(|conversation| conversation.chat_title),
     })
 }
@@ -3653,10 +3655,10 @@ mod tests {
         extract_telegram_actions, format_structured_memory_context, markdown_to_telegram_html,
         render_telegram_chunk, sanitize_telegram_visible_text, scope_for_extracted_memory,
         telegram_action_target_matches, telegram_chat_display_title, truncate_for_telegram,
-        verify_internal_telegram_action_token, workflow_reply_text,
-        workflow_request_delivery_text, Chat, ExtractedTelegramMemory, TelegramAction,
-        TelegramActionKind, TelegramBridge, TelegramMemorySubject, TelegramStructuredMemoryEntry,
-        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
+        verify_internal_telegram_action_token, workflow_reply_text, workflow_request_delivery_text,
+        Chat, ExtractedTelegramMemory, TelegramAction, TelegramActionKind, TelegramBridge,
+        TelegramMemorySubject, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
+        TelegramStructuredMemoryScope,
     };
     use uuid::Uuid;
 
