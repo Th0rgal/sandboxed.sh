@@ -732,7 +732,7 @@ export default function TelegramSettingsPage() {
                         <div className="flex items-center gap-2 text-xs text-white/40 mb-3">
                           <Loader className="h-3 w-3 animate-spin" /> Searching...
                         </div>
-                      ) : (memorySearchByBot[bot.id] || []).length > 0 ? (
+                      ) : (bot.id in memorySearchByBot) && (memorySearchByBot[bot.id] || []).length > 0 ? (
                         <div className="space-y-1 mb-3">
                           {(memorySearchByBot[bot.id] || []).map((hit) => (
                             <div
@@ -754,7 +754,7 @@ export default function TelegramSettingsPage() {
                             </div>
                           ))}
                         </div>
-                      ) : memorySearchQueryByBot[bot.id]?.trim() ? (
+                      ) : (bot.id in memorySearchByBot) && memorySearchQueryByBot[bot.id]?.trim() ? (
                         <p className="text-xs text-white/30 italic mb-3">
                           No ranked memory matches for this query.
                         </p>

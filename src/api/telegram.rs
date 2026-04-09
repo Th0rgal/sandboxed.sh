@@ -2006,7 +2006,7 @@ async fn resolve_telegram_action_chat_id(
         if telegram_action_target_matches(
             target,
             mapping.chat_title.as_deref(),
-            mapping.chat_title.as_deref(),
+            None,
         ) {
             let chat_type = ctx
                 .mission_store

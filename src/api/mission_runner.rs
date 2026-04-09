@@ -107,20 +107,20 @@ def main() -> int:
     url = action_url
 
     if command == "reply":
-        payload["text"] = sys.argv[2]
+        payload["text"] = " ".join(sys.argv[2:])
     elif command == "remind" and len(sys.argv) >= 4:
         payload["delay_seconds"] = int(sys.argv[2])
-        payload["text"] = sys.argv[3]
+        payload["text"] = " ".join(sys.argv[3:])
     elif command == "send-title" and len(sys.argv) >= 4:
         payload["target"] = {"kind": "chat_title", "value": sys.argv[2]}
-        payload["text"] = sys.argv[3]
+        payload["text"] = " ".join(sys.argv[3:])
     elif command == "remind-title" and len(sys.argv) >= 5:
         payload["delay_seconds"] = int(sys.argv[2])
         payload["target"] = {"kind": "chat_title", "value": sys.argv[3]}
-        payload["text"] = sys.argv[4]
+        payload["text"] = " ".join(sys.argv[4:])
     elif command == "ask-title" and len(sys.argv) >= 4 and workflow_url:
         payload["target"] = {"kind": "chat_title", "value": sys.argv[2]}
-        payload["text"] = sys.argv[3]
+        payload["text"] = " ".join(sys.argv[3:])
         url = workflow_url
     else:
         return usage()
