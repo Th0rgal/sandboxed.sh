@@ -148,6 +148,15 @@ jobs:
             dashboard/node_modules
           key: ${{ runner.os }}-dashboard-bun-${{ hashFiles('dashboard/bun.lock', 'dashboard/package.json') }}
 
+      - name: Cache Next.js build artifacts
+        uses: actions/cache@v4
+        with:
+          path: dashboard/.next/cache
+          key: ${{ runner.os }}-dashboard-next-${{ hashFiles('dashboard/bun.lock', 'dashboard/package.json', 'dashboard/next.config.ts', 'dashboard/src/**/*', 'dashboard/public/**/*') }}
+          restore-keys: |
+            ${{ runner.os }}-dashboard-next-${{ hashFiles('dashboard/bun.lock', 'dashboard/package.json') }}-
+            ${{ runner.os }}-dashboard-next-
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
