@@ -70,6 +70,71 @@ struct OpencodeSseParseResult {
     usage: Option<(u64, u64)>,
 }
 
+/// Extract the `[Instructions: <text>]` content from a Telegram user message.
+///
+/// The tag format is: `[Instructions: <text>] [NextTag …` or `[Instructions: <text>] plaintext`.
+/// We look for `] [` or `] ` boundaries first so that brackets inside the instruction text
+/// don't cause early termination.
+fn extract_telegram_instructions(user_message: &str) -> Option<String> {
+    let start = user_message.find("[Instructions: ")?;
+    let after = &user_message[start + "[Instructions: ".len()..];
+    let end = after
+        .find("] [")
+        .or_else(|| after.find("] "))
+        .or_else(|| after.rfind(']'))?;
+    let text = after[..end].trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// Append Telegram bot instructions and structured-memory awareness to a CLAUDE.md file.
+///
+/// This is called once per mission for Telegram-originated messages so that the backend
+/// LLM (Claude Code) adopts the bot persona instead of its default identity.  The
+/// instructions are extracted from the `[Instructions: ...]` tag in the user message
+/// and written to the system-level CLAUDE.md file where they take priority.
+///
+/// The function is idempotent — it only writes once (checks for the `# Telegram Structured Memory`
+/// marker).
+fn inject_telegram_identity_into_claude_md(claude_md_path: &Path, user_message: &str) {
+    let existing = match std::fs::read_to_string(claude_md_path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    // Already injected on a previous turn — skip.
+    if existing.contains("# Telegram Structured Memory") {
+        return;
+    }
+
+    let mut extra = String::new();
+
+    if let Some(instructions) = extract_telegram_instructions(user_message) {
+        extra.push_str("\n\n# Bot Instructions\n\n");
+        extra.push_str(
+            "IMPORTANT: these instructions OVERRIDE any default behavior \
+             and you MUST follow them exactly as written.\n\n",
+        );
+        extra.push_str(&instructions);
+        extra.push('\n');
+    }
+
+    extra.push_str("\n# Telegram Structured Memory\n\n");
+    extra.push_str(
+        "You have access to a persistent structured memory system. \
+         When a `[Structured memory]` block is present in the user \
+         message, it contains facts, notes, and preferences that you \
+         previously stored about the user, the chat, or the channel. \
+         Use this information to personalise your responses. \
+         If the user asks about your memory, describe what you \
+         currently know based on the structured memory block.\n",
+    );
+
+    let _ = std::fs::write(claude_md_path, format!("{}{}", existing, extra));
+}
+
 fn write_telegram_action_cli_helpers(work_dir: &Path) {
     let path = work_dir.join(".sandboxed-sh-telegram-action.py");
     const SCRIPT: &str = r#"#!/usr/bin/env python3
@@ -2261,6 +2326,15 @@ async fn run_mission_turn(
     } else {
         mission_work_dir
     };
+
+    // For Telegram missions, append channel instructions and memory awareness
+    // to CLAUDE.md so the backend LLM adopts the bot persona.
+    if user_message.contains("[Telegram from ") {
+        let claude_md_path = mission_work_dir.join("CLAUDE.md");
+        if claude_md_path.exists() {
+            inject_telegram_identity_into_claude_md(&claude_md_path, &user_message);
+        }
+    }
 
     // Session rotation: Prevent OOM by resetting sessions every N turns
     // Calculate turn count (each assistant response = 1 turn)
@@ -12821,6 +12895,7 @@ mod tests {
         ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
         OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
+    use super::{extract_telegram_instructions, inject_telegram_identity_into_claude_md};
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
     use serde_json::json;
@@ -14544,5 +14619,87 @@ mod tests {
             preferred_model_for_cost(Some("   "), Some("observed-model")),
             Some("observed-model")
         );
+    }
+
+    // --- Telegram CLAUDE.md injection tests ---
+
+    #[test]
+    fn extract_telegram_instructions_basic() {
+        let msg = "[Telegram from Alice in chat 123] [Instructions: You are Paloma, a friendly bot] [Structured memory] hello";
+        assert_eq!(
+            extract_telegram_instructions(msg),
+            Some("You are Paloma, a friendly bot".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_telegram_instructions_with_brackets_in_text() {
+        let msg = "[Telegram from Bob in chat 456] [Instructions: Use [markdown] formatting] [Structured memory] hi";
+        let result = extract_telegram_instructions(msg).unwrap();
+        // Should capture up to the "] [" boundary before [Structured memory]
+        assert_eq!(result, "Use [markdown] formatting");
+    }
+
+    #[test]
+    fn extract_telegram_instructions_none_when_missing() {
+        let msg = "[Telegram from Alice in chat 123] hello there";
+        assert_eq!(extract_telegram_instructions(msg), None);
+    }
+
+    #[test]
+    fn extract_telegram_instructions_at_end_of_message() {
+        let msg = "[Telegram from Alice in chat 123] [Instructions: Be helpful]";
+        assert_eq!(
+            extract_telegram_instructions(msg),
+            Some("Be helpful".to_string())
+        );
+    }
+
+    #[test]
+    fn inject_telegram_identity_writes_to_claude_md() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let claude_md = temp_dir.path().join("CLAUDE.md");
+        fs::write(&claude_md, "# sandboxed.sh Workspace\n\nOriginal content.\n").unwrap();
+
+        let msg = "[Telegram from Alice in chat 123] [Instructions: You are Paloma] [Structured memory] hi";
+        inject_telegram_identity_into_claude_md(&claude_md, msg);
+
+        let content = fs::read_to_string(&claude_md).unwrap();
+        assert!(content.contains("# Bot Instructions"));
+        assert!(content.contains("You are Paloma"));
+        assert!(content.contains("# Telegram Structured Memory"));
+        assert!(content.starts_with("# sandboxed.sh Workspace"));
+    }
+
+    #[test]
+    fn inject_telegram_identity_is_idempotent() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let claude_md = temp_dir.path().join("CLAUDE.md");
+        fs::write(&claude_md, "# sandboxed.sh Workspace\n").unwrap();
+
+        let msg = "[Telegram from Alice in chat 123] [Instructions: You are Paloma] hi";
+        inject_telegram_identity_into_claude_md(&claude_md, msg);
+        let first = fs::read_to_string(&claude_md).unwrap();
+
+        // Call again — should NOT double-append
+        inject_telegram_identity_into_claude_md(&claude_md, msg);
+        let second = fs::read_to_string(&claude_md).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn inject_telegram_identity_without_instructions() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let claude_md = temp_dir.path().join("CLAUDE.md");
+        fs::write(&claude_md, "# sandboxed.sh Workspace\n").unwrap();
+
+        let msg = "[Telegram from Alice in chat 123] hello";
+        inject_telegram_identity_into_claude_md(&claude_md, msg);
+
+        let content = fs::read_to_string(&claude_md).unwrap();
+        // Should still add the memory awareness section even without instructions
+        assert!(content.contains("# Telegram Structured Memory"));
+        assert!(!content.contains("# Bot Instructions"));
     }
 }
