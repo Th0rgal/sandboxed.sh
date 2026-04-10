@@ -4004,10 +4004,21 @@ pub fn run_claudecode_turn<'a>(
                 format!("{}/telegram-action", container_work_dir),
             );
 
-            // NOTE: We intentionally do NOT prepend the workspace directory to PATH.
-            // Doing so would let repository files shadow system binaries.
-            // The CLAUDE.md instructions tell the bot to use the full command path
-            // from the TELEGRAM_ACTION_COMMAND environment variable instead.
+            // Append (not prepend) the workspace directory to PATH so that
+            // `telegram-action` is findable as a bare command.  Appending keeps
+            // system binaries at higher priority, avoiding the shadowing risk
+            // that prepending would create.  The $TELEGRAM_ACTION_COMMAND env var
+            // still works as a full-path fallback for well-behaved agents.
+            {
+                let current_path = env
+                    .get("PATH")
+                    .cloned()
+                    .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+                env.insert(
+                    "PATH".to_string(),
+                    format!("{}:{}", current_path, container_work_dir),
+                );
+            }
 
             tracing::info!(
                 mission_id = %mission_id,
@@ -9697,6 +9708,11 @@ pub async fn run_opencode_turn(
             path_parts.push(bun_bins.to_string());
         }
         path_parts.push(current_path);
+        // Append (not prepend) the workspace directory so `telegram-action` is
+        // findable as a bare command without shadowing system binaries.
+        if telegram_action_helpers_enabled {
+            path_parts.push(work_dir_arg.to_string());
+        }
         env.insert("PATH".to_string(), path_parts.join(":"));
     }
 
