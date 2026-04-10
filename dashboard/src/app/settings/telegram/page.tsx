@@ -20,7 +20,6 @@ import {
   type TelegramScheduledMessage,
   type TelegramStructuredMemoryEntry,
   type TelegramStructuredMemorySearchHit,
-  type TelegramStructuredMemoryScope,
   type TelegramTriggerMode,
   type CreateTelegramBotInput,
 } from '@/lib/api';
@@ -54,12 +53,6 @@ const BACKEND_LABELS: Record<string, string> = {
   codex: 'Codex',
   gemini: 'Gemini',
   amp: 'Amp',
-};
-
-const MEMORY_SCOPE_LABELS: Record<TelegramStructuredMemoryScope, string> = {
-  chat: 'chat',
-  user: 'user',
-  channel: 'channel',
 };
 
 export default function TelegramSettingsPage() {
@@ -781,7 +774,7 @@ export default function TelegramSettingsPage() {
                                     {entry.kind}
                                   </span>
                                   <span className="inline-flex items-center rounded bg-white/[0.04] border border-white/[0.06] px-1.5 py-0.5 text-[10px] font-medium text-white/50">
-                                    {MEMORY_SCOPE_LABELS[entry.scope]}
+                                    {entry.scope}
                                   </span>
                                   <p className="text-xs text-white/60 truncate">
                                     {entry.scope === 'user'
