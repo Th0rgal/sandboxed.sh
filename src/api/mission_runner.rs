@@ -248,8 +248,10 @@ import urllib.request
 def usage() -> int:
     print(
         "usage: telegram-action-cli reply <text> | remind <delay_seconds> <text> | "
-        "send-title <chat_title> <text> | remind-title <delay_seconds> <chat_title> <text> | "
-        "ask-title <chat_title> <text>",
+        "send-title <chat_title_or_@username> <text> | "
+        "remind-title <delay_seconds> <chat_title_or_@username> <text> | "
+        "ask-title <chat_title_or_@username> <text> | "
+        "send-chat-id <chat_id> <text> | ask-chat-id <chat_id> <text>",
         file=sys.stderr,
     )
     return 2
@@ -285,6 +287,13 @@ def main() -> int:
         payload["text"] = " ".join(sys.argv[4:])
     elif command == "ask-title" and len(sys.argv) >= 4 and workflow_url:
         payload["target"] = {"kind": "chat_title", "value": sys.argv[2]}
+        payload["text"] = " ".join(sys.argv[3:])
+        url = workflow_url
+    elif command == "send-chat-id" and len(sys.argv) >= 4:
+        payload["target"] = {"kind": "chat_id", "value": int(sys.argv[2])}
+        payload["text"] = " ".join(sys.argv[3:])
+    elif command == "ask-chat-id" and len(sys.argv) >= 4 and workflow_url:
+        payload["target"] = {"kind": "chat_id", "value": int(sys.argv[2])}
         payload["text"] = " ".join(sys.argv[3:])
         url = workflow_url
     else:

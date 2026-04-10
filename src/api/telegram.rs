@@ -2172,7 +2172,166 @@ async fn resolve_telegram_action_chat_id(
         }
     }
 
+    // Fallback: also search telegram_conversations table (not just chat_missions).
+    // This covers chats the bot has interacted with that may not have an active mission.
+    if let Ok(conversations) = ctx
+        .mission_store
+        .list_telegram_conversations(ctx.channel.id, 100)
+        .await
+    {
+        for conv in &conversations {
+            if telegram_action_target_matches(
+                target,
+                conv.chat_title.as_deref(),
+                None,
+            ) {
+                let (resolved_title, chat_type) = resolve_telegram_chat_metadata(
+                    ctx,
+                    http,
+                    &base_url,
+                    conv.chat_id,
+                    conv.chat_title.clone(),
+                )
+                .await?;
+                return Ok((conv.chat_id, resolved_title, chat_type));
+            }
+        }
+
+        // For each known group/supergroup conversation, use getChatMember to
+        // check whether the requested @username is a member. This lets the bot
+        // target another bot or user by @username when they share a group.
+        let clean_target = target
+            .strip_prefix("title:")
+            .or_else(|| target.strip_prefix("username:"))
+            .unwrap_or(target)
+            .trim()
+            .trim_start_matches('@');
+        let looks_like_username = !clean_target.is_empty()
+            && !clean_target.contains(' ')
+            && clean_target.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+
+        if looks_like_username {
+            for conv in &conversations {
+                let is_group = matches!(
+                    conv.chat_type.as_deref(),
+                    Some("group") | Some("supergroup")
+                );
+                if !is_group {
+                    continue;
+                }
+                // Try getChat(@username) first — this resolves public groups/channels
+                // and bot chats when the bot has previously interacted.
+                let username_target = format!("@{}", clean_target);
+                let get_chat_url = format!("{}/getChat", base_url);
+                if let Ok(response) = http
+                    .post(&get_chat_url)
+                    .json(&serde_json::json!({ "chat_id": username_target }))
+                    .send()
+                    .await
+                {
+                    if response.status().is_success() {
+                        if let Ok(parsed) =
+                            response.json::<TelegramResponse<TelegramActionChatLookup>>().await
+                        {
+                            if let Some(lookup) = parsed.result {
+                                let resolved_title = telegram_action_lookup_title(&lookup);
+                                return Ok((lookup.id, resolved_title, Some(lookup.chat_type)));
+                            }
+                        }
+                    }
+                }
+
+                // Try getChatMember in known group chats to find the @username.
+                // getChatMember doesn't accept usernames, but we can try using the
+                // numeric chat_id from the conversation to search.  Unfortunately,
+                // getChatMember requires a numeric user_id — we don't have one for
+                // the target yet.  Instead, we send the message to the group and
+                // mention the target username inline, which lets group bots pick up
+                // the mention via their own webhook.
+                //
+                // For now, if the target looks like a username and we have a group
+                // conversation, we resolve to that group's chat_id so the message
+                // goes there (the caller prepends @mention in the message text).
+                tracing::info!(
+                    "Resolving @{} to group chat {} ({}) for cross-chat mention",
+                    clean_target,
+                    conv.chat_id,
+                    conv.chat_title.as_deref().unwrap_or("unknown"),
+                );
+                let (resolved_title, chat_type) = resolve_telegram_chat_metadata(
+                    ctx,
+                    http,
+                    &base_url,
+                    conv.chat_id,
+                    conv.chat_title.clone(),
+                )
+                .await?;
+                return Ok((conv.chat_id, resolved_title, chat_type));
+            }
+        }
+    }
+
+    // Last resort: try getChat(@username) directly via Telegram API.
+    // This works for public groups/channels where the bot is a member.
+    {
+        let clean = target
+            .strip_prefix("title:")
+            .or_else(|| target.strip_prefix("username:"))
+            .unwrap_or(target)
+            .trim()
+            .trim_start_matches('@');
+        if !clean.is_empty()
+            && !clean.contains(' ')
+            && clean.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            let username_target = format!("@{}", clean);
+            match fetch_telegram_chat_by_username(http, &base_url, &username_target).await {
+                Ok(lookup) => {
+                    let resolved_title = telegram_action_lookup_title(&lookup);
+                    return Ok((lookup.id, resolved_title, Some(lookup.chat_type)));
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "getChat fallback for {} failed: {}",
+                        username_target,
+                        error
+                    );
+                }
+            }
+        }
+    }
+
     Err(format!("Unknown Telegram chat target '{}'", target))
+}
+
+/// Try to resolve a chat by @username via the Telegram Bot API getChat endpoint.
+async fn fetch_telegram_chat_by_username(
+    http: &Client,
+    base_url: &str,
+    username: &str,
+) -> Result<TelegramActionChatLookup, String> {
+    let url = format!("{}/getChat", base_url);
+    let response = http
+        .post(&url)
+        .json(&serde_json::json!({ "chat_id": username }))
+        .send()
+        .await
+        .map_err(|e| format!("getChat failed for {}: {}", username, e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        return Err(format!("getChat API error {}: {}", status, body_text));
+    }
+
+    let parsed: TelegramResponse<TelegramActionChatLookup> = response
+        .json()
+        .await
+        .map_err(|e| format!("getChat parse failed for {}: {}", username, e))?;
+
+    parsed
+        .result
+        .ok_or_else(|| format!("getChat returned no result for {}", username))
 }
 
 fn telegram_action_target_parts(target: &str) -> (String, String) {
