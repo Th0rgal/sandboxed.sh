@@ -4306,14 +4306,15 @@ impl MissionStore for SqliteMissionStore {
     async fn claim_telegram_scheduled_message(&self, id: Uuid) -> Result<bool, String> {
         let conn = self.conn.clone();
         let id_str = id.to_string();
+        let now = Utc::now().to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let updated = conn
                 .execute(
                     "UPDATE telegram_scheduled_messages
-                     SET status = 'sending'
+                     SET status = 'sending', sent_at = ?2
                      WHERE id = ?1 AND status = 'pending'",
-                    params![id_str],
+                    params![id_str, now],
                 )
                 .map_err(|e| e.to_string())?;
             Ok(updated > 0)
@@ -4335,9 +4336,9 @@ impl MissionStore for SqliteMissionStore {
             let updated = conn
                 .execute(
                     "UPDATE telegram_scheduled_messages
-                     SET status = 'pending'
+                     SET status = 'pending', sent_at = NULL
                      WHERE status = 'sending'
-                       AND send_at < ?1",
+                       AND sent_at IS NOT NULL AND sent_at < ?1",
                     params![cutoff],
                 )
                 .map_err(|e| e.to_string())?;

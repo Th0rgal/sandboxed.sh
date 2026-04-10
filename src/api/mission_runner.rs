@@ -2442,7 +2442,10 @@ async fn run_mission_turn(
         if !claude_md_path.exists() {
             let _ = std::fs::write(&claude_md_path, "");
         }
-        inject_telegram_identity_into_claude_md(&claude_md_path, &user_message, true);
+        let actions_available =
+            crate::api::telegram::build_internal_telegram_action_token(mission_id).is_some()
+                && localhost_api_base_url_from_env().is_some();
+        inject_telegram_identity_into_claude_md(&claude_md_path, &user_message, actions_available);
     } else {
         tracing::debug!(
             mission_id = %mission_id,

@@ -30,12 +30,22 @@ struct JwtClaims {
     exp: i64,
 }
 
+fn service_user_identity() -> String {
+    std::env::var("SANDBOXED_SINGLE_TENANT_USER_ID")
+        .or_else(|_| std::env::var("SINGLE_TENANT_USER_ID"))
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "default".to_string())
+}
+
 fn mint_service_jwt(secret: &str) -> Option<String> {
     let now = Utc::now();
     let exp = now + chrono::Duration::hours(24);
+    let identity = service_user_identity();
     let claims = JwtClaims {
-        sub: "automation-manager-mcp".to_string(),
-        usr: "automation-manager-mcp".to_string(),
+        sub: identity.clone(),
+        usr: identity,
         iat: now.timestamp(),
         exp: exp.timestamp(),
     };
