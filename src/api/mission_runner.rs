@@ -225,7 +225,7 @@ fn public_api_base_url_from_env() -> Option<String> {
     public_api_base_url(std::env::var("SANDBOXED_PUBLIC_URL").ok().as_deref())
 }
 
-fn localhost_api_base_url_from_env() -> Option<String> {
+pub(super) fn localhost_api_base_url_from_env() -> Option<String> {
     localhost_api_base_url(std::env::var("PORT").ok().as_deref())
 }
 

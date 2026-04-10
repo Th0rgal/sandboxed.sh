@@ -4862,10 +4862,12 @@ async fn stale_mission_cleanup_loop(
 /// evaluated at `now_utc` to account for DST — though the lookup table doesn't model
 /// DST transitions, the most common use-case (Europe/Paris, America/New_York, etc.)
 /// is close enough for a 5-second poll cadence.
-fn resolve_tz_offset(tz: &str, now_utc: chrono::DateTime<chrono::Utc>) -> chrono::FixedOffset {
-    // Try to parse as a fixed offset first (e.g. "+02:00", "-05:00").
-    if let Ok(fo) = tz.parse::<chrono::FixedOffset>() {
-        return fo;
+/// Map a timezone string to a `chrono_tz::Tz`, handling common abbreviations
+/// and IANA names.  Returns `None` for fixed-offset strings like "+02:00".
+fn resolve_tz(tz: &str) -> Option<chrono_tz::Tz> {
+    // Fixed-offset strings ("+02:00", "-05:00") are not IANA timezones.
+    if tz.starts_with('+') || tz.starts_with('-') {
+        return None;
     }
 
     // Handle common abbreviations that chrono-tz doesn't know about.
@@ -4881,17 +4883,28 @@ fn resolve_tz_offset(tz: &str, now_utc: chrono::DateTime<chrono::Utc>) -> chrono
         other => other,
     };
 
-    // Use chrono-tz for proper IANA timezone resolution (handles DST correctly).
-    use chrono::Offset;
     match canonical.parse::<chrono_tz::Tz>() {
-        Ok(timezone) => {
+        Ok(timezone) => Some(timezone),
+        Err(_) => {
+            tracing::warn!(timezone = %tz, "Unknown timezone, falling back to UTC");
+            Some(chrono_tz::Tz::UTC)
+        }
+    }
+}
+
+fn resolve_tz_offset(tz: &str, now_utc: chrono::DateTime<chrono::Utc>) -> chrono::FixedOffset {
+    // Try to parse as a fixed offset first (e.g. "+02:00", "-05:00").
+    if let Ok(fo) = tz.parse::<chrono::FixedOffset>() {
+        return fo;
+    }
+
+    use chrono::Offset;
+    match resolve_tz(tz) {
+        Some(timezone) => {
             let local_dt = now_utc.with_timezone(&timezone);
             local_dt.offset().fix()
         }
-        Err(_) => {
-            tracing::warn!(timezone = %tz, "Unknown timezone, falling back to UTC");
-            chrono::FixedOffset::east_opt(0).unwrap()
-        }
+        None => chrono::FixedOffset::east_opt(0).unwrap(),
     }
 }
 
@@ -5094,14 +5107,28 @@ async fn automation_scheduler_loop(
 
                             // Find the next occurrence after the last trigger.
                             // If that occurrence is <= now, it's time to fire.
-                            let tz_offset = resolve_tz_offset(timezone, now_utc);
-                            let ref_with_tz = reference.with_timezone(&tz_offset);
-                            match cron.find_next_occurrence(&ref_with_tz, false) {
-                                Ok(next) => {
-                                    let next_utc = next.with_timezone(&chrono::Utc);
-                                    next_utc <= now_utc
+                            // Use real timezone (not a FixedOffset snapshot) so DST
+                            // transitions are evaluated correctly by croner.
+                            if let Some(tz) = resolve_tz(timezone) {
+                                let ref_with_tz = reference.with_timezone(&tz);
+                                match cron.find_next_occurrence(&ref_with_tz, false) {
+                                    Ok(next) => {
+                                        let next_utc = next.with_timezone(&chrono::Utc);
+                                        next_utc <= now_utc
+                                    }
+                                    Err(_) => false,
                                 }
-                                Err(_) => false,
+                            } else {
+                                // Fixed-offset timezone string (e.g. "+02:00")
+                                let tz_offset = resolve_tz_offset(timezone, now_utc);
+                                let ref_with_tz = reference.with_timezone(&tz_offset);
+                                match cron.find_next_occurrence(&ref_with_tz, false) {
+                                    Ok(next) => {
+                                        let next_utc = next.with_timezone(&chrono::Utc);
+                                        next_utc <= now_utc
+                                    }
+                                    Err(_) => false,
+                                }
                             }
                         }
                         Err(e) => {
@@ -8605,10 +8632,14 @@ async fn run_single_control_turn(
         if !claude_md_path.exists() {
             let _ = std::fs::write(&claude_md_path, "");
         }
+        let actions_available = mission_id
+            .and_then(|mid| crate::api::telegram::build_internal_telegram_action_token(mid))
+            .is_some()
+            && super::mission_runner::localhost_api_base_url_from_env().is_some();
         super::mission_runner::inject_telegram_identity_into_claude_md(
             &claude_md_path,
             &user_message,
-            true,
+            actions_available,
         );
     }
 
