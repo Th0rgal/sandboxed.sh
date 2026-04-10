@@ -2088,16 +2088,23 @@ async fn resolve_telegram_chat_metadata(
     }
 }
 
+/// Result of resolving a Telegram action target.
+/// Fields: (chat_id, chat_title, chat_type, mention_username).
+/// `mention_username` is `Some("@username")` when the target was resolved via
+/// username-to-group fallback, meaning the caller should prepend the @mention
+/// to the message text so the target bot/user actually sees the mention.
+type ResolvedChatTarget = (i64, Option<String>, Option<String>, Option<String>);
+
 async fn resolve_telegram_action_chat_id(
     ctx: &ChannelContext,
     http: &Client,
     current_chat_id: i64,
     target: &str,
-) -> Result<(i64, Option<String>, Option<String>), String> {
+) -> Result<ResolvedChatTarget, String> {
     let target = target.trim();
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
     if target.is_empty() || target.eq_ignore_ascii_case("current") {
-        return Ok((current_chat_id, None, None));
+        return Ok((current_chat_id, None, None, None));
     }
     if let Some(chat_id) = target.strip_prefix("chat:") {
         let parsed = chat_id
@@ -2106,7 +2113,7 @@ async fn resolve_telegram_action_chat_id(
             .map_err(|_| format!("Invalid Telegram chat target '{}'", target))?;
         let (chat_title, chat_type) =
             resolve_telegram_chat_metadata(ctx, http, &base_url, parsed, None).await?;
-        return Ok((parsed, chat_title, chat_type));
+        return Ok((parsed, chat_title, chat_type, None));
     }
 
     let mappings = ctx
@@ -2134,7 +2141,7 @@ async fn resolve_telegram_action_chat_id(
                     )
                     .await;
             }
-            return Ok((mapping.chat_id, resolved_title, chat_type));
+            return Ok((mapping.chat_id, resolved_title, chat_type, None));
         }
 
         let lookup = match fetch_telegram_chat_lookup(http, &base_url, mapping.chat_id).await {
@@ -2168,7 +2175,7 @@ async fn resolve_telegram_action_chat_id(
             resolved_title.as_deref(),
             lookup.username.as_deref(),
         ) {
-            return Ok((lookup.id, resolved_title, Some(lookup.chat_type)));
+            return Ok((lookup.id, resolved_title, Some(lookup.chat_type), None));
         }
     }
 
@@ -2193,7 +2200,7 @@ async fn resolve_telegram_action_chat_id(
                     conv.chat_title.clone(),
                 )
                 .await?;
-                return Ok((conv.chat_id, resolved_title, chat_type));
+                return Ok((conv.chat_id, resolved_title, chat_type, None));
             }
         }
 
@@ -2235,7 +2242,7 @@ async fn resolve_telegram_action_chat_id(
                         {
                             if let Some(lookup) = parsed.result {
                                 let resolved_title = telegram_action_lookup_title(&lookup);
-                                return Ok((lookup.id, resolved_title, Some(lookup.chat_type)));
+                                return Ok((lookup.id, resolved_title, Some(lookup.chat_type), None));
                             }
                         }
                     }
@@ -2252,9 +2259,10 @@ async fn resolve_telegram_action_chat_id(
                 // For now, if the target looks like a username and we have a group
                 // conversation, we resolve to that group's chat_id so the message
                 // goes there (the caller prepends @mention in the message text).
+                let mention = format!("@{}", clean_target);
                 tracing::info!(
-                    "Resolving @{} to group chat {} ({}) for cross-chat mention",
-                    clean_target,
+                    "Resolving {} to group chat {} ({}) for cross-chat mention",
+                    mention,
                     conv.chat_id,
                     conv.chat_title.as_deref().unwrap_or("unknown"),
                 );
@@ -2266,7 +2274,7 @@ async fn resolve_telegram_action_chat_id(
                     conv.chat_title.clone(),
                 )
                 .await?;
-                return Ok((conv.chat_id, resolved_title, chat_type));
+                return Ok((conv.chat_id, resolved_title, chat_type, Some(mention)));
             }
         }
     }
@@ -2288,7 +2296,7 @@ async fn resolve_telegram_action_chat_id(
             match fetch_telegram_chat_by_username(http, &base_url, &username_target).await {
                 Ok(lookup) => {
                     let resolved_title = telegram_action_lookup_title(&lookup);
-                    return Ok((lookup.id, resolved_title, Some(lookup.chat_type)));
+                    return Ok((lookup.id, resolved_title, Some(lookup.chat_type), None));
                 }
                 Err(error) => {
                     tracing::debug!(
@@ -2425,13 +2433,20 @@ async fn execute_telegram_actions(
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
 
     for action in actions {
-        let (chat_id, chat_title, _) =
+        let (chat_id, chat_title, _, mention_username) =
             resolve_telegram_action_chat_id(&ctx, &bridge.http, current_chat_id, &action.target)
                 .await?;
         let (target_kind, target_value) = telegram_action_target_parts(&action.target);
         let execution_kind = match action.kind {
             TelegramActionKind::Send => TelegramActionExecutionKind::Send,
             TelegramActionKind::Reminder => TelegramActionExecutionKind::Reminder,
+        };
+        // When the target was resolved via username-to-group fallback, prepend
+        // the @mention so the target bot/user actually sees the mention.
+        let action_text = if let Some(ref mention) = mention_username {
+            format!("{} {}", mention, action.text)
+        } else {
+            action.text.clone()
         };
 
         let delay_seconds = match action.kind {
@@ -2440,7 +2455,7 @@ async fn execute_telegram_actions(
         };
 
         if delay_seconds == 0 {
-            match send_chunked_message(&bridge.http, &base_url, chat_id, &action.text, None).await {
+            match send_chunked_message(&bridge.http, &base_url, chat_id, &action_text, None).await {
                 Ok(()) => {
                     log_telegram_action_execution(
                         &ctx.mission_store,
@@ -2490,7 +2505,7 @@ async fn execute_telegram_actions(
             source_mission_id: Some(source_mission_id),
             chat_id,
             chat_title: chat_title.clone(),
-            text: action.text.clone(),
+            text: action_text.clone(),
             send_at: (Utc::now() + ChronoDuration::seconds(delay_seconds as i64)).to_rfc3339(),
             sent_at: None,
             status: TelegramScheduledMessageStatus::Pending,
@@ -2553,17 +2568,24 @@ pub async fn execute_native_telegram_action(
             source_mission_id
         )
     })?;
-    let (chat_id, chat_title, _) =
+    let (chat_id, chat_title, _, mention_username) =
         resolve_telegram_action_chat_id(&ctx, bridge.http(), current_chat_id, &target_spec).await?;
 
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+    // When the target was resolved via username-to-group fallback, prepend
+    // the @mention so the target bot/user actually sees the mention.
+    let final_text = if let Some(ref mention) = mention_username {
+        format!("{} {}", mention, text)
+    } else {
+        text.to_string()
+    };
     let execution_kind = if delay_seconds > 0 && target_spec == "current" {
         TelegramActionExecutionKind::Reminder
     } else {
         TelegramActionExecutionKind::Send
     };
     if delay_seconds == 0 {
-        match send_chunked_message(bridge.http(), &base_url, chat_id, text, None).await {
+        match send_chunked_message(bridge.http(), &base_url, chat_id, &final_text, None).await {
             Ok(()) => {
                 log_telegram_action_execution(
                     mission_store,
@@ -2619,7 +2641,7 @@ pub async fn execute_native_telegram_action(
         source_mission_id: Some(source_mission_id),
         chat_id,
         chat_title: chat_title.clone(),
-        text: text.to_string(),
+        text: final_text.clone(),
         send_at: (Utc::now() + ChronoDuration::seconds(delay_seconds as i64)).to_rfc3339(),
         sent_at: None,
         status: TelegramScheduledMessageStatus::Pending,
@@ -2712,7 +2734,7 @@ pub async fn execute_native_telegram_request_workflow(
         .upsert_telegram_conversation(origin_conversation)
         .await?;
 
-    let (target_chat_id, target_chat_title, resolved_target_chat_type) =
+    let (target_chat_id, target_chat_title, resolved_target_chat_type, mention_username) =
         resolve_telegram_action_chat_id(&ctx, bridge.http(), source_chat_id, &target_spec).await?;
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
     let target_conversation = ctx
@@ -2735,7 +2757,14 @@ pub async fn execute_native_telegram_request_workflow(
     if matches!(target_chat_type.as_deref(), Some("channel")) {
         return Err("Telegram request workflows are not supported for channel chats".to_string());
     }
-    let delivery_text = workflow_request_delivery_text(text, target_chat_type.as_deref());
+    // When the target was resolved via username-to-group fallback, prepend
+    // the @mention so the target bot/user actually sees the mention.
+    let mention_text = if let Some(ref mention) = mention_username {
+        format!("{} {}", mention, text)
+    } else {
+        text.to_string()
+    };
+    let delivery_text = workflow_request_delivery_text(&mention_text, target_chat_type.as_deref());
 
     let now = now_string();
     let mut workflow = TelegramWorkflow {
