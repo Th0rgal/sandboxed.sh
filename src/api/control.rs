@@ -3152,8 +3152,12 @@ impl ControlHub {
         );
         sessions.insert(user.id.clone(), state.clone());
 
-        // Boot Telegram channels for this user's missions (synchronous —
-        // ensures channels are registered before we start serving requests).
+        // Drop the write lock before performing async I/O so concurrent
+        // callers of get_or_spawn / all_sessions are not blocked.
+        drop(sessions);
+
+        // Boot Telegram channels for this user's missions — ensures channels
+        // are registered before we start serving requests.
         if let Some(ref bridge) = self.telegram_bridge {
             let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
                 .unwrap_or_else(|_| format!("http://{}:{}", self.config.host, self.config.port));
@@ -10455,7 +10459,7 @@ pub async fn search_bot_structured_memory(
     let Some(q) = query.q.as_deref().filter(|q| !q.trim().is_empty()) else {
         return Ok(Json(Vec::new()));
     };
-    let hits = control
+    let mut hits = control
         .mission_store
         .search_telegram_structured_memory_hybrid(
             channel_id,
@@ -10466,6 +10470,9 @@ pub async fn search_bot_structured_memory(
         )
         .await
         .map_err(internal_error)?;
+    if let Some(subject_user_id) = query.subject_user_id {
+        hits.retain(|hit| hit.entry.subject_user_id == Some(subject_user_id));
+    }
     Ok(Json(hits))
 }
 
@@ -10777,10 +10784,10 @@ pub async fn telegram_webhook_receiver(
         }
     }
 
-    // Deduplicate using SQLite-backed store (survives restarts).
+    // Deduplicate using the channel's own SQLite-backed store (survives restarts).
     // Falls back to in-memory dedup if the mission store is unavailable.
-    let mission_store = state.control.get_mission_store().await;
-    let is_new = match mission_store
+    let is_new = match ctx
+        .mission_store
         .register_webhook_update(channel_id, update.update_id)
         .await
     {
