@@ -4328,9 +4328,7 @@ impl MissionStore for SqliteMissionStore {
         max_age_secs: i64,
     ) -> Result<u32, String> {
         let conn = self.conn.clone();
-        let cutoff = (chrono::Utc::now()
-            - chrono::Duration::seconds(max_age_secs))
-            .to_rfc3339();
+        let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(max_age_secs)).to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let updated = conn
@@ -4609,9 +4607,8 @@ impl MissionStore for SqliteMissionStore {
             );
             let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
             // Build params vec dynamically matching the WHERE clause above.
-            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
-                Box::new(channel_id_str),
-            ];
+            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+                vec![Box::new(channel_id_str)];
             if let Some(cid) = chat_id {
                 params_vec.push(Box::new(cid));
             }
@@ -4879,7 +4876,9 @@ impl MissionStore for SqliteMissionStore {
                      FROM telegram_structured_memory
                      WHERE id = ?1",
                 ) {
-                    if let Ok(mut rows) = stmt.query_map(params![id_str], row_to_telegram_structured_memory) {
+                    if let Ok(mut rows) =
+                        stmt.query_map(params![id_str], row_to_telegram_structured_memory)
+                    {
                         if let Some(Ok(entry)) = rows.next() {
                             candidates.push(entry);
                         }
@@ -5453,8 +5452,7 @@ impl MissionStore for SqliteMissionStore {
         let conn = self.conn.clone();
         let now = now_string();
         // Calculate the cutoff timestamp in Rust (RFC 3339 format sorts lexicographically)
-        let cutoff = chrono::Utc::now()
-            - chrono::Duration::seconds(max_age_secs);
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(max_age_secs);
         let cutoff_str = cutoff.to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -5503,9 +5501,7 @@ impl MissionStore for SqliteMissionStore {
 
     async fn cleanup_webhook_dedup(&self, max_age_secs: i64) -> Result<u32, String> {
         let conn = self.conn.clone();
-        let cutoff = (chrono::Utc::now()
-            - chrono::Duration::seconds(max_age_secs))
-            .to_rfc3339();
+        let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(max_age_secs)).to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let deleted = conn

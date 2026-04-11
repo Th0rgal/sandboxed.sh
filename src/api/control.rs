@@ -4936,7 +4936,7 @@ async fn automation_scheduler_loop(
         tick_count += 1;
 
         // Every ~60 seconds (12 ticks × 5s), run housekeeping sweeps.
-        if tick_count % 12 == 0 {
+        if tick_count.is_multiple_of(12) {
             // Timeout stale WaitingExternal workflows (older than 30 minutes).
             match mission_store
                 .timeout_stale_telegram_workflows(30 * 60)
@@ -8633,7 +8633,7 @@ async fn run_single_control_turn(
             let _ = std::fs::write(&claude_md_path, "");
         }
         let actions_available = mission_id
-            .and_then(|mid| crate::api::telegram::build_internal_telegram_action_token(mid))
+            .and_then(crate::api::telegram::build_internal_telegram_action_token)
             .is_some()
             && super::mission_runner::localhost_api_base_url_from_env().is_some();
         super::mission_runner::inject_telegram_identity_into_claude_md(

@@ -2187,11 +2187,7 @@ async fn resolve_telegram_action_chat_id(
         .await
     {
         for conv in &conversations {
-            if telegram_action_target_matches(
-                target,
-                conv.chat_title.as_deref(),
-                None,
-            ) {
+            if telegram_action_target_matches(target, conv.chat_title.as_deref(), None) {
                 let (resolved_title, chat_type) = resolve_telegram_chat_metadata(
                     ctx,
                     http,
@@ -2215,7 +2211,9 @@ async fn resolve_telegram_action_chat_id(
             .trim_start_matches('@');
         let looks_like_username = !clean_target.is_empty()
             && !clean_target.contains(' ')
-            && clean_target.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            && clean_target
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
 
         if looks_like_username {
             for conv in &conversations {
@@ -2237,12 +2235,18 @@ async fn resolve_telegram_action_chat_id(
                     .await
                 {
                     if response.status().is_success() {
-                        if let Ok(parsed) =
-                            response.json::<TelegramResponse<TelegramActionChatLookup>>().await
+                        if let Ok(parsed) = response
+                            .json::<TelegramResponse<TelegramActionChatLookup>>()
+                            .await
                         {
                             if let Some(lookup) = parsed.result {
                                 let resolved_title = telegram_action_lookup_title(&lookup);
-                                return Ok((lookup.id, resolved_title, Some(lookup.chat_type), None));
+                                return Ok((
+                                    lookup.id,
+                                    resolved_title,
+                                    Some(lookup.chat_type),
+                                    None,
+                                ));
                             }
                         }
                     }
@@ -2299,11 +2303,7 @@ async fn resolve_telegram_action_chat_id(
                     return Ok((lookup.id, resolved_title, Some(lookup.chat_type), None));
                 }
                 Err(error) => {
-                    tracing::debug!(
-                        "getChat fallback for {} failed: {}",
-                        username_target,
-                        error
-                    );
+                    tracing::debug!("getChat fallback for {} failed: {}", username_target, error);
                 }
             }
         }

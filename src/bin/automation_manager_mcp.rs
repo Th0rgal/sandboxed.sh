@@ -617,14 +617,12 @@ async fn main() {
 
     let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
 
-    let api_token = std::env::var("API_TOKEN")
-        .ok()
-        .or_else(|| {
-            // Mint a service JWT from the shared secret when no explicit token is set.
-            std::env::var("JWT_SECRET")
-                .ok()
-                .and_then(|s| mint_service_jwt(&s))
-        });
+    let api_token = std::env::var("API_TOKEN").ok().or_else(|| {
+        // Mint a service JWT from the shared secret when no explicit token is set.
+        std::env::var("JWT_SECRET")
+            .ok()
+            .and_then(|s| mint_service_jwt(&s))
+    });
 
     let server = Arc::new(AutomationManagerMcp::new(mission_id, api_url, api_token));
 

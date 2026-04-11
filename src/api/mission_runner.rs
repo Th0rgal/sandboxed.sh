@@ -112,7 +112,11 @@ fn extract_telegram_instructions(user_message: &str) -> Option<String> {
 ///
 /// The function is idempotent — it only writes once (checks for the `# Telegram Structured Memory`
 /// marker).
-pub fn inject_telegram_identity_into_claude_md(claude_md_path: &Path, user_message: &str, telegram_actions_available: bool) {
+pub fn inject_telegram_identity_into_claude_md(
+    claude_md_path: &Path,
+    user_message: &str,
+    telegram_actions_available: bool,
+) {
     tracing::info!(
         path = %claude_md_path.display(),
         "Injecting Telegram identity into CLAUDE.md"
