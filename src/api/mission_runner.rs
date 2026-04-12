@@ -3371,7 +3371,23 @@ pub fn run_claudecode_turn<'a>(
             true
         } else if let Some((expires_at, _)) = claude_cli_credentials_info(&mission_creds_path) {
             let now_ms = chrono::Utc::now().timestamp_millis();
-            expires_at < now_ms + 120_000 // 2 minute buffer
+            if expires_at < now_ms + 120_000 {
+                true // expired or about to expire
+            } else {
+                // Even if not expired, re-copy if host credentials have a different
+                // (newer) expiry.  This catches server-side token revocations: the
+                // old token's expiry hasn't passed yet but the token itself was
+                // revoked when a new one was minted via OAuth refresh.
+                if let Some(host_path) = find_host_claude_cli_credentials() {
+                    if let Some((host_expires, _)) = claude_cli_credentials_info(&host_path) {
+                        host_expires != expires_at
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
         } else {
             false
         };
