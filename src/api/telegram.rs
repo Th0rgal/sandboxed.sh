@@ -3950,6 +3950,30 @@ async fn send_chunked_message(
     Ok(())
 }
 
+/// Fetch the bot's username via getMe.
+pub async fn get_bot_username(http: &Client, base_url: &str) -> Result<String, String> {
+    let url = format!("{}/getMe", base_url);
+    let response = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("getMe failed: {}", e))?;
+
+    #[derive(Deserialize)]
+    struct GetMeResult {
+        username: Option<String>,
+    }
+
+    let body: TelegramResponse<GetMeResult> = response
+        .json()
+        .await
+        .map_err(|e| format!("getMe parse error: {}", e))?;
+
+    body.result
+        .and_then(|r| r.username)
+        .ok_or_else(|| "Bot has no username".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4336,28 +4360,4 @@ mod tests {
 
         std::env::remove_var("SANDBOXED_INTERNAL_ACTION_SECRET");
     }
-}
-
-/// Fetch the bot's username via getMe.
-pub async fn get_bot_username(http: &Client, base_url: &str) -> Result<String, String> {
-    let url = format!("{}/getMe", base_url);
-    let response = http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("getMe failed: {}", e))?;
-
-    #[derive(Deserialize)]
-    struct GetMeResult {
-        username: Option<String>,
-    }
-
-    let body: TelegramResponse<GetMeResult> = response
-        .json()
-        .await
-        .map_err(|e| format!("getMe parse error: {}", e))?;
-
-    body.result
-        .and_then(|r| r.username)
-        .ok_or_else(|| "Bot has no username".to_string())
 }

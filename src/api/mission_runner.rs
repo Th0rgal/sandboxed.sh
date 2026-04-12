@@ -343,10 +343,9 @@ exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
 "#;
 
     // Skip writes when the files already exist with the expected content.
-    let script_ok = std::fs::read_to_string(&path).map_or(false, |c| c == SCRIPT);
-    let wrapper_ok = std::fs::read_to_string(&wrapper_path).map_or(false, |c| c == WRAPPER);
-    let bin_wrapper_ok =
-        std::fs::read_to_string(&bin_wrapper_path).map_or(false, |c| c == BIN_WRAPPER);
+    let script_ok = std::fs::read_to_string(&path).is_ok_and(|c| c == SCRIPT);
+    let wrapper_ok = std::fs::read_to_string(&wrapper_path).is_ok_and(|c| c == WRAPPER);
+    let bin_wrapper_ok = std::fs::read_to_string(&bin_wrapper_path).is_ok_and(|c| c == BIN_WRAPPER);
     if script_ok && wrapper_ok && bin_wrapper_ok {
         return;
     }
