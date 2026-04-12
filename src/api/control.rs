@@ -5553,13 +5553,19 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
     }
 }
 
-/// If the turn ended with `LlmError` but the agent produced substantive output,
-/// downgrade the reason to `TurnComplete` so the mission stays active and can
-/// be picked up by the next automation cycle or user message. This prevents
-/// transient backend errors (e.g. Codex "Failed to shutdown rollout recorder")
-/// from killing missions that actually completed their work.
+/// If the turn ended with `LlmError` or `AuthError` but the agent produced
+/// substantive output, downgrade the reason to `TurnComplete` so the mission
+/// stays active and can be picked up by the next automation cycle or user
+/// message.  This prevents transient backend errors (e.g. Codex "Failed to
+/// shutdown rollout recorder", or Claude Code exiting with code 1 after a
+/// successful turn that happens to contain an auth-error string in its
+/// output) from killing missions that actually completed their work.
 fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
-    if result.terminal_reason != Some(TerminalReason::LlmError) {
+    let is_recoverable = matches!(
+        result.terminal_reason,
+        Some(TerminalReason::LlmError) | Some(TerminalReason::AuthError)
+    );
+    if !is_recoverable {
         return;
     }
     let output = result.output.trim();
@@ -5569,10 +5575,12 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
         && !output.starts_with("Codex produced no output")
         && !output.starts_with("Codex CLI produced no JSON")
         && !output.starts_with("No response from")
+        && !output.starts_with("Claude Code error:")
     {
         tracing::info!(
             output_len = output.len(),
-            "Recovering from soft LlmError: agent produced valid output, upgrading to TurnComplete"
+            reason = ?result.terminal_reason,
+            "Recovering from soft error: agent produced valid output, upgrading to TurnComplete"
         );
         result.success = true;
         result.terminal_reason = Some(TerminalReason::TurnComplete);

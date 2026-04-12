@@ -3375,6 +3375,34 @@ pub fn run_claudecode_turn<'a>(
         } else {
             false
         };
+        // Proactive refresh: if host CLI credentials are expired or near-expiry,
+        // refresh them before copying into the mission directory.  This prevents
+        // the mission from starting with stale credentials that will fail mid-turn.
+        if needs_copy {
+            if let Some(host_creds_path) = find_host_claude_cli_credentials() {
+                if let Some((host_expires, _)) = claude_cli_credentials_info(&host_creds_path) {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    if host_expires < now_ms + 300_000 {
+                        // 5 minute buffer
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            host_expires_at = host_expires,
+                            now_ms = now_ms,
+                            "Host CLI credentials expired or near-expiry; triggering proactive OAuth refresh"
+                        );
+                        if let Err(e) =
+                            super::ai_providers::force_refresh_anthropic_oauth_token().await
+                        {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                "Proactive OAuth refresh failed: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if needs_copy {
             if let Some(host_creds) = find_host_claude_cli_credentials() {
                 if let Some(parent) = mission_creds_path.parent() {
@@ -10158,10 +10186,18 @@ pub async fn run_opencode_turn(
     } else {
         None
     };
-    // Drop the original sender so the channel closes when the SSE handler exits.
-    // This prevents a stale `tools_active == true` from permanently disabling
-    // the inactivity timeout if the SSE handler dies mid-tool-execution.
-    drop(sse_tool_depth_tx);
+    // In SSE mode, drop the original sender so the channel closes when the SSE
+    // handler exits.  This prevents a stale `tools_active == true` from
+    // permanently disabling the inactivity timeout if the SSE handler dies
+    // mid-tool-execution.
+    // In JSON stdout mode, keep the sender alive — we use it below to track
+    // tool depth from `tool_use` / `step_finish` events on stdout.
+    let json_tool_depth_tx = if use_json_stdout {
+        Some(sse_tool_depth_tx)
+    } else {
+        drop(sse_tool_depth_tx);
+        None
+    };
 
     // Spawn a task to read stderr (just log in JSON mode, events come on stdout)
     let mission_id_clone = mission_id;
@@ -10374,6 +10410,10 @@ pub async fn run_opencode_turn(
     let mut sse_complete_seen = false;
     let mut sse_complete_at: Option<std::time::Instant> = None;
     let mut text_output_at: Option<std::time::Instant> = None;
+    // Set when the process is killed by an idle timeout (text-output or global).
+    // Used after the event loop to flag the result as incomplete so the caller
+    // can surface the truncation to the user.
+    let mut killed_by_idle_timeout = false;
     // Track session idle state — used as a fallback completion signal when
     // response.completed is not emitted (common with GLM models).
     let mut session_idle_seen = false;
@@ -10516,7 +10556,11 @@ pub async fn run_opencode_turn(
                         // may have sent session.idle prematurely before a long
                         // tool execution (build, test) produces more output.
                         let sse_alive = sse_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
-                        let tools_active = sse_alive && *sse_tool_depth_rx.borrow() > 0;
+                        let tools_active = if json_tool_depth_tx.is_some() {
+                            *sse_tool_depth_rx.borrow() > 0
+                        } else {
+                            sse_alive && *sse_tool_depth_rx.borrow() > 0
+                        };
                         if tools_active {
                             tracing::debug!(
                                 mission_id = %mission_id,
@@ -10562,7 +10606,15 @@ pub async fn run_opencode_turn(
                         // If the SSE handler has exited, the depth value may be
                         // stale (stuck > 0), so treat that as "no tools active".
                         let sse_alive = sse_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
-                        let tools_active = sse_alive && *sse_tool_depth_rx.borrow() > 0;
+                        // In JSON stdout mode, tool depth is tracked directly via
+                        // json_tool_depth_tx (no SSE handler).  Check the receiver
+                        // regardless of sse_alive — the sender is kept alive in JSON
+                        // mode specifically for this purpose.
+                        let tools_active = if json_tool_depth_tx.is_some() {
+                            *sse_tool_depth_rx.borrow() > 0
+                        } else {
+                            sse_alive && *sse_tool_depth_rx.borrow() > 0
+                        };
                         let recent_activity = last_activity
                             .lock()
                             .ok()
@@ -10573,6 +10625,7 @@ pub async fn run_opencode_turn(
                                 mission_id = %mission_id,
                                 "OpenCode output idle timeout reached; terminating CLI process"
                             );
+                            killed_by_idle_timeout = true;
                             let _ = child.kill().await;
                             break;
                         }
@@ -10588,7 +10641,11 @@ pub async fn run_opencode_turn(
                 // If the SSE handler has exited, the depth value may be stale,
                 // so treat that as "no tools active".
                 let sse_alive = sse_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
-                let tools_active = sse_alive && *sse_tool_depth_rx.borrow() > 0;
+                let tools_active = if json_tool_depth_tx.is_some() {
+                    *sse_tool_depth_rx.borrow() > 0
+                } else {
+                    sse_alive && *sse_tool_depth_rx.borrow() > 0
+                };
                 let inactivity_elapsed = last_activity
                     .lock()
                     .ok()
@@ -10612,6 +10669,7 @@ pub async fn run_opencode_turn(
                                 inactivity_secs = inactivity_elapsed.as_secs(),
                                 "Heartbeat-only inactivity timeout (420s); terminating stuck CLI process"
                             );
+                            killed_by_idle_timeout = true;
                             let _ = child.kill().await;
                             break;
                         }
@@ -10620,6 +10678,7 @@ pub async fn run_opencode_turn(
                             mission_id = %mission_id,
                             "Global inactivity timeout (120s); terminating stuck CLI process"
                         );
+                        killed_by_idle_timeout = true;
                         let _ = child.kill().await;
                         break;
                     }
@@ -10688,6 +10747,21 @@ pub async fn run_opencode_turn(
                                             }
                                         }
                                     }
+                                }
+                            }
+
+                            // Track tool depth for plain opencode JSON mode so that
+                            // the text-output idle timeout doesn't kill the process
+                            // while MCP tools (web fetch, etc.) are actively running.
+                            if let Some(ref tx) = json_tool_depth_tx {
+                                if event_type == "tool_use" {
+                                    tx.send_modify(|v| *v = v.saturating_add(1));
+                                } else if event_type == "step_finish" {
+                                    // All tools for this step completed — reset depth.
+                                    tx.send_modify(|v| *v = 0);
+                                } else if event_type == "step_start" {
+                                    // New step starting — ensure depth is clean.
+                                    tx.send_modify(|v| *v = 0);
                                 }
                             }
 
@@ -11179,6 +11253,21 @@ pub async fn run_opencode_turn(
             content: final_result.clone(),
             mission_id: Some(mission_id),
         });
+    }
+
+    // When the process was killed by idle timeout, append a notice so the user
+    // knows the response was truncated.  This is especially important for
+    // Telegram where the user sees partial output and then silence.
+    if killed_by_idle_timeout && !had_error && !final_result.trim().is_empty() {
+        tracing::warn!(
+            mission_id = %mission_id,
+            result_len = final_result.len(),
+            "OpenCode idle timeout killed process with partial output; appending truncation notice"
+        );
+        final_result.push_str("\n\n⚠️ [La réponse a été interrompue par un timeout — le modèle a mis trop de temps à répondre pendant l'exécution d'un outil. La réponse ci-dessus est incomplète.]");
+    } else if killed_by_idle_timeout && final_result.trim().is_empty() {
+        had_error = true;
+        final_result = "OpenCode idle timeout: the model stopped producing output while executing tool calls. No response was generated.".to_string();
     }
 
     tracing::info!(
