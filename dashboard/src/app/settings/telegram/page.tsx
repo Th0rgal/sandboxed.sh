@@ -238,18 +238,17 @@ export default function TelegramSettingsPage() {
   };
 
   const toggleExpand = (botId: string) => {
-    let willExpand = false;
+    const wasExpanded = expandedBots.has(botId);
     setExpandedBots((prev) => {
       const next = new Set(prev);
       if (next.has(botId)) {
         next.delete(botId);
       } else {
         next.add(botId);
-        willExpand = true;
       }
       return next;
     });
-    if (willExpand) {
+    if (!wasExpanded) {
       void loadChats(botId);
       void loadActions(botId);
       void loadScheduled(botId);
@@ -757,7 +756,7 @@ export default function TelegramSettingsPage() {
                         <div className="flex items-center gap-2 text-xs text-white/40">
                           <Loader className="h-3 w-3 animate-spin" /> Loading...
                         </div>
-                      ) : (memoryByBot[bot.id] || []).length === 0 ? (
+                      ) : (bot.id in memoryByBot) && (memoryByBot[bot.id] || []).length === 0 ? (
                         <p className="text-xs text-white/30 italic">
                           No structured memory captured yet.
                         </p>

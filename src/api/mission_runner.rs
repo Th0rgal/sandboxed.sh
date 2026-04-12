@@ -235,12 +235,10 @@ pub(super) fn localhost_api_base_url_from_env() -> Option<String> {
 
 fn write_telegram_action_cli_helpers(work_dir: &Path) {
     let path = work_dir.join(".sandboxed-sh-telegram-action.py");
+    let wrapper_path = work_dir.join("telegram-action");
+    let bin_dir = work_dir.join(".sandboxed-sh-bin");
+    let bin_wrapper_path = bin_dir.join("telegram-action");
 
-    // Skip if both helpers already exist — avoids redundant I/O on every turn.
-    let wrapper_path_check = work_dir.join("telegram-action");
-    if path.exists() && wrapper_path_check.exists() {
-        return;
-    }
     const SCRIPT: &str = r#"#!/usr/bin/env python3
 import json
 import os
@@ -330,55 +328,102 @@ if __name__ == "__main__":
     raise SystemExit(main())
 "#;
 
-    if let Err(error) = std::fs::write(&path, SCRIPT) {
-        tracing::warn!(
-            path = %path.display(),
-            error = %error,
-            "Failed to write Telegram action CLI helper"
-        );
-        return;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        {
-            tracing::warn!(
-                path = %path.display(),
-                error = %error,
-                "Failed to mark Telegram action CLI helper executable"
-            );
-        }
-    }
-
-    let wrapper_path = work_dir.join("telegram-action");
     const WRAPPER: &str = r#"#!/bin/sh
 set -eu
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
 "#;
 
-    if let Err(error) = std::fs::write(&wrapper_path, WRAPPER) {
-        tracing::warn!(
-            path = %wrapper_path.display(),
-            error = %error,
-            "Failed to write Telegram action wrapper"
-        );
+    // Wrapper placed in .sandboxed-sh-bin/ so that only that dir needs to be on PATH,
+    // keeping the workspace root itself out of PATH.
+    const BIN_WRAPPER: &str = r#"#!/bin/sh
+set -eu
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
+"#;
+
+    // Skip writes when the files already exist with the expected content.
+    let script_ok = std::fs::read_to_string(&path).map_or(false, |c| c == SCRIPT);
+    let wrapper_ok = std::fs::read_to_string(&wrapper_path).map_or(false, |c| c == WRAPPER);
+    let bin_wrapper_ok =
+        std::fs::read_to_string(&bin_wrapper_path).map_or(false, |c| c == BIN_WRAPPER);
+    if script_ok && wrapper_ok && bin_wrapper_ok {
         return;
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(error) =
-            std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))
+    if !script_ok {
+        if let Err(error) = std::fs::write(&path, SCRIPT) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "Failed to write Telegram action CLI helper"
+            );
+            return;
+        }
+
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) =
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "Failed to mark Telegram action CLI helper executable"
+                );
+            }
+        }
+    }
+
+    if !wrapper_ok {
+        if let Err(error) = std::fs::write(&wrapper_path, WRAPPER) {
             tracing::warn!(
                 path = %wrapper_path.display(),
                 error = %error,
-                "Failed to mark Telegram action wrapper executable"
+                "Failed to write Telegram action wrapper"
             );
+            return;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) =
+                std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))
+            {
+                tracing::warn!(
+                    path = %wrapper_path.display(),
+                    error = %error,
+                    "Failed to mark Telegram action wrapper executable"
+                );
+            }
+        }
+    }
+
+    if !bin_wrapper_ok {
+        let _ = std::fs::create_dir_all(&bin_dir);
+        if let Err(error) = std::fs::write(&bin_wrapper_path, BIN_WRAPPER) {
+            tracing::warn!(
+                path = %bin_wrapper_path.display(),
+                error = %error,
+                "Failed to write Telegram action bin wrapper"
+            );
+            return;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) =
+                std::fs::set_permissions(&bin_wrapper_path, std::fs::Permissions::from_mode(0o755))
+            {
+                tracing::warn!(
+                    path = %bin_wrapper_path.display(),
+                    error = %error,
+                    "Failed to mark Telegram action bin wrapper executable"
+                );
+            }
         }
     }
 }
@@ -4061,11 +4106,9 @@ pub fn run_claudecode_turn<'a>(
                 format!("{}/telegram-action", container_work_dir),
             );
 
-            // Append (not prepend) the workspace directory to PATH so that
-            // `telegram-action` is findable as a bare command.  Appending keeps
-            // system binaries at higher priority, avoiding the shadowing risk
-            // that prepending would create.  The $TELEGRAM_ACTION_COMMAND env var
-            // still works as a full-path fallback for well-behaved agents.
+            // Append a dedicated bin subdirectory (not the workspace root) to
+            // PATH so that `telegram-action` is findable as a bare command
+            // without letting arbitrary repo files shadow system binaries.
             {
                 let current_path = env
                     .get("PATH")
@@ -4073,7 +4116,7 @@ pub fn run_claudecode_turn<'a>(
                     .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
                 env.insert(
                     "PATH".to_string(),
-                    format!("{}:{}", current_path, container_work_dir),
+                    format!("{}:{}/.sandboxed-sh-bin", current_path, container_work_dir),
                 );
             }
 
@@ -9765,10 +9808,11 @@ pub async fn run_opencode_turn(
             path_parts.push(bun_bins.to_string());
         }
         path_parts.push(current_path);
-        // Append (not prepend) the workspace directory so `telegram-action` is
-        // findable as a bare command without shadowing system binaries.
+        // Append a dedicated bin subdirectory (not the workspace root) so
+        // `telegram-action` is findable as a bare command without letting
+        // arbitrary repo files shadow system binaries.
         if telegram_action_helpers_enabled {
-            path_parts.push(work_dir_arg.to_string());
+            path_parts.push(format!("{}/.sandboxed-sh-bin", work_dir_arg));
         }
         env.insert("PATH".to_string(), path_parts.join(":"));
     }
