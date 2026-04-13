@@ -2572,6 +2572,9 @@ struct ControlView: View {
                 }
             }
 
+        case "fido_sign_request":
+            FidoApprovalState.shared.handleSignRequest(data)
+
         default:
             break
         }

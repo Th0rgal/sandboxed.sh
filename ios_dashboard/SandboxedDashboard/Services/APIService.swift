@@ -470,6 +470,19 @@ final class APIService {
         try await get("/api/workspaces/\(id)")
     }
 
+    // MARK: - FIDO Signing
+
+    func fidoRespond(requestId: String, approved: Bool) async throws {
+        struct FidoRespondBody: Encodable {
+            let request_id: String
+            let approved: Bool
+        }
+        let _: EmptyResponse = try await post(
+            "/api/fido/respond",
+            body: FidoRespondBody(request_id: requestId, approved: approved)
+        )
+    }
+
     // MARK: - SSE Streaming
 
     func streamControl(onEvent: @escaping (String, [String: Any]) -> Void) -> Task<Void, Never> {

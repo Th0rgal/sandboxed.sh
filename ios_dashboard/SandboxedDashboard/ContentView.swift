@@ -471,6 +471,11 @@ struct MainTabView: View {
             }
         }
         .tint(Theme.accent)
+        .overlay {
+            if !FidoApprovalState.shared.pendingRequests.isEmpty {
+                FidoApprovalOverlay()
+            }
+        }
     }
     
     @ViewBuilder

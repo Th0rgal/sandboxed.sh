@@ -50,6 +50,10 @@
 		AA1111111111111111111111 /* WorkerPillView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1111111111111111111111 /* WorkerPillView.swift */; };
 		AA2222222222222222222222 /* WorkerSheetView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB2222222222222222222222 /* WorkerSheetView.swift */; };
 		AA3333333333333333333333 /* WorkerPeekView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB3333333333333333333333 /* WorkerPeekView.swift */; };
+		CC1111111111111111111111 /* FidoSignRequest.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD1111111111111111111111 /* FidoSignRequest.swift */; };
+		CC2222222222222222222222 /* FidoApprovalState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD2222222222222222222222 /* FidoApprovalState.swift */; };
+		CC3333333333333333333333 /* FidoApprovalOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD3333333333333333333333 /* FidoApprovalOverlay.swift */; };
+		CC4444444444444444444444 /* AutoApprovalRulesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD4444444444444444444444 /* AutoApprovalRulesView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -110,9 +114,22 @@
 		BB1111111111111111111111 /* WorkerPillView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerPillView.swift; sourceTree = "<group>"; };
 		BB2222222222222222222222 /* WorkerSheetView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerSheetView.swift; sourceTree = "<group>"; };
 		BB3333333333333333333333 /* WorkerPeekView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerPeekView.swift; sourceTree = "<group>"; };
+		DD1111111111111111111111 /* FidoSignRequest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FidoSignRequest.swift; sourceTree = "<group>"; };
+		DD2222222222222222222222 /* FidoApprovalState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FidoApprovalState.swift; sourceTree = "<group>"; };
+		DD3333333333333333333333 /* FidoApprovalOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FidoApprovalOverlay.swift; sourceTree = "<group>"; };
+		DD4444444444444444444444 /* AutoApprovalRulesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoApprovalRulesView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
+		EE1111111111111111111111 /* FidoApproval */ = {
+			isa = PBXGroup;
+			children = (
+				DD4444444444444444444444 /* AutoApprovalRulesView.swift */,
+				DD3333333333333333333333 /* FidoApprovalOverlay.swift */,
+			);
+			path = FidoApproval;
+			sourceTree = "<group>";
+		};
 		04136BE3D92AE400B09C5462 /* Files */ = {
 			isa = PBXGroup;
 			children = (
@@ -144,6 +161,7 @@
 				6064CFC98B156B54304C4737 /* Components */,
 				A56099201CA62E59BEC74589 /* Control */,
 				1B4F5983589F1F81E1CDE71A /* Desktop */,
+				EE1111111111111111111111 /* FidoApproval */,
 				04136BE3D92AE400B09C5462 /* Files */,
 				DA63D97B804AFD44A1D1BFF3 /* History */,
 				D104E1B7D32CBCD873A2C0EA /* Settings */,
@@ -177,6 +195,7 @@
 				55F4658A2D65748FC7AC5DE3 /* APIService.swift */,
 				F6993AD59CA0D7392AAACDC2 /* BackendAgentService.swift */,
 				3BE62F9666647C1F41F15251 /* DesktopStreamService.swift */,
+				DD2222222222222222222222 /* FidoApprovalState.swift */,
 				EB3EDA65C036030CC45BAD0E /* NavigationState.swift */,
 				6922E2F0E17EDB3A8400D473 /* TerminalState.swift */,
 				ADBAC1664CAF3CD9DCCDB8B4 /* WorkspaceState.swift */,
@@ -261,6 +280,7 @@
 				CAC389FA8B9B5C969E606A22 /* Backend.swift */,
 				370F364BA05D1236D9B630AB /* ChatMessage.swift */,
 				492E8CF2E0A3AEF64A472C85 /* FileEntry.swift */,
+				DD1111111111111111111111 /* FidoSignRequest.swift */,
 				0C6DBBABC4AE0FD4368A185C /* Mission.swift */,
 				97D6534BE4C1B5E0BEA90A5A /* Workspace.swift */,
 			);
@@ -399,6 +419,10 @@
 				B3680EB29951C459A8C8A35A /* DesktopStreamService.swift in Sources */,
 				8573A897FBBC1697AE1AA7BA /* DesktopStreamView.swift in Sources */,
 				C7C23F6559C34034D1680FC2 /* FileEntry.swift in Sources */,
+				CC1111111111111111111111 /* FidoSignRequest.swift in Sources */,
+				CC2222222222222222222222 /* FidoApprovalState.swift in Sources */,
+				CC3333333333333333333333 /* FidoApprovalOverlay.swift in Sources */,
+				CC4444444444444444444444 /* AutoApprovalRulesView.swift in Sources */,
 				08D9C00F453EE16A24DC9C84 /* FilesView.swift in Sources */,
 				40C09530EC6F9C083B5474C4 /* GlassButton.swift in Sources */,
 				C159E476E057E6691D1E0E85 /* GlassCard.swift in Sources */,

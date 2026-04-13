@@ -197,6 +197,61 @@ struct SettingsView: View {
                             }
                         }
 
+                        // Security & Signing Section
+                        VStack(alignment: .leading, spacing: 16) {
+                            Label("Security & Signing", systemImage: "key.radiowaves.forward")
+                                .font(.headline)
+                                .foregroundStyle(Theme.textPrimary)
+
+                            GlassCard(padding: 20, cornerRadius: 20) {
+                                VStack(alignment: .leading, spacing: 16) {
+                                    // Require Face ID toggle
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text("Require Face ID for All Requests")
+                                                .font(.subheadline.weight(.medium))
+                                                .foregroundStyle(Theme.textPrimary)
+                                            Text("Biometric authentication before approving")
+                                                .font(.caption)
+                                                .foregroundStyle(Theme.textSecondary)
+                                        }
+                                        Spacer()
+                                        Toggle("", isOn: Binding(
+                                            get: { FidoApprovalState.shared.requireBiometricForAll },
+                                            set: { FidoApprovalState.shared.requireBiometricForAll = $0 }
+                                        ))
+                                            .labelsHidden()
+                                            .tint(Theme.accent)
+                                    }
+
+                                    if !FidoApprovalState.shared.autoApprovalRules.isEmpty {
+                                        Divider()
+                                            .background(Theme.border)
+
+                                        AutoApprovalRulesView()
+
+                                        Button {
+                                            withAnimation {
+                                                FidoApprovalState.shared.autoApprovalRules.removeAll()
+                                            }
+                                            HapticService.mediumTap()
+                                        } label: {
+                                            HStack {
+                                                Image(systemName: "trash")
+                                                Text("Clear All Rules")
+                                            }
+                                            .font(.subheadline.weight(.medium))
+                                            .foregroundStyle(Theme.error)
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 10)
+                                            .background(Theme.error.opacity(0.1))
+                                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // About Section
                         VStack(alignment: .leading, spacing: 16) {
                             Label("About", systemImage: "info.circle")
