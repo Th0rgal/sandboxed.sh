@@ -2697,6 +2697,18 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
     },
+    /// FIDO signing approval request forwarded to the mobile app
+    FidoSignRequest {
+        request_id: Uuid,
+        key_type: String,
+        key_fingerprint: String,
+        origin: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        expires_at: String,
+    },
 }
 
 /// A node in the agent tree (for visualization)
@@ -2779,6 +2791,7 @@ impl AgentEvent {
             AgentEvent::MissionActivity { .. } => "mission_activity",
             AgentEvent::MissionTitleChanged { .. } => "mission_title_changed",
             AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
+            AgentEvent::FidoSignRequest { .. } => "fido_sign_request",
         }
     }
 
@@ -2800,6 +2813,7 @@ impl AgentEvent {
             AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
             AgentEvent::MissionTitleChanged { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
+            AgentEvent::FidoSignRequest { .. } => None,
         }
     }
 }
@@ -3106,6 +3120,15 @@ impl ControlHub {
     /// Set the Telegram bridge reference (called after AppState is created).
     pub fn set_telegram_bridge(&mut self, bridge: super::telegram::SharedTelegramBridge) {
         self.telegram_bridge = Some(bridge);
+    }
+
+    /// Get the events broadcast sender from any active session.
+    /// Used by the FIDO signing hub to broadcast signing requests to all
+    /// connected SSE clients regardless of which user session they belong to.
+    pub fn get_any_session_events_tx(&self) -> Option<broadcast::Sender<AgentEvent>> {
+        // Try to read without blocking — best-effort for the FIDO relay.
+        let sessions = self.sessions.try_read().ok()?;
+        sessions.values().next().map(|s| s.events_tx.clone())
     }
 
     pub async fn get_or_spawn(&self, user: &AuthUser) -> ControlState {

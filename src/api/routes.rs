@@ -116,6 +116,8 @@ pub struct AppState {
     pub deferred_requests: Arc<deferred_proxy_api::DeferredRequestStore>,
     /// Telegram bridge for assistant missions
     pub telegram_bridge: super::telegram::SharedTelegramBridge,
+    /// FIDO signing relay hub (pending approval requests)
+    pub fido_hub: Arc<super::fido::FidoSigningHub>,
 }
 
 /// Start the HTTP server.
@@ -441,6 +443,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         proxy_api_keys,
         deferred_requests,
         telegram_bridge,
+        fido_hub: Arc::new(super::fido::FidoSigningHub::new()),
     });
 
     // Initialize the metadata LLM client for AI-powered mission titles/descriptions
@@ -564,6 +567,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/task/:id/stop", post(stop_task))
         .route("/api/task/:id/stream", get(stream_task))
         .route("/api/tasks", get(list_tasks))
+        // FIDO signing relay endpoints
+        .route("/api/fido/request", post(super::fido::post_fido_request))
+        .route("/api/fido/respond", post(super::fido::post_fido_respond))
         // Global control session endpoints
         .route("/api/control/message", post(control::post_message))
         .route("/api/control/tool_result", post(control::post_tool_result))

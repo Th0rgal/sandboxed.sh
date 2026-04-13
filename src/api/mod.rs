@@ -26,6 +26,7 @@ pub mod control;
 pub mod deferred_proxy;
 pub mod desktop;
 mod desktop_stream;
+pub mod fido;
 mod fs;
 pub mod library;
 pub mod mcp;

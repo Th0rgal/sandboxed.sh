@@ -2856,7 +2856,8 @@ impl MissionStore for SqliteMissionStore {
             | AgentEvent::Progress { .. }
             | AgentEvent::SessionIdUpdate { .. }
             | AgentEvent::MissionActivity { .. }
-            | AgentEvent::MissionTitleChanged { .. } => return Ok(()),
+            | AgentEvent::MissionTitleChanged { .. }
+            | AgentEvent::FidoSignRequest { .. } => return Ok(()),
         };
 
         let event_type = event_type.to_string();
