@@ -649,6 +649,17 @@ impl WorkspaceExec {
                     cmd.arg("--bind=/tmp/.X11-unix");
                 }
 
+                // Bind-mount the FIDO agent proxy socket so SSH inside
+                // containers can relay signing requests to the mobile app.
+                let fido_agent_path = Path::new("/run/sandboxed-sh/fido-agent.sock");
+                if fido_agent_path.exists() {
+                    cmd.arg("--bind=/run/sandboxed-sh/fido-agent.sock");
+                    env.insert(
+                        "SSH_AUTH_SOCK".to_string(),
+                        "/run/sandboxed-sh/fido-agent.sock".to_string(),
+                    );
+                }
+
                 // Network configuration.
                 // Respect the user's shared_network setting directly.
                 // - shared_network=true: Use host network (and host's Tailscale if connected)
@@ -1009,6 +1020,13 @@ impl WorkspaceExec {
                         let x11_socket_path = Path::new("/tmp/.X11-unix");
                         if x11_socket_path.exists() {
                             cmd.arg("--bind=/tmp/.X11-unix");
+                        }
+
+                        // Bind FIDO agent proxy socket for SSH signing relay.
+                        let fido_agent_path = Path::new("/run/sandboxed-sh/fido-agent.sock");
+                        if fido_agent_path.exists() {
+                            cmd.arg("--bind=/run/sandboxed-sh/fido-agent.sock");
+                            cmd.arg("--setenv=SSH_AUTH_SOCK=/run/sandboxed-sh/fido-agent.sock");
                         }
 
                         // Network configuration (same behavior as spawn_streaming/output).
