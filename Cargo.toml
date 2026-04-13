@@ -78,6 +78,7 @@ idna_adapter = "=1.1.0"
 
 # File locking for OAuth token refresh synchronization
 fs2 = "0.4"
+ureq = { version = "2", features = ["json"] }
 
 [[bin]]
 name = "sandboxed-sh"
@@ -98,6 +99,10 @@ path = "src/bin/automation_manager_mcp.rs"
 [[bin]]
 name = "orchestrator-mcp"
 path = "src/bin/orchestrator_mcp.rs"
+
+[[bin]]
+name = "fido-agent-proxy"
+path = "src/bin/fido_agent_proxy.rs"
 
 [dev-dependencies]
 tokio-test = "0.4"
