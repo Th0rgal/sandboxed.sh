@@ -7718,10 +7718,22 @@ async fn ensure_claudecode_cli_available(
         .chain(std::iter::once(BUN_GLOBAL_CLAUDE_CLI_JS))
     {
         if command_available(workspace_exec, cwd, bun_claude_path).await {
-            // Claude Code requires Node.js, but if only bun is available, use bun to run it
+            // cli.js is a raw JS file — it needs an explicit node/bun prefix.
+            // Bin symlinks (e.g. /root/.bun/bin/claude) have shebangs and can run directly.
+            let is_raw_js = bun_claude_path == BUN_GLOBAL_CLAUDE_CLI_JS;
+
             if command_available(workspace_exec, cwd, "node").await {
-                tracing::debug!("Found Claude Code at {} (using node)", bun_claude_path);
-                return Ok(bun_claude_path.to_string());
+                let cmd = if is_raw_js {
+                    format!("node {}", bun_claude_path)
+                } else {
+                    bun_claude_path.to_string()
+                };
+                tracing::debug!(
+                    "Found Claude Code at {} (resolved: {})",
+                    bun_claude_path,
+                    cmd
+                );
+                return Ok(cmd);
             } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
                 let bun_cmd = format!("/root/.bun/bin/bun {}", bun_claude_path);
                 tracing::debug!(
@@ -7781,7 +7793,7 @@ async fn ensure_claudecode_cli_available(
     // Some bun versions (e.g. 1.3.x) report success but silently fail to create
     // the bin symlink, so we manually link it as a workaround.
     let install_cmd = if has_bun {
-        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @anthropic-ai/claude-code@latest && { test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null; } ; true"#
+        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @anthropic-ai/claude-code@latest && { test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null || true; }"#
     } else {
         "npm install -g @anthropic-ai/claude-code@latest"
     };
@@ -7821,8 +7833,13 @@ async fn ensure_claudecode_cli_available(
         .chain(std::iter::once(BUN_GLOBAL_CLAUDE_CLI_JS))
     {
         if command_available(workspace_exec, cwd, bun_claude_path).await {
+            let is_raw_js = bun_claude_path == BUN_GLOBAL_CLAUDE_CLI_JS;
             if command_available(workspace_exec, cwd, "node").await {
-                return Ok(bun_claude_path.to_string());
+                return Ok(if is_raw_js {
+                    format!("node {}", bun_claude_path)
+                } else {
+                    bun_claude_path.to_string()
+                });
             } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
                 return Ok(format!("/root/.bun/bin/bun {}", bun_claude_path));
             } else if command_available(workspace_exec, cwd, "bun").await {
@@ -7931,7 +7948,7 @@ async fn ensure_codex_cli_available(
     }
 
     let install_cmd = if has_bun {
-        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @openai/codex@latest 2>&1 && { test -x /root/.bun/bin/codex || test -x /root/.cache/.bun/bin/codex || ln -sf ../install/global/node_modules/@openai/codex/bin/codex.js /root/.bun/bin/codex 2>/dev/null; } ; true"#
+        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @openai/codex@latest 2>&1 && { test -x /root/.bun/bin/codex || test -x /root/.cache/.bun/bin/codex || ln -sf ../install/global/node_modules/@openai/codex/bin/codex.js /root/.bun/bin/codex 2>/dev/null || true; }"#
     } else {
         "npm install -g @openai/codex@latest 2>&1"
     };
