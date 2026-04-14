@@ -7703,55 +7703,48 @@ async fn ensure_claudecode_cli_available(
         }
     }
 
-    // Also check bun's global bin directory (bun installs globals to ~/.cache/.bun/bin/)
-    const BUN_GLOBAL_CLAUDE_PATH: &str = "/root/.cache/.bun/bin/claude";
-    if command_available(workspace_exec, cwd, BUN_GLOBAL_CLAUDE_PATH).await {
-        // Claude Code requires Node.js, but if only bun is available, use bun to run it
-        if command_available(workspace_exec, cwd, "node").await {
-            tracing::debug!(
-                "Found Claude Code at {} (using node)",
-                BUN_GLOBAL_CLAUDE_PATH
-            );
-            return Ok(BUN_GLOBAL_CLAUDE_PATH.to_string());
-        } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
-            // Use full path to bun since it's not in PATH
-            let bun_cmd = format!("/root/.bun/bin/bun {}", BUN_GLOBAL_CLAUDE_PATH);
-            tracing::debug!(
-                "Found Claude Code at {} (using bun to run it: {})",
-                BUN_GLOBAL_CLAUDE_PATH,
-                bun_cmd
-            );
-            return Ok(bun_cmd);
-        } else if command_available(workspace_exec, cwd, "bun").await {
-            // Bun is in PATH
-            let bun_cmd = format!("bun {}", BUN_GLOBAL_CLAUDE_PATH);
-            tracing::debug!(
-                "Found Claude Code at {} (using bun to run it: {})",
-                BUN_GLOBAL_CLAUDE_PATH,
-                bun_cmd
-            );
-            return Ok(bun_cmd);
-        } else {
-            tracing::debug!(
-                "Found Claude Code at {} but neither node nor bun available to run it",
-                BUN_GLOBAL_CLAUDE_PATH
-            );
-        }
-    }
-
-    // Fallback: bun 1.3.12 has a bug where `bun install -g @anthropic-ai/claude-code`
-    // reports success but doesn't create the /root/.bun/bin/claude symlink. The
-    // package IS installed; we just need to run cli.js directly with node.
+    // Check bun's global bin directories. Depending on bun version and config,
+    // globals may be in ~/.bun/bin/ or ~/.cache/.bun/bin/.
+    const BUN_GLOBAL_CLAUDE_PATHS: &[&str] =
+        &["/root/.bun/bin/claude", "/root/.cache/.bun/bin/claude"];
+    // Also check the direct cli.js path as a fallback — some bun versions
+    // install the package but fail to create the bin symlink.
     const BUN_GLOBAL_CLAUDE_CLI_JS: &str =
         "/root/.bun/install/global/node_modules/@anthropic-ai/claude-code/cli.js";
-    if command_available(workspace_exec, cwd, BUN_GLOBAL_CLAUDE_CLI_JS).await
-        && command_available(workspace_exec, cwd, "node").await
+
+    for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS
+        .iter()
+        .copied()
+        .chain(std::iter::once(BUN_GLOBAL_CLAUDE_CLI_JS))
     {
-        tracing::debug!(
-            "Found Claude Code cli.js at {} (using node; bun symlink missing)",
-            BUN_GLOBAL_CLAUDE_CLI_JS
-        );
-        return Ok(format!("node {}", BUN_GLOBAL_CLAUDE_CLI_JS));
+        if command_available(workspace_exec, cwd, bun_claude_path).await {
+            // Claude Code requires Node.js, but if only bun is available, use bun to run it
+            if command_available(workspace_exec, cwd, "node").await {
+                tracing::debug!("Found Claude Code at {} (using node)", bun_claude_path);
+                return Ok(bun_claude_path.to_string());
+            } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
+                let bun_cmd = format!("/root/.bun/bin/bun {}", bun_claude_path);
+                tracing::debug!(
+                    "Found Claude Code at {} (using bun to run it: {})",
+                    bun_claude_path,
+                    bun_cmd
+                );
+                return Ok(bun_cmd);
+            } else if command_available(workspace_exec, cwd, "bun").await {
+                let bun_cmd = format!("bun {}", bun_claude_path);
+                tracing::debug!(
+                    "Found Claude Code at {} (using bun to run it: {})",
+                    bun_claude_path,
+                    bun_cmd
+                );
+                return Ok(bun_cmd);
+            } else {
+                tracing::debug!(
+                    "Found Claude Code at {} but neither node nor bun available to run it",
+                    bun_claude_path
+                );
+            }
+        }
     }
 
     let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_CLAUDECODE", true);
@@ -7783,11 +7776,12 @@ async fn ensure_claudecode_cli_available(
         ));
     }
 
-    // Use bun if available (faster), otherwise npm
-    // Bun installs globals to ~/.cache/.bun/bin/
+    // Use bun if available (faster), otherwise npm.
+    // Bun installs globals to ~/.bun/install/global/ with bin symlinks in ~/.bun/bin/.
+    // Some bun versions (e.g. 1.3.x) report success but silently fail to create
+    // the bin symlink, so we manually link it as a workaround.
     let install_cmd = if has_bun {
-        // Ensure Bun's bin is in PATH and install globally
-        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @anthropic-ai/claude-code@latest"#
+        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @anthropic-ai/claude-code@latest && { test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null; } ; true"#
     } else {
         "npm install -g @anthropic-ai/claude-code@latest"
     };
@@ -7821,33 +7815,25 @@ async fn ensure_claudecode_cli_available(
     if command_available(workspace_exec, cwd, cli_path).await {
         return Ok(cli_path.to_string());
     }
-    if command_available(workspace_exec, cwd, BUN_GLOBAL_CLAUDE_PATH).await {
-        // Claude Code requires Node.js, but if only bun is available, use bun to run it
-        if command_available(workspace_exec, cwd, "node").await {
-            return Ok(BUN_GLOBAL_CLAUDE_PATH.to_string());
-        } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
-            // Use full path to bun since it's not in PATH
-            return Ok(format!("/root/.bun/bin/bun {}", BUN_GLOBAL_CLAUDE_PATH));
-        } else if command_available(workspace_exec, cwd, "bun").await {
-            // Bun is in PATH
-            return Ok(format!("bun {}", BUN_GLOBAL_CLAUDE_PATH));
-        }
-    }
-    // Bun 1.3.12 bug: install reports success but the /root/.bun/bin/claude symlink
-    // is never created. The cli.js is still present — run it via node directly.
-    if command_available(workspace_exec, cwd, BUN_GLOBAL_CLAUDE_CLI_JS).await
-        && command_available(workspace_exec, cwd, "node").await
+    for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS
+        .iter()
+        .copied()
+        .chain(std::iter::once(BUN_GLOBAL_CLAUDE_CLI_JS))
     {
-        tracing::debug!(
-            "Claude Code cli.js found at {} after install (bun symlink missing); using node",
-            BUN_GLOBAL_CLAUDE_CLI_JS
-        );
-        return Ok(format!("node {}", BUN_GLOBAL_CLAUDE_CLI_JS));
+        if command_available(workspace_exec, cwd, bun_claude_path).await {
+            if command_available(workspace_exec, cwd, "node").await {
+                return Ok(bun_claude_path.to_string());
+            } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
+                return Ok(format!("/root/.bun/bin/bun {}", bun_claude_path));
+            } else if command_available(workspace_exec, cwd, "bun").await {
+                return Ok(format!("bun {}", bun_claude_path));
+            }
+        }
     }
 
     Err(format!(
-        "Claude Code install completed but '{}' is still not available in workspace PATH.",
-        cli_path
+        "Claude Code install completed but '{}' is still not available in workspace PATH. Checked: {:?} and {}",
+        cli_path, BUN_GLOBAL_CLAUDE_PATHS, BUN_GLOBAL_CLAUDE_CLI_JS,
     ))
 }
 
@@ -7945,7 +7931,7 @@ async fn ensure_codex_cli_available(
     }
 
     let install_cmd = if has_bun {
-        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @openai/codex@latest 2>&1"#
+        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @openai/codex@latest 2>&1 && { test -x /root/.bun/bin/codex || test -x /root/.cache/.bun/bin/codex || ln -sf ../install/global/node_modules/@openai/codex/bin/codex.js /root/.bun/bin/codex 2>/dev/null; } ; true"#
     } else {
         "npm install -g @openai/codex@latest 2>&1"
     };
