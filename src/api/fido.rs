@@ -115,9 +115,11 @@ pub async fn post_fido_request(
         "FIDO signing request received"
     );
 
-    // Broadcast to all connected SSE clients (iOS app picks it up).
-    if let Some(control) = state.control.get_any_session_events_tx() {
-        let _ = control.send(AgentEvent::FidoSignRequest {
+    // Broadcast to ALL connected SSE clients so the user sees the approval
+    // request regardless of which browser tab / device they have open.
+    let sessions = state.control.all_sessions().await;
+    for session in &sessions {
+        let _ = session.events_tx.send(AgentEvent::FidoSignRequest {
             request_id,
             key_type: body.key_type.clone(),
             key_fingerprint: body.key_fingerprint.clone(),

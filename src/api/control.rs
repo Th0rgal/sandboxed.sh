@@ -4909,8 +4909,8 @@ fn resolve_tz(tz: &str) -> Option<chrono_tz::Tz> {
     match canonical.parse::<chrono_tz::Tz>() {
         Ok(timezone) => Some(timezone),
         Err(_) => {
-            tracing::warn!(timezone = %tz, "Unknown timezone, falling back to UTC");
-            Some(chrono_tz::Tz::UTC)
+            tracing::warn!(timezone = %tz, "Unknown timezone, rejecting");
+            None
         }
     }
 }
@@ -9098,6 +9098,16 @@ pub async fn create_automation(
         }
         other => other,
     };
+
+    // Validate cron expression before persisting
+    if let mission_store::TriggerType::Cron { ref expression, .. } = trigger {
+        if croner::Cron::new(expression).parse().is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid cron expression: {}", expression),
+            ));
+        }
+    }
 
     let start_immediately = req.start_immediately;
 

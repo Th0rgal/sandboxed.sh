@@ -1634,7 +1634,11 @@ pub async fn process_webhook_message(
 
         workflow.target_conversation_id = conversation_id;
         workflow.latest_reply_text = Some(workflow_reply.clone());
-        workflow.status = TelegramWorkflowStatus::Completed;
+        // Only mark Completed if there is no origin relay needed;
+        // otherwise the spawned relay task will set RelayedToOrigin or Failed.
+        if workflow.origin_mission_id.is_none() {
+            workflow.status = TelegramWorkflowStatus::Completed;
+        }
         workflow.updated_at = now_string();
         workflow.completed_at = Some(workflow.updated_at.clone());
         let _ = ctx

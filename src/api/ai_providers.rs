@@ -5659,13 +5659,11 @@ async fn update_provider(
     if let Some(ref email) = req.account_email {
         updated.account_email = Some(email.clone());
         // Also persist to provider_accounts.json for list endpoint
-        if let Err(e) = update_provider_account(
-            &state.config.working_dir,
-            updated.provider_type.id(),
-            email.clone(),
-        ) {
+        if let Err(e) =
+            update_provider_account(&state.config.working_dir, &uuid.to_string(), email.clone())
+        {
             tracing::warn!(
-                provider = %updated.provider_type.id(),
+                provider = %uuid,
                 error = %e,
                 "Failed to persist provider account email"
             );

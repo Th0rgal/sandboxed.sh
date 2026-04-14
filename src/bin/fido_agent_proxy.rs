@@ -77,11 +77,7 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn handle_client(
-    mut client: UnixStream,
-    api_url: &str,
-    api_token: Option<&str>,
-) -> io::Result<()> {
+fn handle_client(mut client: UnixStream, api_url: &str, api_token: Option<&str>) -> io::Result<()> {
     // Connect to upstream agent if available
     let upstream_sock = std::env::var("SSH_AUTH_SOCK_UPSTREAM").ok();
     let mut upstream: Option<UnixStream> = upstream_sock
@@ -116,12 +112,7 @@ fn handle_client(
                             key_type, fingerprint
                         );
 
-                        match request_approval(
-                            api_url,
-                            api_token,
-                            &key_type,
-                            &fingerprint,
-                        ) {
+                        match request_approval(api_url, api_token, &key_type, &fingerprint) {
                             Ok(true) => {
                                 // Approved — forward to upstream agent
                                 if let Some(ref mut up) = upstream {
@@ -139,10 +130,7 @@ fn handle_client(
                                 send_failure(&mut client)?;
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "[fido-agent-proxy] Approval request failed: {}",
-                                    e
-                                );
+                                eprintln!("[fido-agent-proxy] Approval request failed: {}", e);
                                 send_failure(&mut client)?;
                             }
                         }
@@ -162,9 +150,15 @@ fn handle_client(
                 } else {
                     // No upstream — return empty identity list
                     let reply = [
-                        0, 0, 0, 5, // length = 5
+                        0,
+                        0,
+                        0,
+                        5, // length = 5
                         SSH_AGENT_IDENTITIES_ANSWER,
-                        0, 0, 0, 0, // nkeys = 0
+                        0,
+                        0,
+                        0,
+                        0, // nkeys = 0
                     ];
                     client.write_all(&reply)?;
                 }
@@ -240,8 +234,12 @@ fn parse_sign_request_key_type(data: &[u8]) -> Option<String> {
     String::from_utf8(blob[4..4 + type_len].to_vec()).ok()
 }
 
-/// Compute a simple hex fingerprint of the key blob for display purposes.
+/// Compute the SHA256 fingerprint of the key blob (matches `ssh-keygen -l` output format).
 fn compute_key_fingerprint(data: &[u8]) -> String {
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
     if data.len() < 4 {
         return "unknown".to_string();
     }
@@ -251,18 +249,8 @@ fn compute_key_fingerprint(data: &[u8]) -> String {
     }
     let blob = &data[4..4 + blob_len];
 
-    // SHA256 of the key blob
-    use std::fmt::Write;
-    // Simple hash — just use first 16 bytes as a display fingerprint
-    // (full SHA256 would require a dependency; this is good enough for display)
-    let mut hex = String::with_capacity(48);
-    for (i, byte) in blob.iter().take(16).enumerate() {
-        if i > 0 {
-            hex.push(':');
-        }
-        let _ = write!(hex, "{:02x}", byte);
-    }
-    hex
+    let hash = Sha256::digest(blob);
+    format!("SHA256:{}", STANDARD_NO_PAD.encode(hash))
 }
 
 /// Call the backend to request FIDO signing approval.

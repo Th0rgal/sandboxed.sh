@@ -247,11 +247,17 @@ impl McpRegistry {
                 "automation-manager-mcp".to_string()
             }
         };
+        let mut automation_manager_env = HashMap::new();
+        if let Ok(api_url) = std::env::var("API_URL") {
+            if !api_url.trim().is_empty() {
+                automation_manager_env.insert("API_URL".to_string(), api_url);
+            }
+        }
         let mut automation_manager = McpServerConfig::new_stdio(
             "automation-manager".to_string(),
             automation_manager_command,
             Vec::new(),
-            HashMap::new(),
+            automation_manager_env,
         );
         automation_manager.scope = McpScope::Workspace;
         automation_manager.default_enabled = true;
