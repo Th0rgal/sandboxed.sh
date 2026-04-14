@@ -3520,16 +3520,39 @@ pub fn run_claudecode_turn<'a>(
                 }
             }
         }
-        let has_cli_creds = looks_like_claude_cli_credentials(&mission_creds_path);
+        let mut has_cli_creds = looks_like_claude_cli_credentials(&mission_creds_path);
         if let Some((expires_at, has_refresh)) = claude_cli_credentials_info(&mission_creds_path) {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let is_expired = expires_at < now_ms;
             tracing::info!(
                 mission_id = %mission_id,
                 path = %mission_creds_path.display(),
                 expires_at = expires_at,
                 has_refresh = has_refresh,
                 has_cli_creds = has_cli_creds,
+                is_expired = is_expired,
                 "Claude CLI credential status for mission"
             );
+            // If credentials are expired even after the copy/refresh attempt,
+            // don't trust them — fall through to OAuth injection instead.
+            if is_expired {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    expires_at = expires_at,
+                    now_ms = now_ms,
+                    "Mission CLI credentials are expired; removing stale file and falling through to OAuth refresh"
+                );
+                has_cli_creds = false;
+                // Remove the stale file so Claude Code doesn't pick it up
+                // and fail with "Invalid authentication credentials".
+                if let Err(e) = std::fs::remove_file(&mission_creds_path) {
+                    tracing::debug!(
+                        mission_id = %mission_id,
+                        error = %e,
+                        "Failed to remove expired credentials file (may not exist)"
+                    );
+                }
+            }
         } else {
             tracing::info!(
                 mission_id = %mission_id,
