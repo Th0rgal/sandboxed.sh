@@ -5215,6 +5215,17 @@ pub fn run_claudecode_turn<'a>(
                 TerminalReason::LlmError
             };
             AgentResult::failure(final_result, cost_cents).with_terminal_reason(reason)
+        } else if is_rate_limited_error(&final_result) {
+            // Claude Code sometimes surfaces subscription quota exhaustion as a
+            // normal assistant message (e.g. "You've hit your limit · resets
+            // 9pm") and exits with code 0. Without this check the turn would be
+            // treated as TurnComplete and account rotation would never trigger.
+            tracing::warn!(
+                mission_id = %mission_id,
+                "Claude Code returned a rate-limit message as a successful turn; marking as RateLimited for account rotation"
+            );
+            AgentResult::failure(final_result, cost_cents)
+                .with_terminal_reason(TerminalReason::RateLimited)
         } else {
             AgentResult::success(final_result, cost_cents)
                 .with_terminal_reason(TerminalReason::TurnComplete)
@@ -5610,7 +5621,7 @@ fn is_auth_error(message: &str) -> bool {
 }
 
 fn is_rate_limited_error(message: &str) -> bool {
-    const RATE_LIMIT_MARKERS: [&str; 11] = [
+    const RATE_LIMIT_MARKERS: [&str; 13] = [
         "overloaded_error",
         "rate limit",
         "rate_limit",
@@ -5622,6 +5633,11 @@ fn is_rate_limited_error(message: &str) -> bool {
         "status code: 529",
         "out of extra usage",
         "out of regular usage",
+        // Claude Code CLI surfaces subscription quota exhaustion with this
+        // phrasing (e.g. "You've hit your limit · resets 9pm"). Treat it
+        // as a rate-limit signal so account rotation kicks in.
+        "hit your limit",
+        "you've hit your",
     ];
 
     RATE_LIMIT_MARKERS

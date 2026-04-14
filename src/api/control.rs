@@ -8936,6 +8936,70 @@ async fn run_single_control_turn(
                 .await;
             }
 
+            // Account rotation: if rate-limited, try alternate Anthropic credentials.
+            // The first entry in the list is the highest-priority credential, which
+            // is almost certainly what the initial (override_auth=None) call used.
+            // Skip it to avoid a guaranteed duplicate rate-limit failure.
+            if result.terminal_reason == Some(TerminalReason::RateLimited) && !cancel.is_cancelled()
+            {
+                let all_accounts =
+                    super::ai_providers::get_all_anthropic_auth_for_claudecode(&config.working_dir);
+                let alt_accounts: Vec<_> = all_accounts.into_iter().skip(1).collect();
+                if !alt_accounts.is_empty() {
+                    tracing::info!(
+                        mission_id = %mid,
+                        total_accounts = alt_accounts.len(),
+                        "Rate limited on primary account; trying alternate Anthropic credentials"
+                    );
+                    for (idx, alt_auth) in alt_accounts.into_iter().enumerate() {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        tracing::info!(
+                            mission_id = %mid,
+                            attempt = idx + 2,
+                            auth_type = match &alt_auth {
+                                super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
+                                super::ai_providers::ClaudeCodeAuth::OAuthToken(_) =>
+                                    "oauth_token",
+                            },
+                            "Rotating to alternate Anthropic account"
+                        );
+                        result = Box::pin(super::mission_runner::run_claudecode_turn(
+                            exec_workspace,
+                            &ctx.working_dir,
+                            &effective_message,
+                            config.default_model.as_deref(),
+                            requested_model_effort.as_deref(),
+                            config.opencode_agent.as_deref(),
+                            mid,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            None,
+                            &config.working_dir,
+                            effective_session_id.as_deref(),
+                            is_continuation,
+                            Some(tool_hub.clone()),
+                            Some(status.clone()),
+                            Some(alt_auth),
+                        ))
+                        .await;
+                        // Only continue rotating on rate-limit errors.
+                        match result.terminal_reason {
+                            Some(TerminalReason::RateLimited) => {
+                                tracing::info!(
+                                    mission_id = %mid,
+                                    attempt = idx + 2,
+                                    "Rate limited; rotating to next account"
+                                );
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+
             result
         }
         Some("amp") => {
