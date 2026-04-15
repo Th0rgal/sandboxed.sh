@@ -5599,6 +5599,7 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
         && !output.starts_with("Codex CLI produced no JSON")
         && !output.starts_with("No response from")
         && !output.starts_with("Claude Code error:")
+        && !is_bare_llm_error_output(output)
     {
         tracing::info!(
             output_len = output.len(),
@@ -5608,6 +5609,34 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
         result.success = true;
         result.terminal_reason = Some(TerminalReason::TurnComplete);
     }
+}
+
+fn is_bare_llm_error_output(output: &str) -> bool {
+    let normalized = output
+        .trim()
+        .trim_matches(|c: char| matches!(c, '.' | '!' | '"' | '\''))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return false;
+    }
+
+    matches!(
+        normalized.as_str(),
+        "internal server error"
+            | "unknown error"
+            | "service unavailable"
+            | "bad gateway"
+            | "gateway timeout"
+            | "request timeout"
+            | "upstream error"
+            | "model error"
+    ) || normalized.starts_with("api error:")
+        || normalized.starts_with("anthropic api error:")
+        || normalized.starts_with("claude code error:")
 }
 
 async fn maybe_finalize_terminal_mission(
@@ -14097,6 +14126,32 @@ Investigate <service/> failures.
             mission_status_for_terminal_reason(TerminalReason::TurnComplete, true),
             Some((MissionStatus::Completed, "completed"))
         );
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_bare_internal_server_error() {
+        let mut result =
+            crate::agents::AgentResult::failure("Internal server error".to_string(), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_recovers_substantive_output() {
+        let mut result = crate::agents::AgentResult::failure(
+            "I completed the implementation and verified the focused build.".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::TurnComplete));
     }
 
     #[tokio::test]
