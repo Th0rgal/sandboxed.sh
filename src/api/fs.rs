@@ -200,6 +200,100 @@ fn translate_to_container_display_path(
     }
 }
 
+fn is_context_upload_path(path: &str) -> bool {
+    let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "context".to_string());
+    let normalized = path.trim().trim_start_matches("./");
+    normalized == context_dir_name
+        || normalized.starts_with(&format!("{}/", context_dir_name))
+        || path.starts_with("/root/context")
+}
+
+fn configured_context_root(config_working_dir: &Path) -> PathBuf {
+    let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "context".to_string());
+    let root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_working_dir.join(context_dir_name));
+
+    if root.is_absolute() {
+        root
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(root)
+    } else {
+        root
+    }
+}
+
+async fn mirror_context_upload_to_container_rootfs(
+    config_working_dir: &Path,
+    workspace: Option<&crate::workspace::Workspace>,
+    mission_id: Option<uuid::Uuid>,
+    requested_path: &str,
+    remote_path: &Path,
+) {
+    let (Some(workspace), Some(mission_id)) = (workspace, mission_id) else {
+        return;
+    };
+    if workspace.workspace_type != WorkspaceType::Container
+        || !is_context_upload_path(requested_path)
+    {
+        return;
+    }
+
+    let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "context".to_string());
+    let context_root = configured_context_root(config_working_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| configured_context_root(config_working_dir));
+    let mission_context = context_root.join(mission_id.to_string());
+    let suffix = remote_path
+        .strip_prefix(&mission_context)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| remote_path.file_name().map(PathBuf::from));
+    let Some(suffix) = suffix else {
+        return;
+    };
+
+    let mirror_path = workspace
+        .path
+        .join("root")
+        .join(context_dir_name)
+        .join(mission_id.to_string())
+        .join(suffix);
+
+    if mirror_path == remote_path {
+        return;
+    }
+    if let Some(parent) = mirror_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            tracing::warn!(
+                path = %parent.display(),
+                error = %e,
+                "Failed to create container context mirror directory"
+            );
+            return;
+        }
+    }
+    if let Err(e) = tokio::fs::copy(remote_path, &mirror_path).await {
+        tracing::warn!(
+            source = %remote_path.display(),
+            target = %mirror_path.display(),
+            error = %e,
+            "Failed to mirror uploaded context file into container rootfs"
+        );
+    }
+}
+
 /// Resolve a path relative to a specific workspace.
 /// If mission_id is provided and path is a context path, resolves to mission-specific context.
 pub async fn resolve_path_for_workspace(
@@ -831,6 +925,15 @@ pub async fn upload(
         // Try rename first (fast), fall back to copy+delete if across filesystems
         move_file(&tmp, &remote_path).await?;
 
+        mirror_context_upload_to_container_rootfs(
+            &state.config.working_dir,
+            workspace_for_display.as_ref(),
+            q.mission_id,
+            &q.path,
+            &remote_path,
+        )
+        .await;
+
         // For container workspaces, return the container-internal path so the
         // [Uploaded: ...] tag points to a path the agent can actually access.
         let display_path = match &workspace_for_display {
@@ -1014,6 +1117,15 @@ pub async fn upload_finalize(
 
     let remote_path = result?;
 
+    mirror_context_upload_to_container_rootfs(
+        &state.config.working_dir,
+        workspace_for_display.as_ref(),
+        req.mission_id,
+        &req.path,
+        &remote_path,
+    )
+    .await;
+
     let display_path = match &workspace_for_display {
         Some(ws) => translate_to_container_display_path(&remote_path, ws),
         None => remote_path,
@@ -1171,6 +1283,15 @@ pub async fn download_from_url(
     })?;
 
     move_file(&tmp, &remote_path).await?;
+
+    mirror_context_upload_to_container_rootfs(
+        &state.config.working_dir,
+        workspace_for_display.as_ref(),
+        req.mission_id,
+        &req.path,
+        &remote_path,
+    )
+    .await;
 
     let display_path = match &workspace_for_display {
         Some(ws) => translate_to_container_display_path(&remote_path, ws),
