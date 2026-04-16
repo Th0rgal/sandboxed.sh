@@ -479,6 +479,28 @@ pub(crate) fn codex_chatgpt_fallback_for_result(
     codex_chatgpt_fallback_model(requested_model)
 }
 
+fn is_generic_gpt_codex_model(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    normalized.starts_with("gpt-") && !normalized.contains("codex")
+}
+
+pub(crate) fn codex_tool_stall_should_retry_with_default_model(
+    requested_model: Option<&str>,
+    result: &AgentResult,
+) -> bool {
+    if !matches!(result.terminal_reason, Some(TerminalReason::Stalled)) {
+        return false;
+    }
+    if !result
+        .output
+        .starts_with("Codex stopped before executing required workspace/tool steps.")
+    {
+        return false;
+    }
+
+    requested_model.is_some_and(is_generic_gpt_codex_model)
+}
+
 fn codex_account_semaphore_for_key(api_key: &str) -> Arc<Semaphore> {
     let mut pool = CODEX_ACCOUNT_POOL
         .lock()
@@ -3078,6 +3100,28 @@ async fn run_mission_turn(
                         None,
                     )
                     .await;
+                } else if codex_tool_stall_should_retry_with_default_model(requested_model, &result)
+                {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        requested_model = ?requested_model,
+                        "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
+                    );
+                    result = run_codex_turn(
+                        &workspace,
+                        &mission_work_dir,
+                        &convo,
+                        None,
+                        model_effort.as_deref(),
+                        effective_agent.as_deref(),
+                        mission_id,
+                        events_tx.clone(),
+                        cancel.clone(),
+                        &config.working_dir,
+                        session_id.as_deref(),
+                        None,
+                    )
+                    .await;
                 }
 
                 result
@@ -3152,6 +3196,32 @@ async fn run_mission_turn(
                             &mission_work_dir,
                             &convo,
                             Some(fallback_model),
+                            model_effort.as_deref(),
+                            effective_agent.as_deref(),
+                            mission_id,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            &config.working_dir,
+                            session_id.as_deref(),
+                            Some(&lease.key),
+                        )
+                        .await;
+                    } else if codex_tool_stall_should_retry_with_default_model(
+                        requested_model,
+                        &result,
+                    ) {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            attempt = attempt_idx,
+                            requested_model = ?requested_model,
+                            key = %key_fingerprint,
+                            "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
+                        );
+                        result = run_codex_turn(
+                            &workspace,
+                            &mission_work_dir,
+                            &convo,
+                            None,
                             model_effort.as_deref(),
                             effective_agent.as_deref(),
                             mission_id,
@@ -12428,6 +12498,112 @@ impl From<&MissionRunner> for RunningMissionInfo {
     }
 }
 
+fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str) -> bool {
+    let user = user_message.to_ascii_lowercase();
+    let assistant = assistant_message.trim().to_ascii_lowercase();
+
+    let deferred_action_prefixes = [
+        "i'll perform",
+        "i’ll perform",
+        "i will perform",
+        "i'll run",
+        "i’ll run",
+        "i will run",
+        "i'll execute",
+        "i’ll execute",
+        "i will execute",
+        "i'll create",
+        "i’ll create",
+        "i will create",
+        "i'll inspect",
+        "i’ll inspect",
+        "i will inspect",
+        "i'll review",
+        "i’ll review",
+        "i will review",
+    ];
+    if deferred_action_prefixes
+        .iter()
+        .any(|prefix| assistant.starts_with(prefix))
+    {
+        return true;
+    }
+
+    let explicit_tool_markers = [
+        "```bash",
+        "shell command",
+        "using shell",
+        "run ",
+        " run ",
+        "execute ",
+        " execute ",
+        "test ",
+        " test ",
+        "debug ",
+        " debug ",
+        "fix ",
+        " fix ",
+        "implement ",
+        " implement ",
+        "edit ",
+        " edit ",
+        "modify ",
+        " modify ",
+        "inspect ",
+        " inspect ",
+        "search ",
+        " search ",
+        " grep ",
+        " rg ",
+        " ls ",
+        " cat ",
+        " wc ",
+        " curl ",
+        " git ",
+        " npm ",
+        " bun ",
+        " cargo ",
+        " python ",
+        " pytest ",
+    ];
+    if explicit_tool_markers
+        .iter()
+        .any(|marker| user.contains(marker))
+    {
+        return true;
+    }
+
+    let action_markers = [
+        "create", "write", "read", "open", "access", "review", "inspect", "check", "update",
+        "change", "debug", "fix",
+    ];
+    let object_markers = [
+        " file",
+        " files",
+        " directory",
+        " folder",
+        " repo",
+        " repository",
+        " workspace",
+        " pull request",
+        " pr #",
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".json",
+        ".toml",
+        ".md",
+        ".pdf",
+        "http://",
+        "https://",
+        "localhost",
+    ];
+
+    action_markers.iter().any(|action| user.contains(action))
+        && object_markers.iter().any(|object| user.contains(object))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_codex_turn(
     workspace: &Workspace,
@@ -12557,6 +12733,7 @@ pub async fn run_codex_turn(
     let mut last_summary: Option<String> = None;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    let mut tool_events_seen: usize = 0;
 
     loop {
         tokio::select! {
@@ -12594,6 +12771,7 @@ pub async fn run_codex_turn(
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
+                        tool_events_seen = tool_events_seen.saturating_add(1);
                         // Flush accumulated thinking as done before tool call,
                         // so the event logger persists the full thought block.
                         if !thinking_accumulated.is_empty() {
@@ -12613,6 +12791,7 @@ pub async fn run_codex_turn(
                         });
                     }
                     ExecutionEvent::ToolResult { id, name, result } => {
+                        tool_events_seen = tool_events_seen.saturating_add(1);
                         pending_tools.remove(&id);
                         let _ = events_tx.send(AgentEvent::ToolResult {
                             tool_call_id: id,
@@ -12701,6 +12880,22 @@ pub async fn run_codex_turn(
         "No response from Codex".to_string()
     };
 
+    let stopped_before_required_tools = success
+        && tool_events_seen == 0
+        && codex_turn_requires_tool_activity(user_message, &final_message);
+    if stopped_before_required_tools {
+        tracing::warn!(
+            mission_id = %mission_id,
+            output_len = final_message.len(),
+            "Codex turn completed without tool activity despite a tool-required prompt"
+        );
+        success = false;
+        final_message = format!(
+            "Codex stopped before executing required workspace/tool steps. Last response:\n\n{}",
+            final_message.trim()
+        );
+    }
+
     let lower_final = final_message.to_lowercase();
     if lower_final.contains("does not exist or you do not have access")
         || lower_final.contains("model_not_found")
@@ -12729,7 +12924,9 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
             .with_terminal_reason(TerminalReason::TurnComplete)
     } else {
         // Distinguish provider concurrency exhaustion from classic rate limits.
-        let reason = if is_capacity_limited_error(&final_message) {
+        let reason = if stopped_before_required_tools {
+            TerminalReason::Stalled
+        } else if is_capacity_limited_error(&final_message) {
             TerminalReason::CapacityLimited
         } else if is_rate_limited_error(&final_message) {
             TerminalReason::RateLimited
@@ -13482,19 +13679,20 @@ mod tests {
         claudecode_resume_current_session_message, claudecode_transport_failure_data,
         claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
         claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
-        codex_chatgpt_fallback_model, codex_key_fingerprint, extract_model_from_message,
-        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
-        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
-        is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
-        is_tool_call_only_output, opencode_idle_timeout_result_message,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
-        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        codex_chatgpt_fallback_model, codex_key_fingerprint,
+        codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
+        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
+        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
+        is_codex_node_wrapper, is_provider_payload_error, is_rate_limited_error,
+        is_session_corruption_error, is_tool_call_only_output,
+        opencode_idle_timeout_result_message, opencode_output_needs_fallback,
+        opencode_session_token_from_line, parse_opencode_session_token, parse_opencode_sse_event,
+        parse_opencode_stderr_text_part, preferred_model_for_cost, resolve_cost_cents_and_source,
+        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
+        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
+        sync_opencode_agent_config, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
+        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
+        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, inject_telegram_identity_into_claude_md,
@@ -13507,6 +13705,30 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn codex_turn_requires_tool_activity_for_file_shell_prompt() {
+        assert!(codex_turn_requires_tool_activity(
+            "Create directory codex_probe, write files, run ls -la, wc -c, and cat them.",
+            "ALL_STEPS_DONE"
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_for_deferred_action_response() {
+        assert!(codex_turn_requires_tool_activity(
+            "Please handle this task.",
+            "I’ll perform the filesystem probe exactly as requested."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_allows_plain_text_question() {
+        assert!(!codex_turn_requires_tool_activity(
+            "Explain three possible reasons for this architecture issue.",
+            "Here are three likely reasons."
+        ));
+    }
 
     #[test]
     fn sync_opencode_agent_config_removes_overrides_when_plugin_enabled() {
@@ -13743,6 +13965,28 @@ mod tests {
             codex_chatgpt_fallback_for_result(Some("gpt-5.4-codex"), &rate_limited),
             None
         );
+    }
+
+    #[test]
+    fn codex_tool_stall_retries_generic_gpt_model_with_default() {
+        let stalled = AgentResult::failure(
+            "Codex stopped before executing required workspace/tool steps. Last response:\n\nI’ll run it."
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::Stalled);
+
+        assert!(codex_tool_stall_should_retry_with_default_model(
+            Some("gpt-5.4"),
+            &stalled
+        ));
+        assert!(!codex_tool_stall_should_retry_with_default_model(
+            Some("gpt-5-codex"),
+            &stalled
+        ));
+        assert!(!codex_tool_stall_should_retry_with_default_model(
+            None, &stalled
+        ));
     }
 
     #[test]

@@ -5612,6 +5612,10 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
 }
 
 fn is_bare_llm_error_output(output: &str) -> bool {
+    if looks_like_structured_provider_error(output) {
+        return true;
+    }
+
     let normalized = output
         .trim()
         .trim_matches(|c: char| matches!(c, '.' | '!' | '"' | '\''))
@@ -5638,6 +5642,32 @@ fn is_bare_llm_error_output(output: &str) -> bool {
     ) || normalized.starts_with("api error:")
         || normalized.starts_with("anthropic api error:")
         || normalized.starts_with("claude code error:")
+}
+
+fn looks_like_structured_provider_error(output: &str) -> bool {
+    let trimmed = output.trim();
+    if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let has_error_shape = lower.contains("\"detail\"")
+        || lower.contains("\"error\"")
+        || lower.contains("\"message\"")
+        || lower.contains("\"type\"");
+    if !has_error_shape {
+        return false;
+    }
+
+    lower.contains("invalid_request_error")
+        || lower.contains("model is not supported")
+        || lower.contains("not supported when using codex")
+        || lower.contains("does not exist or you do not have access")
+        || lower.contains("invalid authentication credentials")
+        || lower.contains("rate limit")
+        || lower.contains("capacity")
+        || lower.contains("service unavailable")
+        || lower.contains("internal server error")
 }
 
 async fn maybe_finalize_terminal_mission(
@@ -9151,6 +9181,30 @@ async fn run_single_control_turn(
                     &ctx.working_dir,
                     &convo,
                     Some(fallback_model),
+                    requested_model_effort.as_deref(),
+                    config.opencode_agent.as_deref(),
+                    mid,
+                    events_tx.clone(),
+                    cancel,
+                    &config.working_dir,
+                    session_id.as_deref(),
+                    None,
+                ))
+                .await;
+            } else if super::mission_runner::codex_tool_stall_should_retry_with_default_model(
+                requested_codex_model,
+                &result,
+            ) {
+                tracing::warn!(
+                    mission_id = %mid,
+                    requested_model = ?requested_codex_model,
+                    "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use (control path)"
+                );
+                result = Box::pin(super::mission_runner::run_codex_turn(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &convo,
+                    None,
                     requested_model_effort.as_deref(),
                     config.opencode_agent.as_deref(),
                     mid,
@@ -14191,6 +14245,21 @@ Investigate <service/> failures.
         let mut result =
             crate::agents::AgentResult::failure("Internal server error".to_string(), 0)
                 .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_structured_codex_model_error() {
+        let mut result = crate::agents::AgentResult::failure(
+            r#"{"detail":"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account."}"#
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
 
         maybe_recover_soft_llm_error(&mut result);
 
