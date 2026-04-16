@@ -5655,6 +5655,18 @@ fn is_rate_limited_error(message: &str) -> bool {
         .any(|needle| contains_ascii_case_insensitive(message, needle))
 }
 
+fn opencode_idle_timeout_result_message(partial_output: &str) -> String {
+    let partial_output = partial_output.trim();
+    if partial_output.is_empty() {
+        return "OpenCode idle timeout: the model stopped producing output before finishing the turn. No response was generated.".to_string();
+    }
+
+    format!(
+        "OpenCode idle timeout: the model stopped producing output before finishing the turn. Partial output was discarded because it was incomplete.\n\nPartial output:\n{}",
+        partial_output
+    )
+}
+
 fn is_provider_payload_error(message: &str) -> bool {
     const PROVIDER_PAYLOAD_MARKERS: [&str; 3] = [
         "image.source.base64.data",
@@ -10633,6 +10645,11 @@ pub async fn run_opencode_turn(
     let mut consecutive_retries: u32 = 0;
     let mut last_seen_total_retries: u32 = 0;
     let max_consecutive_retries: u32 = 5;
+    // OpenCode can legitimately spend more than 30s in the next provider call
+    // after emitting an initial acknowledgement and finishing a tool-call step.
+    // A short timeout turns that acknowledgement into a false successful answer
+    // for Telegram. Let the global inactivity timeout handle truly stuck turns.
+    const OPENCODE_TEXT_IDLE_TIMEOUT_SECS: u64 = 120;
 
     loop {
         tokio::select! {
@@ -10805,7 +10822,7 @@ pub async fn run_opencode_turn(
                     }
                 }
                 if let Some(last_text) = text_output_at {
-                    if last_text.elapsed() >= std::time::Duration::from_secs(30) {
+                    if last_text.elapsed() >= std::time::Duration::from_secs(OPENCODE_TEXT_IDLE_TIMEOUT_SECS) {
                         // Only kill if there's also no recent SSE/stderr activity
                         // AND no tools are actively running.  A long tool execution
                         // (build, test, sleep) may produce no text output for >30s;
@@ -10825,7 +10842,7 @@ pub async fn run_opencode_turn(
                         let recent_activity = last_activity
                             .lock()
                             .ok()
-                            .map(|g| g.elapsed() < std::time::Duration::from_secs(30))
+                            .map(|g| g.elapsed() < std::time::Duration::from_secs(OPENCODE_TEXT_IDLE_TIMEOUT_SECS))
                             .unwrap_or(false);
                         if !recent_activity && !tools_active {
                             tracing::info!(
@@ -11462,19 +11479,18 @@ pub async fn run_opencode_turn(
         });
     }
 
-    // When the process was killed by idle timeout, append a notice so the user
-    // knows the response was truncated.  This is especially important for
-    // Telegram where the user sees partial output and then silence.
-    if killed_by_idle_timeout && !had_error && !final_result.trim().is_empty() {
+    // A timeout-killed OpenCode process is not a successful turn, even when it
+    // emitted partial text first. Returning partial text as TurnComplete caused
+    // Telegram to send "Je m'en occupe" followed by a warning while the actual
+    // tool-backed work never finished.
+    if killed_by_idle_timeout {
         tracing::warn!(
             mission_id = %mission_id,
             result_len = final_result.len(),
-            "OpenCode idle timeout killed process with partial output; appending truncation notice"
+            "OpenCode idle timeout killed process; marking turn as stalled"
         );
-        final_result.push_str("\n\n⚠️ [La réponse a été interrompue par un timeout — le modèle a mis trop de temps à répondre pendant l'exécution d'un outil. La réponse ci-dessus est incomplète.]");
-    } else if killed_by_idle_timeout && final_result.trim().is_empty() {
         had_error = true;
-        final_result = "OpenCode idle timeout: the model stopped producing output while executing tool calls. No response was generated.".to_string();
+        final_result = opencode_idle_timeout_result_message(&final_result);
     }
 
     tracing::info!(
@@ -11488,6 +11504,8 @@ pub async fn run_opencode_turn(
         // Use RateLimited terminal reason when rate limit was detected
         let reason = if rate_limit_detected.load(std::sync::atomic::Ordering::SeqCst) {
             TerminalReason::RateLimited
+        } else if killed_by_idle_timeout {
+            TerminalReason::Stalled
         } else {
             TerminalReason::LlmError
         };
@@ -13377,7 +13395,8 @@ mod tests {
         extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
         is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
         is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
-        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
+        is_tool_call_only_output, opencode_idle_timeout_result_message,
+        opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
@@ -13558,6 +13577,17 @@ mod tests {
         assert!(!is_provider_payload_error(
             "I resized the screenshots to fit the image request limits"
         ));
+    }
+
+    #[test]
+    fn opencode_idle_timeout_result_discards_partial_success_text() {
+        let message =
+            opencode_idle_timeout_result_message("Je m'en occupe ! Je te fais ça en parallèle.");
+
+        assert!(message.starts_with("OpenCode idle timeout:"));
+        assert!(message.contains("Partial output was discarded"));
+        assert!(message.contains("Je m'en occupe"));
+        assert!(!message.contains("La réponse a été interrompue"));
     }
 
     #[test]
