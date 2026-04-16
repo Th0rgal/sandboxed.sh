@@ -3436,8 +3436,30 @@ pub fn run_claudecode_turn<'a>(
         // credentials file. We run each mission with a per-mission HOME, and copy the
         // host credentials into the mission directory if needed.
         let mission_creds_path = work_dir.join(".claude").join(".credentials.json");
+        let using_override_auth = override_auth.is_some();
+        if using_override_auth && mission_creds_path.exists() {
+            match std::fs::remove_file(&mission_creds_path) {
+                Ok(_) => {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        path = %mission_creds_path.display(),
+                        "Removed mission Claude CLI credentials so override auth can take precedence"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        path = %mission_creds_path.display(),
+                        error = %e,
+                        "Failed to remove mission Claude CLI credentials before override auth"
+                    );
+                }
+            }
+        }
         // Copy host credentials if missing OR if the existing ones are expired/near-expiry.
-        let needs_copy = if !looks_like_claude_cli_credentials(&mission_creds_path) {
+        let needs_copy = if using_override_auth {
+            false
+        } else if !looks_like_claude_cli_credentials(&mission_creds_path) {
             true
         } else if let Some((expires_at, _)) = claude_cli_credentials_info(&mission_creds_path) {
             let now_ms = chrono::Utc::now().timestamp_millis();
@@ -3520,7 +3542,8 @@ pub fn run_claudecode_turn<'a>(
                 }
             }
         }
-        let mut has_cli_creds = looks_like_claude_cli_credentials(&mission_creds_path);
+        let mut has_cli_creds =
+            !using_override_auth && looks_like_claude_cli_credentials(&mission_creds_path);
         if let Some((expires_at, has_refresh)) = claude_cli_credentials_info(&mission_creds_path) {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let is_expired = expires_at < now_ms;
