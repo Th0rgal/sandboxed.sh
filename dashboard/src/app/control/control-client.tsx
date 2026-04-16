@@ -57,6 +57,7 @@ import {
   type ControlRunState,
   type Mission,
   type MissionStatus,
+  type ModelEffort,
   type RunningMissionInfo,
   type UploadProgress,
   type Workspace,
@@ -4750,7 +4751,7 @@ export default function ControlClient() {
     workspaceId?: string;
     agent?: string;
     modelOverride?: string;
-    modelEffort?: "low" | "medium" | "high";
+    modelEffort?: ModelEffort;
     configProfile?: string;
     backend?: string;
     openInNewTab?: boolean;

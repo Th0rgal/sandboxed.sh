@@ -12,6 +12,8 @@ import { generateMissionTitle } from "../llm";
 
 export type MissionStatus = "active" | "completed" | "failed" | "interrupted" | "blocked" | "not_feasible";
 
+export type ModelEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
 export interface MissionHistoryEntry {
   role: string;
   content: string;
@@ -40,7 +42,7 @@ export interface Mission {
   workspace_name?: string;
   agent?: string;
   model_override?: string;
-  model_effort?: "low" | "medium" | "high";
+  model_effort?: ModelEffort;
   backend?: string;
   history: MissionHistoryEntry[];
   desktop_sessions?: DesktopSessionInfo[];
@@ -71,7 +73,7 @@ export interface CreateMissionOptions {
   workspaceId?: string;
   agent?: string;
   modelOverride?: string;
-  modelEffort?: "low" | "medium" | "high";
+  modelEffort?: ModelEffort;
   configProfile?: string;
   backend?: string;
 }
@@ -179,7 +181,7 @@ export async function createMission(
     workspace_id?: string;
     agent?: string;
     model_override?: string;
-    model_effort?: "low" | "medium" | "high";
+    model_effort?: ModelEffort;
     config_profile?: string;
     backend?: string;
   } = {};

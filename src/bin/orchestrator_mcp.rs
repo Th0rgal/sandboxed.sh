@@ -308,11 +308,11 @@ impl OrchestratorMcp {
                         },
                         "model_override": {
                             "type": "string",
-                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-sonnet-4-5-20250929') for claudecode, GPT models (e.g. 'gpt-5.4') for codex, Gemini models for gemini, 'provider/model' format for opencode."
+                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.4') for codex, Gemini models for gemini, 'provider/model' format for opencode."
                         },
                         "model_effort": {
                             "type": "string",
-                            "enum": ["low", "medium", "high"],
+                            "enum": ["low", "medium", "high", "xhigh", "max"],
                             "description": "Effort level. Supported by codex and claudecode backends."
                         },
                         "agent": {
@@ -351,7 +351,7 @@ impl OrchestratorMcp {
                                     "title": { "type": "string" },
                                     "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "amp"] },
                                     "model_override": { "type": "string" },
-                                    "model_effort": { "type": "string", "enum": ["low", "medium", "high"] },
+                                    "model_effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
                                     "agent": { "type": "string" },
                                     "config_profile": { "type": "string" },
                                     "working_directory": { "type": "string" },

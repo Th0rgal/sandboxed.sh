@@ -129,7 +129,10 @@ fn load_providers_config(working_dir: &str) -> ProvidersConfig {
 
     match std::fs::read_to_string(&config_path) {
         Ok(contents) => match serde_json::from_str(&contents) {
-            Ok(config) => config,
+            Ok(mut config) => {
+                merge_default_provider_models(&mut config);
+                config
+            }
             Err(e) => {
                 tracing::warn!("Failed to parse providers.json: {}. Using defaults.", e);
                 default_providers_config()
@@ -142,6 +145,31 @@ fn load_providers_config(working_dir: &str) -> ProvidersConfig {
             );
             default_providers_config()
         }
+    }
+}
+
+fn merge_default_provider_models(config: &mut ProvidersConfig) {
+    let defaults = default_providers_config();
+    for default_provider in defaults.providers {
+        if let Some(existing) = config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == default_provider.id)
+        {
+            let mut seen: HashSet<String> = existing
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect();
+            for model in default_provider.models {
+                if seen.insert(model.id.clone()) {
+                    existing.models.push(model);
+                }
+            }
+            continue;
+        }
+
+        config.providers.push(default_provider);
     }
 }
 
@@ -369,6 +397,14 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "subscription".to_string(),
                 description: "Included in Claude Max".to_string(),
                 models: vec![
+                    ProviderModel {
+                        id: "claude-opus-4-7".to_string(),
+                        name: "Claude Opus 4.7".to_string(),
+                        description: Some(
+                            "Latest Opus model, recommended for hard coding and agentic tasks"
+                                .to_string(),
+                        ),
+                    },
                     ProviderModel {
                         id: "claude-opus-4-6".to_string(),
                         name: "Claude Opus 4.6".to_string(),
@@ -1333,7 +1369,7 @@ pub async fn validate_model_override(
                     Ok(())
                 } else {
                     Err(format!(
-                        "Anthropic provider not configured. Expected a Claude model ID (e.g., 'claude-opus-4-6'), got '{}'",
+                        "Anthropic provider not configured. Expected a Claude model ID (e.g., 'claude-opus-4-7'), got '{}'",
                         model_override
                     ))
                 }
@@ -1441,6 +1477,49 @@ mod tests {
         // Acronyms <= 3 chars get uppercased
         assert_eq!(model_id_to_display_name("gpt-4"), "GPT 4");
         assert_eq!(model_id_to_display_name("glm-4.6v-flash"), "GLM 4.6v Flash");
+    }
+
+    #[test]
+    fn default_anthropic_catalog_includes_opus_47() {
+        let defaults = default_providers_config();
+        let anthropic = defaults
+            .providers
+            .iter()
+            .find(|provider| provider.id == "anthropic")
+            .expect("anthropic provider");
+        assert!(anthropic
+            .models
+            .iter()
+            .any(|model| model.id == "claude-opus-4-7"));
+    }
+
+    #[test]
+    fn merge_default_provider_models_adds_new_builtin_models_to_stale_config() {
+        let mut config = ProvidersConfig {
+            providers: vec![Provider {
+                id: "anthropic".to_string(),
+                name: "Claude (Subscription)".to_string(),
+                billing: "subscription".to_string(),
+                description: "Included in Claude Max".to_string(),
+                models: vec![ProviderModel {
+                    id: "claude-opus-4-6".to_string(),
+                    name: "Claude Opus 4.6".to_string(),
+                    description: None,
+                }],
+            }],
+        };
+
+        merge_default_provider_models(&mut config);
+
+        let anthropic = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == "anthropic")
+            .expect("anthropic provider");
+        assert!(anthropic
+            .models
+            .iter()
+            .any(|model| model.id == "claude-opus-4-7"));
     }
 
     /// Fetch models from all provider APIs that have credentials available,

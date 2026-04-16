@@ -1749,7 +1749,7 @@ pub struct MissionRunner {
     /// Model override for this mission (e.g. "zai/glm-5")
     pub model_override: Option<String>,
 
-    /// Model effort override for this mission (e.g. low/medium/high)
+    /// Model effort override for this mission (e.g. low/medium/high/xhigh/max)
     pub model_effort: Option<String>,
 
     /// Message queue for this mission
@@ -2370,7 +2370,7 @@ async fn run_mission_turn(
         // models take precedence instead of being overridden.
         config.default_model = None;
     } else if backend_id == "codex" && model_override.is_none() {
-        // The global DEFAULT_MODEL (e.g. claude-opus-4-6) is not valid for
+        // The global DEFAULT_MODEL (e.g. claude-opus-4-7) is not valid for
         // Codex.  Clear it so Codex uses its own CLI default.
         config.default_model = None;
     } else if backend_id == "gemini" && model_override.is_none() {
@@ -4049,8 +4049,8 @@ pub fn run_claudecode_turn<'a>(
         }
 
         if let Some(m) = model {
-            // Claude Code expects bare model IDs (e.g. "claude-opus-4-6"),
-            // not provider-prefixed ones (e.g. "anthropic/claude-opus-4-6").
+            // Claude Code expects bare model IDs (e.g. "claude-opus-4-7"),
+            // not provider-prefixed ones (e.g. "anthropic/claude-opus-4-7").
             let bare = m.strip_prefix("anthropic/").unwrap_or(m);
             args.push("--model".to_string());
             args.push(bare.to_string());

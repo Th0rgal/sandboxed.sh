@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import { Plus, X, ExternalLink, RefreshCw } from 'lucide-react';
 import useSWR from 'swr';
-import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getBackendConfig, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type Provider } from '@/lib/api';
+import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getBackendConfig, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
 
 /** Options returned by the dialog's getCreateOptions() method */
@@ -13,7 +13,7 @@ export interface NewMissionDialogOptions {
   agent?: string;
   /** @deprecated Use workspace config profiles instead */
   modelOverride?: string;
-  modelEffort?: 'low' | 'medium' | 'high';
+  modelEffort?: ModelEffort;
   configProfile?: string;
   backend?: string;
   /** Whether the mission will be opened in a new tab (skip local state updates) */
@@ -30,7 +30,7 @@ export interface InitialMissionValues {
   agent?: string;
   backend?: string;
   modelOverride?: string;
-  modelEffort?: 'low' | 'medium' | 'high';
+  modelEffort?: ModelEffort;
 }
 
 interface NewMissionDialogProps {
@@ -109,7 +109,7 @@ export function NewMissionDialog({
   // Combined value: "backend:agent" or empty for default
   const [selectedAgentValue, setSelectedAgentValue] = useState('');
   const [modelOverride, setModelOverride] = useState('');
-  const [modelEffort, setModelEffort] = useState<'low' | 'medium' | 'high' | ''>('');
+  const [modelEffort, setModelEffort] = useState<ModelEffort | ''>('');
   const [submitting, setSubmitting] = useState(false);
   const [defaultSet, setDefaultSet] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -751,7 +751,7 @@ export function NewMissionDialog({
                   ? 'Amp ignores model overrides.'
                   : selectedBackend === 'opencode'
                     ? 'Use provider/model format (e.g., openai/gpt-5-codex).'
-                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-6).'}
+                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-7).'}
               </p>
             </div>
 
@@ -760,13 +760,15 @@ export function NewMissionDialog({
                 <label className="block text-xs text-white/50 mb-1.5">Model effort (optional)</label>
                 <select
                   value={modelEffort}
-                  onChange={(e) => setModelEffort(e.target.value as 'low' | 'medium' | 'high' | '')}
+                  onChange={(e) => setModelEffort(e.target.value as ModelEffort | '')}
                   className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none [&>option]:bg-slate-800 [&>option]:text-white"
                 >
                   <option value="">Default effort</option>
                   <option value="low">Low</option>
                   <option value="medium">Medium</option>
                   <option value="high">High</option>
+                  {selectedBackend === 'claudecode' && <option value="xhigh">XHigh</option>}
+                  {selectedBackend === 'claudecode' && <option value="max">Max</option>}
                 </select>
                 <p className="text-xs text-white/30 mt-1.5">
                   {selectedBackend === 'codex' ? 'Passed to Codex as reasoning effort.' : 'Controls Claude Code adaptive reasoning depth (via CLAUDE_CODE_EFFORT_LEVEL).'}

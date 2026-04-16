@@ -2850,7 +2850,7 @@ pub enum ControlCommand {
         agent: Option<String>,
         /// Optional model override (provider/model)
         model_override: Option<String>,
-        /// Optional model effort override (e.g. low/medium/high)
+        /// Optional model effort override (e.g. low/medium/high/xhigh/max)
         model_effort: Option<String>,
         /// Backend to use for this mission ("opencode" or "claudecode")
         backend: Option<String>,
@@ -3841,7 +3841,7 @@ pub struct CreateMissionRequest {
     pub agent: Option<String>,
     /// Optional model override (provider/model) - deprecated, use config_profile instead
     pub model_override: Option<String>,
-    /// Optional model effort override (supports: low, medium, high)
+    /// Optional model effort override (supports: low, medium, high, xhigh, max)
     pub model_effort: Option<String>,
     /// Config profile to use for this mission (overrides workspace's default profile)
     pub config_profile: Option<String>,
@@ -3858,6 +3858,8 @@ fn normalize_model_effort(raw: &str) -> Option<String> {
         "low" => Some("low".to_string()),
         "medium" => Some("medium".to_string()),
         "high" => Some("high".to_string()),
+        "xhigh" => Some("xhigh".to_string()),
+        "max" => Some("max".to_string()),
         _ => None,
     }
 }
@@ -3919,7 +3921,8 @@ pub async fn create_mission(
             if model_effort.is_none() {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "Invalid model_effort. Supported values: low, medium, high".to_string(),
+                    "Invalid model_effort. Supported values: low, medium, high, xhigh, max"
+                        .to_string(),
                 ));
             }
         }
@@ -13649,6 +13652,8 @@ And the report:
             Some("medium".to_string())
         );
         assert_eq!(normalize_model_effort("HIGH"), Some("high".to_string()));
+        assert_eq!(normalize_model_effort("xhigh"), Some("xhigh".to_string()));
+        assert_eq!(normalize_model_effort("MAX"), Some("max".to_string()));
     }
 
     #[test]
@@ -13672,8 +13677,8 @@ And the report:
             Some("gpt-5-codex".to_string())
         );
         assert_eq!(
-            normalize_model_override_for_backend(Some("claudecode"), "anthropic/claude-opus-4-6"),
-            Some("claude-opus-4-6".to_string())
+            normalize_model_override_for_backend(Some("claudecode"), "anthropic/claude-opus-4-7"),
+            Some("claude-opus-4-7".to_string())
         );
         assert_eq!(
             normalize_model_override_for_backend(Some("codex"), "   "),

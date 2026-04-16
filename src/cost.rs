@@ -50,6 +50,7 @@ fn normalize_model(model: &str) -> &str {
         s if s.contains("claude-sonnet-4") || s.contains("claude-4-sonnet") => "claude-sonnet-4",
         s if s.contains("claude-3-5-haiku") || s.contains("claude-3.5-haiku") => "claude-3-5-haiku",
         s if s.contains("claude-3-opus") || s.contains("claude-3.0-opus") => "claude-3-opus",
+        s if s.contains("claude-opus-4-7") || s.contains("claude-4-7-opus") => "claude-opus-4-7",
         s if s.contains("claude-opus-4-6") || s.contains("claude-4-6-opus") => "claude-opus-4-6",
         s if s.contains("claude-opus-4") || s.contains("claude-4-opus") => "claude-opus-4",
 
@@ -133,12 +134,20 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_read_nano_per_token: Some(1_500),
         }),
 
-        // Claude Opus 4.6: assume same as Opus 4 until pricing is updated
+        // Claude Opus 4.7: $5/1M input, $25/1M output
+        "claude-opus-4-7" => Some(ModelPricing {
+            input_nano_per_token: 5_000,
+            output_nano_per_token: 25_000,
+            cache_create_nano_per_token: Some(6_250),
+            cache_read_nano_per_token: Some(500),
+        }),
+
+        // Claude Opus 4.6: $5/1M input, $25/1M output
         "claude-opus-4-6" => Some(ModelPricing {
-            input_nano_per_token: 15_000,
-            output_nano_per_token: 75_000,
-            cache_create_nano_per_token: Some(18_750),
-            cache_read_nano_per_token: Some(1_500),
+            input_nano_per_token: 5_000,
+            output_nano_per_token: 25_000,
+            cache_create_nano_per_token: Some(6_250),
+            cache_read_nano_per_token: Some(500),
         }),
 
         // Claude Opus 4: $15/1M input, $75/1M output
@@ -374,6 +383,7 @@ mod tests {
             normalize_model("claude-3.5-sonnet-latest"),
             "claude-3-5-sonnet"
         );
+        assert_eq!(normalize_model("claude-opus-4-7"), "claude-opus-4-7");
         assert_eq!(normalize_model("gpt-4o-2024-08-06"), "gpt-4o");
         assert_eq!(normalize_model("gemini-2.5-pro-preview"), "gemini-2.5-pro");
         assert_eq!(normalize_model("gemini-3.1-pro-preview"), "gemini-3.1-pro");
@@ -384,6 +394,7 @@ mod tests {
     #[test]
     fn test_pricing_for_known_models() {
         assert!(pricing_for_model("claude-3-5-sonnet").is_some());
+        assert!(pricing_for_model("claude-opus-4-7").is_some());
         assert!(pricing_for_model("gpt-4o").is_some());
         assert!(pricing_for_model("gemini-2.5-pro").is_some());
         assert!(pricing_for_model("gemini-3.1-pro-preview").is_some());

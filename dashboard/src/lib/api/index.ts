@@ -33,6 +33,7 @@ export {
 // Missions
 export {
   type MissionStatus,
+  type ModelEffort,
   type MissionHistoryEntry,
   type DesktopSessionInfo,
   type Mission,

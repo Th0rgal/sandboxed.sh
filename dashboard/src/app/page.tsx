@@ -19,6 +19,7 @@ import {
   cancelMission,
   deleteMission,
   resumeMission,
+  type ModelEffort,
   type Mission,
 } from '@/lib/api';
 import {
@@ -306,7 +307,7 @@ function OverviewPageContent() {
   );
 
   const handleNewMission = useCallback(
-    async (options?: { workspaceId?: string; agent?: string; modelOverride?: string; modelEffort?: "low" | "medium" | "high"; configProfile?: string; backend?: string; openInNewTab?: boolean }) => {
+    async (options?: { workspaceId?: string; agent?: string; modelOverride?: string; modelEffort?: ModelEffort; configProfile?: string; backend?: string; openInNewTab?: boolean }) => {
       try {
         setCreatingMission(true);
         const mission = await createMission({

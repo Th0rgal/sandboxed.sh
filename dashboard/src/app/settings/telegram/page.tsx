@@ -918,6 +918,8 @@ export default function TelegramSettingsPage() {
                     <option value="low">Low</option>
                     <option value="medium">Medium</option>
                     <option value="high">High</option>
+                    {createBackend === 'claudecode' && <option value="xhigh">XHigh</option>}
+                    {createBackend === 'claudecode' && <option value="max">Max</option>}
                   </select>
                 </div>
               )}
@@ -1098,6 +1100,8 @@ export default function TelegramSettingsPage() {
                     <option value="low">Low</option>
                     <option value="medium">Medium</option>
                     <option value="high">High</option>
+                    {editBackend === 'claudecode' && <option value="xhigh">XHigh</option>}
+                    {editBackend === 'claudecode' && <option value="max">Max</option>}
                   </select>
                 </div>
               )}

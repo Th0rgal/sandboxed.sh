@@ -49,7 +49,7 @@ pub struct Mission {
     /// Optional model override (provider/model)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
-    /// Optional model effort override (e.g. low/medium/high)
+    /// Optional model effort override (e.g. low/medium/high/xhigh/max)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_effort: Option<String>,
     /// Backend to use for this mission ("opencode" or "claudecode")
@@ -381,7 +381,7 @@ pub struct TelegramChannel {
     /// Default model override for auto-created missions
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model_override: Option<String>,
-    /// Default model effort for auto-created missions (low/medium/high)
+    /// Default model effort for auto-created missions (low/medium/high/xhigh/max)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model_effort: Option<String>,
     /// Default workspace ID for auto-created missions
