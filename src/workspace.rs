@@ -1232,13 +1232,14 @@ async fn write_opencode_config(
         write_commands_as_opencode_skills(workspace_dir, commands).await?;
     }
 
-    // Write Bash PreToolUse hook for Claude Code (which oh-my-opencode wraps).
-    // This fixes gh CLI hanging in PTY and enables RTK compression for the
-    // native Bash tool used by the agent. Since OpenCode wraps Claude Code,
+    // Write Claude PreToolUse hooks for Claude Code (which oh-my-opencode wraps).
+    // These fix gh CLI hanging in PTY, optionally enable RTK compression for
+    // native Bash, and block oversized image Reads before provider submission.
+    // Since OpenCode wraps Claude Code,
     // we need to write a minimal `.claude/settings.local.json` containing the
     // hooks config so the underlying Claude Code process discovers the hook.
     if let Some(hooks) =
-        write_bash_pretool_hook(workspace_dir, workspace_root, workspace_type).await?
+        write_claude_pretool_hooks(workspace_dir, workspace_root, workspace_type).await?
     {
         let claude_dir = workspace_dir.join(".claude");
         tokio::fs::create_dir_all(&claude_dir).await?;
@@ -1246,16 +1247,24 @@ async fn write_opencode_config(
         let settings_content = serde_json::to_string_pretty(&settings)?;
         let settings_path = claude_dir.join("settings.local.json");
         tokio::fs::write(&settings_path, &settings_content).await?;
-        tracing::info!("RTK hooks written to .claude/settings.local.json for OpenCode backend");
+        tracing::info!("Claude hooks written to .claude/settings.local.json for OpenCode backend");
     }
 
     Ok(())
 }
 
-/// If `SANDBOXED_SH_RTK_ENABLED` is set, write a Claude Code `PreToolUse`
-/// hook that prefixes eligible Bash commands with the `rtk` binary.
+/// Write Claude Code `PreToolUse` hooks for workspace execution.
+///
+/// The Bash hook always exists because it fixes `gh` hanging in PTY contexts,
+/// and optionally prefixes eligible commands with `rtk` when enabled.
+///
+/// The Read hook blocks oversized image reads before Claude Code serializes the
+/// image into the next model request. Anthropic applies a 2000px per-dimension
+/// limit when a request contains many images; one oversized screenshot can poison
+/// the session context and make the next model call fail before the agent gets a
+/// chance to recover.
 /// Returns the `hooks` JSON value to embed in `.claude/settings.local.json`,
-/// or `None` when RTK is disabled / the binary is absent.
+/// or `None` when no hooks were written.
 ///
 /// For container workspaces, the RTK binary is copied from the host into
 /// the container's `/usr/local/bin/`, and paths in the hook config are
@@ -1263,7 +1272,7 @@ async fn write_opencode_config(
 ///
 /// For the OpenCode backend this is also called so that the underlying Claude
 /// Code process (wrapped by oh-my-opencode) picks up the hook.
-async fn write_bash_pretool_hook(
+async fn write_claude_pretool_hooks(
     workspace_dir: &Path,
     workspace_root: &Path,
     workspace_type: WorkspaceType,
@@ -1302,7 +1311,7 @@ async fn write_bash_pretool_hook(
         }
     }
 
-    // Write the hook script to .claude/hooks/bash-pretool.sh
+    // Write the Bash hook script to .claude/hooks/bash-pretool.sh
     //
     // This hook serves two purposes:
     // 1. **gh terminal fix** (always): Wraps `gh` commands with `env TERM=dumb` to prevent
@@ -1430,14 +1439,159 @@ exit 0
         "Bash PreToolUse hook written"
     );
 
+    let image_hook_path = hooks_dir.join("image-read-pretool.sh");
+    let image_hook_script = r#"#!/bin/bash
+# PreToolUse hook for Read. Blocks oversized PNG/JPEG images before Claude Code
+# embeds them in a provider request that may contain many images.
+set -euo pipefail
+
+INPUT=$(cat)
+
+if ! command -v python3 >/dev/null 2>&1; then
+  exit 0
+fi
+
+export CLAUDE_HOOK_INPUT="$INPUT"
+python3 <<'PY'
+import json
+import os
+import struct
+import sys
+
+MAX_DIMENSION = 2000
+
+def png_dimensions(data):
+    if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return struct.unpack(">II", data[16:24])
+    return None
+
+def jpeg_dimensions(path):
+    with open(path, "rb") as f:
+        if f.read(2) != b"\xff\xd8":
+            return None
+        while True:
+            marker_prefix = f.read(1)
+            if not marker_prefix:
+                return None
+            if marker_prefix != b"\xff":
+                continue
+            marker = f.read(1)
+            while marker == b"\xff":
+                marker = f.read(1)
+            if not marker:
+                return None
+            code = marker[0]
+            if code in (0xD8, 0xD9):
+                continue
+            length_bytes = f.read(2)
+            if len(length_bytes) != 2:
+                return None
+            length = struct.unpack(">H", length_bytes)[0]
+            if length < 2:
+                return None
+            if code in {
+                0xC0, 0xC1, 0xC2, 0xC3,
+                0xC5, 0xC6, 0xC7,
+                0xC9, 0xCA, 0xCB,
+                0xCD, 0xCE, 0xCF,
+            }:
+                segment = f.read(length - 2)
+                if len(segment) >= 5:
+                    height, width = struct.unpack(">HH", segment[1:5])
+                    return width, height
+                return None
+            f.seek(length - 2, os.SEEK_CUR)
+
+def image_dimensions(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+        dims = png_dimensions(head)
+        if dims:
+            return dims
+        return jpeg_dimensions(path)
+    except Exception:
+        return None
+
+def main():
+    try:
+        payload = json.loads(os.environ.get("CLAUDE_HOOK_INPUT", "{}"))
+    except Exception:
+        return 0
+
+    tool_input = payload.get("tool_input") or {}
+    path = tool_input.get("file_path") or tool_input.get("path")
+    if not isinstance(path, str) or not path:
+        return 0
+    if not os.path.isfile(path):
+        return 0
+
+    dims = image_dimensions(path)
+    if not dims:
+        return 0
+    width, height = dims
+    if width <= MAX_DIMENSION and height <= MAX_DIMENSION:
+        return 0
+
+    reason = (
+        f"Refusing to Read oversized image {path} ({width}x{height}). "
+        "Claude provider requests with many images allow at most 2000 pixels per dimension. "
+        "Downscale or rerender this image first, then Read the smaller file. "
+        "For PDF screenshots, use a lower pdftoppm DPI such as -r 120, or use pdftotext when text is sufficient."
+    )
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }))
+    return 0
+
+sys.exit(main())
+PY
+"#;
+    tokio::fs::write(&image_hook_path, image_hook_script).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&image_hook_path, perms)?;
+    }
+
+    let image_hook_command = if is_container {
+        if let Ok(rel) = image_hook_path.strip_prefix(workspace_root) {
+            format!("/{}", rel.to_string_lossy())
+        } else {
+            image_hook_path.to_string_lossy().to_string()
+        }
+    } else {
+        image_hook_path.to_string_lossy().to_string()
+    };
+    tracing::info!(
+        hook_path = %image_hook_command,
+        is_container = is_container,
+        max_dimension = 2000,
+        "Image Read PreToolUse hook written"
+    );
+
     Ok(Some(json!({
-        "PreToolUse": [{
-            "matcher": "Bash",
-            "hooks": [{
-                "type": "command",
-                "command": hook_command
-            }]
-        }]
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_command
+                }]
+            },
+            {
+                "matcher": "Read",
+                "hooks": [{
+                    "type": "command",
+                    "command": image_hook_command
+                }]
+            }
+        ]
     })))
 }
 
@@ -1534,10 +1688,9 @@ async fn write_claudecode_config(
         }
     });
 
-    // Add Bash PreToolUse hook — fixes gh CLI hanging in PTY environments
-    // and optionally rewrites commands with RTK for token compression.
+    // Add Claude PreToolUse hooks: Bash PTY/RTK handling plus image Read guard.
     if let Some(hooks) =
-        write_bash_pretool_hook(workspace_dir, workspace_root, workspace_type).await?
+        write_claude_pretool_hooks(workspace_dir, workspace_root, workspace_type).await?
     {
         settings
             .as_object_mut()

@@ -5226,6 +5226,16 @@ pub fn run_claudecode_turn<'a>(
             );
             AgentResult::failure(final_result, cost_cents)
                 .with_terminal_reason(TerminalReason::RateLimited)
+        } else if is_provider_payload_error(&final_result) {
+            // Claude Code can surface provider request validation errors as
+            // ordinary assistant text while exiting successfully. Treat them as
+            // LLM failures so the mission does not falsely complete.
+            tracing::warn!(
+                mission_id = %mission_id,
+                "Claude Code returned a provider payload error as a successful turn; marking as LlmError"
+            );
+            AgentResult::failure(final_result, cost_cents)
+                .with_terminal_reason(TerminalReason::LlmError)
         } else {
             AgentResult::success(final_result, cost_cents)
                 .with_terminal_reason(TerminalReason::TurnComplete)
@@ -5641,6 +5651,18 @@ fn is_rate_limited_error(message: &str) -> bool {
     ];
 
     RATE_LIMIT_MARKERS
+        .iter()
+        .any(|needle| contains_ascii_case_insensitive(message, needle))
+}
+
+fn is_provider_payload_error(message: &str) -> bool {
+    const PROVIDER_PAYLOAD_MARKERS: [&str; 3] = [
+        "image.source.base64.data",
+        "image dimensions exceed max allowed size",
+        "many-image requests: 2000 pixels",
+    ];
+
+    PROVIDER_PAYLOAD_MARKERS
         .iter()
         .any(|needle| contains_ascii_case_insensitive(message, needle))
 }
@@ -13354,8 +13376,8 @@ mod tests {
         codex_chatgpt_fallback_model, codex_key_fingerprint, extract_model_from_message,
         extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
         is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
-        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
+        is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
+        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
@@ -13526,6 +13548,16 @@ mod tests {
         assert!(is_rate_limited_error("Overloaded_Error occurred"));
         assert!(!is_rate_limited_error("Model finished successfully"));
         assert!(!is_rate_limited_error("error: 123"));
+    }
+
+    #[test]
+    fn is_provider_payload_error_detects_oversized_many_image_marker() {
+        assert!(is_provider_payload_error(
+            "messages.13.content.88.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels"
+        ));
+        assert!(!is_provider_payload_error(
+            "I resized the screenshots to fit the image request limits"
+        ));
     }
 
     #[test]
