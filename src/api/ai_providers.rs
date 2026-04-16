@@ -442,7 +442,7 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Claude Code authentication material.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeCodeAuth {
     ApiKey(String),
     OAuthToken(String),

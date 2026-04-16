@@ -5841,6 +5841,9 @@ fn is_bare_llm_error_output(output: &str) -> bool {
     if looks_like_structured_provider_error(output) {
         return true;
     }
+    if super::mission_runner::is_provider_payload_error(output) {
+        return true;
+    }
 
     let normalized = output
         .trim()
@@ -9233,35 +9236,11 @@ async fn run_single_control_turn(
                     "Auth error detected — invalidating stale credentials and retrying"
                 );
 
-                // Delete the per-mission CLI credentials (they have a stale access token)
-                let mission_creds = ctx.working_dir.join(".claude").join(".credentials.json");
-                if mission_creds.exists() {
-                    let _ = std::fs::remove_file(&mission_creds);
-                    tracing::info!(
-                        path = %mission_creds.display(),
-                        "Removed stale per-mission CLI credentials"
-                    );
-                }
-
-                // Also invalidate the host CLI credentials so they aren't copied again
-                for host_path in &[
-                    std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
-                    std::path::PathBuf::from("/root/.claude/.credentials.json"),
-                ] {
-                    if host_path.exists() {
-                        let _ = std::fs::remove_file(host_path);
-                        tracing::info!(
-                            path = %host_path.display(),
-                            "Removed stale host CLI credentials"
-                        );
-                    }
-                }
-
-                // Force OAuth token refresh (bypasses local expiry check since
-                // the token was revoked server-side despite not being locally expired)
-                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
-                    tracing::warn!("OAuth refresh after auth error failed: {}", e);
-                }
+                super::mission_runner::refresh_claude_credentials_after_auth_error(
+                    &ctx.working_dir,
+                    "control_initial_auth_error",
+                )
+                .await;
 
                 // Retry with fresh credentials
                 result = Box::pin(super::mission_runner::run_claudecode_turn(
@@ -9289,24 +9268,30 @@ async fn run_single_control_turn(
             // The first entry in the list is the highest-priority credential, which
             // is almost certainly what the initial (override_auth=None) call used.
             // Skip it to avoid a guaranteed duplicate rate-limit failure.
+            let mut rotated_anthropic_account = false;
             if result.terminal_reason == Some(TerminalReason::RateLimited) && !cancel.is_cancelled()
             {
-                let all_accounts =
-                    super::ai_providers::get_all_anthropic_auth_for_claudecode(&config.working_dir);
-                let alt_accounts: Vec<_> = all_accounts.into_iter().skip(1).collect();
-                if !alt_accounts.is_empty() {
+                let rotation_accounts = super::mission_runner::anthropic_rotation_accounts(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &config.working_dir,
+                );
+                if !rotation_accounts.accounts.is_empty() {
                     tracing::info!(
                         mission_id = %mid,
-                        total_accounts = alt_accounts.len(),
+                        total_accounts = rotation_accounts.total_accounts,
+                        alternate_accounts = rotation_accounts.accounts.len(),
+                        skipped_current = rotation_accounts.skipped_current,
                         "Rate limited on primary account; trying alternate Anthropic credentials"
                     );
-                    for (idx, alt_auth) in alt_accounts.into_iter().enumerate() {
+                    for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
                         if cancel.is_cancelled() {
                             break;
                         }
+                        rotated_anthropic_account = true;
                         tracing::info!(
                             mission_id = %mid,
-                            attempt = idx + 2,
+                            rotation_attempt = idx + 1,
                             auth_type = match &alt_auth {
                                 super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
                                 super::ai_providers::ClaudeCodeAuth::OAuthToken(_) =>
@@ -9338,7 +9323,7 @@ async fn run_single_control_turn(
                             Some(TerminalReason::RateLimited) => {
                                 tracing::info!(
                                     mission_id = %mid,
-                                    attempt = idx + 2,
+                                    rotation_attempt = idx + 1,
                                     "Rate limited; rotating to next account"
                                 );
                                 continue;
@@ -9353,37 +9338,20 @@ async fn run_single_control_turn(
             // credential. Run the same stale-credential recovery after rotation
             // so the mission retries with freshly refreshed host credentials
             // instead of stopping on "Invalid authentication credentials".
-            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
+            if rotated_anthropic_account
+                && result.terminal_reason == Some(TerminalReason::AuthError)
+                && !cancel.is_cancelled()
+            {
                 tracing::warn!(
                     mission_id = %mid,
                     "Auth error detected after credential rotation - invalidating stale credentials and retrying"
                 );
 
-                let mission_creds = ctx.working_dir.join(".claude").join(".credentials.json");
-                if mission_creds.exists() {
-                    let _ = std::fs::remove_file(&mission_creds);
-                    tracing::info!(
-                        path = %mission_creds.display(),
-                        "Removed stale per-mission CLI credentials"
-                    );
-                }
-
-                for host_path in &[
-                    std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
-                    std::path::PathBuf::from("/root/.claude/.credentials.json"),
-                ] {
-                    if host_path.exists() {
-                        let _ = std::fs::remove_file(host_path);
-                        tracing::info!(
-                            path = %host_path.display(),
-                            "Removed stale host CLI credentials"
-                        );
-                    }
-                }
-
-                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
-                    tracing::warn!("OAuth refresh after rotated auth error failed: {}", e);
-                }
+                super::mission_runner::refresh_claude_credentials_after_auth_error(
+                    &ctx.working_dir,
+                    "control_rotated_auth_error",
+                )
+                .await;
 
                 result = Box::pin(super::mission_runner::run_claudecode_turn(
                     exec_workspace,
@@ -14547,6 +14515,21 @@ Investigate <service/> failures.
     fn maybe_recover_soft_llm_error_does_not_recover_structured_codex_model_error() {
         let mut result = crate::agents::AgentResult::failure(
             r#"{"detail":"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account."}"#
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_provider_payload_error() {
+        let mut result = crate::agents::AgentResult::failure(
+            "messages.13.content.88.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels"
                 .to_string(),
             0,
         )

@@ -4753,7 +4753,7 @@ export default function ControlClient() {
     agent?: string;
     modelOverride?: string;
     modelEffort?: ModelEffort;
-    configProfile?: string;
+    configProfile?: string | null;
     backend?: string;
     openInNewTab?: boolean;
   }) => {
@@ -4764,7 +4764,7 @@ export default function ControlClient() {
         agent: options?.agent,
         modelOverride: options?.modelOverride,
         modelEffort: options?.modelEffort,
-        configProfile: options?.configProfile,
+        configProfile: options?.configProfile ?? undefined,
         backend: options?.backend,
       });
 
@@ -4800,7 +4800,7 @@ export default function ControlClient() {
     agent?: string;
     modelOverride?: string;
     modelEffort?: ModelEffort;
-    configProfile?: string;
+    configProfile?: string | null;
     backend?: string;
     openInNewTab?: boolean;
   }) => {

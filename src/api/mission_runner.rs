@@ -2773,35 +2773,11 @@ async fn run_mission_turn(
                     "Auth error detected — invalidating stale credentials and retrying"
                 );
 
-                // Delete the per-mission CLI credentials (they have a stale access token)
-                let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
-                if mission_creds.exists() {
-                    let _ = std::fs::remove_file(&mission_creds);
-                    tracing::info!(
-                        path = %mission_creds.display(),
-                        "Removed stale per-mission CLI credentials"
-                    );
-                }
-
-                // Also invalidate the host CLI credentials so they aren't copied again
-                for host_path in &[
-                    std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
-                    std::path::PathBuf::from("/root/.claude/.credentials.json"),
-                ] {
-                    if host_path.exists() {
-                        let _ = std::fs::remove_file(host_path);
-                        tracing::info!(
-                            path = %host_path.display(),
-                            "Removed stale host CLI credentials"
-                        );
-                    }
-                }
-
-                // Force OAuth token refresh (bypasses local expiry check since
-                // the token was revoked server-side despite not being locally expired)
-                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
-                    tracing::warn!("OAuth refresh after auth error failed: {}", e);
-                }
+                refresh_claude_credentials_after_auth_error(
+                    &mission_work_dir,
+                    "mission_runner_initial_auth_error",
+                )
+                .await;
 
                 // Retry with fresh credentials (override_auth=None forces re-resolution)
                 result = run_claudecode_turn(
@@ -2829,23 +2805,26 @@ async fn run_mission_turn(
             // The first entry in the list is the highest-priority credential, which
             // is almost certainly what the initial (override_auth=None) call used.
             // Skip it to avoid a guaranteed duplicate rate-limit failure.
+            let mut rotated_anthropic_account = false;
             if result.terminal_reason == Some(TerminalReason::RateLimited) {
-                let alt_accounts =
-                    super::ai_providers::get_all_anthropic_auth_for_claudecode(&config.working_dir);
-                let alt_accounts: Vec<_> = alt_accounts.into_iter().skip(1).collect();
-                if !alt_accounts.is_empty() {
+                let rotation_accounts =
+                    anthropic_rotation_accounts(&workspace, &mission_work_dir, &config.working_dir);
+                if !rotation_accounts.accounts.is_empty() {
                     tracing::info!(
                         mission_id = %mission_id,
-                        total_accounts = alt_accounts.len(),
+                        total_accounts = rotation_accounts.total_accounts,
+                        alternate_accounts = rotation_accounts.accounts.len(),
+                        skipped_current = rotation_accounts.skipped_current,
                         "Rate limited on primary account; trying alternate credentials"
                     );
-                    for (idx, alt_auth) in alt_accounts.into_iter().enumerate() {
+                    for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
                         if cancel.is_cancelled() {
                             break;
                         }
+                        rotated_anthropic_account = true;
                         tracing::info!(
                             mission_id = %mission_id,
-                            attempt = idx + 2,
+                            rotation_attempt = idx + 1,
                             auth_type = match &alt_auth {
                                 super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
                                 super::ai_providers::ClaudeCodeAuth::OAuthToken(_) => "oauth_token",
@@ -2879,7 +2858,7 @@ async fn run_mission_turn(
                             Some(TerminalReason::RateLimited) => {
                                 tracing::info!(
                                     mission_id = %mission_id,
-                                    attempt = idx + 2,
+                                    rotation_attempt = idx + 1,
                                     "Rate limited; rotating to next account"
                                 );
                                 continue;
@@ -2893,37 +2872,20 @@ async fn run_mission_turn(
             // If an alternate OAuth credential is revoked, rotation returns
             // AuthError. Refresh stale Claude credentials and retry once with
             // freshly resolved auth instead of surfacing a raw 401.
-            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
+            if rotated_anthropic_account
+                && result.terminal_reason == Some(TerminalReason::AuthError)
+                && !cancel.is_cancelled()
+            {
                 tracing::warn!(
                     mission_id = %mission_id,
                     "Auth error detected after credential rotation - invalidating stale credentials and retrying"
                 );
 
-                let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
-                if mission_creds.exists() {
-                    let _ = std::fs::remove_file(&mission_creds);
-                    tracing::info!(
-                        path = %mission_creds.display(),
-                        "Removed stale per-mission CLI credentials"
-                    );
-                }
-
-                for host_path in &[
-                    std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
-                    std::path::PathBuf::from("/root/.claude/.credentials.json"),
-                ] {
-                    if host_path.exists() {
-                        let _ = std::fs::remove_file(host_path);
-                        tracing::info!(
-                            path = %host_path.display(),
-                            "Removed stale host CLI credentials"
-                        );
-                    }
-                }
-
-                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
-                    tracing::warn!("OAuth refresh after rotated auth error failed: {}", e);
-                }
+                refresh_claude_credentials_after_auth_error(
+                    &mission_work_dir,
+                    "mission_runner_rotated_auth_error",
+                )
+                .await;
 
                 result = run_claudecode_turn(
                     &workspace,
@@ -4839,16 +4801,22 @@ pub fn run_claudecode_turn<'a>(
                                             }
                                             // Ignore other delta types (e.g., input_json_delta for tool use)
                                         }
-                                        StreamEvent::ContentBlockStart { index, content_block } => {
+                                        StreamEvent::ContentBlockStart { index, content_block }
+                                            if content_block.block_type == "tool_use" =>
+                                        {
                                             // Track the block type so we know how to handle deltas
                                             block_types.insert(index, content_block.block_type.clone());
 
-                                            if content_block.block_type == "tool_use" {
-                                                if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                                                    pending_tools.insert(id, name);
-                                                    turn_wait_state = ClaudeTurnWaitState::AwaitingToolResults;
-                                                }
+                                            if let (Some(id), Some(name)) =
+                                                (content_block.id, content_block.name)
+                                            {
+                                                pending_tools.insert(id, name);
+                                                turn_wait_state =
+                                                    ClaudeTurnWaitState::AwaitingToolResults;
                                             }
+                                        }
+                                        StreamEvent::ContentBlockStart { index, content_block } => {
+                                            block_types.insert(index, content_block.block_type);
                                         }
                                         _ => {}
                                     }
@@ -4868,29 +4836,26 @@ pub fn run_claudecode_turn<'a>(
                                     for (content_idx, block) in evt.message.content.into_iter().enumerate() {
                                         let content_idx = content_idx as u32;
                                         match block {
-                                            ContentBlock::Text { text } => {
+                                            ContentBlock::Text { text } if !text.is_empty() => {
                                                 // Text content is the final assistant response
                                                 // Don't send as Thinking - it will be in the final AssistantMessage
-                                                if !text.is_empty() {
-                                                    if !thinking_emitted {
-                                                        if let Some((thought, cleaned)) =
-                                                            extract_thought_line(&text)
-                                                        {
-                                                            let _ = events_tx.send(
-                                                                AgentEvent::Thinking {
-                                                                    content: thought,
-                                                                    done: true,
-                                                                    mission_id: Some(mission_id),
-                                                                },
-                                                            );
-                                                            thinking_emitted = true;
-                                                            final_result = cleaned;
-                                                        } else {
-                                                            final_result = text;
-                                                        }
+                                                if !thinking_emitted {
+                                                    if let Some((thought, cleaned)) =
+                                                        extract_thought_line(&text)
+                                                    {
+                                                        let _ =
+                                                            events_tx.send(AgentEvent::Thinking {
+                                                                content: thought,
+                                                                done: true,
+                                                                mission_id: Some(mission_id),
+                                                            });
+                                                        thinking_emitted = true;
+                                                        final_result = cleaned;
                                                     } else {
                                                         final_result = text;
                                                     }
+                                                } else {
+                                                    final_result = text;
                                                 }
                                             }
                                             ContentBlock::ToolUse { id, name, input } => {
@@ -5009,19 +4974,21 @@ pub fn run_claudecode_turn<'a>(
                                                     }
                                                 }
                                             }
-                                            ContentBlock::Thinking { thinking } => {
+                                            ContentBlock::Thinking { thinking }
+                                                if !thinking.is_empty()
+                                                    && !finalized_thinking_indices
+                                                        .contains(&content_idx) =>
+                                            {
                                                 // Only send done:true for the last active thinking block.
                                                 // Earlier blocks were already finalized during streaming
                                                 // (via the block-transition mechanism) and re-sending them
                                                 // causes duplicate items in the frontend thinking panel.
-                                                if !thinking.is_empty() && !finalized_thinking_indices.contains(&content_idx) {
-                                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                                        content: thinking,
-                                                        done: true,
-                                                        mission_id: Some(mission_id),
-                                                    });
-                                                    thinking_emitted = true;
-                                                }
+                                                let _ = events_tx.send(AgentEvent::Thinking {
+                                                    content: thinking,
+                                                    done: true,
+                                                    mission_id: Some(mission_id),
+                                                });
+                                                thinking_emitted = true;
                                             }
                                             _ => {}
                                         }
@@ -5364,7 +5331,7 @@ pub fn run_claudecode_turn<'a>(
                 TerminalReason::LlmError
             };
             AgentResult::failure(final_result, cost_cents).with_terminal_reason(reason)
-        } else if is_rate_limited_error(&final_result) {
+        } else if is_success_path_rate_limited_error(&final_result) {
             // Claude Code sometimes surfaces subscription quota exhaustion as a
             // normal assistant message (e.g. "You've hit your limit · resets
             // 9pm") and exits with code 0. Without this check the turn would be
@@ -5375,7 +5342,7 @@ pub fn run_claudecode_turn<'a>(
             );
             AgentResult::failure(final_result, cost_cents)
                 .with_terminal_reason(TerminalReason::RateLimited)
-        } else if is_auth_error(&final_result) {
+        } else if is_success_path_auth_error(&final_result) {
             // Claude Code can surface revoked/expired credential failures as a
             // normal assistant message while exiting successfully. Treat that
             // as AuthError so the caller invalidates stale credentials, refreshes
@@ -5387,7 +5354,7 @@ pub fn run_claudecode_turn<'a>(
             );
             AgentResult::failure(final_result, cost_cents)
                 .with_terminal_reason(TerminalReason::AuthError)
-        } else if is_provider_payload_error(&final_result) {
+        } else if is_success_path_provider_payload_error(&final_result) {
             // Claude Code can surface provider request validation errors as
             // ordinary assistant text while exiting successfully. Treat them as
             // LLM failures so the mission does not falsely complete.
@@ -5792,7 +5759,7 @@ fn is_auth_error(message: &str) -> bool {
 }
 
 fn is_rate_limited_error(message: &str) -> bool {
-    const RATE_LIMIT_MARKERS: [&str; 13] = [
+    const RATE_LIMIT_MARKERS: [&str; 12] = [
         "overloaded_error",
         "rate limit",
         "rate_limit",
@@ -5808,12 +5775,56 @@ fn is_rate_limited_error(message: &str) -> bool {
         // phrasing (e.g. "You've hit your limit · resets 9pm"). Treat it
         // as a rate-limit signal so account rotation kicks in.
         "hit your limit",
-        "you've hit your",
     ];
 
     RATE_LIMIT_MARKERS
         .iter()
         .any(|needle| contains_ascii_case_insensitive(message, needle))
+}
+
+fn looks_like_explicit_provider_error_output(message: &str) -> bool {
+    let trimmed = message.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    trimmed.starts_with("API Error:")
+        || lower.starts_with("error:")
+        || lower.starts_with("anthropic api error:")
+        || lower.starts_with("claude code error:")
+        || lower.contains("\"type\":\"error\"")
+        || lower.contains("\"type\": \"error\"")
+        || lower.contains("\"error\"")
+        || lower.contains("status code: 401")
+        || lower.contains("status code: 429")
+        || lower.contains("status code: 529")
+}
+
+fn is_standalone_invalid_credentials_message(message: &str) -> bool {
+    let normalized = message
+        .trim()
+        .trim_matches(|c: char| matches!(c, '.' | '!' | '"' | '\''))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    normalized == "invalid authentication credentials"
+}
+
+fn is_success_path_rate_limited_error(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    lower.starts_with("you've hit your limit")
+        || lower.starts_with("you have hit your limit")
+        || lower.starts_with("you’ve hit your limit")
+        || (looks_like_explicit_provider_error_output(message) && is_rate_limited_error(message))
+}
+
+fn is_success_path_auth_error(message: &str) -> bool {
+    is_standalone_invalid_credentials_message(message)
+        || (looks_like_explicit_provider_error_output(message) && is_auth_error(message))
+}
+
+fn is_success_path_provider_payload_error(message: &str) -> bool {
+    (looks_like_explicit_provider_error_output(message)
+        || message.trim_start().starts_with("messages."))
+        && is_provider_payload_error(message)
 }
 
 fn opencode_idle_timeout_result_message(partial_output: &str) -> String {
@@ -5828,7 +5839,7 @@ fn opencode_idle_timeout_result_message(partial_output: &str) -> String {
     )
 }
 
-fn is_provider_payload_error(message: &str) -> bool {
+pub(crate) fn is_provider_payload_error(message: &str) -> bool {
     const PROVIDER_PAYLOAD_MARKERS: [&str; 3] = [
         "image.source.base64.data",
         "image dimensions exceed max allowed size",
@@ -5838,6 +5849,116 @@ fn is_provider_payload_error(message: &str) -> bool {
     PROVIDER_PAYLOAD_MARKERS
         .iter()
         .any(|needle| contains_ascii_case_insensitive(message, needle))
+}
+
+pub(crate) struct AnthropicRotationAccounts {
+    pub total_accounts: usize,
+    pub skipped_current: bool,
+    pub accounts: Vec<super::ai_providers::ClaudeCodeAuth>,
+}
+
+fn current_anthropic_auth_for_rotation(
+    workspace: &Workspace,
+    mission_work_dir: &Path,
+    app_working_dir: &Path,
+) -> Option<super::ai_providers::ClaudeCodeAuth> {
+    let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
+    if mission_creds.exists() {
+        return None;
+    }
+
+    let workspace_auth = if workspace.workspace_type == WorkspaceType::Container {
+        super::ai_providers::get_anthropic_auth_from_workspace(&workspace.path)
+    } else {
+        None
+    };
+    let host_auth = super::ai_providers::get_anthropic_auth_from_host_with_expiry();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    match (&workspace_auth, &host_auth) {
+        (Some(ws), Some(host)) => {
+            let ws_expiry = ws.expires_at.unwrap_or(i64::MAX);
+            let host_expiry = host.expires_at.unwrap_or(i64::MAX);
+            let ws_expired = ws_expiry < now;
+            let host_expired = host_expiry < now;
+            if (ws_expired && !host_expired) || host_expiry > ws_expiry {
+                Some(host.auth.clone())
+            } else {
+                Some(ws.auth.clone())
+            }
+        }
+        (Some(ws), None) => Some(ws.auth.clone()),
+        (None, Some(host)) => Some(host.auth.clone()),
+        (None, None) => super::ai_providers::get_anthropic_auth_for_claudecode(app_working_dir),
+    }
+}
+
+pub(crate) fn anthropic_rotation_accounts(
+    workspace: &Workspace,
+    mission_work_dir: &Path,
+    app_working_dir: &Path,
+) -> AnthropicRotationAccounts {
+    let current = current_anthropic_auth_for_rotation(workspace, mission_work_dir, app_working_dir);
+    let all_accounts = super::ai_providers::get_all_anthropic_auth_for_claudecode(app_working_dir);
+    let total_accounts = all_accounts.len();
+    let mut skipped_current = false;
+    let accounts = all_accounts
+        .into_iter()
+        .filter(|account| {
+            let is_current = current
+                .as_ref()
+                .is_some_and(|candidate| candidate == account);
+            if is_current {
+                skipped_current = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    AnthropicRotationAccounts {
+        total_accounts,
+        skipped_current,
+        accounts,
+    }
+}
+
+pub(crate) async fn refresh_claude_credentials_after_auth_error(
+    mission_work_dir: &Path,
+    log_context: &str,
+) {
+    let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
+    if mission_creds.exists() {
+        let _ = std::fs::remove_file(&mission_creds);
+        tracing::info!(
+            path = %mission_creds.display(),
+            context = log_context,
+            "Removed stale per-mission CLI credentials"
+        );
+    }
+
+    for host_path in &[
+        std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
+        std::path::PathBuf::from("/root/.claude/.credentials.json"),
+    ] {
+        if host_path.exists() {
+            let _ = std::fs::remove_file(host_path);
+            tracing::info!(
+                path = %host_path.display(),
+                context = log_context,
+                "Removed stale host CLI credentials"
+            );
+        }
+    }
+
+    if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
+        tracing::warn!(
+            context = log_context,
+            "OAuth refresh after auth error failed: {}",
+            e
+        );
+    }
 }
 
 fn is_capacity_limited_error(message: &str) -> bool {
@@ -12142,14 +12263,19 @@ pub async fn run_amp_turn(
                                             }
                                         }
                                     }
-                                    StreamEvent::ContentBlockStart { index, content_block } => {
+                                    StreamEvent::ContentBlockStart { index, content_block }
+                                        if content_block.block_type == "tool_use" =>
+                                    {
                                         block_types.insert(index, content_block.block_type.clone());
 
-                                        if content_block.block_type == "tool_use" {
-                                            if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                                                pending_tools.insert(id, name);
-                                            }
+                                        if let (Some(id), Some(name)) =
+                                            (content_block.id, content_block.name)
+                                        {
+                                            pending_tools.insert(id, name);
                                         }
+                                    }
+                                    StreamEvent::ContentBlockStart { index, content_block } => {
+                                        block_types.insert(index, content_block.block_type);
                                     }
                                     _ => {}
                                 }
@@ -12171,27 +12297,23 @@ pub async fn run_amp_turn(
                                 for (content_idx, block) in evt.message.content.into_iter().enumerate() {
                                     let content_idx = content_idx as u32;
                                     match block {
-                                        ContentBlock::Text { text } => {
-                                            if !text.is_empty() {
-                                                if !thinking_streamed {
-                                                    if let Some((thought, cleaned)) =
-                                                        extract_thought_line(&text)
-                                                    {
-                                                        let _ = events_tx.send(
-                                                            AgentEvent::Thinking {
-                                                                content: thought,
-                                                                done: true,
-                                                                mission_id: Some(mission_id),
-                                                            },
-                                                        );
-                                                        thinking_streamed = true;
-                                                        final_result = cleaned;
-                                                    } else {
-                                                        final_result = text;
-                                                    }
+                                        ContentBlock::Text { text } if !text.is_empty() => {
+                                            if !thinking_streamed {
+                                                if let Some((thought, cleaned)) =
+                                                    extract_thought_line(&text)
+                                                {
+                                                    let _ = events_tx.send(AgentEvent::Thinking {
+                                                        content: thought,
+                                                        done: true,
+                                                        mission_id: Some(mission_id),
+                                                    });
+                                                    thinking_streamed = true;
+                                                    final_result = cleaned;
                                                 } else {
                                                     final_result = text;
                                                 }
+                                            } else {
+                                                final_result = text;
                                             }
                                         }
                                         ContentBlock::ToolUse { id, name, input } => {
@@ -12499,7 +12621,8 @@ impl From<&MissionRunner> for RunningMissionInfo {
 }
 
 fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str) -> bool {
-    let user = user_message.to_ascii_lowercase();
+    let user_request = current_user_request_for_tool_activity(user_message);
+    let user = user_request.to_ascii_lowercase();
     let assistant = assistant_message.trim().to_ascii_lowercase();
 
     let deferred_action_prefixes = [
@@ -12600,8 +12723,44 @@ fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str
         "localhost",
     ];
 
-    action_markers.iter().any(|action| user.contains(action))
+    action_markers
+        .iter()
+        .any(|action| contains_ascii_word(&user, action))
         && object_markers.iter().any(|object| user.contains(object))
+}
+
+fn current_user_request_for_tool_activity(prompt: &str) -> &str {
+    let Some((_, after_user)) = prompt.rsplit_once("User:\n") else {
+        return prompt;
+    };
+    after_user
+        .split_once("\n\nInstructions:")
+        .map(|(current, _)| current)
+        .unwrap_or(after_user)
+}
+
+fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    for idx in 0..=haystack.len() - needle.len() {
+        if &haystack[idx..idx + needle.len()] != needle {
+            continue;
+        }
+        let before = idx.checked_sub(1).and_then(|prev| haystack.get(prev));
+        let after = haystack.get(idx + needle.len());
+        if before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+            && after.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13684,15 +13843,17 @@ mod tests {
         extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
         extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
         is_codex_node_wrapper, is_provider_payload_error, is_rate_limited_error,
-        is_session_corruption_error, is_tool_call_only_output,
-        opencode_idle_timeout_result_message, opencode_output_needs_fallback,
-        opencode_session_token_from_line, parse_opencode_session_token, parse_opencode_sse_event,
-        parse_opencode_stderr_text_part, preferred_model_for_cost, resolve_cost_cents_and_source,
-        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
-        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
-        sync_opencode_agent_config, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
-        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
-        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        is_session_corruption_error, is_success_path_auth_error,
+        is_success_path_provider_payload_error, is_success_path_rate_limited_error,
+        is_tool_call_only_output, opencode_idle_timeout_result_message,
+        opencode_output_needs_fallback, opencode_session_token_from_line,
+        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
+        preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
+        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
+        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, inject_telegram_identity_into_claude_md,
@@ -13727,6 +13888,28 @@ mod tests {
         assert!(!codex_turn_requires_tool_activity(
             "Explain three possible reasons for this architecture issue.",
             "Here are three likely reasons."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_uses_word_boundaries() {
+        assert!(!codex_turn_requires_tool_activity(
+            "I already updated the README.md and can summarize it.",
+            "The README.md is already updated."
+        ));
+        assert!(!codex_turn_requires_tool_activity(
+            "The checkbox in settings.md is already enabled.",
+            "The checkbox is enabled."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_uses_latest_user_request_from_prompt() {
+        let prompt = "Previous conversation:\nUser:\nPlease edit src/lib.rs and run tests.\n\nAssistant:\nDone.\n\nUser:\nSummarize what changed.\n\nInstructions:\n- Continue helpfully.";
+
+        assert!(!codex_turn_requires_tool_activity(
+            prompt,
+            "The previous change updated src/lib.rs and tests passed."
         ));
     }
 
@@ -13878,8 +14061,34 @@ mod tests {
         assert!(is_rate_limited_error("Error: 429 Too Many Requests"));
         assert!(is_rate_limited_error("resource_exhausted: slow down"));
         assert!(is_rate_limited_error("Overloaded_Error occurred"));
+        assert!(is_rate_limited_error("You've hit your limit · resets 9pm"));
         assert!(!is_rate_limited_error("Model finished successfully"));
         assert!(!is_rate_limited_error("error: 123"));
+        assert!(!is_rate_limited_error(
+            "You've hit your target for this sprint."
+        ));
+    }
+
+    #[test]
+    fn success_path_error_detection_requires_explicit_provider_failures() {
+        assert!(is_success_path_rate_limited_error(
+            "You've hit your limit · resets 9pm"
+        ));
+        assert!(!is_success_path_rate_limited_error(
+            "I can explain how rate limits work without needing tools."
+        ));
+        assert!(is_success_path_auth_error(
+            "Invalid authentication credentials"
+        ));
+        assert!(!is_success_path_auth_error(
+            "The docs mention an invalid api key as an example."
+        ));
+        assert!(is_success_path_provider_payload_error(
+            "messages.13.content.88.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels"
+        ));
+        assert!(!is_success_path_provider_payload_error(
+            "I resized the image because image dimensions exceed max allowed size in many-image requests."
+        ));
     }
 
     #[test]

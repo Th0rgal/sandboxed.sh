@@ -205,10 +205,17 @@ fn is_context_upload_path(path: &str) -> bool {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "context".to_string());
+    is_context_upload_path_for_dir(path, &context_dir_name)
+}
+
+fn is_context_upload_path_for_dir(path: &str, context_dir_name: &str) -> bool {
     let normalized = path.trim().trim_start_matches("./");
     normalized == context_dir_name
         || normalized.starts_with(&format!("{}/", context_dir_name))
-        || path.starts_with("/root/context")
+        || normalized == format!("root/{}", context_dir_name)
+        || normalized.starts_with(&format!("root/{}/", context_dir_name))
+        || path == format!("/root/{}", context_dir_name)
+        || path.starts_with(&format!("/root/{}/", context_dir_name))
 }
 
 fn configured_context_root(config_working_dir: &Path) -> PathBuf {
@@ -229,6 +236,39 @@ fn configured_context_root(config_working_dir: &Path) -> PathBuf {
     } else {
         root
     }
+}
+
+fn context_mirror_suffix(
+    remote_path: &Path,
+    mission_context: &Path,
+    container_context_root: &Path,
+    mission_id: uuid::Uuid,
+) -> Option<PathBuf> {
+    let mut suffix = remote_path
+        .strip_prefix(mission_context)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            remote_path
+                .strip_prefix(container_context_root)
+                .ok()
+                .map(Path::to_path_buf)
+        })
+        .or_else(|| remote_path.file_name().map(PathBuf::from));
+
+    if let Some(current_suffix) = suffix.as_ref() {
+        let mission_component = mission_id.to_string();
+        if current_suffix.components().next().is_some_and(|component| {
+            component.as_os_str() == std::ffi::OsStr::new(&mission_component)
+        }) {
+            suffix = current_suffix
+                .strip_prefix(&mission_component)
+                .ok()
+                .map(Path::to_path_buf);
+        }
+    }
+
+    suffix
 }
 
 async fn mirror_context_upload_to_container_rootfs(
@@ -255,11 +295,13 @@ async fn mirror_context_upload_to_container_rootfs(
         .canonicalize()
         .unwrap_or_else(|_| configured_context_root(config_working_dir));
     let mission_context = context_root.join(mission_id.to_string());
-    let suffix = remote_path
-        .strip_prefix(&mission_context)
-        .ok()
-        .map(Path::to_path_buf)
-        .or_else(|| remote_path.file_name().map(PathBuf::from));
+    let container_context_root = workspace.path.join("root").join(&context_dir_name);
+    let suffix = context_mirror_suffix(
+        remote_path,
+        &mission_context,
+        &container_context_root,
+        mission_id,
+    );
     let Some(suffix) = suffix else {
         return;
     };
@@ -1301,4 +1343,76 @@ pub async fn download_from_url(
     Ok(Json(
         serde_json::json!({ "ok": true, "path": display_path, "name": file_name }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{context_mirror_suffix, is_context_upload_path_for_dir};
+    use std::path::{Path, PathBuf};
+    use uuid::Uuid;
+
+    #[test]
+    fn context_upload_path_matches_exact_context_root_with_boundary() {
+        assert!(is_context_upload_path_for_dir(
+            "context/file.pdf",
+            "context"
+        ));
+        assert!(is_context_upload_path_for_dir(
+            "./context/file.pdf",
+            "context"
+        ));
+        assert!(is_context_upload_path_for_dir(
+            "/root/context/file.pdf",
+            "context"
+        ));
+        assert!(is_context_upload_path_for_dir("/root/ctx/file.pdf", "ctx"));
+        assert!(!is_context_upload_path_for_dir(
+            "/root/contextual/file.pdf",
+            "context"
+        ));
+        assert!(!is_context_upload_path_for_dir(
+            "/root/context/file.pdf",
+            "ctx"
+        ));
+    }
+
+    #[test]
+    fn context_mirror_suffix_preserves_absolute_container_subdirectories() {
+        let mission_id = Uuid::parse_str("95e6bd13-0963-4b19-a485-c2c3f59aeb02").unwrap();
+        let mission_context = Path::new("/root/.sandboxed-sh/context").join(mission_id.to_string());
+        let container_context_root =
+            Path::new("/root/.sandboxed-sh/containers/ws/root/context").to_path_buf();
+        let remote_path = container_context_root.join("papers/Toward.pdf");
+
+        let suffix = context_mirror_suffix(
+            &remote_path,
+            &mission_context,
+            &container_context_root,
+            mission_id,
+        )
+        .unwrap();
+
+        assert_eq!(suffix, PathBuf::from("papers/Toward.pdf"));
+    }
+
+    #[test]
+    fn context_mirror_suffix_does_not_duplicate_mission_id() {
+        let mission_id = Uuid::parse_str("95e6bd13-0963-4b19-a485-c2c3f59aeb02").unwrap();
+        let mission_context = Path::new("/root/.sandboxed-sh/context").join(mission_id.to_string());
+        let container_context_root =
+            Path::new("/root/.sandboxed-sh/containers/ws/root/context").to_path_buf();
+        let remote_path = container_context_root
+            .join(mission_id.to_string())
+            .join("papers/Toward.pdf");
+
+        let suffix = context_mirror_suffix(
+            &remote_path,
+            &mission_context,
+            &container_context_root,
+            mission_id,
+        )
+        .unwrap();
+
+        assert_eq!(suffix, PathBuf::from("papers/Toward.pdf"));
+    }
 }

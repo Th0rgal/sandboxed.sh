@@ -3124,11 +3124,13 @@ pub async fn stream_response(
                         queued,
                         mission_id: Some(mid),
                         ..
-                    }) if Some(id) == expected_user_message_id && mid == mission_id => {
-                        if !queued && !request_started {
-                            request_started = true;
-                            send_chat_action(http, &base_url, chat_id).await;
-                        }
+                    }) if Some(id) == expected_user_message_id
+                        && mid == mission_id
+                        && !queued
+                        && !request_started =>
+                    {
+                        request_started = true;
+                        send_chat_action(http, &base_url, chat_id).await;
                     }
                     Ok(AgentEvent::TextDelta {
                         content,

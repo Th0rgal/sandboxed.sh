@@ -485,12 +485,13 @@ fn convert_codex_event(
                     }
                 }
                 "command_execution" => {
-                    results.push(ExecutionEvent::ToolCall {
-                        id: item.id.clone(),
-                        name: command_execution_name(),
-                        args: command_execution_args(&item.data),
-                    });
-                    mark_tool_call_emitted(item_content_cache, &item.id);
+                    if !mark_tool_call_emitted(item_content_cache, &item.id) {
+                        results.push(ExecutionEvent::ToolCall {
+                            id: item.id.clone(),
+                            name: command_execution_name(),
+                            args: command_execution_args(&item.data),
+                        });
+                    }
                 }
                 "mcp_tool_call" => {
                     if let Some(name) = mcp_tool_name(&item.data) {
@@ -1039,6 +1040,36 @@ mod tests {
             }
             other => panic!("Expected ToolResult, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn convert_codex_event_repeated_command_execution_updates_emit_one_call() {
+        let created_event: CodexEvent = serde_json::from_value(json!({
+            "type": "item.created",
+            "item": {
+                "id": "cmd_exec_repeat",
+                "type": "command_execution",
+                "command": "pwd"
+            }
+        }))
+        .unwrap();
+        let updated_event: CodexEvent = serde_json::from_value(json!({
+            "type": "item.updated",
+            "item": {
+                "id": "cmd_exec_repeat",
+                "type": "command_execution",
+                "command": "pwd",
+                "aggregated_output": "/tmp\n"
+            }
+        }))
+        .unwrap();
+        let mut cache = HashMap::new();
+        let created = convert_codex_event(created_event, &mut cache);
+        let updated = convert_codex_event(updated_event, &mut cache);
+
+        assert_eq!(created.len(), 1);
+        assert!(matches!(created[0], ExecutionEvent::ToolCall { .. }));
+        assert!(updated.is_empty());
     }
 
     #[test]

@@ -14,7 +14,7 @@ export interface NewMissionDialogOptions {
   /** @deprecated Use workspace config profiles instead */
   modelOverride?: string;
   modelEffort?: ModelEffort;
-  configProfile?: string;
+  configProfile?: string | null;
   backend?: string;
   /** Whether the mission will be opened in a new tab (skip local state updates) */
   openInNewTab?: boolean;
@@ -327,11 +327,11 @@ export function NewMissionDialog({
   }, [allAgents]);
 
   // Parse selected value to get backend and agent
-  const parseSelectedValue = (value: string): { backend: string; agent: string } | null => {
+  const parseSelectedValue = (value: string): { backend: string; agent?: string } | null => {
     if (!value) return null;
     const [backend, ...agentParts] = value.split(':');
     const agent = agentParts.join(':'); // Handle agent names with colons
-    return backend && agent ? { backend, agent } : null;
+    return backend ? { backend, agent: agent || undefined } : null;
   };
 
   const selectedBackend = useMemo(() => {
@@ -430,8 +430,13 @@ export function NewMissionDialog({
 
     // Try to use initialValues for agent/backend (from current mission)
     if (initialValues?.backend) {
+      if (!initialValues.agent) {
+        setSelectedAgentValue(`${initialValues.backend}:`);
+        setDefaultSet(true);
+        return;
+      }
       const matchingAgent = allAgents.find(
-        a => a.backend === initialValues.backend && (!initialValues.agent || a.agent === initialValues.agent)
+        a => a.backend === initialValues.backend && a.agent === initialValues.agent
       );
       if (matchingAgent) {
         setSelectedAgentValue(matchingAgent.value);
@@ -556,7 +561,7 @@ export function NewMissionDialog({
       modelOverride: modelOverrideValue,
       modelEffort: modelEffortValue,
       configProfile: isEditMode
-        ? initialValues?.configProfile || workspaceProfile || undefined
+        ? initialValues?.configProfile ?? null
         : workspaceProfile || undefined,
     };
   };
@@ -693,6 +698,9 @@ export function NewMissionDialog({
 
                   return (
                     <optgroup key={backend.id} label={backend.name} className="bg-[#1a1a1a]">
+                      <option value={`${backend.id}:`} className="bg-[#1a1a1a]">
+                        {backend.name} default
+                      </option>
                       {backendAgentsList.map((agent) => (
                         <option key={agent.value} value={agent.value} className="bg-[#1a1a1a]">
                           {agent.displayName}{agent.backend === 'opencode' && agent.agent === 'Sisyphus' ? ' (recommended)' : ''}
