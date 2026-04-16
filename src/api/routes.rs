@@ -13,7 +13,7 @@ use axum::{
         sse::{Event, Sse},
         Json,
     },
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use futures::stream::Stream;
@@ -628,6 +628,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/:id/title",
             post(control::set_mission_title),
+        )
+        .route(
+            "/api/control/missions/:id/settings",
+            patch(control::update_mission_settings),
         )
         .route(
             "/api/control/missions/:id/mode",

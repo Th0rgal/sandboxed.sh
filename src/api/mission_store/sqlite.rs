@@ -2352,6 +2352,77 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn update_mission_run_settings(
+        &self,
+        id: Uuid,
+        backend: Option<&str>,
+        agent: Option<Option<&str>>,
+        model_override: Option<Option<&str>>,
+        model_effort: Option<Option<&str>>,
+        config_profile: Option<Option<&str>>,
+        session_id: &str,
+    ) -> Result<Mission, String> {
+        let conn = self.conn.clone();
+        let now = now_string();
+        let backend_set = backend.is_some();
+        let agent_set = agent.is_some();
+        let model_override_set = model_override.is_some();
+        let model_effort_set = model_effort.is_some();
+        let config_profile_set = config_profile.is_some();
+        let backend = backend.map(ToString::to_string);
+        let agent = agent.flatten().map(ToString::to_string);
+        let model_override = model_override.flatten().map(ToString::to_string);
+        let model_effort = model_effort.flatten().map(ToString::to_string);
+        let config_profile = config_profile.flatten().map(ToString::to_string);
+        let session_id = session_id.to_string();
+        let id_str = id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let changed = conn
+                .execute(
+                    "UPDATE missions
+                     SET backend = CASE WHEN ?1 THEN ?2 ELSE backend END,
+                         agent = CASE WHEN ?3 THEN ?4 ELSE agent END,
+                         model_override = CASE WHEN ?5 THEN ?6 ELSE model_override END,
+                         model_effort = CASE WHEN ?7 THEN ?8 ELSE model_effort END,
+                         config_profile = CASE WHEN ?9 THEN ?10 ELSE config_profile END,
+                         session_id = ?11,
+                         resumable = 0,
+                         interrupted_at = NULL,
+                         terminal_reason = NULL,
+                         updated_at = ?12
+                     WHERE id = ?13",
+                    params![
+                        backend_set,
+                        backend,
+                        agent_set,
+                        agent,
+                        model_override_set,
+                        model_override,
+                        model_effort_set,
+                        model_effort,
+                        config_profile_set,
+                        config_profile,
+                        session_id,
+                        now,
+                        id_str,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            if changed == 0 {
+                return Err(format!("Mission {} not found", id_str));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+        self.get_mission(id)
+            .await?
+            .ok_or_else(|| format!("Mission {} not found", id))
+    }
+
     async fn update_mission_metadata(
         &self,
         id: Uuid,
@@ -2847,6 +2918,31 @@ impl MissionStore for SqliteMissionStore {
                     "metadata_source": metadata_source,
                     "metadata_model": metadata_model,
                     "metadata_version": metadata_version
+                }),
+            ),
+            AgentEvent::MissionSettingsUpdated {
+                backend,
+                agent,
+                model_override,
+                model_effort,
+                config_profile,
+                session_id,
+                updated_at,
+                ..
+            } => (
+                "mission_settings_updated",
+                None,
+                None,
+                None,
+                backend.clone(),
+                serde_json::json!({
+                    "backend": backend,
+                    "agent": agent,
+                    "model_override": model_override,
+                    "model_effort": model_effort,
+                    "config_profile": config_profile,
+                    "session_id": session_id,
+                    "updated_at": updated_at
                 }),
             ),
             // Skip events that are less important for debugging

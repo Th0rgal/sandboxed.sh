@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
-import { Plus, X, ExternalLink, RefreshCw } from 'lucide-react';
+import { Plus, X, ExternalLink, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import useSWR from 'swr';
 import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getBackendConfig, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
@@ -31,6 +31,7 @@ export interface InitialMissionValues {
   backend?: string;
   modelOverride?: string;
   modelEffort?: ModelEffort;
+  configProfile?: string | null;
 }
 
 interface NewMissionDialogProps {
@@ -46,6 +47,10 @@ interface NewMissionDialogProps {
   autoOpen?: boolean;
   /** Callback when dialog closes (for clearing URL params, etc.) */
   onClose?: () => void;
+  /** Use the same controls to edit an existing mission's future run settings. */
+  mode?: 'create' | 'edit';
+  /** Disable workspace changes, useful when editing an existing mission. */
+  lockWorkspace?: boolean;
 }
 
 // Combined agent with backend info
@@ -102,6 +107,8 @@ export function NewMissionDialog({
   initialValues,
   autoOpen = false,
   onClose,
+  mode = 'create',
+  lockWorkspace = false,
 }: NewMissionDialogProps) {
   const router = useRouter();
   const [open, setOpen] = useState(autoOpen);
@@ -421,10 +428,10 @@ export function NewMissionDialog({
       setModelEffort(initialValues.modelEffort);
     }
 
-    // Try to use initialValues for agent (from current mission)
-    if (initialValues?.backend && initialValues?.agent) {
+    // Try to use initialValues for agent/backend (from current mission)
+    if (initialValues?.backend) {
       const matchingAgent = allAgents.find(
-        a => a.backend === initialValues.backend && a.agent === initialValues.agent
+        a => a.backend === initialValues.backend && (!initialValues.agent || a.agent === initialValues.agent)
       );
       if (matchingAgent) {
         setSelectedAgentValue(matchingAgent.value);
@@ -548,7 +555,9 @@ export function NewMissionDialog({
       backend: parsed?.backend || 'claudecode',
       modelOverride: modelOverrideValue,
       modelEffort: modelEffortValue,
-      configProfile: workspaceProfile || undefined,
+      configProfile: isEditMode
+        ? initialValues?.configProfile || workspaceProfile || undefined
+        : workspaceProfile || undefined,
     };
   };
 
@@ -580,6 +589,7 @@ export function NewMissionDialog({
   };
 
   const isBusy = disabled || submitting;
+  const isEditMode = mode === 'edit';
 
   return (
     <div className="relative" ref={dialogRef}>
@@ -587,17 +597,21 @@ export function NewMissionDialog({
         type="button"
         onClick={() => setOpen((prev) => !prev)}
         disabled={isBusy}
-        className="flex items-center gap-1.5 rounded-lg bg-indigo-500/20 px-2.5 py-2 text-sm font-medium text-indigo-400 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"
-        title="Create new mission"
+        className={isEditMode
+          ? "flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2 text-sm text-white/70 hover:bg-white/[0.04] transition-colors disabled:opacity-50"
+          : "flex items-center gap-1.5 rounded-lg bg-indigo-500/20 px-2.5 py-2 text-sm font-medium text-indigo-400 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"}
+        title={isEditMode ? "Edit mission run settings" : "Create new mission"}
       >
-        <Plus className="h-4 w-4" />
-        <span className="hidden lg:inline">New Mission</span>
+        {isEditMode ? <SlidersHorizontal className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+        <span className="hidden lg:inline">{isEditMode ? 'Run Settings' : 'New Mission'}</span>
       </button>
       {open && (
         <div className="absolute right-0 top-full mt-1 w-96 rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl z-50">
           {/* Header with refresh and close buttons */}
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-sm font-medium text-white">Create New Mission</h3>
+            <h3 className="text-sm font-medium text-white">
+              {isEditMode ? 'Edit Run Settings' : 'Create New Mission'}
+            </h3>
             <div className="flex items-center gap-1">
               <button
                 type="button"
@@ -624,6 +638,7 @@ export function NewMissionDialog({
               <select
                 value={newMissionWorkspace}
                 onChange={(e) => setNewMissionWorkspace(e.target.value)}
+                disabled={lockWorkspace}
                 className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
                 style={{
                   backgroundImage:
@@ -780,21 +795,32 @@ export function NewMissionDialog({
             <div className="flex gap-2 pt-1">
               <button
                 type="button"
-                onClick={() => handleCreate(false)}
-                disabled={isBusy}
+                onClick={isEditMode ? handleClose : () => handleCreate(false)}
+                disabled={isBusy && !isEditMode}
                 className="flex-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] transition-colors disabled:opacity-50"
               >
-                Create here
+                {isEditMode ? 'Cancel' : 'Create here'}
               </button>
-              <button
-                type="button"
-                onClick={() => handleCreate(true)}
-                disabled={isBusy}
-                className="flex-1 flex items-center justify-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
-              >
-                New Tab
-                <ExternalLink className="h-3.5 w-3.5" />
-              </button>
+              {isEditMode ? (
+                <button
+                  type="button"
+                  onClick={() => handleCreate(false)}
+                  disabled={isBusy}
+                  className="flex-1 flex items-center justify-center rounded-lg bg-indigo-500 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                >
+                  Save
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => handleCreate(true)}
+                  disabled={isBusy}
+                  className="flex-1 flex items-center justify-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                >
+                  New Tab
+                  <ExternalLink className="h-3.5 w-3.5" />
+                </button>
+              )}
             </div>
           </div>
         </div>

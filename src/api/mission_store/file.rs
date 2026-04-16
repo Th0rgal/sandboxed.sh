@@ -245,6 +245,46 @@ impl MissionStore for FileMissionStore {
         self.persist().await
     }
 
+    async fn update_mission_run_settings(
+        &self,
+        id: Uuid,
+        backend: Option<&str>,
+        agent: Option<Option<&str>>,
+        model_override: Option<Option<&str>>,
+        model_effort: Option<Option<&str>>,
+        config_profile: Option<Option<&str>>,
+        session_id: &str,
+    ) -> Result<Mission, String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+
+        if let Some(backend) = backend {
+            mission.backend = backend.to_string();
+        }
+        if let Some(agent) = agent {
+            mission.agent = agent.map(ToString::to_string);
+        }
+        if let Some(model_override) = model_override {
+            mission.model_override = model_override.map(ToString::to_string);
+        }
+        if let Some(model_effort) = model_effort {
+            mission.model_effort = model_effort.map(ToString::to_string);
+        }
+        if let Some(config_profile) = config_profile {
+            mission.config_profile = config_profile.map(ToString::to_string);
+        }
+        mission.session_id = Some(session_id.to_string());
+        mission.resumable = false;
+        mission.interrupted_at = None;
+        mission.updated_at = now_string();
+        let updated = mission.clone();
+        drop(missions);
+        self.persist().await?;
+        Ok(updated)
+    }
+
     async fn update_mission_metadata(
         &self,
         id: Uuid,

@@ -39,17 +39,19 @@ export interface Mission {
   metadata_model?: string | null;
   metadata_version?: string | null;
   workspace_id?: string;
-  workspace_name?: string;
-  agent?: string;
-  model_override?: string;
-  model_effort?: ModelEffort;
+  workspace_name?: string | null;
+  agent?: string | null;
+  model_override?: string | null;
+  model_effort?: ModelEffort | null;
   backend?: string;
+  config_profile?: string | null;
   history: MissionHistoryEntry[];
   desktop_sessions?: DesktopSessionInfo[];
   created_at: string;
   updated_at: string;
   interrupted_at?: string;
   resumable?: boolean;
+  session_id?: string | null;
   parent_mission_id?: string;
   working_directory?: string;
   mission_mode?: "task" | "assistant";
@@ -76,6 +78,14 @@ export interface CreateMissionOptions {
   modelEffort?: ModelEffort;
   configProfile?: string;
   backend?: string;
+}
+
+export interface UpdateMissionSettingsOptions {
+  backend?: string;
+  agent?: string | null;
+  modelOverride?: string | null;
+  modelEffort?: ModelEffort | null;
+  configProfile?: string | null;
 }
 
 export interface RunningMissionInfo {
@@ -242,6 +252,35 @@ export async function setMissionStatus(
   status: MissionStatus
 ): Promise<void> {
   return apiPost(`/api/control/missions/${id}/status`, { status }, "Failed to set mission status");
+}
+
+export async function updateMissionSettings(
+  id: string,
+  options: UpdateMissionSettingsOptions
+): Promise<Mission> {
+  const body: {
+    backend?: string;
+    agent?: string | null;
+    model_override?: string | null;
+    model_effort?: ModelEffort | null;
+    config_profile?: string | null;
+  } = {};
+  if ("backend" in options) body.backend = options.backend;
+  if ("agent" in options) body.agent = options.agent;
+  if ("modelOverride" in options) body.model_override = options.modelOverride;
+  if ("modelEffort" in options) body.model_effort = options.modelEffort;
+  if ("configProfile" in options) body.config_profile = options.configProfile;
+
+  const res = await apiFetch(`/api/control/missions/${id}/settings`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to update mission settings: ${text}`);
+  }
+  return res.json();
 }
 
 export async function deleteMission(id: string): Promise<{ ok: boolean; deleted: string }> {

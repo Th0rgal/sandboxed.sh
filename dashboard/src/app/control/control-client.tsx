@@ -30,6 +30,7 @@ import {
   getMissionEvents,
   searchMissionMoments,
   createMission,
+  updateMissionSettings,
   listMissions,
   setMissionStatus,
   resumeMission,
@@ -4794,6 +4795,58 @@ export default function ControlClient() {
     }
   };
 
+  const handleUpdateMissionSettings = async (options?: {
+    workspaceId?: string;
+    agent?: string;
+    modelOverride?: string;
+    modelEffort?: ModelEffort;
+    configProfile?: string;
+    backend?: string;
+    openInNewTab?: boolean;
+  }) => {
+    const mission = viewingMission ?? currentMission;
+    if (!mission) {
+      throw new Error("No mission selected");
+    }
+    try {
+      setMissionLoading(true);
+      const updated = await updateMissionSettings(mission.id, {
+        backend: options?.backend,
+        agent: options?.agent ?? null,
+        modelOverride: options?.modelOverride ?? null,
+        modelEffort: options?.modelEffort ?? null,
+        configProfile: options?.configProfile ?? null,
+      });
+
+      if (currentMission?.id === updated.id) {
+        setCurrentMission(updated);
+      }
+      if (viewingMission?.id === updated.id) {
+        setViewingMission(updated);
+      }
+      setRecentMissions((prev) => {
+        let changed = false;
+        const next = prev.map((item) => {
+          if (item.id !== updated.id) return item;
+          changed = true;
+          return { ...item, ...updated };
+        });
+        return changed
+          ? [...next].sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+          : prev;
+      });
+      refreshRecentMissions();
+      toast.success("Mission run settings updated");
+      return { id: updated.id };
+    } catch (err) {
+      console.error("Failed to update mission settings:", err);
+      toast.error(err instanceof Error ? err.message : "Failed to update mission settings");
+      throw err;
+    } finally {
+      setMissionLoading(false);
+    }
+  };
+
   // Handle setting mission status
   const handleSetStatus = async (status: MissionStatus) => {
     const mission = viewingMission ?? currentMission;
@@ -4917,9 +4970,9 @@ export default function ControlClient() {
 
         const followUpMission = await createMission({
           workspaceId: sourceMission.workspace_id,
-          agent: sourceMission.agent,
-          modelOverride: sourceMission.model_override,
-          modelEffort: sourceMission.model_effort,
+          agent: sourceMission.agent || undefined,
+          modelOverride: sourceMission.model_override || undefined,
+          modelEffort: sourceMission.model_effort || undefined,
           backend: sourceMission.backend,
         });
 
@@ -5955,6 +6008,76 @@ export default function ControlClient() {
         }
       }
 
+      if (event.type === "mission_settings_updated" && isRecord(data)) {
+        const missionId = typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+        if (missionId) {
+          const backend = typeof data["backend"] === "string" ? data["backend"] : undefined;
+          const agent =
+            data["agent"] === null
+              ? null
+              : typeof data["agent"] === "string"
+                ? data["agent"]
+                : undefined;
+          const modelOverride =
+            data["model_override"] === null
+              ? null
+              : typeof data["model_override"] === "string"
+                ? data["model_override"]
+                : undefined;
+          const modelEffort =
+            data["model_effort"] === null
+              ? null
+              : typeof data["model_effort"] === "string"
+                ? data["model_effort"]
+                : undefined;
+          const configProfile =
+            data["config_profile"] === null
+              ? null
+              : typeof data["config_profile"] === "string"
+                ? data["config_profile"]
+                : undefined;
+          const sessionId =
+            data["session_id"] === null
+              ? null
+              : typeof data["session_id"] === "string"
+                ? data["session_id"]
+                : undefined;
+          const updatedAt =
+            typeof data["updated_at"] === "string" ? data["updated_at"] : undefined;
+          const applySettings = (mission: Mission): Mission => ({
+            ...mission,
+            ...(backend !== undefined ? { backend } : {}),
+            ...(agent !== undefined ? { agent } : {}),
+            ...(modelOverride !== undefined ? { model_override: modelOverride } : {}),
+            ...(modelEffort !== undefined ? { model_effort: modelEffort as ModelEffort | null } : {}),
+            ...(configProfile !== undefined ? { config_profile: configProfile } : {}),
+            ...(sessionId !== undefined ? { session_id: sessionId } : {}),
+            ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
+            resumable: false,
+          });
+
+          setRecentMissions((prev) => {
+            let changed = false;
+            const next = prev.map((mission) => {
+              if (mission.id !== missionId) return mission;
+              changed = true;
+              return applySettings(mission);
+            });
+            return changed && updatedAt !== undefined
+              ? [...next].sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+              : changed
+                ? next
+                : prev;
+          });
+          if (currentMissionRef.current?.id === missionId) {
+            setCurrentMission((prev) => (prev ? applySettings(prev) : prev));
+          }
+          if (viewingMissionRef.current?.id === missionId) {
+            setViewingMission((prev) => (prev ? applySettings(prev) : prev));
+          }
+        }
+      }
+
       // Handle progress updates
       if (event.type === "progress" && isRecord(data)) {
         const progressMissionId =
@@ -6588,12 +6711,31 @@ export default function ControlClient() {
             onCreate={handleNewMission}
             initialValues={activeMission ? {
               workspaceId: activeMission.workspace_id,
-              agent: activeMission.agent,
+              agent: activeMission.agent || undefined,
               backend: activeMission.backend,
-              modelOverride: activeMission.model_override,
-              modelEffort: activeMission.model_effort,
+              modelOverride: activeMission.model_override || undefined,
+              modelEffort: activeMission.model_effort || undefined,
+              configProfile: activeMission.config_profile,
             } : undefined}
           />
+
+          {activeMission && (
+            <NewMissionDialog
+              workspaces={workspaces}
+              disabled={missionLoading || viewingMissionIsRunning}
+              onCreate={handleUpdateMissionSettings}
+              mode="edit"
+              lockWorkspace
+              initialValues={{
+                workspaceId: activeMission.workspace_id,
+                agent: activeMission.agent || undefined,
+                backend: activeMission.backend,
+                modelOverride: activeMission.model_override || undefined,
+                modelEffort: activeMission.model_effort || undefined,
+                configProfile: activeMission.config_profile,
+              }}
+            />
+          )}
 
           <button
             onClick={() => setShowAutomationsDialog(true)}
