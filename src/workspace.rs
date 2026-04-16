@@ -3882,48 +3882,52 @@ pub async fn write_runtime_workspace_state(
     }
     let context_link = working_dir.join(context_dir_name);
     if let Some(target) = mission_context.as_ref() {
-        // Use symlink_metadata to avoid following symlinks (prevents ELOOP errors)
-        if tokio::fs::symlink_metadata(&context_link).await.is_ok()
-            && tokio::fs::remove_file(&context_link).await.is_err()
-        {
-            if let Err(e) = tokio::fs::remove_dir_all(&context_link).await {
-                tracing::warn!(
-                    workspace = %workspace.name,
-                    mission = ?mission_id,
-                    error = %e,
-                    "Failed to clear existing context link"
-                );
+        if context_link != context_root {
+            // Use symlink_metadata to avoid following symlinks (prevents ELOOP errors)
+            if tokio::fs::symlink_metadata(&context_link).await.is_ok()
+                && tokio::fs::remove_file(&context_link).await.is_err()
+            {
+                if let Err(e) = tokio::fs::remove_dir_all(&context_link).await {
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        mission = ?mission_id,
+                        error = %e,
+                        "Failed to clear existing context link"
+                    );
+                }
             }
-        }
-        #[cfg(unix)]
-        {
-            // For container workspaces, the symlink must point to the container path
-            // since /root/context is bind-mounted, not the host path
-            let symlink_target = if workspace.workspace_type == WorkspaceType::Container {
-                // mission_id is guaranteed Some here because we're inside
-                // `if let Some(target) = mission_context.as_ref()` and
-                // mission_context is derived from mission_id.map(...)
-                PathBuf::from("/root").join(context_dir_name).join(
-                    mission_id
-                        .expect("mission_id must be Some inside mission_context block")
-                        .to_string(),
-                )
-            } else {
-                target.clone()
-            };
-            if let Err(e) = std::os::unix::fs::symlink(&symlink_target, &context_link) {
-                tracing::warn!(
-                    workspace = %workspace.name,
-                    mission = ?mission_id,
-                    error = %e,
-                    "Failed to create context symlink; falling back to directory"
-                );
+            #[cfg(unix)]
+            {
+                // For container workspaces, the symlink must point to the container path
+                // since /root/context is bind-mounted, not the host path
+                let symlink_target = if workspace.workspace_type == WorkspaceType::Container {
+                    // mission_id is guaranteed Some here because we're inside
+                    // `if let Some(target) = mission_context.as_ref()` and
+                    // mission_context is derived from mission_id.map(...)
+                    PathBuf::from("/root").join(context_dir_name).join(
+                        mission_id
+                            .expect("mission_id must be Some inside mission_context block")
+                            .to_string(),
+                    )
+                } else {
+                    target.clone()
+                };
+                if let Err(e) = std::os::unix::fs::symlink(&symlink_target, &context_link) {
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        mission = ?mission_id,
+                        error = %e,
+                        "Failed to create context symlink; falling back to directory"
+                    );
+                    let _ = tokio::fs::create_dir_all(&context_link).await;
+                }
+            }
+            #[cfg(not(unix))]
+            {
                 let _ = tokio::fs::create_dir_all(&context_link).await;
             }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::fs::create_dir_all(&context_link).await;
+        } else {
+            tracing::debug!("Skipping context symlink creation; workspace directory is root.");
         }
     }
 
