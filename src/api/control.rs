@@ -5627,6 +5627,7 @@ fn is_bare_llm_error_output(output: &str) -> bool {
     matches!(
         normalized.as_str(),
         "internal server error"
+            | "invalid authentication credentials"
             | "unknown error"
             | "service unavailable"
             | "bad gateway"

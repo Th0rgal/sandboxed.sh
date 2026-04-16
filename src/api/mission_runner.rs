@@ -5226,6 +5226,18 @@ pub fn run_claudecode_turn<'a>(
             );
             AgentResult::failure(final_result, cost_cents)
                 .with_terminal_reason(TerminalReason::RateLimited)
+        } else if is_auth_error(&final_result) {
+            // Claude Code can surface revoked/expired credential failures as a
+            // normal assistant message while exiting successfully. Treat that
+            // as AuthError so the caller invalidates stale credentials, refreshes
+            // OAuth, and retries instead of completing the mission with the error
+            // text as if it were the agent's answer.
+            tracing::warn!(
+                mission_id = %mission_id,
+                "Claude Code returned an auth error as a successful turn; marking as AuthError for credential refresh"
+            );
+            AgentResult::failure(final_result, cost_cents)
+                .with_terminal_reason(TerminalReason::AuthError)
         } else if is_provider_payload_error(&final_result) {
             // Claude Code can surface provider request validation errors as
             // ordinary assistant text while exiting successfully. Treat them as
@@ -13567,6 +13579,15 @@ mod tests {
         assert!(is_rate_limited_error("Overloaded_Error occurred"));
         assert!(!is_rate_limited_error("Model finished successfully"));
         assert!(!is_rate_limited_error("error: 123"));
+    }
+
+    #[test]
+    fn is_auth_error_detects_bare_invalid_credentials() {
+        use super::is_auth_error;
+
+        assert!(is_auth_error("Invalid authentication credentials"));
+        assert!(is_auth_error("authentication_error from provider"));
+        assert!(!is_auth_error("The agent authenticated successfully"));
     }
 
     #[test]
