@@ -9030,6 +9030,63 @@ async fn run_single_control_turn(
                 }
             }
 
+            // Account rotation can surface a revoked/expired alternate OAuth
+            // credential. Run the same stale-credential recovery after rotation
+            // so the mission retries with freshly refreshed host credentials
+            // instead of stopping on "Invalid authentication credentials".
+            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
+                tracing::warn!(
+                    mission_id = %mid,
+                    "Auth error detected after credential rotation - invalidating stale credentials and retrying"
+                );
+
+                let mission_creds = ctx.working_dir.join(".claude").join(".credentials.json");
+                if mission_creds.exists() {
+                    let _ = std::fs::remove_file(&mission_creds);
+                    tracing::info!(
+                        path = %mission_creds.display(),
+                        "Removed stale per-mission CLI credentials"
+                    );
+                }
+
+                for host_path in &[
+                    std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
+                    std::path::PathBuf::from("/root/.claude/.credentials.json"),
+                ] {
+                    if host_path.exists() {
+                        let _ = std::fs::remove_file(host_path);
+                        tracing::info!(
+                            path = %host_path.display(),
+                            "Removed stale host CLI credentials"
+                        );
+                    }
+                }
+
+                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
+                    tracing::warn!("OAuth refresh after rotated auth error failed: {}", e);
+                }
+
+                result = Box::pin(super::mission_runner::run_claudecode_turn(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &effective_message,
+                    config.default_model.as_deref(),
+                    requested_model_effort.as_deref(),
+                    config.opencode_agent.as_deref(),
+                    mid,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    None,
+                    &config.working_dir,
+                    effective_session_id.as_deref(),
+                    is_continuation,
+                    Some(tool_hub.clone()),
+                    Some(status.clone()),
+                    None,
+                ))
+                .await;
+            }
+
             result
         }
         Some("amp") => {

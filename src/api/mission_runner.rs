@@ -2868,6 +2868,62 @@ async fn run_mission_turn(
                 }
             }
 
+            // If an alternate OAuth credential is revoked, rotation returns
+            // AuthError. Refresh stale Claude credentials and retry once with
+            // freshly resolved auth instead of surfacing a raw 401.
+            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    "Auth error detected after credential rotation - invalidating stale credentials and retrying"
+                );
+
+                let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
+                if mission_creds.exists() {
+                    let _ = std::fs::remove_file(&mission_creds);
+                    tracing::info!(
+                        path = %mission_creds.display(),
+                        "Removed stale per-mission CLI credentials"
+                    );
+                }
+
+                for host_path in &[
+                    std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
+                    std::path::PathBuf::from("/root/.claude/.credentials.json"),
+                ] {
+                    if host_path.exists() {
+                        let _ = std::fs::remove_file(host_path);
+                        tracing::info!(
+                            path = %host_path.display(),
+                            "Removed stale host CLI credentials"
+                        );
+                    }
+                }
+
+                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
+                    tracing::warn!("OAuth refresh after rotated auth error failed: {}", e);
+                }
+
+                result = run_claudecode_turn(
+                    &workspace,
+                    &mission_work_dir,
+                    &effective_msg,
+                    config.default_model.as_deref(),
+                    model_effort.as_deref(),
+                    effective_agent.as_deref(),
+                    mission_id,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    secrets.clone(),
+                    &config.working_dir,
+                    effective_sid.as_deref(),
+                    is_continuation,
+                    Some(Arc::clone(&tool_hub)),
+                    Some(Arc::clone(&status)),
+                    None,
+                )
+                .await;
+            }
+
             result
         }
         "opencode" => {
