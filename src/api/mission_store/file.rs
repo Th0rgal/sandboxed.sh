@@ -278,6 +278,7 @@ impl MissionStore for FileMissionStore {
         mission.session_id = Some(session_id.to_string());
         mission.resumable = false;
         mission.interrupted_at = None;
+        mission.terminal_reason = None;
         mission.updated_at = now_string();
         let updated = mission.clone();
         drop(missions);
@@ -603,6 +604,45 @@ mod tests {
             metadata_updated_at >= seeded_metadata_updated_at,
             "manual title update should advance metadata timestamp"
         );
+    }
+
+    #[tokio::test]
+    async fn update_mission_run_settings_clears_terminal_reason() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = FileMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("file store");
+        let mission = store
+            .create_mission(Some("Initial"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+
+        store
+            .update_mission_status_with_reason(
+                mission.id,
+                MissionStatus::Failed,
+                Some("rate_limited"),
+            )
+            .await
+            .expect("set terminal reason");
+
+        let updated = store
+            .update_mission_run_settings(
+                mission.id,
+                Some("codex"),
+                None,
+                None,
+                None,
+                None,
+                "new-session",
+            )
+            .await
+            .expect("update run settings");
+
+        assert_eq!(updated.terminal_reason, None);
+        assert_eq!(updated.session_id.as_deref(), Some("new-session"));
+        assert!(!updated.resumable);
+        assert_eq!(updated.interrupted_at, None);
     }
 
     #[tokio::test]

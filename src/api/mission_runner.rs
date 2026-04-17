@@ -5809,10 +5809,9 @@ fn is_standalone_invalid_credentials_message(message: &str) -> bool {
 }
 
 fn is_success_path_rate_limited_error(message: &str) -> bool {
-    let lower = message.trim().to_ascii_lowercase();
+    let lower = message.trim().replace('\u{2019}', "'").to_ascii_lowercase();
     lower.starts_with("you've hit your limit")
         || lower.starts_with("you have hit your limit")
-        || lower.starts_with("you’ve hit your limit")
         || (looks_like_explicit_provider_error_output(message) && is_rate_limited_error(message))
 }
 
