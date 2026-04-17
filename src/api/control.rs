@@ -5823,6 +5823,7 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
     if output.len() >= 20
         && !output.starts_with("Codex produced no output")
         && !output.starts_with("Codex CLI produced no JSON")
+        && !output.starts_with("Codex CLI exited before completing the turn")
         && !output.starts_with("No response from")
         && !output.starts_with("Claude Code error:")
         && !is_bare_llm_error_output(output)
@@ -14530,6 +14531,21 @@ Investigate <service/> failures.
     fn maybe_recover_soft_llm_error_does_not_recover_provider_payload_error() {
         let mut result = crate::agents::AgentResult::failure(
             "messages.13.content.88.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels"
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_codex_process_exit() {
+        let mut result = crate::agents::AgentResult::failure(
+            "Codex CLI exited before completing the turn (exit_status: signal: 9 (SIGKILL)). Stderr: <empty> | Stdout: <empty>"
                 .to_string(),
             0,
         )

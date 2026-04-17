@@ -16,7 +16,13 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tokio::process::{Child, Command};
 
 use crate::nspawn;
+use crate::util::env_var_bool;
 use crate::workspace::{use_nspawn_for_workspace, TailscaleMode, Workspace, WorkspaceType};
+
+const CONTAINER_KEEPALIVE_ENV_KEY: &str = "SANDBOXED_SH_CONTAINER_KEEPALIVE";
+const CONTAINER_KEEPALIVE_ENV_VALUE: &str = "1";
+const ALLOW_TRANSIENT_CONTAINER_NSENTER_ENV: &str =
+    "SANDBOXED_SH_ALLOW_TRANSIENT_CONTAINER_NSENTER";
 
 const CONTAINER_DEFAULT_PATH_DIRS: &[&str] = &[
     "/root/.bun/bin",
@@ -50,6 +56,16 @@ fn normalize_container_path(existing: Option<&str>) -> String {
     }
 
     dirs.join(":")
+}
+
+fn environ_has_keepalive_marker(environ: &[u8]) -> bool {
+    let expected = format!(
+        "{}={}",
+        CONTAINER_KEEPALIVE_ENV_KEY, CONTAINER_KEEPALIVE_ENV_VALUE
+    );
+    environ
+        .split(|byte| *byte == 0)
+        .any(|entry| entry == expected.as_bytes())
 }
 
 fn select_container_resolv_conf() -> Option<PathBuf> {
@@ -106,7 +122,7 @@ fn bind_resolv_conf(cmd: &mut Command) {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_container_path;
+    use super::{environ_has_keepalive_marker, normalize_container_path};
 
     #[test]
     fn container_path_adds_system_dirs_when_missing() {
@@ -127,19 +143,15 @@ mod tests {
         assert_eq!(dirs.iter().filter(|dir| **dir == "/usr/bin").count(), 1);
         assert_eq!(dirs.iter().filter(|dir| **dir == "/tmp/wrapper").count(), 1);
     }
-}
 
-fn bind_resolv_conf_cmd_builder(cmd: &mut CommandBuilder) {
-    if let Some(path) = select_container_resolv_conf() {
-        if path == Path::new("/etc/resolv.conf") {
-            cmd.arg("--bind-ro=/etc/resolv.conf");
-        } else {
-            cmd.arg(format!(
-                "--bind-ro={}:{}",
-                path.display(),
-                "/etc/resolv.conf"
-            ));
-        }
+    #[test]
+    fn keepalive_marker_is_detected_in_proc_environ_bytes() {
+        assert!(environ_has_keepalive_marker(
+            b"PATH=/usr/bin\0SANDBOXED_SH_CONTAINER_KEEPALIVE=1\0HOME=/root\0"
+        ));
+        assert!(!environ_has_keepalive_marker(
+            b"PATH=/usr/bin\0SANDBOXED_SH_CONTAINER_KEEPALIVE=0\0HOME=/root\0"
+        ));
     }
 }
 
@@ -523,6 +535,129 @@ impl WorkspaceExec {
         }
     }
 
+    fn leader_has_keepalive_marker(&self, leader: &str) -> bool {
+        let path = format!("/proc/{}/environ", leader);
+        std::fs::read(path)
+            .map(|bytes| environ_has_keepalive_marker(&bytes))
+            .unwrap_or(false)
+    }
+
+    async fn start_persistent_container_leader(
+        &self,
+        env: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        let root = self.workspace.path.clone();
+        let name = self
+            .machine_name()
+            .filter(|name| !name.trim().is_empty())
+            .context("Container workspace has no machine name")?;
+
+        let mut cmd = Command::new("systemd-nspawn");
+        cmd.arg("-D").arg(root);
+        cmd.arg(format!("--machine={}", name));
+        cmd.arg("--quiet");
+        cmd.arg("--timezone=off");
+        cmd.arg("--console=pipe");
+
+        let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "context".to_string());
+        let global_context_root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/root").join(&context_dir_name));
+        if global_context_root.exists() {
+            cmd.arg(format!(
+                "--bind={}:/root/context",
+                global_context_root.display()
+            ));
+        }
+
+        let x11_socket_path = Path::new("/tmp/.X11-unix");
+        if x11_socket_path.exists() {
+            cmd.arg("--bind=/tmp/.X11-unix");
+        }
+
+        let fido_agent_path = Path::new("/run/sandboxed-sh/fido-agent.sock");
+        if fido_agent_path.exists() {
+            cmd.arg("--bind=/run/sandboxed-sh/fido-agent.sock");
+        }
+
+        let use_shared_network = self.workspace.shared_network.unwrap_or(true);
+        if use_shared_network {
+            bind_resolv_conf(&mut cmd);
+        } else {
+            let tailscale_args = nspawn::tailscale_nspawn_extra_args(env);
+            bind_resolv_conf(&mut cmd);
+            for arg in tailscale_args {
+                cmd.arg(arg);
+            }
+        }
+
+        cmd.arg(format!(
+            "--setenv={}={}",
+            CONTAINER_KEEPALIVE_ENV_KEY, CONTAINER_KEEPALIVE_ENV_VALUE
+        ));
+        cmd.arg("/bin/sh");
+        cmd.arg("-lc");
+        cmd.arg("trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = cmd
+            .spawn()
+            .context("Failed to start persistent container leader")?;
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+
+        Ok(())
+    }
+
+    async fn ensure_persistent_container_leader(
+        &self,
+        env: &HashMap<String, String>,
+    ) -> anyhow::Result<String> {
+        if let Some(leader) = self.running_container_leader().await {
+            if self.leader_has_keepalive_marker(&leader) {
+                return Ok(leader);
+            }
+
+            if env_var_bool(ALLOW_TRANSIENT_CONTAINER_NSENTER_ENV, false) {
+                tracing::warn!(
+                    workspace = %self.workspace.name,
+                    leader = %leader,
+                    "Attaching to transient container leader because override is enabled"
+                );
+                return Ok(leader);
+            }
+
+            anyhow::bail!(
+                "Container workspace '{}' is currently led by transient process {}. Refusing to attach a long-running CLI to it because it can be SIGKILLed when that leader exits.",
+                self.workspace.name,
+                leader
+            );
+        }
+
+        self.start_persistent_container_leader(env).await?;
+        for attempt in 1..=50 {
+            if let Some(leader) = self.running_container_leader().await {
+                if self.leader_has_keepalive_marker(&leader) {
+                    return Ok(leader);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100 * attempt.min(5))).await;
+        }
+
+        anyhow::bail!(
+            "Persistent container leader for workspace '{}' did not become ready",
+            self.workspace.name
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_nsenter_command(
         &self,
@@ -621,6 +756,14 @@ impl WorkspaceExec {
                     env.insert("HOME".to_string(), "/root".to_string());
                 }
 
+                let fido_agent_path = Path::new("/run/sandboxed-sh/fido-agent.sock");
+                if fido_agent_path.exists() {
+                    env.insert(
+                        "SSH_AUTH_SOCK".to_string(),
+                        "/run/sandboxed-sh/fido-agent.sock".to_string(),
+                    );
+                }
+
                 // Debug: log env vars relevant to Tailscale
                 let has_ts_authkey = env.contains_key("TS_AUTHKEY");
                 let has_ts_exit_node = env.contains_key("TS_EXIT_NODE");
@@ -654,179 +797,19 @@ impl WorkspaceExec {
                         .tailscale_mode
                         .unwrap_or(TailscaleMode::ExitNode)
                         == TailscaleMode::TailnetOnly;
-                if let Some(leader) = self.running_container_leader().await {
-                    return self.build_nsenter_command(
-                        &leader,
-                        cwd,
-                        program,
-                        args,
-                        env,
-                        needs_tailscale_bootstrap,
-                        nsenter_tailnet_only,
-                        stdin,
-                        stdout,
-                        stderr,
-                    );
-                }
-
-                // For container workspaces we execute via systemd-nspawn.
-                // Note: this requires systemd-nspawn on the host at runtime.
-                let root = self.workspace.path.clone();
-                let rel_cwd = self.rel_path_in_container(cwd);
-
-                let mut cmd = Command::new("systemd-nspawn");
-                cmd.arg("-D").arg(root);
-                cmd.arg("--quiet");
-                cmd.arg("--timezone=off");
-                cmd.arg("--console=pipe");
-                cmd.arg("--chdir").arg(&rel_cwd);
-
-                // Ensure /root/context is available if Open Agent configured it.
-                let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| "context".to_string());
-                let global_context_root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("/root").join(&context_dir_name));
-                if global_context_root.exists() {
-                    cmd.arg(format!(
-                        "--bind={}:/root/context",
-                        global_context_root.display()
-                    ));
-                    cmd.arg("--setenv=SANDBOXED_SH_CONTEXT_ROOT=/root/context");
-                    cmd.arg(format!(
-                        "--setenv=SANDBOXED_SH_CONTEXT_DIR_NAME={}",
-                        context_dir_name
-                    ));
-                }
-
-                // Bind X11 socket for GUI applications (e.g., Minecraft) when available.
-                // The desktop MCP creates Xvfb displays on the host; containers need
-                // access to /tmp/.X11-unix to connect to these displays.
-                let x11_socket_path = Path::new("/tmp/.X11-unix");
-                if x11_socket_path.exists() {
-                    cmd.arg("--bind=/tmp/.X11-unix");
-                }
-
-                // Bind-mount the FIDO agent proxy socket so SSH inside
-                // containers can relay signing requests to the mobile app.
-                let fido_agent_path = Path::new("/run/sandboxed-sh/fido-agent.sock");
-                if fido_agent_path.exists() {
-                    cmd.arg("--bind=/run/sandboxed-sh/fido-agent.sock");
-                    env.insert(
-                        "SSH_AUTH_SOCK".to_string(),
-                        "/run/sandboxed-sh/fido-agent.sock".to_string(),
-                    );
-                }
-
-                // Network configuration.
-                // Respect the user's shared_network setting directly.
-                // - shared_network=true: Use host network (and host's Tailscale if connected)
-                // - shared_network=false: Isolated network with optional Tailscale
-                //   - tailscale_mode=exit_node: All traffic via Tailscale exit node
-                //   - tailscale_mode=tailnet_only: Tailscale for tailnet, host gateway for internet
-                let use_shared_network = self.workspace.shared_network.unwrap_or(true);
-                let tailscale_mode = self
-                    .workspace
-                    .tailscale_mode
-                    .unwrap_or(TailscaleMode::ExitNode);
-                let tailscale_requested = nspawn::tailscale_enabled(&env);
-
-                tracing::debug!(
-                    workspace = %self.workspace.name,
-                    shared_network = ?self.workspace.shared_network,
-                    tailscale_mode = ?tailscale_mode,
-                    tailscale_requested = %tailscale_requested,
-                    use_shared_network = %use_shared_network,
-                    "WorkspaceExec: checking network configuration"
-                );
-
-                let tailscale_enabled = if use_shared_network {
-                    // Shared network: use host network, bind DNS
-                    tracing::debug!("WorkspaceExec: shared_network=true, binding resolv.conf");
-                    bind_resolv_conf(&mut cmd);
-                    false
-                } else {
-                    // Isolated network: check if Tailscale is configured
-                    let tailscale_args = nspawn::tailscale_nspawn_extra_args(&env);
-                    tracing::debug!(
-                        tailscale_args = ?tailscale_args,
-                        "WorkspaceExec: checking Tailscale args"
-                    );
-                    if tailscale_args.is_empty() {
-                        tracing::debug!("WorkspaceExec: no Tailscale args, binding resolv.conf");
-                        bind_resolv_conf(&mut cmd);
-                        false
-                    } else {
-                        tracing::info!(
-                            workspace = %self.workspace.name,
-                            tailscale_mode = %tailscale_mode.as_str(),
-                            "WorkspaceExec: Tailscale networking enabled"
-                        );
-                        bind_resolv_conf(&mut cmd);
-                        for a in tailscale_args {
-                            cmd.arg(a);
-                        }
-                        true
-                    }
-                };
-
-                // For tailnet_only mode, we need to tell the bootstrap script
-                // to set up a default route via host gateway for internet access
-                let tailnet_only =
-                    tailscale_enabled && tailscale_mode == TailscaleMode::TailnetOnly;
-
-                // Set env vars inside the container.
-                for (k, v) in &env {
-                    if k.trim().is_empty() {
-                        continue;
-                    }
-                    cmd.arg(format!("--setenv={}={}", k, v));
-                }
-
-                // When Tailscale is enabled, wrap the command in a shell that bootstraps
-                // networking before running the actual program. The bootstrap scripts
-                // are installed by the workspace template's init_script.
-                if tailscale_enabled {
-                    // Build a shell command that:
-                    // 1. Runs sandboxed-tailscale-up (which also calls sandboxed-network-up)
-                    // 2. Execs the actual program to hand off control
-                    let shell_cmd = Self::build_tailscale_bootstrap_command(
-                        &rel_cwd,
-                        program,
-                        args,
-                        &env,
-                        false,
-                        tailnet_only,
-                    );
-                    tracing::info!(
-                        workspace = %self.workspace.name,
-                        program = %program,
-                        tailnet_only = %tailnet_only,
-                        "WorkspaceExec: running with Tailscale bootstrap"
-                    );
-                    tracing::debug!(
-                        shell_cmd = %shell_cmd,
-                        "WorkspaceExec: Tailscale bootstrap shell command"
-                    );
-                    cmd.arg("/bin/sh");
-                    cmd.arg("-c");
-                    cmd.arg(shell_cmd);
-                } else {
-                    tracing::debug!(
-                        workspace = %self.workspace.name,
-                        program = %program,
-                        "WorkspaceExec: running without Tailscale bootstrap"
-                    );
-                    cmd.arg(program);
-                    cmd.args(args);
-                }
-
-                cmd.stdin(stdin).stdout(stdout).stderr(stderr);
-                Ok(cmd)
+                let leader = self.ensure_persistent_container_leader(&env).await?;
+                self.build_nsenter_command(
+                    &leader,
+                    cwd,
+                    program,
+                    args,
+                    env,
+                    needs_tailscale_bootstrap,
+                    nsenter_tailnet_only,
+                    stdin,
+                    stdout,
+                    stderr,
+                )
             }
         }
     }
@@ -1003,6 +986,14 @@ impl WorkspaceExec {
                         env.insert("HOME".to_string(), "/root".to_string());
                     }
 
+                    let fido_agent_path = Path::new("/run/sandboxed-sh/fido-agent.sock");
+                    if fido_agent_path.exists() {
+                        env.insert(
+                            "SSH_AUTH_SOCK".to_string(),
+                            "/run/sandboxed-sh/fido-agent.sock".to_string(),
+                        );
+                    }
+
                     // Determine if Tailscale bootstrap is needed before the nsenter check.
                     let tailscale_enabled_check = nspawn::tailscale_enabled(&env);
                     let tailscale_args = nspawn::tailscale_nspawn_extra_args(&env);
@@ -1015,136 +1006,34 @@ impl WorkspaceExec {
                             .unwrap_or(TailscaleMode::ExitNode)
                             == TailscaleMode::TailnetOnly;
 
-                    if let Some(leader) = self.running_container_leader().await {
-                        let nsenter = if Path::new("/usr/bin/nsenter").exists() {
-                            "/usr/bin/nsenter"
-                        } else {
-                            "nsenter"
-                        };
-                        let rel_cwd = self.rel_path_in_container(cwd);
-                        let shell_cmd = if needs_tailscale_bootstrap {
-                            Self::build_tailscale_bootstrap_command(
-                                &rel_cwd,
-                                program,
-                                args,
-                                &env,
-                                true,
-                                nsenter_tailnet_only,
-                            )
-                        } else {
-                            let env_ref = if env.is_empty() { None } else { Some(&env) };
-                            Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
-                        };
-
-                        let mut cmd = CommandBuilder::new(nsenter);
-                        cmd.arg("--target");
-                        cmd.arg(leader);
-                        cmd.args(["--mount", "--uts", "--ipc", "--net", "--pid"]);
-                        cmd.args(["/bin/sh", "-lc"]);
-                        cmd.arg(shell_cmd);
-                        cmd
+                    let leader = self.ensure_persistent_container_leader(&env).await?;
+                    let nsenter = if Path::new("/usr/bin/nsenter").exists() {
+                        "/usr/bin/nsenter"
                     } else {
-                        // Spawn a one-shot command inside the container with systemd-nspawn.
-                        let root = self.workspace.path.clone();
-                        let rel_cwd = self.rel_path_in_container(cwd);
+                        "nsenter"
+                    };
+                    let rel_cwd = self.rel_path_in_container(cwd);
+                    let shell_cmd = if needs_tailscale_bootstrap {
+                        Self::build_tailscale_bootstrap_command(
+                            &rel_cwd,
+                            program,
+                            args,
+                            &env,
+                            true,
+                            nsenter_tailnet_only,
+                        )
+                    } else {
+                        let env_ref = if env.is_empty() { None } else { Some(&env) };
+                        Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
+                    };
 
-                        let mut cmd = CommandBuilder::new("systemd-nspawn");
-                        cmd.arg("-D");
-                        cmd.arg(root.to_string_lossy().to_string());
-                        cmd.arg("--quiet");
-                        cmd.arg("--timezone=off");
-                        cmd.arg("--chdir");
-                        cmd.arg(rel_cwd.clone());
-
-                        // Ensure /root/context is available if Open Agent configured it.
-                        let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
-                            .ok()
-                            .filter(|s| !s.trim().is_empty())
-                            .unwrap_or_else(|| "context".to_string());
-                        let global_context_root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
-                            .ok()
-                            .filter(|s| !s.trim().is_empty())
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| PathBuf::from("/root").join(&context_dir_name));
-                        if global_context_root.exists() {
-                            cmd.arg(format!(
-                                "--bind={}:/root/context",
-                                global_context_root.display()
-                            ));
-                            cmd.arg("--setenv=SANDBOXED_SH_CONTEXT_ROOT=/root/context");
-                            cmd.arg(format!(
-                                "--setenv=SANDBOXED_SH_CONTEXT_DIR_NAME={}",
-                                context_dir_name
-                            ));
-                        }
-
-                        // Bind X11 socket for GUI applications when available.
-                        let x11_socket_path = Path::new("/tmp/.X11-unix");
-                        if x11_socket_path.exists() {
-                            cmd.arg("--bind=/tmp/.X11-unix");
-                        }
-
-                        // Bind FIDO agent proxy socket for SSH signing relay.
-                        let fido_agent_path = Path::new("/run/sandboxed-sh/fido-agent.sock");
-                        if fido_agent_path.exists() {
-                            cmd.arg("--bind=/run/sandboxed-sh/fido-agent.sock");
-                            cmd.arg("--setenv=SSH_AUTH_SOCK=/run/sandboxed-sh/fido-agent.sock");
-                        }
-
-                        // Network configuration (same behavior as spawn_streaming/output).
-                        let use_shared_network = self.workspace.shared_network.unwrap_or(true);
-                        let tailscale_mode = self
-                            .workspace
-                            .tailscale_mode
-                            .unwrap_or(TailscaleMode::ExitNode);
-
-                        let tailscale_enabled = if use_shared_network {
-                            bind_resolv_conf_cmd_builder(&mut cmd);
-                            false
-                        } else {
-                            let tailscale_args = nspawn::tailscale_nspawn_extra_args(&env);
-                            if tailscale_args.is_empty() {
-                                bind_resolv_conf_cmd_builder(&mut cmd);
-                                false
-                            } else {
-                                bind_resolv_conf_cmd_builder(&mut cmd);
-                                for a in tailscale_args {
-                                    cmd.arg(a);
-                                }
-                                true
-                            }
-                        };
-
-                        // For tailnet_only mode, tell the bootstrap script to route internet via host gateway.
-                        let tailnet_only =
-                            tailscale_enabled && tailscale_mode == TailscaleMode::TailnetOnly;
-
-                        // Set env vars inside the container.
-                        for (k, v) in &env {
-                            if k.trim().is_empty() {
-                                continue;
-                            }
-                            cmd.arg(format!("--setenv={}={}", k, v));
-                        }
-
-                        if tailscale_enabled {
-                            // When Tailscale is configured, run the bootstrap script then exec the program.
-                            let shell_cmd = Self::build_tailscale_bootstrap_command(
-                                &rel_cwd,
-                                program,
-                                args,
-                                &env,
-                                false,
-                                tailnet_only,
-                            );
-                            cmd.args(["/bin/sh", "-c"]);
-                            cmd.arg(shell_cmd);
-                        } else {
-                            cmd.arg(program);
-                            cmd.args(args);
-                        }
-                        cmd
-                    }
+                    let mut cmd = CommandBuilder::new(nsenter);
+                    cmd.arg("--target");
+                    cmd.arg(leader);
+                    cmd.args(["--mount", "--uts", "--ipc", "--net", "--pid"]);
+                    cmd.args(["/bin/sh", "-lc"]);
+                    cmd.arg(shell_cmd);
+                    cmd
                 }
             }
         };
