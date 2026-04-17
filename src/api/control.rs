@@ -3914,6 +3914,23 @@ fn normalize_model_effort(raw: &str) -> Option<String> {
     }
 }
 
+fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Option<String> {
+    let normalized = normalize_model_effort(raw)?;
+    match (backend, normalized.as_str()) {
+        (Some("claudecode"), "low" | "medium" | "high" | "xhigh" | "max") => Some(normalized),
+        (Some("codex"), "low" | "medium" | "high") => Some(normalized),
+        _ => None,
+    }
+}
+
+fn supported_model_efforts_for_backend(backend: Option<&str>) -> &'static str {
+    match backend {
+        Some("claudecode") => "low, medium, high, xhigh, max",
+        Some("codex") => "low, medium, high",
+        _ => "none",
+    }
+}
+
 fn normalize_string_patch(value: Option<Option<String>>) -> Option<Option<String>> {
     value.map(|inner| {
         inner.and_then(|value| {
@@ -3979,15 +3996,6 @@ pub async fn create_mission(
     if let Some(value) = model_effort.as_ref() {
         if value.trim().is_empty() {
             model_effort = None;
-        } else {
-            model_effort = normalize_model_effort(value);
-            if model_effort.is_none() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "Invalid model_effort. Supported values: low, medium, high, xhigh, max"
-                        .to_string(),
-                ));
-            }
         }
     }
 
@@ -4001,6 +4009,18 @@ pub async fn create_mission(
     // Model effort is supported for Codex and Claude Code missions.
     if !matches!(backend.as_deref(), Some("codex") | Some("claudecode")) {
         model_effort = None;
+    } else if let Some(value) = model_effort.as_ref() {
+        model_effort = normalize_model_effort_for_backend(backend.as_deref(), value);
+        if model_effort.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid model_effort for backend '{}'. Supported values: {}",
+                    backend.as_deref().unwrap_or("unknown"),
+                    supported_model_efforts_for_backend(backend.as_deref())
+                ),
+            ));
+        }
     }
 
     // Normalize model override based on backend expectations.
@@ -4186,10 +4206,15 @@ pub async fn update_mission_settings(
     }
 
     if let Some(Some(raw_effort)) = model_effort.as_ref() {
-        let normalized = normalize_model_effort(raw_effort).ok_or_else(|| {
+        let normalized = normalize_model_effort_for_backend(Some(&effective_backend), raw_effort)
+            .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                "Invalid model_effort. Supported values: low, medium, high, xhigh, max".to_string(),
+                format!(
+                    "Invalid model_effort for backend '{}'. Supported values: {}",
+                    effective_backend,
+                    supported_model_efforts_for_backend(Some(&effective_backend))
+                ),
             )
         })?;
         model_effort = Some(Some(normalized));
@@ -13909,6 +13934,22 @@ And the report:
         assert_eq!(normalize_model_effort("HIGH"), Some("high".to_string()));
         assert_eq!(normalize_model_effort("xhigh"), Some("xhigh".to_string()));
         assert_eq!(normalize_model_effort("MAX"), Some("max".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_model_effort_for_backend_rejects_codex_max() {
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("codex"), "high"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("codex"), "max"),
+            None
+        );
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("claudecode"), "max"),
+            Some("max".to_string())
+        );
     }
 
     #[test]

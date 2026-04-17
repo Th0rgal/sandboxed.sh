@@ -593,15 +593,15 @@ export function NewMissionDialog({
   const handleCreate = async (openInNewTab: boolean) => {
     if (disabled || submitting) return;
     setSubmitting(true);
-		try {
-			const options = getCreateOptions();
-			const mission = await onCreate({ ...options, openInNewTab });
-			if (isEditMode) {
-				setOpen(false);
-				onClose?.();
-				return;
-			}
-			const url = `${controlPath}?mission=${mission.id}`;
+    try {
+      const options = getCreateOptions();
+      const mission = await onCreate({ ...options, openInNewTab });
+      if (isEditMode) {
+        setOpen(false);
+        onClose?.();
+        return;
+      }
+      const url = `${controlPath}?mission=${mission.id}`;
 
       if (openInNewTab) {
         window.open(url, '_blank');
