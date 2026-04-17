@@ -3084,6 +3084,7 @@ export default function ControlClient() {
 
   // Treat "waiting_for_tool" as not busy for message input (user should respond immediately)
   const isBusy = viewingRunState === "running";
+  const canSubmitComposer = canSubmitInput || input.trim().length > 0;
 
   const streamCleanupRef = useRef<null | (() => void)>(null);
   const enhancedInputRef = useRef<EnhancedInputHandle>(null);
@@ -6292,7 +6293,8 @@ export default function ControlClient() {
   // Handler for EnhancedInput that takes a payload with content and optional agent
   const handleEnhancedSubmit = useCallback(async (payload: SubmitPayload) => {
     const { content, agent } = payload;
-    if (!content.trim()) return;
+    const trimmedContent = content.trim();
+    if (!trimmedContent) return;
 
     // Guard against double-submission (e.g., double-click, React StrictMode)
     if (submittingRef.current) {
@@ -6338,9 +6340,6 @@ export default function ControlClient() {
       }
     }
 
-    setInput("");
-    setDraftInput("");
-
     const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const timestamp = Date.now();
     const hasExistingUserMessages = items.some((item) => item.kind === "user");
@@ -6359,6 +6358,9 @@ export default function ControlClient() {
         queued: willBeQueued,
       },
     ]);
+    enhancedInputRef.current?.clear();
+    setInput("");
+    setDraftInput("");
 
     try {
       // Send message with mission_id - backend handles routing (main vs parallel)
@@ -6384,6 +6386,9 @@ export default function ControlClient() {
     } catch (err) {
       console.error(err);
       setItems((prev) => prev.filter((item) => item.id !== tempId));
+      const restoredDraft = agent ? `@${agent} ${trimmedContent}` : content;
+      setInput(restoredDraft);
+      setDraftInput(restoredDraft);
       toast.error("Failed to send message");
     } finally {
       submittingRef.current = false;
@@ -8103,7 +8108,7 @@ export default function ControlClient() {
                     <button
                       type="button"
                       onClick={() => enhancedInputRef.current?.submit()}
-                      disabled={!canSubmitInput}
+                      disabled={!canSubmitComposer}
                       className="flex items-center gap-2 rounded-xl bg-indigo-500/80 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500/80"
                     >
                       <ListPlus className="h-4 w-4" />
@@ -8122,7 +8127,7 @@ export default function ControlClient() {
                   <button
                     type="button"
                     onClick={() => enhancedInputRef.current?.submit()}
-                    disabled={!canSubmitInput}
+                    disabled={!canSubmitComposer}
                     className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500"
                   >
                     <Send className="h-4 w-4" />

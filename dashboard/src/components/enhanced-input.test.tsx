@@ -69,6 +69,61 @@ describe("EnhancedInput file paste handling", () => {
   });
 });
 
+describe("EnhancedInput composer behavior", () => {
+  it("does not clear text synchronously when submitted", async () => {
+    const onSubmit = vi.fn();
+
+    const { container } = render(
+      <EnhancedInput
+        value="draft message"
+        onChange={() => {}}
+        onSubmit={onSubmit}
+      />,
+    );
+    await Promise.resolve();
+
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+
+    fireEvent.keyDown(textarea as HTMLTextAreaElement, {
+      key: "Enter",
+      code: "Enter",
+      shiftKey: false,
+    });
+
+    expect(onSubmit).toHaveBeenCalledWith({ content: "draft message" });
+    expect((textarea as HTMLTextAreaElement).value).toBe("draft message");
+  });
+
+  it("reports submit availability during the input change event", async () => {
+    const onCanSubmitChange = vi.fn();
+
+    function ControlledInput() {
+      const [value, setValue] = useState("");
+      return (
+        <EnhancedInput
+          value={value}
+          onChange={setValue}
+          onSubmit={() => {}}
+          onCanSubmitChange={onCanSubmitChange}
+        />
+      );
+    }
+
+    const { container } = render(<ControlledInput />);
+    await Promise.resolve();
+
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+
+    fireEvent.change(textarea as HTMLTextAreaElement, {
+      target: { value: "hello" },
+    });
+
+    expect(onCanSubmitChange).toHaveBeenLastCalledWith(true);
+  });
+});
+
 describe("EnhancedInput command autocomplete backend filtering", () => {
   it("does not show OpenCode or Claude builtins for codex backend", async () => {
     vi.mocked(getBuiltinCommands).mockResolvedValue({

@@ -876,12 +876,23 @@ impl ModelChainStore {
                 if !account.has_credentials() {
                     continue;
                 }
+                let oauth_is_fresh = account
+                    .oauth
+                    .as_ref()
+                    .map(|oauth| {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        oauth.expires_at > now_ms + 60_000
+                    })
+                    .unwrap_or(false);
                 let routed_api_key = account.api_key.clone().or_else(|| {
                     if !matches!(
                         provider_type,
                         crate::ai_providers::ProviderType::OpenAI
                             | crate::ai_providers::ProviderType::Anthropic
                     ) {
+                        return None;
+                    }
+                    if !oauth_is_fresh {
                         return None;
                     }
                     account.oauth.as_ref().and_then(|oauth| {
@@ -893,13 +904,21 @@ impl ModelChainStore {
                         }
                     })
                 });
+                if routed_api_key.is_none() && account.oauth.is_some() {
+                    tracing::debug!(
+                        account_id = %account.id,
+                        provider = %entry.provider_id,
+                        "Skipping account with expired OAuth token"
+                    );
+                    continue;
+                }
                 seen_account_ids.insert(account.id);
                 resolved.push(ResolvedEntry {
                     provider_id: entry.provider_id.clone(),
                     model_id: entry.model_id.clone(),
                     account_id: account.id,
                     api_key: routed_api_key,
-                    has_oauth: account.oauth.is_some(),
+                    has_oauth: oauth_is_fresh,
                     base_url: account.base_url.clone(),
                 });
             }

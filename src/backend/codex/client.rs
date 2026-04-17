@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -92,9 +92,11 @@ impl CodexClient {
             args.push(format!("reasoning.effort=\"{}\"", effort));
         }
 
-        // Add the message as a positional arg (guard prompts starting with '-')
+        // Read the prompt from stdin instead of placing the full mission
+        // transcript on argv. Long resumed missions can otherwise produce very
+        // large process command lines, especially through container wrappers.
         args.push("--".to_string());
-        args.push(message.to_string());
+        args.push("-".to_string());
 
         info!(
             "Spawning Codex CLI: directory={}, model={:?}, effort={:?}",
@@ -142,9 +144,20 @@ impl CodexClient {
             })?
         };
 
-        // Close stdin immediately since we don't need to write to it
-        // (message is passed as CLI argument)
-        drop(child.stdin.take());
+        let prompt = message.to_string();
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Failed to capture Codex stdin"))?;
+        let stdin_task = tokio::spawn(async move {
+            if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                debug!("Failed to write Codex prompt to stdin: {}", e);
+                return;
+            }
+            if let Err(e) = stdin.shutdown().await {
+                debug!("Failed to close Codex stdin: {}", e);
+            }
+        });
 
         // Spawn task to read stdout and parse events
         let stdout = child
@@ -268,6 +281,7 @@ impl CodexClient {
                 }
             }
 
+            let _ = stdin_task.await;
             let _ = stderr_task.await;
 
             let stderr_content = stderr_capture.lock().await;
