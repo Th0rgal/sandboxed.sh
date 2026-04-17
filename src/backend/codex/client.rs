@@ -270,26 +270,40 @@ impl CodexClient {
 
             let _ = stderr_task.await;
 
-            // If the CLI exited without emitting any JSON events, surface stderr/stdout as an error.
-            if !saw_any_event {
-                let stderr_content = stderr_capture.lock().await;
-                let non_json = stdout_non_json.lock().await;
-                let exit_status = exit_status
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
+            let stderr_content = stderr_capture.lock().await;
+            let non_json = stdout_non_json.lock().await;
+            let exit_failed = exit_status.as_ref().is_some_and(|status| !status.success());
+            let exit_status_text = exit_status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let stderr_excerpt = stderr_content
+                .lines()
+                .take(10)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let stdout_excerpt = non_json.join(" | ");
 
+            // If Codex exits unsuccessfully after having emitted partial JSON
+            // events, do not let the runner mistake the last progress update for
+            // a completed answer.
+            if exit_failed {
+                let _ = tx
+                    .send(CodexEvent::Error {
+                        message: format!(
+                            "Codex CLI exited before completing the turn (exit_status: {}). Stderr: {} | Stdout: {}",
+                            exit_status_text,
+                            if stderr_excerpt.is_empty() { "<empty>" } else { &stderr_excerpt },
+                            if stdout_excerpt.is_empty() { "<empty>" } else { &stdout_excerpt }
+                        ),
+                    })
+                    .await;
+            } else if !saw_any_event {
                 if !stderr_content.trim().is_empty() || !non_json.is_empty() {
-                    let stderr_excerpt = stderr_content
-                        .lines()
-                        .take(10)
-                        .collect::<Vec<_>>()
-                        .join(" | ");
-                    let stdout_excerpt = non_json.join(" | ");
                     let _ = tx
                         .send(CodexEvent::Error {
                             message: format!(
                                 "Codex CLI produced no JSON output (exit_status: {}). Stderr: {} | Stdout: {}",
-                                exit_status,
+                                exit_status_text,
                                 if stderr_excerpt.is_empty() { "<empty>" } else { &stderr_excerpt },
                                 if stdout_excerpt.is_empty() { "<empty>" } else { &stdout_excerpt }
                             ),
@@ -300,7 +314,7 @@ impl CodexClient {
                         .send(CodexEvent::Error {
                             message: format!(
                                 "Codex CLI produced no JSON output (exit_status: {}). No stderr/stdout captured.",
-                                exit_status
+                                exit_status_text
                             ),
                         })
                         .await;

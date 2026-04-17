@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo, useId } from 'react';
+import { useState, useMemo, useEffect, useRef } from 'react';
 import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import {
@@ -55,6 +55,123 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
+function ModelDropdown({
+  value,
+  models,
+  disabled,
+  placeholder,
+  onChange,
+}: {
+  value: string;
+  models: Provider['models'];
+  disabled?: boolean;
+  placeholder: string;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => document.removeEventListener('pointerdown', handlePointerDown);
+  }, []);
+
+  const selected = models.find((model) => model.id === value);
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredModels = normalizedQuery
+    ? models.filter((model) =>
+        `${model.name} ${model.id}`.toLowerCase().includes(normalizedQuery)
+      )
+    : models;
+  const canUseCustom =
+    normalizedQuery.length > 0 &&
+    !models.some((model) => model.id.toLowerCase() === normalizedQuery);
+
+  return (
+    <div ref={rootRef} className="relative flex-[1.35] min-w-0">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => {
+          if (disabled) return;
+          setOpen((prev) => !prev);
+          setQuery('');
+        }}
+        className="flex min-h-8 w-full items-center justify-between gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-left text-xs text-white/80 transition-colors hover:bg-white/[0.04] focus:border-indigo-500/50 focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        <span className="min-w-0 truncate">
+          {selected ? selected.name : value || placeholder}
+        </span>
+        <ChevronDown className="h-3.5 w-3.5 flex-shrink-0 text-white/35" />
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-full z-50 mt-1 w-[min(28rem,calc(100vw-3rem))] overflow-hidden rounded-lg border border-white/[0.06] bg-[#1a1a1a] shadow-xl">
+          <div className="border-b border-white/[0.06] p-2">
+            <input
+              autoFocus
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search or type a model ID"
+              className="w-full rounded-md border border-white/[0.06] bg-white/[0.03] px-2.5 py-2 text-xs text-white placeholder:text-white/30 focus:border-indigo-500/50 focus:outline-none"
+            />
+          </div>
+          <div className="max-h-64 overflow-y-auto py-1">
+            {filteredModels.map((model) => (
+              <button
+                key={model.id}
+                type="button"
+                onClick={() => {
+                  onChange(model.id);
+                  setOpen(false);
+                  setQuery('');
+                }}
+                className="flex w-full items-start gap-2 px-3 py-2 text-left text-xs text-white/70 transition-colors hover:bg-white/[0.04] hover:text-white"
+              >
+                <Check
+                  className={cn(
+                    'mt-0.5 h-3.5 w-3.5 flex-shrink-0',
+                    value === model.id ? 'text-indigo-400' : 'text-transparent'
+                  )}
+                />
+                <span className="min-w-0">
+                  <span className="block truncate text-white/80">{model.name}</span>
+                  <span className="block truncate font-mono text-[10px] text-white/35">
+                    {model.id}
+                  </span>
+                </span>
+              </button>
+            ))}
+            {filteredModels.length === 0 && !canUseCustom && (
+              <div className="px-3 py-3 text-xs text-white/30">No models found</div>
+            )}
+            {canUseCustom && (
+              <button
+                type="button"
+                onClick={() => {
+                  onChange(query.trim());
+                  setOpen(false);
+                  setQuery('');
+                }}
+                className="flex w-full items-center gap-2 border-t border-white/[0.06] px-3 py-2 text-left text-xs text-indigo-300 transition-colors hover:bg-indigo-500/10"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                Use <span className="font-mono">{query.trim()}</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Chain Entry Editor
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,8 +188,6 @@ function EntryEditor({
   const addEntry = () => {
     onChange([...entries, { provider_id: '', model_id: '' }]);
   };
-  const editorId = useId().replace(/:/g, '');
-
   const removeEntry = (index: number) => {
     onChange(entries.filter((_, i) => i !== index));
   };
@@ -117,7 +232,6 @@ function EntryEditor({
       </div>
       {entries.map((entry, i) => {
         const models = getModelsForProvider(entry.provider_id);
-        const datalistId = `routing-models-${editorId}-${i}`;
         return (
           <div
             key={i}
@@ -129,13 +243,13 @@ function EntryEditor({
             <select
               value={entry.provider_id}
               onChange={(e) => updateEntry(i, 'provider_id', e.target.value)}
-              className="flex-1 min-w-0 rounded border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer"
+              className="min-h-8 flex-1 min-w-0 cursor-pointer appearance-none rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-white transition-colors hover:bg-white/[0.04] focus:border-indigo-500/50 focus:outline-none"
               style={{
                 backgroundImage: "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
-                backgroundPosition: 'right 0.25rem center',
+                backgroundPosition: 'right 0.5rem center',
                 backgroundRepeat: 'no-repeat',
-                backgroundSize: '1.2em 1.2em',
-                paddingRight: '1.5rem',
+                backgroundSize: '1.4em 1.4em',
+                paddingRight: '2rem',
               }}
             >
               <option value="" className="bg-[#1a1a1a]">Select provider</option>
@@ -144,21 +258,13 @@ function EntryEditor({
               ))}
             </select>
             <span className="text-white/20">/</span>
-            <input
-              list={datalistId}
+            <ModelDropdown
               value={entry.model_id}
-              onChange={(e) => updateEntry(i, 'model_id', e.target.value)}
+              models={models}
               disabled={!entry.provider_id}
               placeholder={entry.provider_id ? 'Select or type model id' : 'Select provider first'}
-              className="flex-1 min-w-0 rounded border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500/50 disabled:opacity-40 disabled:cursor-not-allowed"
+              onChange={(value) => updateEntry(i, 'model_id', value)}
             />
-            <datalist id={datalistId}>
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name || m.id}
-                </option>
-              ))}
-            </datalist>
             <div className="flex items-center gap-0.5 flex-shrink-0">
               <button
                 onClick={() => moveEntry(i, 'up')}

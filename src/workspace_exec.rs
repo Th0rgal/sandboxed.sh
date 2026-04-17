@@ -18,6 +18,40 @@ use tokio::process::{Child, Command};
 use crate::nspawn;
 use crate::workspace::{use_nspawn_for_workspace, TailscaleMode, Workspace, WorkspaceType};
 
+const CONTAINER_DEFAULT_PATH_DIRS: &[&str] = &[
+    "/root/.bun/bin",
+    "/root/.cache/.bun/bin",
+    "/root/.local/bin",
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+];
+
+fn normalize_container_path(existing: Option<&str>) -> String {
+    let mut dirs = Vec::new();
+
+    if let Some(existing) = existing {
+        for dir in existing.split(':') {
+            let dir = dir.trim();
+            if dir.is_empty() || dirs.iter().any(|existing| existing == dir) {
+                continue;
+            }
+            dirs.push(dir.to_string());
+        }
+    }
+
+    for dir in CONTAINER_DEFAULT_PATH_DIRS {
+        if !dirs.iter().any(|existing| existing == dir) {
+            dirs.push((*dir).to_string());
+        }
+    }
+
+    dirs.join(":")
+}
+
 fn select_container_resolv_conf() -> Option<PathBuf> {
     let default_path = PathBuf::from("/etc/resolv.conf");
     let content = fs::read_to_string(&default_path).ok()?;
@@ -67,6 +101,31 @@ fn bind_resolv_conf(cmd: &mut Command) {
                 "/etc/resolv.conf"
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_container_path;
+
+    #[test]
+    fn container_path_adds_system_dirs_when_missing() {
+        let path = normalize_container_path(Some("/root/.elan/bin"));
+
+        assert!(path.starts_with("/root/.elan/bin:"));
+        assert!(path.contains(":/usr/bin:"));
+        assert!(path.ends_with(":/bin"));
+        assert!(path.contains(":/root/.bun/bin:"));
+    }
+
+    #[test]
+    fn container_path_preserves_existing_priority_without_duplicates() {
+        let path = normalize_container_path(Some("/tmp/wrapper:/usr/bin:/tmp/wrapper"));
+        let dirs: Vec<_> = path.split(':').collect();
+
+        assert_eq!(dirs[0], "/tmp/wrapper");
+        assert_eq!(dirs.iter().filter(|dir| **dir == "/usr/bin").count(), 1);
+        assert_eq!(dirs.iter().filter(|dir| **dir == "/tmp/wrapper").count(), 1);
     }
 }
 
@@ -264,6 +323,9 @@ impl WorkspaceExec {
             merged
                 .entry("XDG_CACHE_HOME".to_string())
                 .or_insert_with(|| "/root/.cache".to_string());
+
+            let normalized_path = normalize_container_path(merged.get("PATH").map(String::as_str));
+            merged.insert("PATH".to_string(), normalized_path);
         }
         if self.workspace.workspace_type == WorkspaceType::Container
             && !use_nspawn_for_workspace(&self.workspace)

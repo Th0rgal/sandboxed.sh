@@ -8070,6 +8070,69 @@ async fn command_available(
     false
 }
 
+async fn available_bun_command(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    for candidate in [
+        "bun",
+        "/usr/local/bin/bun",
+        "/usr/bin/bun",
+        "/root/.bun/bin/bun",
+        "/root/.cache/.bun/bin/bun",
+    ] {
+        if command_available(workspace_exec, cwd, candidate).await {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
+async fn seed_container_bun_from_host(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    if workspace_exec.workspace.workspace_type != WorkspaceType::Container {
+        return None;
+    }
+
+    let host_bun = resolve_host_executable("bun").or_else(|| {
+        ["/usr/local/bin/bun", "/usr/bin/bun"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|path| path.is_file())
+    })?;
+
+    match copy_host_executable_into_container(&workspace_exec.workspace, &host_bun) {
+        Ok(container_bun) => {
+            if command_available(workspace_exec, cwd, &container_bun).await {
+                tracing::info!(
+                    host_source = %host_bun.display(),
+                    container_path = %container_bun,
+                    "Copied Bun into container workspace for harness bootstrap"
+                );
+                Some(container_bun)
+            } else {
+                tracing::warn!(
+                    host_source = %host_bun.display(),
+                    container_path = %container_bun,
+                    "Copied Bun into container, but it is not executable in workspace"
+                );
+                None
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                host_source = %host_bun.display(),
+                error = %err,
+                "Failed to copy Bun into container workspace"
+            );
+            None
+        }
+    }
+}
+
 async fn resolve_command_path_in_workspace(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
@@ -8551,6 +8614,12 @@ async fn ensure_claudecode_cli_available(
         }
     }
 
+    for direct_claude_path in ["/usr/local/bin/claude", "/usr/bin/claude"] {
+        if command_available(workspace_exec, cwd, direct_claude_path).await {
+            return Ok(direct_claude_path.to_string());
+        }
+    }
+
     // Check bun's global bin directories. Depending on bun version and config,
     // globals may be in ~/.bun/bin/ or ~/.cache/.bun/bin/.
     const BUN_GLOBAL_CLAUDE_PATHS: &[&str] =
@@ -8582,16 +8651,8 @@ async fn ensure_claudecode_cli_available(
                     cmd
                 );
                 return Ok(cmd);
-            } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
-                let bun_cmd = format!("/root/.bun/bin/bun {}", bun_claude_path);
-                tracing::debug!(
-                    "Found Claude Code at {} (using bun to run it: {})",
-                    bun_claude_path,
-                    bun_cmd
-                );
-                return Ok(bun_cmd);
-            } else if command_available(workspace_exec, cwd, "bun").await {
-                let bun_cmd = format!("bun {}", bun_claude_path);
+            } else if let Some(bun) = available_bun_command(workspace_exec, cwd).await {
+                let bun_cmd = format!("{} {}", bun, bun_claude_path);
                 tracing::debug!(
                     "Found Claude Code at {} (using bun to run it: {})",
                     bun_claude_path,
@@ -8619,13 +8680,14 @@ async fn ensure_claudecode_cli_available(
     let has_npm = command_available(workspace_exec, cwd, "npm").await;
     tracing::debug!("Claude Code auto-install: npm available = {}", has_npm);
 
-    let bun_in_path = command_available(workspace_exec, cwd, "bun").await;
-    let bun_direct = command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
-    let has_bun = bun_in_path || bun_direct;
+    let mut bun_command = available_bun_command(workspace_exec, cwd).await;
+    if bun_command.is_none() {
+        bun_command = seed_container_bun_from_host(workspace_exec, cwd).await;
+    }
+    let has_bun = bun_command.is_some();
     tracing::debug!(
-        "Claude Code auto-install: bun in PATH = {}, bun at /root/.bun/bin/bun = {}, has_bun = {}",
-        bun_in_path,
-        bun_direct,
+        "Claude Code auto-install: bun command = {:?}, has_bun = {}",
+        bun_command,
         has_bun
     );
 
@@ -8640,10 +8702,13 @@ async fn ensure_claudecode_cli_available(
     // Bun installs globals to ~/.bun/install/global/ with bin symlinks in ~/.bun/bin/.
     // Some bun versions (e.g. 1.3.x) report success but silently fail to create
     // the bin symlink, so we manually link it as a workaround.
-    let install_cmd = if has_bun {
-        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @anthropic-ai/claude-code@latest && { test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null || true; }"#
+    let install_cmd = if let Some(bun) = bun_command.as_deref() {
+        format!(
+            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && {} install -g @anthropic-ai/claude-code@latest && {{ test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null || true; }}"#,
+            shell_quote(bun)
+        )
     } else {
-        "npm install -g @anthropic-ai/claude-code@latest"
+        "npm install -g @anthropic-ai/claude-code@latest".to_string()
     };
 
     let args = vec!["-lc".to_string(), install_cmd.to_string()];
@@ -8688,10 +8753,8 @@ async fn ensure_claudecode_cli_available(
                 } else {
                     bun_claude_path.to_string()
                 });
-            } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
-                return Ok(format!("/root/.bun/bin/bun {}", bun_claude_path));
-            } else if command_available(workspace_exec, cwd, "bun").await {
-                return Ok(format!("bun {}", bun_claude_path));
+            } else if let Some(bun) = available_bun_command(workspace_exec, cwd).await {
+                return Ok(format!("{} {}", bun, bun_claude_path));
             }
         }
     }
@@ -9292,6 +9355,8 @@ async fn check_claudecode_prerequisites(
     let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
 
     let cli_available = command_available(workspace_exec, cwd, program).await
+        || command_available(workspace_exec, cwd, "/usr/local/bin/claude").await
+        || command_available(workspace_exec, cwd, "/usr/bin/claude").await
         || command_available(workspace_exec, cwd, "/root/.cache/.bun/bin/claude").await
         || command_available(workspace_exec, cwd, "/root/.bun/bin/claude").await;
 
@@ -9307,8 +9372,9 @@ async fn check_claudecode_prerequisites(
     }
 
     let has_npm = command_available(workspace_exec, cwd, "npm").await;
-    let has_bun = command_available(workspace_exec, cwd, "bun").await
-        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+    let has_bun = available_bun_command(workspace_exec, cwd).await.is_some()
+        || (workspace_exec.workspace.workspace_type == WorkspaceType::Container
+            && resolve_host_executable("bun").is_some());
 
     if !has_npm && !has_bun {
         missing.push("npm or bun".to_string());
@@ -12728,6 +12794,56 @@ fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str
         && object_markers.iter().any(|object| user.contains(object))
 }
 
+fn codex_final_message_looks_like_progress_update(assistant_message: &str) -> bool {
+    let assistant = assistant_message.trim().to_ascii_lowercase();
+    if assistant.is_empty() {
+        return false;
+    }
+
+    let progress_prefixes = [
+        "i'm reading",
+        "i’m reading",
+        "i am reading",
+        "i'm checking",
+        "i’m checking",
+        "i am checking",
+        "i'm inspecting",
+        "i’m inspecting",
+        "i am inspecting",
+        "i'm pulling",
+        "i’m pulling",
+        "i am pulling",
+        "i'm running",
+        "i’m running",
+        "i am running",
+        "i'll run",
+        "i’ll run",
+        "i will run",
+        "i'll execute",
+        "i’ll execute",
+        "i will execute",
+        "next i'm",
+        "next i’m",
+        "next i'll",
+        "next i’ll",
+        "now i'm",
+        "now i’m",
+    ];
+    if progress_prefixes
+        .iter()
+        .any(|prefix| assistant.starts_with(prefix))
+    {
+        return true;
+    }
+
+    assistant.contains(" i'm reading ")
+        || assistant.contains(" i’m reading ")
+        || assistant.contains(" i'm checking ")
+        || assistant.contains(" i’m checking ")
+        || assistant.contains(" i'm running ")
+        || assistant.contains(" i’m running ")
+}
+
 fn current_user_request_for_tool_activity(prompt: &str) -> &str {
     let Some((_, after_user)) = prompt.rsplit_once("User:\n") else {
         return prompt;
@@ -12972,7 +13088,9 @@ pub async fn run_codex_turn(
                         // "Failed to shutdown rollout recorder") after the agent has
                         // already produced a valid response. Ignore these if we
                         // already have assistant output.
-                        if assistant_message.trim().is_empty() {
+                        let fatal_process_exit =
+                            message.contains("Codex CLI exited before completing the turn");
+                        if assistant_message.trim().is_empty() || fatal_process_exit {
                             error_message = Some(message.clone());
                             tracing::error!("Codex error: {}", message);
                         } else {
@@ -13038,18 +13156,22 @@ pub async fn run_codex_turn(
         "No response from Codex".to_string()
     };
 
-    let stopped_before_required_tools = success
-        && tool_events_seen == 0
-        && codex_turn_requires_tool_activity(user_message, &final_message);
-    if stopped_before_required_tools {
+    let tool_activity_required = codex_turn_requires_tool_activity(user_message, &final_message);
+    let stopped_before_required_tools = success && tool_events_seen == 0 && tool_activity_required;
+    let stopped_on_progress_update = success
+        && tool_activity_required
+        && codex_final_message_looks_like_progress_update(&final_message);
+    if stopped_before_required_tools || stopped_on_progress_update {
         tracing::warn!(
             mission_id = %mission_id,
             output_len = final_message.len(),
-            "Codex turn completed without tool activity despite a tool-required prompt"
+            tool_events_seen = tool_events_seen,
+            stopped_on_progress_update = stopped_on_progress_update,
+            "Codex turn completed before satisfying a tool-required prompt"
         );
         success = false;
         final_message = format!(
-            "Codex stopped before executing required workspace/tool steps. Last response:\n\n{}",
+            "Codex stopped before completing required workspace/tool steps. Last response:\n\n{}",
             final_message.trim()
         );
     }
@@ -13082,7 +13204,7 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
             .with_terminal_reason(TerminalReason::TurnComplete)
     } else {
         // Distinguish provider concurrency exhaustion from classic rate limits.
-        let reason = if stopped_before_required_tools {
+        let reason = if stopped_before_required_tools || stopped_on_progress_update {
             TerminalReason::Stalled
         } else if is_capacity_limited_error(&final_message) {
             TerminalReason::CapacityLimited
@@ -13837,12 +13959,12 @@ mod tests {
         claudecode_resume_current_session_message, claudecode_transport_failure_data,
         claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
         claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
-        codex_chatgpt_fallback_model, codex_key_fingerprint,
-        codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
-        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
-        is_codex_node_wrapper, is_provider_payload_error, is_rate_limited_error,
-        is_session_corruption_error, is_success_path_auth_error,
+        codex_chatgpt_fallback_model, codex_final_message_looks_like_progress_update,
+        codex_key_fingerprint, codex_tool_stall_should_retry_with_default_model,
+        codex_turn_requires_tool_activity, extract_model_from_message, extract_opencode_session_id,
+        extract_part_text, extract_str, extract_thought_line, is_capacity_limited_error,
+        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_provider_payload_error,
+        is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
         is_success_path_provider_payload_error, is_success_path_rate_limited_error,
         is_tool_call_only_output, opencode_idle_timeout_result_message,
         opencode_output_needs_fallback, opencode_session_token_from_line,
@@ -13909,6 +14031,19 @@ mod tests {
         assert!(!codex_turn_requires_tool_activity(
             prompt,
             "The previous change updated src/lib.rs and tests passed."
+        ));
+    }
+
+    #[test]
+    fn codex_progress_update_is_not_terminal_answer() {
+        assert!(codex_final_message_looks_like_progress_update(
+            "The repo includes a harness directory and preconfigured interactive agent JSON files. I’m reading those entrypoints and configs now."
+        ));
+        assert!(codex_final_message_looks_like_progress_update(
+            "Next I’ll run the small smoke task for both model aliases."
+        ));
+        assert!(!codex_final_message_looks_like_progress_update(
+            "I ran the smoke task for both model aliases. opus-6 succeeded and opus failed with a timeout."
         ));
     }
 
