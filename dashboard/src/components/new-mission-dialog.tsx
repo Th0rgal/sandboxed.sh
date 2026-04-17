@@ -121,6 +121,7 @@ export function NewMissionDialog({
   const [defaultSet, setDefaultSet] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
   const prevBackendRef = useRef<string | null>(null);
+  const isEditMode = mode === 'edit';
 
   // SWR: fetch backends
   const { data: backends } = useSWR<Backend[]>('backends', listBackends, {
@@ -334,6 +335,25 @@ export function NewMissionDialog({
     return backend ? { backend, agent: agent || undefined } : null;
   };
 
+  const preservedSelectedAgent = useMemo(() => {
+    const parsed = parseSelectedValue(selectedAgentValue);
+    if (!parsed) return null;
+    if (allAgents.some(a => a.value === selectedAgentValue)) return null;
+
+    const backendHasDefaultOption =
+      !parsed.agent &&
+      enabledBackends.some(backend => backend.id === parsed.backend) &&
+      (agentsByBackend[parsed.backend]?.length || 0) > 0;
+    if (backendHasDefaultOption) return null;
+
+    const backendName = backends?.find(backend => backend.id === parsed.backend)?.name || parsed.backend;
+    return {
+      backendName,
+      label: parsed.agent ? `${parsed.agent} (current)` : `${backendName} default (current)`,
+      value: selectedAgentValue,
+    };
+  }, [agentsByBackend, allAgents, backends, enabledBackends, selectedAgentValue]);
+
   const selectedBackend = useMemo(() => {
     return parseSelectedValue(selectedAgentValue)?.backend || 'claudecode';
   }, [selectedAgentValue]);
@@ -430,8 +450,9 @@ export function NewMissionDialog({
 
     // Try to use initialValues for agent/backend (from current mission)
     if (initialValues?.backend) {
+      const currentAgentValue = `${initialValues.backend}:${initialValues.agent || ''}`;
       if (!initialValues.agent) {
-        setSelectedAgentValue(`${initialValues.backend}:`);
+        setSelectedAgentValue(currentAgentValue);
         setDefaultSet(true);
         return;
       }
@@ -443,6 +464,9 @@ export function NewMissionDialog({
         setDefaultSet(true);
         return;
       }
+      setSelectedAgentValue(currentAgentValue);
+      setDefaultSet(true);
+      return;
     }
 
     // Fallback: try to find the default agent from config
@@ -599,7 +623,6 @@ export function NewMissionDialog({
   };
 
   const isBusy = disabled || submitting;
-  const isEditMode = mode === 'edit';
 
   return (
     <div className="relative" ref={dialogRef}>
@@ -697,6 +720,17 @@ export function NewMissionDialog({
                   paddingRight: '2.5rem',
                 }}
               >
+                {preservedSelectedAgent && (
+                  <optgroup
+                    key="current-agent"
+                    label={`${preservedSelectedAgent.backendName} (current)`}
+                    className="bg-[#1a1a1a]"
+                  >
+                    <option value={preservedSelectedAgent.value} className="bg-[#1a1a1a]">
+                      {preservedSelectedAgent.label}
+                    </option>
+                  </optgroup>
+                )}
                 {enabledBackends.map((backend) => {
                   const backendAgentsList = agentsByBackend[backend.id] || [];
                   if (backendAgentsList.length === 0) return null;

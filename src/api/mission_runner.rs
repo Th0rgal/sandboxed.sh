@@ -488,13 +488,13 @@ pub(crate) fn codex_tool_stall_should_retry_with_default_model(
     requested_model: Option<&str>,
     result: &AgentResult,
 ) -> bool {
+    const CODEX_TOOL_STALL_PREFIX: &str =
+        "Codex stopped before completing required workspace/tool steps.";
+
     if !matches!(result.terminal_reason, Some(TerminalReason::Stalled)) {
         return false;
     }
-    if !result
-        .output
-        .starts_with("Codex stopped before executing required workspace/tool steps.")
-    {
+    if !result.output.starts_with(CODEX_TOOL_STALL_PREFIX) {
         return false;
     }
 
@@ -5785,13 +5785,28 @@ fn is_rate_limited_error(message: &str) -> bool {
 fn looks_like_explicit_provider_error_output(message: &str) -> bool {
     let trimmed = message.trim();
     let lower = trimmed.to_ascii_lowercase();
+    let compact_lower = lower
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect::<String>();
+    let starts_with_error_payload = compact_lower.starts_with("{\"error\":")
+        || compact_lower.starts_with("[{\"error\":")
+        || compact_lower.starts_with("{\"type\":\"error\"");
+    let structured_provider_error = starts_with_error_payload
+        && (compact_lower.contains("\"error\":{")
+            || compact_lower.contains("\"message\":")
+            || compact_lower.contains("\"code\":")
+            || compact_lower.contains("authentication_error")
+            || compact_lower.contains("invalid_request_error")
+            || compact_lower.contains("permission_error")
+            || compact_lower.contains("rate_limit_error")
+            || compact_lower.contains("overloaded_error"));
+
     trimmed.starts_with("API Error:")
         || lower.starts_with("error:")
         || lower.starts_with("anthropic api error:")
         || lower.starts_with("claude code error:")
-        || lower.contains("\"type\":\"error\"")
-        || lower.contains("\"type\": \"error\"")
-        || lower.contains("\"error\"")
+        || structured_provider_error
         || lower.contains("status code: 401")
         || lower.contains("status code: 429")
         || lower.contains("status code: 529")
@@ -12770,11 +12785,10 @@ fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str
         " files",
         " directory",
         " folder",
-        " repo",
-        " repository",
         " workspace",
         " pull request",
         " pr #",
+        " github.com/",
         ".rs",
         ".ts",
         ".tsx",
@@ -14010,6 +14024,18 @@ mod tests {
             "Explain three possible reasons for this architecture issue.",
             "Here are three likely reasons."
         ));
+        assert!(!codex_turn_requires_tool_activity(
+            "How do I create a repository on GitHub?",
+            "Here is how to create a repository on GitHub."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_detects_concrete_repo_work() {
+        assert!(codex_turn_requires_tool_activity(
+            "Run https://github.com/lfglabs-dev/verity-benchmark with the interactive harness.",
+            "The repo includes a harness directory. I’m reading those entrypoints and configs now."
+        ));
     }
 
     #[test]
@@ -14211,11 +14237,20 @@ mod tests {
         assert!(!is_success_path_rate_limited_error(
             "I can explain how rate limits work without needing tools."
         ));
+        assert!(!is_success_path_rate_limited_error(
+            "A provider response might look like {\"error\":\"rate limit\"}, but this turn is only explaining the shape."
+        ));
+        assert!(is_success_path_rate_limited_error(
+            "{\"error\":{\"message\":\"rate limit exceeded\",\"type\":\"rate_limit_error\"}}"
+        ));
         assert!(is_success_path_auth_error(
             "Invalid authentication credentials"
         ));
         assert!(!is_success_path_auth_error(
             "The docs mention an invalid api key as an example."
+        ));
+        assert!(!is_success_path_auth_error(
+            "For example, {\"error\":\"Invalid authentication credentials\"} means the key is bad."
         ));
         assert!(is_success_path_provider_payload_error(
             "messages.13.content.88.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels"
@@ -14313,7 +14348,7 @@ mod tests {
     #[test]
     fn codex_tool_stall_retries_generic_gpt_model_with_default() {
         let stalled = AgentResult::failure(
-            "Codex stopped before executing required workspace/tool steps. Last response:\n\nI’ll run it."
+            "Codex stopped before completing required workspace/tool steps. Last response:\n\nI’ll run it."
                 .to_string(),
             0,
         )
