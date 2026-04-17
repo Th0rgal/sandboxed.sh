@@ -916,6 +916,8 @@ fn load_ai_providers(working_dir: &Path) -> Vec<serde_json::Value> {
 /// Get all Anthropic credentials from ai_providers.json, sorted by priority.
 fn get_all_anthropic_auth_from_ai_providers(working_dir: &Path) -> Vec<ClaudeCodeAuth> {
     let providers = load_ai_providers(working_dir);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let freshness_buffer_ms = 60_000;
 
     // Collect (priority, insertion_index, auth) for deterministic sorting.
     // The insertion index breaks ties when multiple accounts share the same priority.
@@ -949,6 +951,18 @@ fn get_all_anthropic_auth_from_ai_providers(working_dir: &Path) -> Vec<ClaudeCod
         // Check for OAuth access token
         if let Some(oauth) = provider.get("oauth") {
             if let Some(access_token) = oauth.get("access_token").and_then(|v| v.as_str()) {
+                let expires_at = oauth
+                    .get("expires_at")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                if expires_at <= now_ms + freshness_buffer_ms {
+                    tracing::warn!(
+                        provider_id = provider.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                        expires_at = expires_at,
+                        "Skipping expired Anthropic OAuth credential from ai_providers.json"
+                    );
+                    continue;
+                }
                 if !access_token.is_empty() {
                     entries.push((
                         priority,
@@ -2920,7 +2934,9 @@ async fn refresh_anthropic_oauth_token_inner(force: bool) -> Result<(), String> 
             || status == reqwest::StatusCode::UNAUTHORIZED)
             && lower.contains("invalid_grant")
         {
-            // Before deleting credentials, check if another process just refreshed the token
+            // Before deleting credentials, check if another process just refreshed the token.
+            // Anthropic rotates refresh tokens, so an unchanged token is still the revoked one
+            // even if its local expiry timestamp is in the future.
             tracing::warn!(
                 "Received invalid_grant error. Checking if token was recently refreshed..."
             );
@@ -2928,17 +2944,12 @@ async fn refresh_anthropic_oauth_token_inner(force: bool) -> Result<(), String> 
             // Wait a moment and re-read credentials
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-            // Re-read token entry to see if it was updated
+            // Re-read token entry to see if it was updated.
             if let Some(updated_entry) = read_oauth_token_entry(ProviderType::Anthropic) {
-                // Check if the refresh token changed (indicating a recent refresh)
-                if updated_entry.refresh_token != refresh_token {
+                let token_changed = updated_entry.refresh_token != refresh_token
+                    || updated_entry.access_token != entry.access_token;
+                if token_changed && !oauth_token_expired(updated_entry.expires_at) {
                     tracing::info!("Token was refreshed by another process after invalid_grant");
-                    return Ok(());
-                }
-
-                // Check if access token is now valid
-                if !oauth_token_expired(updated_entry.expires_at) {
-                    tracing::info!("Token is now valid after invalid_grant");
                     return Ok(());
                 }
             }

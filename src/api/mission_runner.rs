@@ -2801,12 +2801,17 @@ async fn run_mission_turn(
                 .await;
             }
 
-            // Account rotation: if rate-limited, try alternate Anthropic credentials.
+            // Account rotation: if rate-limited, or if auth still fails after
+            // one refresh attempt, try alternate Anthropic credentials.
             // The first entry in the list is the highest-priority credential, which
             // is almost certainly what the initial (override_auth=None) call used.
-            // Skip it to avoid a guaranteed duplicate rate-limit failure.
+            // Skip it to avoid a guaranteed duplicate failure.
             let mut rotated_anthropic_account = false;
-            if result.terminal_reason == Some(TerminalReason::RateLimited) {
+            if matches!(
+                result.terminal_reason,
+                Some(TerminalReason::RateLimited | TerminalReason::AuthError)
+            ) {
+                let rotation_reason = result.terminal_reason;
                 let rotation_accounts =
                     anthropic_rotation_accounts(&workspace, &mission_work_dir, &config.working_dir);
                 if !rotation_accounts.accounts.is_empty() {
@@ -2815,7 +2820,8 @@ async fn run_mission_turn(
                         total_accounts = rotation_accounts.total_accounts,
                         alternate_accounts = rotation_accounts.accounts.len(),
                         skipped_current = rotation_accounts.skipped_current,
-                        "Rate limited on primary account; trying alternate credentials"
+                        ?rotation_reason,
+                        "Primary Anthropic credential failed; trying alternate credentials"
                     );
                     for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
                         if cancel.is_cancelled() {
@@ -2850,16 +2856,17 @@ async fn run_mission_turn(
                             Some(alt_auth),
                         )
                         .await;
-                        // Only continue rotating on rate-limit errors.
-                        // Non-rate-limit LLM errors (model errors, context
-                        // limit, etc.) would fail on every account, so stop
-                        // early to avoid masking the real failure.
+                        // Continue rotating on account-specific failures.
+                        // Other LLM errors (model errors, context limit, etc.)
+                        // would fail on every account, so stop early to avoid
+                        // masking the real failure.
                         match result.terminal_reason {
-                            Some(TerminalReason::RateLimited) => {
+                            Some(TerminalReason::RateLimited | TerminalReason::AuthError) => {
                                 tracing::info!(
                                     mission_id = %mission_id,
                                     rotation_attempt = idx + 1,
-                                    "Rate limited; rotating to next account"
+                                    ?result.terminal_reason,
+                                    "Anthropic credential failed; rotating to next account"
                                 );
                                 continue;
                             }

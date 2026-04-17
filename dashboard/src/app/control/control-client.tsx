@@ -1553,11 +1553,22 @@ function ThinkingPanel({
   // Performance: limit visible thoughts, load more on demand
   const INITIAL_VISIBLE_THOUGHTS = 10;
   const LOAD_MORE_THOUGHTS = 10;
-  const [visibleThoughtsLimit, setVisibleThoughtsLimit] = useState(INITIAL_VISIBLE_THOUGHTS);
-
-  // Reset limit when mission changes (not during streaming updates)
-  useEffect(() => {
-    setVisibleThoughtsLimit(INITIAL_VISIBLE_THOUGHTS);
+  const [visibleThoughtsState, setVisibleThoughtsState] = useState({
+    missionId,
+    limit: INITIAL_VISIBLE_THOUGHTS,
+  });
+  const visibleThoughtsLimit =
+    visibleThoughtsState.missionId === missionId
+      ? visibleThoughtsState.limit
+      : INITIAL_VISIBLE_THOUGHTS;
+  const loadMoreThoughts = useCallback(() => {
+    setVisibleThoughtsState((prev) => ({
+      missionId,
+      limit:
+        prev.missionId === missionId
+          ? prev.limit + LOAD_MORE_THOUGHTS
+          : INITIAL_VISIBLE_THOUGHTS + LOAD_MORE_THOUGHTS,
+    }));
   }, [missionId]);
 
   // Memoize the visible slice to avoid re-rendering completed items when only active content changes
@@ -1650,7 +1661,7 @@ function ThinkingPanel({
                 {/* Load more button if there are hidden thoughts */}
                 {completedItems.length > visibleThoughtsLimit && (
                   <button
-                    onClick={() => setVisibleThoughtsLimit(prev => prev + LOAD_MORE_THOUGHTS)}
+                    onClick={loadMoreThoughts}
                     className="w-full py-1.5 px-3 text-[10px] text-white/40 hover:text-white/60 hover:bg-white/5 rounded-lg transition-colors flex items-center justify-center gap-1.5"
                   >
                     <ChevronUp className="w-3 h-3" />
@@ -1688,27 +1699,27 @@ function ThinkingPanel({
 }
 
 // Get icon for tool based on its name
-function getToolIcon(toolName: string) {
+function ToolIcon({ toolName, className }: { toolName: string; className?: string }) {
   const name = toolName.toLowerCase();
   if (name.includes("bash") || name.includes("shell") || name.includes("terminal") || name.includes("exec")) {
-    return Terminal;
+    return <Terminal className={className} />;
   }
   if (name.includes("read") || name.includes("file") || name.includes("write")) {
-    return FileText;
+    return <FileText className={className} />;
   }
   if (name.includes("search") || name.includes("grep") || name.includes("find")) {
-    return Search;
+    return <Search className={className} />;
   }
   if (name.includes("browser") || name.includes("web") || name.includes("http") || name.includes("url")) {
-    return Globe;
+    return <Globe className={className} />;
   }
   if (name.includes("code") || name.includes("edit") || name.includes("patch")) {
-    return Code;
+    return <Code className={className} />;
   }
   if (name.includes("list") || name.includes("dir") || name.includes("ls")) {
-    return FolderOpen;
+    return <FolderOpen className={className} />;
   }
-  return Wrench;
+  return <Wrench className={className} />;
 }
 
 // Format tool arguments for display
@@ -2168,7 +2179,6 @@ const ToolCallItem = memo(function ToolCallItem({
   const [expanded, setExpanded] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const isDone = item.result !== undefined;
-  const ToolIcon = getToolIcon(item.name);
 
   // Update elapsed time while tool is running
   useEffect(() => {
@@ -2265,6 +2275,7 @@ const ToolCallItem = memo(function ToolCallItem({
         )}
       >
         <ToolIcon
+          toolName={item.name}
           className={cn(
             "h-3 w-3",
             !isDone && "animate-pulse text-amber-400",
