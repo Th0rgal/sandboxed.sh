@@ -5851,6 +5851,7 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
         && !output.starts_with("Codex CLI exited before completing the turn")
         && !output.starts_with("No response from")
         && !output.starts_with("Claude Code error:")
+        && !output.starts_with("No Claude Code credentials detected")
         && !is_bare_llm_error_output(output)
     {
         tracing::info!(
@@ -5887,6 +5888,7 @@ fn is_bare_llm_error_output(output: &str) -> bool {
         normalized.as_str(),
         "internal server error"
             | "invalid authentication credentials"
+            | "no claude code credentials detected"
             | "unknown error"
             | "service unavailable"
             | "bad gateway"
@@ -14546,6 +14548,21 @@ Investigate <service/> failures.
         let mut result =
             crate::agents::AgentResult::failure("Internal server error".to_string(), 0)
                 .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_missing_claude_credentials() {
+        let mut result = crate::agents::AgentResult::failure(
+            "No Claude Code credentials detected. Either run `claude /login` on the host, or authenticate in Settings → AI Providers / set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY."
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
 
         maybe_recover_soft_llm_error(&mut result);
 

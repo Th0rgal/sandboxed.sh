@@ -3451,6 +3451,52 @@ pub fn run_claudecode_turn<'a>(
             }
         }
 
+        #[derive(Debug, Clone)]
+        struct ClaudeCodeProxyConfig {
+            base_url: String,
+            api_key: String,
+        }
+
+        fn env_truthy(name: &str) -> bool {
+            std::env::var(name)
+                .ok()
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        }
+
+        fn claudecode_cli_proxy_config() -> Option<ClaudeCodeProxyConfig> {
+            if env_truthy("CLAUDE_CODE_DISABLE_CLI_PROXY") {
+                return None;
+            }
+
+            let base_url = std::env::var("CLAUDE_CODE_PROXY_BASE_URL")
+                .or_else(|_| std::env::var("ANTHROPIC_BASE_URL"))
+                .or_else(|_| std::env::var("CLI_PROXY_API_BASE_URL"))
+                .or_else(|_| std::env::var("CLIPROXY_API_BASE_URL"))
+                .or_else(|_| std::env::var("CLIPROXY_BASE_URL"))
+                .unwrap_or_else(|_| "http://127.0.0.1:8317".to_string());
+            let base_url = base_url.trim().trim_end_matches('/').to_string();
+            if base_url.is_empty() {
+                return None;
+            }
+
+            // The CLI Proxy API commonly runs unauthenticated on localhost, but
+            // Claude Code still requires a non-empty ANTHROPIC_API_KEY when an
+            // Anthropic base URL is configured. If the proxy needs auth, pass
+            // through the configured proxy key; otherwise use an inert value.
+            let api_key = std::env::var("CLAUDE_CODE_PROXY_API_KEY")
+                .or_else(|_| std::env::var("CLI_PROXY_API_KEY"))
+                .or_else(|_| std::env::var("CLIPROXY_API_KEY"))
+                .unwrap_or_else(|_| "sandboxed-sh-cli-proxy".to_string());
+
+            Some(ClaudeCodeProxyConfig { base_url, api_key })
+        }
+
         fn claude_cli_credentials_info(path: &std::path::Path) -> Option<(i64, bool)> {
             let metadata = match std::fs::metadata(path) {
                 Ok(m) => m,
@@ -3680,11 +3726,27 @@ pub fn run_claudecode_turn<'a>(
             );
         }
 
+        let proxy_auth = if !using_override_auth && !has_cli_creds {
+            let config = claudecode_cli_proxy_config();
+            if let Some(ref proxy) = config {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    base_url = %proxy.base_url,
+                    "Using Claude Code via CLI Proxy API fallback"
+                );
+            }
+            config
+        } else {
+            None
+        };
+
         // Only refresh OpenCode/Anthropic OAuth tokens if we plan to inject them.
-        let oauth_refresh_result = if has_cli_creds {
+        let oauth_refresh_result = if has_cli_creds || proxy_auth.is_some() {
             tracing::info!(
                 mission_id = %mission_id,
-                "Using Claude CLI credentials for mission; skipping OAuth refresh injection"
+                has_cli_creds = has_cli_creds,
+                using_cli_proxy = proxy_auth.is_some(),
+                "Using non-OAuth-refresh Claude Code auth path; skipping OAuth refresh injection"
             );
             Ok(())
         } else {
@@ -3714,6 +3776,8 @@ pub fn run_claudecode_turn<'a>(
                 "Using override credential for account rotation"
             );
             Some(auth)
+        } else if proxy_auth.is_some() {
+            None
         } else
         // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
         // For container workspaces, compare workspace auth vs host auth and use the fresher one.
@@ -3884,7 +3948,7 @@ pub fn run_claudecode_turn<'a>(
         // Fail fast only if neither:
         // - Claude CLI credentials are available (copied into the mission directory), nor
         // - We have explicit API auth to inject via env vars.
-        if api_auth.is_none() && !has_cli_creds {
+        if api_auth.is_none() && !has_cli_creds && proxy_auth.is_none() {
             let err_msg = "No Claude Code credentials detected. Either run `claude /login` on the host, or authenticate in Settings → AI Providers / set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
             tracing::warn!(mission_id = %mission_id, "{}", err_msg);
             return AgentResult::failure(err_msg.to_string(), 0)
@@ -4231,7 +4295,15 @@ pub fn run_claudecode_turn<'a>(
         env.insert("NO_COLOR".to_string(), "1".to_string());
         env.insert("GH_PROMPT_DISABLED".to_string(), "1".to_string());
 
-        if let Some(ref auth) = api_auth {
+        if let Some(ref proxy) = proxy_auth {
+            env.insert("ANTHROPIC_BASE_URL".to_string(), proxy.base_url.clone());
+            env.insert("ANTHROPIC_API_KEY".to_string(), proxy.api_key.clone());
+            tracing::info!(
+                mission_id = %mission_id,
+                base_url = %proxy.base_url,
+                "Injecting Claude Code CLI Proxy API environment"
+            );
+        } else if let Some(ref auth) = api_auth {
             match auth {
                 ClaudeCodeAuth::OAuthToken(token) => {
                     env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
