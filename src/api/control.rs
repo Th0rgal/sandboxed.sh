@@ -5952,9 +5952,19 @@ async fn maybe_finalize_terminal_mission(
 
     match mission_store.get_mission(mission_id).await {
         Ok(Some(mission)) => {
+            if mission.status == MissionStatus::Interrupted {
+                tracing::debug!(
+                    mission_id = %mission_id,
+                    reason = ?reason,
+                    context = log_context,
+                    "Skipping mission finalization because mission is already interrupted"
+                );
+                return;
+            }
+
             if !matches!(
                 mission.status,
-                MissionStatus::Active | MissionStatus::Interrupted | MissionStatus::Pending
+                MissionStatus::Active | MissionStatus::Pending
             ) {
                 tracing::debug!(
                     mission_id = %mission_id,
@@ -14541,6 +14551,40 @@ Investigate <service/> failures.
             mission_status_for_terminal_reason(TerminalReason::TurnComplete, true),
             Some((MissionStatus::Completed, "completed"))
         );
+    }
+
+    #[tokio::test]
+    async fn maybe_finalize_terminal_mission_preserves_interrupted_status() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("Shutdown race"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Interrupted)
+            .await
+            .expect("mission should be interrupted");
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel(8);
+
+        maybe_finalize_terminal_mission(
+            &store,
+            &events_tx,
+            mission.id,
+            Some(TerminalReason::LlmError),
+            false,
+            "shutdown race test",
+        )
+        .await;
+
+        let updated = store
+            .get_mission(mission.id)
+            .await
+            .expect("mission lookup should succeed")
+            .expect("mission should exist");
+        assert_eq!(updated.status, MissionStatus::Interrupted);
+        assert_eq!(updated.terminal_reason, None);
+        assert!(updated.resumable);
+        assert!(events_rx.try_recv().is_err());
     }
 
     #[test]
