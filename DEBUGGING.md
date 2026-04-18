@@ -42,6 +42,39 @@ systemctl restart sandboxed-sh-dev
 - Service: `/etc/systemd/system/sandboxed-sh-dev.service`
 - Data: `/root/.sandboxed-sh-dev/`
 
+### Investigating Unexpected Service Stops
+
+When a mission reports `SIGTERM` or `SIGKILL`, first determine whether the
+backend was deliberately stopped by systemd:
+
+```bash
+journalctl -u sandboxed-sh-prod \
+  --since "2026-04-18 06:00:00 UTC" \
+  --until "2026-04-18 06:10:00 UTC" \
+  --no-pager | grep -Ei "Shutdown signal|Stopping|Stopped|Started|SIGTERM|SIGKILL|client request"
+```
+
+If systemd says `on client request`, correlate that timestamp with SSH sessions:
+
+```bash
+journalctl \
+  --since "2026-04-18 06:00:00 UTC" \
+  --until "2026-04-18 06:10:00 UTC" \
+  --no-pager | grep -Ei "Accepted publickey|session-|sshd|sandboxed-sh-prod"
+```
+
+The app can log that it received `SIGTERM`/`SIGINT`, process metadata, and
+interrupted mission IDs, but Linux does not pass the exact `systemctl` caller to
+the process. For command-level attribution, enable host auditing for `systemctl`
+before reproducing:
+
+```bash
+apt-get install -y auditd
+auditctl -a always,exit -F arch=b64 -S execve -F path=/usr/bin/systemctl -k systemctl_exec
+auditctl -a always,exit -F arch=b64 -S execve -F path=/bin/systemctl -k systemctl_exec
+ausearch -k systemctl_exec --start "2026-04-18 06:00:00" --end "2026-04-18 06:10:00"
+```
+
 ## Backend Service (Ben)
 
 Ben's server runs a single instance:

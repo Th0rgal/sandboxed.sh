@@ -911,6 +911,7 @@ async fn shutdown_signal(state: Arc<AppState>) {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to install Ctrl+C handler");
+        "SIGINT"
     };
 
     #[cfg(unix)]
@@ -919,20 +920,39 @@ async fn shutdown_signal(state: Arc<AppState>) {
             .expect("failed to install signal handler")
             .recv()
             .await;
+        "SIGTERM"
     };
 
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let terminate = std::future::pending::<&'static str>();
 
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
+    let signal = tokio::select! {
+        signal = ctrl_c => signal,
+        signal = terminate => signal,
+    };
 
-    tracing::info!("Shutdown signal received, marking running missions as interrupted...");
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let invocation_id = std::env::var("INVOCATION_ID").ok();
+    tracing::warn!(
+        signal,
+        pid = std::process::id(),
+        ppid = shutdown_parent_pid(),
+        exe = %exe,
+        cmdline = ?shutdown_cmdline(),
+        invocation_id = ?invocation_id,
+        "Shutdown signal received; marking running missions as interrupted"
+    );
 
     // Send graceful shutdown command to all control sessions
     let sessions = state.control.all_sessions().await;
+    tracing::info!(
+        signal,
+        control_sessions = sessions.len(),
+        "Dispatching graceful shutdown to control sessions"
+    );
     if sessions.is_empty() {
         tracing::info!("No active control sessions to shut down");
         return;
@@ -992,6 +1012,47 @@ async fn shutdown_signal(state: Arc<AppState>) {
     }
 
     tracing::info!("Graceful shutdown complete");
+}
+
+#[cfg(target_os = "linux")]
+fn shutdown_parent_pid() -> Option<u32> {
+    // /proc/self/stat has the executable name in parentheses and the ppid as
+    // the fourth field. Split after the closing parenthesis so names containing
+    // spaces do not shift the field positions.
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shutdown_parent_pid() -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn shutdown_cmdline() -> Option<String> {
+    let bytes = std::fs::read("/proc/self/cmdline").ok()?;
+    let cmdline = bytes
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cmdline.is_empty() {
+        None
+    } else if cmdline.len() > 300 {
+        Some(format!(
+            "{}...",
+            cmdline.chars().take(300).collect::<String>()
+        ))
+    } else {
+        Some(cmdline)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shutdown_cmdline() -> Option<String> {
+    None
 }
 
 /// Health check endpoint.
