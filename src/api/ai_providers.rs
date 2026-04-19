@@ -317,7 +317,7 @@ fn google_authorize_url(challenge: &str, state: &str) -> Result<String, String> 
 }
 
 /// Build [`StandardAccount`] entries for all standard (non-custom) providers
-/// that have credentials in OpenCode's `auth.json`.
+/// that have credentials in OpenCode's `auth.json` or the local CLI proxy.
 ///
 /// These are used by chain resolution to include standard providers alongside
 /// custom providers from `AIProviderStore`.
@@ -330,90 +330,195 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
     let mut accounts = Vec::new();
     let mut seen_types = std::collections::HashSet::new();
 
-    // Iterate over all keys in auth.json
-    let Some(auth_map) = auth_obj else {
-        return accounts;
-    };
-
-    for (key, value) in auth_map {
-        let Some(provider_type) = ProviderType::from_id(key.as_str()) else {
-            continue;
-        };
-        // Skip custom/amp providers — they live in AIProviderStore / backend config
-        if provider_type == ProviderType::Custom || provider_type == ProviderType::Amp {
-            continue;
-        }
-        // Extract actual API key from the auth entry.
-        // Check all field name variants for consistency with get_api_key_for_provider.
-        let mut api_key = value
-            .get("key")
-            .or_else(|| value.get("api_key"))
-            .or_else(|| value.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.to_string());
-        let has_oauth = value
-            .get("type")
-            .and_then(|v| v.as_str())
-            .map(|t| t == "oauth")
-            .unwrap_or(false)
-            || value
-                .get("refresh")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.trim().is_empty());
-
-        // OpenAI/Anthropic OAuth entries include an access token that can be
-        // forwarded as a Bearer token for proxy routing.
-        if api_key.is_none()
-            && has_oauth
-            && matches!(
-                provider_type,
-                ProviderType::OpenAI | ProviderType::Anthropic
-            )
-        {
-            api_key = value
-                .get("access")
-                .or_else(|| value.get("access_token"))
-                .or_else(|| value.get("accessToken"))
+    if let Some(auth_map) = auth_obj {
+        // Iterate over all keys in auth.json.
+        for (key, value) in auth_map {
+            let Some(provider_type) = ProviderType::from_id(key.as_str()) else {
+                continue;
+            };
+            // Skip custom/amp providers — they live in AIProviderStore / backend config
+            if provider_type == ProviderType::Custom || provider_type == ProviderType::Amp {
+                continue;
+            }
+            // Extract actual API key from the auth entry.
+            // Check all field name variants for consistency with get_api_key_for_provider.
+            let mut api_key = value
+                .get("key")
+                .or_else(|| value.get("api_key"))
+                .or_else(|| value.get("apiKey"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.to_string());
-        }
+            let has_oauth = value
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|t| t == "oauth")
+                .unwrap_or(false)
+                || value
+                    .get("refresh")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty());
 
-        // Only include accounts that have credentials we can route with.
-        let has_routable_credentials =
-            api_key.is_some() || (provider_type == ProviderType::Google && has_oauth);
-        if !has_routable_credentials {
-            continue;
-        }
+            // OpenAI/Anthropic OAuth entries include an access token that can be
+            // forwarded as a Bearer token for proxy routing.
+            if api_key.is_none()
+                && has_oauth
+                && matches!(
+                    provider_type,
+                    ProviderType::OpenAI | ProviderType::Anthropic
+                )
+            {
+                api_key = value
+                    .get("access")
+                    .or_else(|| value.get("access_token"))
+                    .or_else(|| value.get("accessToken"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string());
+            }
 
-        // Skip duplicates — e.g. "openai" and "codex" both map to OpenAI.
-        // Must come after the api_key check so a keyless alias doesn't
-        // shadow a valid one.
-        if !seen_types.insert(provider_type) {
-            continue;
-        }
-
-        // Check if this provider is disabled in opencode.json
-        let config_entry = get_provider_config_entry(&opencode_config, provider_type);
-        if let Some(ref entry) = config_entry {
-            if entry.enabled == Some(false) {
+            // Only include accounts that have credentials we can route with.
+            let has_routable_credentials =
+                api_key.is_some() || (provider_type == ProviderType::Google && has_oauth);
+            if !has_routable_credentials {
                 continue;
             }
+
+            // Skip duplicates — e.g. "openai" and "codex" both map to OpenAI.
+            // Must come after the api_key check so a keyless alias doesn't
+            // shadow a valid one.
+            if !seen_types.insert(provider_type) {
+                continue;
+            }
+
+            // Check if this provider is disabled in opencode.json
+            let config_entry = get_provider_config_entry(&opencode_config, provider_type);
+            if let Some(ref entry) = config_entry {
+                if entry.enabled == Some(false) {
+                    continue;
+                }
+            }
+
+            let base_url = config_entry.and_then(|e| e.base_url);
+
+            accounts.push(crate::provider_health::StandardAccount {
+                account_id: crate::provider_health::stable_provider_uuid(provider_type.id()),
+                provider_type,
+                api_key,
+                has_oauth,
+                base_url,
+            });
         }
+    }
 
-        let base_url = config_entry.and_then(|e| e.base_url);
-
+    // Anthropic subscription routing is served by CLI Proxy API, which exposes
+    // an Anthropic/OpenAI-compatible local endpoint backed by Claude accounts.
+    // Those credentials do not live in OpenCode auth.json, so synthesize a
+    // standard Anthropic OAuth account when the proxy has a usable Claude
+    // account. This keeps model-routing chains like `opus` and `opus-6`
+    // selectable without depending on direct Anthropic OAuth/API-key records.
+    if !seen_types.contains(&ProviderType::Anthropic) && anthropic_cli_proxy_account_available() {
         accounts.push(crate::provider_health::StandardAccount {
-            account_id: crate::provider_health::stable_provider_uuid(provider_type.id()),
-            provider_type,
-            api_key,
-            has_oauth,
-            base_url,
+            account_id: crate::provider_health::stable_provider_uuid("anthropic-cli-proxy"),
+            provider_type: ProviderType::Anthropic,
+            api_key: None,
+            has_oauth: true,
+            base_url: None,
         });
     }
 
     accounts
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn anthropic_cli_proxy_account_available() -> bool {
+    if env_truthy("CLAUDE_CODE_DISABLE_CLI_PROXY") {
+        return false;
+    }
+
+    let has_explicit_proxy_config = [
+        "CLAUDE_CODE_PROXY_BASE_URL",
+        "CLI_PROXY_API_BASE_URL",
+        "CLIPROXY_API_BASE_URL",
+        "CLIPROXY_BASE_URL",
+        "CLI_PROXY_API_KEY",
+        "CLIPROXY_API_KEY",
+    ]
+    .iter()
+    .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+
+    has_explicit_proxy_config || has_fresh_cli_proxy_claude_account()
+}
+
+fn has_fresh_cli_proxy_claude_account() -> bool {
+    let mut dirs = Vec::new();
+    if let Ok(dir) = std::env::var("CLI_PROXY_AUTH_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            dirs.push(std::path::PathBuf::from(trimmed));
+        }
+    }
+    dirs.push(std::path::PathBuf::from("/root/.cli-proxy-api"));
+
+    let now = chrono::Utc::now();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with("claude-") && name.ends_with(".json")) {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                continue;
+            };
+            if value
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if value.get("type").and_then(|v| v.as_str()) != Some("claude") {
+                continue;
+            }
+            let has_access = value
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_access {
+                continue;
+            }
+            let Some(expired) = value.get("expired").and_then(|v| v.as_str()) else {
+                return true;
+            };
+            match chrono::DateTime::parse_from_rfc3339(expired) {
+                Ok(expires_at) if expires_at.with_timezone(&chrono::Utc) > now => return true,
+                Err(_) => return true,
+                _ => {}
+            }
+        }
+    }
+
+    false
 }
 
 /// Create AI provider routes.
