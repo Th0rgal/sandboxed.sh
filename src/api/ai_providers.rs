@@ -442,6 +442,7 @@ pub(crate) fn anthropic_cli_proxy_account_available() -> bool {
         "CLI_PROXY_API_BASE_URL",
         "CLIPROXY_API_BASE_URL",
         "CLIPROXY_BASE_URL",
+        "CLAUDE_CODE_PROXY_API_KEY",
         "CLI_PROXY_API_KEY",
         "CLIPROXY_API_KEY",
     ]

@@ -906,12 +906,16 @@ impl ModelChainStore {
                 });
                 // `routed_api_key` is only populated for OpenAI/Anthropic
                 // OAuth (where we can forward the access token as a Bearer
-                // credential). Google OAuth is routed via a separate
-                // per-request token fetch, so `routed_api_key` being None for
-                // a Google account is expected — don't drop it here. Only
-                // skip when we have no api_key at all and the OAuth token is
-                // stale/missing, which means no usable credential exists.
-                if account.api_key.is_none() && !oauth_is_fresh {
+                // credential). Google OAuth is routed via `get_google_access_token`
+                // which reads from `auth.json` and refreshes independently of
+                // the store-level token, so the store-level expiry doesn't
+                // tell us whether the request will succeed — keep Google
+                // accounts in the chain whenever they hold OAuth at all and
+                // let the proxy layer fetch a fresh token at request time.
+                let provider_is_google =
+                    matches!(provider_type, crate::ai_providers::ProviderType::Google);
+                let google_oauth_routable = provider_is_google && account.oauth.is_some();
+                if account.api_key.is_none() && !oauth_is_fresh && !google_oauth_routable {
                     tracing::debug!(
                         account_id = %account.id,
                         provider = %entry.provider_id,
@@ -925,7 +929,10 @@ impl ModelChainStore {
                     model_id: entry.model_id.clone(),
                     account_id: account.id,
                     api_key: routed_api_key,
-                    has_oauth: oauth_is_fresh,
+                    // For Google we want `use_google_oauth_adapter` in the
+                    // proxy to fire even when the store-level token is stale,
+                    // because the proxy refreshes from `auth.json`.
+                    has_oauth: oauth_is_fresh || google_oauth_routable,
                     base_url: account.base_url.clone(),
                 });
             }

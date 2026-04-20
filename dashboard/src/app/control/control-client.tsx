@@ -6735,10 +6735,10 @@ export default function ControlClient() {
             } : undefined}
           />
 
-          {activeMission && (
+          {activeMission && !viewingMissionIsRunning && (
             <NewMissionDialog
               workspaces={workspaces}
-              disabled={missionLoading || viewingMissionIsRunning}
+              disabled={missionLoading}
               onCreate={handleUpdateMissionSettings}
               mode="edit"
               lockWorkspace

@@ -157,7 +157,12 @@ fn completions_url(provider_type: ProviderType, account_base_url: Option<&str>) 
 }
 
 fn cli_proxy_chat_completions_url() -> String {
-    let base = std::env::var("CLI_PROXY_API_BASE_URL")
+    // Keep this list in sync with `anthropic_cli_proxy_account_available` in
+    // ai_providers.rs. If a user sets only `CLAUDE_CODE_PROXY_BASE_URL` we
+    // would otherwise enable the synthetic CLI-proxy account but route to the
+    // hardcoded localhost default.
+    let base = std::env::var("CLAUDE_CODE_PROXY_BASE_URL")
+        .or_else(|_| std::env::var("CLI_PROXY_API_BASE_URL"))
         .or_else(|_| std::env::var("CLIPROXY_API_BASE_URL"))
         .or_else(|_| std::env::var("CLIPROXY_BASE_URL"))
         .unwrap_or_else(|_| DEFAULT_CLI_PROXY_API_BASE_URL.to_string());
@@ -173,7 +178,8 @@ fn cli_proxy_chat_completions_url() -> String {
 
 fn build_cli_proxy_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
-    let api_key = std::env::var("CLI_PROXY_API_KEY")
+    let api_key = std::env::var("CLAUDE_CODE_PROXY_API_KEY")
+        .or_else(|_| std::env::var("CLI_PROXY_API_KEY"))
         .or_else(|_| std::env::var("CLIPROXY_API_KEY"))
         .ok()
         .map(|v| v.trim().to_string())
@@ -2700,6 +2706,10 @@ fn transform_anthropic_sse_to_openai(
     created: i64,
     model_id: String,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    // tool_blocks maps an Anthropic content_block index to the OpenAI
+    // tool_calls[].index we assigned for it. next_tool_idx is the next free
+    // OpenAI tool index. Tool indexing is independent of Anthropic block
+    // indexing because Anthropic interleaves text and tool_use blocks.
     futures::stream::unfold(
         (
             Box::pin(inner),
@@ -2708,8 +2718,19 @@ fn transform_anthropic_sse_to_openai(
             stream_id,
             model_id,
             created,
+            std::collections::HashMap::<u64, u32>::new(),
+            0u32,
         ),
-        |(mut stream, mut buf, mut sent_role, stream_id, model_id, created)| async move {
+        |(
+            mut stream,
+            mut buf,
+            mut sent_role,
+            stream_id,
+            model_id,
+            created,
+            mut tool_blocks,
+            mut next_tool_idx,
+        )| async move {
             loop {
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line = buf.drain(..=pos).collect::<Vec<u8>>();
@@ -2739,22 +2760,101 @@ fn transform_anthropic_sse_to_openai(
                         sent_role = true;
                     }
                     match event_type {
-                        "content_block_delta" => {
-                            if let Some(text) = parsed
-                                .get("delta")
-                                .and_then(|d| d.get("text"))
-                                .and_then(|v| v.as_str())
+                        "content_block_start" => {
+                            let block_index =
+                                parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let block = parsed.get("content_block");
+                            if block.and_then(|b| b.get("type")).and_then(|v| v.as_str())
+                                == Some("tool_use")
                             {
-                                if !text.is_empty() {
-                                    let chunk = serde_json::json!({
-                                        "id": stream_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": model_id,
-                                        "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": serde_json::Value::Null }],
-                                    });
-                                    chunks.push(format!("data: {}\n\n", chunk));
+                                let tool_idx = next_tool_idx;
+                                next_tool_idx += 1;
+                                tool_blocks.insert(block_index, tool_idx);
+                                let id = block
+                                    .and_then(|b| b.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let name = block
+                                    .and_then(|b| b.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let chunk = serde_json::json!({
+                                    "id": stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [{
+                                                "index": tool_idx,
+                                                "id": id,
+                                                "type": "function",
+                                                "function": { "name": name, "arguments": "" }
+                                            }]
+                                        },
+                                        "finish_reason": serde_json::Value::Null
+                                    }],
+                                });
+                                chunks.push(format!("data: {}\n\n", chunk));
+                            }
+                        }
+                        "content_block_delta" => {
+                            let delta = parsed.get("delta");
+                            let delta_type = delta
+                                .and_then(|d| d.get("type"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            match delta_type {
+                                "text_delta" | "" => {
+                                    if let Some(text) =
+                                        delta.and_then(|d| d.get("text")).and_then(|v| v.as_str())
+                                    {
+                                        if !text.is_empty() {
+                                            let chunk = serde_json::json!({
+                                                "id": stream_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created,
+                                                "model": model_id,
+                                                "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": serde_json::Value::Null }],
+                                            });
+                                            chunks.push(format!("data: {}\n\n", chunk));
+                                        }
+                                    }
                                 }
+                                "input_json_delta" => {
+                                    let block_index =
+                                        parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let tool_idx = match tool_blocks.get(&block_index) {
+                                        Some(idx) => *idx,
+                                        None => continue,
+                                    };
+                                    if let Some(partial) = delta
+                                        .and_then(|d| d.get("partial_json"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        if !partial.is_empty() {
+                                            let chunk = serde_json::json!({
+                                                "id": stream_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created,
+                                                "model": model_id,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "tool_calls": [{
+                                                            "index": tool_idx,
+                                                            "function": { "arguments": partial }
+                                                        }]
+                                                    },
+                                                    "finish_reason": serde_json::Value::Null
+                                                }],
+                                            });
+                                            chunks.push(format!("data: {}\n\n", chunk));
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         "message_delta" => {
@@ -2783,7 +2883,16 @@ fn transform_anthropic_sse_to_openai(
                     }
                     return Some((
                         Ok(bytes::Bytes::from(chunks.concat())),
-                        (stream, buf, sent_role, stream_id, model_id, created),
+                        (
+                            stream,
+                            buf,
+                            sent_role,
+                            stream_id,
+                            model_id,
+                            created,
+                            tool_blocks,
+                            next_tool_idx,
+                        ),
                     ));
                 }
 
@@ -2792,7 +2901,16 @@ fn transform_anthropic_sse_to_openai(
                     Some(Err(e)) => {
                         return Some((
                             Err(std::io::Error::other(e.to_string())),
-                            (stream, buf, sent_role, stream_id, model_id, created),
+                            (
+                                stream,
+                                buf,
+                                sent_role,
+                                stream_id,
+                                model_id,
+                                created,
+                                tool_blocks,
+                                next_tool_idx,
+                            ),
                         ));
                     }
                     None => return None,
