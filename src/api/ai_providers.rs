@@ -5074,9 +5074,13 @@ async fn get_provider_usage(
     // Determine how to call each provider for rate-limit info
     let usage_result = match provider_type {
         ProviderType::Anthropic => {
-            // Use API key or OAuth access token
-            let auth = if let Some(ref key) = api_key_opt {
-                key.clone()
+            // Use API key or OAuth access token. OAuth credentials must be
+            // sent as a Bearer token with the oauth-2025-04-20 beta header
+            // — sending them as `x-api-key` gets rejected with 401, which
+            // is what users on a Claude subscription (no api_key, OAuth only)
+            // were seeing while their missions still worked via Claude Code.
+            let (auth, is_oauth) = if let Some(ref key) = api_key_opt {
+                (key.clone(), false)
             } else if let Some(ref o) = oauth {
                 // Refresh the token if expired before using it
                 if oauth_token_expired(o.expires_at) {
@@ -5087,11 +5091,12 @@ async fn get_provider_usage(
                         );
                     }
                     // Re-read the fresh token from auth.json
-                    read_oauth_token_entry(ProviderType::Anthropic)
+                    let token = read_oauth_token_entry(ProviderType::Anthropic)
                         .map(|entry| entry.access_token)
-                        .unwrap_or_else(|| o.access_token.clone())
+                        .unwrap_or_else(|| o.access_token.clone());
+                    (token, true)
                 } else {
-                    o.access_token.clone()
+                    (o.access_token.clone(), true)
                 }
             } else {
                 return Ok(Json(serde_json::json!({
@@ -5103,18 +5108,35 @@ async fn get_provider_usage(
             };
 
             // Minimal messages API call to get rate limit headers
-            let resp = client
+            let mut req_builder = client
                 .post("https://api.anthropic.com/v1/messages")
-                .header("x-api-key", &auth)
                 .header("anthropic-version", "2023-06-01")
-                .header("Content-Type", "application/json")
-                .json(&serde_json::json!({
+                .header("Content-Type", "application/json");
+            if is_oauth {
+                req_builder = req_builder
+                    .header("Authorization", format!("Bearer {}", auth))
+                    .header("anthropic-beta", "oauth-2025-04-20");
+            } else {
+                req_builder = req_builder.header("x-api-key", &auth);
+            }
+            // OAuth subscription tokens are only accepted when the request
+            // identifies itself as Claude Code via the system prompt; API-key
+            // requests don't need it, but including it is harmless.
+            let body = if is_oauth {
+                serde_json::json!({
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1,
+                    "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+            } else {
+                serde_json::json!({
                     "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 1,
                     "messages": [{"role": "user", "content": "hi"}]
-                }))
-                .send()
-                .await;
+                })
+            };
+            let resp = req_builder.json(&body).send().await;
 
             match resp {
                 Ok(r) => {
