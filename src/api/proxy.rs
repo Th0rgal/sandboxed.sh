@@ -471,8 +471,14 @@ async fn chat_completions(
             continue;
         }
 
+        // The synthetic "anthropic-cli-proxy" account is the only Anthropic
+        // entry without an api_key — `read_standard_accounts` hoists the
+        // access_token into `api_key` for real Anthropic OAuth records so we
+        // can forward it as a Bearer credential. Gate the CLI-proxy adapter on
+        // that distinction, otherwise direct Anthropic OAuth accounts get sent
+        // through the local CLI proxy with no credential and fail.
         let use_anthropic_oauth_cli_proxy_adapter =
-            provider_type == ProviderType::Anthropic && entry.has_oauth;
+            provider_type == ProviderType::Anthropic && entry.has_oauth && entry.api_key.is_none();
         let use_anthropic_adapter =
             provider_type == ProviderType::Anthropic && !use_anthropic_oauth_cli_proxy_adapter;
         let use_google_oauth_adapter = provider_type == ProviderType::Google && entry.has_oauth;

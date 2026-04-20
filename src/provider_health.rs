@@ -904,7 +904,14 @@ impl ModelChainStore {
                         }
                     })
                 });
-                if routed_api_key.is_none() && account.oauth.is_some() {
+                // `routed_api_key` is only populated for OpenAI/Anthropic
+                // OAuth (where we can forward the access token as a Bearer
+                // credential). Google OAuth is routed via a separate
+                // per-request token fetch, so `routed_api_key` being None for
+                // a Google account is expected — don't drop it here. Only
+                // skip when we have no api_key at all and the OAuth token is
+                // stale/missing, which means no usable credential exists.
+                if account.api_key.is_none() && !oauth_is_fresh {
                     tracing::debug!(
                         account_id = %account.id,
                         provider = %entry.provider_id,
