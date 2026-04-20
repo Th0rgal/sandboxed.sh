@@ -3423,9 +3423,10 @@ pub fn run_claudecode_turn<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
     Box::pin(async move {
         use super::ai_providers::{
-            ensure_anthropic_oauth_token_valid, get_anthropic_auth_for_claudecode,
-            get_anthropic_auth_from_host_with_expiry, get_anthropic_auth_from_workspace,
-            get_workspace_auth_path, refresh_workspace_anthropic_auth, ClaudeCodeAuth,
+            anthropic_cli_proxy_account_available, ensure_anthropic_oauth_token_valid,
+            get_anthropic_auth_for_claudecode, get_anthropic_auth_from_host_with_expiry,
+            get_anthropic_auth_from_workspace, get_workspace_auth_path,
+            refresh_workspace_anthropic_auth, ClaudeCodeAuth,
         };
         use std::collections::HashMap;
         use tokio::time::{Duration, Instant};
@@ -3457,25 +3458,20 @@ pub fn run_claudecode_turn<'a>(
             api_key: String,
         }
 
-        fn env_truthy(name: &str) -> bool {
-            std::env::var(name)
-                .ok()
-                .map(|value| {
-                    matches!(
-                        value.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    )
-                })
-                .unwrap_or(false)
-        }
-
         fn claudecode_cli_proxy_config() -> Option<ClaudeCodeProxyConfig> {
-            if env_truthy("CLAUDE_CODE_DISABLE_CLI_PROXY") {
+            // Only fall back to the CLI proxy when it is actually configured —
+            // either via explicit env vars or a fresh CLI-proxy-api account.
+            // Without this gate we would hijack any ANTHROPIC_* setup on hosts
+            // that never opted into the proxy and inject the synthetic key.
+            if !anthropic_cli_proxy_account_available() {
                 return None;
             }
 
+            // Note: ANTHROPIC_BASE_URL is intentionally *not* consulted here;
+            // it is a standard Anthropic SDK variable and users set it for
+            // unrelated API proxies. Use CLAUDE_CODE_PROXY_BASE_URL (or the
+            // CLIPROXY_* aliases) to point us at a specific CLI proxy.
             let base_url = std::env::var("CLAUDE_CODE_PROXY_BASE_URL")
-                .or_else(|_| std::env::var("ANTHROPIC_BASE_URL"))
                 .or_else(|_| std::env::var("CLI_PROXY_API_BASE_URL"))
                 .or_else(|_| std::env::var("CLIPROXY_API_BASE_URL"))
                 .or_else(|_| std::env::var("CLIPROXY_BASE_URL"))

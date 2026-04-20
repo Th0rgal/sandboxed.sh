@@ -27,7 +27,9 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::ai_providers::{AuthMethod, PendingOAuth, ProviderType};
-use crate::util::{home_dir, internal_error, strip_jsonc_comments, AI_PROVIDERS_PATH};
+use crate::util::{
+    env_var_bool, home_dir, internal_error, strip_jsonc_comments, AI_PROVIDERS_PATH,
+};
 
 /// Anthropic OAuth client ID (from opencode-anthropic-auth plugin)
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -430,20 +432,8 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
     accounts
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn anthropic_cli_proxy_account_available() -> bool {
-    if env_truthy("CLAUDE_CODE_DISABLE_CLI_PROXY") {
+pub(crate) fn anthropic_cli_proxy_account_available() -> bool {
+    if env_var_bool("CLAUDE_CODE_DISABLE_CLI_PROXY", false) {
         return false;
     }
 
