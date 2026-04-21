@@ -363,6 +363,7 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
 
             // OpenAI/Anthropic OAuth entries include an access token that can be
             // forwarded as a Bearer token for proxy routing.
+            let mut oauth_expires_at: Option<i64> = None;
             if api_key.is_none()
                 && has_oauth
                 && matches!(
@@ -377,6 +378,10 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.trim().is_empty())
                     .map(|s| s.to_string());
+                oauth_expires_at = value
+                    .get("expires")
+                    .or_else(|| value.get("expires_at"))
+                    .and_then(|v| v.as_i64());
             }
 
             // Only include accounts that have credentials we can route with.
@@ -409,6 +414,7 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
                 api_key,
                 has_oauth,
                 base_url,
+                oauth_expires_at,
             });
         }
     }
@@ -426,6 +432,7 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
             api_key: None,
             has_oauth: true,
             base_url: None,
+            oauth_expires_at: None,
         });
     }
 
@@ -5271,6 +5278,24 @@ async fn get_provider_usage(
                         .and_then(|v| v.to_str().ok())
                     {
                         map.insert("organization_id".to_string(), serde_json::json!(org));
+
+                        // Persist the org onto the provider record so the
+                        // chain resolver can group credentials of the same
+                        // subscription under one shared cooldown — see
+                        // `store_account_subscription_key`.
+                        if let Some(uuid) = provider_uuid {
+                            if state
+                                .ai_providers
+                                .set_organization_id(uuid, org.to_string())
+                                .await
+                                .is_none()
+                            {
+                                tracing::warn!(
+                                    provider_id = %uuid,
+                                    "Provider disappeared while persisting organization_id"
+                                );
+                            }
+                        }
                     }
 
                     // Try new unified rate limit headers (Anthropic 2025+)

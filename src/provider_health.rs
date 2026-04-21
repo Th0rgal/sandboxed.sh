@@ -218,6 +218,17 @@ pub struct ProviderHealthTracker {
     backoff_config: BackoffConfig,
     /// Recent fallback events (ring buffer, newest last).
     fallback_events: Arc<RwLock<Vec<FallbackEvent>>>,
+    /// Cooldown state keyed by shared subscription (e.g. a single Claude Pro
+    /// subscription reached through multiple credential records). When one
+    /// account backing the subscription hits 429, every other chain entry
+    /// sharing the same subscription is skipped until the cooldown expires.
+    subscription_cooldowns: Arc<RwLock<HashMap<SubscriptionKey, SubscriptionCooldown>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SubscriptionCooldown {
+    cooldown_until: Option<std::time::Instant>,
+    consecutive_failures: u32,
 }
 
 /// Serializable snapshot of account health for API responses.
@@ -257,6 +268,7 @@ impl ProviderHealthTracker {
             accounts: Arc::new(RwLock::new(HashMap::new())),
             backoff_config: BackoffConfig::default(),
             fallback_events: Arc::new(RwLock::new(Vec::new())),
+            subscription_cooldowns: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -265,6 +277,7 @@ impl ProviderHealthTracker {
             accounts: Arc::new(RwLock::new(HashMap::new())),
             backoff_config,
             fallback_events: Arc::new(RwLock::new(Vec::new())),
+            subscription_cooldowns: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -277,6 +290,23 @@ impl ProviderHealthTracker {
             .unwrap_or(true) // Unknown accounts are healthy by default
     }
 
+    /// Check whether a shared subscription (e.g. Claude Pro org) is currently
+    /// cooling down. Callers pass `None` for accounts without a known shared
+    /// identity; those are always healthy at this layer.
+    pub async fn subscription_is_healthy(&self, key: Option<&SubscriptionKey>) -> bool {
+        let Some(key) = key else {
+            return true;
+        };
+        let cooldowns = self.subscription_cooldowns.read().await;
+        match cooldowns.get(key) {
+            Some(entry) => entry
+                .cooldown_until
+                .map(|until| std::time::Instant::now() >= until)
+                .unwrap_or(true),
+            None => true,
+        }
+    }
+
     /// Set the provider identifier for an account (no-op if already set).
     pub async fn set_provider_id(&self, account_id: Uuid, provider_id: &str) {
         let mut accounts = self.accounts.write().await;
@@ -287,14 +317,52 @@ impl ProviderHealthTracker {
     }
 
     /// Record a successful request for an account.
+    ///
+    /// When recovering from failure (consecutive_failures > 0), this clears
+    /// the visible request counters so the dashboard reflects current health
+    /// rather than a cumulative tally that lingers forever. Lifetime totals
+    /// past the first recovery aren't preserved here; the fallback-events
+    /// ring buffer is the long-lived record of failures.
     pub async fn record_success(&self, account_id: Uuid) {
+        self.record_success_with_subscription(account_id, None)
+            .await;
+    }
+
+    /// Like [`Self::record_success`] but also clears cooldown on a shared
+    /// subscription. A successful call through one credential proves the
+    /// subscription itself is serving traffic again.
+    pub async fn record_success_with_subscription(
+        &self,
+        account_id: Uuid,
+        subscription: Option<&SubscriptionKey>,
+    ) {
         let mut accounts = self.accounts.write().await;
         let health = accounts.entry(account_id).or_default();
+        let was_recovering = health.consecutive_failures > 0 || health.cooldown_until.is_some();
+        if was_recovering {
+            // Reset the visible window so a single 429 burst from hours ago
+            // stops being surfaced as "1 req, 0% success" long after the
+            // account recovered.
+            health.total_requests = 0;
+            health.total_successes = 0;
+            health.total_rate_limits = 0;
+            health.total_errors = 0;
+            health.last_failure_reason = None;
+            health.last_failure_at = None;
+        }
         health.total_requests += 1;
         health.total_successes += 1;
-        // Reset consecutive failures on success
         health.consecutive_failures = 0;
         health.cooldown_until = None;
+        drop(accounts);
+
+        if let Some(key) = subscription {
+            let mut subs = self.subscription_cooldowns.write().await;
+            if let Some(entry) = subs.get_mut(key) {
+                entry.cooldown_until = None;
+                entry.consecutive_failures = 0;
+            }
+        }
     }
 
     /// Record a failure and place the account into cooldown.
@@ -306,6 +374,22 @@ impl ProviderHealthTracker {
     pub async fn record_failure(
         &self,
         account_id: Uuid,
+        reason: CooldownReason,
+        retry_after: Option<std::time::Duration>,
+    ) -> std::time::Duration {
+        self.record_failure_with_subscription(account_id, None, reason, retry_after)
+            .await
+    }
+
+    /// Like [`Self::record_failure`] but also cools down the shared
+    /// subscription the account belongs to (Claude Pro org, OpenAI org, etc.).
+    /// Any chain entry whose resolved `SubscriptionKey` matches will be
+    /// skipped until the subscription cooldown expires, even if its own
+    /// credential record hasn't been tried directly.
+    pub async fn record_failure_with_subscription(
+        &self,
+        account_id: Uuid,
+        subscription: Option<&SubscriptionKey>,
         reason: CooldownReason,
         retry_after: Option<std::time::Duration>,
     ) -> std::time::Duration {
@@ -355,8 +439,56 @@ impl ProviderHealthTracker {
                 "Account placed in cooldown"
             );
         }
+        drop(accounts);
+
+        // Propagate the cooldown to the shared subscription, if known. Auth
+        // errors stay account-local — a revoked token on one record doesn't
+        // say anything about the other records that share the subscription.
+        if let (Some(key), false) = (subscription, is_auth_error) {
+            let mut subs = self.subscription_cooldowns.write().await;
+            let entry = subs.entry(key.clone()).or_default();
+            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+            let now = std::time::Instant::now();
+            let until = now + cooldown;
+            // Extend rather than shrink on concurrent failures.
+            entry.cooldown_until = Some(match entry.cooldown_until {
+                Some(prev) if prev > until => prev,
+                _ => until,
+            });
+            tracing::info!(
+                subscription = %key,
+                consecutive_failures = entry.consecutive_failures,
+                cooldown_secs = cooldown.as_secs_f64(),
+                "Subscription placed in cooldown"
+            );
+        }
 
         cooldown
+    }
+
+    /// Convenience wrapper: record a failure for a resolved chain entry,
+    /// automatically propagating the entry's shared-subscription cooldown.
+    pub async fn record_entry_failure(
+        &self,
+        entry: &ResolvedEntry,
+        reason: CooldownReason,
+        retry_after: Option<std::time::Duration>,
+    ) -> std::time::Duration {
+        self.record_failure_with_subscription(
+            entry.account_id,
+            entry.subscription_key.as_ref(),
+            reason,
+            retry_after,
+        )
+        .await
+    }
+
+    /// Convenience wrapper: record a successful request for a resolved
+    /// chain entry, clearing both the account and its shared-subscription
+    /// cooldown.
+    pub async fn record_entry_success(&self, entry: &ResolvedEntry) {
+        self.record_success_with_subscription(entry.account_id, entry.subscription_key.as_ref())
+            .await;
     }
 
     /// Record a latency sample for an account (in milliseconds).
@@ -534,6 +666,30 @@ pub struct StandardAccount {
     pub has_oauth: bool,
     /// Base URL override from opencode.json (if any).
     pub base_url: Option<String>,
+    /// OAuth access token expiry in ms since epoch, when known. Lets the
+    /// chain resolver apply the same freshness guard it applies to store
+    /// accounts — a stale access token would 401 on the upstream and get
+    /// (mis)counted as a live failure.
+    pub oauth_expires_at: Option<i64>,
+}
+
+/// Shared-subscription identifier used to group chain entries that will be
+/// throttled together upstream (same Claude Pro subscription, same OpenAI
+/// org, etc.). Two accounts with the same `SubscriptionKey` share a single
+/// cooldown lane — when one hits 429, the other is skipped too.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SubscriptionKey(pub String);
+
+impl SubscriptionKey {
+    pub fn new(provider_id: &str, identity: &str) -> Self {
+        Self(format!("{}:{}", provider_id, identity))
+    }
+}
+
+impl std::fmt::Display for SubscriptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Derive a deterministic UUID from a provider type ID string.
@@ -557,6 +713,45 @@ pub fn stable_provider_uuid(provider_id: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+/// Derive the shared-subscription key for an [`AIProvider`] store account.
+///
+/// Prefers `organization_id` (set by successful usage probes) so siblings
+/// authed to the same org share a cooldown lane even when they belong to
+/// different credential records. Falls back to `account_email` for
+/// OAuth-only providers where the email identifies the subscription. Returns
+/// `None` when we can't identify a stable subscription — those accounts stay
+/// independent at the subscription layer.
+pub fn store_account_subscription_key(
+    provider_type: crate::ai_providers::ProviderType,
+    account: &crate::ai_providers::AIProvider,
+) -> Option<SubscriptionKey> {
+    let provider_id = provider_type.id();
+    if let Some(org) = account
+        .organization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(SubscriptionKey::new(provider_id, org));
+    }
+    if matches!(
+        provider_type,
+        crate::ai_providers::ProviderType::Anthropic
+            | crate::ai_providers::ProviderType::OpenAI
+            | crate::ai_providers::ProviderType::Google
+    ) {
+        if let Some(email) = account
+            .account_email
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(SubscriptionKey::new(provider_id, email));
+        }
+    }
+    None
+}
+
 /// A resolved chain entry: a specific account + model ready for routing.
 #[derive(Debug, Clone)]
 pub struct ResolvedEntry {
@@ -572,6 +767,11 @@ pub struct ResolvedEntry {
     pub has_oauth: bool,
     /// The account's base URL (if custom).
     pub base_url: Option<String>,
+    /// Shared-subscription identifier (e.g. Claude Pro org). When set and
+    /// cooling down, every entry with the same key is skipped by
+    /// [`ModelChainStore::resolve_chain`] — no wasted fallback attempts on
+    /// siblings of a credential that just 429'd.
+    pub subscription_key: Option<SubscriptionKey>,
 }
 
 /// In-memory store for model chains, persisted to disk as JSON.
@@ -844,6 +1044,8 @@ impl ModelChainStore {
 
         let mut resolved = Vec::new();
 
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
         for entry in &chain.entries {
             let provider_type = match crate::ai_providers::ProviderType::from_id(&entry.provider_id)
             {
@@ -860,9 +1062,12 @@ impl ModelChainStore {
             // Collect account IDs we've already added to avoid duplicates
             // when both store and standard accounts exist for the same provider.
             let mut seen_account_ids = std::collections::HashSet::new();
+            let mut seen_subscriptions: std::collections::HashSet<SubscriptionKey> =
+                std::collections::HashSet::new();
 
             // 1. Check AIProviderStore (custom providers, multi-account)
             let store_accounts = ai_providers.get_all_by_type(provider_type).await;
+            let store_has_account_for_provider = !store_accounts.is_empty();
 
             for account in &store_accounts {
                 if !health_tracker.is_healthy(account.id).await {
@@ -879,10 +1084,7 @@ impl ModelChainStore {
                 let oauth_is_fresh = account
                     .oauth
                     .as_ref()
-                    .map(|oauth| {
-                        let now_ms = chrono::Utc::now().timestamp_millis();
-                        oauth.expires_at > now_ms + 60_000
-                    })
+                    .map(|oauth| oauth.expires_at > now_ms + 60_000)
                     .unwrap_or(false);
                 let routed_api_key = account.api_key.clone().or_else(|| {
                     if !matches!(
@@ -923,6 +1125,30 @@ impl ModelChainStore {
                     );
                     continue;
                 }
+                let subscription_key = store_account_subscription_key(provider_type, account);
+                if !health_tracker
+                    .subscription_is_healthy(subscription_key.as_ref())
+                    .await
+                {
+                    tracing::debug!(
+                        account_id = %account.id,
+                        provider = %entry.provider_id,
+                        subscription = ?subscription_key,
+                        "Skipping account — shared subscription cooling down"
+                    );
+                    continue;
+                }
+                if let Some(ref key) = subscription_key {
+                    if !seen_subscriptions.insert(key.clone()) {
+                        tracing::debug!(
+                            account_id = %account.id,
+                            provider = %entry.provider_id,
+                            subscription = %key,
+                            "Skipping duplicate account for subscription already in chain"
+                        );
+                        continue;
+                    }
+                }
                 seen_account_ids.insert(account.id);
                 resolved.push(ResolvedEntry {
                     provider_id: entry.provider_id.clone(),
@@ -934,12 +1160,20 @@ impl ModelChainStore {
                     // because the proxy refreshes from `auth.json`.
                     has_oauth: oauth_is_fresh || google_oauth_routable,
                     base_url: account.base_url.clone(),
+                    subscription_key,
                 });
             }
 
-            // 2. Also check standard accounts from OpenCode config.
-            // These complement store accounts — a user may have both custom
-            // multi-account entries AND standard credentials from auth.json.
+            // 2. Fall back to standard accounts from OpenCode config only
+            // when no store account exists for this provider. A user who has
+            // registered the provider in AIProviderStore treats that as the
+            // authoritative source — the opencode auth.json entry is usually
+            // a stale duplicate of the same underlying subscription (its
+            // access_token comes from a separate refresh chain) and just
+            // wastes fallback attempts when the real subscription rate-limits.
+            if store_has_account_for_provider {
+                continue;
+            }
             for sa in standard_accounts {
                 if sa.provider_type != provider_type {
                     continue;
@@ -959,6 +1193,26 @@ impl ModelChainStore {
                 if sa.api_key.is_none() && !sa.has_oauth {
                     continue;
                 }
+                // Apply the same OAuth-freshness guard store accounts get —
+                // a stale access_token from opencode's auth.json would 401
+                // on Anthropic/OpenAI and get recorded as a live failure.
+                // Google is routed via a separate refresh flow, so skip the
+                // guard for it (mirrors the store-account carve-out above).
+                let is_oauth_only_token = sa.api_key.is_some() && sa.has_oauth;
+                let provider_is_google =
+                    matches!(provider_type, crate::ai_providers::ProviderType::Google);
+                if is_oauth_only_token && !provider_is_google {
+                    if let Some(expires_at) = sa.oauth_expires_at {
+                        if expires_at <= now_ms + 60_000 {
+                            tracing::debug!(
+                                account_id = %sa.account_id,
+                                provider = %entry.provider_id,
+                                "Skipping standard account with expired OAuth token"
+                            );
+                            continue;
+                        }
+                    }
+                }
                 resolved.push(ResolvedEntry {
                     provider_id: entry.provider_id.clone(),
                     model_id: entry.model_id.clone(),
@@ -966,6 +1220,7 @@ impl ModelChainStore {
                     api_key: sa.api_key.clone(),
                     has_oauth: sa.has_oauth,
                     base_url: sa.base_url.clone(),
+                    subscription_key: None,
                 });
             }
         }
@@ -976,3 +1231,308 @@ impl ModelChainStore {
 
 /// Shared chain store type.
 pub type SharedModelChainStore = Arc<ModelChainStore>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai_providers::{
+        AIProvider, AIProviderStore, OAuthCredentials, ProviderStatus, ProviderType,
+    };
+    use tempfile::TempDir;
+
+    async fn store_with(providers: Vec<AIProvider>) -> AIProviderStore {
+        let tmp = TempDir::new().unwrap();
+        let store = AIProviderStore::new(tmp.path().join("ai_providers.json")).await;
+        for p in providers {
+            store.add(p).await;
+        }
+        // Keep tmpdir alive for the test duration: leak intentionally because
+        // AIProviderStore holds the path internally and we need the directory
+        // to persist for save_to_disk. Tests short-lived, OK to leak.
+        std::mem::forget(tmp);
+        store
+    }
+
+    fn anth_oauth_account(email: &str, org: Option<&str>, expires_at: i64) -> AIProvider {
+        let mut p = AIProvider::new(ProviderType::Anthropic, format!("Anthropic ({email})"));
+        p.oauth = Some(OAuthCredentials {
+            access_token: format!("at-{email}"),
+            refresh_token: format!("rt-{email}"),
+            expires_at,
+        });
+        p.account_email = Some(email.to_string());
+        p.organization_id = org.map(str::to_string);
+        p.status = ProviderStatus::Connected;
+        p
+    }
+
+    async fn store_with_chain(chain_id: &str, entries: Vec<ChainEntry>) -> ModelChainStore {
+        let tmp = TempDir::new().unwrap();
+        let store = ModelChainStore::new(tmp.path().join("chains.json")).await;
+        let now = chrono::Utc::now();
+        store
+            .upsert(ModelChain {
+                id: chain_id.to_string(),
+                name: chain_id.to_string(),
+                entries,
+                is_default: false,
+                created_at: now,
+                updated_at: now,
+            })
+            .await;
+        std::mem::forget(tmp);
+        store
+    }
+
+    fn future_ms(hours: i64) -> i64 {
+        chrono::Utc::now().timestamp_millis() + hours * 3600 * 1000
+    }
+
+    fn past_ms(hours: i64) -> i64 {
+        chrono::Utc::now().timestamp_millis() - hours * 3600 * 1000
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_skips_standard_account_when_store_covers_provider() {
+        // Two store Anthropic accounts + a standard account for the same
+        // provider — the standard entry should be suppressed.
+        let store = store_with(vec![
+            anth_oauth_account("a@example.com", Some("org-a"), future_ms(6)),
+            anth_oauth_account("b@example.com", Some("org-b"), future_ms(6)),
+        ])
+        .await;
+        let chains = store_with_chain(
+            "opus",
+            vec![ChainEntry {
+                provider_id: "anthropic".to_string(),
+                model_id: "claude-opus-4-7".to_string(),
+            }],
+        )
+        .await;
+        let standard = vec![StandardAccount {
+            account_id: stable_provider_uuid("anthropic"),
+            provider_type: ProviderType::Anthropic,
+            api_key: Some("stale-token".to_string()),
+            has_oauth: true,
+            base_url: None,
+            oauth_expires_at: Some(future_ms(6)),
+        }];
+        let tracker = ProviderHealthTracker::new();
+
+        let resolved = chains
+            .resolve_chain("opus", &store, &standard, &tracker)
+            .await;
+
+        assert_eq!(
+            resolved.len(),
+            2,
+            "store covers provider → no standard fallback"
+        );
+        assert!(resolved
+            .iter()
+            .all(|e| e.account_id != standard[0].account_id));
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_skips_standard_account_with_expired_oauth() {
+        // No store account, so standard accounts are eligible — but the one
+        // we offer has an expired access_token and should be filtered.
+        let store = store_with(vec![]).await;
+        let chains = store_with_chain(
+            "opus",
+            vec![ChainEntry {
+                provider_id: "anthropic".to_string(),
+                model_id: "claude-opus-4-7".to_string(),
+            }],
+        )
+        .await;
+        let standard = vec![StandardAccount {
+            account_id: stable_provider_uuid("anthropic"),
+            provider_type: ProviderType::Anthropic,
+            api_key: Some("stale-token".to_string()),
+            has_oauth: true,
+            base_url: None,
+            oauth_expires_at: Some(past_ms(2)),
+        }];
+        let tracker = ProviderHealthTracker::new();
+
+        let resolved = chains
+            .resolve_chain("opus", &store, &standard, &tracker)
+            .await;
+
+        assert!(
+            resolved.is_empty(),
+            "expired standard OAuth token should not be routed, got {:?}",
+            resolved
+        );
+    }
+
+    #[tokio::test]
+    async fn record_success_resets_counters_after_recovery() {
+        // The real-world scenario: a 429 burst cools the account down briefly,
+        // the cooldown timer expires on its own, and the next request succeeds.
+        // The dashboard should then show a clean "1 req, 100% success" window
+        // instead of the lingering "1 req, 0% success, 1 rate-limited".
+        let tracker = ProviderHealthTracker::new();
+        let id = Uuid::new_v4();
+
+        tracker
+            .record_failure(id, CooldownReason::RateLimit, None)
+            .await;
+        // Do NOT call clear_cooldown — that's the admin override path and
+        // scrubs the `consecutive_failures` we want the reset to notice.
+        // Natural expiry leaves consecutive_failures in place, which is what
+        // `record_success` keys off to decide whether to reset the window.
+        tracker.record_success(id).await;
+
+        let snap = tracker.get_health(id).await;
+        assert_eq!(
+            snap.total_requests, 1,
+            "recovery should drop pre-recovery request from the visible window"
+        );
+        assert_eq!(snap.total_successes, 1);
+        assert_eq!(snap.total_rate_limits, 0);
+        assert_eq!(snap.consecutive_failures, 0);
+        assert!(snap.last_failure_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn subscription_cooldown_skips_sibling_chain_entries() {
+        // Two Anthropic accounts sharing the same `organization_id` — a 429
+        // on one should take both out of the chain.
+        let shared_org = "org-shared";
+        let store = store_with(vec![
+            anth_oauth_account("a@example.com", Some(shared_org), future_ms(6)),
+            anth_oauth_account("b@example.com", Some(shared_org), future_ms(6)),
+        ])
+        .await;
+        let chains = store_with_chain(
+            "opus",
+            vec![ChainEntry {
+                provider_id: "anthropic".to_string(),
+                model_id: "claude-opus-4-7".to_string(),
+            }],
+        )
+        .await;
+        let tracker = ProviderHealthTracker::new();
+
+        // Both should resolve initially; dedup by subscription keeps only one.
+        let initial = chains.resolve_chain("opus", &store, &[], &tracker).await;
+        assert_eq!(
+            initial.len(),
+            1,
+            "two accounts on the same subscription collapse to one chain entry"
+        );
+        let picked = initial.into_iter().next().unwrap();
+        assert!(picked.subscription_key.is_some());
+
+        // Record a rate-limit against the picked account, which propagates
+        // to the subscription. After that the other account — same subscription
+        // — should also be filtered out.
+        tracker
+            .record_entry_failure(&picked, CooldownReason::RateLimit, None)
+            .await;
+
+        let after = chains.resolve_chain("opus", &store, &[], &tracker).await;
+        assert!(
+            after.is_empty(),
+            "subscription cooldown should hide every account under that subscription, got {:?}",
+            after
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_cooldown_cleared_by_success_on_sibling() {
+        let shared_org = "org-recover";
+        let acc_a = anth_oauth_account("a@example.com", Some(shared_org), future_ms(6));
+        let acc_b = anth_oauth_account("b@example.com", Some(shared_org), future_ms(6));
+        let store = store_with(vec![acc_a.clone(), acc_b.clone()]).await;
+
+        let tracker = ProviderHealthTracker::new();
+        let key = store_account_subscription_key(ProviderType::Anthropic, &acc_a).unwrap();
+
+        let entry = ResolvedEntry {
+            provider_id: "anthropic".to_string(),
+            model_id: "claude-opus-4-7".to_string(),
+            account_id: acc_a.id,
+            api_key: Some("test".to_string()),
+            has_oauth: true,
+            base_url: None,
+            subscription_key: Some(key.clone()),
+        };
+
+        // Simulate a 429 → subscription cools down.
+        tracker
+            .record_entry_failure(&entry, CooldownReason::RateLimit, None)
+            .await;
+        assert!(!tracker.subscription_is_healthy(Some(&key)).await);
+
+        // Record a success on the same subscription — cooldown clears.
+        tracker.record_entry_success(&entry).await;
+        assert!(
+            tracker.subscription_is_healthy(Some(&key)).await,
+            "successful call should clear the shared subscription cooldown"
+        );
+
+        // And the store now resolves the chain again.
+        let chains = store_with_chain(
+            "opus",
+            vec![ChainEntry {
+                provider_id: "anthropic".to_string(),
+                model_id: "claude-opus-4-7".to_string(),
+            }],
+        )
+        .await;
+        let resolved = chains.resolve_chain("opus", &store, &[], &tracker).await;
+        assert_eq!(resolved.len(), 1);
+        drop(acc_b);
+    }
+
+    #[tokio::test]
+    async fn auth_error_does_not_cool_down_subscription() {
+        let shared_org = "org-auth-error";
+        let acc = anth_oauth_account("a@example.com", Some(shared_org), future_ms(6));
+        let tracker = ProviderHealthTracker::new();
+        let key = store_account_subscription_key(ProviderType::Anthropic, &acc).unwrap();
+
+        let entry = ResolvedEntry {
+            provider_id: "anthropic".to_string(),
+            model_id: "claude-opus-4-7".to_string(),
+            account_id: acc.id,
+            api_key: Some("test".to_string()),
+            has_oauth: true,
+            base_url: None,
+            subscription_key: Some(key.clone()),
+        };
+
+        // Auth errors are credential-specific, not subscription-wide — a
+        // revoked token on one record doesn't mean sibling records are dead.
+        tracker
+            .record_entry_failure(&entry, CooldownReason::AuthError, None)
+            .await;
+        assert!(
+            tracker.subscription_is_healthy(Some(&key)).await,
+            "auth errors should stay account-local, not block the whole subscription"
+        );
+    }
+
+    #[test]
+    fn subscription_key_prefers_org_over_email() {
+        let mut acc = anth_oauth_account("a@example.com", Some("org-x"), future_ms(6));
+        let by_org = store_account_subscription_key(ProviderType::Anthropic, &acc);
+        assert_eq!(by_org, Some(SubscriptionKey::new("anthropic", "org-x")));
+
+        acc.organization_id = None;
+        let by_email = store_account_subscription_key(ProviderType::Anthropic, &acc);
+        assert_eq!(
+            by_email,
+            Some(SubscriptionKey::new("anthropic", "a@example.com"))
+        );
+
+        acc.account_email = None;
+        assert_eq!(
+            store_account_subscription_key(ProviderType::Anthropic, &acc),
+            None
+        );
+    }
+}

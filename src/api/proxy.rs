@@ -656,7 +656,7 @@ async fn chat_completions(
                 };
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, reason, None)
+                    .record_entry_failure(&entry, reason, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -704,8 +704,13 @@ async fn chat_completions(
                     .await;
                 let account_id = entry.account_id;
                 let health_tracker = state.health_tracker.clone();
-                let tracked_stream =
-                    track_stream_health(response_stream, health_tracker, account_id, None);
+                let tracked_stream = track_stream_health(
+                    response_stream,
+                    health_tracker,
+                    account_id,
+                    None,
+                    entry.subscription_key.clone(),
+                );
 
                 let success_provider = entry.provider_id.clone();
                 for evt in &mut pending_fallback_events {
@@ -734,7 +739,7 @@ async fn chat_completions(
                     );
                     let cooldown = state
                         .health_tracker
-                        .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                        .record_entry_failure(&entry, CooldownReason::ServerError, None)
                         .await;
                     pending_fallback_events.push(crate::provider_health::FallbackEvent {
                         timestamp: chrono::Utc::now(),
@@ -764,7 +769,7 @@ async fn chat_completions(
                 };
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, reason, retry_after)
+                    .record_entry_failure(&entry, reason, retry_after)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -787,7 +792,7 @@ async fn chat_completions(
                 let elapsed_ms = request_start.elapsed().as_millis() as u64;
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, CooldownReason::AuthError, None)
+                    .record_entry_failure(&entry, CooldownReason::AuthError, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -810,7 +815,7 @@ async fn chat_completions(
                 let elapsed_ms = request_start.elapsed().as_millis() as u64;
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                    .record_entry_failure(&entry, CooldownReason::ServerError, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -857,7 +862,7 @@ async fn chat_completions(
                 .health_tracker
                 .record_latency(entry.account_id, elapsed_ms)
                 .await;
-            state.health_tracker.record_success(entry.account_id).await;
+            state.health_tracker.record_entry_success(&entry).await;
             if let Some((input, output)) = usage {
                 state
                     .health_tracker
@@ -915,8 +920,13 @@ async fn chat_completions(
                     .await;
                 let account_id = entry.account_id;
                 let health_tracker = state.health_tracker.clone();
-                let tracked_stream =
-                    track_stream_health(response_stream, health_tracker, account_id, None);
+                let tracked_stream = track_stream_health(
+                    response_stream,
+                    health_tracker,
+                    account_id,
+                    None,
+                    entry.subscription_key.clone(),
+                );
 
                 let success_provider = entry.provider_id.clone();
                 for evt in &mut pending_fallback_events {
@@ -945,7 +955,7 @@ async fn chat_completions(
                     );
                     let cooldown = state
                         .health_tracker
-                        .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                        .record_entry_failure(&entry, CooldownReason::ServerError, None)
                         .await;
                     pending_fallback_events.push(crate::provider_health::FallbackEvent {
                         timestamp: chrono::Utc::now(),
@@ -971,7 +981,7 @@ async fn chat_completions(
                     .or_else(|| parse_rate_limit_headers(&response_headers, provider_type));
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, CooldownReason::RateLimit, retry_after)
+                    .record_entry_failure(&entry, CooldownReason::RateLimit, retry_after)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -1005,7 +1015,7 @@ async fn chat_completions(
                 };
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, reason, retry_after)
+                    .record_entry_failure(&entry, reason, retry_after)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -1032,7 +1042,7 @@ async fn chat_completions(
                 let elapsed_ms = request_start.elapsed().as_millis() as u64;
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                    .record_entry_failure(&entry, CooldownReason::ServerError, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -1079,7 +1089,7 @@ async fn chat_completions(
                 .health_tracker
                 .record_latency(entry.account_id, elapsed_ms)
                 .await;
-            state.health_tracker.record_success(entry.account_id).await;
+            state.health_tracker.record_entry_success(&entry).await;
             if let Some((input, output)) = usage {
                 state
                     .health_tracker
@@ -1129,7 +1139,7 @@ async fn chat_completions(
             );
             let cooldown = state
                 .health_tracker
-                .record_failure(entry.account_id, reason, retry_after)
+                .record_entry_failure(&entry, reason, retry_after)
                 .await;
             pending_fallback_events.push(crate::provider_health::FallbackEvent {
                 timestamp: chrono::Utc::now(),
@@ -1158,7 +1168,7 @@ async fn chat_completions(
             );
             let cooldown = state
                 .health_tracker
-                .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                .record_entry_failure(&entry, CooldownReason::ServerError, None)
                 .await;
             pending_fallback_events.push(crate::provider_health::FallbackEvent {
                 timestamp: chrono::Utc::now(),
@@ -1188,7 +1198,7 @@ async fn chat_completions(
             );
             let cooldown = state
                 .health_tracker
-                .record_failure(entry.account_id, CooldownReason::AuthError, None)
+                .record_entry_failure(&entry, CooldownReason::AuthError, None)
                 .await;
             pending_fallback_events.push(crate::provider_health::FallbackEvent {
                 timestamp: chrono::Utc::now(),
@@ -1288,7 +1298,7 @@ async fn chat_completions(
                 let elapsed_ms = request_start.elapsed().as_millis() as u64;
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                    .record_entry_failure(&entry, CooldownReason::ServerError, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -1330,7 +1340,7 @@ async fn chat_completions(
                 );
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, reason, None)
+                    .record_entry_failure(&entry, reason, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -1391,8 +1401,13 @@ async fn chat_completions(
             let byte_stream = normalize_sse_stream(combined);
 
             // Wrap the stream to record success/failure on completion.
-            let tracked_stream =
-                track_stream_health(byte_stream, health_tracker, account_id, rate_limit_snapshot);
+            let tracked_stream = track_stream_health(
+                byte_stream,
+                health_tracker,
+                account_id,
+                rate_limit_snapshot,
+                entry.subscription_key.clone(),
+            );
 
             return (status, response_headers, Body::from_stream(tracked_stream)).into_response();
         }
@@ -1420,7 +1435,7 @@ async fn chat_completions(
                             );
                             let cooldown = state
                                 .health_tracker
-                                .record_failure(entry.account_id, reason, None)
+                                .record_entry_failure(&entry, reason, None)
                                 .await;
                             pending_fallback_events.push(crate::provider_health::FallbackEvent {
                                 timestamp: chrono::Utc::now(),
@@ -1451,7 +1466,7 @@ async fn chat_completions(
                         .health_tracker
                         .record_latency(entry.account_id, elapsed_ms)
                         .await;
-                    state.health_tracker.record_success(entry.account_id).await;
+                    state.health_tracker.record_entry_success(&entry).await;
 
                     // Extract rate-limit quota snapshot from response headers
                     if let Some(snapshot) =
@@ -1516,7 +1531,7 @@ async fn chat_completions(
                 );
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                    .record_entry_failure(&entry, CooldownReason::ServerError, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -2277,6 +2292,7 @@ fn track_stream_health(
     health_tracker: crate::provider_health::SharedProviderHealthTracker,
     account_id: uuid::Uuid,
     rate_limit_snapshot: Option<crate::provider_health::RateLimitSnapshot>,
+    subscription_key: Option<crate::provider_health::SubscriptionKey>,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
     async_stream::stream! {
         let mut stream = std::pin::pin!(inner);
@@ -2314,10 +2330,17 @@ fn track_stream_health(
         }
         if errored || !received_any {
             health_tracker
-                .record_failure(account_id, CooldownReason::ServerError, None)
+                .record_failure_with_subscription(
+                    account_id,
+                    subscription_key.as_ref(),
+                    CooldownReason::ServerError,
+                    None,
+                )
                 .await;
         } else {
-            health_tracker.record_success(account_id).await;
+            health_tracker
+                .record_success_with_subscription(account_id, subscription_key.as_ref())
+                .await;
             if input_tokens > 0 || output_tokens > 0 {
                 health_tracker.record_token_usage(account_id, input_tokens, output_tokens).await;
             }
