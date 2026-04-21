@@ -162,10 +162,12 @@ pub struct WorkspaceExec {
 
 /// Child process spawned inside a PTY.
 ///
-/// On Unix, Host workspaces use raw `openpty()` for better compatibility with
-/// CLI tools (e.g. Claude Code's `--agent` flag hangs under portable-pty but
-/// works fine with a standard Unix PTY). Container workspaces still use
-/// portable-pty since the command is wrapped in nsenter/nspawn.
+/// On Unix, both Host and nspawn Container workspaces use raw `openpty()` for
+/// compatibility with CLI tools that hang under portable-pty. portable-pty
+/// 0.9's spawn_command resets signal dispositions and sweeps random fds in
+/// pre_exec, which causes Claude Code CLI to silently hang producing no PTY
+/// output. Raw openpty with a minimal `setsid`/`TIOCSCTTY` pre_exec avoids
+/// this. Non-nspawn containers and non-Unix hosts still use portable-pty.
 pub struct PtyChild {
     child: PtyChildProcess,
     master: PtyMasterHandle,
@@ -931,16 +933,27 @@ impl WorkspaceExec {
         env.entry("TERM".to_string())
             .or_insert_with(|| "xterm-256color".to_string());
 
-        // On Unix, use raw openpty() for Host workspaces. This fixes an
-        // incompatibility between portable-pty 0.9 and Claude Code's --agent
-        // flag where the CLI hangs and produces no PTY output. Raw Unix PTY
-        // (verified via Python pty.openpty()) works correctly.
+        // On Unix, use raw openpty() for Host workspaces and for Container
+        // workspaces that go through nspawn/nsenter. portable-pty 0.9's
+        // spawn_command resets signal dispositions and sweeps random fds in
+        // pre_exec, which makes Claude Code CLI hang producing no PTY output.
+        // Raw openpty with a minimal `setsid`/`TIOCSCTTY` pre_exec works.
         #[cfg(unix)]
         if matches!(self.workspace.workspace_type, WorkspaceType::Host) {
-            return self.spawn_host_unix_pty(cwd, program, args, &env);
+            return self.spawn_unix_pty(cwd, program, args, &env);
         }
 
-        // For Container workspaces (or non-Unix), use portable-pty.
+        #[cfg(unix)]
+        if matches!(self.workspace.workspace_type, WorkspaceType::Container)
+            && use_nspawn_for_workspace(&self.workspace)
+        {
+            let (nsenter_program, nsenter_args) = self
+                .build_container_nsenter_invocation(cwd, program, args, &mut env)
+                .await?;
+            return self.spawn_unix_pty(cwd, &nsenter_program, &nsenter_args, &env);
+        }
+
+        // Portable-pty fallback (non-Unix, or non-nspawn Container).
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -982,57 +995,15 @@ impl WorkspaceExec {
                     }
                     cmd
                 } else {
-                    if !env.contains_key("HOME") {
-                        env.insert("HOME".to_string(), "/root".to_string());
+                    // On Unix this branch is handled by `spawn_unix_pty` above;
+                    // build the same nsenter invocation here for non-Unix.
+                    let (nsenter_program, nsenter_args) = self
+                        .build_container_nsenter_invocation(cwd, program, args, &mut env)
+                        .await?;
+                    let mut cmd = CommandBuilder::new(&nsenter_program);
+                    for arg in &nsenter_args {
+                        cmd.arg(arg);
                     }
-
-                    let fido_agent_path = Path::new("/run/sandboxed-sh/fido-agent.sock");
-                    if fido_agent_path.exists() {
-                        env.insert(
-                            "SSH_AUTH_SOCK".to_string(),
-                            "/run/sandboxed-sh/fido-agent.sock".to_string(),
-                        );
-                    }
-
-                    // Determine if Tailscale bootstrap is needed before the nsenter check.
-                    let tailscale_enabled_check = nspawn::tailscale_enabled(&env);
-                    let tailscale_args = nspawn::tailscale_nspawn_extra_args(&env);
-                    let needs_tailscale_bootstrap =
-                        tailscale_enabled_check && !tailscale_args.is_empty();
-                    let nsenter_tailnet_only = needs_tailscale_bootstrap
-                        && self
-                            .workspace
-                            .tailscale_mode
-                            .unwrap_or(TailscaleMode::ExitNode)
-                            == TailscaleMode::TailnetOnly;
-
-                    let leader = self.ensure_persistent_container_leader(&env).await?;
-                    let nsenter = if Path::new("/usr/bin/nsenter").exists() {
-                        "/usr/bin/nsenter"
-                    } else {
-                        "nsenter"
-                    };
-                    let rel_cwd = self.rel_path_in_container(cwd);
-                    let shell_cmd = if needs_tailscale_bootstrap {
-                        Self::build_tailscale_bootstrap_command(
-                            &rel_cwd,
-                            program,
-                            args,
-                            &env,
-                            true,
-                            nsenter_tailnet_only,
-                        )
-                    } else {
-                        let env_ref = if env.is_empty() { None } else { Some(&env) };
-                        Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
-                    };
-
-                    let mut cmd = CommandBuilder::new(nsenter);
-                    cmd.arg("--target");
-                    cmd.arg(leader);
-                    cmd.args(["--mount", "--uts", "--ipc", "--net", "--pid"]);
-                    cmd.args(["/bin/sh", "-lc"]);
-                    cmd.arg(shell_cmd);
                     cmd
                 }
             }
@@ -1051,9 +1022,84 @@ impl WorkspaceExec {
         })
     }
 
-    /// Spawn a process in a raw Unix PTY (Host workspaces only).
+    /// Build the (program, args) tuple for spawning a command inside an
+    /// nspawn container via nsenter. Also mutates `env` to add container
+    /// defaults (HOME, SSH_AUTH_SOCK). The returned args end with
+    /// `"/bin/sh", "-lc", <shell_cmd>` where `shell_cmd` re-exports env and
+    /// execs the target program.
+    async fn build_container_nsenter_invocation(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+        env: &mut HashMap<String, String>,
+    ) -> anyhow::Result<(String, Vec<String>)> {
+        if !env.contains_key("HOME") {
+            env.insert("HOME".to_string(), "/root".to_string());
+        }
+
+        let fido_agent_path = Path::new("/run/sandboxed-sh/fido-agent.sock");
+        if fido_agent_path.exists() {
+            env.insert(
+                "SSH_AUTH_SOCK".to_string(),
+                "/run/sandboxed-sh/fido-agent.sock".to_string(),
+            );
+        }
+
+        let tailscale_enabled_check = nspawn::tailscale_enabled(env);
+        let tailscale_args = nspawn::tailscale_nspawn_extra_args(env);
+        let needs_tailscale_bootstrap = tailscale_enabled_check && !tailscale_args.is_empty();
+        let nsenter_tailnet_only = needs_tailscale_bootstrap
+            && self
+                .workspace
+                .tailscale_mode
+                .unwrap_or(TailscaleMode::ExitNode)
+                == TailscaleMode::TailnetOnly;
+
+        let leader = self.ensure_persistent_container_leader(env).await?;
+        let nsenter = if Path::new("/usr/bin/nsenter").exists() {
+            "/usr/bin/nsenter"
+        } else {
+            "nsenter"
+        }
+        .to_string();
+        let rel_cwd = self.rel_path_in_container(cwd);
+        let shell_cmd = if needs_tailscale_bootstrap {
+            Self::build_tailscale_bootstrap_command(
+                &rel_cwd,
+                program,
+                args,
+                env,
+                true,
+                nsenter_tailnet_only,
+            )
+        } else {
+            let env_ref = if env.is_empty() { None } else { Some(&*env) };
+            Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
+        };
+
+        let nsenter_args = vec![
+            "--target".to_string(),
+            leader,
+            "--mount".to_string(),
+            "--uts".to_string(),
+            "--ipc".to_string(),
+            "--net".to_string(),
+            "--pid".to_string(),
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            shell_cmd,
+        ];
+
+        Ok((nsenter, nsenter_args))
+    }
+
+    /// Spawn a process in a raw Unix PTY. Used for Host workspaces and for
+    /// nspawn Container workspaces (with `program`/`args` pre-wrapped in
+    /// `nsenter ... /bin/sh -lc ...` by
+    /// [`Self::build_container_nsenter_invocation`]).
     #[cfg(unix)]
-    fn spawn_host_unix_pty(
+    fn spawn_unix_pty(
         &self,
         cwd: &Path,
         program: &str,

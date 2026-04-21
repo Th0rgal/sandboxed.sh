@@ -5842,6 +5842,19 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
     if !is_recoverable {
         return;
     }
+    // Claude Code transport failures (startup timeout, incomplete turn, etc.)
+    // carry a structured `claudecode_transport_failure` marker. These are
+    // never a successful turn — treating them as TurnComplete lets the mission
+    // re-enter an automation loop where every retry fake-succeeds. Keep the
+    // failure classification so the mission is surfaced as failed.
+    if result
+        .data
+        .as_ref()
+        .and_then(|v| v.get("claudecode_transport_failure"))
+        .is_some()
+    {
+        return;
+    }
     let output = result.output.trim();
     // Only recover when we have real content — not just an error message.
     // Heuristic: at least 20 chars and doesn't look like a bare error.
@@ -5851,6 +5864,11 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
         && !output.starts_with("Codex CLI exited before completing the turn")
         && !output.starts_with("No response from")
         && !output.starts_with("Claude Code error:")
+        && !output.starts_with("Claude Code produced no")
+        && !output.starts_with("Claude Code emitted malformed")
+        && !output.starts_with("Claude Code ended before startup")
+        && !output.starts_with("Claude Code exited without")
+        && !output.starts_with("Claude Code stopped producing output")
         && !output.starts_with("No Claude Code credentials detected")
         && !is_bare_llm_error_output(output)
     {
@@ -14671,6 +14689,46 @@ Investigate <service/> failures.
 
         assert!(result.success);
         assert_eq!(result.terminal_reason, Some(TerminalReason::TurnComplete));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_claude_transport_failure() {
+        let mut result = crate::agents::AgentResult::failure(
+            "Claude Code produced no stream events after startup timeout. \
+             The Claude CLI started but did not emit any stream-json events."
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError)
+        .with_data(serde_json::json!({
+            "claudecode_transport_failure": {
+                "stage": "startup",
+                "idle_timeout_triggered": false,
+                "process_exited_without_result": false,
+                "pending_tool_names": [],
+            }
+        }));
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_claude_startup_timeout_message() {
+        let mut result = crate::agents::AgentResult::failure(
+            "Claude Code produced no stream events after startup timeout. \
+             More text that pushes it past the 20 char heuristic."
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
     }
 
     #[tokio::test]
