@@ -361,16 +361,16 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
                     .and_then(|v| v.as_str())
                     .is_some_and(|s| !s.trim().is_empty());
 
-            // OpenAI/Anthropic OAuth entries include an access token that can be
-            // forwarded as a Bearer token for proxy routing.
+            // Anthropic OAuth entries include an access token that works as a
+            // Bearer credential at `/v1/messages` (with the oauth-2025-04-20
+            // beta header). OpenAI OAuth JWTs look similar but are only valid
+            // against the Codex `/v1/responses` path — `/v1/chat/completions`
+            // rejects them with 401. Don't hoist OpenAI OAuth to `api_key`
+            // or the chain resolver will route to an endpoint that can never
+            // succeed; leave OpenAI OAuth accounts without an `api_key` so
+            // `has_routable_credentials` excludes them from the pool.
             let mut oauth_expires_at: Option<i64> = None;
-            if api_key.is_none()
-                && has_oauth
-                && matches!(
-                    provider_type,
-                    ProviderType::OpenAI | ProviderType::Anthropic
-                )
-            {
+            if api_key.is_none() && has_oauth && provider_type == ProviderType::Anthropic {
                 api_key = value
                     .get("access")
                     .or_else(|| value.get("access_token"))

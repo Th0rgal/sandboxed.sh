@@ -1067,7 +1067,7 @@ impl ModelChainStore {
 
             // 1. Check AIProviderStore (custom providers, multi-account)
             let store_accounts = ai_providers.get_all_by_type(provider_type).await;
-            let store_has_account_for_provider = !store_accounts.is_empty();
+            let mut store_contributed_entry = false;
 
             for account in &store_accounts {
                 if !health_tracker.is_healthy(account.id).await {
@@ -1162,16 +1162,19 @@ impl ModelChainStore {
                     base_url: account.base_url.clone(),
                     subscription_key,
                 });
+                store_contributed_entry = true;
             }
 
             // 2. Fall back to standard accounts from OpenCode config only
-            // when no store account exists for this provider. A user who has
-            // registered the provider in AIProviderStore treats that as the
-            // authoritative source — the opencode auth.json entry is usually
-            // a stale duplicate of the same underlying subscription (its
-            // access_token comes from a separate refresh chain) and just
-            // wastes fallback attempts when the real subscription rate-limits.
-            if store_has_account_for_provider {
+            // when the store *actually contributed* a routable entry. A store
+            // record that exists but was filtered out (stale OAuth, cooldown,
+            // duplicate subscription) shouldn't suppress the opencode
+            // auth.json fallback — without this, a single expired store OAuth
+            // entry silently disables a provider that opencode could still
+            // serve. A standard account that actually duplicates a live store
+            // subscription would have produced the same shared-subscription
+            // cooldown anyway, so no real risk of duplicate attempts.
+            if store_contributed_entry {
                 continue;
             }
             for sa in standard_accounts {
@@ -1290,6 +1293,52 @@ mod tests {
 
     fn past_ms(hours: i64) -> i64 {
         chrono::Utc::now().timestamp_millis() - hours * 3600 * 1000
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_falls_back_to_standard_when_store_entry_is_stale() {
+        // Store has an OpenAI entry but its OAuth is 8 days expired — the
+        // chain must fall through to the standard account (opencode auth.json)
+        // instead of resolving to zero entries and returning a spurious
+        // "all providers rate-limited" error to the client.
+        let mut stale = AIProvider::new(ProviderType::OpenAI, "OpenAI (stale)".to_string());
+        stale.oauth = Some(OAuthCredentials {
+            access_token: "stale".to_string(),
+            refresh_token: "stale-rt".to_string(),
+            expires_at: past_ms(200),
+        });
+        stale.account_email = Some("user@example.com".to_string());
+
+        let store = store_with(vec![stale]).await;
+        let chains = store_with_chain(
+            "gpt",
+            vec![ChainEntry {
+                provider_id: "openai".to_string(),
+                model_id: "gpt-5.4".to_string(),
+            }],
+        )
+        .await;
+        let standard = vec![StandardAccount {
+            account_id: stable_provider_uuid("openai"),
+            provider_type: ProviderType::OpenAI,
+            api_key: Some("fresh-access-token".to_string()),
+            has_oauth: true,
+            base_url: None,
+            oauth_expires_at: Some(future_ms(6)),
+        }];
+        let tracker = ProviderHealthTracker::new();
+
+        let resolved = chains
+            .resolve_chain("gpt", &store, &standard, &tracker)
+            .await;
+
+        assert_eq!(
+            resolved.len(),
+            1,
+            "standard account should back-fill when store entry was filtered, got {:?}",
+            resolved
+        );
+        assert_eq!(resolved[0].account_id, standard[0].account_id);
     }
 
     #[tokio::test]
