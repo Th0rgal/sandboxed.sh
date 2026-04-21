@@ -3115,6 +3115,56 @@ async fn refresh_anthropic_oauth_token_inner(force: bool) -> Result<(), String> 
     Ok(())
 }
 
+/// Exchange an Anthropic refresh token for fresh credentials.
+///
+/// Pure HTTP exchange — no side effects on any credential store. Callers are
+/// responsible for persisting the returned credentials wherever they're
+/// needed (per-provider record, opencode auth.json, etc.).
+pub async fn exchange_anthropic_refresh_token(
+    refresh_token: &str,
+) -> Result<crate::ai_providers::OAuthCredentials, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://console.anthropic.com/v1/oauth/token")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", ANTHROPIC_CLIENT_ID),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("Failed to refresh token: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Token refresh failed ({}): {}", status, body));
+    }
+
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse token response: {}", e))?;
+
+    let access_token = data["access_token"]
+        .as_str()
+        .ok_or_else(|| "No access_token in refresh response".to_string())?
+        .to_string();
+    let new_refresh_token = data["refresh_token"]
+        .as_str()
+        .ok_or_else(|| "No refresh_token in refresh response".to_string())?
+        .to_string();
+    let expires_in = data["expires_in"].as_i64().unwrap_or(3600);
+    let expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
+
+    Ok(crate::ai_providers::OAuthCredentials {
+        access_token,
+        refresh_token: new_refresh_token,
+        expires_at,
+    })
+}
+
 /// Ensure the Anthropic OAuth token is valid, refreshing if needed.
 /// This should be called before starting a mission that uses Claude Code.
 pub async fn ensure_anthropic_oauth_token_valid() -> Result<(), String> {
@@ -4960,111 +5010,116 @@ async fn get_provider_usage(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Resolve provider credentials: check AIProviderStore first, then OpenCode auth
-    let (provider_type, api_key_opt, oauth, account_email, provider_name) = if let Ok(uuid) =
-        uuid::Uuid::parse_str(&id)
-    {
-        // UUID lookup for custom providers
-        let provider = state
-            .ai_providers
-            .get(uuid)
-            .await
-            .ok_or((StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
-        (
-            provider.provider_type,
-            provider.api_key.clone(),
-            provider.oauth.clone(),
-            provider.account_email.clone(),
-            provider.name.clone(),
-        )
-    } else if let Some(pt) = ProviderType::from_id(&id) {
-        // Try AIProviderStore first
-        if let Some(provider) = state.ai_providers.get_by_type(pt).await {
+    // Resolve provider credentials: check AIProviderStore first, then OpenCode auth.
+    // `provider_uuid` is `Some` when the credentials live in AIProviderStore and we
+    // can persist a refreshed OAuth back into that specific record.
+    let (provider_type, api_key_opt, oauth, account_email, provider_name, provider_uuid) =
+        if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+            // UUID lookup for custom providers
+            let provider = state
+                .ai_providers
+                .get(uuid)
+                .await
+                .ok_or((StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
             (
                 provider.provider_type,
                 provider.api_key.clone(),
                 provider.oauth.clone(),
                 provider.account_email.clone(),
                 provider.name.clone(),
+                Some(uuid),
             )
-        } else {
-            // Fall back to OpenCode auth: check both central auth.json
-            // and per-provider auth files (~/.opencode/auth/{provider}.json)
-            let auth = read_opencode_auth().map_err(internal_error)?;
-            let accounts_state = read_provider_accounts_state(&state.config.working_dir);
-            let account_email = accounts_state.get(pt.id()).cloned();
-
-            // Collect all auth entries: central + per-provider file
-            let mut auth_entries: Vec<&serde_json::Value> = opencode_auth_keys(pt)
-                .into_iter()
-                .filter_map(|key| auth.get(key))
-                .collect();
-            // Also read per-provider auth file
-            let provider_auth_path = get_opencode_provider_auth_path(pt);
-            let provider_auth_value: Option<serde_json::Value> = if provider_auth_path.exists() {
-                std::fs::read_to_string(&provider_auth_path)
-                    .ok()
-                    .and_then(|c| serde_json::from_str(&c).ok())
+        } else if let Some(pt) = ProviderType::from_id(&id) {
+            // Try AIProviderStore first
+            if let Some(provider) = state.ai_providers.get_by_type(pt).await {
+                (
+                    provider.provider_type,
+                    provider.api_key.clone(),
+                    provider.oauth.clone(),
+                    provider.account_email.clone(),
+                    provider.name.clone(),
+                    Some(provider.id),
+                )
             } else {
-                None
-            };
-            if let Some(ref pav) = provider_auth_value {
-                auth_entries.push(pav);
+                // Fall back to OpenCode auth: check both central auth.json
+                // and per-provider auth files (~/.opencode/auth/{provider}.json)
+                let auth = read_opencode_auth().map_err(internal_error)?;
+                let accounts_state = read_provider_accounts_state(&state.config.working_dir);
+                let account_email = accounts_state.get(pt.id()).cloned();
+
+                // Collect all auth entries: central + per-provider file
+                let mut auth_entries: Vec<&serde_json::Value> = opencode_auth_keys(pt)
+                    .into_iter()
+                    .filter_map(|key| auth.get(key))
+                    .collect();
+                // Also read per-provider auth file
+                let provider_auth_path = get_opencode_provider_auth_path(pt);
+                let provider_auth_value: Option<serde_json::Value> = if provider_auth_path.exists()
+                {
+                    std::fs::read_to_string(&provider_auth_path)
+                        .ok()
+                        .and_then(|c| serde_json::from_str(&c).ok())
+                } else {
+                    None
+                };
+                if let Some(ref pav) = provider_auth_value {
+                    auth_entries.push(pav);
+                }
+
+                let api_key = auth_entries.iter().find_map(|v| {
+                    v.get("key")
+                        .or_else(|| v.get("api_key"))
+                        .or_else(|| v.get("apiKey"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                });
+
+                let oauth_creds = auth_entries.iter().find_map(|entry| {
+                    let access = entry
+                        .get("access")
+                        .or_else(|| entry.get("access_token"))
+                        .and_then(|v| v.as_str())?;
+                    let refresh = entry
+                        .get("refresh")
+                        .or_else(|| entry.get("refresh_token"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let expires_at = entry
+                        .get("expires")
+                        .or_else(|| entry.get("expires_at"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    Some(crate::ai_providers::OAuthCredentials {
+                        access_token: access.to_string(),
+                        refresh_token: refresh,
+                        expires_at,
+                    })
+                });
+
+                if api_key.is_none() && oauth_creds.is_none() {
+                    return Ok(Json(serde_json::json!({
+                        "provider_type": pt.id(),
+                        "provider_name": pt.display_name(),
+                        "error": "No credentials found"
+                    })));
+                }
+
+                (
+                    pt,
+                    api_key,
+                    oauth_creds,
+                    account_email,
+                    pt.display_name().to_string(),
+                    None,
+                )
             }
-
-            let api_key = auth_entries.iter().find_map(|v| {
-                v.get("key")
-                    .or_else(|| v.get("api_key"))
-                    .or_else(|| v.get("apiKey"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            });
-
-            let oauth_creds = auth_entries.iter().find_map(|entry| {
-                let access = entry
-                    .get("access")
-                    .or_else(|| entry.get("access_token"))
-                    .and_then(|v| v.as_str())?;
-                let refresh = entry
-                    .get("refresh")
-                    .or_else(|| entry.get("refresh_token"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let expires_at = entry
-                    .get("expires")
-                    .or_else(|| entry.get("expires_at"))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                Some(crate::ai_providers::OAuthCredentials {
-                    access_token: access.to_string(),
-                    refresh_token: refresh,
-                    expires_at,
-                })
-            });
-
-            if api_key.is_none() && oauth_creds.is_none() {
-                return Ok(Json(serde_json::json!({
-                    "provider_type": pt.id(),
-                    "provider_name": pt.display_name(),
-                    "error": "No credentials found"
-                })));
-            }
-
-            (
-                pt,
-                api_key,
-                oauth_creds,
-                account_email,
-                pt.display_name().to_string(),
-            )
-        }
-    } else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("Invalid provider ID: {}", id),
-        ));
-    };
+        } else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("Invalid provider ID: {}", id),
+            ));
+        };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -5082,18 +5137,71 @@ async fn get_provider_usage(
             let (auth, is_oauth) = if let Some(ref key) = api_key_opt {
                 (key.clone(), false)
             } else if let Some(ref o) = oauth {
-                // Refresh the token if expired before using it
+                // Refresh the token if expired before using it.
+                //
+                // When the provider lives in AIProviderStore (UUID-based
+                // lookup), refresh using that record's own refresh_token and
+                // persist the new credentials back into the same record —
+                // refresh_anthropic_oauth_token() only touches the shared
+                // opencode auth.json, so without this we'd silently reuse a
+                // months-stale access_token and surface as HTTP 401.
                 if oauth_token_expired(o.expires_at) {
-                    if let Err(e) = refresh_anthropic_oauth_token().await {
-                        tracing::warn!(
-                            "Failed to refresh Anthropic OAuth token for usage check: {}",
-                            e
-                        );
+                    let (token, refresh_err) = if let Some(uuid) = provider_uuid {
+                        match exchange_anthropic_refresh_token(&o.refresh_token).await {
+                            Ok(fresh) => {
+                                let access = fresh.access_token.clone();
+                                if state
+                                    .ai_providers
+                                    .set_oauth_credentials(uuid, fresh)
+                                    .await
+                                    .is_none()
+                                {
+                                    tracing::warn!(
+                                        provider_id = %uuid,
+                                        "Provider disappeared while persisting refreshed OAuth credentials"
+                                    );
+                                }
+                                (access, None)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    provider_id = %uuid,
+                                    "Per-provider Anthropic OAuth refresh failed: {}",
+                                    e
+                                );
+                                (o.access_token.clone(), Some(e))
+                            }
+                        }
+                    } else {
+                        if let Err(e) = refresh_anthropic_oauth_token().await {
+                            tracing::warn!(
+                                "Failed to refresh Anthropic OAuth token for usage check: {}",
+                                e
+                            );
+                        }
+                        let tok = read_oauth_token_entry(ProviderType::Anthropic)
+                            .map(|entry| entry.access_token)
+                            .unwrap_or_else(|| o.access_token.clone());
+                        (tok, None)
+                    };
+                    // If the refresh_token itself is dead, short-circuit with a
+                    // clear message — probing Anthropic with the stale
+                    // access_token would just return HTTP 401 and hide the real
+                    // problem (the user needs to re-authenticate).
+                    if let Some(err) = refresh_err {
+                        let lower = err.to_lowercase();
+                        if lower.contains("invalid_grant")
+                            || lower.contains("refresh token not found")
+                        {
+                            return Ok(Json(serde_json::json!({
+                                "provider_type": "anthropic",
+                                "provider_name": provider_name,
+                                "account_email": account_email,
+                                "status_code": 401,
+                                "error": "Refresh token revoked — please re-authenticate this account",
+                            })));
+                        }
                     }
-                    // Re-read the fresh token from auth.json
-                    let token = read_oauth_token_entry(ProviderType::Anthropic)
-                        .map(|entry| entry.access_token)
-                        .unwrap_or_else(|| o.access_token.clone());
                     (token, true)
                 } else {
                     (o.access_token.clone(), true)
