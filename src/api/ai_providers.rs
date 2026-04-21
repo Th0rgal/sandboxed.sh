@@ -436,6 +436,23 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
         });
     }
 
+    // Same pattern for OpenAI (ChatGPT Plus/Pro OAuth). The Codex OAuth JWT
+    // isn't valid against `api.openai.com/v1/chat/completions` directly, but
+    // the CLI proxy exposes an OpenAI-compatible endpoint that translates it
+    // to the Codex `/v1/responses` API internally. So when we have no API
+    // key and the proxy has fresh codex credentials, let chains route through
+    // the proxy instead of giving up.
+    if !seen_types.contains(&ProviderType::OpenAI) && openai_cli_proxy_account_available() {
+        accounts.push(crate::provider_health::StandardAccount {
+            account_id: crate::provider_health::stable_provider_uuid("openai-cli-proxy"),
+            provider_type: ProviderType::OpenAI,
+            api_key: None,
+            has_oauth: true,
+            base_url: None,
+            oauth_expires_at: None,
+        });
+    }
+
     accounts
 }
 
@@ -460,6 +477,24 @@ pub(crate) fn anthropic_cli_proxy_account_available() -> bool {
 }
 
 fn has_fresh_cli_proxy_claude_account() -> bool {
+    has_fresh_cli_proxy_account_of_type("claude-", "claude")
+}
+
+/// True when the CLI Proxy API has at least one fresh Codex (ChatGPT
+/// Plus/Pro OAuth) credential on disk. Used to decide whether the
+/// `openai-cli-proxy` synthetic standard account is worth adding to
+/// chains — without a live upstream credential the proxy would 401 on
+/// every request, so keeping it out of the chain avoids wasted attempts.
+pub(crate) fn has_fresh_cli_proxy_codex_account() -> bool {
+    has_fresh_cli_proxy_account_of_type("codex-", "codex")
+}
+
+/// Scan the CLI proxy's auth directory for entries with
+/// `name.starts_with(file_prefix)` and `type == type_tag`, returning true
+/// as soon as one is enabled and has a non-empty access_token that hasn't
+/// expired. Shared by Claude and Codex because the directory layout and
+/// file shape are identical across providers.
+fn has_fresh_cli_proxy_account_of_type(file_prefix: &str, type_tag: &str) -> bool {
     let mut dirs = Vec::new();
     if let Ok(dir) = std::env::var("CLI_PROXY_AUTH_DIR") {
         let trimmed = dir.trim();
@@ -479,7 +514,7 @@ fn has_fresh_cli_proxy_claude_account() -> bool {
             let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if !(name.starts_with("claude-") && name.ends_with(".json")) {
+            if !(name.starts_with(file_prefix) && name.ends_with(".json")) {
                 continue;
             }
             let Ok(contents) = std::fs::read_to_string(&path) else {
@@ -495,7 +530,7 @@ fn has_fresh_cli_proxy_claude_account() -> bool {
             {
                 continue;
             }
-            if value.get("type").and_then(|v| v.as_str()) != Some("claude") {
+            if value.get("type").and_then(|v| v.as_str()) != Some(type_tag) {
                 continue;
             }
             let has_access = value
@@ -517,6 +552,29 @@ fn has_fresh_cli_proxy_claude_account() -> bool {
     }
 
     false
+}
+
+/// Equivalent of `anthropic_cli_proxy_account_available` for OpenAI
+/// (Codex) OAuth. Returns true when the CLI proxy is either explicitly
+/// configured via env, or has at least one fresh codex-*.json credential.
+pub(crate) fn openai_cli_proxy_account_available() -> bool {
+    if env_var_bool("CLAUDE_CODE_DISABLE_CLI_PROXY", false) {
+        return false;
+    }
+
+    let has_explicit_proxy_config = [
+        "CLAUDE_CODE_PROXY_BASE_URL",
+        "CLI_PROXY_API_BASE_URL",
+        "CLIPROXY_API_BASE_URL",
+        "CLIPROXY_BASE_URL",
+        "CLAUDE_CODE_PROXY_API_KEY",
+        "CLI_PROXY_API_KEY",
+        "CLIPROXY_API_KEY",
+    ]
+    .iter()
+    .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+
+    has_explicit_proxy_config || has_fresh_cli_proxy_codex_account()
 }
 
 /// Create AI provider routes.

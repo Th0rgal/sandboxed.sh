@@ -199,7 +199,13 @@ fn has_routable_proxy_credentials(
 ) -> bool {
     match provider_type {
         ProviderType::Custom => true,
+        // OpenAI joins Anthropic here: the local CLI proxy's
+        // `/v1/chat/completions` endpoint knows how to translate ChatGPT
+        // Plus/Pro OAuth into the Codex `/v1/responses` call, so an
+        // OAuth-only entry is still routable — the adapter matches on
+        // `api_key.is_none() && has_oauth` and forwards through the proxy.
         ProviderType::Anthropic => has_api_key || has_oauth,
+        ProviderType::OpenAI => has_api_key || has_oauth,
         ProviderType::Google => has_api_key || has_oauth,
         _ => has_api_key,
     }
@@ -487,10 +493,31 @@ async fn chat_completions(
             provider_type == ProviderType::Anthropic && entry.has_oauth && entry.api_key.is_none();
         let use_anthropic_adapter =
             provider_type == ProviderType::Anthropic && !use_anthropic_oauth_cli_proxy_adapter;
+        // OpenAI OAuth (Codex ChatGPT Plus/Pro tokens) can't authenticate at
+        // `api.openai.com/v1/chat/completions` directly — only at the Codex
+        // `/v1/responses` endpoint. The local CLI proxy knows how to translate
+        // between the two, so when we have OAuth but no `sk-...` key we route
+        // through it instead of burning through 401s upstream.
+        let use_openai_oauth_cli_proxy_adapter =
+            provider_type == ProviderType::OpenAI && entry.has_oauth && entry.api_key.is_none();
         let use_google_oauth_adapter = provider_type == ProviderType::Google && entry.has_oauth;
         let (url, upstream_body, extra_headers) = if use_anthropic_oauth_cli_proxy_adapter {
             let upstream_body = match rewrite_model_for_anthropic_cli_proxy(&body, &entry.model_id)
             {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("Failed to rewrite model in request body: {}", e);
+                    server_error_count += 1;
+                    continue;
+                }
+            };
+            (
+                cli_proxy_chat_completions_url(),
+                upstream_body,
+                build_cli_proxy_headers(),
+            )
+        } else if use_openai_oauth_cli_proxy_adapter {
+            let upstream_body = match rewrite_model(&body, &entry.model_id) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("Failed to rewrite model in request body: {}", e);
@@ -606,6 +633,7 @@ async fn chat_completions(
         if !use_google_oauth_adapter
             && !use_anthropic_adapter
             && !use_anthropic_oauth_cli_proxy_adapter
+            && !use_openai_oauth_cli_proxy_adapter
         {
             if let Some(api_key) = &entry.api_key {
                 upstream_req = upstream_req.header("Authorization", format!("Bearer {}", api_key));

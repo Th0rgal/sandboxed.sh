@@ -1086,12 +1086,15 @@ impl ModelChainStore {
                     .as_ref()
                     .map(|oauth| oauth.expires_at > now_ms + 60_000)
                     .unwrap_or(false);
+                // Hoist the OAuth access token to `api_key` so the proxy can
+                // forward it as a Bearer credential — but only for Anthropic,
+                // where `api.anthropic.com/v1/messages` accepts the OAuth JWT
+                // with the `oauth-2025-04-20` beta header. OpenAI (Codex) JWTs
+                // don't work at `api.openai.com/v1/chat/completions`; those
+                // accounts are routed through the CLI-proxy adapter, which
+                // needs `api_key = None, has_oauth = true` to trigger.
                 let routed_api_key = account.api_key.clone().or_else(|| {
-                    if !matches!(
-                        provider_type,
-                        crate::ai_providers::ProviderType::OpenAI
-                            | crate::ai_providers::ProviderType::Anthropic
-                    ) {
+                    if provider_type != crate::ai_providers::ProviderType::Anthropic {
                         return None;
                     }
                     if !oauth_is_fresh {
