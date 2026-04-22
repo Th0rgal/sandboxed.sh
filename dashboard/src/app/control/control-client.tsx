@@ -320,24 +320,17 @@ function deriveItemViews(
   showThinkingPanel: boolean
 ): ItemViews {
   // Pass 1: dedup by id (last occurrence wins, preserve original order).
-  // Walk right-to-left recording seen ids, then left-to-right keeping the
-  // first encounter of each id that survived the dedup pass. Two linear
-  // walks with a Set, so O(n) and no reversal allocation.
-  const keep = new Set<string>();
-  const seenRev = new Set<string>();
-  for (let i = items.length - 1; i >= 0; i--) {
-    const id = items[i].id;
-    if (seenRev.has(id)) continue;
-    seenRev.add(id);
-    keep.add(id);
+  // Record the last index per id, then emit items whose index matches.
+  // O(n) with a single map allocation.
+  const lastIndexById = new Map<string, number>();
+  for (let i = 0; i < items.length; i++) {
+    lastIndexById.set(items[i].id, i);
   }
   const dedupedItems: ChatItem[] = [];
-  const seenFwd = new Set<string>();
-  for (const item of items) {
-    if (!keep.has(item.id)) continue;
-    if (seenFwd.has(item.id)) continue;
-    seenFwd.add(item.id);
-    dedupedItems.push(item);
+  for (let i = 0; i < items.length; i++) {
+    if (lastIndexById.get(items[i].id) === i) {
+      dedupedItems.push(items[i]);
+    }
   }
 
   // Pass 2: split queued user messages off the end, collect thinking
@@ -3306,7 +3299,17 @@ export default function ControlClient() {
           missionMaxSeqRef.current.delete(id);
           return [];
         }
-        missionMaxSeqRef.current.set(id, meta.maxSequence);
+        // If the page was capped by `limit`, advance the cursor to the
+        // last returned event's sequence instead of `meta.maxSequence` —
+        // otherwise the next poll would skip every event between the
+        // returned tail and the true max.
+        const lastSeq =
+          events.length > 0 ? events[events.length - 1].sequence : opts.sinceSeq;
+        const cursor =
+          events.length >= MAX_EVENTS && lastSeq < meta.maxSequence
+            ? lastSeq
+            : meta.maxSequence;
+        missionMaxSeqRef.current.set(id, cursor);
         return events;
       }
 
@@ -6883,15 +6886,15 @@ export default function ControlClient() {
     const hasExistingUserMessages = items.some((item) => item.kind === "user");
     const willBeQueued = isBusy && hasExistingUserMessages;
 
-    // Use raw content for optimistic message (not prefixed with agent)
-    // This ensures content matches what SSE echoes back, preventing duplicate messages
-    // when SSE arrives before API response and needs to dedupe by content
+    // Use trimmed content for optimistic message (not prefixed with agent)
+    // so it matches exactly what the backend stores and SSE echoes back,
+    // preventing duplicate messages when SSE arrives before the API response
     setItems((prev) => [
       ...prev,
       {
         kind: "user" as const,
         id: tempId,
-        content,
+        content: trimmedContent,
         timestamp,
         queued: willBeQueued,
       },
@@ -6902,7 +6905,7 @@ export default function ControlClient() {
 
     try {
       // Send message with mission_id - backend handles routing (main vs parallel)
-      const { id, queued } = await postControlMessage(content, {
+      const { id, queued } = await postControlMessage(trimmedContent, {
         agent: agent || undefined,
         mission_id: targetMissionId || undefined,
       });

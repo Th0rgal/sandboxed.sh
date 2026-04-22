@@ -103,7 +103,7 @@ impl CodexClient {
             directory, effective_model, self.config.model_effort
         );
 
-        let (program, full_args) = if self.config.cli_path.contains(' ') {
+        let (program, mut full_args) = if self.config.cli_path.contains(' ') {
             let parts: Vec<&str> = self.config.cli_path.splitn(2, ' ').collect();
             let program = parts[0].to_string();
             let mut full_args = if parts.len() > 1 {
@@ -117,47 +117,92 @@ impl CodexClient {
             (self.config.cli_path.clone(), args.clone())
         };
 
-        let mut child = if let Some(exec) = workspace_exec {
-            exec.spawn_streaming(Path::new(directory), &program, &full_args, env)
-                .await
-                .map_err(|e| {
-                    error!("Failed to spawn Codex CLI in workspace: {}", e);
-                    anyhow!("Failed to spawn Codex CLI in workspace: {}", e)
-                })?
-        } else {
-            let mut cmd = Command::new(&program);
-            cmd.current_dir(directory)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .args(&full_args);
-            if !env.is_empty() {
-                cmd.envs(env);
+        // Spawn the child, asking for piped stdin so we can feed the prompt
+        // via stdin. If for some reason the exec path returns a child
+        // without a stdin pipe (e.g., a container wrapper that closes
+        // stdin), fall back to passing the prompt on argv instead of
+        // failing the mission outright.
+        async fn spawn_codex_child(
+            workspace_exec: Option<&WorkspaceExec>,
+            directory: &str,
+            program: &str,
+            full_args: &[String],
+            env: HashMap<String, String>,
+            cli_path: &str,
+        ) -> Result<tokio::process::Child> {
+            if let Some(exec) = workspace_exec {
+                exec.spawn_streaming(Path::new(directory), program, full_args, env)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to spawn Codex CLI in workspace: {}", e);
+                        anyhow!("Failed to spawn Codex CLI in workspace: {}", e)
+                    })
+            } else {
+                let mut cmd = Command::new(program);
+                cmd.current_dir(directory)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .args(full_args);
+                if !env.is_empty() {
+                    cmd.envs(env);
+                }
+                cmd.spawn().map_err(|e| {
+                    error!("Failed to spawn Codex CLI: {}", e);
+                    anyhow!(
+                        "Failed to spawn Codex CLI: {}. Is it installed at '{}'?",
+                        e,
+                        cli_path
+                    )
+                })
             }
-            cmd.spawn().map_err(|e| {
-                error!("Failed to spawn Codex CLI: {}", e);
-                anyhow!(
-                    "Failed to spawn Codex CLI: {}. Is it installed at '{}'?",
-                    e,
-                    self.config.cli_path
-                )
-            })?
-        };
+        }
+
+        let mut child = spawn_codex_child(
+            workspace_exec,
+            directory,
+            &program,
+            &full_args,
+            env.clone(),
+            &self.config.cli_path,
+        )
+        .await?;
 
         let prompt = message.to_string();
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("Failed to capture Codex stdin"))?;
-        let stdin_task = tokio::spawn(async move {
-            if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
-                debug!("Failed to write Codex prompt to stdin: {}", e);
-                return;
+        let stdin_task = if let Some(mut stdin) = child.stdin.take() {
+            let prompt_for_stdin = prompt.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = stdin.write_all(prompt_for_stdin.as_bytes()).await {
+                    debug!("Failed to write Codex prompt to stdin: {}", e);
+                    return;
+                }
+                if let Err(e) = stdin.shutdown().await {
+                    debug!("Failed to close Codex stdin: {}", e);
+                }
+            }))
+        } else {
+            // Fallback path: no stdin pipe. Kill the child, rewrite the
+            // `-` placeholder to the actual prompt, and respawn. Keeps
+            // container-workspace Codex missions working even if the exec
+            // layer doesn't forward stdin.
+            warn!("Codex child had no stdin pipe; falling back to argv prompt");
+            let _ = child.kill().await;
+            if let Some(pos) = full_args.iter().rposition(|a| a == "-") {
+                full_args[pos] = prompt.clone();
+            } else {
+                full_args.push(prompt.clone());
             }
-            if let Err(e) = stdin.shutdown().await {
-                debug!("Failed to close Codex stdin: {}", e);
-            }
-        });
+            child = spawn_codex_child(
+                workspace_exec,
+                directory,
+                &program,
+                &full_args,
+                env.clone(),
+                &self.config.cli_path,
+            )
+            .await?;
+            None
+        };
 
         // Spawn task to read stdout and parse events
         let stdout = child
@@ -281,7 +326,9 @@ impl CodexClient {
                 }
             }
 
-            let _ = stdin_task.await;
+            if let Some(task) = stdin_task {
+                let _ = task.await;
+            }
             let _ = stderr_task.await;
 
             let stderr_content = stderr_capture.lock().await;

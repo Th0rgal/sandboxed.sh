@@ -3469,15 +3469,10 @@ pub fn run_claudecode_turn<'a>(
 
             // Note: ANTHROPIC_BASE_URL is intentionally *not* consulted here;
             // it is a standard Anthropic SDK variable and users set it for
-            // unrelated API proxies. Use CLAUDE_CODE_PROXY_BASE_URL (or the
-            // CLIPROXY_* aliases) to point us at a specific CLI proxy.
-            //
-            // `env_var_nonempty` skips blank values so a templated empty
-            // CLAUDE_CODE_PROXY_BASE_URL doesn't shadow a valid alias.
-            let base_url = crate::util::env_var_nonempty("CLAUDE_CODE_PROXY_BASE_URL")
-                .or_else(|| crate::util::env_var_nonempty("CLI_PROXY_API_BASE_URL"))
-                .or_else(|| crate::util::env_var_nonempty("CLIPROXY_API_BASE_URL"))
-                .or_else(|| crate::util::env_var_nonempty("CLIPROXY_BASE_URL"))
+            // unrelated API proxies. The aliases used here are the same ones
+            // listed in `util::CLI_PROXY_BASE_URL_ENV_VARS` so every CLI-proxy
+            // code path agrees.
+            let base_url = crate::util::cli_proxy_base_url_from_env()
                 .unwrap_or_else(|| "http://127.0.0.1:8317".to_string());
             let base_url = base_url.trim_end_matches('/').to_string();
             if base_url.is_empty() {
@@ -3488,9 +3483,7 @@ pub fn run_claudecode_turn<'a>(
             // Claude Code still requires a non-empty ANTHROPIC_API_KEY when an
             // Anthropic base URL is configured. If the proxy needs auth, pass
             // through the configured proxy key; otherwise use an inert value.
-            let api_key = crate::util::env_var_nonempty("CLAUDE_CODE_PROXY_API_KEY")
-                .or_else(|| crate::util::env_var_nonempty("CLI_PROXY_API_KEY"))
-                .or_else(|| crate::util::env_var_nonempty("CLIPROXY_API_KEY"))
+            let api_key = crate::util::cli_proxy_api_key_from_env()
                 .unwrap_or_else(|| "sandboxed-sh-cli-proxy".to_string());
 
             Some(ClaudeCodeProxyConfig { base_url, api_key })

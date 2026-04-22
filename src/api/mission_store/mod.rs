@@ -730,6 +730,11 @@ pub struct MissionImportOptions {
     /// Override the target workspace UUID. When `None`, the import resolves
     /// `bundle.workspace_name` against the local workspace store.
     pub target_workspace_id: Option<Uuid>,
+    /// Display name of the target workspace. When set, this is used
+    /// instead of the source bundle's `workspace_name` — otherwise a
+    /// `?workspace_id=` override would leave the stored name pointing
+    /// at the source workspace and confuse future exports/imports.
+    pub target_workspace_name: Option<String>,
     /// Keep the bundle's automations enabled (default: import as disabled).
     pub keep_automations_active: bool,
 }

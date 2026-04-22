@@ -697,9 +697,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/:id/export",
             get(control::export_mission),
         )
+        // Single-shot import buffers the entire body in memory (it
+        // arrives as `axum::body::Bytes`). Keep the cap tight enough
+        // that one request can't exhaust RAM — callers with larger
+        // bundles should use the chunked `/import-chunks` flow, which
+        // streams straight from disk.
         .route(
             "/api/control/missions/import",
-            post(control::import_mission).layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)),
+            post(control::import_mission).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
         )
         // Chunked fallback for bundles that exceed Cloudflare's 100 MB
         // per-request cap even after gzip. Upload flow:

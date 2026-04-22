@@ -157,17 +157,11 @@ fn completions_url(provider_type: ProviderType, account_base_url: Option<&str>) 
 }
 
 fn cli_proxy_chat_completions_url() -> String {
-    // Keep this list in sync with `anthropic_cli_proxy_account_available` in
-    // ai_providers.rs. If a user sets only `CLAUDE_CODE_PROXY_BASE_URL` we
-    // would otherwise enable the synthetic CLI-proxy account but route to the
-    // hardcoded localhost default.
-    //
-    // `env_var_nonempty` skips blank values so a templated empty first alias
-    // doesn't collapse the URL to just `/v1/chat/completions`.
-    let base = crate::util::env_var_nonempty("CLAUDE_CODE_PROXY_BASE_URL")
-        .or_else(|| crate::util::env_var_nonempty("CLI_PROXY_API_BASE_URL"))
-        .or_else(|| crate::util::env_var_nonempty("CLIPROXY_API_BASE_URL"))
-        .or_else(|| crate::util::env_var_nonempty("CLIPROXY_BASE_URL"))
+    // Alias precedence lives in `util::CLI_PROXY_BASE_URL_ENV_VARS` so every
+    // CLI-proxy code path agrees. `env_var_nonempty` (used by the helper)
+    // skips blank values so a templated empty first alias doesn't collapse
+    // the URL to just `/v1/chat/completions`.
+    let base = crate::util::cli_proxy_base_url_from_env()
         .unwrap_or_else(|| DEFAULT_CLI_PROXY_API_BASE_URL.to_string());
     let base = base.trim_end_matches('/');
     if base.ends_with("/chat/completions") {
@@ -181,10 +175,7 @@ fn cli_proxy_chat_completions_url() -> String {
 
 fn build_cli_proxy_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
-    let api_key = crate::util::env_var_nonempty("CLAUDE_CODE_PROXY_API_KEY")
-        .or_else(|| crate::util::env_var_nonempty("CLI_PROXY_API_KEY"))
-        .or_else(|| crate::util::env_var_nonempty("CLIPROXY_API_KEY"));
-    if let Some(api_key) = api_key {
+    if let Some(api_key) = crate::util::cli_proxy_api_key_from_env() {
         if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", api_key)) {
             headers.insert(header::AUTHORIZATION, value);
         }
@@ -863,6 +854,28 @@ async fn chat_completions(
             }
 
             if status.is_client_error() {
+                // 4xx outside 429/529/401/403 (e.g., 400 malformed request).
+                // Still a provider failure — track it so cooldown/backoff and
+                // FallbackEvent reporting kick in instead of silently burning
+                // through retries.
+                let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                let cooldown = state
+                    .health_tracker
+                    .record_entry_failure(entry, CooldownReason::ClientError, None)
+                    .await;
+                pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                    timestamp: chrono::Utc::now(),
+                    chain_id: chain_id.clone(),
+                    from_provider: entry.provider_id.clone(),
+                    from_model: entry.model_id.clone(),
+                    from_account_id: entry.account_id,
+                    reason: CooldownReason::ClientError,
+                    cooldown_secs: Some(cooldown.as_secs_f64()),
+                    to_provider: None,
+                    latency_ms: Some(elapsed_ms),
+                    attempt_number: (entry_idx + 1) as u32,
+                    chain_length,
+                });
                 client_error_count += 1;
                 continue;
             }
@@ -2596,9 +2609,28 @@ fn anthropic_content_blocks_from_openai(
                     .and_then(|v| v.get("url"))
                     .and_then(|v| v.as_str())
                 {
+                    // data URIs → Anthropic base64 source; regular URLs → url source.
+                    if let Some(rest) = url.strip_prefix("data:") {
+                        if let Some((meta, data)) = rest.split_once(',') {
+                            let media_type = meta
+                                .split(';')
+                                .next()
+                                .filter(|m| !m.is_empty())
+                                .unwrap_or("image/jpeg");
+                            out.push(serde_json::json!({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": data,
+                                }
+                            }));
+                            continue;
+                        }
+                    }
                     out.push(serde_json::json!({
-                        "type": "text",
-                        "text": format!("[image:{}]", url)
+                        "type": "image",
+                        "source": { "type": "url", "url": url }
                     }));
                 }
             }
@@ -2772,6 +2804,7 @@ fn transform_anthropic_sse_to_openai(
             std::collections::HashMap::<u64, u32>::new(),
             0u32,
             false,
+            false,
         ),
         |(
             mut stream,
@@ -2783,6 +2816,7 @@ fn transform_anthropic_sse_to_openai(
             mut tool_blocks,
             mut next_tool_idx,
             mut stream_ended,
+            mut done_emitted,
         )| async move {
             if stream_ended {
                 return None;
@@ -2930,7 +2964,33 @@ fn transform_anthropic_sse_to_openai(
                             chunks.push(format!("data: {}\n\n", chunk));
                         }
                         "message_stop" => {
-                            chunks.push("data: [DONE]\n\n".to_string());
+                            if !done_emitted {
+                                chunks.push("data: [DONE]\n\n".to_string());
+                                done_emitted = true;
+                                stream_ended = true;
+                            }
+                        }
+                        "error" => {
+                            // Anthropic stream-time error. Surface as an OpenAI
+                            // error chunk followed by [DONE] so callers see the
+                            // failure instead of a silent empty completion.
+                            let err_obj = parsed.get("error").cloned().unwrap_or_else(
+                                || serde_json::json!({ "message": "upstream stream error" }),
+                            );
+                            let chunk = serde_json::json!({
+                                "id": stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{ "index": 0, "delta": {}, "finish_reason": "error" }],
+                                "error": err_obj,
+                            });
+                            chunks.push(format!("data: {}\n\n", chunk));
+                            if !done_emitted {
+                                chunks.push("data: [DONE]\n\n".to_string());
+                                done_emitted = true;
+                            }
+                            stream_ended = true;
                         }
                         _ => {}
                     }
@@ -2949,6 +3009,7 @@ fn transform_anthropic_sse_to_openai(
                             tool_blocks,
                             next_tool_idx,
                             stream_ended,
+                            done_emitted,
                         ),
                     ));
                 }
@@ -2968,6 +3029,7 @@ fn transform_anthropic_sse_to_openai(
                                 tool_blocks,
                                 next_tool_idx,
                                 stream_ended,
+                                done_emitted,
                             ),
                         ));
                     }
@@ -2975,13 +3037,19 @@ fn transform_anthropic_sse_to_openai(
                         // Upstream closed. Promote any buffered bytes into a
                         // final line (they may be a complete `data:` event
                         // that just missed a trailing `\n`) so we don't drop
-                        // the last event, then terminate the stream with a
-                        // synthesized `[DONE]` so clients see a proper close.
+                        // the last event, then terminate the stream. Only
+                        // synthesize `[DONE]` if we haven't already emitted
+                        // one via `message_stop`.
                         stream_ended = true;
                         if !buf.is_empty() && !buf.ends_with(b"\n") {
                             buf.push(b'\n');
+                            stream_ended = false;
                             continue;
                         }
+                        if done_emitted {
+                            return None;
+                        }
+                        done_emitted = true;
                         return Some((
                             Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")),
                             (
@@ -2994,6 +3062,7 @@ fn transform_anthropic_sse_to_openai(
                                 tool_blocks,
                                 next_tool_idx,
                                 stream_ended,
+                                done_emitted,
                             ),
                         ));
                     }

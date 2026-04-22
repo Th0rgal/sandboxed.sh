@@ -31,6 +31,10 @@ pub enum CooldownReason {
     ServerError,
     /// Authentication/authorization error (401/403)
     AuthError,
+    /// Generic 4xx client error other than 401/403/429 (e.g., 400 malformed
+    /// request, 404 unknown model). Tracked so repeated failures trigger
+    /// cooldown/backoff instead of silently consuming retries.
+    ClientError,
 }
 
 impl std::fmt::Display for CooldownReason {
@@ -41,6 +45,7 @@ impl std::fmt::Display for CooldownReason {
             Self::Timeout => write!(f, "timeout"),
             Self::ServerError => write!(f, "server_error"),
             Self::AuthError => write!(f, "auth_error"),
+            Self::ClientError => write!(f, "client_error"),
         }
     }
 }

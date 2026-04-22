@@ -10188,34 +10188,16 @@ pub async fn import_mission(
         ));
     }
 
-    // Resolve target workspace: explicit override wins; otherwise try by
-    // name; otherwise bail so the user sees why — silently defaulting
-    // to a random workspace would be a nasty surprise.
-    let target_workspace_id = if let Some(id) = query.workspace_id {
-        id
-    } else if let Some(ref name) = bundle.workspace_name {
-        let workspaces = state.workspaces.list().await;
-        match workspaces.iter().find(|w| &w.name == name) {
-            Some(ws) => ws.id,
-            None => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "Workspace '{name}' not found on this instance. Pass \
-                         ?workspace_id=<uuid> to pick one explicitly."
-                    ),
-                ))
-            }
-        }
-    } else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Bundle has no workspace_name and no ?workspace_id= override was provided.".to_string(),
-        ));
-    };
+    let target = resolve_import_target_workspace(
+        &state,
+        query.workspace_id,
+        bundle.workspace_name.as_deref(),
+    )
+    .await?;
 
     let options = mission_store::MissionImportOptions {
-        target_workspace_id: Some(target_workspace_id),
+        target_workspace_id: Some(target.workspace_id),
+        target_workspace_name: target.workspace_name.clone(),
         keep_automations_active: query.keep_automations_active,
     };
     let original_mission_id = bundle.mission.id;
@@ -10230,7 +10212,7 @@ pub async fn import_mission(
 
     Ok(Json(serde_json::json!({
         "mission_id": new_id,
-        "workspace_id": target_workspace_id,
+        "workspace_id": target.workspace_id,
         "original_mission_id": original_mission_id,
         "imported": {
             "events": events_imported,
@@ -10241,11 +10223,161 @@ pub async fn import_mission(
     })))
 }
 
+/// Resolve the workspace a mission import should land in.
+///
+/// Explicit `?workspace_id=` wins. Otherwise the bundle's
+/// `workspace_name` is matched against the local workspace list. A
+/// single match is used; zero matches or multiple matches return
+/// `BAD_REQUEST`/`CONFLICT` asking the caller to disambiguate — we
+/// never silently pick "the first" when workspace names aren't unique.
+/// Resolved import target: the workspace UUID the new mission will be
+/// attached to, plus its current display name (used so
+/// `mission.workspace_name` agrees with `mission.workspace_id`).
+struct ResolvedImportTarget {
+    workspace_id: Uuid,
+    workspace_name: Option<String>,
+}
+
+async fn resolve_import_target_workspace(
+    state: &Arc<AppState>,
+    explicit_id: Option<Uuid>,
+    bundle_workspace_name: Option<&str>,
+) -> Result<ResolvedImportTarget, (StatusCode, String)> {
+    if let Some(id) = explicit_id {
+        // Look up the workspace so we can stamp its current name onto
+        // the import; if it no longer exists, mission_store insertion
+        // will still succeed because workspace_name is nullable.
+        let workspaces = state.workspaces.list().await;
+        let name = workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.name.clone());
+        return Ok(ResolvedImportTarget {
+            workspace_id: id,
+            workspace_name: name,
+        });
+    }
+    let Some(name) = bundle_workspace_name else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Bundle has no workspace_name and no ?workspace_id= override was provided.".to_string(),
+        ));
+    };
+    let workspaces = state.workspaces.list().await;
+    let matches: Vec<_> = workspaces.iter().filter(|w| w.name == name).collect();
+    match matches.as_slice() {
+        [] => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Workspace '{name}' not found on this instance. Pass \
+                 ?workspace_id=<uuid> to pick one explicitly."
+            ),
+        )),
+        [only] => Ok(ResolvedImportTarget {
+            workspace_id: only.id,
+            workspace_name: Some(only.name.clone()),
+        }),
+        _ => Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Workspace name '{name}' is ambiguous ({} matches). \
+                 Pass ?workspace_id=<uuid> to pick one explicitly.",
+                matches.len()
+            ),
+        )),
+    }
+}
+
 /// Parse a mission bundle from raw bytes, transparently decompressing
 /// `Content-Encoding: gzip` before JSON-decoding. Both the single-shot
 /// `/import` route and the chunked `/import-chunks/:id/commit` route
 /// share this helper — they both arrive as a `Bytes` blob that may or
 /// may not be gzipped.
+/// Hard cap on decompressed mission bundle size. Bounds gzip expansion
+/// so a crafted compressed payload can't OOM the daemon before JSON
+/// validation runs. 2 GiB mirrors the single-shot body cap.
+const MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Stream a mission bundle out of a staged chunk directory without ever
+/// holding the concatenated body in memory. Handles gzip transparently —
+/// either because the caller set `?gzip=true` or because the first chunk
+/// starts with the gzip magic header.
+fn parse_mission_bundle_from_chunk_dir(
+    dir: &std::path::Path,
+    total_chunks: u32,
+    gzip_hint: bool,
+) -> Result<mission_store::MissionBundle, (StatusCode, String)> {
+    use std::fs::File;
+    use std::io::{BufReader, Read};
+
+    if total_chunks == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "total_chunks must be > 0".to_string(),
+        ));
+    }
+
+    // Peek at the first chunk to auto-detect gzip when the caller
+    // forgot to pass the hint. A plain `[0x1f, 0x8b]` prefix is
+    // unambiguous for gzip and lets us decompress without buffering
+    // the whole upload first.
+    let first_path = dir.join(format!("chunk_{:06}", 0));
+    let mut first = File::open(&first_path).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Chunk 0 missing or unreadable: {e}"),
+        )
+    })?;
+    let mut magic = [0u8; 2];
+    let peeked = first.read(&mut magic).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read chunk 0: {e}"),
+        )
+    })?;
+    let is_gzipped = gzip_hint || (peeked == 2 && magic == [0x1f, 0x8b]);
+    // Seek back to start so the reader chain sees the full first chunk.
+    use std::io::Seek;
+    first
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("seek: {e}")))?;
+
+    // Build a chained reader across every chunk file in index order.
+    // `Read::chain` is associative, so we fold left across the remaining
+    // chunk indices without allocating intermediate buffers.
+    let mut reader: Box<dyn Read> = Box::new(BufReader::new(first));
+    for i in 1..total_chunks {
+        let path = dir.join(format!("chunk_{i:06}"));
+        let f = File::open(&path).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Chunk {i} missing or unreadable: {e}"),
+            )
+        })?;
+        reader = Box::new(reader.chain(BufReader::new(f)));
+    }
+
+    let bundle: mission_store::MissionBundle = if is_gzipped {
+        let decoder = flate2::read::GzDecoder::new(reader);
+        let bounded = decoder.take(MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES);
+        serde_json::from_reader(BufReader::new(bounded)).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid mission bundle (after gunzip): {e}"),
+            )
+        })?
+    } else {
+        serde_json::from_reader(reader).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid mission bundle: {e}"),
+            )
+        })?
+    };
+
+    Ok(bundle)
+}
+
 fn parse_mission_bundle(
     headers: &axum::http::HeaderMap,
     body: &[u8],
@@ -10266,14 +10398,29 @@ fn parse_mission_bundle(
         || body.starts_with(&[0x1f, 0x8b]);
 
     let bundle: mission_store::MissionBundle = if is_gzipped {
-        let mut decoder = GzDecoder::new(body);
-        let mut decompressed = Vec::with_capacity(body.len() * 4);
+        // Cap the decompressed size via `take` so a zip-bomb can't
+        // exhaust memory. We reserve capacity conservatively (4× body
+        // only up to the cap) so reasonable bundles still allocate in
+        // one shot.
+        let mut decoder = GzDecoder::new(body).take(MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES);
+        let reserve =
+            ((body.len() as u64).saturating_mul(4)).min(MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES);
+        let mut decompressed = Vec::with_capacity(reserve as usize);
         decoder.read_to_end(&mut decompressed).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("Failed to decompress gzipped bundle: {e}"),
             )
         })?;
+        if decompressed.len() as u64 >= MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "Decompressed bundle exceeds the {} byte cap",
+                    MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES
+                ),
+            ));
+        }
         serde_json::from_slice(&decompressed).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
@@ -10313,6 +10460,56 @@ fn import_chunks_dir(upload_id: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("sandboxed_sh_mission_import_{upload_id}"))
 }
 
+/// Staging TTL. Any chunked import dir untouched for longer than this is
+/// considered abandoned (client disconnect, crash, never committed) and
+/// gets swept on the next `init_mission_import` call. Picked large
+/// enough that a slow human-driven upload won't get culled mid-flight.
+const MISSION_IMPORT_STAGING_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Best-effort cleanup of abandoned chunked-import staging dirs. Runs
+/// opportunistically on `init_mission_import`; errors are logged but not
+/// propagated because temp directory sweeping must never block an
+/// otherwise-valid new upload.
+fn sweep_stale_import_staging_dirs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(name_os) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name_os.starts_with("sandboxed_sh_mission_import_") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        // Prefer mtime over ctime — a chunk upload touches mtime, so a
+        // currently-active upload looks "fresh" even if init_ was hours
+        // ago. Fall back to created() if mtime isn't available.
+        let last_touched = metadata
+            .modified()
+            .or_else(|_| metadata.created())
+            .unwrap_or(now);
+        match now.duration_since(last_touched) {
+            Ok(age) if age > MISSION_IMPORT_STAGING_TTL => {
+                let path = entry.path();
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    tracing::warn!(?path, error = %e, "Failed to sweep stale mission-import staging dir");
+                } else {
+                    tracing::info!(
+                        ?path,
+                        age_secs = age.as_secs(),
+                        "Swept abandoned mission-import staging dir"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Initialize a chunked mission import.
 ///
 /// Returns `{"upload_id": "..."}` — the caller then PUTs chunks in order
@@ -10327,6 +10524,11 @@ pub async fn init_mission_import(
     State(_state): State<Arc<AppState>>,
     Extension(_user): Extension<AuthUser>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Opportunistic cleanup of prior abandoned uploads so /tmp can't
+    // grow without bound. Runs on a blocking thread since it hits the
+    // filesystem synchronously.
+    tokio::task::spawn_blocking(sweep_stale_import_staging_dirs);
+
     let upload_id = Uuid::new_v4().simple().to_string();
     let dir = import_chunks_dir(&upload_id);
     tokio::fs::create_dir_all(&dir).await.map_err(|e| {
@@ -10409,48 +10611,30 @@ pub async fn commit_mission_import(
         return Err((StatusCode::NOT_FOUND, "Unknown upload_id.".to_string()));
     }
 
-    // Assemble in order, cleaning up staging on both success and error
-    // paths. The block returns the assembled bytes on success or an
-    // error tuple we re-raise after the cleanup.
-    let assembled = {
-        let inner = async {
-            let mut buf: Vec<u8> = Vec::new();
-            for i in 0..query.total_chunks {
-                let chunk_path = dir.join(format!("chunk_{i:06}"));
-                let data = tokio::fs::read(&chunk_path).await.map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("Chunk {i} missing or unreadable: {e}"),
-                    )
-                })?;
-                buf.extend_from_slice(&data);
-            }
-            Ok::<Vec<u8>, (StatusCode, String)>(buf)
-        };
-        match inner.await {
-            Ok(buf) => buf,
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&dir).await;
-                return Err(e);
-            }
-        }
-    };
-    // Chunks on disk are no longer needed — wipe staging before the
-    // import so a slow/failing import doesn't also hold the raw upload
-    // open in /tmp.
+    // Parse directly from the staged chunk files instead of concatenating
+    // them into one giant `Vec<u8>` in memory. For multi-hundred-MB or GB
+    // uploads that's the difference between "handled" and "OOM'd the
+    // daemon". The parser streams via `serde_json::from_reader` on a
+    // chained `File` iterator (optionally gzip-decoded in flight).
+    let total_chunks = query.total_chunks;
+    let gzip_hint = query.gzip;
+    let dir_for_parse = dir.clone();
+    let bundle_result = tokio::task::spawn_blocking(move || {
+        parse_mission_bundle_from_chunk_dir(&dir_for_parse, total_chunks, gzip_hint)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Join error while parsing import: {e}"),
+        )
+    })?;
+
+    // Chunks on disk are no longer needed — wipe staging regardless of
+    // parse outcome so /tmp doesn't hold the raw upload open.
     let _ = tokio::fs::remove_dir_all(&dir).await;
 
-    // Build a synthetic headers map that carries Content-Encoding so the
-    // shared parser does the right thing. The gzip sniff on the body
-    // bytes catches callers that forgot the hint.
-    let mut headers = axum::http::HeaderMap::new();
-    if query.gzip {
-        headers.insert(
-            axum::http::header::CONTENT_ENCODING,
-            "gzip".parse().unwrap(),
-        );
-    }
-    let bundle = parse_mission_bundle(&headers, &assembled)?;
+    let bundle = bundle_result?;
     if bundle.version != 1 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -10458,32 +10642,17 @@ pub async fn commit_mission_import(
         ));
     }
 
-    let target_workspace_id = if let Some(id) = query.workspace_id {
-        id
-    } else if let Some(ref name) = bundle.workspace_name {
-        let workspaces = state.workspaces.list().await;
-        match workspaces.iter().find(|w| &w.name == name) {
-            Some(ws) => ws.id,
-            None => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "Workspace '{name}' not found on this instance. Pass \
-                         ?workspace_id=<uuid> to pick one explicitly."
-                    ),
-                ))
-            }
-        }
-    } else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Bundle has no workspace_name and no ?workspace_id= override was provided.".to_string(),
-        ));
-    };
+    let target = resolve_import_target_workspace(
+        &state,
+        query.workspace_id,
+        bundle.workspace_name.as_deref(),
+    )
+    .await?;
 
     let control = control_for_user(&state, &user).await;
     let options = mission_store::MissionImportOptions {
-        target_workspace_id: Some(target_workspace_id),
+        target_workspace_id: Some(target.workspace_id),
+        target_workspace_name: target.workspace_name.clone(),
         keep_automations_active: query.keep_automations_active,
     };
     let original_mission_id = bundle.mission.id;
@@ -10498,7 +10667,7 @@ pub async fn commit_mission_import(
 
     Ok(Json(serde_json::json!({
         "mission_id": new_id,
-        "workspace_id": target_workspace_id,
+        "workspace_id": target.workspace_id,
         "original_mission_id": original_mission_id,
         "imported": {
             "events": events_imported,
@@ -10506,7 +10675,6 @@ pub async fn commit_mission_import(
             "executions": executions_imported,
         },
         "automations_active": query.keep_automations_active,
-        "assembled_bytes": assembled.len(),
     })))
 }
 

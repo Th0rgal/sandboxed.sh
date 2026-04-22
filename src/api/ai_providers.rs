@@ -453,7 +453,12 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
             api_key: None,
             has_oauth: true,
             base_url: None,
-            oauth_expires_at: None,
+            // Freshness of the underlying CLI-proxy credential is checked
+            // at availability time (`has_fresh_cli_proxy_*`); once this
+            // synthetic entry is added we don't want the chain resolver
+            // to drop it for "missing expiry". Use a far-future sentinel
+            // so any future code that defaults None to 0 still keeps it.
+            oauth_expires_at: Some(i64::MAX),
         });
     }
 
@@ -476,7 +481,12 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
             api_key: None,
             has_oauth: true,
             base_url: None,
-            oauth_expires_at: None,
+            // Freshness of the underlying CLI-proxy credential is checked
+            // at availability time (`has_fresh_cli_proxy_*`); once this
+            // synthetic entry is added we don't want the chain resolver
+            // to drop it for "missing expiry". Use a far-future sentinel
+            // so any future code that defaults None to 0 still keeps it.
+            oauth_expires_at: Some(i64::MAX),
         });
     }
 
@@ -488,19 +498,7 @@ pub(crate) fn anthropic_cli_proxy_account_available() -> bool {
         return false;
     }
 
-    let has_explicit_proxy_config = [
-        "CLAUDE_CODE_PROXY_BASE_URL",
-        "CLI_PROXY_API_BASE_URL",
-        "CLIPROXY_API_BASE_URL",
-        "CLIPROXY_BASE_URL",
-        "CLAUDE_CODE_PROXY_API_KEY",
-        "CLI_PROXY_API_KEY",
-        "CLIPROXY_API_KEY",
-    ]
-    .iter()
-    .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
-
-    has_explicit_proxy_config || has_fresh_cli_proxy_claude_account()
+    crate::util::any_cli_proxy_env_configured() || has_fresh_cli_proxy_claude_account()
 }
 
 fn has_fresh_cli_proxy_claude_account() -> bool {
@@ -569,20 +567,24 @@ fn has_fresh_cli_proxy_account_of_type(file_prefix: &str, type_tag: &str) -> boo
             }
             // CLIProxyAPI writes the expiry as `expired` (an RFC3339 string)
             // today, but also check `expires`/`expires_at` so a future rename
-            // or an alternate proxy schema doesn't silently cause every
-            // token-bearing account to be treated as fresh.
+            // or an alternate proxy schema is caught.
+            //
+            // Missing or unparseable expiry fields are treated as **not
+            // fresh** — if we can't tell, assume expired. Otherwise a
+            // malformed credential file would force traffic through a
+            // proxy that's about to 401 on every request.
             let expiry_str = value
                 .get("expired")
                 .or_else(|| value.get("expires"))
                 .or_else(|| value.get("expires_at"))
                 .and_then(|v| v.as_str());
             let Some(expired) = expiry_str else {
-                return true;
+                continue;
             };
-            match chrono::DateTime::parse_from_rfc3339(expired) {
-                Ok(expires_at) if expires_at.with_timezone(&chrono::Utc) > now => return true,
-                Err(_) => return true,
-                _ => {}
+            if let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expired) {
+                if expires_at.with_timezone(&chrono::Utc) > now {
+                    return true;
+                }
             }
         }
     }
@@ -591,26 +593,17 @@ fn has_fresh_cli_proxy_account_of_type(file_prefix: &str, type_tag: &str) -> boo
 }
 
 /// Equivalent of `anthropic_cli_proxy_account_available` for OpenAI
-/// (Codex) OAuth. Returns true when the CLI proxy is either explicitly
-/// configured via env, or has at least one fresh codex-*.json credential.
+/// (Codex) OAuth. The OpenAI CLI-proxy path only makes sense when a
+/// Codex OAuth JWT is available on disk — the proxy translates that
+/// token into Codex `/v1/responses` calls. Explicit `CLAUDE_CODE_PROXY_*`
+/// env vars alone (common for Anthropic-only deployments) are *not*
+/// enough: without a Codex credential the proxy 401s on every request.
 pub(crate) fn openai_cli_proxy_account_available() -> bool {
     if env_var_bool("CLAUDE_CODE_DISABLE_CLI_PROXY", false) {
         return false;
     }
 
-    let has_explicit_proxy_config = [
-        "CLAUDE_CODE_PROXY_BASE_URL",
-        "CLI_PROXY_API_BASE_URL",
-        "CLIPROXY_API_BASE_URL",
-        "CLIPROXY_BASE_URL",
-        "CLAUDE_CODE_PROXY_API_KEY",
-        "CLI_PROXY_API_KEY",
-        "CLIPROXY_API_KEY",
-    ]
-    .iter()
-    .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
-
-    has_explicit_proxy_config || has_fresh_cli_proxy_codex_account()
+    has_fresh_cli_proxy_codex_account()
 }
 
 /// Create AI provider routes.

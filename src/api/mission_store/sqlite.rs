@@ -5879,7 +5879,7 @@ impl MissionStore for SqliteMissionStore {
         bundle: super::MissionBundle,
         options: super::MissionImportOptions,
     ) -> Result<Uuid, String> {
-        use super::{MissionBundle, MissionImportOptions};
+        use super::MissionBundle;
         // Always mint fresh IDs on import so a bundle can be re-imported
         // into the same instance for debugging without collisions and
         // without clobbering the source history if the bundle round-trips
@@ -5888,6 +5888,13 @@ impl MissionStore for SqliteMissionStore {
         let target_workspace_id = options
             .target_workspace_id
             .unwrap_or(bundle.mission.workspace_id);
+        // Prefer the caller-provided target name; only fall back to the
+        // bundle's own name when no override was passed. This keeps the
+        // stored workspace_name consistent with the target workspace_id.
+        let target_workspace_name = options
+            .target_workspace_name
+            .clone()
+            .or_else(|| bundle.mission.workspace_name.clone());
         let keep_active = options.keep_automations_active;
 
         // Remap automation IDs: bundle's automation_id -> freshly minted
@@ -5906,10 +5913,6 @@ impl MissionStore for SqliteMissionStore {
             executions,
             ..
         } = bundle;
-        let _ = MissionImportOptions {
-            target_workspace_id: options.target_workspace_id,
-            keep_automations_active: options.keep_automations_active,
-        };
 
         let conn = self.conn.clone();
         let content_dir = self.content_dir.clone();
@@ -5923,7 +5926,19 @@ impl MissionStore for SqliteMissionStore {
                 .ok()
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
                 .unwrap_or_else(|| "task".to_string());
-            let status_str = status_to_string(mission.status);
+            // Normalize statuses that imply an attached runtime session.
+            // The bundle clears `session_id` (the CLI-level handles don't
+            // travel), so `active`/`pending` would leave the record
+            // looking running with nothing behind it — it couldn't be
+            // continued and couldn't be resumed via the normal path
+            // (which only accepts interrupted/failed/blocked). Rewrite to
+            // `interrupted` so the user can explicitly resume it.
+            use crate::api::control::MissionStatus;
+            let normalized_status = match mission.status {
+                MissionStatus::Active | MissionStatus::Pending => MissionStatus::Interrupted,
+                other => other,
+            };
+            let status_str = status_to_string(normalized_status);
             let now = Utc::now().to_rfc3339();
             let imported_title = mission
                 .title
@@ -5943,7 +5958,7 @@ impl MissionStore for SqliteMissionStore {
                     mission.metadata_model,
                     mission.metadata_version,
                     target_workspace_id.to_string(),
-                    mission.workspace_name,
+                    target_workspace_name,
                     mission.agent,
                     mission.model_override,
                     mission.model_effort,
