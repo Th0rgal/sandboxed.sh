@@ -12816,6 +12816,14 @@ fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str
         return true;
     }
 
+    // Advisory prompts ("how do I run tests?", "explain what cargo does")
+    // contain verbs like "run" or "test" but don't ask us to execute them.
+    // If we classified those as tool-required, a perfectly good text-only
+    // answer from Codex would get converted into a `Stalled` failure.
+    if user_looks_advisory(&user) {
+        return false;
+    }
+
     let explicit_tool_markers = [
         "```bash",
         "shell command",
@@ -12890,6 +12898,56 @@ fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str
         .iter()
         .any(|action| contains_ascii_word(&user, action))
         && object_markers.iter().any(|object| user.contains(object))
+}
+
+/// Does the user message read as a question or request-for-explanation,
+/// rather than an imperative "go do this"? Used to suppress the
+/// `explicit_tool_markers` heuristic so advisory questions that mention
+/// common verbs ("how do I run tests", "explain cargo") don't get
+/// mis-classified as tool-required.
+fn user_looks_advisory(user_lower: &str) -> bool {
+    let trimmed = user_lower.trim_start();
+    const ADVISORY_PREFIXES: &[&str] = &[
+        "how do i ",
+        "how do you ",
+        "how to ",
+        "how can i ",
+        "how does ",
+        "how should ",
+        "how would ",
+        "how is ",
+        "how are ",
+        "what is ",
+        "what are ",
+        "what does ",
+        "what do ",
+        "what would ",
+        "what happens ",
+        "what's ",
+        "why does ",
+        "why is ",
+        "why are ",
+        "why do ",
+        "when should ",
+        "when does ",
+        "when do ",
+        "where does ",
+        "where is ",
+        "where are ",
+        "explain ",
+        "describe ",
+        "summarize ",
+        "tell me about ",
+        "tell me how ",
+        "tell me why ",
+        "can you explain ",
+        "can you describe ",
+        "could you explain ",
+        "would you explain ",
+    ];
+    ADVISORY_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
 }
 
 fn codex_final_message_looks_like_progress_update(assistant_message: &str) -> bool {
@@ -14111,6 +14169,24 @@ mod tests {
         assert!(!codex_turn_requires_tool_activity(
             "How do I create a repository on GitHub?",
             "Here is how to create a repository on GitHub."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_allows_advisory_verbs() {
+        // User asks "how to run tests" — advisory, even though "run " appears.
+        assert!(!codex_turn_requires_tool_activity(
+            "How do I run the test suite locally?",
+            "You can invoke the test runner with cargo test."
+        ));
+        // "explain what X does" contains "debug"/"run" etc but is a Q.
+        assert!(!codex_turn_requires_tool_activity(
+            "Explain what cargo test does under the hood.",
+            "It compiles the crate in test mode and runs the harness."
+        ));
+        assert!(!codex_turn_requires_tool_activity(
+            "What happens when you run npm install in a monorepo?",
+            "It walks the package.json and installs the dependency graph."
         ));
     }
 
