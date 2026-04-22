@@ -3471,12 +3471,15 @@ pub fn run_claudecode_turn<'a>(
             // it is a standard Anthropic SDK variable and users set it for
             // unrelated API proxies. Use CLAUDE_CODE_PROXY_BASE_URL (or the
             // CLIPROXY_* aliases) to point us at a specific CLI proxy.
-            let base_url = std::env::var("CLAUDE_CODE_PROXY_BASE_URL")
-                .or_else(|_| std::env::var("CLI_PROXY_API_BASE_URL"))
-                .or_else(|_| std::env::var("CLIPROXY_API_BASE_URL"))
-                .or_else(|_| std::env::var("CLIPROXY_BASE_URL"))
-                .unwrap_or_else(|_| "http://127.0.0.1:8317".to_string());
-            let base_url = base_url.trim().trim_end_matches('/').to_string();
+            //
+            // `env_var_nonempty` skips blank values so a templated empty
+            // CLAUDE_CODE_PROXY_BASE_URL doesn't shadow a valid alias.
+            let base_url = crate::util::env_var_nonempty("CLAUDE_CODE_PROXY_BASE_URL")
+                .or_else(|| crate::util::env_var_nonempty("CLI_PROXY_API_BASE_URL"))
+                .or_else(|| crate::util::env_var_nonempty("CLIPROXY_API_BASE_URL"))
+                .or_else(|| crate::util::env_var_nonempty("CLIPROXY_BASE_URL"))
+                .unwrap_or_else(|| "http://127.0.0.1:8317".to_string());
+            let base_url = base_url.trim_end_matches('/').to_string();
             if base_url.is_empty() {
                 return None;
             }
@@ -3485,10 +3488,10 @@ pub fn run_claudecode_turn<'a>(
             // Claude Code still requires a non-empty ANTHROPIC_API_KEY when an
             // Anthropic base URL is configured. If the proxy needs auth, pass
             // through the configured proxy key; otherwise use an inert value.
-            let api_key = std::env::var("CLAUDE_CODE_PROXY_API_KEY")
-                .or_else(|_| std::env::var("CLI_PROXY_API_KEY"))
-                .or_else(|_| std::env::var("CLIPROXY_API_KEY"))
-                .unwrap_or_else(|_| "sandboxed-sh-cli-proxy".to_string());
+            let api_key = crate::util::env_var_nonempty("CLAUDE_CODE_PROXY_API_KEY")
+                .or_else(|| crate::util::env_var_nonempty("CLI_PROXY_API_KEY"))
+                .or_else(|| crate::util::env_var_nonempty("CLIPROXY_API_KEY"))
+                .unwrap_or_else(|| "sandboxed-sh-cli-proxy".to_string());
 
             Some(ClaudeCodeProxyConfig { base_url, api_key })
         }
@@ -3772,15 +3775,15 @@ pub fn run_claudecode_turn<'a>(
                 "Using override credential for account rotation"
             );
             Some(auth)
-        } else if proxy_auth.is_some() {
-            None
-        } else
-        // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
-        // For container workspaces, compare workspace auth vs host auth and use the fresher one.
-        // If workspace auth is expired, try to refresh it using the refresh token.
-        if has_cli_creds {
+        } else if proxy_auth.is_some() || has_cli_creds {
+            // CLI-proxy runs get credentials injected via `proxy_auth` env vars,
+            // and CLI credentials come from the mirrored `.credentials.json`.
+            // Either way, there's nothing to select here.
             None
         } else {
+            // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
+            // For container workspaces, compare workspace auth vs host auth and use the fresher one.
+            // If workspace auth is expired, try to refresh it using the refresh token.
             // For container workspaces, get both workspace and host auth with expiry info
             let mut workspace_auth = if workspace.workspace_type == WorkspaceType::Container {
                 get_anthropic_auth_from_workspace(&workspace.path)
@@ -3984,10 +3987,16 @@ pub fn run_claudecode_turn<'a>(
             };
 
         // Proactive network connectivity check - fail fast if API is unreachable
-        // This catches DNS/network issues immediately instead of waiting for a timeout
-        if let Err(err_msg) = check_claudecode_connectivity(&workspace_exec, work_dir).await {
-            tracing::error!(mission_id = %mission_id, "{}", err_msg);
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+        // This catches DNS/network issues immediately instead of waiting for a timeout.
+        // When the CLI proxy is the auth source, skip this probe: it hits
+        // `api.anthropic.com` directly, and environments that rely on the CLI
+        // proxy may intentionally block direct Anthropic egress.
+        if proxy_auth.is_none() {
+            if let Err(err_msg) = check_claudecode_connectivity(&workspace_exec, work_dir).await {
+                tracing::error!(mission_id = %mission_id, "{}", err_msg);
+                return AgentResult::failure(err_msg, 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
+            }
         }
 
         tracing::info!(

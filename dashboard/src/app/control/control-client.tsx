@@ -6397,7 +6397,7 @@ export default function ControlClient() {
     } catch (err) {
       console.error(err);
       setItems((prev) => prev.filter((item) => item.id !== tempId));
-      const restoredDraft = agent ? `@${agent} ${trimmedContent}` : content;
+      const restoredDraft = agent ? `@${agent} ${content}` : content;
       setInput(restoredDraft);
       setDraftInput(restoredDraft);
       toast.error("Failed to send message");

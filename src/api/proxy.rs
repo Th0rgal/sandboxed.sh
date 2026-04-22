@@ -161,12 +161,15 @@ fn cli_proxy_chat_completions_url() -> String {
     // ai_providers.rs. If a user sets only `CLAUDE_CODE_PROXY_BASE_URL` we
     // would otherwise enable the synthetic CLI-proxy account but route to the
     // hardcoded localhost default.
-    let base = std::env::var("CLAUDE_CODE_PROXY_BASE_URL")
-        .or_else(|_| std::env::var("CLI_PROXY_API_BASE_URL"))
-        .or_else(|_| std::env::var("CLIPROXY_API_BASE_URL"))
-        .or_else(|_| std::env::var("CLIPROXY_BASE_URL"))
-        .unwrap_or_else(|_| DEFAULT_CLI_PROXY_API_BASE_URL.to_string());
-    let base = base.trim().trim_end_matches('/');
+    //
+    // `env_var_nonempty` skips blank values so a templated empty first alias
+    // doesn't collapse the URL to just `/v1/chat/completions`.
+    let base = crate::util::env_var_nonempty("CLAUDE_CODE_PROXY_BASE_URL")
+        .or_else(|| crate::util::env_var_nonempty("CLI_PROXY_API_BASE_URL"))
+        .or_else(|| crate::util::env_var_nonempty("CLIPROXY_API_BASE_URL"))
+        .or_else(|| crate::util::env_var_nonempty("CLIPROXY_BASE_URL"))
+        .unwrap_or_else(|| DEFAULT_CLI_PROXY_API_BASE_URL.to_string());
+    let base = base.trim_end_matches('/');
     if base.ends_with("/chat/completions") {
         base.to_string()
     } else if base.ends_with("/v1") {
@@ -178,12 +181,9 @@ fn cli_proxy_chat_completions_url() -> String {
 
 fn build_cli_proxy_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
-    let api_key = std::env::var("CLAUDE_CODE_PROXY_API_KEY")
-        .or_else(|_| std::env::var("CLI_PROXY_API_KEY"))
-        .or_else(|_| std::env::var("CLIPROXY_API_KEY"))
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
+    let api_key = crate::util::env_var_nonempty("CLAUDE_CODE_PROXY_API_KEY")
+        .or_else(|| crate::util::env_var_nonempty("CLI_PROXY_API_KEY"))
+        .or_else(|| crate::util::env_var_nonempty("CLIPROXY_API_KEY"));
     if let Some(api_key) = api_key {
         if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", api_key)) {
             headers.insert(header::AUTHORIZATION, value);
@@ -2771,6 +2771,7 @@ fn transform_anthropic_sse_to_openai(
             created,
             std::collections::HashMap::<u64, u32>::new(),
             0u32,
+            false,
         ),
         |(
             mut stream,
@@ -2781,7 +2782,11 @@ fn transform_anthropic_sse_to_openai(
             created,
             mut tool_blocks,
             mut next_tool_idx,
+            mut stream_ended,
         )| async move {
+            if stream_ended {
+                return None;
+            }
             loop {
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line = buf.drain(..=pos).collect::<Vec<u8>>();
@@ -2943,6 +2948,7 @@ fn transform_anthropic_sse_to_openai(
                             created,
                             tool_blocks,
                             next_tool_idx,
+                            stream_ended,
                         ),
                     ));
                 }
@@ -2961,10 +2967,36 @@ fn transform_anthropic_sse_to_openai(
                                 created,
                                 tool_blocks,
                                 next_tool_idx,
+                                stream_ended,
                             ),
                         ));
                     }
-                    None => return None,
+                    None => {
+                        // Upstream closed. Promote any buffered bytes into a
+                        // final line (they may be a complete `data:` event
+                        // that just missed a trailing `\n`) so we don't drop
+                        // the last event, then terminate the stream with a
+                        // synthesized `[DONE]` so clients see a proper close.
+                        stream_ended = true;
+                        if !buf.is_empty() && !buf.ends_with(b"\n") {
+                            buf.push(b'\n');
+                            continue;
+                        }
+                        return Some((
+                            Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")),
+                            (
+                                stream,
+                                buf,
+                                sent_role,
+                                stream_id,
+                                model_id,
+                                created,
+                                tool_blocks,
+                                next_tool_idx,
+                                stream_ended,
+                            ),
+                        ));
+                    }
                 }
             }
         },
@@ -4146,7 +4178,13 @@ mod tests {
 
     #[test]
     fn proxy_credential_gating_is_provider_aware_for_oauth() {
-        assert!(!has_routable_proxy_credentials(
+        // OpenAI OAuth-only entries are now routable — they flow through
+        // the `use_openai_oauth_cli_proxy_adapter` branch, which lets the
+        // local CLI proxy translate Codex OAuth into `/v1/responses`.
+        // Previously this returned false because OAuth JWTs don't work
+        // against `api.openai.com/v1/chat/completions`; the adapter
+        // closed that gap.
+        assert!(has_routable_proxy_credentials(
             ProviderType::OpenAI,
             false,
             true
@@ -4175,10 +4213,16 @@ mod tests {
 
     #[test]
     fn cli_proxy_chat_completions_url_accepts_proxy_root_or_v1_base() {
+        // `CLAUDE_CODE_PROXY_BASE_URL` is the highest-priority alias, so the
+        // test must isolate it too — otherwise an ambient value from the
+        // test runner shadows everything this test sets and the assertions
+        // silently verify the wrong env var.
+        let original_claude_code = std::env::var("CLAUDE_CODE_PROXY_BASE_URL").ok();
         let original_cli_proxy = std::env::var("CLI_PROXY_API_BASE_URL").ok();
         let original_clip = std::env::var("CLIPROXY_API_BASE_URL").ok();
         let original_legacy = std::env::var("CLIPROXY_BASE_URL").ok();
 
+        std::env::remove_var("CLAUDE_CODE_PROXY_BASE_URL");
         std::env::remove_var("CLIPROXY_API_BASE_URL");
         std::env::remove_var("CLIPROXY_BASE_URL");
 
@@ -4203,6 +4247,10 @@ mod tests {
             "http://127.0.0.1:8317/v1/chat/completions"
         );
 
+        match original_claude_code {
+            Some(value) => std::env::set_var("CLAUDE_CODE_PROXY_BASE_URL", value),
+            None => std::env::remove_var("CLAUDE_CODE_PROXY_BASE_URL"),
+        }
         match original_cli_proxy {
             Some(value) => std::env::set_var("CLI_PROXY_API_BASE_URL", value),
             None => std::env::remove_var("CLI_PROXY_API_BASE_URL"),

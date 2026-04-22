@@ -1153,15 +1153,20 @@ impl ModelChainStore {
                     }
                 }
                 seen_account_ids.insert(account.id);
+                // `has_oauth` on the resolved entry needs to match the credential
+                // we're actually going to send. If the account has both an API
+                // key and a fresh OAuth token, `routed_api_key` picks the API
+                // key — so we must report `has_oauth=false` to avoid the proxy
+                // attaching OAuth-only headers (Bearer + oauth beta) to an
+                // x-api-key request. Google still needs `has_oauth=true` to
+                // trigger its adapter regardless of store-token freshness.
+                let credential_is_oauth_token = account.api_key.is_none() && oauth_is_fresh;
                 resolved.push(ResolvedEntry {
                     provider_id: entry.provider_id.clone(),
                     model_id: entry.model_id.clone(),
                     account_id: account.id,
                     api_key: routed_api_key,
-                    // For Google we want `use_google_oauth_adapter` in the
-                    // proxy to fire even when the store-level token is stale,
-                    // because the proxy refreshes from `auth.json`.
-                    has_oauth: oauth_is_fresh || google_oauth_routable,
+                    has_oauth: credential_is_oauth_token || google_oauth_routable,
                     base_url: account.base_url.clone(),
                     subscription_key,
                 });

@@ -351,7 +351,8 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.to_string());
-            let has_oauth = value
+            let original_api_key_present = api_key.is_some();
+            let account_has_oauth = value
                 .get("type")
                 .and_then(|v| v.as_str())
                 .map(|t| t == "oauth")
@@ -370,7 +371,7 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
             // succeed; leave OpenAI OAuth accounts without an `api_key` so
             // `has_routable_credentials` excludes them from the pool.
             let mut oauth_expires_at: Option<i64> = None;
-            if api_key.is_none() && has_oauth && provider_type == ProviderType::Anthropic {
+            if api_key.is_none() && account_has_oauth && provider_type == ProviderType::Anthropic {
                 api_key = value
                     .get("access")
                     .or_else(|| value.get("access_token"))
@@ -383,6 +384,17 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
                     .or_else(|| value.get("expires_at"))
                     .and_then(|v| v.as_i64());
             }
+
+            // `has_oauth` on the resolved account must reflect the credential
+            // we'll actually send, not just whether OAuth info existed in
+            // auth.json. If the user has both an API key and a refresh token
+            // for the same provider, we route with the API key (`x-api-key`),
+            // so `has_oauth=false` to stop the proxy from attaching OAuth-only
+            // Bearer + beta headers. It stays true for hoisted Anthropic OAuth
+            // (api_key was originally None and now holds the access token) and
+            // for Google OAuth-only entries (no api_key; adapter refreshes
+            // from auth.json at request time).
+            let has_oauth = account_has_oauth && !original_api_key_present;
 
             // Only include accounts that have credentials we can route with.
             let has_routable_credentials =
@@ -425,7 +437,16 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
     // standard Anthropic OAuth account when the proxy has a usable Claude
     // account. This keeps model-routing chains like `opus` and `opus-6`
     // selectable without depending on direct Anthropic OAuth/API-key records.
-    if !seen_types.contains(&ProviderType::Anthropic) && anthropic_cli_proxy_account_available() {
+    //
+    // Respect `enabled == false` in opencode.json — if the user explicitly
+    // disabled Anthropic, don't reintroduce it through the synthetic path.
+    let anthropic_disabled = get_provider_config_entry(&opencode_config, ProviderType::Anthropic)
+        .and_then(|e| e.enabled)
+        == Some(false);
+    if !seen_types.contains(&ProviderType::Anthropic)
+        && !anthropic_disabled
+        && anthropic_cli_proxy_account_available()
+    {
         accounts.push(crate::provider_health::StandardAccount {
             account_id: crate::provider_health::stable_provider_uuid("anthropic-cli-proxy"),
             provider_type: ProviderType::Anthropic,
@@ -442,7 +463,13 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
     // to the Codex `/v1/responses` API internally. So when we have no API
     // key and the proxy has fresh codex credentials, let chains route through
     // the proxy instead of giving up.
-    if !seen_types.contains(&ProviderType::OpenAI) && openai_cli_proxy_account_available() {
+    let openai_disabled = get_provider_config_entry(&opencode_config, ProviderType::OpenAI)
+        .and_then(|e| e.enabled)
+        == Some(false);
+    if !seen_types.contains(&ProviderType::OpenAI)
+        && !openai_disabled
+        && openai_cli_proxy_account_available()
+    {
         accounts.push(crate::provider_health::StandardAccount {
             account_id: crate::provider_health::stable_provider_uuid("openai-cli-proxy"),
             provider_type: ProviderType::OpenAI,
@@ -540,7 +567,16 @@ fn has_fresh_cli_proxy_account_of_type(file_prefix: &str, type_tag: &str) -> boo
             if !has_access {
                 continue;
             }
-            let Some(expired) = value.get("expired").and_then(|v| v.as_str()) else {
+            // CLIProxyAPI writes the expiry as `expired` (an RFC3339 string)
+            // today, but also check `expires`/`expires_at` so a future rename
+            // or an alternate proxy schema doesn't silently cause every
+            // token-bearing account to be treated as fresh.
+            let expiry_str = value
+                .get("expired")
+                .or_else(|| value.get("expires"))
+                .or_else(|| value.get("expires_at"))
+                .and_then(|v| v.as_str());
+            let Some(expired) = expiry_str else {
                 return true;
             };
             match chrono::DateTime::parse_from_rfc3339(expired) {

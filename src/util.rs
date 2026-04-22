@@ -22,6 +22,18 @@ pub fn home_dir() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
 }
 
+/// Read an environment variable, returning `Some(trimmed)` only when the
+/// variable is set *and* non-empty after trimming whitespace. Callers that
+/// chain several aliases via `or_else` need this to skip templated blank
+/// values — otherwise the first alias wins with an empty string and later
+/// aliases never get a chance.
+pub fn env_var_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Build a truncated context string from conversation history.
 ///
 /// Walks `history` from most-recent to oldest, accumulating entries until
