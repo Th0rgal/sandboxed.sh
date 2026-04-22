@@ -10006,16 +10006,33 @@ pub async fn get_mission_automation_executions(
 
 /// Export a mission as a portable bundle for transfer to another instance.
 ///
-/// Response: `application/json` — a [`mission_store::MissionBundle`] serialized
-/// as JSON. Dashboard clients typically save this to disk and upload to the
-/// target instance's `/api/control/missions/import`.
+/// Response: JSON by default, or gzipped JSON when the caller sends
+/// `Accept-Encoding: gzip` (or explicitly forces it with `?gzip=true`).
+/// Gzipping typically shrinks bundles 5–10× — a 220 MB text-heavy bundle
+/// lands around 30 MB, comfortably under Cloudflare's 100 MB free-tier
+/// request cap. Clients that can't decompress pass `?gzip=false` to
+/// disable.
+#[derive(Debug, Deserialize, Default)]
+pub struct ExportMissionQuery {
+    /// Force gzip encoding regardless of Accept-Encoding. `None` defers to
+    /// the header; `Some(false)` disables even if Accept-Encoding asked.
+    #[serde(default)]
+    pub gzip: Option<bool>,
+}
+
 pub async fn export_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(mission_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<ExportMissionQuery>,
+    headers_in: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use axum::http::header;
     use axum::response::IntoResponse;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
     let control = control_for_user(&state, &user).await;
     let source_public_url = std::env::var("SANDBOXED_PUBLIC_URL").ok();
     let mut bundle = control
@@ -10035,14 +10052,49 @@ pub async fn export_mission(
     }
     let mission_id_simple = bundle.mission.id.simple().to_string();
     let body = serde_json::to_string(&bundle).map_err(internal_error)?;
-    let filename = format!("mission-{mission_id_simple}.json");
-    let mut resp = (StatusCode::OK, body).into_response();
-    let headers = resp.headers_mut();
-    headers.insert(
+
+    // Gzip opt-in:
+    //   1. `?gzip=true` always compresses
+    //   2. `?gzip=false` always skips
+    //   3. Otherwise honor Accept-Encoding: gzip
+    let accepts_gzip = headers_in
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').any(|t| t.trim().starts_with("gzip")))
+        .unwrap_or(false);
+    let use_gzip = query.gzip.unwrap_or(accepts_gzip);
+
+    let (payload, gzipped) = if use_gzip {
+        // Level 6 — the standard "speed vs ratio" sweet spot. Text JSON
+        // typically hits 5–10× at level 6; higher levels save another
+        // ~5–10% for a lot more CPU.
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body.as_bytes()).map_err(internal_error)?;
+        let bytes = encoder.finish().map_err(internal_error)?;
+        (bytes, true)
+    } else {
+        (body.into_bytes(), false)
+    };
+
+    let filename = if gzipped {
+        format!("mission-{mission_id_simple}.json.gz")
+    } else {
+        format!("mission-{mission_id_simple}.json")
+    };
+
+    let mut resp = (StatusCode::OK, payload).into_response();
+    let out_headers = resp.headers_mut();
+    out_headers.insert(
         header::CONTENT_TYPE,
         "application/json; charset=utf-8".parse().unwrap(),
     );
-    headers.insert(
+    if gzipped {
+        out_headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        // Mark the response as varying on Accept-Encoding so caches
+        // don't serve a gzipped body to a client that didn't ask.
+        out_headers.insert(header::VARY, "Accept-Encoding".parse().unwrap());
+    }
+    out_headers.insert(
         header::CONTENT_DISPOSITION,
         format!("attachment; filename=\"{filename}\"")
             .parse()
@@ -10070,15 +10122,11 @@ pub async fn import_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     axum::extract::Query(query): axum::extract::Query<ImportMissionQuery>,
+    headers_in: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
-    let bundle: mission_store::MissionBundle = serde_json::from_slice(&body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid mission bundle: {e}"),
-        )
-    })?;
+    let bundle = parse_mission_bundle(&headers_in, &body)?;
     if bundle.version != 1 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -10137,6 +10185,292 @@ pub async fn import_mission(
         },
         "automations_active": query.keep_automations_active,
     })))
+}
+
+/// Parse a mission bundle from raw bytes, transparently decompressing
+/// `Content-Encoding: gzip` before JSON-decoding. Both the single-shot
+/// `/import` route and the chunked `/import-chunks/:id/commit` route
+/// share this helper — they both arrive as a `Bytes` blob that may or
+/// may not be gzipped.
+fn parse_mission_bundle(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<mission_store::MissionBundle, (StatusCode, String)> {
+    use axum::http::header;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let is_gzipped = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("gzip")))
+        .unwrap_or(false)
+        // Also sniff the gzip magic header — CLIs uploading gzipped
+        // bodies via `curl --data-binary @file.gz` sometimes forget to
+        // set Content-Encoding, and hitting them with "invalid JSON"
+        // instead of decoding would be a confusing footgun.
+        || body.starts_with(&[0x1f, 0x8b]);
+
+    let bundle: mission_store::MissionBundle = if is_gzipped {
+        let mut decoder = GzDecoder::new(body);
+        let mut decompressed = Vec::with_capacity(body.len() * 4);
+        decoder.read_to_end(&mut decompressed).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to decompress gzipped bundle: {e}"),
+            )
+        })?;
+        serde_json::from_slice(&decompressed).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid mission bundle (after gunzip): {e}"),
+            )
+        })?
+    } else {
+        serde_json::from_slice(body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid mission bundle: {e}"),
+            )
+        })?
+    };
+
+    Ok(bundle)
+}
+
+fn sanitize_upload_id(id: &str) -> Option<String> {
+    // Keep upload IDs to a conservative alphabet — these become path
+    // components under /tmp, so allowing only [A-Za-z0-9_-] avoids path
+    // traversal without sacrificing UUIDs or custom labels.
+    let trimmed = id.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn import_chunks_dir(upload_id: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("sandboxed_sh_mission_import_{upload_id}"))
+}
+
+/// Initialize a chunked mission import.
+///
+/// Returns `{"upload_id": "..."}` — the caller then PUTs chunks in order
+/// to `/api/control/missions/import-chunks/:upload_id/:index`, and POSTs
+/// `/commit` to finalize. This exists for bundles that exceed
+/// Cloudflare's 100 MB per-request cap even after gzip (very long
+/// missions with binary-heavy payloads that don't compress well).
+///
+/// For bundles under ~90 MB gzipped, prefer the single-shot `/import`
+/// route — it's simpler and doesn't leave temp files on disk.
+pub async fn init_mission_import(
+    State(_state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let upload_id = Uuid::new_v4().simple().to_string();
+    let dir = import_chunks_dir(&upload_id);
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create chunk staging dir: {e}"),
+        )
+    })?;
+    Ok(Json(serde_json::json!({
+        "upload_id": upload_id,
+        "recommended_chunk_bytes": 80 * 1024 * 1024,
+    })))
+}
+
+/// Upload one chunk of a mission import.
+///
+/// Path: `/api/control/missions/import-chunks/:upload_id/:index`.
+/// Chunks are written to `chunk_<index:06>` under the upload's staging
+/// directory. Index order determines assembly order — the commit step
+/// reads `chunk_000000`, `chunk_000001`, ... in sequence.
+pub async fn upload_mission_import_chunk(
+    State(_state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+    Path((upload_id, index)): Path<(String, u32)>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let safe_id = sanitize_upload_id(&upload_id)
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid upload_id".to_string()))?;
+    let dir = import_chunks_dir(&safe_id);
+    if !dir.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Unknown upload_id. Call /import-chunks first to initialize.".to_string(),
+        ));
+    }
+    let chunk_path = dir.join(format!("chunk_{index:06}"));
+    tokio::fs::write(&chunk_path, &body).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write chunk {index}: {e}"),
+        )
+    })?;
+    Ok(Json(serde_json::json!({
+        "upload_id": safe_id,
+        "chunk_index": index,
+        "chunk_bytes": body.len(),
+    })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CommitMissionImportQuery {
+    pub workspace_id: Option<Uuid>,
+    #[serde(default)]
+    pub keep_automations_active: bool,
+    /// Total number of chunks the client uploaded. Must match the files
+    /// present in the staging dir — any gap aborts the commit.
+    pub total_chunks: u32,
+    /// Hint: the bundle is gzipped (set `?gzip=true` when sending
+    /// compressed chunks; otherwise server sniffs the magic header).
+    #[serde(default)]
+    pub gzip: bool,
+}
+
+/// Assemble uploaded chunks, optionally decompress, and run the regular
+/// import.
+///
+/// Cleans up the staging directory on success or failure — a caller that
+/// wants to retry a failed commit must re-upload all chunks under a
+/// fresh `upload_id`.
+pub async fn commit_mission_import(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(upload_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<CommitMissionImportQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let safe_id = sanitize_upload_id(&upload_id)
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid upload_id".to_string()))?;
+    let dir = import_chunks_dir(&safe_id);
+    if !dir.exists() {
+        return Err((StatusCode::NOT_FOUND, "Unknown upload_id.".to_string()));
+    }
+
+    // Assemble in order, cleaning up staging on both success and error
+    // paths. The block returns the assembled bytes on success or an
+    // error tuple we re-raise after the cleanup.
+    let assembled = {
+        let inner = async {
+            let mut buf: Vec<u8> = Vec::new();
+            for i in 0..query.total_chunks {
+                let chunk_path = dir.join(format!("chunk_{i:06}"));
+                let data = tokio::fs::read(&chunk_path).await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("Chunk {i} missing or unreadable: {e}"),
+                    )
+                })?;
+                buf.extend_from_slice(&data);
+            }
+            Ok::<Vec<u8>, (StatusCode, String)>(buf)
+        };
+        match inner.await {
+            Ok(buf) => buf,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+                return Err(e);
+            }
+        }
+    };
+    // Chunks on disk are no longer needed — wipe staging before the
+    // import so a slow/failing import doesn't also hold the raw upload
+    // open in /tmp.
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+
+    // Build a synthetic headers map that carries Content-Encoding so the
+    // shared parser does the right thing. The gzip sniff on the body
+    // bytes catches callers that forgot the hint.
+    let mut headers = axum::http::HeaderMap::new();
+    if query.gzip {
+        headers.insert(
+            axum::http::header::CONTENT_ENCODING,
+            "gzip".parse().unwrap(),
+        );
+    }
+    let bundle = parse_mission_bundle(&headers, &assembled)?;
+    if bundle.version != 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Unsupported bundle version {} (expected 1)", bundle.version),
+        ));
+    }
+
+    let target_workspace_id = if let Some(id) = query.workspace_id {
+        id
+    } else if let Some(ref name) = bundle.workspace_name {
+        let workspaces = state.workspaces.list().await;
+        match workspaces.iter().find(|w| &w.name == name) {
+            Some(ws) => ws.id,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Workspace '{name}' not found on this instance. Pass \
+                         ?workspace_id=<uuid> to pick one explicitly."
+                    ),
+                ))
+            }
+        }
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Bundle has no workspace_name and no ?workspace_id= override was provided.".to_string(),
+        ));
+    };
+
+    let control = control_for_user(&state, &user).await;
+    let options = mission_store::MissionImportOptions {
+        target_workspace_id: Some(target_workspace_id),
+        keep_automations_active: query.keep_automations_active,
+    };
+    let original_mission_id = bundle.mission.id;
+    let events_imported = bundle.events.len();
+    let automations_imported = bundle.automations.len();
+    let executions_imported = bundle.executions.len();
+    let new_id = control
+        .mission_store
+        .import_mission_bundle(bundle, options)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(serde_json::json!({
+        "mission_id": new_id,
+        "workspace_id": target_workspace_id,
+        "original_mission_id": original_mission_id,
+        "imported": {
+            "events": events_imported,
+            "automations": automations_imported,
+            "executions": executions_imported,
+        },
+        "automations_active": query.keep_automations_active,
+        "assembled_bytes": assembled.len(),
+    })))
+}
+
+/// Cancel an in-progress chunked import and remove its staging dir.
+pub async fn cancel_mission_import(
+    State(_state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+    Path(upload_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let safe_id = sanitize_upload_id(&upload_id)
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid upload_id".to_string()))?;
+    let dir = import_chunks_dir(&safe_id);
+    if dir.exists() {
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .map_err(internal_error)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Webhook receiver endpoint for triggering automations.

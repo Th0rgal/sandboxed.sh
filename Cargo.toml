@@ -80,6 +80,11 @@ idna_adapter = "=1.1.0"
 fs2 = "0.4"
 ureq = { version = "2", features = ["json"] }
 
+# Gzip compression for mission export/import transport. flate2 already
+# lands transitively via zip/tokio-util; naming it explicitly keeps the
+# feature gate visible and lets `cargo update` move it deliberately.
+flate2 = "1"
+
 [[bin]]
 name = "sandboxed-sh"
 path = "src/main.rs"

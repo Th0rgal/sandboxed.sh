@@ -699,8 +699,30 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .route(
             "/api/control/missions/import",
-            post(control::import_mission)
-                .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)),
+            post(control::import_mission).layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)),
+        )
+        // Chunked fallback for bundles that exceed Cloudflare's 100 MB
+        // per-request cap even after gzip. Upload flow:
+        //   1. POST /import-chunks → { upload_id }
+        //   2. PUT  /import-chunks/:upload_id/:index (raw chunk body)
+        //   3. POST /import-chunks/:upload_id/commit?total_chunks=N&gzip=...
+        // Chunks stage under /tmp; commit assembles, decompresses, imports.
+        .route(
+            "/api/control/missions/import-chunks",
+            post(control::init_mission_import),
+        )
+        .route(
+            "/api/control/missions/import-chunks/:upload_id/:index",
+            axum::routing::put(control::upload_mission_import_chunk)
+                .layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+        )
+        .route(
+            "/api/control/missions/import-chunks/:upload_id/commit",
+            post(control::commit_mission_import),
+        )
+        .route(
+            "/api/control/missions/import-chunks/:upload_id",
+            axum::routing::delete(control::cancel_mission_import),
         )
         // Assistant missions
         .route(
