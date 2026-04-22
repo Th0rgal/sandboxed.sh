@@ -4,8 +4,7 @@ import { useState, useCallback, useEffect, useMemo, memo } from "react";
 import { createRoot } from "react-dom/client";
 import Markdown, { Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { LazyCodeBlock } from "./lazy-code-block";
 import { Copy, Check, Download, Image, X, FileText, File, FileCode, FileArchive } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getRuntimeApiBase } from "@/lib/settings";
@@ -417,26 +416,16 @@ function FilePreviewModalContent({
                               return (
                                 <div className="relative group my-3 rounded-lg overflow-hidden">
                                   <CopyCodeButton code={codeString} />
-                                  <SyntaxHighlighter
-                                    style={oneDark}
+                                  <LazyCodeBlock
                                     language={match ? match[1] : "markdown"}
-                                    PreTag="div"
                                     customStyle={{
-                                      margin: 0,
                                       padding: "1rem",
-                                      fontSize: "0.75rem",
                                       borderRadius: "0.5rem",
                                       background: "rgba(0, 0, 0, 0.3)",
                                     }}
-                                    codeTagProps={{
-                                      style: {
-                                        fontFamily:
-                                          'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-                                      },
-                                    }}
                                   >
                                     {codeString}
-                                  </SyntaxHighlighter>
+                                  </LazyCodeBlock>
                                 </div>
                               );
                             },
@@ -831,15 +820,16 @@ export const MarkdownContent = memo(function MarkdownContent({
         <div className="relative group my-3 rounded-lg overflow-hidden">
           <CopyCodeButton code={codeString} />
           {match ? (
-            <SyntaxHighlighter
-              style={oneDark}
+            <LazyCodeBlock
               language={match[1]}
-              PreTag="div"
-              customStyle={{ margin: 0, padding: "1rem", fontSize: "0.75rem", borderRadius: "0.5rem", background: "rgba(0, 0, 0, 0.3)" }}
-              codeTagProps={{ style: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace' } }}
+              customStyle={{
+                padding: "1rem",
+                borderRadius: "0.5rem",
+                background: "rgba(0, 0, 0, 0.3)",
+              }}
             >
               {codeString}
-            </SyntaxHighlighter>
+            </LazyCodeBlock>
           ) : (
             <pre className="p-4 bg-black/30 rounded-lg overflow-x-auto">
               <code className="text-xs font-mono text-white/80">{codeString}</code>

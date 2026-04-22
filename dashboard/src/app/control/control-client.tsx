@@ -13,8 +13,7 @@ import {
 } from "@/components/enhanced-input";
 import { MissionAutomationsDialog } from "@/components/mission-automations-dialog";
 import { MissionDebugStats } from "./MissionDebugStats";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
 import { getMissionShortName } from "@/lib/mission-display";
@@ -271,6 +270,195 @@ export type ChatItem =
 
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
+
+type ToolGroup = {
+  kind: "tool_group";
+  groupId: string;
+  tools: ToolItem[];
+};
+type ThinkingGroup = {
+  kind: "thinking_group";
+  groupId: string;
+  thoughts: SidePanelItem[];
+};
+type GroupedItem = ChatItem | ToolGroup | ThinkingGroup;
+
+type ItemViews = {
+  /** Items after dedup by `id`, in original order. */
+  dedupedItems: ChatItem[];
+  /** Deduped + queued-user items moved to the end. */
+  displayItems: ChatItem[];
+  /** `displayItems` with queued users filtered out (they render in
+   * the QueueStrip instead). */
+  chatDisplayItems: ChatItem[];
+  /** The last non-queued item; used by a few pinned UI bits. */
+  lastNonQueuedItem: ChatItem | undefined;
+  /** Thinking + streaming items, for the side panel. */
+  thinkingItems: SidePanelItem[];
+  /** Completed (de-duplicated by content) + in-flight thinking count. */
+  thinkingItemsCount: number;
+  /** Any in-flight (not done) thinking item present. */
+  hasActiveThinking: boolean;
+  /** `chatDisplayItems` collapsed into tool / thinking groups. */
+  groupedItems: GroupedItem[];
+};
+
+/**
+ * Single-pass derivation of every view we display from the raw `items`
+ * array. Replaces a cascade of 7–8 separate `useMemo` hooks that each
+ * looped over `items` independently — on a 5 000-item mission with a
+ * 10 Hz SSE stream that was ~35 000 ops/sec just to keep views in
+ * sync. Merging into one traversal is O(n) in `items.length` and runs
+ * exactly once per `(items, showThinkingPanel)` change.
+ *
+ * Keep this pure — it's called from a `useMemo` and must not touch
+ * React state or refs.
+ */
+function deriveItemViews(
+  items: ChatItem[],
+  showThinkingPanel: boolean
+): ItemViews {
+  // Pass 1: dedup by id (last occurrence wins, preserve original order).
+  // Walk right-to-left recording seen ids, then left-to-right keeping the
+  // first encounter of each id that survived the dedup pass. Two linear
+  // walks with a Set, so O(n) and no reversal allocation.
+  const keep = new Set<string>();
+  const seenRev = new Set<string>();
+  for (let i = items.length - 1; i >= 0; i--) {
+    const id = items[i].id;
+    if (seenRev.has(id)) continue;
+    seenRev.add(id);
+    keep.add(id);
+  }
+  const dedupedItems: ChatItem[] = [];
+  const seenFwd = new Set<string>();
+  for (const item of items) {
+    if (!keep.has(item.id)) continue;
+    if (seenFwd.has(item.id)) continue;
+    seenFwd.add(item.id);
+    dedupedItems.push(item);
+  }
+
+  // Pass 2: split queued user messages off the end, collect thinking
+  // items, find lastNonQueued — all in one sweep.
+  let hasQueuedUser = false;
+  const thinkingItems: SidePanelItem[] = [];
+  let hasActiveThinking = false;
+  for (const item of dedupedItems) {
+    if (item.kind === "user" && item.queued) {
+      hasQueuedUser = true;
+    }
+    if (item.kind === "thinking" || item.kind === "stream") {
+      thinkingItems.push(item as SidePanelItem);
+      if (!item.done) hasActiveThinking = true;
+    }
+  }
+
+  let displayItems: ChatItem[];
+  if (!hasQueuedUser) {
+    displayItems = dedupedItems;
+  } else {
+    const normal: ChatItem[] = [];
+    const queued: ChatItem[] = [];
+    for (const item of dedupedItems) {
+      if (item.kind === "user" && item.queued) queued.push(item);
+      else normal.push(item);
+    }
+    displayItems = normal.concat(queued);
+  }
+
+  // `chatDisplayItems` is `displayItems` minus queued users. When there
+  // are no queued users the two are identical; share the reference so
+  // downstream memos see stable identity on the common path.
+  const chatDisplayItems = hasQueuedUser
+    ? displayItems.filter((it) => !(it.kind === "user" && it.queued === true))
+    : displayItems;
+
+  let lastNonQueuedItem: ChatItem | undefined;
+  for (let i = displayItems.length - 1; i >= 0; i--) {
+    const item = displayItems[i];
+    if (!(item.kind === "user" && item.queued)) {
+      lastNonQueuedItem = item;
+      break;
+    }
+  }
+  if (!lastNonQueuedItem && displayItems.length > 0) {
+    lastNonQueuedItem = displayItems[displayItems.length - 1];
+  }
+
+  // Thinking-count dedup by content (matches the panel's own rule).
+  const seenThinkContent = new Set<string>();
+  let completedThinking = 0;
+  let activeThinking = 0;
+  for (const t of thinkingItems) {
+    if (!t.done) {
+      activeThinking += 1;
+      continue;
+    }
+    const trimmed = t.content.trim();
+    if (!trimmed || seenThinkContent.has(trimmed)) continue;
+    seenThinkContent.add(trimmed);
+    completedThinking += 1;
+  }
+  const thinkingItemsCount = completedThinking + activeThinking;
+
+  // Pass 3: group consecutive tool/thinking blocks for collapsed display.
+  const groupedItems: GroupedItem[] = [];
+  let currentToolGroup: ToolItem[] = [];
+  let currentThinkingGroup: SidePanelItem[] = [];
+  const flushToolGroup = () => {
+    if (currentToolGroup.length === 0) return;
+    if (currentToolGroup.length === 1) {
+      groupedItems.push(currentToolGroup[0]);
+    } else {
+      groupedItems.push({
+        kind: "tool_group",
+        groupId: currentToolGroup[0].id,
+        tools: currentToolGroup,
+      });
+    }
+    currentToolGroup = [];
+  };
+  const flushThinkingGroup = () => {
+    if (currentThinkingGroup.length === 0) return;
+    groupedItems.push({
+      kind: "thinking_group",
+      groupId: currentThinkingGroup[0].id,
+      thoughts: currentThinkingGroup,
+    });
+    currentThinkingGroup = [];
+  };
+  for (const item of chatDisplayItems) {
+    if (item.kind === "tool" && !item.isUiTool) {
+      flushThinkingGroup();
+      currentToolGroup.push(item);
+    } else if (item.kind === "thinking" || item.kind === "stream") {
+      if (showThinkingPanel) {
+        flushThinkingGroup();
+      } else {
+        flushToolGroup();
+        currentThinkingGroup.push(item as SidePanelItem);
+      }
+    } else {
+      flushToolGroup();
+      flushThinkingGroup();
+      groupedItems.push(item);
+    }
+  }
+  flushToolGroup();
+  flushThinkingGroup();
+
+  return {
+    dedupedItems,
+    displayItems,
+    chatDisplayItems,
+    lastNonQueuedItem,
+    thinkingItems,
+    thinkingItemsCount,
+    hasActiveThinking,
+    groupedItems,
+  };
+}
 
 type QuestionOption = {
   label: string;
@@ -933,25 +1121,17 @@ function SharedFilePreviewModal({
             </div>
           ) : (
             <div className="text-sm">
-              <SyntaxHighlighter
+              <LazyCodeBlock
                 language={language}
-                style={oneDark}
                 showLineNumbers
                 customStyle={{
-                  margin: 0,
                   padding: "1rem",
                   background: "transparent",
                   fontSize: "0.8125rem",
                 }}
-                codeTagProps={{
-                  style: {
-                    fontFamily:
-                      'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-                  },
-                }}
               >
                 {text}
-              </SyntaxHighlighter>
+              </LazyCodeBlock>
             </div>
           )}
         </div>
@@ -2843,81 +3023,21 @@ export default function ControlClient() {
   // Tool groups expansion state - tracks which groups are expanded by their first tool's id
   const [expandedToolGroups, setExpandedToolGroups] = useState<Set<string>>(new Set());
 
-  const dedupedItems = useMemo(() => {
-    if (items.length <= 1) return items;
-    const seen = new Set<string>();
-    const out: ChatItem[] = [];
-    for (let i = items.length - 1; i >= 0; i--) {
-      const item = items[i];
-      if (seen.has(item.id)) continue;
-      seen.add(item.id);
-      out.push(item);
-    }
-    return out.reverse();
-  }, [items]);
-
-  const displayItems = useMemo(() => {
-    if (!dedupedItems.some((item) => item.kind === "user" && item.queued)) {
-      return dedupedItems;
-    }
-    const queued: ChatItem[] = [];
-    const normal: ChatItem[] = [];
-    for (const item of dedupedItems) {
-      if (item.kind === "user" && item.queued) {
-        queued.push(item);
-      } else {
-        normal.push(item);
-      }
-    }
-    return [...normal, ...queued];
-  }, [dedupedItems]);
-
-  const lastNonQueuedItem = useMemo(() => {
-    for (let i = displayItems.length - 1; i >= 0; i--) {
-      const item = displayItems[i];
-      if (!(item.kind === "user" && item.queued)) {
-        return item;
-      }
-    }
-    return displayItems[displayItems.length - 1];
-  }, [displayItems]);
-
-  // Queued messages should render only in the QueueStrip above the input.
-  // When a queued message is dequeued (queued=false), it will appear in chat normally.
-  const chatDisplayItems = useMemo(
-    () => displayItems.filter((it) => !(it.kind === "user" && it.queued === true)),
-    [displayItems]
-  );
-
-  // Extract thinking + streaming items for the side panel.
-  const thinkingItems = useMemo(
-    () =>
-      dedupedItems.filter(
-        (it): it is SidePanelItem =>
-          it.kind === "thinking" || it.kind === "stream"
-      ),
-    [dedupedItems]
-  );
-
-  // Deduplicated count for display (same logic as ThinkingPanel)
-  const thinkingItemsCount = useMemo(() => {
-    const activeCount = thinkingItems.filter((t) => !t.done).length;
-    const seen = new Set<string>();
-    let completedCount = 0;
-    for (const t of thinkingItems) {
-      if (!t.done) continue;
-      const trimmed = t.content.trim();
-      if (!trimmed || seen.has(trimmed)) continue;
-      seen.add(trimmed);
-      completedCount++;
-    }
-    return completedCount + activeCount;
-  }, [thinkingItems]);
-
-  // Check if there's active thinking happening
-  const hasActiveThinking = useMemo(() =>
-    thinkingItems.some(t => !t.done),
-    [thinkingItems]
+  // Single O(n) pass derives every downstream view. Replaces 7 separate
+  // `useMemo` hooks that each looped over `items` (see `deriveItemViews`
+  // for the rationale).
+  const {
+    dedupedItems,
+    displayItems,
+    chatDisplayItems,
+    lastNonQueuedItem,
+    thinkingItems,
+    thinkingItemsCount,
+    hasActiveThinking,
+    groupedItems,
+  } = useMemo(
+    () => deriveItemViews(items, showThinkingPanel),
+    [items, showThinkingPanel]
   );
 
   // Auto-show thinking panel when thinking starts (only on transition to active)
@@ -2946,79 +3066,9 @@ export default function ControlClient() {
     setThinkingPanelManuallyHidden(false);
   }, [viewingMissionId]);
 
-  // Group consecutive tool items and thinking items for collapsed display
-  // Returns array of: original items OR { kind: "tool_group", tools: [...] } OR { kind: "thinking_group", thoughts: [...] }
-  type ToolGroup = {
-    kind: "tool_group";
-    groupId: string;
-    tools: Extract<ChatItem, { kind: "tool" }>[];
-  };
-  type ThinkingGroup = {
-    kind: "thinking_group";
-    groupId: string;
-    thoughts: SidePanelItem[];
-  };
-  type GroupedItem = ChatItem | ToolGroup | ThinkingGroup;
-
-  const groupedItems = useMemo((): GroupedItem[] => {
-    const result: GroupedItem[] = [];
-    let currentToolGroup: Extract<ChatItem, { kind: "tool" }>[] = [];
-    let currentThinkingGroup: SidePanelItem[] = [];
-
-    const flushToolGroup = () => {
-      if (currentToolGroup.length === 0) return;
-      if (currentToolGroup.length === 1) {
-        result.push(currentToolGroup[0]);
-      } else {
-        result.push({
-          kind: "tool_group",
-          groupId: currentToolGroup[0].id,
-          tools: currentToolGroup,
-        });
-      }
-      currentToolGroup = [];
-    };
-
-    const flushThinkingGroup = () => {
-      if (currentThinkingGroup.length === 0) return;
-      // Always create a group for thinking items (even for single items)
-      // This ensures consistent rendering through ThinkingGroupItem
-      result.push({
-        kind: "thinking_group",
-        groupId: currentThinkingGroup[0].id,
-        thoughts: currentThinkingGroup,
-      });
-      currentThinkingGroup = [];
-    };
-
-    for (const item of chatDisplayItems) {
-      if (item.kind === "tool" && !item.isUiTool) {
-        // Non-UI tool - flush thinking first, then add to tool group
-        flushThinkingGroup();
-        currentToolGroup.push(item);
-      } else if (item.kind === "thinking" || item.kind === "stream") {
-        if (showThinkingPanel) {
-          // When thinking panel is open, skip all thinking items entirely
-          // (they're shown in the side panel)
-          flushThinkingGroup();
-        } else {
-          // Add to thinking group
-          flushToolGroup();
-          currentThinkingGroup.push(item);
-        }
-      } else {
-        // Other item - flush any pending groups first
-        flushToolGroup();
-        flushThinkingGroup();
-        result.push(item);
-      }
-    }
-    // Flush any remaining groups
-    flushToolGroup();
-    flushThinkingGroup();
-
-    return result;
-  }, [chatDisplayItems, showThinkingPanel]);
+  // `groupedItems`, `thinkingItems`, etc. are all produced in the single
+  // `deriveItemViews` pass above. The old per-view `useMemo` hooks used
+  // to live here and have been removed.
 
   const runningMissionById = useMemo(() => {
     return new Map(runningMissions.map((m) => [m.mission_id, m]));

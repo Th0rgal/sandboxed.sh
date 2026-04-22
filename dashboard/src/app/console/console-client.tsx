@@ -11,8 +11,7 @@ import { authHeader, getValidJwt } from "@/lib/auth";
 import { formatBytes } from "@/lib/format";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { CopyButton } from "@/components/ui/copy-button";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { LazyCodeBlock } from "@/components/lazy-code-block";
 
 const isTerminalDebugEnabled = () => {
   if (typeof window === "undefined") return false;
@@ -379,24 +378,17 @@ function FilePreviewModal({
             </div>
           ) : (
             <div className="text-sm">
-              <SyntaxHighlighter
+              <LazyCodeBlock
                 language={language}
-                style={oneDark}
                 showLineNumbers
                 customStyle={{
-                  margin: 0,
                   padding: "1rem",
                   background: "transparent",
                   fontSize: "0.8125rem",
                 }}
-                codeTagProps={{
-                  style: {
-                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-                  },
-                }}
               >
                 {content || ""}
-              </SyntaxHighlighter>
+              </LazyCodeBlock>
             </div>
           )}
         </div>
