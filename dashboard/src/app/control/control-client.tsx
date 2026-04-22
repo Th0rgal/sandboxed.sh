@@ -7902,20 +7902,38 @@ export default function ControlClient() {
                   item.kind === "tool_group"
                     ? expandedToolGroups.has(item.groupId)
                     : false;
+                // `content-visibility: auto` tells the browser to skip
+                // layout and paint for rows that are scrolled off-screen,
+                // and `contain-intrinsic-size: auto 140px` tells it to
+                // reserve the last-rendered height (fallback 140px on
+                // first render) so scroll position stays stable when
+                // rows are re-entered. This is the CSS-level equivalent
+                // of windowing — a measurable paint-time win on missions
+                // with hundreds of messages without the refactor cost of
+                // a full virtualizer. See issue #156 (OOM on 5k-item
+                // missions). Supported in Chrome 107+ / Safari 17+;
+                // older browsers just render every row as before.
                 return (
-                  <ChatItemRow
+                  <div
                     key={key}
-                    item={item}
-                    highlighted={highlightedItemId === key}
-                    workspaceId={missionForDownloads?.workspace_id}
-                    missionId={missionForDownloads?.id}
-                    basePath={missionWorkingDirectory}
-                    isToolGroupExpanded={isToolGroupExpanded}
-                    onToggleToolGroup={handleToggleToolGroup}
-                    onResume={stableResumeMission}
-                    onToolResult={handleToolResultCommit}
-                    onOptimisticToolResult={handleOptimisticToolResult}
-                  />
+                    style={{
+                      contentVisibility: "auto",
+                      containIntrinsicSize: "auto 140px",
+                    }}
+                  >
+                    <ChatItemRow
+                      item={item}
+                      highlighted={highlightedItemId === key}
+                      workspaceId={missionForDownloads?.workspace_id}
+                      missionId={missionForDownloads?.id}
+                      basePath={missionWorkingDirectory}
+                      isToolGroupExpanded={isToolGroupExpanded}
+                      onToggleToolGroup={handleToggleToolGroup}
+                      onResume={stableResumeMission}
+                      onToolResult={handleToolResultCommit}
+                      onOptimisticToolResult={handleOptimisticToolResult}
+                    />
+                  </div>
                 );
               })}
 
