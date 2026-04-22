@@ -96,21 +96,30 @@ function fmtBytes(n: number | undefined): string {
 }
 
 const SESSION_KEY = "control-debug-peak";
+const ENABLE_KEY = "control-debug";
 
 /**
- * Floating memory/debug overlay for the control page.
- *
- * Renders a small badge in the bottom-right that shows live item counts
- * and JS heap usage, plus the peak heap seen during this tab's lifetime.
- * Always-on (not gated by a flag) because the renderer crashes we're
- * chasing leave no post-mortem otherwise — when the tab goes OOM, the
- * last snapshot written to `sessionStorage[control-debug-peak]` is all
- * that survives, and the user can copy it out after reload.
- *
- * Also emits `console.warn` / `console.error` when thresholds are hit so
- * anyone with DevTools open sees exactly what blew up, and publishes a
- * `mission-debug-stats` CustomEvent that `control-client.tsx` listens
- * for to decide whether to shed items pre-emptively.
+ * Opt-in debug overlay. Enable via `localStorage.setItem("control-debug","1")`
+ * or a `?debug=1` query param. Off by default so production users don't see
+ * the badge or pay the per-tick item-walk / sessionStorage writes.
+ */
+function isDebugEnabled(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    if (window.localStorage.getItem(ENABLE_KEY) === "1") return true;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("debug") === "1") return true;
+  } catch {
+    /* private mode or parse error — stay off */
+  }
+  return false;
+}
+
+/**
+ * Floating memory/debug overlay for the control page. Opt-in via
+ * `localStorage[control-debug]=1` or `?debug=1`. Polls `performance.memory`
+ * on a fixed 2s cadence and publishes a `mission-debug-stats` CustomEvent
+ * that `control-client.tsx` listens for to decide whether to shed items.
  */
 export function MissionDebugStats(props: {
   items: ChatItem[];
@@ -119,24 +128,37 @@ export function MissionDebugStats(props: {
   const { items, visibleItems } = props;
   const [snapshot, setSnapshot] = useState<MemoryStatsSnapshot | null>(null);
   const [expanded, setExpanded] = useState(false);
+  const [enabled] = useState<boolean>(isDebugEnabled);
   const peakHeapRef = useRef<number>(0);
   const lastLoggedBucketRef = useRef<number>(0);
+  // Refs so the sampler reads the latest values without re-subscribing
+  // (depending on `items` in the effect below would reset the 2s interval
+  // on every streaming update and trigger an O(n) scan per event).
+  const itemsRef = useRef(items);
+  const visibleItemsRef = useRef(visibleItems);
+  useEffect(() => {
+    itemsRef.current = items;
+    visibleItemsRef.current = visibleItems;
+  }, [items, visibleItems]);
 
   useEffect(() => {
+    if (!enabled) return;
     let cancelled = false;
 
     function tick() {
       if (cancelled) return;
-      const itemsContentBytes = estimateItemsBytes(items);
+      const currentItems = itemsRef.current;
+      const currentVisible = visibleItemsRef.current;
+      const itemsContentBytes = estimateItemsBytes(currentItems);
       const heap = readHeap();
       const used = heap.usedJSHeapSize ?? 0;
       if (used > peakHeapRef.current) {
         peakHeapRef.current = used;
       }
       const snap: MemoryStatsSnapshot = {
-        itemsCount: items.length,
+        itemsCount: currentItems.length,
         itemsContentBytes,
-        visibleItems,
+        visibleItems: currentVisible,
         heap,
         peakHeap: peakHeapRef.current,
         timestamp: Date.now(),
@@ -172,8 +194,8 @@ export function MissionDebugStats(props: {
               ? console.warn
               : console.log;
         logger(
-          `[mission-debug] heap=${fmtBytes(used)} items=${items.length} ` +
-            `content≈${fmtBytes(itemsContentBytes)} visible=${visibleItems} ` +
+          `[mission-debug] heap=${fmtBytes(used)} items=${currentItems.length} ` +
+            `content≈${fmtBytes(itemsContentBytes)} visible=${currentVisible} ` +
             `peak=${fmtBytes(peakHeapRef.current)}`
         );
       }
@@ -185,8 +207,9 @@ export function MissionDebugStats(props: {
       cancelled = true;
       window.clearInterval(handle);
     };
-  }, [items, visibleItems]);
+  }, [enabled]);
 
+  if (!enabled) return null;
   if (!snapshot) return null;
 
   const used = snapshot.heap.usedJSHeapSize ?? 0;

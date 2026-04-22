@@ -6999,7 +6999,34 @@ export default function ControlClient() {
           ]);
           if (viewingMissionIdRef.current !== missionId) return;
 
+          // eventsToItems is not context-free: a tool_result whose
+          // matching tool_call arrived before the disconnect cannot be
+          // translated from the delta alone (it would be silently dropped
+          // because toolCallMap is rebuilt per pass). Detect that case
+          // and fall through to the full reload so state reconstructs
+          // coherently.
+          let needsFullReload = false;
           if (deltaEvents && deltaEvents.length > 0) {
+            const deltaToolCallIds = new Set<string>();
+            for (const ev of deltaEvents) {
+              if (ev.event_type === "tool_call" && ev.tool_call_id) {
+                deltaToolCallIds.add(ev.tool_call_id);
+              }
+            }
+            const prevToolCallIds = new Set<string>();
+            for (const it of itemsRef.current) {
+              if (it.kind === "tool") prevToolCallIds.add(it.toolCallId);
+            }
+            needsFullReload = deltaEvents.some(
+              (ev) =>
+                ev.event_type === "tool_result" &&
+                !!ev.tool_call_id &&
+                !deltaToolCallIds.has(ev.tool_call_id) &&
+                !prevToolCallIds.has(ev.tool_call_id)
+            );
+          }
+
+          if (!needsFullReload && deltaEvents && deltaEvents.length > 0) {
             const deltaItems = eventsToItems(deltaEvents, mission);
             setItems((prev) => {
               const existingIds = new Set(prev.map((it) => it.id));
@@ -7044,7 +7071,10 @@ export default function ControlClient() {
             updateMissionItems(missionId, merged);
             return merged;
           });
-          return;
+          if (!needsFullReload) return;
+          // Orphan delta — clear the cursor and fall through to the
+          // full reload below so state reconstructs with full context.
+          missionMaxSeqRef.current.delete(missionId);
         }
 
         // Full reload fallback (first load or counter reset).
