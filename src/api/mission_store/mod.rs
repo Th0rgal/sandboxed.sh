@@ -685,6 +685,55 @@ pub fn sanitize_filename(value: &str) -> String {
     }
 }
 
+/// Portable snapshot of a mission for cross-environment transfer.
+///
+/// Produced by [`MissionStore::export_mission_bundle`] and consumed by
+/// [`MissionStore::import_mission_bundle`]. Designed to round-trip between
+/// instances that may disagree on workspace UUIDs — the bundle carries
+/// `workspace_name` so the import side can resolve against its own
+/// workspace store, and does *not* carry runtime session state (Claude/Codex
+/// `.credentials.json`, container mount points) which are per-environment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionBundle {
+    /// Bundle format version. Bump on breaking changes.
+    pub version: u32,
+    /// When this bundle was exported (ISO-8601 UTC).
+    pub exported_at: String,
+    /// Optional `SANDBOXED_PUBLIC_URL` of the source instance — purely for
+    /// auditing/debug; import logic ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_public_url: Option<String>,
+    /// Name of the workspace this mission ran in. The import side resolves
+    /// this to a local workspace UUID (or the caller can supply one).
+    pub workspace_name: Option<String>,
+    /// The mission row itself. On import its `id` may be replaced; the
+    /// exported value lets a consumer correlate to the source instance.
+    pub mission: Mission,
+    /// All `mission_events` rows for this mission, in sequence order.
+    /// Content is loaded inline — the import side stores it back through
+    /// the normal spill mechanism, so large payloads re-spill on the
+    /// target side regardless of where they lived originally.
+    pub events: Vec<StoredEvent>,
+    /// All `automations` for this mission. Imported as disabled so they
+    /// don't immediately fire on the target — the user re-enables
+    /// explicitly.
+    pub automations: Vec<Automation>,
+    /// Last N executions per automation, preserved for history context.
+    /// May be empty.
+    #[serde(default)]
+    pub executions: Vec<AutomationExecution>,
+}
+
+/// Options accepted by [`MissionStore::import_mission_bundle`].
+#[derive(Debug, Clone, Default)]
+pub struct MissionImportOptions {
+    /// Override the target workspace UUID. When `None`, the import resolves
+    /// `bundle.workspace_name` against the local workspace store.
+    pub target_workspace_id: Option<Uuid>,
+    /// Keep the bundle's automations enabled (default: import as disabled).
+    pub keep_automations_active: bool,
+}
+
 /// Mission store trait - implemented by all storage backends.
 #[allow(clippy::too_many_arguments)]
 #[async_trait]
@@ -1006,6 +1055,73 @@ pub trait MissionStore: Send + Sync {
     /// List all missions in Assistant mode.
     async fn list_assistant_missions(&self) -> Result<Vec<Mission>, String> {
         Ok(vec![])
+    }
+
+    // === Export / Import ===
+
+    /// Assemble a portable snapshot of a mission for transfer to another
+    /// instance.
+    ///
+    /// Default implementation walks the public trait methods and works for
+    /// any store that implements them; backends are free to override for
+    /// efficiency (e.g. streaming directly from SQL).
+    async fn export_mission_bundle(
+        &self,
+        id: Uuid,
+        source_public_url: Option<String>,
+    ) -> Result<MissionBundle, String> {
+        let mission = self
+            .get_mission(id)
+            .await?
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+        // Paginate events so we capture the full log even when the mission
+        // exceeds the 50_000-event default cap used by `get_events`. Large
+        // long-running missions can easily cross 100_000 events; truncating
+        // silently during export would produce a bundle that looks complete
+        // but isn't.
+        let mut events = Vec::new();
+        let page = 25_000usize;
+        let mut offset = 0usize;
+        loop {
+            let batch = self.get_events(id, None, Some(page), Some(offset)).await?;
+            let len = batch.len();
+            events.extend(batch);
+            if len < page {
+                break;
+            }
+            offset += page;
+        }
+        let automations = self.get_mission_automations(id).await?;
+        // Cap execution history at 100 per mission so bundle size doesn't
+        // balloon on long-running missions. Callers that need the full log
+        // can pull /api/control/missions/:id/automation-executions directly.
+        let executions = self
+            .get_mission_automation_executions(id, Some(100))
+            .await?;
+        let workspace_name = mission.workspace_name.clone();
+        Ok(MissionBundle {
+            version: 1,
+            exported_at: Utc::now().to_rfc3339(),
+            source_public_url,
+            workspace_name,
+            mission,
+            events,
+            automations,
+            executions,
+        })
+    }
+
+    /// Import a mission bundle, returning the newly assigned mission UUID.
+    ///
+    /// Default implementation is a no-op error — backends must opt in. The
+    /// file/memory backends don't participate because they're debug-only.
+    async fn import_mission_bundle(
+        &self,
+        bundle: MissionBundle,
+        options: MissionImportOptions,
+    ) -> Result<Uuid, String> {
+        let _ = (bundle, options);
+        Err("Mission import is only supported by the sqlite backend".to_string())
     }
 
     // === Telegram Channel methods ===

@@ -688,6 +688,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/:id/automation-executions",
             get(control::get_mission_automation_executions),
         )
+        // Mission portability — export a mission for transfer to another
+        // instance, and import one coming from elsewhere. The import route
+        // gets its own body limit layer because mission bundles routinely
+        // hit hundreds of MB (a long-running mission carries 50k+ tool
+        // results), and the default axum limit (2 MB) would 413 them.
+        .route(
+            "/api/control/missions/:id/export",
+            get(control::export_mission),
+        )
+        .route(
+            "/api/control/missions/import",
+            post(control::import_mission)
+                .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)),
+        )
         // Assistant missions
         .route(
             "/api/control/assistants",

@@ -10004,6 +10004,141 @@ pub async fn get_mission_automation_executions(
     Ok(Json(executions))
 }
 
+/// Export a mission as a portable bundle for transfer to another instance.
+///
+/// Response: `application/json` — a [`mission_store::MissionBundle`] serialized
+/// as JSON. Dashboard clients typically save this to disk and upload to the
+/// target instance's `/api/control/missions/import`.
+pub async fn export_mission(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    let control = control_for_user(&state, &user).await;
+    let source_public_url = std::env::var("SANDBOXED_PUBLIC_URL").ok();
+    let mut bundle = control
+        .mission_store
+        .export_mission_bundle(mission_id, source_public_url)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    // Ensure `workspace_name` is populated so the import side can resolve
+    // it against its own workspace store without requiring the caller to
+    // pass `?workspace_id=`. The stored `missions.workspace_name` column
+    // can be NULL (it's only populated opportunistically at display time).
+    if bundle.workspace_name.is_none() {
+        if let Some(ws) = state.workspaces.get(bundle.mission.workspace_id).await {
+            bundle.workspace_name = Some(ws.name.clone());
+            bundle.mission.workspace_name = Some(ws.name);
+        }
+    }
+    let mission_id_simple = bundle.mission.id.simple().to_string();
+    let body = serde_json::to_string(&bundle).map_err(internal_error)?;
+    let filename = format!("mission-{mission_id_simple}.json");
+    let mut resp = (StatusCode::OK, body).into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "application/json; charset=utf-8".parse().unwrap(),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{filename}\"")
+            .parse()
+            .map_err(internal_error)?,
+    );
+    Ok(resp)
+}
+
+/// Import a mission bundle previously produced by [`export_mission`].
+///
+/// Body is the raw JSON bundle (no multipart wrapper — keep the happy path
+/// simple for curl / scripts). Optional query params:
+/// - `workspace_id=<uuid>` — override target workspace; otherwise we resolve
+///   the bundle's `workspace_name` against the local workspace store.
+/// - `keep_automations_active=true` — import automations enabled. Default is
+///   disabled so bundles don't immediately start firing on the target.
+#[derive(Debug, Deserialize, Default)]
+pub struct ImportMissionQuery {
+    pub workspace_id: Option<Uuid>,
+    #[serde(default)]
+    pub keep_automations_active: bool,
+}
+
+pub async fn import_mission(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    axum::extract::Query(query): axum::extract::Query<ImportMissionQuery>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let bundle: mission_store::MissionBundle = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid mission bundle: {e}"),
+        )
+    })?;
+    if bundle.version != 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Unsupported bundle version {} (expected 1)", bundle.version),
+        ));
+    }
+
+    // Resolve target workspace: explicit override wins; otherwise try by
+    // name; otherwise bail so the user sees why — silently defaulting
+    // to a random workspace would be a nasty surprise.
+    let target_workspace_id = if let Some(id) = query.workspace_id {
+        id
+    } else if let Some(ref name) = bundle.workspace_name {
+        let workspaces = state.workspaces.list().await;
+        match workspaces.iter().find(|w| &w.name == name) {
+            Some(ws) => ws.id,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Workspace '{name}' not found on this instance. Pass \
+                         ?workspace_id=<uuid> to pick one explicitly."
+                    ),
+                ))
+            }
+        }
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Bundle has no workspace_name and no ?workspace_id= override was provided.".to_string(),
+        ));
+    };
+
+    let options = mission_store::MissionImportOptions {
+        target_workspace_id: Some(target_workspace_id),
+        keep_automations_active: query.keep_automations_active,
+    };
+    let original_mission_id = bundle.mission.id;
+    let events_imported = bundle.events.len();
+    let automations_imported = bundle.automations.len();
+    let executions_imported = bundle.executions.len();
+    let new_id = control
+        .mission_store
+        .import_mission_bundle(bundle, options)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(serde_json::json!({
+        "mission_id": new_id,
+        "workspace_id": target_workspace_id,
+        "original_mission_id": original_mission_id,
+        "imported": {
+            "events": events_imported,
+            "automations": automations_imported,
+            "executions": executions_imported,
+        },
+        "automations_active": query.keep_automations_active,
+    })))
+}
+
 /// Webhook receiver endpoint for triggering automations.
 /// Accepts POST requests with JSON body and validates webhook secret if configured.
 pub async fn webhook_receiver(
