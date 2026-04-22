@@ -2637,6 +2637,384 @@ function CollapsedToolGroup({
   );
 }
 
+type ChatItemRowProps = {
+  item: GroupedItem;
+  highlighted: boolean;
+  workspaceId: string | undefined;
+  missionId: string | undefined;
+  basePath: string | undefined;
+  isToolGroupExpanded: boolean;
+  onToggleToolGroup: (groupId: string) => void;
+  onResume: () => void;
+  onToolResult: (
+    toolCallId: string,
+    name: string,
+    result: unknown
+  ) => Promise<void>;
+  onOptimisticToolResult: (toolCallId: string, result: unknown) => void;
+};
+
+/**
+ * Memoized row for the chat list. React.memo short-circuits when the
+ * row's props are shallow-equal — the common SSE-tick case, where only
+ * the tail of `items` is appended. Tool-group expansion is passed as a
+ * plain boolean per row so toggling one group doesn't invalidate any
+ * of the others.
+ */
+const ChatItemRow = memo(function ChatItemRow({
+  item,
+  highlighted,
+  workspaceId,
+  missionId,
+  basePath,
+  isToolGroupExpanded,
+  onToggleToolGroup,
+  onResume,
+  onToolResult,
+  onOptimisticToolResult,
+}: ChatItemRowProps) {
+  if (item.kind === "tool_group") {
+    return (
+      <div
+        id={`chat-item-${item.groupId}`}
+        data-chat-item-id={item.groupId}
+        className={cn(
+          "rounded-xl transition-colors",
+          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10"
+        )}
+      >
+        <CollapsedToolGroup
+          tools={item.tools}
+          isExpanded={isToolGroupExpanded}
+          onToggleExpand={() => onToggleToolGroup(item.groupId)}
+          workspaceId={workspaceId}
+          missionId={missionId}
+        />
+      </div>
+    );
+  }
+
+  if (item.kind === "user") {
+    return (
+      <div
+        id={`chat-item-${item.id}`}
+        data-chat-item-id={item.id}
+        className={cn(
+          "flex justify-end gap-3 group rounded-xl transition-colors",
+          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10"
+        )}
+      >
+        <CopyButton text={item.content} className="self-start mt-2" />
+        <div className="max-w-[80%]">
+          <div
+            className={cn(
+              "rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light",
+              item.queued
+                ? "border-2 border-dashed border-indigo-500/60 bg-indigo-500/20"
+                : "bg-indigo-500"
+            )}
+          >
+            <p className="whitespace-pre-wrap text-sm break-words">
+              {item.content}
+            </p>
+          </div>
+          <div className="mt-1 text-right flex items-center justify-end gap-2">
+            {item.queued === true && (
+              <span className="text-[10px] text-white/30">Queued</span>
+            )}
+            <span className="text-[10px] text-white/30">
+              {formatTime(item.timestamp)}
+            </span>
+          </div>
+        </div>
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.08]">
+          <User className="h-4 w-4 text-white/60" />
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === "assistant") {
+    const MessageStatusIcon = item.success ? CheckCircle : XCircle;
+    const displayModel = item.model
+      ? item.model.includes("/")
+        ? item.model.split("/").pop()
+        : item.model
+      : null;
+    return (
+      <div
+        id={`chat-item-${item.id}`}
+        data-chat-item-id={item.id}
+        className={cn(
+          "flex justify-start gap-3 group rounded-xl transition-colors",
+          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10"
+        )}
+      >
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+          <Bot className="h-4 w-4 text-indigo-400" />
+        </div>
+        <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+          <div className="mb-2 flex items-center gap-2 text-xs text-white/40">
+            <MessageStatusIcon
+              className={cn(
+                "h-3 w-3",
+                item.success ? "text-emerald-400" : "text-red-400"
+              )}
+            />
+            <span>{item.success ? "Turn complete" : "Failed"}</span>
+            {displayModel && (
+              <>
+                <span>•</span>
+                <span
+                  className="font-mono truncate max-w-[120px]"
+                  title={item.model ?? undefined}
+                >
+                  {displayModel}
+                </span>
+              </>
+            )}
+            <>
+              <span>•</span>
+              <span
+                className={
+                  item.costSource === "actual"
+                    ? "text-emerald-400"
+                    : item.costSource === "estimated"
+                      ? "text-amber-300"
+                      : "text-white/50"
+                }
+              >
+                {item.costSource === "unknown"
+                  ? item.costCents > 0
+                    ? `$${(item.costCents / 100).toFixed(4)}`
+                    : "N/A"
+                  : `$${(item.costCents / 100).toFixed(4)}`}
+              </span>
+              <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/60">
+                {item.costSource === "actual"
+                  ? "Actual"
+                  : item.costSource === "estimated"
+                    ? "Estimated"
+                    : "Unknown"}
+              </span>
+            </>
+            <span>•</span>
+            <span className="text-white/30">{formatTime(item.timestamp)}</span>
+          </div>
+          <MarkdownContent
+            content={item.content}
+            basePath={basePath}
+            workspaceId={workspaceId}
+            missionId={missionId}
+          />
+          {item.sharedFiles && item.sharedFiles.length > 0 && (
+            <div className="mt-2">
+              {item.sharedFiles.map((file, idx) => (
+                <SharedFileCard key={`${file.url}-${idx}`} file={file} />
+              ))}
+            </div>
+          )}
+          {!item.success && item.resumable && (
+            <div className="mt-3 flex gap-2">
+              <button
+                onClick={onResume}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded-lg transition-colors"
+              >
+                <RotateCcw className="h-3 w-3" />
+                Resume Mission
+              </button>
+            </div>
+          )}
+        </div>
+        <CopyButton text={item.content} className="self-start mt-8" />
+      </div>
+    );
+  }
+
+  if (item.kind === "phase") {
+    return <PhaseItem item={item} />;
+  }
+
+  if (item.kind === "thinking_group") {
+    return (
+      <ThinkingGroupItem
+        items={item.thoughts}
+        basePath={basePath}
+        workspaceId={workspaceId}
+        missionId={missionId}
+      />
+    );
+  }
+
+  if (item.kind === "thinking" || item.kind === "stream") {
+    return (
+      <ThinkingGroupItem
+        items={[item]}
+        basePath={basePath}
+        workspaceId={workspaceId}
+        missionId={missionId}
+      />
+    );
+  }
+
+  if (item.kind === "tool") {
+    if (item.isUiTool) {
+      if (item.name === "question" || item.name === "AskUserQuestion") {
+        return (
+          <QuestionToolItem
+            item={item}
+            onSubmit={async (toolCallId, answers) => {
+              onOptimisticToolResult(toolCallId, { answers });
+              await onToolResult(toolCallId, item.name, { answers });
+            }}
+          />
+        );
+      }
+      if (item.name === "ui_optionList") {
+        const toolCallId = item.toolCallId;
+        const rawArgs: Record<string, unknown> = isRecord(item.args)
+          ? item.args
+          : {};
+
+        let optionList: ReturnType<
+          typeof parseSerializableOptionList
+        > | null = null;
+        let parseErr: string | null = null;
+        try {
+          optionList = parseSerializableOptionList({
+            ...rawArgs,
+            id:
+              typeof rawArgs["id"] === "string" && rawArgs["id"]
+                ? (rawArgs["id"] as string)
+                : `option-list-${toolCallId}`,
+          });
+        } catch (e) {
+          parseErr =
+            e instanceof Error ? e.message : "Invalid option list payload";
+        }
+
+        const confirmed = item.result as OptionListSelection | undefined;
+
+        return (
+          <div className="flex justify-start gap-3">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+              <Bot className="h-4 w-4 text-indigo-400" />
+            </div>
+            <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+              <div className="mb-2 text-xs text-white/40">
+                Tool:{" "}
+                <span className="font-mono text-indigo-400">{item.name}</span>
+              </div>
+
+              {parseErr || !optionList ? (
+                <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
+                  {parseErr ?? "Failed to render OptionList"}
+                </div>
+              ) : (
+                <OptionListErrorBoundary>
+                  <OptionList
+                    {...optionList}
+                    value={undefined}
+                    confirmed={confirmed}
+                    onConfirm={async (selection) => {
+                      onOptimisticToolResult(toolCallId, selection);
+                      await onToolResult(toolCallId, item.name, selection);
+                    }}
+                    onCancel={async () => {
+                      onOptimisticToolResult(toolCallId, null);
+                      await onToolResult(toolCallId, item.name, null);
+                    }}
+                  />
+                </OptionListErrorBoundary>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      if (item.name === "ui_dataTable") {
+        const rawArgs: Record<string, unknown> = isRecord(item.args)
+          ? item.args
+          : {};
+        const dataTable = parseSerializableDataTable(rawArgs);
+
+        return (
+          <div className="flex justify-start gap-3">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+              <Bot className="h-4 w-4 text-indigo-400" />
+            </div>
+            <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+              <div className="mb-2 text-xs text-white/40">
+                Tool:{" "}
+                <span className="font-mono text-indigo-400">{item.name}</span>
+              </div>
+              {dataTable ? (
+                <DataTable
+                  id={dataTable.id}
+                  title={dataTable.title}
+                  columns={dataTable.columns}
+                  rows={dataTable.rows}
+                />
+              ) : (
+                <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
+                  Failed to render DataTable
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <ToolCallItem
+          item={item}
+          highlighted={highlighted}
+          workspaceId={workspaceId}
+          missionId={missionId}
+        />
+      );
+    }
+
+    if (isSubagentTool(item.name)) {
+      return <SubagentToolItem item={item} highlighted={highlighted} />;
+    }
+
+    return (
+      <ToolCallItem
+        item={item}
+        highlighted={highlighted}
+        workspaceId={workspaceId}
+        missionId={missionId}
+      />
+    );
+  }
+
+  // system
+  return (
+    <div className="flex justify-start gap-3">
+      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.04]">
+        <Ban className="h-4 w-4 text-white/40" />
+      </div>
+      <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.02] border border-white/[0.04] px-4 py-3">
+        <p className="whitespace-pre-wrap text-sm text-white/60 break-words">
+          {item.content}
+        </p>
+        {item.resumable && (
+          <div className="mt-3 flex gap-2">
+            <button
+              onClick={onResume}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded-lg transition-colors"
+            >
+              <RotateCcw className="h-3 w-3" />
+              Resume Mission
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
 // Attachment preview component
 function AttachmentPreview({
   file,
@@ -5035,6 +5413,55 @@ export default function ControlClient() {
       setMissionLoading(false);
     }
   };
+
+  // Stable handler refs for ChatItemRow. We keep `handleResumeMission`
+  // unstable (it captures a lot of scope) and bounce through a ref so
+  // the identity passed to memoized rows doesn't change each render.
+  const handleResumeMissionRef = useRef(handleResumeMission);
+  useEffect(() => {
+    handleResumeMissionRef.current = handleResumeMission;
+  });
+  const stableResumeMission = useCallback(() => {
+    void handleResumeMissionRef.current();
+  }, []);
+
+  const handleToggleToolGroup = useCallback((groupId: string) => {
+    startTransition(() => {
+      setExpandedToolGroups((prev) => {
+        const next = new Set(prev);
+        if (next.has(groupId)) {
+          next.delete(groupId);
+        } else {
+          next.add(groupId);
+        }
+        return next;
+      });
+    });
+  }, []);
+
+  const handleOptimisticToolResult = useCallback(
+    (toolCallId: string, result: unknown) => {
+      setItems((prev) =>
+        prev.map((it) =>
+          it.kind === "tool" && it.toolCallId === toolCallId
+            ? { ...it, result }
+            : it
+        )
+      );
+    },
+    []
+  );
+
+  const handleToolResultCommit = useCallback(
+    async (toolCallId: string, name: string, result: unknown) => {
+      await postControlToolResult({
+        tool_call_id: toolCallId,
+        name,
+        result,
+      });
+    },
+    []
+  );
 
   const handleOpenFailingToolCallById = useCallback(
     async (missionId: string) => {
@@ -7469,448 +7896,28 @@ export default function ControlClient() {
                 </button>
               )}
               {groupedItems.slice(-visibleItemsLimit).map((item) => {
-                // Handle tool groups (multiple consecutive tools collapsed)
-                if (item.kind === "tool_group") {
-                  const isExpanded = expandedToolGroups.has(item.groupId);
-                  return (
-                    <div
-                      key={item.groupId}
-                      id={`chat-item-${item.groupId}`}
-                      data-chat-item-id={item.groupId}
-                      className={cn(
-                        "rounded-xl transition-colors",
-                        highlightedItemId === item.groupId && "ring-1 ring-amber-400/70 bg-amber-500/10"
-                      )}
-                    >
-                      <CollapsedToolGroup
-                        tools={item.tools}
-                        isExpanded={isExpanded}
-                        onToggleExpand={() => {
-                          // Use startTransition so expanding many tools
-                          // doesn't block the browser from painting the
-                          // button's click feedback first (issue #156).
-                          startTransition(() => {
-                            setExpandedToolGroups((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(item.groupId)) {
-                                next.delete(item.groupId);
-                              } else {
-                                next.add(item.groupId);
-                              }
-                              return next;
-                            });
-                          });
-                        }}
-                        workspaceId={missionForDownloads?.workspace_id}
-                        missionId={missionForDownloads?.id}
-                      />
-                    </div>
-                  );
-                }
-
-                if (item.kind === "user") {
-                  return (
-                    <div
-                      key={item.id}
-                      id={`chat-item-${item.id}`}
-                      data-chat-item-id={item.id}
-                      className={cn(
-                        "flex justify-end gap-3 group rounded-xl transition-colors",
-                        highlightedItemId === item.id && "ring-1 ring-amber-400/70 bg-amber-500/10"
-                      )}
-                    >
-                      <CopyButton
-                        text={item.content}
-                        className="self-start mt-2"
-                      />
-                      <div className="max-w-[80%]">
-                        <div
-                          className={cn(
-                            "rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light",
-                            item.queued
-                              ? "border-2 border-dashed border-indigo-500/60 bg-indigo-500/20"
-                              : "bg-indigo-500"
-                          )}
-                        >
-                          <p className="whitespace-pre-wrap text-sm break-words">
-                            {item.content}
-                          </p>
-                        </div>
-                        <div className="mt-1 text-right flex items-center justify-end gap-2">
-                          {item.queued === true && (
-                            <span className="text-[10px] text-white/30">
-                              Queued
-                            </span>
-                          )}
-                          <span className="text-[10px] text-white/30">
-                            {formatTime(item.timestamp)}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.08]">
-                        <User className="h-4 w-4 text-white/60" />
-                      </div>
-                    </div>
-                  );
-                }
-
-                if (item.kind === "assistant") {
-                  const statusIcon = item.success ? CheckCircle : XCircle;
-                  const MessageStatusIcon = statusIcon;
-                  const displayModel = item.model
-                    ? item.model.includes("/")
-                      ? item.model.split("/").pop()
-                      : item.model
-                    : null;
-                  return (
-                    <div
-                      key={item.id}
-                      id={`chat-item-${item.id}`}
-                      data-chat-item-id={item.id}
-                      className={cn(
-                        "flex justify-start gap-3 group rounded-xl transition-colors",
-                        highlightedItemId === item.id && "ring-1 ring-amber-400/70 bg-amber-500/10"
-                      )}
-                    >
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                        <Bot className="h-4 w-4 text-indigo-400" />
-                      </div>
-                      <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-                        <div className="mb-2 flex items-center gap-2 text-xs text-white/40">
-                          <MessageStatusIcon
-                            className={cn(
-                              "h-3 w-3",
-                              item.success ? "text-emerald-400" : "text-red-400"
-                            )}
-                          />
-                          <span>{item.success ? "Turn complete" : "Failed"}</span>
-                          {displayModel && (
-                            <>
-                              <span>•</span>
-                              <span
-                                className="font-mono truncate max-w-[120px]"
-                                title={item.model ?? undefined}
-                              >
-                                {displayModel}
-                              </span>
-                            </>
-                          )}
-                          <>
-                            <span>•</span>
-                            <span
-                              className={
-                                item.costSource === "actual"
-                                  ? "text-emerald-400"
-                                  : item.costSource === "estimated"
-                                    ? "text-amber-300"
-                                    : "text-white/50"
-                              }
-                            >
-                              {item.costSource === "unknown"
-                                ? item.costCents > 0
-                                  ? `$${(item.costCents / 100).toFixed(4)}`
-                                  : "N/A"
-                                : `$${(item.costCents / 100).toFixed(4)}`}
-                            </span>
-                            <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/60">
-                              {item.costSource === "actual"
-                                ? "Actual"
-                                : item.costSource === "estimated"
-                                  ? "Estimated"
-                                  : "Unknown"}
-                            </span>
-                          </>
-                          <span>•</span>
-                          <span className="text-white/30">
-                            {formatTime(item.timestamp)}
-                          </span>
-                        </div>
-                        <MarkdownContent
-                          content={item.content}
-                          basePath={missionWorkingDirectory}
-                          workspaceId={missionForDownloads?.workspace_id}
-                          missionId={missionForDownloads?.id}
-                        />
-                        {/* Render shared files */}
-                        {item.sharedFiles && item.sharedFiles.length > 0 && (
-                          <div className="mt-2">
-                            {item.sharedFiles.map((file, idx) => (
-                              <SharedFileCard key={`${file.url}-${idx}`} file={file} />
-                            ))}
-                          </div>
-                        )}
-                        {/* Resume button for failed messages */}
-                        {!item.success && item.resumable && (
-                          <div className="mt-3 flex gap-2">
-                            <button
-                              onClick={() => handleResumeMission()}
-                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded-lg transition-colors"
-                            >
-                              <RotateCcw className="h-3 w-3" />
-                              Resume Mission
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                      <CopyButton
-                        text={item.content}
-                        className="self-start mt-8"
-                      />
-                    </div>
-                  );
-                }
-
-                if (item.kind === "phase") {
-                  return <PhaseItem key={item.id} item={item} />;
-                }
-
-                if (item.kind === "thinking_group") {
-                  // Render grouped thinking items as a single merged block
-                  return (
-                    <ThinkingGroupItem
-                      key={item.groupId}
-                      items={item.thoughts}
-                      basePath={missionWorkingDirectory}
-                      workspaceId={missionForDownloads?.workspace_id}
-                      missionId={missionForDownloads?.id}
-                    />
-                  );
-                }
-
-                if (item.kind === "thinking") {
-                  // Fallback for individual thinking items (should be rare with grouping)
-                  return (
-                    <ThinkingGroupItem
-                      key={item.id}
-                      items={[item]}
-                      basePath={missionWorkingDirectory}
-                      workspaceId={missionForDownloads?.workspace_id}
-                      missionId={missionForDownloads?.id}
-                    />
-                  );
-                }
-
-                if (item.kind === "stream") {
-                  // Fallback for individual stream items (should be rare with grouping)
-                  return (
-                    <ThinkingGroupItem
-                      key={item.id}
-                      items={[item]}
-                      basePath={missionWorkingDirectory}
-                      workspaceId={missionForDownloads?.workspace_id}
-                      missionId={missionForDownloads?.id}
-                    />
-                  );
-                }
-
-                if (item.kind === "tool") {
-                  // UI tools get special interactive rendering
-                  if (item.isUiTool) {
-                    if (item.name === "question" || item.name === "AskUserQuestion") {
-                      return (
-                        <QuestionToolItem
-                          key={item.id}
-                          item={item}
-                          onSubmit={async (toolCallId, answers) => {
-                            setItems((prev) =>
-                              prev.map((it) =>
-                                it.kind === "tool" && it.toolCallId === toolCallId
-                                  ? { ...it, result: { answers } }
-                                  : it
-                              )
-                            );
-                            await postControlToolResult({
-                              tool_call_id: toolCallId,
-                              name: item.name,
-                              result: { answers },
-                            });
-                          }}
-                        />
-                      );
-                    }
-                    if (item.name === "ui_optionList") {
-                      const toolCallId = item.toolCallId;
-                      const rawArgs: Record<string, unknown> = isRecord(item.args)
-                        ? item.args
-                        : {};
-
-                      let optionList: ReturnType<
-                        typeof parseSerializableOptionList
-                      > | null = null;
-                      let parseErr: string | null = null;
-                      try {
-                        optionList = parseSerializableOptionList({
-                          ...rawArgs,
-                          id:
-                            typeof rawArgs["id"] === "string" && rawArgs["id"]
-                              ? (rawArgs["id"] as string)
-                              : `option-list-${toolCallId}`,
-                        });
-                      } catch (e) {
-                        parseErr =
-                          e instanceof Error
-                            ? e.message
-                            : "Invalid option list payload";
-                      }
-
-                      const confirmed = item.result as
-                        | OptionListSelection
-                        | undefined;
-
-                      return (
-                        <div key={item.id} className="flex justify-start gap-3">
-                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                            <Bot className="h-4 w-4 text-indigo-400" />
-                          </div>
-                          <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-                            <div className="mb-2 text-xs text-white/40">
-                              Tool:{" "}
-                              <span className="font-mono text-indigo-400">
-                                {item.name}
-                              </span>
-                            </div>
-
-                            {parseErr || !optionList ? (
-                              <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
-                                {parseErr ?? "Failed to render OptionList"}
-                              </div>
-                            ) : (
-                              <OptionListErrorBoundary>
-                                <OptionList
-                                  {...optionList}
-                                  value={undefined}
-                                  confirmed={confirmed}
-                                  onConfirm={async (selection) => {
-                                    setItems((prev) =>
-                                      prev.map((it) =>
-                                        it.kind === "tool" &&
-                                        it.toolCallId === toolCallId
-                                          ? { ...it, result: selection }
-                                          : it
-                                      )
-                                    );
-                                    await postControlToolResult({
-                                      tool_call_id: toolCallId,
-                                      name: item.name,
-                                      result: selection,
-                                    });
-                                  }}
-                                  onCancel={async () => {
-                                    setItems((prev) =>
-                                      prev.map((it) =>
-                                        it.kind === "tool" &&
-                                        it.toolCallId === toolCallId
-                                          ? { ...it, result: null }
-                                          : it
-                                      )
-                                    );
-                                    await postControlToolResult({
-                                      tool_call_id: toolCallId,
-                                      name: item.name,
-                                      result: null,
-                                    });
-                                  }}
-                                />
-                              </OptionListErrorBoundary>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    }
-
-                    if (item.name === "ui_dataTable") {
-                      const rawArgs: Record<string, unknown> = isRecord(item.args)
-                        ? item.args
-                        : {};
-                      const dataTable = parseSerializableDataTable(rawArgs);
-
-                      return (
-                        <div key={item.id} className="flex justify-start gap-3">
-                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                            <Bot className="h-4 w-4 text-indigo-400" />
-                          </div>
-                          <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-                            <div className="mb-2 text-xs text-white/40">
-                              Tool:{" "}
-                              <span className="font-mono text-indigo-400">
-                                {item.name}
-                              </span>
-                            </div>
-                            {dataTable ? (
-                              <DataTable
-                                id={dataTable.id}
-                                title={dataTable.title}
-                                columns={dataTable.columns}
-                                rows={dataTable.rows}
-                              />
-                            ) : (
-                              <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
-                                Failed to render DataTable
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    }
-
-                    // Unknown UI tool - still show with ToolCallItem
-                    return (
-                      <ToolCallItem
-                        key={item.id}
-                        item={item}
-                        highlighted={highlightedItemId === item.id}
-                        workspaceId={missionForDownloads?.workspace_id}
-                        missionId={missionForDownloads?.id}
-                      />
-                    );
-                  }
-
-                  // Subagent/background task tools get enhanced rendering
-                  if (isSubagentTool(item.name)) {
-                    return (
-                      <SubagentToolItem
-                        key={item.id}
-                        item={item}
-                        highlighted={highlightedItemId === item.id}
-                      />
-                    );
-                  }
-
-                  // Non-UI tools use the collapsible ToolCallItem component
-                  return (
-                    <ToolCallItem
-                      key={item.id}
-                      item={item}
-                      highlighted={highlightedItemId === item.id}
-                      workspaceId={missionForDownloads?.workspace_id}
-                      missionId={missionForDownloads?.id}
-                    />
-                  );
-                }
-
-                // system
+                const key =
+                  item.kind === "tool_group" || item.kind === "thinking_group"
+                    ? item.groupId
+                    : item.id;
+                const isToolGroupExpanded =
+                  item.kind === "tool_group"
+                    ? expandedToolGroups.has(item.groupId)
+                    : false;
                 return (
-                  <div key={item.id} className="flex justify-start gap-3">
-                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.04]">
-                      <Ban className="h-4 w-4 text-white/40" />
-                    </div>
-                    <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.02] border border-white/[0.04] px-4 py-3">
-                      <p className="whitespace-pre-wrap text-sm text-white/60 break-words">
-                        {item.content}
-                      </p>
-                      {item.resumable && (
-                        <div className="mt-3 flex gap-2">
-                          <button
-                            onClick={() => handleResumeMission()}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded-lg transition-colors"
-                          >
-                            <RotateCcw className="h-3 w-3" />
-                            Resume Mission
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
+                  <ChatItemRow
+                    key={key}
+                    item={item}
+                    highlighted={highlightedItemId === key}
+                    workspaceId={missionForDownloads?.workspace_id}
+                    missionId={missionForDownloads?.id}
+                    basePath={missionWorkingDirectory}
+                    isToolGroupExpanded={isToolGroupExpanded}
+                    onToggleToolGroup={handleToggleToolGroup}
+                    onResume={stableResumeMission}
+                    onToolResult={handleToolResultCommit}
+                    onOptimisticToolResult={handleOptimisticToolResult}
+                  />
                 );
               })}
 
