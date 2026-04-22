@@ -12,6 +12,7 @@ import {
   type FilePasteContext,
 } from "@/components/enhanced-input";
 import { MissionAutomationsDialog } from "@/components/mission-automations-dialog";
+import { MissionDebugStats } from "./MissionDebugStats";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
@@ -204,7 +205,7 @@ import type { SharedFile } from "@/lib/api";
 
 type CostSource = "actual" | "estimated" | "unknown";
 
-type ChatItem =
+export type ChatItem =
   | {
       kind: "user";
       id: string;
@@ -2514,6 +2515,41 @@ export default function ControlClient() {
   const INITIAL_VISIBLE_ITEMS = 30;
   const LOAD_MORE_INCREMENT = 30;
   const [visibleItemsLimit, setVisibleItemsLimit] = useState(INITIAL_VISIBLE_ITEMS);
+
+  // Memory pressure safety valve. Long-running missions (25k+ events, each
+  // with large tool_result payloads) have crashed the Brave/Chrome tab with
+  // "Can't open this page / Error code: 5" — a renderer OOM. The per-mission
+  // 5k event cap on the initial fetch isn't enough on its own because each
+  // tool_result can carry 100 KB+ of bash output. When `MissionDebugStats`
+  // reports a heap above ~1.2 GB, we trim `items` down to the most recent
+  // slice so the tab recovers instead of the user losing the whole session.
+  //
+  // Thresholds tuned against the observed crash profile (~1.5 GB heap before
+  // renderer exit): shed at 1.2 GB, keep the last 1500 items, and log so it's
+  // obvious in DevTools that trimming happened. Below-threshold ticks don't
+  // touch state at all.
+  useEffect(() => {
+    const SHED_HEAP_BYTES = 1_200_000_000;
+    const KEEP_TAIL_ITEMS = 1500;
+    function onStats(ev: Event) {
+      const detail = (ev as CustomEvent).detail as
+        | { heap?: { usedJSHeapSize?: number }; itemsCount?: number }
+        | undefined;
+      const used = detail?.heap?.usedJSHeapSize ?? 0;
+      if (used < SHED_HEAP_BYTES) return;
+      setItems((prev) => {
+        if (prev.length <= KEEP_TAIL_ITEMS) return prev;
+        console.warn(
+          `[mission-debug] heap ${(used / 1_048_576).toFixed(0)} MB exceeded ` +
+            `${SHED_HEAP_BYTES / 1_048_576} MB — trimming items ` +
+            `${prev.length} → ${KEEP_TAIL_ITEMS}`
+        );
+        return prev.slice(-KEEP_TAIL_ITEMS);
+      });
+    }
+    window.addEventListener("mission-debug-stats", onStats);
+    return () => window.removeEventListener("mission-debug-stats", onStats);
+  }, []);
 
   // Connection state for SSE stream - starts as disconnected until first event received
   const [connectionState, setConnectionState] = useState<
@@ -6636,6 +6672,12 @@ export default function ControlClient() {
 
   return (
     <div className="flex h-screen flex-col p-6">
+      {/* Always-on debug overlay so any OOM-style crash leaves a trail
+          we can reconstruct from sessionStorage after reload. Cheap:
+          a polling tick every 2s that reads performance.memory and
+          publishes a CustomEvent the parent listens to for shedding. */}
+      <MissionDebugStats items={items} visibleItems={visibleItemsLimit} />
+
       {/* Hidden file input */}
       <input
         ref={fileInputRef}
