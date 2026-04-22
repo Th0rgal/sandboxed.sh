@@ -904,6 +904,21 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Get events with `sequence > since_seq`, ordered by sequence ASC.
+    /// Used by the client for delta reconnect — pass the highest
+    /// sequence the client has seen and get only events that arrived
+    /// since. Cheaper than offset-based pagination for long missions.
+    async fn get_events_since(
+        &self,
+        mission_id: Uuid,
+        since_seq: i64,
+        event_types: Option<&[&str]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let _ = (mission_id, since_seq, event_types, limit);
+        Ok(vec![])
+    }
+
     /// Count events for a mission, optionally filtered by type.
     async fn count_events(
         &self,
@@ -911,6 +926,13 @@ pub trait MissionStore: Send + Sync {
         event_types: Option<&[&str]>,
     ) -> Result<usize, String> {
         let _ = (mission_id, event_types);
+        Ok(0)
+    }
+
+    /// Return the highest `sequence` value for this mission, or 0 if
+    /// the mission has no events yet.
+    async fn max_event_sequence(&self, mission_id: Uuid) -> Result<i64, String> {
+        let _ = mission_id;
         Ok(0)
     }
 

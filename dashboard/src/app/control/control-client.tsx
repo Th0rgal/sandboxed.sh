@@ -28,6 +28,7 @@ import {
   loadMission,
   getMission,
   getMissionEvents,
+  getMissionEventsWithMeta,
   searchMissionMoments,
   createMission,
   updateMissionSettings,
@@ -3271,129 +3272,60 @@ export default function ControlClient() {
     ],
     []
   );
+  /**
+   * Per-mission high-water mark for `sequence`. When non-zero, reload
+   * paths pass it as `since_seq` to `/events` so the server returns
+   * only the tail that arrived while we were disconnected, not the
+   * whole history. The backend's own `sequence` column is monotonic
+   * per-mission (see mission_store/sqlite.rs), so a simple ordered
+   * compare is enough.
+   */
+  const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
+
   const loadHistoryEvents = useCallback(
-    async (id: string) => {
-      const PAGE_LIMIT = 1000;
+    async (id: string, opts?: { sinceSeq?: number }) => {
       const MAX_EVENTS = 5000;
-      const MAX_PAGES = 20;
 
-      // For very long missions (25k+ events), loading everything crashes the
-      // browser (Chrome Error code 11 / out-of-memory). We probe the total
-      // event count first and only load the most recent MAX_EVENTS events.
-      let startOffset = 0;
-      const firstPage = await getMissionEvents(id, {
+      if (opts?.sinceSeq !== undefined) {
+        // Delta load — used on reconnect/visibility/periodic sync.
+        // The server returns events with sequence > sinceSeq already
+        // ordered ASC, so we don't need to re-sort client-side.
+        const { events, meta } = await getMissionEventsWithMeta(id, {
+          types: HISTORY_EVENT_TYPES,
+          sinceSeq: opts.sinceSeq,
+          limit: MAX_EVENTS,
+        });
+        if (meta.maxSequence !== undefined) {
+          missionMaxSeqRef.current.set(id, meta.maxSequence);
+        } else if (events.length > 0) {
+          const last = events[events.length - 1];
+          const prev = missionMaxSeqRef.current.get(id) ?? 0;
+          missionMaxSeqRef.current.set(id, Math.max(prev, last.sequence));
+        }
+        return events;
+      }
+
+      // Initial load — request the most recent MAX_EVENTS events.
+      // `latest=true` lets the server compute the tail offset in one
+      // shot, so clients no longer need the binary-search probe loop
+      // to handle 25k+ event missions.
+      const { events, meta } = await getMissionEventsWithMeta(id, {
         types: HISTORY_EVENT_TYPES,
-        limit: PAGE_LIMIT,
-        offset: 0,
+        latest: true,
+        limit: MAX_EVENTS,
       });
-      if (!Array.isArray(firstPage) || firstPage.length === 0) return [];
-
-      if (firstPage.length === PAGE_LIMIT) {
-        // There may be more than one page — check if total exceeds MAX_EVENTS
-        const probe = await getMissionEvents(id, {
-          types: HISTORY_EVENT_TYPES,
-          limit: 1,
-          offset: MAX_EVENTS,
-        });
-        if (Array.isArray(probe) && probe.length > 0) {
-          // Total exceeds MAX_EVENTS. Binary-search for the end to compute
-          // a starting offset so we load only the tail.
-          let lo = MAX_EVENTS;
-          let hi = MAX_EVENTS * 4;
-          // Find upper bound where no events exist
-          for (let i = 0; i < 10; i++) {
-            const p = await getMissionEvents(id, {
-              types: HISTORY_EVENT_TYPES,
-              limit: 1,
-              offset: hi,
-            });
-            if (!Array.isArray(p) || p.length === 0) break;
-            lo = hi;
-            hi *= 2;
-          }
-          // Verify hi is actually an upper bound (no events at this offset).
-          // The doubling loop may have exited due to iteration limit.
-          {
-            const p = await getMissionEvents(id, {
-              types: HISTORY_EVENT_TYPES,
-              limit: 1,
-              offset: hi,
-            });
-            if (Array.isArray(p) && p.length > 0) {
-              // hi is not a true upper bound — can't determine total precisely.
-              // Fall back: just load the last MAX_EVENTS from hi as best-effort.
-              startOffset = Math.max(0, hi - MAX_EVENTS);
-            }
-          }
-          // Narrow down to find the precise total
-          if (startOffset === 0) {
-            for (let i = 0; i < 20; i++) {
-              if (hi - lo <= 1) break;
-              const mid = Math.floor((lo + hi) / 2);
-              const p = await getMissionEvents(id, {
-                types: HISTORY_EVENT_TYPES,
-                limit: 1,
-                offset: mid,
-              });
-              if (Array.isArray(p) && p.length > 0) {
-                lo = mid;
-              } else {
-                hi = mid;
-              }
-            }
-            // lo is the last offset with an event, hi is the first without.
-            // Total event count ≈ hi. Load the most recent MAX_EVENTS.
-            startOffset = Math.max(0, hi - MAX_EVENTS);
-          }
-        }
-      }
-
-      const all: StoredEvent[] = [];
-      const seenIds = new Set<number>();
-
-      // If startOffset is 0, reuse the first page we already fetched
-      if (startOffset === 0) {
-        for (const event of firstPage) {
-          if (!seenIds.has(event.id)) {
-            seenIds.add(event.id);
-            all.push(event);
-          }
-        }
-      }
-
-      let offset = startOffset === 0 ? firstPage.length : startOffset;
-      const pageStart = startOffset === 0 ? 1 : 0; // skip page 0 if reused
-      for (let page = pageStart; page < MAX_PAGES; page += 1) {
-        const batch = await getMissionEvents(id, {
-          types: HISTORY_EVENT_TYPES,
-          limit: PAGE_LIMIT,
-          offset,
-        });
-        if (!Array.isArray(batch) || batch.length === 0) break;
-
-        let newCount = 0;
-        for (const event of batch) {
-          if (seenIds.has(event.id)) continue;
-          seenIds.add(event.id);
-          all.push(event);
-          newCount += 1;
-        }
-
-        if (batch.length < PAGE_LIMIT) break;
-        if (newCount === 0) break;
-        if (all.length >= MAX_EVENTS) break;
-        offset += batch.length;
-      }
-
-      all.sort((a, b) => {
-        if (a.sequence !== b.sequence) return a.sequence - b.sequence;
-        const ta = new Date(a.timestamp).getTime();
-        const tb = new Date(b.timestamp).getTime();
-        if (ta !== tb) return ta - tb;
-        return a.id - b.id;
-      });
-
-      return all;
+      const maxSeqFromData = events.reduce(
+        (m, e) => (e.sequence > m ? e.sequence : m),
+        0
+      );
+      const maxSeq =
+        meta.maxSequence !== undefined
+          ? Math.max(meta.maxSequence, maxSeqFromData)
+          : maxSeqFromData;
+      if (maxSeq > 0) missionMaxSeqRef.current.set(id, maxSeq);
+      // Defensive: sort by sequence ASC in case upstream contract changes.
+      const sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
+      return sorted;
     },
     [HISTORY_EVENT_TYPES]
   );
@@ -6958,17 +6890,84 @@ export default function ControlClient() {
     }
   }, []);
 
-  // Reload full mission history from API (events + queue). Used for visibility
-  // change, periodic sync, and SSE reconnect catch-up.
+  // Reload mission history from the API. Used for visibility change,
+  // periodic sync, and SSE reconnect catch-up.
+  //
+  // Fast path: when we know our per-mission max `sequence`, we ask for
+  // `since_seq=N` and get back only the events we missed — typically a
+  // handful per 15s tick. We merge those into the existing items state
+  // in place instead of rebuilding it from scratch, so React only has
+  // to re-render appended rows.
+  //
+  // Slow path: first visit or missing seq — fall back to the old
+  // full-rebuild flow (last MAX_EVENTS events, recompute everything).
   const reloadMissionHistory = useCallback(
     async (missionId: string) => {
       try {
+        const knownSeq = missionMaxSeqRef.current.get(missionId) ?? 0;
+
+        if (knownSeq > 0) {
+          const [mission, deltaEvents, queuedMessages] = await Promise.all([
+            getMission(missionId),
+            loadHistoryEvents(missionId, { sinceSeq: knownSeq }).catch(() => null),
+            getQueue().catch(() => []),
+          ]);
+          if (viewingMissionIdRef.current !== missionId) return;
+
+          if (deltaEvents && deltaEvents.length > 0) {
+            const deltaItems = eventsToItems(deltaEvents, mission);
+            setItems((prev) => {
+              const existingIds = new Set(prev.map((it) => it.id));
+              const additions = deltaItems.filter((it) => !existingIds.has(it.id));
+              if (additions.length === 0) return prev;
+              const merged = [...prev, ...additions];
+              adjustVisibleItemsLimit(merged);
+              updateMissionItems(missionId, merged);
+              return merged;
+            });
+            applyDesktopSessionFromEvents(deltaEvents);
+          }
+
+          // Queue reconciliation still needs every tick — a message
+          // could move from "queued" to "processing" with no new events.
+          const missionQueuedMessages = queuedMessages.filter(
+            (qm) => qm.mission_id === missionId
+          );
+          const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
+          setItems((prev) => {
+            let changed = false;
+            const next = prev.map((item) => {
+              if (item.kind !== "user") return item;
+              const shouldBeQueued = queuedIds.has(item.id);
+              if (!!item.queued === shouldBeQueued) return item;
+              changed = true;
+              return { ...item, queued: shouldBeQueued };
+            });
+            const existingIds = new Set(prev.map((it) => it.id));
+            const newQueued: ChatItem[] = missionQueuedMessages
+              .filter((qm) => !existingIds.has(qm.id))
+              .map((qm) => ({
+                kind: "user" as const,
+                id: qm.id,
+                content: qm.content,
+                timestamp: Date.now(),
+                agent: qm.agent ?? undefined,
+                queued: true,
+              }));
+            if (newQueued.length === 0 && !changed) return prev;
+            const merged = newQueued.length > 0 ? [...next, ...newQueued] : next;
+            updateMissionItems(missionId, merged);
+            return merged;
+          });
+          return;
+        }
+
+        // Full reload fallback (first load or counter reset).
         const [mission, events, queuedMessages] = await Promise.all([
           getMission(missionId),
           loadHistoryEvents(missionId).catch(() => null),
           getQueue().catch(() => []),
         ]);
-        // Race guard: only apply if we're still viewing this mission
         if (viewingMissionIdRef.current !== missionId) return;
 
         let historyItems = events
@@ -6983,7 +6982,6 @@ export default function ControlClient() {
           }
         }
 
-        // Merge queued messages that belong to this mission
         const missionQueuedMessages = queuedMessages.filter(
           (qm) => qm.mission_id === missionId
         );

@@ -3116,6 +3116,105 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn get_events_since(
+        &self,
+        mission_id: Uuid,
+        since_seq: i64,
+        event_types: Option<&[&str]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let types: Option<Vec<String>> =
+            event_types.map(|t| t.iter().map(|s| s.to_string()).collect());
+        let limit = limit.unwrap_or(50000) as i64;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+
+            let query = if types.is_some() {
+                "SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                 FROM mission_events
+                 WHERE mission_id = ?1 AND sequence > ?2 AND event_type IN (SELECT value FROM json_each(?3))
+                 ORDER BY sequence ASC
+                 LIMIT ?4"
+            } else {
+                "SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                 FROM mission_events
+                 WHERE mission_id = ?1 AND sequence > ?2
+                 ORDER BY sequence ASC
+                 LIMIT ?3"
+            };
+
+            fn parse_row(row: &rusqlite::Row<'_>) -> Result<StoredEvent, rusqlite::Error> {
+                let content: Option<String> = row.get(8)?;
+                let content_file: Option<String> = row.get(9)?;
+                let full_content = SqliteMissionStore::load_content(content.as_deref(), content_file.as_deref());
+                let metadata_str: String = row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "{}".to_string());
+                let mid_str: String = row.get(1)?;
+
+                Ok(StoredEvent {
+                    id: row.get(0)?,
+                    mission_id: parse_uuid_or_nil(&mid_str),
+                    sequence: row.get(2)?,
+                    event_type: row.get(3)?,
+                    timestamp: row.get(4)?,
+                    event_id: row.get(5)?,
+                    tool_call_id: row.get(6)?,
+                    tool_name: row.get(7)?,
+                    content: full_content,
+                    metadata: serde_json::from_str(&metadata_str).unwrap_or(serde_json::json!({})),
+                })
+            }
+
+            let events: Vec<StoredEvent> = if let Some(types) = types {
+                let types_json = serde_json::to_string(&types).unwrap_or_else(|_| "[]".to_string());
+                let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![&mid, since_seq, &types_json, limit], parse_row)
+                    .map_err(|e| e.to_string())?;
+                let mut result = Vec::new();
+                for row in rows {
+                    result.push(row.map_err(|e| e.to_string())?);
+                }
+                result
+            } else {
+                let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![&mid, since_seq, limit], parse_row)
+                    .map_err(|e| e.to_string())?;
+                let mut result = Vec::new();
+                for row in rows {
+                    result.push(row.map_err(|e| e.to_string())?);
+                }
+                result
+            };
+
+            Ok(events)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn max_event_sequence(&self, mission_id: Uuid) -> Result<i64, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let max_seq: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM mission_events WHERE mission_id = ?1",
+                    params![&mid],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            Ok(max_seq)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn count_events(
         &self,
         mission_id: Uuid,
@@ -7697,5 +7796,117 @@ mod tests {
         drop(conn);
 
         assert_eq!(search_text, "stale marker");
+    }
+
+    #[tokio::test]
+    async fn get_events_since_returns_only_events_after_seq() {
+        use crate::api::control::AgentEvent;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("seq test"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        for i in 0..5 {
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::UserMessage {
+                        id: Uuid::new_v4(),
+                        content: format!("msg {i}"),
+                        queued: false,
+                        mission_id: Some(mission.id),
+                    },
+                )
+                .await
+                .expect("log user message");
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::AssistantMessage {
+                        id: Uuid::new_v4(),
+                        content: format!("reply {i}"),
+                        success: true,
+                        cost_cents: 0,
+                        cost_source: CostSource::Unknown,
+                        usage: None,
+                        model: None,
+                        model_normalized: None,
+                        mission_id: Some(mission.id),
+                        shared_files: None,
+                        resumable: false,
+                    },
+                )
+                .await
+                .expect("log assistant");
+        }
+
+        // Max sequence should reflect all 10 events
+        let max = store.max_event_sequence(mission.id).await.expect("max seq");
+        assert_eq!(max, 10);
+
+        // since_seq=0 returns all 10 events, ordered ASC
+        let from_zero = store
+            .get_events_since(mission.id, 0, None, None)
+            .await
+            .expect("get_events_since zero");
+        assert_eq!(from_zero.len(), 10);
+        let seqs: Vec<i64> = from_zero.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, (1..=10).collect::<Vec<_>>());
+
+        // since_seq=5 returns events 6..=10
+        let tail = store
+            .get_events_since(mission.id, 5, None, None)
+            .await
+            .expect("get_events_since tail");
+        assert_eq!(tail.len(), 5);
+        assert_eq!(tail.first().map(|e| e.sequence), Some(6));
+        assert_eq!(tail.last().map(|e| e.sequence), Some(10));
+
+        // since_seq=10 returns empty (caller is already caught up)
+        let empty = store
+            .get_events_since(mission.id, 10, None, None)
+            .await
+            .expect("get_events_since empty");
+        assert!(empty.is_empty());
+
+        // limit clamps the response
+        let limited = store
+            .get_events_since(mission.id, 0, None, Some(3))
+            .await
+            .expect("get_events_since limited");
+        assert_eq!(limited.len(), 3);
+        assert_eq!(
+            limited.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        // event_types filter narrows further
+        let assistants_only = store
+            .get_events_since(mission.id, 0, Some(&["assistant_message"]), None)
+            .await
+            .expect("get_events_since types");
+        assert_eq!(assistants_only.len(), 5);
+        for e in &assistants_only {
+            assert_eq!(e.event_type, "assistant_message");
+        }
+    }
+
+    #[tokio::test]
+    async fn max_event_sequence_is_zero_for_mission_with_no_events() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("empty"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        let max = store.max_event_sequence(mission.id).await.expect("max seq");
+        assert_eq!(max, 0);
     }
 }

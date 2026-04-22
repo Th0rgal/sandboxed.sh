@@ -48,6 +48,8 @@ export {
   searchMissionMoments,
   getMission,
   getMissionEvents,
+  getMissionEventsWithMeta,
+  type MissionEventsMeta,
   getCurrentMission,
   createMission,
   loadMission,

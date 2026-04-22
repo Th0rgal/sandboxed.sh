@@ -169,14 +169,71 @@ export async function getMission(id: string): Promise<Mission> {
 
 export async function getMissionEvents(
   id: string,
-  options?: { types?: string[]; limit?: number; offset?: number }
+  options?: {
+    types?: string[];
+    limit?: number;
+    offset?: number;
+    latest?: boolean;
+    /** When set, request only events with `sequence > sinceSeq`.
+     * Takes precedence over `offset`/`latest` on the server. */
+    sinceSeq?: number;
+  }
 ): Promise<StoredEvent[]> {
+  const { events } = await getMissionEventsWithMeta(id, options);
+  return events;
+}
+
+export interface MissionEventsMeta {
+  /** Total events stored for this mission (matching the type filter if
+   * one was supplied). Read from `X-Total-Events`. `undefined` if the
+   * header was missing or unparseable. */
+  totalEvents?: number;
+  /** Highest `sequence` value stored for this mission, regardless of
+   * filter. Read from `X-Max-Sequence`. Use this as the `sinceSeq` of
+   * the next call to resume from exactly where the server is. */
+  maxSequence?: number;
+}
+
+/**
+ * Like `getMissionEvents` but also returns the `X-Total-Events` and
+ * `X-Max-Sequence` headers. Prefer this at call sites that reconnect
+ * or paginate — it lets the client skip a second count round-trip and
+ * resume from the server's latest sequence on the next delta fetch.
+ */
+export async function getMissionEventsWithMeta(
+  id: string,
+  options?: {
+    types?: string[];
+    limit?: number;
+    offset?: number;
+    latest?: boolean;
+    sinceSeq?: number;
+  }
+): Promise<{ events: StoredEvent[]; meta: MissionEventsMeta }> {
   const params = new URLSearchParams();
   if (options?.types?.length) params.set("types", options.types.join(","));
   if (options?.limit) params.set("limit", String(options.limit));
   if (options?.offset) params.set("offset", String(options.offset));
+  if (options?.latest) params.set("latest", "true");
+  if (options?.sinceSeq !== undefined) params.set("since_seq", String(options.sinceSeq));
   const query = params.toString();
-  return apiGet(`/api/control/missions/${id}/events${query ? `?${query}` : ""}`, "Failed to fetch mission events");
+  const res = await apiFetch(
+    `/api/control/missions/${id}/events${query ? `?${query}` : ""}`
+  );
+  if (!res.ok) throw new Error("Failed to fetch mission events");
+  const events = (await res.json()) as StoredEvent[];
+
+  const totalHeader = res.headers.get("x-total-events");
+  const maxSeqHeader = res.headers.get("x-max-sequence");
+  const totalEvents =
+    totalHeader !== null && totalHeader !== "" && !Number.isNaN(Number(totalHeader))
+      ? Number(totalHeader)
+      : undefined;
+  const maxSequence =
+    maxSeqHeader !== null && maxSeqHeader !== "" && !Number.isNaN(Number(maxSeqHeader))
+      ? Number(maxSeqHeader)
+      : undefined;
+  return { events, meta: { totalEvents, maxSequence } };
 }
 
 export async function getCurrentMission(): Promise<Mission | null> {

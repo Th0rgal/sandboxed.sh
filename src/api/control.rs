@@ -16,8 +16,11 @@ use std::sync::Arc;
 use axum::{
     body::Bytes,
     extract::{Extension, Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::sse::{Event, Sse},
+    http::{header, HeaderMap, StatusCode},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Response,
+    },
     Json,
 };
 use futures::stream::Stream;
@@ -39,7 +42,7 @@ use super::desktop;
 use super::library::SharedLibrary;
 use super::mission_store::{
     self, create_mission_store, now_string, Mission, MissionHistoryEntry, MissionStore,
-    MissionStoreType, StoredEvent,
+    MissionStoreType,
 };
 use super::routes::AppState;
 
@@ -4450,15 +4453,26 @@ pub struct GetEventsQuery {
     /// When true, return the latest N events (computes offset from total count)
     #[serde(default)]
     pub latest: Option<bool>,
+    /// If set, return only events with `sequence > since_seq`, ordered
+    /// by sequence ASC. Used by the client for delta reconnect to
+    /// avoid redownloading the full event tail on every focus/reopen.
+    /// Takes precedence over `offset`/`latest` when provided.
+    #[serde(default)]
+    pub since_seq: Option<i64>,
 }
 
 /// Get events for a mission (for debugging/replay).
+///
+/// Response includes `X-Total-Events` (total count matching the type
+/// filter) and `X-Max-Sequence` (highest sequence stored for this
+/// mission) headers so the client can decide whether it's caught up
+/// without issuing a second request.
 pub async fn get_mission_events(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(mission_id): Path<Uuid>,
     axum::extract::Query(query): axum::extract::Query<GetEventsQuery>,
-) -> Result<Json<Vec<StoredEvent>>, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
     // Check mission exists
@@ -4478,29 +4492,69 @@ pub async fn get_mission_events(
         .as_ref()
         .map(|s| s.split(',').map(|t| t.trim()).collect());
 
-    // When latest=true with a limit, compute offset to return the last N events
-    let offset = if query.latest.unwrap_or(false) {
-        if let Some(limit) = query.limit {
-            let total = control
-                .mission_store
-                .count_events(mission_id, types.as_deref())
-                .await
-                .map_err(internal_error)?;
-            Some(total.saturating_sub(limit))
+    let events = if let Some(since_seq) = query.since_seq {
+        control
+            .mission_store
+            .get_events_since(mission_id, since_seq, types.as_deref(), query.limit)
+            .await
+            .map_err(internal_error)?
+    } else {
+        // When latest=true with a limit, compute offset to return the last N events
+        let offset = if query.latest.unwrap_or(false) {
+            if let Some(limit) = query.limit {
+                let total = control
+                    .mission_store
+                    .count_events(mission_id, types.as_deref())
+                    .await
+                    .map_err(internal_error)?;
+                Some(total.saturating_sub(limit))
+            } else {
+                query.offset
+            }
         } else {
             query.offset
-        }
-    } else {
-        query.offset
+        };
+
+        control
+            .mission_store
+            .get_events(mission_id, types.as_deref(), query.limit, offset)
+            .await
+            .map_err(internal_error)?
     };
 
-    let events = control
+    // Metadata headers let the client decide whether it's caught up
+    // without a second round-trip. Failures here are non-fatal — we just
+    // skip the header rather than breaking the whole response.
+    let total = control
         .mission_store
-        .get_events(mission_id, types.as_deref(), query.limit, offset)
+        .count_events(mission_id, types.as_deref())
         .await
-        .map_err(internal_error)?;
+        .ok();
+    let max_seq = control
+        .mission_store
+        .max_event_sequence(mission_id)
+        .await
+        .ok();
 
-    Ok(Json(events))
+    let mut response = Json(events).into_response();
+    let headers = response.headers_mut();
+    if let Some(total) = total {
+        if let Ok(v) = header::HeaderValue::from_str(&total.to_string()) {
+            headers.insert("X-Total-Events", v);
+        }
+    }
+    if let Some(max_seq) = max_seq {
+        if let Ok(v) = header::HeaderValue::from_str(&max_seq.to_string()) {
+            headers.insert("X-Max-Sequence", v);
+        }
+    }
+    // CORS exposure so browsers can read these headers from JS.
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        header::HeaderValue::from_static("X-Total-Events, X-Max-Sequence"),
+    );
+
+    Ok(response)
 }
 
 // ==================== Diagnostic Endpoints ====================
