@@ -30,6 +30,7 @@ import {
   listProviders,
   type Provider,
 } from '@/lib/api/providers';
+import { getSettings } from '@/lib/api';
 import { getRuntimeApiBase } from '@/lib/settings';
 import {
   GitBranch,
@@ -680,6 +681,11 @@ export default function ModelRoutingPage() {
     refreshInterval: 10000, // Poll RTK stats every 10s
   });
 
+  const { data: settings } = useSWR('settings', getSettings, {
+    revalidateOnFocus: false,
+  });
+  const rtkEnabled = Boolean(settings?.rtk_enabled);
+
   const handleCreate = async () => {
     if (!createForm.id.trim() || !createForm.name.trim()) {
       toast.error('Chain ID and name are required');
@@ -1002,9 +1008,19 @@ export default function ModelRoutingPage() {
             </div>
           ) : !rtkStats || rtkStats.commands_processed === 0 ? (
             <div className="text-center py-4">
-              <p className="text-xs text-white/30">
-                No RTK data yet. Enable RTK in <a href="/settings/data" className="text-white/50 underline">Settings</a>
-              </p>
+              {rtkEnabled ? (
+                <>
+                  <p className="text-xs text-white/50">RTK is enabled — waiting for a wrapped command.</p>
+                  <p className="mt-1 text-[10px] text-white/30">
+                    Only commands run through the MCP terminal tool are wrapped. Claude Code and OpenCode
+                    default to built-in bash, which bypasses RTK.
+                  </p>
+                </>
+              ) : (
+                <p className="text-xs text-white/30">
+                  No RTK data yet. Enable RTK in <a href="/settings/data" className="text-white/50 underline">Settings</a>
+                </p>
+              )}
             </div>
           ) : (
             <div className="grid grid-cols-4 gap-3">

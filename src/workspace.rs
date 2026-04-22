@@ -1311,110 +1311,13 @@ async fn write_claude_pretool_hooks(
         }
     }
 
-    // Write the Bash hook script to .claude/hooks/bash-pretool.sh
-    //
-    // This hook serves two purposes:
-    // 1. **gh terminal fix** (always): Wraps `gh` commands with `env TERM=dumb` to prevent
-    //    lipgloss from sending terminal capability queries (OSC 11, DSR) that hang forever
-    //    in our PTY environment (no terminal emulator to respond).
-    // 2. **RTK compression** (when enabled): Rewrites eligible commands to use RTK
-    //    subcommands for 60-90% token compression on CLI output.
+    // Write the Bash hook script to .claude/hooks/bash-pretool.sh.
+    // See `render_bash_pretool_script` for the script body.
     let hooks_dir = workspace_dir.join(".claude").join("hooks");
     tokio::fs::create_dir_all(&hooks_dir).await?;
     let hook_path = hooks_dir.join("bash-pretool.sh");
-    let hook_script = r#"#!/bin/bash
-# PreToolUse hook for Bash commands.
-# 1. Fixes gh CLI hanging in PTY by setting TERM=dumb (prevents lipgloss terminal queries)
-# 2. Optionally rewrites commands to use RTK for token compression
-set -euo pipefail
-
-INPUT=$(cat)
-COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
-
-# Skip if empty or already wrapped
-if [ -z "$COMMAND" ]; then exit 0; fi
-case "$COMMAND" in
-  rtk\ *|/*/rtk\ *) exit 0 ;;
-esac
-# Skip compound commands (pipes, chains, heredocs, subshells, semicolons)
-case "$COMMAND" in
-  *"&&"*|*"||"*|*"|"*|*"<<"*|*"("*|*";"*|*'`'*|*'$('*) exit 0 ;;
-esac
-
-# Extract the base command (first word, ignoring path prefix)
-FIRST_WORD=$(echo "$COMMAND" | awk '{print $1}')
-BASE_CMD=$(basename "$FIRST_WORD")
-REST=$(echo "$COMMAND" | sed "s|^[^ ]* *||")
-
-emit_rewrite() {
-  jq -n --arg cmd "$1" '{
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "allow",
-      updatedInput: { command: $cmd }
-    }
-  }'
-}
-
-# Find rtk binary (for optional compression)
-RTK_PATH=""
-for p in /usr/local/bin/rtk /usr/bin/rtk; do
-  if [ -x "$p" ]; then RTK_PATH="$p"; break; fi
-done
-
-# Map base commands to RTK subcommands (only commands RTK natively supports)
-RTK_SUB=""
-if [ -n "$RTK_PATH" ]; then
-  case "$BASE_CMD" in
-    ls)        RTK_SUB="ls" ;;
-    tree)      RTK_SUB="tree" ;;
-    git)       RTK_SUB="git" ;;
-    gh)        RTK_SUB="gh" ;;
-    grep|rg)   RTK_SUB="grep" ;;
-    cargo)     RTK_SUB="cargo" ;;
-    npm)       RTK_SUB="npm" ;;
-    npx)       RTK_SUB="npx" ;;
-    bun)       RTK_SUB="npm" ;;
-    bunx)      RTK_SUB="npx" ;;
-    pnpm)      RTK_SUB="pnpm" ;;
-    docker)    RTK_SUB="docker" ;;
-    kubectl)   RTK_SUB="kubectl" ;;
-    vitest)    RTK_SUB="vitest" ;;
-    pytest)    RTK_SUB="pytest" ;;
-    go)        RTK_SUB="go" ;;
-    tsc)       RTK_SUB="tsc" ;;
-    eslint)    RTK_SUB="lint" ;;
-    ruff)      RTK_SUB="ruff" ;;
-    curl)      RTK_SUB="curl" ;;
-    pip|uv)    RTK_SUB="pip" ;;
-    diff)      RTK_SUB="diff" ;;
-  esac
-fi
-
-# If RTK supports this command, rewrite to use RTK (which pipes internally, fixing PTY too)
-if [ -n "$RTK_SUB" ]; then
-  if [ -n "$REST" ]; then
-    emit_rewrite "$RTK_PATH $RTK_SUB -- $REST"
-  else
-    emit_rewrite "$RTK_PATH $RTK_SUB"
-  fi
-  exit 0
-fi
-
-# No RTK available — still fix gh commands that hang in PTY environments.
-# The gh CLI (via lipgloss/glamour) sends terminal capability queries like
-# OSC 11 (background color) and DSR (cursor position) when TERM != dumb.
-# Our PTY has no terminal emulator to respond, causing indefinite hangs.
-case "$BASE_CMD" in
-  gh)
-    emit_rewrite "env TERM=dumb $COMMAND"
-    exit 0
-    ;;
-esac
-
-exit 0
-"#;
-    tokio::fs::write(&hook_path, hook_script).await?;
+    let hook_script = render_bash_pretool_script(use_rtk);
+    tokio::fs::write(&hook_path, &hook_script).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1593,6 +1496,122 @@ PY
             }
         ]
     })))
+}
+
+/// Render the Claude Code Bash `PreToolUse` hook script.
+///
+/// The hook has two responsibilities, independently toggleable:
+/// 1. **gh terminal fix** (always on): wraps `gh` commands with `env TERM=dumb`
+///    so lipgloss/glamour stops issuing terminal capability queries that hang
+///    forever in our PTY. This is a bugfix unrelated to RTK.
+/// 2. **RTK compression** (gated on `use_rtk`): when the dashboard RTK setting
+///    is enabled, rewrites eligible commands to their `rtk <sub>` equivalents.
+///    When disabled, the hook leaves commands alone even if `rtk` is installed.
+///
+/// The `use_rtk` flag is baked into the script at workspace preparation time,
+/// so toggling the dashboard setting only takes effect for workspaces prepared
+/// after the toggle.
+fn render_bash_pretool_script(use_rtk: bool) -> String {
+    let rtk_flag = if use_rtk { "true" } else { "false" };
+    format!(
+        r#"#!/bin/bash
+# PreToolUse hook for Bash commands.
+# 1. Fixes gh CLI hanging in PTY by setting TERM=dumb (prevents lipgloss terminal queries)
+# 2. Optionally rewrites commands to use RTK for token compression
+set -euo pipefail
+
+# Baked in at workspace preparation time from the dashboard RTK setting.
+RTK_ENABLED={rtk_flag}
+
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+
+# Skip if empty or already wrapped
+if [ -z "$COMMAND" ]; then exit 0; fi
+case "$COMMAND" in
+  rtk\ *|/*/rtk\ *) exit 0 ;;
+esac
+# Skip compound commands (pipes, chains, heredocs, subshells, semicolons)
+case "$COMMAND" in
+  *"&&"*|*"||"*|*"|"*|*"<<"*|*"("*|*";"*|*'`'*|*'$('*) exit 0 ;;
+esac
+
+# Extract the base command (first word, ignoring path prefix)
+FIRST_WORD=$(echo "$COMMAND" | awk '{{print $1}}')
+BASE_CMD=$(basename "$FIRST_WORD")
+REST=$(echo "$COMMAND" | sed "s|^[^ ]* *||")
+
+emit_rewrite() {{
+  jq -n --arg cmd "$1" '{{
+    hookSpecificOutput: {{
+      hookEventName: "PreToolUse",
+      permissionDecision: "allow",
+      updatedInput: {{ command: $cmd }}
+    }}
+  }}'
+}}
+
+# Find rtk binary only when the dashboard setting is on.
+RTK_PATH=""
+if [ "$RTK_ENABLED" = "true" ]; then
+  for p in /usr/local/bin/rtk /usr/bin/rtk; do
+    if [ -x "$p" ]; then RTK_PATH="$p"; break; fi
+  done
+fi
+
+# Map base commands to RTK subcommands (only commands RTK natively supports)
+RTK_SUB=""
+if [ -n "$RTK_PATH" ]; then
+  case "$BASE_CMD" in
+    ls)        RTK_SUB="ls" ;;
+    tree)      RTK_SUB="tree" ;;
+    git)       RTK_SUB="git" ;;
+    gh)        RTK_SUB="gh" ;;
+    grep|rg)   RTK_SUB="grep" ;;
+    cargo)     RTK_SUB="cargo" ;;
+    npm)       RTK_SUB="npm" ;;
+    npx)       RTK_SUB="npx" ;;
+    bun)       RTK_SUB="npm" ;;
+    bunx)      RTK_SUB="npx" ;;
+    pnpm)      RTK_SUB="pnpm" ;;
+    docker)    RTK_SUB="docker" ;;
+    kubectl)   RTK_SUB="kubectl" ;;
+    vitest)    RTK_SUB="vitest" ;;
+    pytest)    RTK_SUB="pytest" ;;
+    go)        RTK_SUB="go" ;;
+    tsc)       RTK_SUB="tsc" ;;
+    eslint)    RTK_SUB="lint" ;;
+    ruff)      RTK_SUB="ruff" ;;
+    curl)      RTK_SUB="curl" ;;
+    pip|uv)    RTK_SUB="pip" ;;
+    diff)      RTK_SUB="diff" ;;
+  esac
+fi
+
+# If RTK supports this command, rewrite to use RTK (which pipes internally, fixing PTY too)
+if [ -n "$RTK_SUB" ]; then
+  if [ -n "$REST" ]; then
+    emit_rewrite "$RTK_PATH $RTK_SUB -- $REST"
+  else
+    emit_rewrite "$RTK_PATH $RTK_SUB"
+  fi
+  exit 0
+fi
+
+# No RTK available — still fix gh commands that hang in PTY environments.
+# The gh CLI (via lipgloss/glamour) sends terminal capability queries like
+# OSC 11 (background color) and DSR (cursor position) when TERM != dumb.
+# Our PTY has no terminal emulator to respond, causing indefinite hangs.
+case "$BASE_CMD" in
+  gh)
+    emit_rewrite "env TERM=dumb $COMMAND"
+    exit 0
+    ;;
+esac
+
+exit 0
+"#
+    )
 }
 
 /// Deep-merge `overlay` into `base`.
@@ -4882,6 +4901,80 @@ mod tests {
         let overlay = json!({"b": 99, "c": 3});
         merge_json(&mut base, &overlay);
         assert_eq!(base, json!({"a": 1, "b": 99, "c": 3}));
+    }
+
+    #[test]
+    fn bash_pretool_script_bakes_rtk_flag() {
+        let on = render_bash_pretool_script(true);
+        let off = render_bash_pretool_script(false);
+        assert!(on.contains("RTK_ENABLED=true"));
+        assert!(off.contains("RTK_ENABLED=false"));
+    }
+
+    #[test]
+    fn bash_pretool_script_rtk_off_skips_rtk_binary_lookup() {
+        // When RTK_ENABLED=false the script must evaluate RTK_PATH to the
+        // empty string, so eligible commands fall through to the `gh` bugfix
+        // branch instead of being rewritten with rtk.
+        let script = render_bash_pretool_script(false);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &script).unwrap();
+
+        // ls → when RTK is off, script must NOT rewrite (no output); exits 0 with no stdout.
+        let out = std::process::Command::new("bash")
+            .arg(tmp.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(br#"{"tool_input":{"command":"ls -la"}}"#)
+                    .unwrap();
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(out.status.success(), "script failed: {:?}", out);
+        assert!(
+            out.stdout.is_empty(),
+            "expected no rewrite, got: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    #[test]
+    fn bash_pretool_script_gh_bugfix_runs_even_when_rtk_off() {
+        // The `gh` TERM=dumb fix is independent of RTK and must fire regardless.
+        let script = render_bash_pretool_script(false);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &script).unwrap();
+
+        let out = std::process::Command::new("bash")
+            .arg(tmp.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(br#"{"tool_input":{"command":"gh pr list"}}"#)
+                    .unwrap();
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(out.status.success(), "script failed: {:?}", out);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("env TERM=dumb gh pr list"),
+            "expected gh TERM=dumb rewrite, got: {}",
+            stdout
+        );
     }
 
     #[test]

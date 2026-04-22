@@ -397,15 +397,14 @@ export default function DataSettingsPage() {
                     : 'bg-white/10'
                 )}
               >
-                {togglingRtk ? (
-                  <Loader className="h-4 w-4 animate-spin absolute left-1/2 -translate-x-1/2 text-white" />
-                ) : (
-                  <span
-                    className={cn(
-                      'inline-block h-4 w-4 transform rounded-full bg-white transition-transform',
-                      serverSettings?.rtk_enabled ? 'translate-x-6' : 'translate-x-1'
-                    )}
-                  />
+                <span
+                  className={cn(
+                    'inline-block h-4 w-4 rounded-full bg-white transition-transform',
+                    serverSettings?.rtk_enabled ? 'translate-x-6' : 'translate-x-1'
+                  )}
+                />
+                {togglingRtk && (
+                  <Loader className="absolute left-1/2 top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 animate-spin text-white" />
                 )}
               </button>
             </div>

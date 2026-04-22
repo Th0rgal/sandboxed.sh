@@ -1861,6 +1861,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "croner",
+ "flate2",
  "fs2",
  "futures",
  "hex",
