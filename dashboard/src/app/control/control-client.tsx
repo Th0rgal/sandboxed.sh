@@ -427,10 +427,15 @@ function deriveItemViews(
       flushThinkingGroup();
       currentToolGroup.push(item);
     } else if (item.kind === "thinking" || item.kind === "stream") {
+      // Always flush the pending tool group before (possibly) dropping
+      // this item into the side panel — otherwise a sequence like
+      // [tool_A, thinking, tool_B] would merge tool_A with tool_B in
+      // the grouped output because the tool group stayed open across
+      // the thinking item.
+      flushToolGroup();
       if (showThinkingPanel) {
         flushThinkingGroup();
       } else {
-        flushToolGroup();
         currentThinkingGroup.push(item as SidePanelItem);
       }
     } else {
@@ -3089,7 +3094,6 @@ export default function ControlClient() {
         | undefined;
       const used = detail?.heap?.usedJSHeapSize ?? 0;
       if (used < SHED_HEAP_BYTES) return;
-      let sheddedCount: number | null = null;
       setItems((prev) => {
         if (prev.length <= KEEP_TAIL_ITEMS) return prev;
         console.warn(
@@ -3097,21 +3101,26 @@ export default function ControlClient() {
             `${SHED_HEAP_BYTES / 1_048_576} MB — trimming items ` +
             `${prev.length} → ${KEEP_TAIL_ITEMS}`
         );
-        const trimmed = prev.slice(-KEEP_TAIL_ITEMS);
-        sheddedCount = trimmed.length;
-        return trimmed;
+        return prev.slice(-KEEP_TAIL_ITEMS);
       });
-      // Also trim the per-mission cache so a subsequent mission switch
-      // or reload path that rehydrates from `missionItems` can't
-      // resurrect the full untrimmed history and re-trigger OOM.
-      const viewingId = viewingMissionIdRef.current;
-      if (viewingId && sheddedCount !== null) {
-        setMissionItems((prev) => {
-          const cached = prev[viewingId];
-          if (!cached || cached.length <= KEEP_TAIL_ITEMS) return prev;
-          return { ...prev, [viewingId]: cached.slice(-KEEP_TAIL_ITEMS) };
-        });
-      }
+      // Also trim every per-mission cache entry that exceeds the
+      // threshold, not just the one whose live `items` we just
+      // trimmed. The cache can be larger than current `items` from a
+      // prior snapshot (e.g. after a mission switch), so this must
+      // not depend on whether the live trim happened.
+      setMissionItems((prev) => {
+        let changed = false;
+        const next: Record<string, ChatItem[]> = {};
+        for (const [id, cached] of Object.entries(prev)) {
+          if (cached.length > KEEP_TAIL_ITEMS) {
+            next[id] = cached.slice(-KEEP_TAIL_ITEMS);
+            changed = true;
+          } else {
+            next[id] = cached;
+          }
+        }
+        return changed ? next : prev;
+      });
     }
     window.addEventListener("mission-debug-stats", onStats);
     return () => window.removeEventListener("mission-debug-stats", onStats);
