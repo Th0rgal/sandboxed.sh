@@ -4498,22 +4498,48 @@ export default function ControlClient() {
     setLastMissionId((prev) => (prev === id ? prev : id));
   }, [viewingMission?.id, currentMission?.id, setLastMissionId]);
 
-  // Poll for running parallel missions
+  // Fetch running parallel missions. Primary refresh path is now
+  // event-driven (see the `mission_status_changed` handler further
+  // down), but a slow visibility-gated interval keeps the list
+  // eventually-consistent in case we miss a state change (SSE lag,
+  // out-of-band cancel, etc.).
+  const refreshRunningMissions = useCallback(async () => {
+    try {
+      const running = await getRunningMissions();
+      setRunningMissions(running);
+    } catch {
+      // Ignore errors — next event or tick will retry.
+    }
+  }, []);
+
   useEffect(() => {
-    const pollRunning = async () => {
-      try {
-        const running = await getRunningMissions();
-        setRunningMissions(running);
-      } catch {
-        // Ignore errors
+    refreshRunningMissions();
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (intervalId !== null) return;
+      intervalId = setInterval(refreshRunningMissions, 15_000);
+    };
+    const stop = () => {
+      if (intervalId !== null) {
+        clearInterval(intervalId);
+        intervalId = null;
       }
     };
-
-    // Poll immediately and then every 3 seconds
-    pollRunning();
-    const interval = setInterval(pollRunning, 3000);
-    return () => clearInterval(interval);
-  }, []);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refreshRunningMissions();
+        start();
+      } else {
+        stop();
+      }
+    };
+    if (document.visibilityState === "visible") start();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      stop();
+    };
+  }, [refreshRunningMissions]);
 
   const refreshRecentMissions = useCallback(async () => {
     try {
@@ -4611,11 +4637,37 @@ export default function ControlClient() {
     });
   }, []);
 
-  // Refresh recent missions periodically (after the callback is defined)
+  // Refresh recent missions periodically (after the callback is defined).
+  // Paused when the tab is hidden — there's nothing to update on screen
+  // and backgrounded tabs don't need to keep the list warm. Event-driven
+  // refresh on `mission_status_changed` keeps it live when visible.
   useEffect(() => {
     refreshRecentMissions();
-    const interval = setInterval(refreshRecentMissions, 10000);
-    return () => clearInterval(interval);
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (intervalId !== null) return;
+      intervalId = setInterval(refreshRecentMissions, 30_000);
+    };
+    const stop = () => {
+      if (intervalId !== null) {
+        clearInterval(intervalId);
+        intervalId = null;
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refreshRecentMissions();
+        start();
+      } else {
+        stop();
+      }
+    };
+    if (document.visibilityState === "visible") start();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      stop();
+    };
   }, [refreshRecentMissions]);
 
   // Fetch desktop sessions periodically for the enhanced dropdown
@@ -4675,9 +4727,30 @@ export default function ControlClient() {
 
   useEffect(() => {
     refreshDesktopSessions();
-    const interval = setInterval(refreshDesktopSessions, 10000);
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (intervalId !== null) return;
+      intervalId = setInterval(refreshDesktopSessions, 30_000);
+    };
+    const stop = () => {
+      if (intervalId !== null) {
+        clearInterval(intervalId);
+        intervalId = null;
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refreshDesktopSessions();
+        start();
+      } else {
+        stop();
+      }
+    };
+    if (document.visibilityState === "visible") start();
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
-      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      stop();
       // Also clean up rapid polling interval
       if (desktopRapidPollRef.current) {
         clearInterval(desktopRapidPollRef.current);
@@ -6254,6 +6327,11 @@ export default function ControlClient() {
       if (event.type === "mission_status_changed" && isRecord(data)) {
         const newStatus = String(data["status"] ?? "");
         const missionId = typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+
+        // A mission starting/stopping changes the running-missions list.
+        // Fire-and-forget refresh so we don't have to rely on the 15 s
+        // background tick.
+        void refreshRunningMissions();
 
         // Always update mission status in state when it changes
         if (missionId) {
