@@ -6858,26 +6858,18 @@ export default function ControlClient() {
     }
     submittingRef.current = true;
 
-    // EnhancedInput.handleSubmit self-clears synchronously before our
-    // async work runs (so Send/Queue button call sites always clear),
-    // which means every error-return path below must restore the
-    // user's draft explicitly or their typed message is silently lost.
-    const restoredDraft = agent ? `@${agent} ${content}` : content;
-    const restoreDraft = () => {
-      setInput(restoredDraft);
-      setDraftInput(restoredDraft);
-    };
-
     const targetMissionId = viewingMissionIdRef.current;
 
-    // Sync mission state before sending (backend needs current_mission set correctly)
+    // Sync mission state before sending (backend needs current_mission set correctly).
+    // Mission-sync error paths below return early BEFORE we call
+    // `enhancedInputRef.current?.clear()`, so the user's typed draft
+    // stays intact and doesn't need to be explicitly restored.
     if (targetMissionId) {
       try {
         let mission = await loadMission(targetMissionId);
 
         if (!mission) {
           toast.error("Mission not found");
-          restoreDraft();
           submittingRef.current = false;
           return;
         }
@@ -6901,7 +6893,6 @@ export default function ControlClient() {
         const errMsg = err instanceof Error ? err.message : String(err);
         console.error("Failed to sync mission before sending:", err);
         toast.error(`Failed to sync mission: ${errMsg}. Check API connection in Settings.`);
-        restoreDraft();
         submittingRef.current = false;
         return;
       }
@@ -6953,7 +6944,9 @@ export default function ControlClient() {
     } catch (err) {
       console.error(err);
       setItems((prev) => prev.filter((item) => item.id !== tempId));
-      restoreDraft();
+      const restoredDraft = agent ? `@${agent} ${content}` : content;
+      setInput(restoredDraft);
+      setDraftInput(restoredDraft);
       toast.error("Failed to send message");
     } finally {
       submittingRef.current = false;

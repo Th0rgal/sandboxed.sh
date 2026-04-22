@@ -545,12 +545,12 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
       onSubmit({ content: value });
     }
 
-    // Self-clear so callers that invoke submit() directly (e.g. Send/Queue
-    // buttons) don't rely on the parent's onSubmit handler to clear state.
-    // Idempotent with the parent's explicit clear() call.
-    setLockedAgent(null);
-    onChange('');
-  }, [displayValue, lockedAgent, disabled, onSubmit, onChange, parsedAgentFromValue, value, pushToHistory]);
+    // Intentionally does NOT clear here. Clearing is driven by the
+    // parent via the imperative `clear()` handle so a submission that
+    // fails upstream (mission sync error, post rejection) can leave the
+    // user's draft intact. See enhanced-input.test.tsx — "does not
+    // clear text synchronously when submitted".
+  }, [displayValue, lockedAgent, disabled, onSubmit, parsedAgentFromValue, value, pushToHistory]);
 
   // Check if submission is valid (has content or locked agent)
   const canSubmit = useCallback(() => {
