@@ -1214,10 +1214,16 @@ impl ModelChainStore {
                 // on Anthropic/OpenAI and get recorded as a live failure.
                 // Google is routed via a separate refresh flow, so skip the
                 // guard for it (mirrors the store-account carve-out above).
-                let is_oauth_only_token = sa.api_key.is_some() && sa.has_oauth;
+                // `api_key` is populated and `has_oauth` is set → the
+                // `api_key` field actually carries a hoisted OAuth access
+                // token (OpenCode stores Anthropic OAuth access tokens in
+                // `api_key` for header-building convenience). Freshness
+                // must be enforced against `oauth_expires_at`; a stale
+                // token would 401 and get recorded as a live failure.
+                let is_hoisted_oauth_token = sa.api_key.is_some() && sa.has_oauth;
                 let provider_is_google =
                     matches!(provider_type, crate::ai_providers::ProviderType::Google);
-                if is_oauth_only_token && !provider_is_google {
+                if is_hoisted_oauth_token && !provider_is_google {
                     if let Some(expires_at) = sa.oauth_expires_at {
                         if expires_at <= now_ms + 60_000 {
                             tracing::debug!(

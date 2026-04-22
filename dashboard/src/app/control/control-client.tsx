@@ -3089,6 +3089,7 @@ export default function ControlClient() {
         | undefined;
       const used = detail?.heap?.usedJSHeapSize ?? 0;
       if (used < SHED_HEAP_BYTES) return;
+      let sheddedCount: number | null = null;
       setItems((prev) => {
         if (prev.length <= KEEP_TAIL_ITEMS) return prev;
         console.warn(
@@ -3096,8 +3097,21 @@ export default function ControlClient() {
             `${SHED_HEAP_BYTES / 1_048_576} MB — trimming items ` +
             `${prev.length} → ${KEEP_TAIL_ITEMS}`
         );
-        return prev.slice(-KEEP_TAIL_ITEMS);
+        const trimmed = prev.slice(-KEEP_TAIL_ITEMS);
+        sheddedCount = trimmed.length;
+        return trimmed;
       });
+      // Also trim the per-mission cache so a subsequent mission switch
+      // or reload path that rehydrates from `missionItems` can't
+      // resurrect the full untrimmed history and re-trigger OOM.
+      const viewingId = viewingMissionIdRef.current;
+      if (viewingId && sheddedCount !== null) {
+        setMissionItems((prev) => {
+          const cached = prev[viewingId];
+          if (!cached || cached.length <= KEEP_TAIL_ITEMS) return prev;
+          return { ...prev, [viewingId]: cached.slice(-KEEP_TAIL_ITEMS) };
+        });
+      }
     }
     window.addEventListener("mission-debug-stats", onStats);
     return () => window.removeEventListener("mission-debug-stats", onStats);
@@ -6844,6 +6858,16 @@ export default function ControlClient() {
     }
     submittingRef.current = true;
 
+    // EnhancedInput.handleSubmit self-clears synchronously before our
+    // async work runs (so Send/Queue button call sites always clear),
+    // which means every error-return path below must restore the
+    // user's draft explicitly or their typed message is silently lost.
+    const restoredDraft = agent ? `@${agent} ${content}` : content;
+    const restoreDraft = () => {
+      setInput(restoredDraft);
+      setDraftInput(restoredDraft);
+    };
+
     const targetMissionId = viewingMissionIdRef.current;
 
     // Sync mission state before sending (backend needs current_mission set correctly)
@@ -6853,6 +6877,7 @@ export default function ControlClient() {
 
         if (!mission) {
           toast.error("Mission not found");
+          restoreDraft();
           submittingRef.current = false;
           return;
         }
@@ -6876,6 +6901,7 @@ export default function ControlClient() {
         const errMsg = err instanceof Error ? err.message : String(err);
         console.error("Failed to sync mission before sending:", err);
         toast.error(`Failed to sync mission: ${errMsg}. Check API connection in Settings.`);
+        restoreDraft();
         submittingRef.current = false;
         return;
       }
@@ -6927,9 +6953,7 @@ export default function ControlClient() {
     } catch (err) {
       console.error(err);
       setItems((prev) => prev.filter((item) => item.id !== tempId));
-      const restoredDraft = agent ? `@${agent} ${content}` : content;
-      setInput(restoredDraft);
-      setDraftInput(restoredDraft);
+      restoreDraft();
       toast.error("Failed to send message");
     } finally {
       submittingRef.current = false;

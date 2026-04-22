@@ -10293,10 +10293,20 @@ async fn resolve_import_target_workspace(
 /// `/import` route and the chunked `/import-chunks/:id/commit` route
 /// share this helper — they both arrive as a `Bytes` blob that may or
 /// may not be gzipped.
-/// Hard cap on decompressed mission bundle size. Bounds gzip expansion
-/// so a crafted compressed payload can't OOM the daemon before JSON
-/// validation runs. 2 GiB mirrors the single-shot body cap.
+/// Hard cap on decompressed mission bundle size for the *chunked*
+/// import path, where the decoder streams from disk-staged chunks into
+/// `serde_json::from_reader` without ever buffering the full payload.
+/// 2 GiB bounds a zip-bomb there.
 const MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Tighter cap for the *single-shot* `/import` route. That path streams
+/// the decompressed body into `from_reader`, but the parser still
+/// allocates per-frame state up to this ceiling — and an attacker can
+/// drive it from a 128 MiB compressed body. Keep the ceiling small
+/// enough that even the worst-case allocation stays bounded; larger
+/// bundles must use the chunked route, which stages chunks on disk
+/// first.
+const MISSION_BUNDLE_SINGLE_SHOT_MAX_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Stream a mission bundle out of a staged chunk directory without ever
 /// holding the concatenated body in memory. Handles gzip transparently —
@@ -10397,38 +10407,22 @@ fn parse_mission_bundle(
         // instead of decoding would be a confusing footgun.
         || body.starts_with(&[0x1f, 0x8b]);
 
+    // Stream straight from the body into `from_reader` and cap both
+    // the compressed wire size (enforced at the route layer via
+    // DefaultBodyLimit) and the decompressed size (via `Read::take`)
+    // so a zip-bomb can't allocate more than the single-shot ceiling
+    // inside the JSON parser.
     let bundle: mission_store::MissionBundle = if is_gzipped {
-        // Cap the decompressed size via `take` so a zip-bomb can't
-        // exhaust memory. We reserve capacity conservatively (4× body
-        // only up to the cap) so reasonable bundles still allocate in
-        // one shot.
-        let mut decoder = GzDecoder::new(body).take(MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES);
-        let reserve =
-            ((body.len() as u64).saturating_mul(4)).min(MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES);
-        let mut decompressed = Vec::with_capacity(reserve as usize);
-        decoder.read_to_end(&mut decompressed).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to decompress gzipped bundle: {e}"),
-            )
-        })?;
-        if decompressed.len() as u64 >= MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!(
-                    "Decompressed bundle exceeds the {} byte cap",
-                    MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES
-                ),
-            ));
-        }
-        serde_json::from_slice(&decompressed).map_err(|e| {
+        let decoder = GzDecoder::new(body).take(MISSION_BUNDLE_SINGLE_SHOT_MAX_DECOMPRESSED_BYTES);
+        serde_json::from_reader(std::io::BufReader::new(decoder)).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid mission bundle (after gunzip): {e}"),
             )
         })?
     } else {
-        serde_json::from_slice(body).map_err(|e| {
+        let reader = body.take(MISSION_BUNDLE_SINGLE_SHOT_MAX_DECOMPRESSED_BYTES);
+        serde_json::from_reader(std::io::BufReader::new(reader)).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid mission bundle: {e}"),
