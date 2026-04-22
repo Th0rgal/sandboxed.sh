@@ -3290,18 +3290,23 @@ export default function ControlClient() {
         // Delta load — used on reconnect/visibility/periodic sync.
         // The server returns events with sequence > sinceSeq already
         // ordered ASC, so we don't need to re-sort client-side.
+        //
+        // If the server does NOT support `since_seq` (older backend),
+        // it silently ignores the param and returns events from
+        // offset=0, which would pollute the tail with stale oldest-
+        // events. `X-Max-Sequence` is only set by backends that
+        // support delta reload — if it's missing, we clear the ref
+        // so callers fall back to full reload next time.
         const { events, meta } = await getMissionEventsWithMeta(id, {
           types: HISTORY_EVENT_TYPES,
           sinceSeq: opts.sinceSeq,
           limit: MAX_EVENTS,
         });
-        if (meta.maxSequence !== undefined) {
-          missionMaxSeqRef.current.set(id, meta.maxSequence);
-        } else if (events.length > 0) {
-          const last = events[events.length - 1];
-          const prev = missionMaxSeqRef.current.get(id) ?? 0;
-          missionMaxSeqRef.current.set(id, Math.max(prev, last.sequence));
+        if (meta.maxSequence === undefined) {
+          missionMaxSeqRef.current.delete(id);
+          return [];
         }
+        missionMaxSeqRef.current.set(id, meta.maxSequence);
         return events;
       }
 
@@ -3314,15 +3319,14 @@ export default function ControlClient() {
         latest: true,
         limit: MAX_EVENTS,
       });
-      const maxSeqFromData = events.reduce(
-        (m, e) => (e.sequence > m ? e.sequence : m),
-        0
-      );
-      const maxSeq =
-        meta.maxSequence !== undefined
-          ? Math.max(meta.maxSequence, maxSeqFromData)
-          : maxSeqFromData;
-      if (maxSeq > 0) missionMaxSeqRef.current.set(id, maxSeq);
+      // Only seed `missionMaxSeqRef` when the server has confirmed it
+      // supports the resume protocol via `X-Max-Sequence`. Seeding from
+      // `event.sequence` alone would enable the delta path against old
+      // backends that ignore `since_seq`, causing them to return
+      // offset=0 rows that'd get appended as bogus "new" events.
+      if (meta.maxSequence !== undefined && meta.maxSequence > 0) {
+        missionMaxSeqRef.current.set(id, meta.maxSequence);
+      }
       // Defensive: sort by sequence ASC in case upstream contract changes.
       const sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
       return sorted;
