@@ -428,17 +428,19 @@ function deriveItemViews(
       flushThinkingGroup();
       currentToolGroup.push(item);
     } else if (item.kind === "thinking" || item.kind === "stream") {
-      // Always flush the pending tool group before (possibly) dropping
-      // this item into the side panel — otherwise a sequence like
-      // [tool_A, thinking, tool_B] would merge tool_A with tool_B in
-      // the grouped output because the tool group stayed open across
-      // the thinking item.
-      flushToolGroup();
       if (showThinkingPanel) {
-        flushThinkingGroup();
-      } else {
-        currentThinkingGroup.push(item as SidePanelItem);
+        // Thinking/stream items are routed to the side panel in this
+        // mode — they don't render inline at all. Keep the tool group
+        // open across them so consecutive tool calls (with thinking
+        // between) stay collapsed into a single group in the main
+        // chat; otherwise the user sees every tool as an individual
+        // row with no "Show N previous tools" collapse button.
+        continue;
       }
+      // Inline thinking: break the current tool group so ordering
+      // renders as tool → thinking → tool in the chat.
+      flushToolGroup();
+      currentThinkingGroup.push(item as SidePanelItem);
     } else {
       flushToolGroup();
       flushThinkingGroup();
