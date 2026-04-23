@@ -201,6 +201,7 @@ import { DesktopStream } from "@/components/desktop-stream";
 import { NewMissionDialog } from "@/components/new-mission-dialog";
 import { MissionSwitcher, normalizeMetadataText } from "@/components/mission-switcher";
 import { WorkerPanel } from "@/components/worker-panel";
+import { SubagentsPanel, type SubagentEntry } from "@/components/subagents-panel";
 
 import type { SharedFile } from "@/lib/api";
 
@@ -5117,6 +5118,20 @@ export default function ControlClient() {
 
   const focusChatItem = useCallback(
     (itemId: string, entryIndex?: number) => {
+      // If the target sits inside a collapsed tool_group, the inner
+      // tool rows aren't in the DOM yet — expand the enclosing group
+      // so scrollIntoView has something to hit.
+      const enclosingGroup = groupedItems.find(
+        (g) => g.kind === "tool_group" && g.tools.some((t) => t.id === itemId)
+      );
+      if (enclosingGroup && enclosingGroup.kind === "tool_group") {
+        setExpandedToolGroups((prev) => {
+          if (prev.has(enclosingGroup.groupId)) return prev;
+          const next = new Set(prev);
+          next.add(enclosingGroup.groupId);
+          return next;
+        });
+      }
       let requiredVisible = groupedItems.length;
       if (typeof entryIndex === "number" && entryIndex >= 0) {
         let historyIndex = 0;
@@ -7271,14 +7286,48 @@ export default function ControlClient() {
     return recentMissions.filter((m) => m.parent_mission_id === activeMission.id);
   }, [activeMission, recentMissions]);
   const activeMissionRole = activeMission ? inferMissionRole(activeMission) : null;
-  const isBossMission = childMissions.length > 0 || activeMissionRole === "boss";
 
-  // Auto-show worker panel when viewing a boss mission with workers
+  // In-mission sub-agents (Claude Code `Task`, orchestrator MCP worker
+  // creators). These run inside the same harness process — not as
+  // separate missions with parent_mission_id — so the child-mission
+  // `WorkerPanel` can't represent them. We expose them through a
+  // lighter `SubagentsPanel` keyed off the current mission's own items.
+  const inMissionSubagents = useMemo<SubagentEntry[]>(() => {
+    const out: SubagentEntry[] = [];
+    for (const item of items) {
+      if (item.kind !== "tool") continue;
+      const name = item.name.toLowerCase();
+      const isOrchestratorWorker =
+        name.startsWith("mcp__orchestrator__create_worker") ||
+        name === "mcp__orchestrator__batch_create_workers" ||
+        name === "mcp__orchestrator__retask_worker";
+      if (!isSubagentTool(item.name) && !isOrchestratorWorker) continue;
+      out.push({
+        id: item.id,
+        toolCallId: item.toolCallId,
+        name: item.name,
+        args: item.args,
+        result: item.result,
+        startTime: item.startTime,
+        endTime: item.endTime,
+      });
+    }
+    return out;
+  }, [items]);
+
+  const hasInMissionSubagents = inMissionSubagents.length > 0;
+  const isBossMission =
+    childMissions.length > 0 ||
+    activeMissionRole === "boss" ||
+    hasInMissionSubagents;
+
+  // Auto-show the workers/sub-agents panel when the active mission
+  // first acquires workers or sub-agents.
   useEffect(() => {
-    if (childMissions.length > 0) {
+    if (childMissions.length > 0 || hasInMissionSubagents) {
       setShowWorkerPanel(true);
     }
-  }, [activeMission?.id, childMissions.length]);
+  }, [activeMission?.id, childMissions.length, hasInMissionSubagents]);
 
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
@@ -8427,8 +8476,8 @@ export default function ControlClient() {
             "min-h-0 flex flex-col gap-4 transition-all duration-300 animate-fade-in shrink-0",
             showDesktopStream ? "flex-1 max-w-md" : "w-80"
           )}>
-            {/* Worker Panel */}
-            {showWorkerPanel && isBossMission && (
+            {/* Worker Panel — real child missions (parent_mission_id) */}
+            {showWorkerPanel && childMissions.length > 0 && (
               <WorkerPanel
                 childMissions={childMissions}
                 runningMissions={runningMissions}
@@ -8437,7 +8486,21 @@ export default function ControlClient() {
                 onSelectWorker={(missionId) => handleViewMission(missionId)}
                 onClose={() => setShowWorkerPanel(false)}
                 className={cn(
-                  showThinkingPanel || showDesktopStream
+                  showThinkingPanel || showDesktopStream || hasInMissionSubagents
+                    ? "flex-shrink-0 max-h-[50%]"
+                    : "flex-1"
+                )}
+              />
+            )}
+
+            {/* Sub-agents Panel — in-mission Task / orchestrator workers */}
+            {showWorkerPanel && hasInMissionSubagents && (
+              <SubagentsPanel
+                subagents={inMissionSubagents}
+                onFocusItem={focusChatItem}
+                onClose={() => setShowWorkerPanel(false)}
+                className={cn(
+                  showThinkingPanel || showDesktopStream || childMissions.length > 0
                     ? "flex-shrink-0 max-h-[50%]"
                     : "flex-1"
                 )}
