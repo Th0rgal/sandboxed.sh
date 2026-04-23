@@ -5121,6 +5121,7 @@ async fn cleanup_stale_active_missions_once(
     mission_store: &Arc<dyn MissionStore>,
     stale_hours: u64,
     events_tx: &broadcast::Sender<AgentEvent>,
+    cmd_tx: &mpsc::Sender<ControlCommand>,
 ) {
     match mission_store.get_stale_active_missions(stale_hours).await {
         Ok(stale_missions) => {
@@ -5131,6 +5132,28 @@ async fn cleanup_stale_active_missions_once(
                     mission.title.as_deref().unwrap_or("Untitled"),
                     mission.updated_at
                 );
+
+                // Ask the control actor to cancel any in-memory runner
+                // for this mission before we overwrite DB status. Without
+                // this, a frozen runner (e.g. stuck in `child.wait()` on
+                // an orphaned tool subprocess) would keep
+                // `running_mission_id` pinned and /api/control/running
+                // would keep reporting the mission as "running, stalled"
+                // until the daemon restarts. CancelMission is idempotent
+                // — it returns "not found" when there is no live runner,
+                // which is the common case for stale missions, and we
+                // ignore that error.
+                let (tx, rx) = oneshot::channel();
+                if cmd_tx
+                    .send(ControlCommand::CancelMission {
+                        mission_id: mission.id,
+                        respond: tx,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    let _ = rx.await;
+                }
 
                 if let Err(e) = mission_store
                     .update_mission_status(mission.id, MissionStatus::Completed)
@@ -5165,7 +5188,7 @@ async fn cleanup_stale_active_missions_once(
 async fn stale_mission_cleanup_loop(
     mission_store: Arc<dyn MissionStore>,
     stale_hours: u64,
-    _cmd_tx: mpsc::Sender<ControlCommand>,
+    cmd_tx: mpsc::Sender<ControlCommand>,
     events_tx: broadcast::Sender<AgentEvent>,
 ) {
     // Check every 5 minutes; the stale timeout remains a safety net for missions that
@@ -5179,7 +5202,7 @@ async fn stale_mission_cleanup_loop(
 
     loop {
         tokio::time::sleep(check_interval).await;
-        cleanup_stale_active_missions_once(&mission_store, stale_hours, &events_tx).await;
+        cleanup_stale_active_missions_once(&mission_store, stale_hours, &events_tx, &cmd_tx).await;
     }
 }
 
@@ -12405,7 +12428,8 @@ mod tests {
             .expect("mission should become active");
 
         let (events_tx, _events_rx) = broadcast::channel(8);
-        cleanup_stale_active_missions_once(&store, 24, &events_tx).await;
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        cleanup_stale_active_missions_once(&store, 24, &events_tx, &cmd_tx).await;
 
         let stored = store
             .get_mission(mission.id)

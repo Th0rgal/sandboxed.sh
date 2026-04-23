@@ -18,6 +18,7 @@ import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
 import { getMissionShortName } from "@/lib/mission-display";
 import { inferMissionRole } from "@/lib/mission-role";
+import { isFinishedStatus, needsAttentionStatus } from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import {
@@ -3481,8 +3482,18 @@ export default function ControlClient() {
     if (!viewingMissionId) return null;
     if (!viewingRunningInfo) return null;
     if (viewingRunningInfo.health?.status !== "stalled") return null;
+    // Suppress the stall banner when the mission is already in a
+    // terminal state in the DB. The backend's in-memory running-list
+    // can lag behind the DB (e.g. stale-cleanup marked the mission
+    // Completed but the orphan runner task never resolved), and nagging
+    // the user about a mission that's actually done is worse than
+    // missing a genuine stall.
+    const status = viewingMission?.status;
+    if (status && (isFinishedStatus(status) || needsAttentionStatus(status))) {
+      return null;
+    }
     return viewingRunningInfo.health;
-  }, [viewingMissionId, viewingRunningInfo]);
+  }, [viewingMissionId, viewingRunningInfo, viewingMission?.status]);
 
   const hasPendingQuestion = useMemo(() => {
     // Find the index of the last user message — any question before it is
