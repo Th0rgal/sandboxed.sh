@@ -5994,6 +5994,21 @@ fn is_bare_llm_error_output(output: &str) -> bool {
     ) || normalized.starts_with("api error:")
         || normalized.starts_with("anthropic api error:")
         || normalized.starts_with("claude code error:")
+        // Claude Code's canonical auth-failure surface: the CLI prints
+        // `Failed to authenticate. API Error: 401 ...` when Anthropic
+        // rejects the request mid-turn. Without this pattern the
+        // short auth-error string slipped past
+        // `maybe_recover_soft_llm_error` and got fake-promoted to
+        // TurnComplete, hiding rotation exhaustion from the UI.
+        || normalized.starts_with("failed to authenticate")
+        // Any short output whose only substantive content is an auth
+        // HTTP status from Anthropic/OpenAI — catches phrasings like
+        // `<some prefix>. API Error: 401 ...` without needing to
+        // enumerate the prefix.
+        || (normalized.len() < 200
+            && (normalized.contains("api error: 401")
+                || normalized.contains("api error: 403")
+                || normalized.contains("api error: 407")))
 }
 
 fn looks_like_structured_provider_error(output: &str) -> bool {
@@ -15507,6 +15522,42 @@ Investigate <service/> failures.
 
         assert!(!result.success);
         assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_claude_cli_401() {
+        // Regression: Claude Code CLI prints this exact string when
+        // Anthropic 401s mid-turn. It was previously upgraded to
+        // TurnComplete because the output exceeded 20 chars and
+        // didn't match a known bare-error prefix — users then saw the
+        // auth error as a successful assistant reply.
+        let mut result = crate::agents::AgentResult::failure(
+            "Failed to authenticate. API Error: 401 terminated".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::AuthError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::AuthError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_generic_api_error_401() {
+        // Any short output whose substantive content is an HTTP 401
+        // status from the underlying provider should stay classified
+        // as AuthError regardless of the leading prefix.
+        let mut result = crate::agents::AgentResult::failure(
+            "Anthropic returned an error. API Error: 401 Unauthorized".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::AuthError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::AuthError));
     }
 
     #[test]
