@@ -308,7 +308,7 @@ impl OrchestratorMcp {
                         },
                         "model_override": {
                             "type": "string",
-                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.4') for codex, Gemini models for gemini, 'provider/model' format for opencode."
+                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.5') for codex, Gemini models for gemini, 'provider/model' format for opencode."
                         },
                         "model_effort": {
                             "type": "string",

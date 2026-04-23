@@ -25,7 +25,7 @@ You coordinate worker missions. Prefer delegation over direct work.
 
 ## Backend Guide
 
-- `codex` + `gpt-5.4`: default for code changes
+- `codex` + `gpt-5.5`: default for code changes
 - `gemini` + `gemini-3.1-pro-preview` or `gemini-2.5-pro`: good for proofs and parallel analysis
 - `claudecode` + Claude models: careful broad edits
 - `opencode`: cheap redundancy

@@ -502,9 +502,16 @@ fn default_providers_config() -> ProvidersConfig {
                     },
                     // Additional OpenAI models
                     ProviderModel {
+                        id: "gpt-5.5".to_string(),
+                        name: "GPT-5.5".to_string(),
+                        description: Some(
+                            "Latest frontier coding model in Codex (Spud, 2026-04)".to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "gpt-5.4".to_string(),
                         name: "GPT-5.4".to_string(),
-                        description: Some("Latest frontier coding model in Codex".to_string()),
+                        description: Some("Previous frontier coding model in Codex".to_string()),
                     },
                     ProviderModel {
                         id: "gpt-5.3".to_string(),
@@ -1227,9 +1234,14 @@ pub async fn list_backend_model_options(
         };
 
     push_options("claudecode", Some(&["anthropic"]), false, None);
-    // Codex model catalog includes codex-* IDs and gpt-5.4.
-    // Source of truth: https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/models.json
-    let codex_filter: &dyn Fn(&str) -> bool = &|id: &str| id.contains("codex") || id == "gpt-5.4";
+    // Codex model catalog includes codex-* IDs plus the latest plain
+    // `gpt-5.X` flagship models (currently 5.5 and 5.4). The Codex CLI
+    // passes `--model <slug>` straight through to OpenAI's backend, so
+    // a new slug starts working as soon as the backend recognizes it
+    // — there is no hard dependency on the CLI's embedded catalog
+    // being up-to-date.
+    let codex_filter: &dyn Fn(&str) -> bool =
+        &|id: &str| id.contains("codex") || id == "gpt-5.5" || id == "gpt-5.4";
     push_options("codex", Some(&["openai"]), false, Some(codex_filter));
     push_options("gemini", Some(&["google"]), false, None);
     push_options("opencode", None, true, None);
