@@ -7036,12 +7036,15 @@ export default function ControlClient() {
           ]);
           if (viewingMissionIdRef.current !== missionId) return;
 
-          // eventsToItems is not context-free: a tool_result whose
-          // matching tool_call arrived before the disconnect cannot be
-          // translated from the delta alone (it would be silently dropped
-          // because toolCallMap is rebuilt per pass). Detect that case
-          // and fall through to the full reload so state reconstructs
-          // coherently.
+          // eventsToItems is not context-free: `tool_result` events are
+          // only matched against `tool_call` rows seen in the same pass
+          // (it rebuilds `toolCallMap` per call). When a tool_call has
+          // already been rendered into `items` from a prior tick and
+          // only the result arrives in the delta, the merge path cannot
+          // update the existing tool row and would leave it stuck as
+          // "running" until a later full reload. Force a full reload
+          // whenever a delta `tool_result` has no matching `tool_call`
+          // in the same delta, regardless of prev-items state.
           let needsFullReload = false;
           if (deltaEvents && deltaEvents.length > 0) {
             const deltaToolCallIds = new Set<string>();
@@ -7050,16 +7053,11 @@ export default function ControlClient() {
                 deltaToolCallIds.add(ev.tool_call_id);
               }
             }
-            const prevToolCallIds = new Set<string>();
-            for (const it of itemsRef.current) {
-              if (it.kind === "tool") prevToolCallIds.add(it.toolCallId);
-            }
             needsFullReload = deltaEvents.some(
               (ev) =>
                 ev.event_type === "tool_result" &&
                 !!ev.tool_call_id &&
-                !deltaToolCallIds.has(ev.tool_call_id) &&
-                !prevToolCallIds.has(ev.tool_call_id)
+                !deltaToolCallIds.has(ev.tool_call_id)
             );
           }
 
