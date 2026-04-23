@@ -190,13 +190,19 @@ fn has_routable_proxy_credentials(
 ) -> bool {
     match provider_type {
         ProviderType::Custom => true,
-        // OpenAI joins Anthropic here: the local CLI proxy's
-        // `/v1/chat/completions` endpoint knows how to translate ChatGPT
-        // Plus/Pro OAuth into the Codex `/v1/responses` call, so an
-        // OAuth-only entry is still routable — the adapter matches on
-        // `api_key.is_none() && has_oauth` and forwards through the proxy.
         ProviderType::Anthropic => has_api_key || has_oauth,
-        ProviderType::OpenAI => has_api_key || has_oauth,
+        // OpenAI OAuth-only entries are only routable when the local
+        // CLI proxy is usable (Codex credential on disk). The
+        // CLI-proxy adapter doesn't forward the entry's own OAuth
+        // token — it relies on the global Codex credential — so
+        // without that we'd select the entry, fall through the
+        // non-adapter path, send no Authorization header, and burn
+        // through deterministic 401s. Keep it unroutable so chain
+        // resolution skips it and picks the next provider instead.
+        ProviderType::OpenAI => {
+            has_api_key
+                || (has_oauth && crate::api::ai_providers::openai_cli_proxy_account_available())
+        }
         ProviderType::Google => has_api_key || has_oauth,
         _ => has_api_key,
     }

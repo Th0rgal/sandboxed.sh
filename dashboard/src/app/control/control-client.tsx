@@ -18,7 +18,7 @@ import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
 import { getMissionShortName } from "@/lib/mission-display";
 import { inferMissionRole } from "@/lib/mission-role";
-import { isFinishedStatus, needsAttentionStatus } from "@/lib/mission-status";
+import { isFinishedStatus } from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import {
@@ -3482,14 +3482,16 @@ export default function ControlClient() {
     if (!viewingMissionId) return null;
     if (!viewingRunningInfo) return null;
     if (viewingRunningInfo.health?.status !== "stalled") return null;
-    // Suppress the stall banner when the mission is already in a
-    // terminal state in the DB. The backend's in-memory running-list
-    // can lag behind the DB (e.g. stale-cleanup marked the mission
-    // Completed but the orphan runner task never resolved), and nagging
-    // the user about a mission that's actually done is worse than
-    // missing a genuine stall.
+    // Suppress the stall banner only when the mission is in a truly
+    // terminal DB state (completed/failed/not_feasible). The backend's
+    // in-memory running-list can lag behind the DB (e.g. stale-cleanup
+    // marked the mission Completed but the orphan runner task never
+    // resolved), and nagging the user about a mission that's actually
+    // done is worse than missing a genuine stall. Interrupted/blocked
+    // are *not* terminal — they need user action — so a mission
+    // stalled in one of those states should keep showing the banner.
     const status = viewingMission?.status;
-    if (status && (isFinishedStatus(status) || needsAttentionStatus(status))) {
+    if (status && isFinishedStatus(status)) {
       return null;
     }
     return viewingRunningInfo.health;
