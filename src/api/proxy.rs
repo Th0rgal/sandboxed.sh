@@ -4260,17 +4260,20 @@ mod tests {
 
     #[test]
     fn proxy_credential_gating_is_provider_aware_for_oauth() {
-        // OpenAI OAuth-only entries are now routable — they flow through
-        // the `use_openai_oauth_cli_proxy_adapter` branch, which lets the
-        // local CLI proxy translate Codex OAuth into `/v1/responses`.
-        // Previously this returned false because OAuth JWTs don't work
-        // against `api.openai.com/v1/chat/completions`; the adapter
-        // closed that gap.
-        assert!(has_routable_proxy_credentials(
+        // OpenAI OAuth-only routability now also depends on whether a
+        // Codex CLI-proxy credential is available on disk — the
+        // adapter doesn't forward the entry's own OAuth token, so
+        // without a Codex cred the request would 401 anyway. The test
+        // environment has no such credential, so OpenAI OAuth-only
+        // should be unroutable here.
+        assert!(!has_routable_proxy_credentials(
             ProviderType::OpenAI,
             false,
             true
         ));
+        // Anthropic and Google OAuth entries keep the old contract —
+        // Anthropic CLI-proxy routing has its own fallback path and
+        // Google uses a proper refresh flow.
         assert!(has_routable_proxy_credentials(
             ProviderType::Anthropic,
             false,
@@ -4281,6 +4284,7 @@ mod tests {
             false,
             true
         ));
+        // API-key entries are always routable regardless of OAuth state.
         assert!(has_routable_proxy_credentials(
             ProviderType::OpenAI,
             true,
