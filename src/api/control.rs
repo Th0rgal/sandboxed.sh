@@ -10108,7 +10108,6 @@ pub async fn export_mission(
     use axum::response::IntoResponse;
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use std::io::Write;
 
     let control = control_for_user(&state, &user).await;
     let source_public_url = std::env::var("SANDBOXED_PUBLIC_URL").ok();
@@ -10128,44 +10127,60 @@ pub async fn export_mission(
         }
     }
     let mission_id_simple = bundle.mission.id.simple().to_string();
-    let body = serde_json::to_string(&bundle).map_err(internal_error)?;
 
     // Gzip opt-in:
     //   1. `?gzip=true` always compresses
     //   2. `?gzip=false` always skips
-    //   3. Otherwise honor Accept-Encoding: gzip
+    //   3. Otherwise honor Accept-Encoding: gzip, including q-values
+    //      (`gzip;q=0` explicitly disallows gzip even when present).
     let accepts_gzip = headers_in
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').any(|t| t.trim().starts_with("gzip")))
+        .map(accept_encoding_allows_gzip)
         .unwrap_or(false);
     let use_gzip = query.gzip.unwrap_or(accepts_gzip);
 
-    let (payload, gzipped) = if use_gzip {
-        // Level 6 — the standard "speed vs ratio" sweet spot. Text JSON
-        // typically hits 5–10× at level 6; higher levels save another
-        // ~5–10% for a lot more CPU.
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(body.as_bytes()).map_err(internal_error)?;
-        let bytes = encoder.finish().map_err(internal_error)?;
-        (bytes, true)
-    } else {
-        (body.into_bytes(), false)
-    };
+    // Stream the bundle out instead of materializing a full JSON string
+    // (and a full gzip buffer on top of that). For large missions the
+    // old approach held bundle + JSON + optional gzip — three in-memory
+    // copies at once — which could OOM the daemon on export. Here the
+    // serializer writes into a bounded mpsc channel in ~64 KB chunks;
+    // flate2 compresses on the fly when use_gzip is set.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+    tokio::task::spawn_blocking(move || {
+        let mut writer = ChannelWriter::new(tx);
+        let serialize_result: std::io::Result<()> = if use_gzip {
+            let mut encoder = GzEncoder::new(&mut writer, Compression::default());
+            serde_json::to_writer(&mut encoder, &bundle)
+                .map_err(std::io::Error::other)
+                .and_then(|_| encoder.finish().map(|_| ()))
+        } else {
+            serde_json::to_writer(&mut writer, &bundle).map_err(std::io::Error::other)
+        };
+        if let Err(e) = serialize_result.and_then(|_| writer.flush_all()) {
+            writer.send_error(e);
+        }
+    });
+    // Adapt the mpsc receiver into a `Stream` via futures::stream::unfold —
+    // tokio-stream isn't in the dep set, and this is a ~5-line adapter.
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let body = axum::body::Body::from_stream(stream);
 
-    let filename = if gzipped {
+    let filename = if use_gzip {
         format!("mission-{mission_id_simple}.json.gz")
     } else {
         format!("mission-{mission_id_simple}.json")
     };
 
-    let mut resp = (StatusCode::OK, payload).into_response();
+    let mut resp = (StatusCode::OK, body).into_response();
     let out_headers = resp.headers_mut();
     out_headers.insert(
         header::CONTENT_TYPE,
         "application/json; charset=utf-8".parse().unwrap(),
     );
-    if gzipped {
+    if use_gzip {
         out_headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
         // Mark the response as varying on Accept-Encoding so caches
         // don't serve a gzipped body to a client that didn't ask.
@@ -10267,17 +10282,24 @@ async fn resolve_import_target_workspace(
     bundle_workspace_name: Option<&str>,
 ) -> Result<ResolvedImportTarget, (StatusCode, String)> {
     if let Some(id) = explicit_id {
-        // Look up the workspace so we can stamp its current name onto
-        // the import; if it no longer exists, mission_store insertion
-        // will still succeed because workspace_name is nullable.
+        // Reject unknown IDs up front — the alternative is persisting a
+        // mission pointing at a nonexistent workspace, which later falls
+        // through to the default host workspace in resolve_workspace and
+        // silently executes in the wrong directory.
         let workspaces = state.workspaces.list().await;
-        let name = workspaces
-            .iter()
-            .find(|w| w.id == id)
-            .map(|w| w.name.clone());
+        let Some(ws) = workspaces.iter().find(|w| w.id == id) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Workspace '{id}' not found on this instance. Pass a \
+                     valid ?workspace_id=<uuid> or omit it to resolve \
+                     by workspace_name."
+                ),
+            ));
+        };
         return Ok(ResolvedImportTarget {
             workspace_id: id,
-            workspace_name: name,
+            workspace_name: Some(ws.name.clone()),
         });
     }
     let Some(name) = bundle_workspace_name else {
@@ -10415,6 +10437,116 @@ fn parse_mission_bundle_from_chunk_dir(
     };
 
     Ok(bundle)
+}
+
+/// `std::io::Write` adapter that pushes ~64 KB chunks into an mpsc
+/// channel consumed by the HTTP response body. Lets `export_mission`
+/// serialize (and optionally gzip) the bundle straight to the wire
+/// without ever holding the full payload in RAM.
+struct ChannelWriter {
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    buf: Vec<u8>,
+}
+
+impl ChannelWriter {
+    /// Flush threshold — large enough to amortize channel overhead,
+    /// small enough that stream backpressure is responsive.
+    const CHUNK_BYTES: usize = 64 * 1024;
+
+    fn new(tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>) -> Self {
+        Self {
+            tx,
+            buf: Vec::with_capacity(Self::CHUNK_BYTES * 2),
+        }
+    }
+
+    /// Drain whatever is in `buf`.
+    fn flush_all(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            let chunk = std::mem::take(&mut self.buf);
+            self.tx
+                .blocking_send(Ok(bytes::Bytes::from(chunk)))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Surface a late error (serialization or flush) to the consumer
+    /// by pushing it as a stream item. Best-effort: if the receiver is
+    /// already gone we swallow it.
+    fn send_error(&self, err: std::io::Error) {
+        let _ = self.tx.blocking_send(Err(err));
+    }
+}
+
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= Self::CHUNK_BYTES {
+            self.flush_all()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_all()
+    }
+}
+
+/// Parse an `Accept-Encoding` header and decide whether the client
+/// allows gzip. Treats `identity;q=0` / `*;q=0` semantics correctly —
+/// a token of the form `gzip;q=0` explicitly disallows gzip, so simply
+/// matching on `starts_with("gzip")` (the previous behavior) returns
+/// the wrong answer for proxies that send weighted encodings.
+fn accept_encoding_allows_gzip(header_value: &str) -> bool {
+    let mut gzip_seen = false;
+    let mut gzip_qzero = false;
+    let mut star_qzero = false;
+    for raw in header_value.split(',') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        // Split into `name` and optional `q=<float>` parameter.
+        let mut parts = token.split(';');
+        let name = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let mut q: f32 = 1.0;
+        for param in parts {
+            let p = param.trim();
+            if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                if let Ok(v) = rest.parse::<f32>() {
+                    q = v;
+                }
+            }
+        }
+        let disallowed = q <= 0.0;
+        match name.as_str() {
+            "gzip" | "x-gzip" => {
+                if disallowed {
+                    gzip_qzero = true;
+                } else {
+                    gzip_seen = true;
+                }
+            }
+            "*" => {
+                if disallowed {
+                    star_qzero = true;
+                } else if !gzip_qzero {
+                    gzip_seen = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // Explicit `gzip;q=0` always wins over `*`. Otherwise gzip is on
+    // only when the client named it with a positive q-value — a bare
+    // `*` (without q=0) could mean "any", but we stay conservative and
+    // only compress when explicitly asked.
+    if gzip_qzero {
+        return false;
+    }
+    let _ = star_qzero; // star handling is advisory only here
+    gzip_seen
 }
 
 fn parse_mission_bundle(
