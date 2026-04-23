@@ -25,6 +25,9 @@ export interface EnhancedInputHandle {
   submit: () => void;
   canSubmit: () => boolean;
   clear: () => void;
+  /** Restore a previously-submitted draft with its locked-agent badge
+   *  intact (used when the parent's send path fails after clear()). */
+  restoreDraft: (content: string, agent?: string | null) => void;
 }
 
 export interface FilePasteContext {
@@ -571,6 +574,10 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
     clear: () => {
       setLockedAgent(null);
       onChange('');
+    },
+    restoreDraft: (content: string, agent?: string | null) => {
+      setLockedAgent(agent ?? null);
+      onChange(content);
     },
   }), [handleSubmit, canSubmit, onChange]);
 

@@ -6964,9 +6964,11 @@ export default function ControlClient() {
     } catch (err) {
       console.error(err);
       setItems((prev) => prev.filter((item) => item.id !== tempId));
-      const restoredDraft = agent ? `@${agent} ${content}` : content;
-      setInput(restoredDraft);
-      setDraftInput(restoredDraft);
+      // Restore via the imperative handle so a locked-agent badge is
+      // reinstated instead of surfacing as a raw "@agent " prefix.
+      enhancedInputRef.current?.restoreDraft(content, agent ?? null);
+      setInput(content);
+      setDraftInput(content);
       toast.error("Failed to send message");
     } finally {
       submittingRef.current = false;

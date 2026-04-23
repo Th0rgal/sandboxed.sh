@@ -489,8 +489,17 @@ async fn chat_completions(
         // `/v1/responses` endpoint. The local CLI proxy knows how to translate
         // between the two, so when we have OAuth but no `sk-...` key we route
         // through it instead of burning through 401s upstream.
-        let use_openai_oauth_cli_proxy_adapter =
-            provider_type == ProviderType::OpenAI && entry.has_oauth && entry.api_key.is_none();
+        //
+        // The CLI-proxy adapter does NOT forward the selected entry's OAuth
+        // token — it relies on the global Codex credential on disk. If no
+        // such credential is available, routing here would just produce
+        // repeated 401/connection failures and cooldown churn, so also
+        // require a usable Codex CLI-proxy account before picking this
+        // adapter.
+        let use_openai_oauth_cli_proxy_adapter = provider_type == ProviderType::OpenAI
+            && entry.has_oauth
+            && entry.api_key.is_none()
+            && crate::api::ai_providers::openai_cli_proxy_account_available();
         let use_google_oauth_adapter = provider_type == ProviderType::Google && entry.has_oauth;
         let (url, upstream_body, extra_headers) = if use_anthropic_oauth_cli_proxy_adapter {
             let upstream_body = match rewrite_model_for_anthropic_cli_proxy(&body, &entry.model_id)
@@ -2963,12 +2972,10 @@ fn transform_anthropic_sse_to_openai(
                             });
                             chunks.push(format!("data: {}\n\n", chunk));
                         }
-                        "message_stop" => {
-                            if !done_emitted {
-                                chunks.push("data: [DONE]\n\n".to_string());
-                                done_emitted = true;
-                                stream_ended = true;
-                            }
+                        "message_stop" if !done_emitted => {
+                            chunks.push("data: [DONE]\n\n".to_string());
+                            done_emitted = true;
+                            stream_ended = true;
                         }
                         "error" => {
                             // Anthropic stream-time error. Surface as an OpenAI
