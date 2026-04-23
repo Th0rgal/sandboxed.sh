@@ -10400,7 +10400,13 @@ fn parse_mission_bundle_from_chunk_dir(
             )
         })?
     } else {
-        serde_json::from_reader(reader).map_err(|e| {
+        // Cap the plain-JSON path at the same ceiling as the gzip
+        // branch. `/import-chunks` accepts many 128 MB chunks, so
+        // without a cap an attacker could chain them into an
+        // arbitrarily large payload and drive unbounded allocation
+        // inside serde_json::from_reader.
+        let bounded = reader.take(MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES);
+        serde_json::from_reader(BufReader::new(bounded)).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid mission bundle: {e}"),

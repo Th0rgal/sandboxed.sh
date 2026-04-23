@@ -12813,7 +12813,12 @@ fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str
     // contain verbs like "run" or "test" but don't ask us to execute them.
     // If we classified those as tool-required, a perfectly good text-only
     // answer from Codex would get converted into a `Stalled` failure.
-    if user_looks_advisory(&user) {
+    //
+    // Mixed prompts like "How do I run these tests? Please run them and
+    // fix failures." still request execution; the advisory heuristic
+    // must not bypass the imperative half. Only short-circuit when no
+    // explicit imperative follow-up is present.
+    if user_looks_advisory(&user) && !user_has_imperative_execution_request(&user) {
         return false;
     }
 
@@ -12941,6 +12946,50 @@ fn user_looks_advisory(user_lower: &str) -> bool {
     ADVISORY_PREFIXES
         .iter()
         .any(|prefix| trimmed.starts_with(prefix))
+}
+
+/// Detects explicit imperative execution requests that override the
+/// advisory heuristic. Matches phrases that can only be read as
+/// "actually do it" — not the ambiguous verbs that live inside advisory
+/// questions themselves. Input is expected to be ASCII-lowercased.
+fn user_has_imperative_execution_request(user_lower: &str) -> bool {
+    const IMPERATIVE_PHRASES: &[&str] = &[
+        "please run",
+        "please execute",
+        "please apply",
+        "please fix",
+        "please implement",
+        "please do ",
+        "go ahead and ",
+        "actually run",
+        "actually execute",
+        "run them",
+        "run it",
+        "run the tests",
+        "run these",
+        "run this",
+        "execute them",
+        "execute it",
+        "execute this",
+        "apply them",
+        "apply the fix",
+        "fix them",
+        "fix failures",
+        "fix the failures",
+        "fix it",
+        "implement them",
+        "implement it",
+        "then run",
+        "then execute",
+        "now run",
+        "now execute",
+        "and run them",
+        "and execute them",
+        "and fix",
+    ];
+    IMPERATIVE_PHRASES
+        .iter()
+        .any(|phrase| user_lower.contains(phrase))
 }
 
 fn codex_final_message_looks_like_progress_update(assistant_message: &str) -> bool {
@@ -14180,6 +14229,26 @@ mod tests {
         assert!(!codex_turn_requires_tool_activity(
             "What happens when you run npm install in a monorepo?",
             "It walks the package.json and installs the dependency graph."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_detects_imperative_follow_up_in_advisory_prompt() {
+        // Advisory question followed by an explicit imperative request.
+        // The short-circuit must NOT fire — the user is asking us to
+        // execute after explaining.
+        assert!(codex_turn_requires_tool_activity(
+            "How do I run these tests? Please run them and fix failures.",
+            "Here's how you would run them."
+        ));
+        assert!(codex_turn_requires_tool_activity(
+            "What is cargo test? Now run it and fix any failures.",
+            "cargo test runs the harness."
+        ));
+        // But a pure advisory prompt without imperative still short-circuits.
+        assert!(!codex_turn_requires_tool_activity(
+            "How do I run the test suite in this repo?",
+            "You would run cargo test from the crate root."
         ));
     }
 
