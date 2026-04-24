@@ -6053,12 +6053,18 @@ pub(crate) async fn refresh_claude_credentials_after_auth_error(
 }
 
 fn is_capacity_limited_error(message: &str) -> bool {
-    const CAPACITY_LIMIT_MARKERS: [&str; 5] = [
+    const CAPACITY_LIMIT_MARKERS: [&str; 8] = [
         "already have five missions running",
         "already have 5 missions running",
         "too many concurrent missions",
         "concurrent mission limit",
         "maximum concurrent missions",
+        // OpenAI's model-level capacity rejection, emitted by Codex CLI
+        // as a TurnFailed error when the selected model (e.g. GPT-5.5
+        // during its rollout window) is saturated.
+        "selected model is at capacity",
+        "model is at capacity",
+        "please try a different model",
     ];
 
     if CAPACITY_LIMIT_MARKERS
@@ -14558,6 +14564,23 @@ mod tests {
         ));
         assert!(!is_capacity_limited_error("Error: 429 Too Many Requests"));
         assert!(!is_capacity_limited_error("Model finished successfully"));
+    }
+
+    #[test]
+    fn is_capacity_limited_error_detects_openai_model_capacity_rejection() {
+        // Codex CLI surfaces this as a TurnFailed error when the
+        // selected OpenAI model (e.g. gpt-5.5 during its rollout
+        // window) is saturated. Previously misclassified as LlmError.
+        assert!(is_capacity_limited_error(
+            "Selected model is at capacity. Please try a different model."
+        ));
+        assert!(is_capacity_limited_error(
+            "Model is at capacity, please try a different model."
+        ));
+        // Case-insensitive and substring-safe.
+        assert!(is_capacity_limited_error(
+            "SOMETHING upstream: SELECTED MODEL IS AT CAPACITY. retry later."
+        ));
     }
 
     #[test]
