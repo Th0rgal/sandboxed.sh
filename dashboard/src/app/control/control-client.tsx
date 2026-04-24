@@ -6342,15 +6342,34 @@ export default function ControlClient() {
           }
         }
 
-        // When mission is no longer active, mark all pending tool calls as cancelled
+        // When the mission leaves the running state, finalize any
+        // in-flight side-panel items so they don't stay stuck
+        // "thinking". For tool calls we only cancel when the turn
+        // ended unexpectedly (interrupted / failed / blocked /
+        // not_feasible) — a normal `completed` means an
+        // assistant_message was produced, so any truly-pending
+        // tool_result will arrive over SSE shortly and the
+        // tool_result handler will fill it in. Pre-cancelling on
+        // `completed` wrongly flips sub-agents (Task / orchestrator
+        // workers) to a cancelled state that then persists across
+        // subsequent user messages.
         if (newStatus !== "active") {
           const now = Date.now();
+          const shouldCancelPendingTools =
+            newStatus === "interrupted" ||
+            newStatus === "failed" ||
+            newStatus === "blocked" ||
+            newStatus === "not_feasible";
           setItems((prev) =>
             prev.map((item) => {
               if ((item.kind === "thinking" || item.kind === "stream") && !item.done) {
                 return { ...item, done: true, endTime: now };
               }
-              if (item.kind === "tool" && item.result === undefined) {
+              if (
+                shouldCancelPendingTools &&
+                item.kind === "tool" &&
+                item.result === undefined
+              ) {
                 return {
                   ...item,
                   result: { status: "cancelled", reason: `Mission ${newStatus}` },
