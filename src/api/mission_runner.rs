@@ -13284,13 +13284,27 @@ pub async fn run_codex_turn(
                         total_output_tokens = total_output_tokens.saturating_add(output_tokens);
                     }
                     ExecutionEvent::Error { message } => {
-                        // Codex CLI sometimes emits non-fatal internal errors (e.g.
-                        // "Failed to shutdown rollout recorder") after the agent has
-                        // already produced a valid response. Ignore these if we
-                        // already have assistant output.
-                        let fatal_process_exit =
-                            message.contains("Codex CLI exited before completing the turn");
-                        if assistant_message.trim().is_empty() || fatal_process_exit {
+                        // Codex CLI emits two kinds of post-response errors we
+                        // want to treat as non-fatal:
+                        //   1. Internal hiccups like "Failed to shutdown rollout
+                        //      recorder" that fire after a clean turn.
+                        //   2. OpenAI backend returning a 500 mid-stream after
+                        //      real content has already been produced; Codex
+                        //      retries 5× and then exits with status 1. Our
+                        //      client wraps that in "Codex CLI exited before
+                        //      completing the turn (exit_status: exit status:
+                        //      1). Stderr: <empty> | Stdout: <empty>". The
+                        //      earlier assistant_message already captured the
+                        //      real response, so the exit error is a downstream
+                        //      consequence of the in-stream disconnect we
+                        //      already decided to swallow.
+                        //
+                        // Rule: if we have assistant output, ignore the error.
+                        // The empty-output branch still surfaces startup /
+                        // auth / config failures (which produce no text at
+                        // all) and mid-turn disconnects that happened before
+                        // any real content streamed.
+                        if assistant_message.trim().is_empty() {
                             error_message = Some(message.clone());
                             tracing::error!("Codex error: {}", message);
                         } else {
