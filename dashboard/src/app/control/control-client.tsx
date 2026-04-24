@@ -6985,9 +6985,13 @@ export default function ControlClient() {
       setItems((prev) => prev.filter((item) => item.id !== tempId));
       // Restore via the imperative handle so a locked-agent badge is
       // reinstated instead of surfacing as a raw "@agent " prefix.
-      enhancedInputRef.current?.restoreDraft(content, agent ?? null);
-      setInput(content);
-      setDraftInput(content);
+      // Use `trimmedContent` — it's what the optimistic item and the
+      // failed API call carried, so the restored draft matches what
+      // the user actually sent. Leading/trailing whitespace in
+      // `content` is intentionally dropped here.
+      enhancedInputRef.current?.restoreDraft(trimmedContent, agent ?? null);
+      setInput(trimmedContent);
+      setDraftInput(trimmedContent);
       toast.error("Failed to send message");
     } finally {
       submittingRef.current = false;

@@ -12949,36 +12949,32 @@ fn user_looks_advisory(user_lower: &str) -> bool {
 }
 
 /// Detects explicit imperative execution requests that override the
-/// advisory heuristic. Matches phrases that can only be read as
-/// "actually do it" — not the ambiguous verbs that live inside advisory
-/// questions themselves. Input is expected to be ASCII-lowercased.
+/// advisory heuristic. Input is expected to be ASCII-lowercased.
+///
+/// Entries must be **unambiguous** — they should never match a purely
+/// explanatory question. Phrases like `run this` / `run it` are not
+/// safe to include (they appear inside questions such as "How do I
+/// run this locally?"); rely on explicit imperative framing
+/// (`please`, `actually`, `go ahead`, `then`, `now`) or on
+/// direct-object coupling with verbs that can't occur mid-question
+/// without being a command (`fix failures`, `apply the fix`).
 fn user_has_imperative_execution_request(user_lower: &str) -> bool {
     const IMPERATIVE_PHRASES: &[&str] = &[
+        // Explicit politeness prefix — only present when the user is
+        // directing us to act.
         "please run",
         "please execute",
         "please apply",
         "please fix",
         "please implement",
         "please do ",
-        "go ahead and ",
+        // "Actually" framing is also unambiguous: "actually run" only
+        // shows up as a follow-up command.
         "actually run",
         "actually execute",
-        "run them",
-        "run it",
-        "run the tests",
-        "run these",
-        "run this",
-        "execute them",
-        "execute it",
-        "execute this",
-        "apply them",
-        "apply the fix",
-        "fix them",
-        "fix failures",
-        "fix the failures",
-        "fix it",
-        "implement them",
-        "implement it",
+        "go ahead and ",
+        // Sequencing markers — if the user says "then run" or "now
+        // run" after a question, they're asking us to do it next.
         "then run",
         "then execute",
         "now run",
@@ -12986,6 +12982,12 @@ fn user_has_imperative_execution_request(user_lower: &str) -> bool {
         "and run them",
         "and execute them",
         "and fix",
+        // Direct-object phrases that don't fit neatly inside an
+        // advisory question.
+        "run the tests",
+        "fix failures",
+        "fix the failures",
+        "apply the fix",
     ];
     IMPERATIVE_PHRASES
         .iter()
@@ -14252,6 +14254,23 @@ mod tests {
         assert!(!codex_turn_requires_tool_activity(
             "How do I run the test suite in this repo?",
             "You would run cargo test from the crate root."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_does_not_fire_on_advisory_run_this_question() {
+        // Regression: `run this` used to be listed as an imperative
+        // override, which flipped plain advisory questions that happen
+        // to contain the substring ("How do I run this locally?") into
+        // tool-required and then Stalled a perfectly valid text-only
+        // answer. The imperative list must stay unambiguous.
+        assert!(!codex_turn_requires_tool_activity(
+            "How do I run this locally?",
+            "You can run it with `cargo run` from the crate root.",
+        ));
+        assert!(!codex_turn_requires_tool_activity(
+            "How can I execute this script on my machine?",
+            "Invoke it with `bash ./script.sh`.",
         ));
     }
 

@@ -183,7 +183,7 @@ fn build_cli_proxy_headers() -> HeaderMap {
     headers
 }
 
-fn has_routable_proxy_credentials(
+pub(crate) fn has_routable_proxy_credentials(
     provider_type: ProviderType,
     has_api_key: bool,
     has_oauth: bool,

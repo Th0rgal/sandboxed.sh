@@ -1166,27 +1166,48 @@ impl ModelChainStore {
                 // x-api-key request. Google still needs `has_oauth=true` to
                 // trigger its adapter regardless of store-token freshness.
                 let credential_is_oauth_token = account.api_key.is_none() && oauth_is_fresh;
+                let entry_has_oauth = credential_is_oauth_token || google_oauth_routable;
+                let entry_has_api_key = routed_api_key.is_some();
                 resolved.push(ResolvedEntry {
                     provider_id: entry.provider_id.clone(),
                     model_id: entry.model_id.clone(),
                     account_id: account.id,
                     api_key: routed_api_key,
-                    has_oauth: credential_is_oauth_token || google_oauth_routable,
+                    has_oauth: entry_has_oauth,
                     base_url: account.base_url.clone(),
                     subscription_key,
                 });
-                store_contributed_entry = true;
+                // Only count this as a routable store contribution if the
+                // proxy layer will actually send a request with these
+                // credentials. An OpenAI OAuth-only store entry, for
+                // example, is filtered in `chat_completions` via
+                // `has_routable_proxy_credentials` when no Codex CLI-proxy
+                // credential is on disk; treating that entry as a
+                // contribution would suppress the standard-account
+                // fallback below and surface a `provider_configuration_
+                // error` even though valid API-key accounts exist.
+                if crate::api::proxy::has_routable_proxy_credentials(
+                    provider_type,
+                    entry_has_api_key,
+                    entry_has_oauth,
+                ) {
+                    store_contributed_entry = true;
+                }
             }
 
             // 2. Fall back to standard accounts from OpenCode config only
-            // when the store *actually contributed* a routable entry. A store
-            // record that exists but was filtered out (stale OAuth, cooldown,
-            // duplicate subscription) shouldn't suppress the opencode
-            // auth.json fallback — without this, a single expired store OAuth
-            // entry silently disables a provider that opencode could still
-            // serve. A standard account that actually duplicates a live store
-            // subscription would have produced the same shared-subscription
-            // cooldown anyway, so no real risk of duplicate attempts.
+            // when the store *actually contributed a routable entry* that
+            // `chat_completions` will accept. A store record that exists
+            // but was filtered out (stale OAuth, cooldown, duplicate
+            // subscription) or was pushed but will be rejected downstream
+            // by `has_routable_proxy_credentials` (e.g. OpenAI OAuth-only
+            // with no Codex CLI-proxy credential) shouldn't suppress the
+            // opencode auth.json fallback — otherwise a single unroutable
+            // store entry silently disables a provider that opencode
+            // could still serve. A standard account that duplicates a
+            // live store subscription would have produced the same
+            // shared-subscription cooldown anyway, so no real risk of
+            // duplicate attempts.
             if store_contributed_entry {
                 continue;
             }
