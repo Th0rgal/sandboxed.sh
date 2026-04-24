@@ -197,6 +197,7 @@ import {
 import { useScrollToBottom } from "@/hooks/use-scroll-to-bottom";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import { useVisibilityPolling } from "@/hooks/use-visibility-polling";
 import { DesktopStream } from "@/components/desktop-stream";
 import { NewMissionDialog } from "@/components/new-mission-dialog";
 import { MissionSwitcher, normalizeMetadataText } from "@/components/mission-switcher";
@@ -4558,34 +4559,7 @@ export default function ControlClient() {
     }
   }, []);
 
-  useEffect(() => {
-    refreshRunningMissions();
-    let intervalId: ReturnType<typeof setInterval> | null = null;
-    const start = () => {
-      if (intervalId !== null) return;
-      intervalId = setInterval(refreshRunningMissions, 15_000);
-    };
-    const stop = () => {
-      if (intervalId !== null) {
-        clearInterval(intervalId);
-        intervalId = null;
-      }
-    };
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        refreshRunningMissions();
-        start();
-      } else {
-        stop();
-      }
-    };
-    if (document.visibilityState === "visible") start();
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-      stop();
-    };
-  }, [refreshRunningMissions]);
+  useVisibilityPolling(refreshRunningMissions, { interval: 15_000 });
 
   const refreshRecentMissions = useCallback(async () => {
     try {
@@ -4687,34 +4661,7 @@ export default function ControlClient() {
   // Paused when the tab is hidden — there's nothing to update on screen
   // and backgrounded tabs don't need to keep the list warm. Event-driven
   // refresh on `mission_status_changed` keeps it live when visible.
-  useEffect(() => {
-    refreshRecentMissions();
-    let intervalId: ReturnType<typeof setInterval> | null = null;
-    const start = () => {
-      if (intervalId !== null) return;
-      intervalId = setInterval(refreshRecentMissions, 30_000);
-    };
-    const stop = () => {
-      if (intervalId !== null) {
-        clearInterval(intervalId);
-        intervalId = null;
-      }
-    };
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        refreshRecentMissions();
-        start();
-      } else {
-        stop();
-      }
-    };
-    if (document.visibilityState === "visible") start();
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-      stop();
-    };
-  }, [refreshRecentMissions]);
+  useVisibilityPolling(refreshRecentMissions, { interval: 30_000 });
 
   // Fetch desktop sessions periodically for the enhanced dropdown
   const refreshDesktopSessions = useCallback(async () => {
@@ -4771,39 +4718,18 @@ export default function ControlClient() {
     }
   }, [hasDesktopSession, desktopDisplayId]);
 
+  useVisibilityPolling(refreshDesktopSessions, { interval: 30_000 });
+  // Tear down the rapid-poll interval (used while waiting for an
+  // expected desktop session to attach) on unmount, separate from the
+  // main visibility-gated poller above.
   useEffect(() => {
-    refreshDesktopSessions();
-    let intervalId: ReturnType<typeof setInterval> | null = null;
-    const start = () => {
-      if (intervalId !== null) return;
-      intervalId = setInterval(refreshDesktopSessions, 30_000);
-    };
-    const stop = () => {
-      if (intervalId !== null) {
-        clearInterval(intervalId);
-        intervalId = null;
-      }
-    };
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        refreshDesktopSessions();
-        start();
-      } else {
-        stop();
-      }
-    };
-    if (document.visibilityState === "visible") start();
-    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-      stop();
-      // Also clean up rapid polling interval
       if (desktopRapidPollRef.current) {
         clearInterval(desktopRapidPollRef.current);
         desktopRapidPollRef.current = null;
       }
     };
-  }, [refreshDesktopSessions]);
+  }, []);
 
   // Handle closing a desktop session
   const handleCloseDesktopSession = useCallback(async (display: string) => {
@@ -7061,15 +6987,32 @@ export default function ControlClient() {
           ]);
           if (viewingMissionIdRef.current !== missionId) return;
 
-          // eventsToItems is not context-free: `tool_result` events are
-          // only matched against `tool_call` rows seen in the same pass
-          // (it rebuilds `toolCallMap` per call). When a tool_call has
-          // already been rendered into `items` from a prior tick and
-          // only the result arrives in the delta, the merge path cannot
-          // update the existing tool row and would leave it stuck as
-          // "running" until a later full reload. Force a full reload
-          // whenever a delta `tool_result` has no matching `tool_call`
-          // in the same delta, regardless of prev-items state.
+          // The delta merge path is intentionally simple: it appends
+          // only items whose `id` is not already present. That's safe
+          // for purely additive event types (user_message,
+          // assistant_message of a finished turn, tool_call), but is
+          // wrong whenever the historical-derived item would need to
+          // *update* an existing live row instead of be appended:
+          //
+          //   1. `tool_result` whose matching `tool_call` arrived in a
+          //      prior tick — `eventsToItems` rebuilds `toolCallMap`
+          //      per pass, so the result has nothing to attach to and
+          //      a naive merge leaves the tool row stuck "running".
+          //   2. `thinking` / `text_delta` whose live counterpart in
+          //      `items` is the in-flight SSE row keyed off synthetic
+          //      ids (`text_delta_latest`, `thinking-…`). The
+          //      historical event materializes as `event-<id>` instead,
+          //      so the append path silently duplicates the row,
+          //      stale "active" thoughts pile up in the side panel,
+          //      and the live row's `done` flag never flips.
+          //   3. `assistant_message` whose live counterpart is the
+          //      same — the SSE-injected row gets shadowed by a
+          //      duplicate from history without its updated metadata.
+          //
+          // For (1) we have a structured signal (orphan tool_result).
+          // For (2)/(3) the cheapest correct thing is to fall through
+          // to the full reload whenever the delta touches an event
+          // type that we know lives in items under a synthetic id.
           let needsFullReload = false;
           if (deltaEvents && deltaEvents.length > 0) {
             const deltaToolCallIds = new Set<string>();
@@ -7078,12 +7021,30 @@ export default function ControlClient() {
                 deltaToolCallIds.add(ev.tool_call_id);
               }
             }
-            needsFullReload = deltaEvents.some(
+            const hasOrphanToolResult = deltaEvents.some(
               (ev) =>
                 ev.event_type === "tool_result" &&
                 !!ev.tool_call_id &&
                 !deltaToolCallIds.has(ev.tool_call_id)
             );
+            // Detect overlap with a live SSE row (case 2/3). We only
+            // care when an in-flight stream/thinking row is currently
+            // mounted; otherwise eventsToItems' `event-<id>` items can
+            // safely append.
+            const hasLiveStreamingRow = itemsRef.current.some(
+              (it) =>
+                (it.kind === "stream" && it.id === "text_delta_latest") ||
+                (it.kind === "thinking" && !it.done)
+            );
+            const deltaTouchesStreamingTypes = deltaEvents.some(
+              (ev) =>
+                ev.event_type === "thinking" ||
+                ev.event_type === "text_delta" ||
+                ev.event_type === "assistant_message"
+            );
+            needsFullReload =
+              hasOrphanToolResult ||
+              (hasLiveStreamingRow && deltaTouchesStreamingTypes);
           }
 
           if (!needsFullReload && deltaEvents && deltaEvents.length > 0) {
