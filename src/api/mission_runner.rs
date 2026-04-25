@@ -5836,7 +5836,7 @@ fn is_auth_error(message: &str) -> bool {
 }
 
 fn is_rate_limited_error(message: &str) -> bool {
-    const RATE_LIMIT_MARKERS: [&str; 12] = [
+    const RATE_LIMIT_MARKERS: [&str; 15] = [
         "overloaded_error",
         "rate limit",
         "rate_limit",
@@ -5852,6 +5852,18 @@ fn is_rate_limited_error(message: &str) -> bool {
         // phrasing (e.g. "You've hit your limit · resets 9pm"). Treat it
         // as a rate-limit signal so account rotation kicks in.
         "hit your limit",
+        // Codex CLI / ChatGPT account quota exhaustion. Codex emits
+        // TurnFailed with messages like:
+        //   "You've hit your usage limit. Visit
+        //    https://chatgpt.com/codex/settings/usage to purchase more
+        //    credits or try again at Apr 28th, 2026 10:03 PM."
+        // The reset window is days, not minutes — match it as a
+        // rate-limit so the harness classifies the turn correctly and
+        // surfaces the actionable message instead of the generic
+        // "Codex CLI exited before completing the turn" wrapper.
+        "hit your usage limit",
+        "purchase more credits",
+        "settings/usage",
     ];
 
     RATE_LIMIT_MARKERS
@@ -13310,9 +13322,40 @@ pub async fn run_codex_turn(
                         // auth / config failures (which produce no text at
                         // all) and mid-turn disconnects that happened before
                         // any real content streamed.
+                        //
+                        // When we do surface an error, prefer the *first*
+                        // meaningful message we saw — Codex CLI usually emits
+                        // a specific TurnFailed (e.g. "You've hit your usage
+                        // limit. ... try again at Apr 28th, 2026 10:03 PM")
+                        // before its outer wrapper "Codex CLI exited before
+                        // completing the turn (exit_status: exit status: 1).
+                        // Stderr: <empty> | Stdout: <empty>". The wrapper is
+                        // a generic post-mortem that hides the real cause;
+                        // overwriting the specific message with the wrapper
+                        // forces the user (and our `is_*_error` classifiers)
+                        // to debug from log lines instead of the surfaced
+                        // assistant_message.
                         if assistant_message.trim().is_empty() {
-                            error_message = Some(message.clone());
-                            tracing::error!("Codex error: {}", message);
+                            let new_is_generic_exit_wrapper = message.contains(
+                                "Codex CLI exited before completing the turn",
+                            );
+                            let already_have_specific = error_message
+                                .as_deref()
+                                .is_some_and(|existing| {
+                                    !existing.contains(
+                                        "Codex CLI exited before completing the turn",
+                                    )
+                                });
+                            if new_is_generic_exit_wrapper && already_have_specific {
+                                tracing::warn!(
+                                    "Keeping prior specific Codex error over generic exit wrapper: existing={}, ignored={}",
+                                    error_message.as_deref().unwrap_or(""),
+                                    message
+                                );
+                            } else {
+                                error_message = Some(message.clone());
+                                tracing::error!("Codex error: {}", message);
+                            }
                         } else {
                             tracing::warn!(
                                 "Ignoring post-response Codex error (have {}B assistant output): {}",
@@ -14490,6 +14533,22 @@ mod tests {
         assert!(!is_rate_limited_error("error: 123"));
         assert!(!is_rate_limited_error(
             "You've hit your target for this sprint."
+        ));
+    }
+
+    #[test]
+    fn is_rate_limited_error_detects_codex_quota_exhausted() {
+        // Codex CLI's TurnFailed message when the ChatGPT account is
+        // out of credits — reset window is days, not minutes.
+        assert!(is_rate_limited_error(
+            "You've hit your usage limit. Visit \
+             https://chatgpt.com/codex/settings/usage to purchase more \
+             credits or try again at Apr 28th, 2026 10:03 PM."
+        ));
+        // Variant phrasing.
+        assert!(is_rate_limited_error("Please purchase more credits"));
+        assert!(is_rate_limited_error(
+            "see chatgpt.com/codex/settings/usage for details"
         ));
     }
 
