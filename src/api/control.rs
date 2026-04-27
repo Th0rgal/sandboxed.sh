@@ -6443,6 +6443,16 @@ async fn control_actor_loop(
     let mut main_runner_activity: Option<String> = None;
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
+    // Deadline for force-reaping a runner whose cancel token was fired
+    // but whose JoinHandle never resolved. This handles the "zombie
+    // runner" case: the underlying CLI subprocess died (or never reacts
+    // to the cancel because it's blocked on a closed pipe / dead
+    // child), so the spawned task never returns, `running` stays
+    // `Some`, the in-memory running list keeps reporting the mission,
+    // and `Stop` becomes a no-op. After this deadline we force-abort
+    // the JoinHandle and clean up the in-memory state.
+    let mut runner_force_clear_deadline: Option<tokio::time::Instant> = None;
+    const RUNNER_FORCE_CLEAR_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
     // Parallel mission runners - each runs independently
     let mut parallel_runners: std::collections::HashMap<
@@ -7651,6 +7661,17 @@ async fn control_actor_loop(
                                 // Cancel the current execution
                                 if let Some(token) = &running_cancel {
                                     token.cancel();
+                                    // Arm the force-clear deadline. Most cancels
+                                    // wind down within a few seconds via the
+                                    // task's own observation of the cancel
+                                    // token; the deadline catches the zombie
+                                    // case where the underlying CLI subprocess
+                                    // is dead/blocked and the JoinHandle never
+                                    // resolves on its own.
+                                    runner_force_clear_deadline = Some(
+                                        tokio::time::Instant::now()
+                                            + RUNNER_FORCE_CLEAR_GRACE,
+                                    );
                                     close_mission_desktop_sessions(
                                         &mission_store,
                                         mission_id,
@@ -8123,6 +8144,8 @@ async fn control_actor_loop(
                     running_cancel = None;
                     running_mission_id = None;
                     main_runner_activity = None;
+                    // Runner cleared itself; cancel the force-clear watchdog.
+                    runner_force_clear_deadline = None;
                     let mut completed_terminal_reason = None;
                     match res {
                         Ok((_mid, _user_msg, mut agent_result)) => {
@@ -8701,6 +8724,76 @@ async fn control_actor_loop(
                     )
                     .await;
                     tracing::info!("Parallel mission {} removed from runners", mid);
+                }
+            }
+            // Force-reap a runner whose cancel was fired but whose
+            // JoinHandle never resolved within the grace window. See
+            // `runner_force_clear_deadline` for context.
+            _ = async {
+                match runner_force_clear_deadline {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if runner_force_clear_deadline.is_some() && running.is_some() => {
+                let stuck_mid = running_mission_id;
+                tracing::warn!(
+                    mission_id = ?stuck_mid,
+                    "Force-aborting stuck runner: cancel fired but JoinHandle never resolved within {}s",
+                    RUNNER_FORCE_CLEAR_GRACE.as_secs()
+                );
+                if let Some(handle) = running.take() {
+                    handle.abort();
+                }
+                running_cancel = None;
+                running_mission_id = None;
+                main_runner_activity = None;
+                runner_force_clear_deadline = None;
+                if let Some(mid) = stuck_mid {
+                    // Mark mission as Interrupted so it stays resumable.
+                    if let Err(e) = mission_store
+                        .update_mission_status(mid, MissionStatus::Interrupted)
+                        .await
+                    {
+                        tracing::warn!(
+                            mission_id = %mid,
+                            "Failed to mark force-cleared mission as Interrupted: {}",
+                            e
+                        );
+                    } else {
+                        maybe_schedule_mission_metadata_refresh_for_status(
+                            &mission_store,
+                            &events_tx,
+                            mid,
+                            MissionStatus::Interrupted,
+                        );
+                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                            mission_id: mid,
+                            status: MissionStatus::Interrupted,
+                            summary: Some(
+                                "Cancel timed out; force-aborted stuck runner.".to_string(),
+                            ),
+                        });
+                    }
+                    if let Err(e) = mission_store
+                        .complete_running_executions_for_mission(
+                            mid,
+                            false,
+                            Some("Force-aborted stuck runner after cancel timed out".to_string()),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            mission_id = %mid,
+                            "Failed to complete running executions on force-clear: {}",
+                            e
+                        );
+                    }
+                    close_mission_desktop_sessions(
+                        &mission_store,
+                        mid,
+                        &config.working_dir,
+                    )
+                    .await;
                 }
             }
             // Update last_activity for runners when we receive events for them
