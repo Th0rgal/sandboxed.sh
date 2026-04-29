@@ -23,7 +23,14 @@ struct ControlView: View {
     @State private var isLoading = true
     @State private var streamTask: Task<Void, Never>?
     @State private var showMissionMenu = false
-    @State private var shouldScrollToBottom = false
+    /// Monotonic counter — each increment is a request to scroll to the bottom.
+    /// Counter rather than a Bool because the conversation `ScrollView` is
+    /// conditionally mounted (only when `messages` is non-empty). A Bool flag
+    /// can get stuck `true` if it's set while the ScrollView is unmounted —
+    /// the resetter inside `.onChange` never runs, and subsequent re-arms to
+    /// `true` are no-ops because the value didn't change. A counter always
+    /// advances, so `.onChange` fires reliably on every request.
+    @State private var scrollToBottomTick = 0
     @State private var progress: ExecutionProgress?
     @State private var isAtBottom = true
     @State private var copiedMessageId: String?
@@ -686,10 +693,8 @@ struct ControlView: View {
                     scrollToBottom(proxy: proxy)
                 }
             }
-            .onChange(of: shouldScrollToBottom) { _, shouldScroll in
-                guard shouldScroll else { return }
+            .onChange(of: scrollToBottomTick) { _, _ in
                 let immediate = shouldScrollImmediately
-                shouldScrollToBottom = false
                 shouldScrollImmediately = false
                 // Used when the ScrollView is already mounted and the
                 // mission's content has been swapped wholesale (mission
@@ -1103,7 +1108,7 @@ struct ControlView: View {
 
         if scrollToBottom {
             shouldScrollImmediately = true
-            shouldScrollToBottom = true
+            scrollToBottomTick += 1
         }
         clearLoadingHistoryAfterRender()
     }
@@ -1163,7 +1168,7 @@ struct ControlView: View {
 
         if scrollToBottom {
             shouldScrollImmediately = true
-            shouldScrollToBottom = true
+            scrollToBottomTick += 1
         }
         clearLoadingHistoryAfterRender()
     }
@@ -1446,11 +1451,13 @@ struct ControlView: View {
             }
             applyDeltaEvents(result.events)
             // If the page was capped by the limit, advance the cursor to the
-            // last returned event's sequence so the next call resumes from
-            // that point — otherwise we'd skip rows between this page's tail
-            // and the true max.
-            let lastSeq = result.events.last?.sequence ?? knownSeq
-            let cursor = (result.events.count >= Self.deltaResumePageLimit && lastSeq < maxSeq) ? lastSeq : maxSeq
+            // largest sequence we actually saw so the next call resumes from
+            // there — otherwise we'd skip rows between this page and the
+            // true max. Use `max()` rather than `last`: the API contract is
+            // ASC-by-sequence but defensive callers shouldn't trust input
+            // ordering.
+            let pageMax = result.events.map { $0.sequence }.max() ?? knownSeq
+            let cursor = (result.events.count >= Self.deltaResumePageLimit && pageMax < maxSeq) ? pageMax : maxSeq
             missionMaxSeq[id] = cursor
             return .applied
         } catch {
@@ -1486,20 +1493,34 @@ struct ControlView: View {
                 }
             }
 
-            // Fallback / first-time path: fetch the recent tail.
+            // Fallback / first-time path: fetch the recent tail. Distinguish
+            // a *failed* fetch (network/server error) from a *successful but
+            // empty* response. On failure we keep the currently rendered
+            // conversation — silently downgrading to `applyViewingMission`
+            // (which uses the basic `mission.history` payload) would erase
+            // the event-rendered chat under flaky networks. On empty we
+            // clear the cache and fall back, since the mission really does
+            // have no events.
             let limit = hasMoreHistory ? Self.initialEventLimit : nil
             let latest = hasMoreHistory
-            if let result = try? await api.getMissionEventsWithMeta(id: id, types: historyEventTypes, limit: limit, latest: latest), !result.events.isEmpty {
+            do {
+                let result = try await api.getMissionEventsWithMeta(id: id, types: historyEventTypes, limit: limit, latest: latest)
                 guard viewingMissionId == id else { return }
-                applyViewingMissionWithEvents(mission, events: result.events, scrollToBottom: false)
-                if let maxSeq = result.maxSequence, maxSeq > 0 {
-                    missionMaxSeq[id] = maxSeq
+                if result.events.isEmpty {
+                    removeMissionFromCache(mission.id)
+                    applyViewingMission(mission, scrollToBottom: false)
+                } else {
+                    applyViewingMissionWithEvents(mission, events: result.events, scrollToBottom: false)
+                    if let maxSeq = result.maxSequence, maxSeq > 0 {
+                        missionMaxSeq[id] = maxSeq
+                    }
+                    cacheMissionWithEvents(mission, events: result.events)
                 }
-                cacheMissionWithEvents(mission, events: result.events)
-            } else {
-                guard viewingMissionId == id else { return }
-                removeMissionFromCache(mission.id)
-                applyViewingMission(mission, scrollToBottom: false)
+            } catch {
+                // Tail fetch failed — keep the existing rendered conversation.
+                // SSE will deliver any new events; next active/visible cycle
+                // will retry the fetch.
+                print("Tail reload fetch failed, keeping current view: \(error)")
             }
         } catch {
             print("Failed to reload mission from server: \(error)")
@@ -1885,7 +1906,7 @@ struct ControlView: View {
         let tempMessage = ChatMessage(id: tempId, type: .user, content: content)
         messages.append(tempMessage)
         recomputeGroupedItems()
-        shouldScrollToBottom = true
+        scrollToBottomTick += 1
 
         Task { @MainActor in
             do {
