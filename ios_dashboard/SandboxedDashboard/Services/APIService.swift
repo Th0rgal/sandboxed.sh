@@ -167,6 +167,31 @@ final class APIService {
     }
 
     func getMissionEvents(id: String, types: [String]? = nil, limit: Int? = nil, offset: Int? = nil, latest: Bool = false) async throws -> [StoredEvent] {
+        try await getMissionEventsWithMeta(
+            id: id,
+            types: types,
+            limit: limit,
+            offset: offset,
+            latest: latest
+        ).events
+    }
+
+    /// Fetch mission events along with the response metadata.
+    ///
+    /// `maxSequence` is parsed from the `X-Max-Sequence` response header. Backends
+    /// that do not advertise this header return `nil` — callers should treat that
+    /// as "delta resume not supported" and not seed any high-water mark.
+    ///
+    /// `sinceSeq` requests only events with `sequence > sinceSeq` (delta path used
+    /// on SSE reconnect / scene-phase active). `latest` requests the tail page.
+    func getMissionEventsWithMeta(
+        id: String,
+        types: [String]? = nil,
+        limit: Int? = nil,
+        offset: Int? = nil,
+        latest: Bool = false,
+        sinceSeq: Int64? = nil
+    ) async throws -> MissionEventsResult {
         var queryItems: [URLQueryItem] = []
         if let types = types {
             queryItems.append(URLQueryItem(name: "types", value: types.joined(separator: ",")))
@@ -180,6 +205,9 @@ final class APIService {
         if latest {
             queryItems.append(URLQueryItem(name: "latest", value: "true"))
         }
+        if let sinceSeq = sinceSeq {
+            queryItems.append(URLQueryItem(name: "since_seq", value: String(sinceSeq)))
+        }
 
         var urlString = "/api/control/missions/\(id)/events"
         if !queryItems.isEmpty {
@@ -190,7 +218,10 @@ final class APIService {
             }
         }
 
-        return try await get(urlString)
+        let (events, response): ([StoredEvent], HTTPURLResponse) = try await getWithResponse(urlString)
+        let maxSequence = (response.value(forHTTPHeaderField: "X-Max-Sequence") ?? response.value(forHTTPHeaderField: "x-max-sequence"))
+            .flatMap { Int64($0) }
+        return MissionEventsResult(events: events, maxSequence: maxSequence)
     }
 
     /// Get child (worker) missions for a boss mission.
@@ -554,18 +585,27 @@ final class APIService {
     private struct EmptyResponse: Decodable {}
     
     private func get<T: Decodable>(_ path: String, authenticated: Bool = true) async throws -> T {
+        try await getWithResponse(path, authenticated: authenticated).0
+    }
+
+    /// GET that also returns the underlying `HTTPURLResponse` so callers can
+    /// inspect response headers (e.g. `X-Max-Sequence` for delta-event resume).
+    private func getWithResponse<T: Decodable>(
+        _ path: String,
+        authenticated: Bool = true
+    ) async throws -> (T, HTTPURLResponse) {
         guard let url = URL(string: "\(baseURL)\(path)") else {
             throw APIError.invalidURL
         }
-        
+
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        
+
         if authenticated, let token = jwtToken {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
-        
-        return try await execute(request)
+
+        return try await executeWithResponse(request)
     }
     
     private func post<T: Decodable, B: Encodable>(_ path: String, body: B, authenticated: Bool = true) async throws -> T {
@@ -620,31 +660,44 @@ final class APIService {
     }
     
     private func execute<T: Decodable>(_ request: URLRequest) async throws -> T {
+        try await executeWithResponse(request).0
+    }
+
+    private func executeWithResponse<T: Decodable>(_ request: URLRequest) async throws -> (T, HTTPURLResponse) {
         let (data, response) = try await URLSession.shared.data(for: request)
-        
+
         guard let httpResponse = response as? HTTPURLResponse else {
             throw APIError.invalidResponse
         }
-        
+
         if httpResponse.statusCode == 401 {
             logout()
             throw APIError.unauthorized
         }
-        
+
         guard httpResponse.statusCode >= 200 && httpResponse.statusCode < 300 else {
             throw APIError.httpError(httpResponse.statusCode, String(data: data, encoding: .utf8))
         }
-        
+
         // Handle empty responses
         if data.isEmpty || (T.self == EmptyResponse.self) {
             if let empty = EmptyResponse() as? T {
-                return empty
+                return (empty, httpResponse)
             }
         }
-        
+
         let decoder = JSONDecoder()
-        return try decoder.decode(T.self, from: data)
+        let value = try decoder.decode(T.self, from: data)
+        return (value, httpResponse)
     }
+}
+
+/// Result of a `/missions/:id/events` fetch. `maxSequence` is the response's
+/// `X-Max-Sequence` header — `nil` if the backend doesn't advertise it (older
+/// versions). Callers must treat `nil` as "delta resume unsupported".
+struct MissionEventsResult {
+    let events: [StoredEvent]
+    let maxSequence: Int64?
 }
 
 enum APIError: LocalizedError {

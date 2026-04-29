@@ -62,4 +62,7 @@ vllm-gb10-dgx-spark/
 
 # iOS build artifacts
 ios_dashboard/.build/
-ios_dashboard/SandboxedDashboard.xcodeproj/
+ios_dashboard/build/
+ios_dashboard/**/xcuserdata/
+ios_dashboard/SandboxedDashboard.xcodeproj/*
+!ios_dashboard/SandboxedDashboard.xcodeproj/project.pbxproj
