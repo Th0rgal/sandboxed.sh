@@ -1105,10 +1105,7 @@ struct ControlView: View {
             shouldScrollImmediately = true
             shouldScrollToBottom = true
         }
-        // Cleared synchronously at the next runloop tick, alongside the
-        // explicit scroll, so the `messages.count` onChange and the bottom
-        // anchor land in the same render pass instead of racing a sleep.
-        isLoadingHistory = false
+        clearLoadingHistoryAfterRender()
     }
 
     private static let initialEventLimit = 50
@@ -1168,7 +1165,20 @@ struct ControlView: View {
             shouldScrollImmediately = true
             shouldScrollToBottom = true
         }
-        isLoadingHistory = false
+        clearLoadingHistoryAfterRender()
+    }
+
+    /// Clear `isLoadingHistory` on the next runloop tick. Setting it to `false`
+    /// in the same synchronous block where it was set to `true` would coalesce
+    /// into a single observed value, defeating the `messages.count` onChange
+    /// guard that is supposed to suppress an animated auto-scroll during
+    /// content replacement. Deferring lets the count-change handler observe
+    /// `isLoadingHistory == true`, after which the explicit scroll path wins.
+    private func clearLoadingHistoryAfterRender() {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 16_000_000)
+            isLoadingHistory = false
+        }
     }
 
     /// Append delta events to the existing conversation without clearing.
@@ -1176,9 +1186,12 @@ struct ControlView: View {
     /// Used by the SSE-reconnect / scene-phase-active resume path: the server
     /// returns only events with `sequence > knownMaxSeq`, so they must be
     /// appended (not replayed-from-empty). Each event is fed through
-    /// `handleStreamEvent` with `isHistoricalReplay: false` so the existing
-    /// upsert-by-id logic naturally dedupes anything that overlapped a live
-    /// SSE event we already saw.
+    /// `handleStreamEvent` as a historical replay — the request includes
+    /// `text_delta` events, so without the historical flag the live-only
+    /// `upsertStreamingFallbackThought` path would synthesize duplicate
+    /// thinking content from already-finalized text. Per-id dedup guards on
+    /// `user_message`, `assistant_message`, and `tool_call` further protect
+    /// against overlap with events we already rendered live.
     private func applyDeltaEvents(_ events: [StoredEvent]) {
         guard !events.isEmpty else { return }
 
@@ -1199,7 +1212,7 @@ struct ControlView: View {
             if let toolCallId = event.toolCallId { data["tool_call_id"] = toolCallId }
             if let toolName = event.toolName { data["name"] = toolName }
 
-            handleStreamEvent(type: event.eventType, data: data)
+            handleStreamEvent(type: event.eventType, data: data, isHistoricalReplay: true)
         }
 
         loadedEventCount += orderedEvents.count
@@ -1397,6 +1410,53 @@ struct ControlView: View {
         }
     }
 
+    /// Hard cap on the number of events per delta page. Mirrors the web client.
+    private static let deltaResumePageLimit = 5000
+
+    /// Outcome of a `tryDeltaResume` attempt.
+    private enum DeltaResumeOutcome {
+        case applied      // backend supports resume, events applied, cursor advanced
+        case unsupported  // backend stripped `X-Max-Sequence` — cursor dropped
+        case noCursor     // no high-water mark recorded; nothing attempted
+        case failed       // network/server error; cursor untouched
+    }
+
+    /// Try to fetch and apply only the events that arrived after our recorded
+    /// high-water mark for this mission. Shared between `resumeMissionAfterReconnect`
+    /// (post SSE reconnect) and `reloadMissionFromServer` (post scene-phase active).
+    /// Caller is responsible for the fallback path when this returns anything
+    /// other than `.applied`.
+    private func tryDeltaResume(missionId id: String) async -> DeltaResumeOutcome {
+        guard let knownSeq = missionMaxSeq[id] else { return .noCursor }
+        do {
+            let result = try await api.getMissionEventsWithMeta(
+                id: id,
+                types: historyEventTypes,
+                limit: Self.deltaResumePageLimit,
+                sinceSeq: knownSeq
+            )
+            guard viewingMissionId == id else { return .applied }
+            guard let maxSeq = result.maxSequence else {
+                // Backend stripped `X-Max-Sequence` — drop the cursor so the
+                // delta path is disabled until the next header-bearing fetch.
+                missionMaxSeq.removeValue(forKey: id)
+                return .unsupported
+            }
+            applyDeltaEvents(result.events)
+            // If the page was capped by the limit, advance the cursor to the
+            // last returned event's sequence so the next call resumes from
+            // that point — otherwise we'd skip rows between this page's tail
+            // and the true max.
+            let lastSeq = result.events.last?.sequence ?? knownSeq
+            let cursor = (result.events.count >= Self.deltaResumePageLimit && lastSeq < maxSeq) ? lastSeq : maxSeq
+            missionMaxSeq[id] = cursor
+            return .applied
+        } catch {
+            print("Delta resume failed: \(error)")
+            return .failed
+        }
+    }
+
     // Reload mission from server without showing loading state or cache.
     // Called when the scene becomes active to catch missed SSE events (mirrors
     // the web's visibility-change handler). Prefers the `since_seq` delta path
@@ -1413,33 +1473,11 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            // Delta path: if we have a high-water mark, ask the backend for
-            // events arriving after it. Avoids re-downloading the entire
-            // history for what is usually a single missed message.
-            if let knownSeq = missionMaxSeq[id] {
-                do {
-                    let result = try await api.getMissionEventsWithMeta(
-                        id: id,
-                        types: historyEventTypes,
-                        limit: 5000,
-                        sinceSeq: knownSeq
-                    )
-                    guard viewingMissionId == id else { return }
-                    if let maxSeq = result.maxSequence {
-                        // Backend supports delta resume — apply and update cursor.
-                        applyDeltaEvents(result.events)
-                        let lastSeq = result.events.last?.sequence ?? knownSeq
-                        let cursor = (result.events.count >= 5000 && lastSeq < maxSeq) ? lastSeq : maxSeq
-                        missionMaxSeq[id] = cursor
-                        return
-                    }
-                    // Backend stripped X-Max-Sequence — drop the cursor and
-                    // fall through to the full-reload path below.
-                    missionMaxSeq.removeValue(forKey: id)
-                } catch {
-                    // Network/server error during delta — fall through to full reload.
-                    print("Delta resume failed, falling back to tail reload: \(error)")
-                }
+            switch await tryDeltaResume(missionId: id) {
+            case .applied:
+                return
+            case .noCursor, .unsupported, .failed:
+                break  // fall through to full tail reload below
             }
 
             // Fallback / first-time path: fetch the recent tail.
@@ -1468,31 +1506,9 @@ struct ControlView: View {
     /// reconnect catch-up fast even on missions with thousands of events.
     private func resumeMissionAfterReconnect(id: String) async {
         guard viewingMissionId == id else { return }
-
-        if let knownSeq = missionMaxSeq[id] {
-            do {
-                let result = try await api.getMissionEventsWithMeta(
-                    id: id,
-                    types: historyEventTypes,
-                    limit: 5000,
-                    sinceSeq: knownSeq
-                )
-                guard viewingMissionId == id else { return }
-                if let maxSeq = result.maxSequence {
-                    applyDeltaEvents(result.events)
-                    let lastSeq = result.events.last?.sequence ?? knownSeq
-                    let cursor = (result.events.count >= 5000 && lastSeq < maxSeq) ? lastSeq : maxSeq
-                    missionMaxSeq[id] = cursor
-                    return
-                }
-                missionMaxSeq.removeValue(forKey: id)
-            } catch {
-                print("Reconnect delta resume failed: \(error)")
-            }
-        }
-
-        // No cursor or backend doesn't advertise resume — fall back to the
-        // full reload, scoped to this mission.
+        if case .applied = await tryDeltaResume(missionId: id) { return }
+        // No cursor, backend doesn't advertise resume, or transient error —
+        // fall back to a scoped tail reload.
         await reloadMissionFromServer(id: id)
     }
 
@@ -2497,6 +2513,13 @@ struct ControlView: View {
             if let toolCallId = data["tool_call_id"] as? String,
                let name = data["name"] as? String,
                let args = data["args"] as? [String: Any] {
+                // Skip if already present — historical replay or delta resume
+                // can re-deliver a tool_call we already saw via SSE. The
+                // per-row id depends on the path (toolUI vs toolCall), so
+                // check both forms.
+                if messages.contains(where: { $0.id == toolCallId || $0.id == "tool-\(toolCallId)" }) {
+                    break
+                }
                 finalizeActiveThinkingMessages()
                 // Parse UI tool calls
                 if let toolUI = ToolUIContent.parse(name: name, args: args) {
