@@ -548,6 +548,7 @@ mod tests {
             library_path: PathBuf::from("/tmp/library"),
             default_backend: None,
             automations_enabled: true,
+            max_concurrent_tasks: 5,
         }
     }
 
