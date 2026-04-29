@@ -395,9 +395,6 @@ struct ControlView: View {
         .onChange(of: viewingMissionId) { _, newId in
             UserDefaults.standard.set(newId, forKey: Self.lastMissionIdKey)
         }
-        .onChange(of: showThoughts) { _, _ in
-            recomputeGroupedItems()
-        }
         .onChange(of: inputText) { _, newText in
             // Debounced save: persist draft after 1 second of inactivity
             draftSaveTask?.cancel()
@@ -739,15 +736,22 @@ struct ControlView: View {
     }
     
     private var hasActiveStreamingItem: Bool {
+        // Thinking messages don't render in the main content pane any more
+        // (they live exclusively in the thoughts sheet), so a live thinking
+        // event isn't a "visible streaming item". Without this exclusion the
+        // "Agent is working…" indicator would be suppressed while the agent
+        // is thinking, leaving the main pane silent.
         messages.contains { msg in
-            (msg.isThinking && !msg.thinkingDone) || msg.isPhase || (msg.isToolCall && msg.isActiveToolCall)
+            msg.isPhase || (msg.isToolCall && msg.isActiveToolCall)
         }
     }
 
     // MARK: - Message Grouping
 
-    /// Groups consecutive tool calls together for collapsed display (like dashboard)
-    private static func buildGroupedItems(from messages: [ChatMessage], showThoughts: Bool) -> [GroupedChatItem] {
+    /// Groups consecutive tool calls together for collapsed display (like dashboard).
+    /// Thinking messages are always elided here — they live in the thoughts sheet
+    /// only. Showing them inline duplicated the same content twice on screen.
+    private static func buildGroupedItems(from messages: [ChatMessage]) -> [GroupedChatItem] {
         var result: [GroupedChatItem] = []
         var currentToolGroup: [ChatMessage] = []
 
@@ -763,8 +767,8 @@ struct ControlView: View {
         }
 
         for message in messages {
-            // Skip thinking messages when thoughts panel is open (they're shown in the panel)
-            if message.isThinking && showThoughts {
+            // Thinking renders only in the thoughts sheet, never in the main pane.
+            if message.isThinking {
                 flushToolGroup()
                 continue
             }
@@ -785,7 +789,7 @@ struct ControlView: View {
     }
 
     private func recomputeGroupedItems() {
-        groupedItems = Self.buildGroupedItems(from: messages, showThoughts: showThoughts)
+        groupedItems = Self.buildGroupedItems(from: messages)
     }
 
     /// Check if the currently viewed mission is running (not just any mission)
