@@ -1463,8 +1463,10 @@ struct ControlView: View {
     // Called when the scene becomes active to catch missed SSE events (mirrors
     // the web's visibility-change handler). Prefers the `since_seq` delta path
     // when supported; falls back to a tail reload only when no high-water mark
-    // is recorded for this mission yet.
-    private func reloadMissionFromServer(id: String) async {
+    // is recorded for this mission yet. `skipDeltaAttempt=true` is used by
+    // callers that just tried delta and got `.failed` — no point hammering
+    // the same flaky network for the same answer twice.
+    private func reloadMissionFromServer(id: String, skipDeltaAttempt: Bool = false) async {
         guard viewingMissionId == id else { return }
 
         do {
@@ -1475,11 +1477,13 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            switch await tryDeltaResume(missionId: id) {
-            case .applied, .viewChanged:
-                return
-            case .noCursor, .unsupported, .failed:
-                break  // fall through to full tail reload below
+            if !skipDeltaAttempt {
+                switch await tryDeltaResume(missionId: id) {
+                case .applied, .viewChanged:
+                    return
+                case .noCursor, .unsupported, .failed:
+                    break  // fall through to full tail reload below
+                }
             }
 
             // Fallback / first-time path: fetch the recent tail.
@@ -1511,10 +1515,15 @@ struct ControlView: View {
         switch await tryDeltaResume(missionId: id) {
         case .applied, .viewChanged:
             return
-        case .noCursor, .unsupported, .failed:
-            // Fall back to a scoped tail reload — covers first-connect (no cursor),
-            // older backends (no `X-Max-Sequence`), and transient errors.
-            await reloadMissionFromServer(id: id)
+        case .noCursor, .unsupported:
+            // Cursor wasn't usable — fall back to a tail reload. Skip its
+            // delta retry since the cursor state is what just told us the
+            // delta path isn't available right now.
+            await reloadMissionFromServer(id: id, skipDeltaAttempt: true)
+        case .failed:
+            // Transient network/server error — same skip rationale, plus
+            // avoid hammering a flaky connection with the identical request.
+            await reloadMissionFromServer(id: id, skipDeltaAttempt: true)
         }
     }
 
@@ -2142,10 +2151,16 @@ struct ControlView: View {
             }
 
             // Fetch full event history to avoid partial history rendering.
-            if let events = try? await api.getMissionEvents(id: id, types: historyEventTypes), !events.isEmpty {
+            // Use the meta variant so the `X-Max-Sequence` header seeds the
+            // delta-resume cursor — otherwise missions loaded via the switcher
+            // would always fall back to a full tail reload on reconnect.
+            if let result = try? await api.getMissionEventsWithMeta(id: id, types: historyEventTypes), !result.events.isEmpty {
                 guard fetchingMissionId == id else { return }
-                applyViewingMissionWithEvents(mission, events: events)
-                cacheMissionWithEvents(mission, events: events)
+                applyViewingMissionWithEvents(mission, events: result.events)
+                if let maxSeq = result.maxSequence, maxSeq > 0 {
+                    missionMaxSeq[id] = maxSeq
+                }
+                cacheMissionWithEvents(mission, events: result.events)
             } else {
                 guard fetchingMissionId == id else { return }
                 removeMissionFromCache(mission.id)
