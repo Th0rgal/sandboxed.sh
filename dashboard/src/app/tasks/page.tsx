@@ -5,6 +5,7 @@ import useSWR from "swr";
 import { cn } from "@/lib/utils";
 import { listTasks, stopTask, type Task, type TaskStep } from "@/lib/api/tasks";
 import { RelativeTime } from "@/components/ui/relative-time";
+import { useDocumentVisible } from "@/hooks/use-visibility-polling";
 import {
   Clock,
   Loader,
@@ -251,10 +252,11 @@ function TaskRow({ task, onStop, stopping }: { task: Task; onStop: (id: string) 
 export default function TasksPage() {
   const [stoppingIds, setStoppingIds] = useState<Set<string>>(new Set());
 
+  const visible = useDocumentVisible();
   const { data: tasks = [], mutate } = useSWR<Task[]>(
     "tasks",
     listTasks,
-    { refreshInterval: 2000 }
+    { refreshInterval: visible ? 2000 : 0 }
   );
 
   const handleStop = async (id: string) => {

@@ -821,10 +821,23 @@ fn normalize_init_script(value: Option<String>) -> Option<String> {
 }
 
 fn sanitize_env_vars(env_vars: HashMap<String, String>) -> HashMap<String, String> {
+    // Drop entries whose key is not a valid POSIX env var name. nspawn passes
+    // `--setenv=KEY=VALUE` as one argv token, so a key containing `=`, whitespace,
+    // a leading `-`, or a control character would either confuse the parser or be
+    // silently mishandled. Values are passed through unchanged.
     env_vars
         .into_iter()
-        .filter(|(key, _)| !key.trim().is_empty())
+        .filter(|(key, value)| is_valid_env_name(key) && !value.contains('\0'))
         .collect()
+}
+
+fn is_valid_env_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Escape a string for safe use in shell commands.
