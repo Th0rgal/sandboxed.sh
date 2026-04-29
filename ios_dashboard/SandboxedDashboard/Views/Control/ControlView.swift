@@ -1416,6 +1416,8 @@ struct ControlView: View {
     /// Outcome of a `tryDeltaResume` attempt.
     private enum DeltaResumeOutcome {
         case applied      // backend supports resume, events applied, cursor advanced
+        case viewChanged  // user navigated away mid-request; nothing applied, no
+                          // fallback should run (the new view will refetch on its own)
         case unsupported  // backend stripped `X-Max-Sequence` — cursor dropped
         case noCursor     // no high-water mark recorded; nothing attempted
         case failed       // network/server error; cursor untouched
@@ -1435,7 +1437,7 @@ struct ControlView: View {
                 limit: Self.deltaResumePageLimit,
                 sinceSeq: knownSeq
             )
-            guard viewingMissionId == id else { return .applied }
+            guard viewingMissionId == id else { return .viewChanged }
             guard let maxSeq = result.maxSequence else {
                 // Backend stripped `X-Max-Sequence` — drop the cursor so the
                 // delta path is disabled until the next header-bearing fetch.
@@ -1474,7 +1476,7 @@ struct ControlView: View {
             }
 
             switch await tryDeltaResume(missionId: id) {
-            case .applied:
+            case .applied, .viewChanged:
                 return
             case .noCursor, .unsupported, .failed:
                 break  // fall through to full tail reload below
@@ -1506,10 +1508,14 @@ struct ControlView: View {
     /// reconnect catch-up fast even on missions with thousands of events.
     private func resumeMissionAfterReconnect(id: String) async {
         guard viewingMissionId == id else { return }
-        if case .applied = await tryDeltaResume(missionId: id) { return }
-        // No cursor, backend doesn't advertise resume, or transient error —
-        // fall back to a scoped tail reload.
-        await reloadMissionFromServer(id: id)
+        switch await tryDeltaResume(missionId: id) {
+        case .applied, .viewChanged:
+            return
+        case .noCursor, .unsupported, .failed:
+            // Fall back to a scoped tail reload — covers first-connect (no cursor),
+            // older backends (no `X-Max-Sequence`), and transient errors.
+            await reloadMissionFromServer(id: id)
+        }
     }
 
     private func createNewMission(options: NewMissionOptions? = nil) async {
