@@ -458,6 +458,10 @@ CREATE INDEX IF NOT EXISTS idx_events_mission ON mission_events(mission_id, sequ
 CREATE INDEX IF NOT EXISTS idx_events_type ON mission_events(mission_id, event_type);
 CREATE INDEX IF NOT EXISTS idx_events_tool_call ON mission_events(tool_call_id) WHERE tool_call_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_event_type ON mission_events(event_type);
+-- Stale-mission detection takes MAX(timestamp) per mission. Sequence ordering
+-- doesn't help here because in-place updates (e.g. text_delta_latest rewriting
+-- an existing event_id row) bump `timestamp` without changing `sequence`.
+CREATE INDEX IF NOT EXISTS idx_events_mission_timestamp ON mission_events(mission_id, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS mission_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1080,7 +1084,8 @@ impl SqliteMissionStore {
         // Add performance indexes if they don't exist (idempotent)
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_missions_status_updated ON missions(status, updated_at);
-             CREATE INDEX IF NOT EXISTS idx_events_event_type ON mission_events(event_type);",
+             CREATE INDEX IF NOT EXISTS idx_events_event_type ON mission_events(event_type);
+             CREATE INDEX IF NOT EXISTS idx_events_mission_timestamp ON mission_events(mission_id, timestamp DESC);",
         )
         .map_err(|e| format!("Failed to create performance indexes: {}", e))?;
 
@@ -2658,9 +2663,17 @@ impl MissionStore for SqliteMissionStore {
         // assistant turns for >2h (e.g. waiting on a CI build via repeated
         // `gh run watch` invocations) would falsely trip this scan. Joining
         // against `mission_events.timestamp` ties the stale signal to real
-        // activity. The `idx_events_mission(mission_id, sequence)` index
-        // makes the per-mission tail lookup an O(log n) seek; missions with
-        // no events fall back to `updated_at` via COALESCE.
+        // activity.
+        //
+        // We compute `MAX(timestamp)` rather than the timestamp of the row
+        // with the highest `sequence`: `log_event` updates an existing row
+        // in-place when it sees a duplicate `event_id` (e.g. the
+        // `text_delta_latest` row gets its `timestamp` rewritten on every
+        // streamed delta), so a higher-sequence row can carry an *older*
+        // timestamp than a refreshed lower-sequence row. The query is backed
+        // by `idx_events_mission_timestamp(mission_id, timestamp DESC)` so
+        // the per-mission MAX is an O(log n) seek; missions with no events
+        // fall back to `updated_at` via COALESCE.
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn
@@ -2673,9 +2686,8 @@ impl MissionStore for SqliteMissionStore {
                        AND max(
                              m.updated_at,
                              COALESCE(
-                               (SELECT timestamp FROM mission_events
-                                WHERE mission_id = m.id
-                                ORDER BY sequence DESC LIMIT 1),
+                               (SELECT MAX(timestamp) FROM mission_events
+                                WHERE mission_id = m.id),
                                m.updated_at
                              )
                            ) < ?1",
@@ -8075,6 +8087,79 @@ mod tests {
         assert!(
             stale.iter().any(|m| m.id == mission.id),
             "mission with no recent events and old updated_at must still be flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_query_uses_max_timestamp_not_max_sequence() {
+        // Regression for a subtler variant: `log_event` updates an existing
+        // row in-place when it sees a duplicate `event_id` (e.g. a
+        // `text_delta_latest` row gets its `timestamp` rewritten on every
+        // streamed delta), so the row with the highest `sequence` can carry
+        // an *older* timestamp than a refreshed lower-sequence row. A query
+        // that reads `ORDER BY sequence DESC LIMIT 1` would then miss the
+        // refreshed row and falsely flag the mission stale. We force this
+        // ordering by hand and confirm `MAX(timestamp)` recovers correctly.
+        use crate::api::mission_store::MissionStatus;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("inplace-update"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("set active");
+
+        let now = chrono::Utc::now();
+        let three_hours_ago = (now - chrono::Duration::hours(3)).to_rfc3339();
+        let one_minute_ago = (now - chrono::Duration::minutes(1)).to_rfc3339();
+        let mid = mission.id.to_string();
+
+        // Drive raw inserts so we can pin (sequence, timestamp) independently.
+        // Highest sequence carries an old timestamp; a lower-sequence row
+        // carries the recent one — exactly the in-place-update layout that
+        // a sequence-based MAX would mishandle.
+        store
+            .force_backdate_for_test(mission.id, &three_hours_ago)
+            .await
+            .expect("backdate metadata");
+        let conn = store.conn.clone();
+        let three_hours_ago_clone = three_hours_ago.clone();
+        let one_minute_ago_clone = one_minute_ago.clone();
+        let mid_clone = mid.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            // Lower sequence, recent timestamp (the "refreshed" row)
+            conn.execute(
+                "INSERT INTO mission_events (mission_id, sequence, event_type, timestamp, content)
+                 VALUES (?1, 1, 'text_delta', ?2, 'streaming…')",
+                rusqlite::params![mid_clone, one_minute_ago_clone],
+            )
+            .expect("insert refreshed row");
+            // Higher sequence, old timestamp (would be the row picked by ORDER BY sequence DESC)
+            conn.execute(
+                "INSERT INTO mission_events (mission_id, sequence, event_type, timestamp, content)
+                 VALUES (?1, 2, 'tool_call', ?2, 'cmd')",
+                rusqlite::params![mid_clone, three_hours_ago_clone],
+            )
+            .expect("insert old high-seq row");
+        })
+        .await
+        .expect("raw inserts");
+
+        let stale = store
+            .get_stale_active_missions(2)
+            .await
+            .expect("query stale");
+        assert!(
+            stale.iter().all(|m| m.id != mission.id),
+            "mission whose newest activity lives on a *lower* sequence row than \
+             the highest sequence must NOT be flagged stale"
         );
     }
 
