@@ -1336,19 +1336,32 @@ const MAX_TASK_STEPS: usize = 1_000;
 /// Maximum completed tasks to retain per user. Oldest are evicted first on completion.
 const MAX_COMPLETED_TASKS: usize = 500;
 
-/// Truncate `s` so the resulting string is at most `max_bytes` long while staying on a
-/// UTF-8 char boundary. Returns the original string when already within budget.
+/// Truncate `s` so the *output* string is at most `max_bytes` long while staying on a
+/// UTF-8 char boundary. The trailing `…[truncated]` marker is counted against the cap,
+/// so the returned string's length never exceeds `max_bytes`. Returns the original
+/// string when already within budget.
 fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    let mut end = max_bytes;
+    const MARKER: &str = "…[truncated]";
+    // If the cap is so small the marker doesn't fit, fall back to a hard byte
+    // truncation on a char boundary — better than blowing past the limit.
+    if max_bytes <= MARKER.len() {
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        return s[..end].to_string();
+    }
+    let budget = max_bytes - MARKER.len();
+    let mut end = budget;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    let mut out = String::with_capacity(end + 24);
+    let mut out = String::with_capacity(max_bytes);
     out.push_str(&s[..end]);
-    out.push_str("…[truncated]");
+    out.push_str(MARKER);
     out
 }
 
@@ -2337,5 +2350,51 @@ async fn oauth_token_refresher_loop(
         );
 
         tokio::time::sleep(check_interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_utf8;
+
+    #[test]
+    fn truncate_utf8_passes_through_short_strings() {
+        assert_eq!(truncate_utf8("hello", 32), "hello");
+    }
+
+    #[test]
+    fn truncate_utf8_caps_total_output_length_at_max_bytes() {
+        // 100 bytes of input, cap of 32 — output must not exceed 32 bytes
+        // *including* the marker. Previous implementation kept 32 bytes of
+        // input and *appended* the marker, blowing past the cap.
+        let s = "x".repeat(100);
+        let out = truncate_utf8(&s, 32);
+        assert!(
+            out.len() <= 32,
+            "output {} bytes exceeded cap of 32",
+            out.len()
+        );
+        assert!(out.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn truncate_utf8_keeps_char_boundary() {
+        // 4-byte char (U+1F600) repeated; truncating in the middle of a
+        // multi-byte sequence must back up to a boundary.
+        let s = "😀".repeat(20); // 80 bytes of content
+        let out = truncate_utf8(&s, 32);
+        assert!(out.len() <= 32);
+        // Just confirms valid UTF-8 — String is by construction valid here, so
+        // this test mainly guards the boundary backtrack logic from panicking.
+        assert!(out.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn truncate_utf8_handles_cap_smaller_than_marker() {
+        // When the cap is smaller than the marker itself we still must not
+        // exceed the cap — fall back to a hard byte truncation.
+        let s = "abcdefghijklmnop".to_string();
+        let out = truncate_utf8(&s, 4);
+        assert!(out.len() <= 4);
     }
 }
