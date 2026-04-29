@@ -166,7 +166,7 @@ final class APIService {
         return response.ok
     }
 
-    func getMissionEvents(id: String, types: [String]? = nil, limit: Int? = nil, offset: Int? = nil) async throws -> [StoredEvent] {
+    func getMissionEvents(id: String, types: [String]? = nil, limit: Int? = nil, offset: Int? = nil, latest: Bool = false) async throws -> [StoredEvent] {
         var queryItems: [URLQueryItem] = []
         if let types = types {
             queryItems.append(URLQueryItem(name: "types", value: types.joined(separator: ",")))
@@ -176,6 +176,9 @@ final class APIService {
         }
         if let offset = offset {
             queryItems.append(URLQueryItem(name: "offset", value: String(offset)))
+        }
+        if latest {
+            queryItems.append(URLQueryItem(name: "latest", value: "true"))
         }
 
         var urlString = "/api/control/missions/\(id)/events"
@@ -465,6 +468,19 @@ final class APIService {
 
     func getWorkspace(id: String) async throws -> Workspace {
         try await get("/api/workspaces/\(id)")
+    }
+
+    // MARK: - FIDO Signing
+
+    func fidoRespond(requestId: String, approved: Bool) async throws {
+        struct FidoRespondBody: Encodable {
+            let request_id: String
+            let approved: Bool
+        }
+        let _: EmptyResponse = try await post(
+            "/api/fido/respond",
+            body: FidoRespondBody(request_id: requestId, approved: approved)
+        )
     }
 
     // MARK: - SSE Streaming

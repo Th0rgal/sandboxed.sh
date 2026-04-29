@@ -62,6 +62,11 @@ literature. Local inference, isolated containers, nothing leaves your machines.
   with per-mission directories
 - **Git-backed Library**: Skills, tools, rules, agents, and MCPs versioned in a
   single repo
+- **Telegram Integration**: Connect bots to missions for chat-based AI
+  assistants with auto-mission creation per chat
+- **Automations**: Schedule recurring agent runs with cron-like triggers
+- **Model Routing**: Provider fallback chains with health checks and
+  rate-limit handling
 - **MCP Registry (optional)**: Extra tool servers (desktop/playwright/etc.) when
   needed
 - **OpenAI-compatible Proxy Queue Mode**: Optional deferred execution for
@@ -181,6 +186,7 @@ deployment:
 - **[Backend API](docs/BACKEND_API.md)** - Backend configuration
 
 ### Setup Guides
+- **[Telegram Assistant](docs/TELEGRAM_ASSISTANT.md)** - Connect Telegram bots to missions
 - **[Desktop Setup](docs/DESKTOP_SETUP.md)** - X11/Xvfb configuration for GUI automation
 - **[Amp Proxy Setup](docs/AMP_PROXY_SETUP.md)** - Amp backend proxy configuration
 

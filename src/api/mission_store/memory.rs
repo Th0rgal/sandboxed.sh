@@ -97,6 +97,7 @@ impl MissionStore for InMemoryMissionStore {
             terminal_reason: None,
             parent_mission_id,
             working_directory: working_directory.map(|s| s.to_string()),
+            mission_mode: super::MissionMode::default(),
         };
         self.missions
             .write()
@@ -188,6 +189,45 @@ impl MissionStore for InMemoryMissionStore {
         mission.metadata_updated_at = Some(now.clone());
         mission.updated_at = now;
         Ok(())
+    }
+
+    async fn update_mission_run_settings(
+        &self,
+        id: Uuid,
+        backend: Option<&str>,
+        agent: Option<Option<&str>>,
+        model_override: Option<Option<&str>>,
+        model_effort: Option<Option<&str>>,
+        config_profile: Option<Option<&str>>,
+        session_id: &str,
+    ) -> Result<Mission, String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+
+        if let Some(backend) = backend {
+            mission.backend = backend.to_string();
+        }
+        if let Some(agent) = agent {
+            mission.agent = agent.map(ToString::to_string);
+        }
+        if let Some(model_override) = model_override {
+            mission.model_override = model_override.map(ToString::to_string);
+        }
+        if let Some(model_effort) = model_effort {
+            mission.model_effort = model_effort.map(ToString::to_string);
+        }
+        if let Some(config_profile) = config_profile {
+            mission.config_profile = config_profile.map(ToString::to_string);
+        }
+        mission.session_id = Some(session_id.to_string());
+        mission.resumable = false;
+        mission.interrupted_at = None;
+        mission.terminal_reason = None;
+        mission.updated_at = now_string();
+
+        Ok(mission.clone())
     }
 
     async fn update_mission_metadata(
@@ -493,6 +533,42 @@ mod tests {
             metadata_updated_at >= seeded_metadata_updated_at,
             "manual title update should advance metadata timestamp"
         );
+    }
+
+    #[tokio::test]
+    async fn update_mission_run_settings_clears_terminal_reason() {
+        let store = InMemoryMissionStore::new();
+        let mission = store
+            .create_mission(Some("Initial"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+
+        store
+            .update_mission_status_with_reason(
+                mission.id,
+                MissionStatus::Failed,
+                Some("rate_limited"),
+            )
+            .await
+            .expect("set terminal reason");
+
+        let updated = store
+            .update_mission_run_settings(
+                mission.id,
+                Some("codex"),
+                None,
+                None,
+                None,
+                None,
+                "new-session",
+            )
+            .await
+            .expect("update run settings");
+
+        assert_eq!(updated.terminal_reason, None);
+        assert_eq!(updated.session_id.as_deref(), Some("new-session"));
+        assert!(!updated.resumable);
+        assert_eq!(updated.interrupted_at, None);
     }
 
     #[tokio::test]

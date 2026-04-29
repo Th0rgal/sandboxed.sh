@@ -22,6 +22,61 @@ pub fn home_dir() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
 }
 
+/// Read an environment variable, returning `Some(trimmed)` only when the
+/// variable is set *and* non-empty after trimming whitespace. Callers that
+/// chain several aliases via `or_else` need this to skip templated blank
+/// values — otherwise the first alias wins with an empty string and later
+/// aliases never get a chance.
+pub fn env_var_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// CLI-proxy base URL aliases, in priority order.
+///
+/// Shared across `ai_providers.rs`, `proxy.rs`, and `mission_runner.rs` so
+/// that every lookup path agrees on the same precedence. Callers should
+/// walk these with `env_var_nonempty` so blank values fall through.
+pub const CLI_PROXY_BASE_URL_ENV_VARS: &[&str] = &[
+    "CLAUDE_CODE_PROXY_BASE_URL",
+    "CLI_PROXY_API_BASE_URL",
+    "CLIPROXY_API_BASE_URL",
+    "CLIPROXY_BASE_URL",
+];
+
+/// CLI-proxy API key aliases, in priority order.
+pub const CLI_PROXY_API_KEY_ENV_VARS: &[&str] = &[
+    "CLAUDE_CODE_PROXY_API_KEY",
+    "CLI_PROXY_API_KEY",
+    "CLIPROXY_API_KEY",
+];
+
+/// First non-empty CLI-proxy base URL found among the alias env vars.
+pub fn cli_proxy_base_url_from_env() -> Option<String> {
+    CLI_PROXY_BASE_URL_ENV_VARS
+        .iter()
+        .find_map(|name| env_var_nonempty(name))
+}
+
+/// First non-empty CLI-proxy API key found among the alias env vars.
+pub fn cli_proxy_api_key_from_env() -> Option<String> {
+    CLI_PROXY_API_KEY_ENV_VARS
+        .iter()
+        .find_map(|name| env_var_nonempty(name))
+}
+
+/// True when any CLI-proxy base URL or API key env var is configured
+/// (non-empty). Used by the availability gates to decide whether the
+/// synthetic `*-cli-proxy` accounts are worth adding.
+pub fn any_cli_proxy_env_configured() -> bool {
+    CLI_PROXY_BASE_URL_ENV_VARS
+        .iter()
+        .chain(CLI_PROXY_API_KEY_ENV_VARS.iter())
+        .any(|name| env_var_nonempty(name).is_some())
+}
+
 /// Build a truncated context string from conversation history.
 ///
 /// Walks `history` from most-recent to oldest, accumulating entries until

@@ -2,9 +2,9 @@
 
 import { useEffect, useRef, useState, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
-import { Plus, X, ExternalLink, RefreshCw } from 'lucide-react';
+import { Plus, X, ExternalLink, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import useSWR from 'swr';
-import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getBackendConfig, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type Provider } from '@/lib/api';
+import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getBackendConfig, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
 
 /** Options returned by the dialog's getCreateOptions() method */
@@ -13,8 +13,8 @@ export interface NewMissionDialogOptions {
   agent?: string;
   /** @deprecated Use workspace config profiles instead */
   modelOverride?: string;
-  modelEffort?: 'low' | 'medium' | 'high';
-  configProfile?: string;
+  modelEffort?: ModelEffort;
+  configProfile?: string | null;
   backend?: string;
   /** Whether the mission will be opened in a new tab (skip local state updates) */
   openInNewTab?: boolean;
@@ -30,7 +30,8 @@ export interface InitialMissionValues {
   agent?: string;
   backend?: string;
   modelOverride?: string;
-  modelEffort?: 'low' | 'medium' | 'high';
+  modelEffort?: ModelEffort;
+  configProfile?: string | null;
 }
 
 interface NewMissionDialogProps {
@@ -46,6 +47,10 @@ interface NewMissionDialogProps {
   autoOpen?: boolean;
   /** Callback when dialog closes (for clearing URL params, etc.) */
   onClose?: () => void;
+  /** Use the same controls to edit an existing mission's future run settings. */
+  mode?: 'create' | 'edit';
+  /** Disable workspace changes, useful when editing an existing mission. */
+  lockWorkspace?: boolean;
 }
 
 // Combined agent with backend info
@@ -102,6 +107,8 @@ export function NewMissionDialog({
   initialValues,
   autoOpen = false,
   onClose,
+  mode = 'create',
+  lockWorkspace = false,
 }: NewMissionDialogProps) {
   const router = useRouter();
   const [open, setOpen] = useState(autoOpen);
@@ -109,11 +116,12 @@ export function NewMissionDialog({
   // Combined value: "backend:agent" or empty for default
   const [selectedAgentValue, setSelectedAgentValue] = useState('');
   const [modelOverride, setModelOverride] = useState('');
-  const [modelEffort, setModelEffort] = useState<'low' | 'medium' | 'high' | ''>('');
+  const [modelEffort, setModelEffort] = useState<ModelEffort | ''>('');
   const [submitting, setSubmitting] = useState(false);
   const [defaultSet, setDefaultSet] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
   const prevBackendRef = useRef<string | null>(null);
+  const isEditMode = mode === 'edit';
 
   // SWR: fetch backends
   const { data: backends } = useSWR<Backend[]>('backends', listBackends, {
@@ -320,12 +328,31 @@ export function NewMissionDialog({
   }, [allAgents]);
 
   // Parse selected value to get backend and agent
-  const parseSelectedValue = (value: string): { backend: string; agent: string } | null => {
+  const parseSelectedValue = (value: string): { backend: string; agent?: string } | null => {
     if (!value) return null;
     const [backend, ...agentParts] = value.split(':');
     const agent = agentParts.join(':'); // Handle agent names with colons
-    return backend && agent ? { backend, agent } : null;
+    return backend ? { backend, agent: agent || undefined } : null;
   };
+
+  const preservedSelectedAgent = useMemo(() => {
+    const parsed = parseSelectedValue(selectedAgentValue);
+    if (!parsed) return null;
+    if (allAgents.some(a => a.value === selectedAgentValue)) return null;
+
+    const backendHasDefaultOption =
+      !parsed.agent &&
+      enabledBackends.some(backend => backend.id === parsed.backend) &&
+      (agentsByBackend[parsed.backend]?.length || 0) > 0;
+    if (backendHasDefaultOption) return null;
+
+    const backendName = backends?.find(backend => backend.id === parsed.backend)?.name || parsed.backend;
+    return {
+      backendName,
+      label: parsed.agent ? `${parsed.agent} (current)` : `${backendName} default (current)`,
+      value: selectedAgentValue,
+    };
+  }, [agentsByBackend, allAgents, backends, enabledBackends, selectedAgentValue]);
 
   const selectedBackend = useMemo(() => {
     return parseSelectedValue(selectedAgentValue)?.backend || 'claudecode';
@@ -421,8 +448,14 @@ export function NewMissionDialog({
       setModelEffort(initialValues.modelEffort);
     }
 
-    // Try to use initialValues for agent (from current mission)
-    if (initialValues?.backend && initialValues?.agent) {
+    // Try to use initialValues for agent/backend (from current mission)
+    if (initialValues?.backend) {
+      const currentAgentValue = `${initialValues.backend}:${initialValues.agent || ''}`;
+      if (!initialValues.agent) {
+        setSelectedAgentValue(currentAgentValue);
+        setDefaultSet(true);
+        return;
+      }
       const matchingAgent = allAgents.find(
         a => a.backend === initialValues.backend && a.agent === initialValues.agent
       );
@@ -431,6 +464,9 @@ export function NewMissionDialog({
         setDefaultSet(true);
         return;
       }
+      setSelectedAgentValue(currentAgentValue);
+      setDefaultSet(true);
+      return;
     }
 
     // Fallback: try to find the default agent from config
@@ -548,7 +584,9 @@ export function NewMissionDialog({
       backend: parsed?.backend || 'claudecode',
       modelOverride: modelOverrideValue,
       modelEffort: modelEffortValue,
-      configProfile: workspaceProfile || undefined,
+      configProfile: isEditMode
+        ? initialValues?.configProfile ?? null
+        : workspaceProfile || undefined,
     };
   };
 
@@ -558,6 +596,11 @@ export function NewMissionDialog({
     try {
       const options = getCreateOptions();
       const mission = await onCreate({ ...options, openInNewTab });
+      if (isEditMode) {
+        setOpen(false);
+        onClose?.();
+        return;
+      }
       const url = `${controlPath}?mission=${mission.id}`;
 
       if (openInNewTab) {
@@ -587,17 +630,21 @@ export function NewMissionDialog({
         type="button"
         onClick={() => setOpen((prev) => !prev)}
         disabled={isBusy}
-        className="flex items-center gap-1.5 rounded-lg bg-indigo-500/20 px-2.5 py-2 text-sm font-medium text-indigo-400 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"
-        title="Create new mission"
+        className={isEditMode
+          ? "flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2 text-sm text-white/70 hover:bg-white/[0.04] transition-colors disabled:opacity-50"
+          : "flex items-center gap-1.5 rounded-lg bg-indigo-500/20 px-2.5 py-2 text-sm font-medium text-indigo-400 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"}
+        title={isEditMode ? "Edit mission run settings" : "Create new mission"}
       >
-        <Plus className="h-4 w-4" />
-        <span className="hidden lg:inline">New Mission</span>
+        {isEditMode ? <SlidersHorizontal className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+        <span className="hidden lg:inline">{isEditMode ? 'Run Settings' : 'New Mission'}</span>
       </button>
       {open && (
         <div className="absolute right-0 top-full mt-1 w-96 rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl z-50">
           {/* Header with refresh and close buttons */}
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-sm font-medium text-white">Create New Mission</h3>
+            <h3 className="text-sm font-medium text-white">
+              {isEditMode ? 'Edit Run Settings' : 'Create New Mission'}
+            </h3>
             <div className="flex items-center gap-1">
               <button
                 type="button"
@@ -624,6 +671,7 @@ export function NewMissionDialog({
               <select
                 value={newMissionWorkspace}
                 onChange={(e) => setNewMissionWorkspace(e.target.value)}
+                disabled={lockWorkspace}
                 className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
                 style={{
                   backgroundImage:
@@ -672,12 +720,26 @@ export function NewMissionDialog({
                   paddingRight: '2.5rem',
                 }}
               >
+                {preservedSelectedAgent && (
+                  <optgroup
+                    key="current-agent"
+                    label={`${preservedSelectedAgent.backendName} (current)`}
+                    className="bg-[#1a1a1a]"
+                  >
+                    <option value={preservedSelectedAgent.value} className="bg-[#1a1a1a]">
+                      {preservedSelectedAgent.label}
+                    </option>
+                  </optgroup>
+                )}
                 {enabledBackends.map((backend) => {
                   const backendAgentsList = agentsByBackend[backend.id] || [];
                   if (backendAgentsList.length === 0) return null;
 
                   return (
                     <optgroup key={backend.id} label={backend.name} className="bg-[#1a1a1a]">
+                      <option value={`${backend.id}:`} className="bg-[#1a1a1a]">
+                        {backend.name} default
+                      </option>
                       {backendAgentsList.map((agent) => (
                         <option key={agent.value} value={agent.value} className="bg-[#1a1a1a]">
                           {agent.displayName}{agent.backend === 'opencode' && agent.agent === 'Sisyphus' ? ' (recommended)' : ''}
@@ -751,7 +813,7 @@ export function NewMissionDialog({
                   ? 'Amp ignores model overrides.'
                   : selectedBackend === 'opencode'
                     ? 'Use provider/model format (e.g., openai/gpt-5-codex).'
-                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-6).'}
+                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-7).'}
               </p>
             </div>
 
@@ -760,13 +822,15 @@ export function NewMissionDialog({
                 <label className="block text-xs text-white/50 mb-1.5">Model effort (optional)</label>
                 <select
                   value={modelEffort}
-                  onChange={(e) => setModelEffort(e.target.value as 'low' | 'medium' | 'high' | '')}
+                  onChange={(e) => setModelEffort(e.target.value as ModelEffort | '')}
                   className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none [&>option]:bg-slate-800 [&>option]:text-white"
                 >
                   <option value="">Default effort</option>
                   <option value="low">Low</option>
                   <option value="medium">Medium</option>
                   <option value="high">High</option>
+                  {selectedBackend === 'claudecode' && <option value="xhigh">XHigh</option>}
+                  {selectedBackend === 'claudecode' && <option value="max">Max</option>}
                 </select>
                 <p className="text-xs text-white/30 mt-1.5">
                   {selectedBackend === 'codex' ? 'Passed to Codex as reasoning effort.' : 'Controls Claude Code adaptive reasoning depth (via CLAUDE_CODE_EFFORT_LEVEL).'}
@@ -778,21 +842,32 @@ export function NewMissionDialog({
             <div className="flex gap-2 pt-1">
               <button
                 type="button"
-                onClick={() => handleCreate(false)}
-                disabled={isBusy}
+                onClick={isEditMode ? handleClose : () => handleCreate(false)}
+                disabled={isBusy && !isEditMode}
                 className="flex-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] transition-colors disabled:opacity-50"
               >
-                Create here
+                {isEditMode ? 'Cancel' : 'Create here'}
               </button>
-              <button
-                type="button"
-                onClick={() => handleCreate(true)}
-                disabled={isBusy}
-                className="flex-1 flex items-center justify-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
-              >
-                New Tab
-                <ExternalLink className="h-3.5 w-3.5" />
-              </button>
+              {isEditMode ? (
+                <button
+                  type="button"
+                  onClick={() => handleCreate(false)}
+                  disabled={isBusy}
+                  className="flex-1 flex items-center justify-center rounded-lg bg-indigo-500 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                >
+                  Save
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => handleCreate(true)}
+                  disabled={isBusy}
+                  className="flex-1 flex items-center justify-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                >
+                  New Tab
+                  <ExternalLink className="h-3.5 w-3.5" />
+                </button>
+              )}
             </div>
           </div>
         </div>

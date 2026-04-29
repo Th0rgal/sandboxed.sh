@@ -336,6 +336,12 @@ pub struct AIProvider {
     /// Account identifier (email or username) from OAuth or user-provided
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
+    /// Provider-assigned organization identifier — e.g. Anthropic's
+    /// `anthropic-organization-id` response header. Persisted so the chain
+    /// resolver can group credential records under the same subscription
+    /// and apply shared cooldowns across them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
     /// Connection status (populated at runtime)
     #[serde(skip)]
     pub status: ProviderStatus,
@@ -380,6 +386,7 @@ impl AIProvider {
             enabled: true,
             is_default: false,
             account_email: None,
+            organization_id: None,
             status: ProviderStatus::Unknown,
             created_at: now,
             updated_at: now,
@@ -622,6 +629,38 @@ impl AIProviderStore {
         if let Some(provider) = providers.get_mut(&id) {
             provider.oauth = Some(credentials);
             provider.status = ProviderStatus::Connected;
+            provider.updated_at = chrono::Utc::now();
+            let updated = provider.clone();
+            drop(providers);
+
+            if let Err(e) = self.save_to_disk().await {
+                tracing::error!("Failed to save AI providers to disk: {}", e);
+            }
+
+            Some(updated)
+        } else {
+            None
+        }
+    }
+
+    /// Update the provider's recorded organization ID (no-op when unchanged).
+    ///
+    /// Used by the usage probe to persist Anthropic's
+    /// `anthropic-organization-id` once we've successfully talked to the
+    /// upstream. Chain resolution uses this ID to group credential records
+    /// under the same subscription so cooldowns are shared.
+    pub async fn set_organization_id(
+        &self,
+        id: Uuid,
+        organization_id: String,
+    ) -> Option<AIProvider> {
+        let mut providers = self.providers.write().await;
+
+        if let Some(provider) = providers.get_mut(&id) {
+            if provider.organization_id.as_deref() == Some(organization_id.as_str()) {
+                return Some(provider.clone());
+            }
+            provider.organization_id = Some(organization_id);
             provider.updated_at = chrono::Utc::now();
             let updated = provider.clone();
             drop(providers);

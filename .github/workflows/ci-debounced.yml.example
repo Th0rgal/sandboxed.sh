@@ -75,7 +75,7 @@ jobs:
         pr_number: ${{ fromJson(needs.check-stale-prs.outputs.pr_numbers) }}
     steps:
       - name: Checkout PR
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: refs/pull/${{ matrix.pr_number }}/head
 
@@ -83,15 +83,22 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-test-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-test-
 
       - name: Run tests
         run: cargo test --workspace

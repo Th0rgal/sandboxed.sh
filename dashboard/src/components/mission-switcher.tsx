@@ -218,6 +218,9 @@ export function getMissionSearchText(mission: Mission): string {
   if (status) {
     textParts.push(status);
   }
+  if (mission.mission_mode === 'assistant') {
+    textParts.push('assistant telegram');
+  }
   return textParts.join(' ');
 }
 
@@ -1104,6 +1107,11 @@ export function MissionSwitcher({
                               </span>
                             ) : null;
                           })()}
+                          {mission?.mission_mode === 'assistant' && (
+                            <span className="inline-flex items-center rounded bg-indigo-500/10 border border-indigo-500/20 px-1 py-0.5 text-[8px] font-medium text-indigo-400 shrink-0">
+                              Assistant
+                            </span>
+                          )}
                           {item.isBoss && (
                             <span className="inline-flex items-center rounded bg-violet-500/10 border border-violet-500/20 px-1 py-0.5 text-[8px] font-medium text-violet-400 shrink-0">
                               Boss

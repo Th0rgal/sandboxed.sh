@@ -43,6 +43,42 @@ pub struct AuthUser {
     pub username: String,
 }
 
+fn configured_single_tenant_user_id() -> Option<String> {
+    std::env::var("SANDBOXED_SINGLE_TENANT_USER_ID")
+        .or_else(|_| std::env::var("SINGLE_TENANT_USER_ID"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn implicit_single_tenant_user_from_id(
+    config: &Config,
+    configured_user_id: Option<String>,
+) -> AuthUser {
+    if config.dev_mode {
+        return AuthUser {
+            id: "dev".to_string(),
+            username: "dev".to_string(),
+        };
+    }
+
+    let id = configured_user_id.unwrap_or_else(|| "default".to_string());
+    AuthUser {
+        username: id.clone(),
+        id,
+    }
+}
+
+/// Resolve the effective single-tenant user identity.
+///
+/// By default, authenticated single-tenant deployments use `default`, while
+/// dev-mode sessions use `dev`. Operators can override the production
+/// single-tenant identity with `SANDBOXED_SINGLE_TENANT_USER_ID` (or the
+/// shorter `SINGLE_TENANT_USER_ID`) to keep using a legacy mission partition.
+pub fn implicit_single_tenant_user(config: &Config) -> AuthUser {
+    implicit_single_tenant_user_from_id(config, configured_single_tenant_user_id())
+}
+
 pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
@@ -242,10 +278,7 @@ pub async fn login(
                 return Err((StatusCode::UNAUTHORIZED, "Invalid password".to_string()));
             }
 
-            AuthUser {
-                id: "default".to_string(),
-                username: "default".to_string(),
-            }
+            implicit_single_tenant_user(&state.config)
         }
     };
 
@@ -269,10 +302,8 @@ pub async fn require_auth(
 ) -> Response {
     // Dev mode => no auth checks.
     if state.config.dev_mode {
-        req.extensions_mut().insert(AuthUser {
-            id: "dev".to_string(),
-            username: "dev".to_string(),
-        });
+        req.extensions_mut()
+            .insert(implicit_single_tenant_user(&state.config));
         return next.run(req).await;
     }
 
@@ -316,10 +347,7 @@ pub async fn require_auth(
                     id: claims.sub,
                     username: claims.usr,
                 },
-                AuthMode::Disabled => AuthUser {
-                    id: "default".to_string(),
-                    username: "default".to_string(),
-                },
+                AuthMode::Disabled => implicit_single_tenant_user(&state.config),
             };
             req.extensions_mut().insert(user);
             next.run(req).await
@@ -494,4 +522,47 @@ pub async fn change_password(
         "success": true,
         "password_changed_at": now
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AuthConfig, ContextConfig};
+    use std::path::PathBuf;
+
+    fn test_config(dev_mode: bool) -> Config {
+        Config {
+            default_model: None,
+            working_dir: PathBuf::from("/tmp"),
+            host: "127.0.0.1".to_string(),
+            port: 3000,
+            max_iterations: 50,
+            stale_mission_hours: 0,
+            max_parallel_missions: 1,
+            dev_mode,
+            auth: AuthConfig::default(),
+            context: ContextConfig::default(),
+            opencode_base_url: "http://127.0.0.1:4096".to_string(),
+            opencode_agent: None,
+            opencode_permissive: false,
+            library_path: PathBuf::from("/tmp/library"),
+            default_backend: None,
+            automations_enabled: true,
+        }
+    }
+
+    #[test]
+    fn implicit_single_tenant_user_defaults_to_default_outside_dev_mode() {
+        let user = implicit_single_tenant_user_from_id(&test_config(false), None);
+        assert_eq!(user.id, "default");
+        assert_eq!(user.username, "default");
+    }
+
+    #[test]
+    fn implicit_single_tenant_user_honors_override() {
+        let user =
+            implicit_single_tenant_user_from_id(&test_config(false), Some("legacy-prod".into()));
+        assert_eq!(user.id, "legacy-prod");
+        assert_eq!(user.username, "legacy-prod");
+    }
 }

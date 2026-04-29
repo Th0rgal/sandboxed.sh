@@ -113,6 +113,11 @@ impl TailscaleMode {
     }
 }
 
+/// Serde default helper: returns `true`.
+pub fn default_true() -> bool {
+    true
+}
+
 /// A workspace definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
@@ -165,10 +170,21 @@ pub struct Workspace {
     #[serde(default)]
     pub tailscale_mode: Option<TailscaleMode>,
     /// MCP server names to enable for this workspace.
-    /// Empty = use all MCPs with `default_enabled = true`.
-    /// Non-empty = allowlist of MCP names.
+    ///
+    /// - Empty + any `mcps_replace_defaults` → all MCPs with `default_enabled = true`
+    /// - Non-empty + `mcps_replace_defaults = true`  → **only** the listed MCPs
+    /// - Non-empty + `mcps_replace_defaults = false` → listed MCPs **plus** all `default_enabled` MCPs
     #[serde(default)]
     pub mcps: Vec<String>,
+    /// Controls whether a non-empty `mcps` list fully replaces default MCPs.
+    ///
+    /// - `true` (default): the `mcps` list is the complete set — default MCPs are excluded
+    ///   unless explicitly listed. This is the original behavior.
+    /// - `false`: the `mcps` list is additive — default MCPs stay active alongside custom ones.
+    ///
+    /// Has no effect when `mcps` is empty (defaults are always used in that case).
+    #[serde(default = "default_true")]
+    pub mcps_replace_defaults: bool,
     /// Config profile to use for this workspace (from workspace template).
     /// Defaults to "default" if not specified.
     #[serde(default)]
@@ -197,6 +213,7 @@ impl Workspace {
             shared_network: None,
             tailscale_mode: None,
             mcps: Vec::new(),
+            mcps_replace_defaults: true,
             config_profile: None,
         }
     }
@@ -223,6 +240,7 @@ impl Workspace {
             shared_network: None,
             tailscale_mode: None,
             mcps: Vec::new(),
+            mcps_replace_defaults: true,
         }
     }
 }
@@ -413,6 +431,7 @@ impl WorkspaceStore {
                     shared_network: None, // Default to shared network
                     tailscale_mode: None,
                     mcps: Vec::new(),
+                    mcps_replace_defaults: true,
                     config_profile: None,
                 };
 
@@ -1213,13 +1232,14 @@ async fn write_opencode_config(
         write_commands_as_opencode_skills(workspace_dir, commands).await?;
     }
 
-    // Write Bash PreToolUse hook for Claude Code (which oh-my-opencode wraps).
-    // This fixes gh CLI hanging in PTY and enables RTK compression for the
-    // native Bash tool used by the agent. Since OpenCode wraps Claude Code,
+    // Write Claude PreToolUse hooks for Claude Code (which oh-my-opencode wraps).
+    // These fix gh CLI hanging in PTY, optionally enable RTK compression for
+    // native Bash, and block oversized image Reads before provider submission.
+    // Since OpenCode wraps Claude Code,
     // we need to write a minimal `.claude/settings.local.json` containing the
     // hooks config so the underlying Claude Code process discovers the hook.
     if let Some(hooks) =
-        write_bash_pretool_hook(workspace_dir, workspace_root, workspace_type).await?
+        write_claude_pretool_hooks(workspace_dir, workspace_root, workspace_type).await?
     {
         let claude_dir = workspace_dir.join(".claude");
         tokio::fs::create_dir_all(&claude_dir).await?;
@@ -1227,16 +1247,24 @@ async fn write_opencode_config(
         let settings_content = serde_json::to_string_pretty(&settings)?;
         let settings_path = claude_dir.join("settings.local.json");
         tokio::fs::write(&settings_path, &settings_content).await?;
-        tracing::info!("RTK hooks written to .claude/settings.local.json for OpenCode backend");
+        tracing::info!("Claude hooks written to .claude/settings.local.json for OpenCode backend");
     }
 
     Ok(())
 }
 
-/// If `SANDBOXED_SH_RTK_ENABLED` is set, write a Claude Code `PreToolUse`
-/// hook that prefixes eligible Bash commands with the `rtk` binary.
+/// Write Claude Code `PreToolUse` hooks for workspace execution.
+///
+/// The Bash hook always exists because it fixes `gh` hanging in PTY contexts,
+/// and optionally prefixes eligible commands with `rtk` when enabled.
+///
+/// The Read hook blocks oversized image reads before Claude Code serializes the
+/// image into the next model request. Anthropic applies a 2000px per-dimension
+/// limit when a request contains many images; one oversized screenshot can poison
+/// the session context and make the next model call fail before the agent gets a
+/// chance to recover.
 /// Returns the `hooks` JSON value to embed in `.claude/settings.local.json`,
-/// or `None` when RTK is disabled / the binary is absent.
+/// or `None` when no hooks were written.
 ///
 /// For container workspaces, the RTK binary is copied from the host into
 /// the container's `/usr/local/bin/`, and paths in the hook config are
@@ -1244,7 +1272,7 @@ async fn write_opencode_config(
 ///
 /// For the OpenCode backend this is also called so that the underlying Claude
 /// Code process (wrapped by oh-my-opencode) picks up the hook.
-async fn write_bash_pretool_hook(
+async fn write_claude_pretool_hooks(
     workspace_dir: &Path,
     workspace_root: &Path,
     workspace_type: WorkspaceType,
@@ -1283,22 +1311,217 @@ async fn write_bash_pretool_hook(
         }
     }
 
-    // Write the hook script to .claude/hooks/bash-pretool.sh
-    //
-    // This hook serves two purposes:
-    // 1. **gh terminal fix** (always): Wraps `gh` commands with `env TERM=dumb` to prevent
-    //    lipgloss from sending terminal capability queries (OSC 11, DSR) that hang forever
-    //    in our PTY environment (no terminal emulator to respond).
-    // 2. **RTK compression** (when enabled): Rewrites eligible commands to use RTK
-    //    subcommands for 60-90% token compression on CLI output.
+    // Write the Bash hook script to .claude/hooks/bash-pretool.sh.
+    // See `render_bash_pretool_script` for the script body.
     let hooks_dir = workspace_dir.join(".claude").join("hooks");
     tokio::fs::create_dir_all(&hooks_dir).await?;
     let hook_path = hooks_dir.join("bash-pretool.sh");
-    let hook_script = r#"#!/bin/bash
+    let hook_script = render_bash_pretool_script(use_rtk);
+    tokio::fs::write(&hook_path, &hook_script).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms)?;
+    }
+
+    // For container workspaces, translate the hook path from host to container-relative
+    let hook_command = if is_container {
+        if let Ok(rel) = hook_path.strip_prefix(workspace_root) {
+            format!("/{}", rel.to_string_lossy())
+        } else {
+            hook_path.to_string_lossy().to_string()
+        }
+    } else {
+        hook_path.to_string_lossy().to_string()
+    };
+    tracing::info!(
+        hook_path = %hook_command,
+        is_container = is_container,
+        use_rtk = use_rtk,
+        "Bash PreToolUse hook written"
+    );
+
+    let image_hook_path = hooks_dir.join("image-read-pretool.sh");
+    let image_hook_script = r#"#!/bin/bash
+# PreToolUse hook for Read. Blocks oversized PNG/JPEG images before Claude Code
+# embeds them in a provider request that may contain many images.
+set -euo pipefail
+
+INPUT=$(cat)
+
+if ! command -v python3 >/dev/null 2>&1; then
+  exit 0
+fi
+
+export CLAUDE_HOOK_INPUT="$INPUT"
+python3 <<'PY'
+import json
+import os
+import struct
+import sys
+
+MAX_DIMENSION = 2000
+
+def png_dimensions(data):
+    if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return struct.unpack(">II", data[16:24])
+    return None
+
+def jpeg_dimensions(path):
+    with open(path, "rb") as f:
+        if f.read(2) != b"\xff\xd8":
+            return None
+        while True:
+            marker_prefix = f.read(1)
+            if not marker_prefix:
+                return None
+            if marker_prefix != b"\xff":
+                continue
+            marker = f.read(1)
+            while marker == b"\xff":
+                marker = f.read(1)
+            if not marker:
+                return None
+            code = marker[0]
+            if code in (0xD8, 0xD9):
+                continue
+            length_bytes = f.read(2)
+            if len(length_bytes) != 2:
+                return None
+            length = struct.unpack(">H", length_bytes)[0]
+            if length < 2:
+                return None
+            if code in {
+                0xC0, 0xC1, 0xC2, 0xC3,
+                0xC5, 0xC6, 0xC7,
+                0xC9, 0xCA, 0xCB,
+                0xCD, 0xCE, 0xCF,
+            }:
+                segment = f.read(length - 2)
+                if len(segment) >= 5:
+                    height, width = struct.unpack(">HH", segment[1:5])
+                    return width, height
+                return None
+            f.seek(length - 2, os.SEEK_CUR)
+
+def image_dimensions(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+        dims = png_dimensions(head)
+        if dims:
+            return dims
+        return jpeg_dimensions(path)
+    except Exception:
+        return None
+
+def main():
+    try:
+        payload = json.loads(os.environ.get("CLAUDE_HOOK_INPUT", "{}"))
+    except Exception:
+        return 0
+
+    tool_input = payload.get("tool_input") or {}
+    path = tool_input.get("file_path") or tool_input.get("path")
+    if not isinstance(path, str) or not path:
+        return 0
+    if not os.path.isfile(path):
+        return 0
+
+    dims = image_dimensions(path)
+    if not dims:
+        return 0
+    width, height = dims
+    if width <= MAX_DIMENSION and height <= MAX_DIMENSION:
+        return 0
+
+    reason = (
+        f"Refusing to Read oversized image {path} ({width}x{height}). "
+        "Claude provider requests with many images allow at most 2000 pixels per dimension. "
+        "Downscale or rerender this image first, then Read the smaller file. "
+        "For PDF screenshots, use a lower pdftoppm DPI such as -r 120, or use pdftotext when text is sufficient."
+    )
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }))
+    return 0
+
+sys.exit(main())
+PY
+"#;
+    tokio::fs::write(&image_hook_path, image_hook_script).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&image_hook_path, perms)?;
+    }
+
+    let image_hook_command = if is_container {
+        if let Ok(rel) = image_hook_path.strip_prefix(workspace_root) {
+            format!("/{}", rel.to_string_lossy())
+        } else {
+            image_hook_path.to_string_lossy().to_string()
+        }
+    } else {
+        image_hook_path.to_string_lossy().to_string()
+    };
+    tracing::info!(
+        hook_path = %image_hook_command,
+        is_container = is_container,
+        max_dimension = 2000,
+        "Image Read PreToolUse hook written"
+    );
+
+    Ok(Some(json!({
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_command
+                }]
+            },
+            {
+                "matcher": "Read",
+                "hooks": [{
+                    "type": "command",
+                    "command": image_hook_command
+                }]
+            }
+        ]
+    })))
+}
+
+/// Render the Claude Code Bash `PreToolUse` hook script.
+///
+/// The hook has two responsibilities, independently toggleable:
+/// 1. **gh terminal fix** (always on): wraps `gh` commands with `env TERM=dumb`
+///    so lipgloss/glamour stops issuing terminal capability queries that hang
+///    forever in our PTY. This is a bugfix unrelated to RTK.
+/// 2. **RTK compression** (gated on `use_rtk`): when the dashboard RTK setting
+///    is enabled, rewrites eligible commands to their `rtk <sub>` equivalents.
+///    When disabled, the hook leaves commands alone even if `rtk` is installed.
+///
+/// The `use_rtk` flag is baked into the script at workspace preparation time,
+/// so toggling the dashboard setting only takes effect for workspaces prepared
+/// after the toggle.
+fn render_bash_pretool_script(use_rtk: bool) -> String {
+    let rtk_flag = if use_rtk { "true" } else { "false" };
+    format!(
+        r#"#!/bin/bash
 # PreToolUse hook for Bash commands.
 # 1. Fixes gh CLI hanging in PTY by setting TERM=dumb (prevents lipgloss terminal queries)
 # 2. Optionally rewrites commands to use RTK for token compression
 set -euo pipefail
+
+# Baked in at workspace preparation time from the dashboard RTK setting.
+RTK_ENABLED={rtk_flag}
 
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
@@ -1314,25 +1537,27 @@ case "$COMMAND" in
 esac
 
 # Extract the base command (first word, ignoring path prefix)
-FIRST_WORD=$(echo "$COMMAND" | awk '{print $1}')
+FIRST_WORD=$(echo "$COMMAND" | awk '{{print $1}}')
 BASE_CMD=$(basename "$FIRST_WORD")
 REST=$(echo "$COMMAND" | sed "s|^[^ ]* *||")
 
-emit_rewrite() {
-  jq -n --arg cmd "$1" '{
-    hookSpecificOutput: {
+emit_rewrite() {{
+  jq -n --arg cmd "$1" '{{
+    hookSpecificOutput: {{
       hookEventName: "PreToolUse",
       permissionDecision: "allow",
-      updatedInput: { command: $cmd }
-    }
-  }'
-}
+      updatedInput: {{ command: $cmd }}
+    }}
+  }}'
+}}
 
-# Find rtk binary (for optional compression)
+# Find rtk binary only when the dashboard setting is on.
 RTK_PATH=""
-for p in /usr/local/bin/rtk /usr/bin/rtk; do
-  if [ -x "$p" ]; then RTK_PATH="$p"; break; fi
-done
+if [ "$RTK_ENABLED" = "true" ]; then
+  for p in /usr/local/bin/rtk /usr/bin/rtk; do
+    if [ -x "$p" ]; then RTK_PATH="$p"; break; fi
+  done
+fi
 
 # Map base commands to RTK subcommands (only commands RTK natively supports)
 RTK_SUB=""
@@ -1385,41 +1610,8 @@ case "$BASE_CMD" in
 esac
 
 exit 0
-"#;
-    tokio::fs::write(&hook_path, hook_script).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&hook_path, perms)?;
-    }
-
-    // For container workspaces, translate the hook path from host to container-relative
-    let hook_command = if is_container {
-        if let Ok(rel) = hook_path.strip_prefix(workspace_root) {
-            format!("/{}", rel.to_string_lossy())
-        } else {
-            hook_path.to_string_lossy().to_string()
-        }
-    } else {
-        hook_path.to_string_lossy().to_string()
-    };
-    tracing::info!(
-        hook_path = %hook_command,
-        is_container = is_container,
-        use_rtk = use_rtk,
-        "Bash PreToolUse hook written"
-    );
-
-    Ok(Some(json!({
-        "PreToolUse": [{
-            "matcher": "Bash",
-            "hooks": [{
-                "type": "command",
-                "command": hook_command
-            }]
-        }]
-    })))
+"#
+    )
 }
 
 /// Deep-merge `overlay` into `base`.
@@ -1515,10 +1707,9 @@ async fn write_claudecode_config(
         }
     });
 
-    // Add Bash PreToolUse hook — fixes gh CLI hanging in PTY environments
-    // and optionally rewrites commands with RTK for token compression.
+    // Add Claude PreToolUse hooks: Bash PTY/RTK handling plus image Read guard.
     if let Some(hooks) =
-        write_bash_pretool_hook(workspace_dir, workspace_root, workspace_type).await?
+        write_claude_pretool_hooks(workspace_dir, workspace_root, workspace_type).await?
     {
         settings
             .as_object_mut()
@@ -1541,7 +1732,13 @@ async fn write_claudecode_config(
     tokio::fs::write(&settings_json_path, &settings_content).await?;
 
     // Write a dedicated MCP config for CLI flags like --mcp-config.
-    let mcp_only = json!({ "mcpServers": mcp_servers });
+    // Use mcpServers from the merged settings (includes profile overlay MCPs)
+    // rather than only the RTK-generated MCPs.
+    let final_mcp_servers = settings
+        .get("mcpServers")
+        .cloned()
+        .unwrap_or_else(|| json!(mcp_servers));
+    let mcp_only = json!({ "mcpServers": final_mcp_servers });
     let mcp_content = serde_json::to_string_pretty(&mcp_only)?;
     let mcp_config_path = claude_dir.join("mcp.json");
     tokio::fs::write(&mcp_config_path, &mcp_content).await?;
@@ -3089,23 +3286,35 @@ async fn prepare_workspace_dir(path: &Path) -> anyhow::Result<PathBuf> {
 /// Filter MCP configs based on a workspace's MCP allowlist.
 ///
 /// - Empty `workspace_mcps` → include only MCPs with `default_enabled = true`
-/// - Non-empty `workspace_mcps` → include only MCPs whose name is in the list
+///   (`replace_defaults` is ignored in this case)
+/// - Non-empty `workspace_mcps` + `replace_defaults = true` → **only** the allowlist
+/// - Non-empty `workspace_mcps` + `replace_defaults = false` → allowlist **plus** `default_enabled` MCPs
 ///
-/// In both cases, globally disabled MCPs are excluded.
+/// In all cases, globally disabled MCPs (`enabled = false`) are excluded.
 fn filter_mcp_configs_for_workspace(
     configs: Vec<McpServerConfig>,
     workspace_mcps: &[String],
+    replace_defaults: bool,
 ) -> Vec<McpServerConfig> {
     configs
         .into_iter()
         .filter(|c| {
+            // Globally disabled MCPs are always excluded
             if !c.enabled {
                 return false;
             }
             if workspace_mcps.is_empty() {
+                // No explicit list → fall back to default MCPs
                 c.default_enabled
             } else {
-                workspace_mcps.iter().any(|name| name == &c.name)
+                let in_list = workspace_mcps.iter().any(|name| name == &c.name);
+                if replace_defaults {
+                    // Explicit list is the complete set — only listed MCPs
+                    in_list
+                } else {
+                    // Additive mode — listed MCPs + all default-enabled MCPs
+                    in_list || c.default_enabled
+                }
             }
         })
         .collect()
@@ -3156,7 +3365,11 @@ pub async fn prepare_mission_workspace_in(
     // can run concurrently without clobbering per-workspace config files.
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
-    let mcp_configs = filter_mcp_configs_for_workspace(mcp.list_configs().await, &workspace.mcps);
+    let mcp_configs = filter_mcp_configs_for_workspace(
+        mcp.list_configs().await,
+        &workspace.mcps,
+        workspace.mcps_replace_defaults,
+    );
     let skill_allowlist = if workspace.skills.is_empty() {
         None
     } else {
@@ -3257,7 +3470,11 @@ pub async fn prepare_mission_workspace_with_skills_backend(
             Some(providers_from_file.as_slice())
         }
     };
-    let mcp_configs = filter_mcp_configs_for_workspace(mcp.list_configs().await, &workspace.mcps);
+    let mcp_configs = filter_mcp_configs_for_workspace(
+        mcp.list_configs().await,
+        &workspace.mcps,
+        workspace.mcps_replace_defaults,
+    );
     let skill_allowlist = if workspace.skills.is_empty() {
         None
     } else {
@@ -3409,10 +3626,10 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                     env.entry("API_URL".to_string())
                         .or_insert_with(|| format!("http://127.0.0.1:{}", port));
                 }
-                // Only forward JWT_SECRET to the orchestrator MCP so it can
+                // Forward JWT_SECRET to trusted internal MCPs so they can
                 // mint service tokens.  Other MCPs (including third-party ones)
                 // must not receive this secret.
-                if cfg.name == "orchestrator" {
+                if cfg.name == "orchestrator" || cfg.name == "automation-manager" {
                     if let Ok(secret) = std::env::var("JWT_SECRET") {
                         env.entry("JWT_SECRET".to_string()).or_insert(secret);
                     }
@@ -3515,6 +3732,44 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                         error = %e,
                         "Failed to load oh-my-opencode settings from library"
                     );
+                }
+            }
+
+            // Sync agents directory from profile (e.g. .opencode/agents/*.md)
+            {
+                let profile_path = lib.config_profile_path(profile);
+                let agents_src = profile_path.join(".opencode").join("agents");
+                if agents_src.is_dir() {
+                    let agents_dest = dir.join(".opencode").join("agent");
+                    if let Err(e) = tokio::fs::create_dir_all(&agents_dest).await {
+                        tracing::warn!(
+                            mission = %mission_id,
+                            error = %e,
+                            "Failed to create .opencode/agent directory"
+                        );
+                    } else {
+                        let mut count = 0u32;
+                        if let Ok(mut entries) = tokio::fs::read_dir(&agents_src).await {
+                            while let Ok(Some(entry)) = entries.next_entry().await {
+                                let path = entry.path();
+                                if path.extension().map(|e| e == "md").unwrap_or(false) {
+                                    let dest = agents_dest.join(entry.file_name());
+                                    if let Ok(content) = tokio::fs::read(&path).await {
+                                        let _ = tokio::fs::write(&dest, &content).await;
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if count > 0 {
+                            tracing::info!(
+                                mission = %mission_id,
+                                count = count,
+                                profile = %profile,
+                                "Synced agents from config profile to workspace"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -3646,48 +3901,52 @@ pub async fn write_runtime_workspace_state(
     }
     let context_link = working_dir.join(context_dir_name);
     if let Some(target) = mission_context.as_ref() {
-        // Use symlink_metadata to avoid following symlinks (prevents ELOOP errors)
-        if tokio::fs::symlink_metadata(&context_link).await.is_ok()
-            && tokio::fs::remove_file(&context_link).await.is_err()
-        {
-            if let Err(e) = tokio::fs::remove_dir_all(&context_link).await {
-                tracing::warn!(
-                    workspace = %workspace.name,
-                    mission = ?mission_id,
-                    error = %e,
-                    "Failed to clear existing context link"
-                );
+        if context_link != context_root {
+            // Use symlink_metadata to avoid following symlinks (prevents ELOOP errors)
+            if tokio::fs::symlink_metadata(&context_link).await.is_ok()
+                && tokio::fs::remove_file(&context_link).await.is_err()
+            {
+                if let Err(e) = tokio::fs::remove_dir_all(&context_link).await {
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        mission = ?mission_id,
+                        error = %e,
+                        "Failed to clear existing context link"
+                    );
+                }
             }
-        }
-        #[cfg(unix)]
-        {
-            // For container workspaces, the symlink must point to the container path
-            // since /root/context is bind-mounted, not the host path
-            let symlink_target = if workspace.workspace_type == WorkspaceType::Container {
-                // mission_id is guaranteed Some here because we're inside
-                // `if let Some(target) = mission_context.as_ref()` and
-                // mission_context is derived from mission_id.map(...)
-                PathBuf::from("/root").join(context_dir_name).join(
-                    mission_id
-                        .expect("mission_id must be Some inside mission_context block")
-                        .to_string(),
-                )
-            } else {
-                target.clone()
-            };
-            if let Err(e) = std::os::unix::fs::symlink(&symlink_target, &context_link) {
-                tracing::warn!(
-                    workspace = %workspace.name,
-                    mission = ?mission_id,
-                    error = %e,
-                    "Failed to create context symlink; falling back to directory"
-                );
+            #[cfg(unix)]
+            {
+                // For container workspaces, the symlink must point to the container path
+                // since /root/context is bind-mounted, not the host path
+                let symlink_target = if workspace.workspace_type == WorkspaceType::Container {
+                    // mission_id is guaranteed Some here because we're inside
+                    // `if let Some(target) = mission_context.as_ref()` and
+                    // mission_context is derived from mission_id.map(...)
+                    PathBuf::from("/root").join(context_dir_name).join(
+                        mission_id
+                            .expect("mission_id must be Some inside mission_context block")
+                            .to_string(),
+                    )
+                } else {
+                    target.clone()
+                };
+                if let Err(e) = std::os::unix::fs::symlink(&symlink_target, &context_link) {
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        mission = ?mission_id,
+                        error = %e,
+                        "Failed to create context symlink; falling back to directory"
+                    );
+                    let _ = tokio::fs::create_dir_all(&context_link).await;
+                }
+            }
+            #[cfg(not(unix))]
+            {
                 let _ = tokio::fs::create_dir_all(&context_link).await;
             }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::fs::create_dir_all(&context_link).await;
+        } else {
+            tracing::debug!("Skipping context symlink creation; workspace directory is root.");
         }
     }
 
@@ -3914,7 +4173,12 @@ async fn sync_workspace_mcp_binaries(
     container_root: &Path,
 ) -> anyhow::Result<()> {
     // Copy MCP binaries into the container so workspace-local MCP configs can run them directly.
-    for binary in ["workspace-mcp", "desktop-mcp", "orchestrator-mcp"] {
+    for binary in [
+        "workspace-mcp",
+        "desktop-mcp",
+        "orchestrator-mcp",
+        "automation-manager-mcp",
+    ] {
         if find_host_binary(binary, working_dir).is_none() {
             tracing::warn!(binary, "MCP binary not found on host; skipping copy");
             continue;
@@ -4637,6 +4901,80 @@ mod tests {
         let overlay = json!({"b": 99, "c": 3});
         merge_json(&mut base, &overlay);
         assert_eq!(base, json!({"a": 1, "b": 99, "c": 3}));
+    }
+
+    #[test]
+    fn bash_pretool_script_bakes_rtk_flag() {
+        let on = render_bash_pretool_script(true);
+        let off = render_bash_pretool_script(false);
+        assert!(on.contains("RTK_ENABLED=true"));
+        assert!(off.contains("RTK_ENABLED=false"));
+    }
+
+    #[test]
+    fn bash_pretool_script_rtk_off_skips_rtk_binary_lookup() {
+        // When RTK_ENABLED=false the script must evaluate RTK_PATH to the
+        // empty string, so eligible commands fall through to the `gh` bugfix
+        // branch instead of being rewritten with rtk.
+        let script = render_bash_pretool_script(false);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &script).unwrap();
+
+        // ls → when RTK is off, script must NOT rewrite (no output); exits 0 with no stdout.
+        let out = std::process::Command::new("bash")
+            .arg(tmp.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(br#"{"tool_input":{"command":"ls -la"}}"#)
+                    .unwrap();
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(out.status.success(), "script failed: {:?}", out);
+        assert!(
+            out.stdout.is_empty(),
+            "expected no rewrite, got: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    #[test]
+    fn bash_pretool_script_gh_bugfix_runs_even_when_rtk_off() {
+        // The `gh` TERM=dumb fix is independent of RTK and must fire regardless.
+        let script = render_bash_pretool_script(false);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &script).unwrap();
+
+        let out = std::process::Command::new("bash")
+            .arg(tmp.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(br#"{"tool_input":{"command":"gh pr list"}}"#)
+                    .unwrap();
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(out.status.success(), "script failed: {:?}", out);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("env TERM=dumb gh pr list"),
+            "expected gh TERM=dumb rewrite, got: {}",
+            stdout
+        );
     }
 
     #[test]

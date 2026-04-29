@@ -19,7 +19,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 reqwest-eventsource = "0.6"
 
 # Logging
@@ -43,6 +43,8 @@ async-recursion = "1"
 
 # For memory/storage
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+croner = "2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 
 # For desktop tools (process management on Unix)
@@ -76,6 +78,12 @@ idna_adapter = "=1.1.0"
 
 # File locking for OAuth token refresh synchronization
 fs2 = "0.4"
+ureq = { version = "2", features = ["json"] }
+
+# Gzip compression for mission export/import transport. flate2 already
+# lands transitively via zip/tokio-util; naming it explicitly keeps the
+# feature gate visible and lets `cargo update` move it deliberately.
+flate2 = "1"
 
 [[bin]]
 name = "sandboxed-sh"
@@ -96,6 +104,10 @@ path = "src/bin/automation_manager_mcp.rs"
 [[bin]]
 name = "orchestrator-mcp"
 path = "src/bin/orchestrator_mcp.rs"
+
+[[bin]]
+name = "fido-agent-proxy"
+path = "src/bin/fido_agent_proxy.rs"
 
 [dev-dependencies]
 tokio-test = "0.4"

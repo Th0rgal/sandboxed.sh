@@ -121,6 +121,7 @@ Files written per mission workspace:
 - `.claude/settings.local.json` (for Claude Code)
 - `.claude/skills/<name>/SKILL.md` (native Claude Code skills)
 - `CLAUDE.md` (general workspace context)
+- `AGENTS.md` (general workspace context for Amp)
 
 ## Observability
 

@@ -81,9 +81,13 @@ pub struct CreateWorkspaceRequest {
     /// Tailscale networking mode when shared_network is false.
     pub tailscale_mode: Option<TailscaleMode>,
     /// MCP server names to enable for this workspace.
-    /// Empty = use default MCPs (those with `default_enabled = true`).
+    /// See `Workspace::mcps` for the full interaction with `mcps_replace_defaults`.
     #[serde(default)]
     pub mcps: Vec<String>,
+    /// `true` (default) = `mcps` list replaces defaults, `false` = additive.
+    /// See `Workspace::mcps_replace_defaults`.
+    #[serde(default = "crate::workspace::default_true")]
+    pub mcps_replace_defaults: bool,
     /// Optional config profile to apply to this workspace.
     pub config_profile: Option<String>,
 }
@@ -113,6 +117,8 @@ pub struct UpdateWorkspaceRequest {
     pub tailscale_mode: Option<TailscaleMode>,
     /// MCP server names to enable for this workspace.
     pub mcps: Option<Vec<String>>,
+    /// `true` (default) = `mcps` list replaces defaults, `false` = additive.
+    pub mcps_replace_defaults: Option<bool>,
     /// Optional config profile to apply to this workspace.
     pub config_profile: Option<String>,
     /// Freeform workspace configuration (merged with existing config).
@@ -138,6 +144,7 @@ pub struct WorkspaceResponse {
     pub shared_network: Option<bool>,
     pub tailscale_mode: Option<TailscaleMode>,
     pub mcps: Vec<String>,
+    pub mcps_replace_defaults: bool,
     pub config_profile: Option<String>,
     pub config: serde_json::Value,
 }
@@ -162,6 +169,7 @@ impl From<Workspace> for WorkspaceResponse {
             shared_network: w.shared_network,
             tailscale_mode: w.tailscale_mode,
             mcps: w.mcps,
+            mcps_replace_defaults: w.mcps_replace_defaults,
             config_profile: w.config_profile,
             config: w.config,
         }
@@ -415,6 +423,17 @@ async fn create_workspace(
             .unwrap_or_default()
     };
 
+    // mcps_replace_defaults: if the request explicitly sets false, use that;
+    // otherwise inherit from template (default: true = original behavior).
+    let mcps_replace_defaults = if !req.mcps_replace_defaults {
+        false
+    } else {
+        template_data
+            .as_ref()
+            .map(|t| t.mcps_replace_defaults)
+            .unwrap_or(true)
+    };
+
     // Config profile from template (request overrides)
     let mut config_profile = template_data
         .as_ref()
@@ -448,6 +467,7 @@ async fn create_workspace(
             shared_network,
             tailscale_mode,
             mcps: mcps.clone(),
+            mcps_replace_defaults,
             config_profile: config_profile.clone(),
         },
         WorkspaceType::Container => {
@@ -462,6 +482,7 @@ async fn create_workspace(
             ws.shared_network = shared_network;
             ws.tailscale_mode = tailscale_mode;
             ws.mcps = mcps;
+            ws.mcps_replace_defaults = mcps_replace_defaults;
             ws.config_profile = config_profile;
             ws
         }
@@ -631,6 +652,9 @@ async fn update_workspace(
     // Update MCPs if provided
     if let Some(mcps) = req.mcps {
         workspace.mcps = mcps;
+    }
+    if let Some(exclude) = req.mcps_replace_defaults {
+        workspace.mcps_replace_defaults = exclude;
     }
 
     if let Some(config_profile) = req.config_profile {

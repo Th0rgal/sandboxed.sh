@@ -124,9 +124,9 @@ export function MissionSwitcherProvider({ children }: { children: React.ReactNod
 
       const followUpMission = await createMission({
         workspaceId: sourceMission.workspace_id,
-        agent: sourceMission.agent,
-        modelOverride: sourceMission.model_override,
-        modelEffort: sourceMission.model_effort,
+        agent: sourceMission.agent || undefined,
+        modelOverride: sourceMission.model_override || undefined,
+        modelEffort: sourceMission.model_effort || undefined,
         backend: sourceMission.backend,
       });
       await Promise.all([mutateMissions(), mutateRunningMissions()]);

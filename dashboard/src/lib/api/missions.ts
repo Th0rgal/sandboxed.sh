@@ -12,6 +12,8 @@ import { generateMissionTitle } from "../llm";
 
 export type MissionStatus = "active" | "completed" | "failed" | "interrupted" | "blocked" | "not_feasible";
 
+export type ModelEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
 export interface MissionHistoryEntry {
   role: string;
   content: string;
@@ -37,19 +39,22 @@ export interface Mission {
   metadata_model?: string | null;
   metadata_version?: string | null;
   workspace_id?: string;
-  workspace_name?: string;
-  agent?: string;
-  model_override?: string;
-  model_effort?: "low" | "medium" | "high";
+  workspace_name?: string | null;
+  agent?: string | null;
+  model_override?: string | null;
+  model_effort?: ModelEffort | null;
   backend?: string;
+  config_profile?: string | null;
   history: MissionHistoryEntry[];
   desktop_sessions?: DesktopSessionInfo[];
   created_at: string;
   updated_at: string;
   interrupted_at?: string;
   resumable?: boolean;
+  session_id?: string | null;
   parent_mission_id?: string;
   working_directory?: string;
+  mission_mode?: "task" | "assistant";
 }
 
 export interface StoredEvent {
@@ -70,9 +75,17 @@ export interface CreateMissionOptions {
   workspaceId?: string;
   agent?: string;
   modelOverride?: string;
-  modelEffort?: "low" | "medium" | "high";
+  modelEffort?: ModelEffort;
   configProfile?: string;
   backend?: string;
+}
+
+export interface UpdateMissionSettingsOptions {
+  backend?: string;
+  agent?: string | null;
+  modelOverride?: string | null;
+  modelEffort?: ModelEffort | null;
+  configProfile?: string | null;
 }
 
 export interface RunningMissionInfo {
@@ -156,14 +169,71 @@ export async function getMission(id: string): Promise<Mission> {
 
 export async function getMissionEvents(
   id: string,
-  options?: { types?: string[]; limit?: number; offset?: number }
+  options?: {
+    types?: string[];
+    limit?: number;
+    offset?: number;
+    latest?: boolean;
+    /** When set, request only events with `sequence > sinceSeq`.
+     * Takes precedence over `offset`/`latest` on the server. */
+    sinceSeq?: number;
+  }
 ): Promise<StoredEvent[]> {
+  const { events } = await getMissionEventsWithMeta(id, options);
+  return events;
+}
+
+export interface MissionEventsMeta {
+  /** Total events stored for this mission (matching the type filter if
+   * one was supplied). Read from `X-Total-Events`. `undefined` if the
+   * header was missing or unparseable. */
+  totalEvents?: number;
+  /** Highest `sequence` value stored for this mission, regardless of
+   * filter. Read from `X-Max-Sequence`. Use this as the `sinceSeq` of
+   * the next call to resume from exactly where the server is. */
+  maxSequence?: number;
+}
+
+/**
+ * Like `getMissionEvents` but also returns the `X-Total-Events` and
+ * `X-Max-Sequence` headers. Prefer this at call sites that reconnect
+ * or paginate — it lets the client skip a second count round-trip and
+ * resume from the server's latest sequence on the next delta fetch.
+ */
+export async function getMissionEventsWithMeta(
+  id: string,
+  options?: {
+    types?: string[];
+    limit?: number;
+    offset?: number;
+    latest?: boolean;
+    sinceSeq?: number;
+  }
+): Promise<{ events: StoredEvent[]; meta: MissionEventsMeta }> {
   const params = new URLSearchParams();
   if (options?.types?.length) params.set("types", options.types.join(","));
   if (options?.limit) params.set("limit", String(options.limit));
   if (options?.offset) params.set("offset", String(options.offset));
+  if (options?.latest) params.set("latest", "true");
+  if (options?.sinceSeq !== undefined) params.set("since_seq", String(options.sinceSeq));
   const query = params.toString();
-  return apiGet(`/api/control/missions/${id}/events${query ? `?${query}` : ""}`, "Failed to fetch mission events");
+  const res = await apiFetch(
+    `/api/control/missions/${id}/events${query ? `?${query}` : ""}`
+  );
+  if (!res.ok) throw new Error("Failed to fetch mission events");
+  const events = (await res.json()) as StoredEvent[];
+
+  const totalHeader = res.headers.get("x-total-events");
+  const maxSeqHeader = res.headers.get("x-max-sequence");
+  const totalEvents =
+    totalHeader !== null && totalHeader !== "" && !Number.isNaN(Number(totalHeader))
+      ? Number(totalHeader)
+      : undefined;
+  const maxSequence =
+    maxSeqHeader !== null && maxSeqHeader !== "" && !Number.isNaN(Number(maxSeqHeader))
+      ? Number(maxSeqHeader)
+      : undefined;
+  return { events, meta: { totalEvents, maxSequence } };
 }
 
 export async function getCurrentMission(): Promise<Mission | null> {
@@ -178,7 +248,7 @@ export async function createMission(
     workspace_id?: string;
     agent?: string;
     model_override?: string;
-    model_effort?: "low" | "medium" | "high";
+    model_effort?: ModelEffort;
     config_profile?: string;
     backend?: string;
   } = {};
@@ -239,6 +309,35 @@ export async function setMissionStatus(
   status: MissionStatus
 ): Promise<void> {
   return apiPost(`/api/control/missions/${id}/status`, { status }, "Failed to set mission status");
+}
+
+export async function updateMissionSettings(
+  id: string,
+  options: UpdateMissionSettingsOptions
+): Promise<Mission> {
+  const body: {
+    backend?: string;
+    agent?: string | null;
+    model_override?: string | null;
+    model_effort?: ModelEffort | null;
+    config_profile?: string | null;
+  } = {};
+  if ("backend" in options) body.backend = options.backend;
+  if ("agent" in options) body.agent = options.agent;
+  if ("modelOverride" in options) body.model_override = options.modelOverride;
+  if ("modelEffort" in options) body.model_effort = options.modelEffort;
+  if ("configProfile" in options) body.config_profile = options.configProfile;
+
+  const res = await apiFetch(`/api/control/missions/${id}/settings`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to update mission settings: ${text}`);
+  }
+  return res.json();
 }
 
 export async function deleteMission(id: string): Promise<{ ok: boolean; deleted: string }> {

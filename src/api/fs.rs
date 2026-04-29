@@ -200,6 +200,142 @@ fn translate_to_container_display_path(
     }
 }
 
+fn is_context_upload_path(path: &str) -> bool {
+    let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "context".to_string());
+    is_context_upload_path_for_dir(path, &context_dir_name)
+}
+
+fn is_context_upload_path_for_dir(path: &str, context_dir_name: &str) -> bool {
+    let normalized = path.trim().trim_start_matches("./");
+    normalized == context_dir_name
+        || normalized.starts_with(&format!("{}/", context_dir_name))
+        || normalized == format!("root/{}", context_dir_name)
+        || normalized.starts_with(&format!("root/{}/", context_dir_name))
+        || path == format!("/root/{}", context_dir_name)
+        || path.starts_with(&format!("/root/{}/", context_dir_name))
+}
+
+fn configured_context_root(config_working_dir: &Path) -> PathBuf {
+    let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "context".to_string());
+    let root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_working_dir.join(context_dir_name));
+
+    if root.is_absolute() {
+        root
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(root)
+    } else {
+        root
+    }
+}
+
+fn context_mirror_suffix(
+    remote_path: &Path,
+    mission_context: &Path,
+    container_context_root: &Path,
+    mission_id: uuid::Uuid,
+) -> Option<PathBuf> {
+    let mut suffix = remote_path
+        .strip_prefix(mission_context)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            remote_path
+                .strip_prefix(container_context_root)
+                .ok()
+                .map(Path::to_path_buf)
+        })
+        .or_else(|| remote_path.file_name().map(PathBuf::from));
+
+    if let Some(current_suffix) = suffix.as_ref() {
+        let mission_component = mission_id.to_string();
+        if current_suffix.components().next().is_some_and(|component| {
+            component.as_os_str() == std::ffi::OsStr::new(&mission_component)
+        }) {
+            suffix = current_suffix
+                .strip_prefix(&mission_component)
+                .ok()
+                .map(Path::to_path_buf);
+        }
+    }
+
+    suffix
+}
+
+async fn mirror_context_upload_to_container_rootfs(
+    config_working_dir: &Path,
+    workspace: Option<&crate::workspace::Workspace>,
+    mission_id: Option<uuid::Uuid>,
+    requested_path: &str,
+    remote_path: &Path,
+) {
+    let (Some(workspace), Some(mission_id)) = (workspace, mission_id) else {
+        return;
+    };
+    if workspace.workspace_type != WorkspaceType::Container
+        || !is_context_upload_path(requested_path)
+    {
+        return;
+    }
+
+    let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "context".to_string());
+    let context_root = configured_context_root(config_working_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| configured_context_root(config_working_dir));
+    let mission_context = context_root.join(mission_id.to_string());
+    let container_context_root = workspace.path.join("root").join(&context_dir_name);
+    let suffix = context_mirror_suffix(
+        remote_path,
+        &mission_context,
+        &container_context_root,
+        mission_id,
+    );
+    let Some(suffix) = suffix else {
+        return;
+    };
+
+    let mirror_path = workspace
+        .path
+        .join("root")
+        .join(context_dir_name)
+        .join(mission_id.to_string())
+        .join(suffix);
+
+    if mirror_path == remote_path {
+        return;
+    }
+    if let Some(parent) = mirror_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            tracing::warn!(
+                path = %parent.display(),
+                error = %e,
+                "Failed to create container context mirror directory"
+            );
+            return;
+        }
+    }
+    if let Err(e) = tokio::fs::copy(remote_path, &mirror_path).await {
+        tracing::warn!(
+            source = %remote_path.display(),
+            target = %mirror_path.display(),
+            error = %e,
+            "Failed to mirror uploaded context file into container rootfs"
+        );
+    }
+}
+
 /// Resolve a path relative to a specific workspace.
 /// If mission_id is provided and path is a context path, resolves to mission-specific context.
 pub async fn resolve_path_for_workspace(
@@ -247,18 +383,21 @@ pub async fn resolve_path_for_workspace(
         // This ensures uploaded files go to the right place for the agent to find them
         let context_path = if let Some(mid) = mission_id {
             if workspace.workspace_type == WorkspaceType::Container {
-                // For container workspaces, store inside the container rootfs so
-                // the file is always accessible at /root/context/{mission_id}/
-                // without depending on bind-mounts (which are unreliable when the
-                // container is already running and we use nsenter).
+                // For container workspaces, write to the HOST context root
+                // (config.working_dir/context/<mid>/).  This directory is
+                // bind-mounted into the container at /root/context, so the
+                // agent sees the files.  Writing to the container rootfs does
+                // NOT work because the bind-mount shadows the rootfs path.
                 let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "context".to_string());
-                workspace_root
-                    .join("root")
-                    .join(context_dir_name)
-                    .join(mid.to_string())
+                let global_context_root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| state.config.working_dir.join(&context_dir_name));
+                global_context_root.join(mid.to_string())
             } else {
                 // For host workspaces, use the global context root
                 let context_root = state.config.working_dir.join("context");
@@ -828,6 +967,15 @@ pub async fn upload(
         // Try rename first (fast), fall back to copy+delete if across filesystems
         move_file(&tmp, &remote_path).await?;
 
+        mirror_context_upload_to_container_rootfs(
+            &state.config.working_dir,
+            workspace_for_display.as_ref(),
+            q.mission_id,
+            &q.path,
+            &remote_path,
+        )
+        .await;
+
         // For container workspaces, return the container-internal path so the
         // [Uploaded: ...] tag points to a path the agent can actually access.
         let display_path = match &workspace_for_display {
@@ -1011,6 +1159,15 @@ pub async fn upload_finalize(
 
     let remote_path = result?;
 
+    mirror_context_upload_to_container_rootfs(
+        &state.config.working_dir,
+        workspace_for_display.as_ref(),
+        req.mission_id,
+        &req.path,
+        &remote_path,
+    )
+    .await;
+
     let display_path = match &workspace_for_display {
         Some(ws) => translate_to_container_display_path(&remote_path, ws),
         None => remote_path,
@@ -1169,6 +1326,15 @@ pub async fn download_from_url(
 
     move_file(&tmp, &remote_path).await?;
 
+    mirror_context_upload_to_container_rootfs(
+        &state.config.working_dir,
+        workspace_for_display.as_ref(),
+        req.mission_id,
+        &req.path,
+        &remote_path,
+    )
+    .await;
+
     let display_path = match &workspace_for_display {
         Some(ws) => translate_to_container_display_path(&remote_path, ws),
         None => remote_path,
@@ -1177,4 +1343,76 @@ pub async fn download_from_url(
     Ok(Json(
         serde_json::json!({ "ok": true, "path": display_path, "name": file_name }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{context_mirror_suffix, is_context_upload_path_for_dir};
+    use std::path::{Path, PathBuf};
+    use uuid::Uuid;
+
+    #[test]
+    fn context_upload_path_matches_exact_context_root_with_boundary() {
+        assert!(is_context_upload_path_for_dir(
+            "context/file.pdf",
+            "context"
+        ));
+        assert!(is_context_upload_path_for_dir(
+            "./context/file.pdf",
+            "context"
+        ));
+        assert!(is_context_upload_path_for_dir(
+            "/root/context/file.pdf",
+            "context"
+        ));
+        assert!(is_context_upload_path_for_dir("/root/ctx/file.pdf", "ctx"));
+        assert!(!is_context_upload_path_for_dir(
+            "/root/contextual/file.pdf",
+            "context"
+        ));
+        assert!(!is_context_upload_path_for_dir(
+            "/root/context/file.pdf",
+            "ctx"
+        ));
+    }
+
+    #[test]
+    fn context_mirror_suffix_preserves_absolute_container_subdirectories() {
+        let mission_id = Uuid::parse_str("95e6bd13-0963-4b19-a485-c2c3f59aeb02").unwrap();
+        let mission_context = Path::new("/root/.sandboxed-sh/context").join(mission_id.to_string());
+        let container_context_root =
+            Path::new("/root/.sandboxed-sh/containers/ws/root/context").to_path_buf();
+        let remote_path = container_context_root.join("papers/Toward.pdf");
+
+        let suffix = context_mirror_suffix(
+            &remote_path,
+            &mission_context,
+            &container_context_root,
+            mission_id,
+        )
+        .unwrap();
+
+        assert_eq!(suffix, PathBuf::from("papers/Toward.pdf"));
+    }
+
+    #[test]
+    fn context_mirror_suffix_does_not_duplicate_mission_id() {
+        let mission_id = Uuid::parse_str("95e6bd13-0963-4b19-a485-c2c3f59aeb02").unwrap();
+        let mission_context = Path::new("/root/.sandboxed-sh/context").join(mission_id.to_string());
+        let container_context_root =
+            Path::new("/root/.sandboxed-sh/containers/ws/root/context").to_path_buf();
+        let remote_path = container_context_root
+            .join(mission_id.to_string())
+            .join("papers/Toward.pdf");
+
+        let suffix = context_mirror_suffix(
+            &remote_path,
+            &mission_context,
+            &container_context_root,
+            mission_id,
+        )
+        .unwrap();
+
+        assert_eq!(suffix, PathBuf::from("papers/Toward.pdf"));
+    }
 }

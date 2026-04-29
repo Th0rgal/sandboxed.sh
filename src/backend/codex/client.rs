@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -92,16 +92,18 @@ impl CodexClient {
             args.push(format!("reasoning.effort=\"{}\"", effort));
         }
 
-        // Add the message as a positional arg (guard prompts starting with '-')
+        // Read the prompt from stdin instead of placing the full mission
+        // transcript on argv. Long resumed missions can otherwise produce very
+        // large process command lines, especially through container wrappers.
         args.push("--".to_string());
-        args.push(message.to_string());
+        args.push("-".to_string());
 
         info!(
             "Spawning Codex CLI: directory={}, model={:?}, effort={:?}",
             directory, effective_model, self.config.model_effort
         );
 
-        let (program, full_args) = if self.config.cli_path.contains(' ') {
+        let (program, mut full_args) = if self.config.cli_path.contains(' ') {
             let parts: Vec<&str> = self.config.cli_path.splitn(2, ' ').collect();
             let program = parts[0].to_string();
             let mut full_args = if parts.len() > 1 {
@@ -115,36 +117,92 @@ impl CodexClient {
             (self.config.cli_path.clone(), args.clone())
         };
 
-        let mut child = if let Some(exec) = workspace_exec {
-            exec.spawn_streaming(Path::new(directory), &program, &full_args, env)
-                .await
-                .map_err(|e| {
-                    error!("Failed to spawn Codex CLI in workspace: {}", e);
-                    anyhow!("Failed to spawn Codex CLI in workspace: {}", e)
-                })?
-        } else {
-            let mut cmd = Command::new(&program);
-            cmd.current_dir(directory)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .args(&full_args);
-            if !env.is_empty() {
-                cmd.envs(env);
+        // Spawn the child, asking for piped stdin so we can feed the prompt
+        // via stdin. If for some reason the exec path returns a child
+        // without a stdin pipe (e.g., a container wrapper that closes
+        // stdin), fall back to passing the prompt on argv instead of
+        // failing the mission outright.
+        async fn spawn_codex_child(
+            workspace_exec: Option<&WorkspaceExec>,
+            directory: &str,
+            program: &str,
+            full_args: &[String],
+            env: HashMap<String, String>,
+            cli_path: &str,
+        ) -> Result<tokio::process::Child> {
+            if let Some(exec) = workspace_exec {
+                exec.spawn_streaming(Path::new(directory), program, full_args, env)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to spawn Codex CLI in workspace: {}", e);
+                        anyhow!("Failed to spawn Codex CLI in workspace: {}", e)
+                    })
+            } else {
+                let mut cmd = Command::new(program);
+                cmd.current_dir(directory)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .args(full_args);
+                if !env.is_empty() {
+                    cmd.envs(env);
+                }
+                cmd.spawn().map_err(|e| {
+                    error!("Failed to spawn Codex CLI: {}", e);
+                    anyhow!(
+                        "Failed to spawn Codex CLI: {}. Is it installed at '{}'?",
+                        e,
+                        cli_path
+                    )
+                })
             }
-            cmd.spawn().map_err(|e| {
-                error!("Failed to spawn Codex CLI: {}", e);
-                anyhow!(
-                    "Failed to spawn Codex CLI: {}. Is it installed at '{}'?",
-                    e,
-                    self.config.cli_path
-                )
-            })?
-        };
+        }
 
-        // Close stdin immediately since we don't need to write to it
-        // (message is passed as CLI argument)
-        drop(child.stdin.take());
+        let mut child = spawn_codex_child(
+            workspace_exec,
+            directory,
+            &program,
+            &full_args,
+            env.clone(),
+            &self.config.cli_path,
+        )
+        .await?;
+
+        let prompt = message.to_string();
+        let stdin_task = if let Some(mut stdin) = child.stdin.take() {
+            let prompt_for_stdin = prompt.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = stdin.write_all(prompt_for_stdin.as_bytes()).await {
+                    debug!("Failed to write Codex prompt to stdin: {}", e);
+                    return;
+                }
+                if let Err(e) = stdin.shutdown().await {
+                    debug!("Failed to close Codex stdin: {}", e);
+                }
+            }))
+        } else {
+            // Fallback path: no stdin pipe. Kill the child, rewrite the
+            // `-` placeholder to the actual prompt, and respawn. Keeps
+            // container-workspace Codex missions working even if the exec
+            // layer doesn't forward stdin.
+            warn!("Codex child had no stdin pipe; falling back to argv prompt");
+            let _ = child.kill().await;
+            if let Some(pos) = full_args.iter().rposition(|a| a == "-") {
+                full_args[pos] = prompt.clone();
+            } else {
+                full_args.push(prompt.clone());
+            }
+            child = spawn_codex_child(
+                workspace_exec,
+                directory,
+                &program,
+                &full_args,
+                env.clone(),
+                &self.config.cli_path,
+            )
+            .await?;
+            None
+        };
 
         // Spawn task to read stdout and parse events
         let stdout = child
@@ -268,28 +326,45 @@ impl CodexClient {
                 }
             }
 
+            if let Some(task) = stdin_task {
+                let _ = task.await;
+            }
             let _ = stderr_task.await;
 
-            // If the CLI exited without emitting any JSON events, surface stderr/stdout as an error.
-            if !saw_any_event {
-                let stderr_content = stderr_capture.lock().await;
-                let non_json = stdout_non_json.lock().await;
-                let exit_status = exit_status
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
+            let stderr_content = stderr_capture.lock().await;
+            let non_json = stdout_non_json.lock().await;
+            let exit_failed = exit_status.as_ref().is_some_and(|status| !status.success());
+            let exit_status_text = exit_status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let stderr_excerpt = stderr_content
+                .lines()
+                .take(10)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let stdout_excerpt = non_json.join(" | ");
 
+            // If Codex exits unsuccessfully after having emitted partial JSON
+            // events, do not let the runner mistake the last progress update for
+            // a completed answer.
+            if exit_failed {
+                let _ = tx
+                    .send(CodexEvent::Error {
+                        message: format!(
+                            "Codex CLI exited before completing the turn (exit_status: {}). Stderr: {} | Stdout: {}",
+                            exit_status_text,
+                            if stderr_excerpt.is_empty() { "<empty>" } else { &stderr_excerpt },
+                            if stdout_excerpt.is_empty() { "<empty>" } else { &stdout_excerpt }
+                        ),
+                    })
+                    .await;
+            } else if !saw_any_event {
                 if !stderr_content.trim().is_empty() || !non_json.is_empty() {
-                    let stderr_excerpt = stderr_content
-                        .lines()
-                        .take(10)
-                        .collect::<Vec<_>>()
-                        .join(" | ");
-                    let stdout_excerpt = non_json.join(" | ");
                     let _ = tx
                         .send(CodexEvent::Error {
                             message: format!(
                                 "Codex CLI produced no JSON output (exit_status: {}). Stderr: {} | Stdout: {}",
-                                exit_status,
+                                exit_status_text,
                                 if stderr_excerpt.is_empty() { "<empty>" } else { &stderr_excerpt },
                                 if stdout_excerpt.is_empty() { "<empty>" } else { &stdout_excerpt }
                             ),
@@ -300,7 +375,7 @@ impl CodexClient {
                         .send(CodexEvent::Error {
                             message: format!(
                                 "Codex CLI produced no JSON output (exit_status: {}). No stderr/stdout captured.",
-                                exit_status
+                                exit_status_text
                             ),
                         })
                         .await;

@@ -444,11 +444,11 @@ pub fn convert_cli_event(
                     debug!("Tool input delta: {}", partial);
                 }
             }
-            StreamEvent::ContentBlockStart { content_block, .. } => {
-                if content_block.block_type == "tool_use" {
-                    if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                        pending_tools.insert(id, name);
-                    }
+            StreamEvent::ContentBlockStart { content_block, .. }
+                if content_block.block_type == "tool_use" =>
+            {
+                if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
+                    pending_tools.insert(id, name);
                 }
             }
             _ => {}

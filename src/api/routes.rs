@@ -13,7 +13,7 @@ use axum::{
         sse::{Event, Sse},
         Json,
     },
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use futures::stream::Stream;
@@ -114,6 +114,10 @@ pub struct AppState {
     pub proxy_api_keys: super::proxy_keys::SharedProxyApiKeyStore,
     /// Deferred queue for proxy requests that opt into async-on-rate-limit mode
     pub deferred_requests: Arc<deferred_proxy_api::DeferredRequestStore>,
+    /// Telegram bridge for assistant missions
+    pub telegram_bridge: super::telegram::SharedTelegramBridge,
+    /// FIDO signing relay hub (pending approval requests)
+    pub fido_hub: Arc<super::fido::FidoSigningHub>,
 }
 
 /// Start the HTTP server.
@@ -413,8 +417,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!("Configuration library disabled (no remote configured)");
     }
 
+    // Create Telegram bridge (shared across all user sessions).
+    let telegram_bridge = Arc::new(super::telegram::TelegramBridge::new());
+
     // Spawn the single global control session actor.
-    let control_state = control::ControlHub::new(
+    let mut control_state = control::ControlHub::new(
         config.clone(),
         Arc::clone(&root_agent),
         Arc::clone(&mcp),
@@ -422,6 +429,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         Arc::clone(&library),
         secrets.clone(),
     );
+    control_state.set_telegram_bridge(Arc::clone(&telegram_bridge));
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -462,6 +470,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             }),
         proxy_api_keys,
         deferred_requests,
+        telegram_bridge,
+        fido_hub: Arc::new(super::fido::FidoSigningHub::new()),
     });
 
     // Initialize the metadata LLM client for AI-powered mission titles/descriptions
@@ -497,6 +507,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Start deferred proxy queue worker.
     deferred_proxy_api::start_worker(Arc::clone(&state));
 
+    // Eagerly boot the control session so Telegram webhooks are re-registered
+    // immediately on server start (rather than waiting for the first
+    // authenticated API call). Use the same implicit single-tenant identity
+    // that the auth middleware would assign so Telegram channels and missions
+    // are visible in the dashboard.
+    {
+        let state_clone = Arc::clone(&state);
+        tokio::spawn(async move {
+            let default_user = super::auth::implicit_single_tenant_user(&state_clone.config);
+            let _ = state_clone.control.get_or_spawn(&default_user).await;
+            tracing::info!("Eagerly booted default control session (Telegram webhooks registered)");
+        });
+    }
+
     // Fetch model catalog from provider APIs in background
     {
         let catalog = Arc::clone(&state.model_catalog);
@@ -522,6 +546,19 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/webhooks/:mission_id/:webhook_id",
             post(control::webhook_receiver),
+        )
+        // Telegram webhook receiver (no auth - uses Telegram secret_token header validation)
+        .route(
+            "/api/telegram/webhook/:channel_id",
+            post(control::telegram_webhook_receiver),
+        )
+        .route(
+            "/api/control/telegram/actions/internal",
+            post(control::execute_telegram_action_internal_api),
+        )
+        .route(
+            "/api/control/telegram/workflows/request/internal",
+            post(control::execute_telegram_workflow_request_internal_api),
         )
         // WebSocket console uses subprotocol-based auth (browser can't set Authorization header)
         .route("/api/console/ws", get(console::console_ws))
@@ -558,6 +595,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/task/:id/stop", post(stop_task))
         .route("/api/task/:id/stream", get(stream_task))
         .route("/api/tasks", get(list_tasks))
+        // FIDO signing relay endpoints
+        .route("/api/fido/request", post(super::fido::post_fido_request))
+        .route("/api/fido/respond", post(super::fido::post_fido_respond))
         // Global control session endpoints
         .route("/api/control/message", post(control::post_message))
         .route("/api/control/tool_result", post(control::post_tool_result))
@@ -618,6 +658,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::set_mission_title),
         )
         .route(
+            "/api/control/missions/:id/settings",
+            patch(control::update_mission_settings),
+        )
+        .route(
+            "/api/control/missions/:id/mode",
+            post(control::set_mission_mode),
+        )
+        .route(
             "/api/control/missions/:id/cancel",
             post(control::cancel_mission),
         )
@@ -667,6 +715,123 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/:id/automation-executions",
             get(control::get_mission_automation_executions),
+        )
+        // Mission portability — export a mission for transfer to another
+        // instance, and import one coming from elsewhere. The import route
+        // gets its own body limit layer because mission bundles routinely
+        // hit hundreds of MB (a long-running mission carries 50k+ tool
+        // results), and the default axum limit (2 MB) would 413 them.
+        .route(
+            "/api/control/missions/:id/export",
+            get(control::export_mission),
+        )
+        // Single-shot import buffers the entire body in memory (it
+        // arrives as `axum::body::Bytes`). Keep the cap tight enough
+        // that one request can't exhaust RAM — callers with larger
+        // bundles should use the chunked `/import-chunks` flow, which
+        // streams straight from disk.
+        .route(
+            "/api/control/missions/import",
+            post(control::import_mission).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+        )
+        // Chunked fallback for bundles that exceed Cloudflare's 100 MB
+        // per-request cap even after gzip. Upload flow:
+        //   1. POST /import-chunks → { upload_id }
+        //   2. PUT  /import-chunks/:upload_id/:index (raw chunk body)
+        //   3. POST /import-chunks/:upload_id/commit?total_chunks=N&gzip=...
+        // Chunks stage under /tmp; commit assembles, decompresses, imports.
+        .route(
+            "/api/control/missions/import-chunks",
+            post(control::init_mission_import),
+        )
+        .route(
+            "/api/control/missions/import-chunks/:upload_id/:index",
+            axum::routing::put(control::upload_mission_import_chunk)
+                .layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+        )
+        .route(
+            "/api/control/missions/import-chunks/:upload_id/commit",
+            post(control::commit_mission_import),
+        )
+        .route(
+            "/api/control/missions/import-chunks/:upload_id",
+            axum::routing::delete(control::cancel_mission_import),
+        )
+        // Assistant missions
+        .route(
+            "/api/control/assistants",
+            get(control::list_assistant_missions),
+        )
+        // Telegram channel endpoints
+        .route(
+            "/api/control/missions/:id/telegram-channels",
+            get(control::list_telegram_channels),
+        )
+        .route(
+            "/api/control/missions/:id/telegram-channels",
+            post(control::create_telegram_channel),
+        )
+        .route(
+            "/api/control/telegram-channels/:id",
+            axum::routing::delete(control::delete_telegram_channel)
+                .patch(control::update_telegram_channel),
+        )
+        .route(
+            "/api/control/telegram-channels/:id/toggle",
+            post(control::toggle_telegram_channel),
+        )
+        // Standalone Telegram bot endpoints (auto-create missions per chat)
+        .route(
+            "/api/control/telegram/bots",
+            get(control::list_telegram_bots).post(control::create_telegram_bot),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/chats",
+            get(control::list_bot_chats),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/scheduled",
+            get(control::list_bot_scheduled_messages),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/actions",
+            get(control::list_bot_action_executions),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/conversations",
+            get(control::list_bot_conversations),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/workflows",
+            get(control::list_bot_workflows),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/memory",
+            get(control::list_bot_structured_memory),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/memory-search",
+            get(control::search_bot_structured_memory),
+        )
+        .route(
+            "/api/control/telegram/conversations/:id/messages",
+            get(control::list_telegram_conversation_messages),
+        )
+        .route(
+            "/api/control/telegram/workflows/:id/events",
+            get(control::list_telegram_workflow_events),
+        )
+        .route(
+            "/api/control/telegram/send",
+            post(control::send_telegram_message_api),
+        )
+        .route(
+            "/api/control/telegram/actions",
+            post(control::execute_telegram_action_api),
+        )
+        .route(
+            "/api/control/telegram/workflows/request",
+            post(control::execute_telegram_workflow_request_api),
         )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))
@@ -815,6 +980,7 @@ async fn shutdown_signal(state: Arc<AppState>) {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to install Ctrl+C handler");
+        "SIGINT"
     };
 
     #[cfg(unix)]
@@ -823,24 +989,46 @@ async fn shutdown_signal(state: Arc<AppState>) {
             .expect("failed to install signal handler")
             .recv()
             .await;
+        "SIGTERM"
     };
 
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let terminate = std::future::pending::<&'static str>();
 
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
+    let signal = tokio::select! {
+        signal = ctrl_c => signal,
+        signal = terminate => signal,
+    };
 
-    tracing::info!("Shutdown signal received, marking running missions as interrupted...");
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let invocation_id = std::env::var("INVOCATION_ID").ok();
+    tracing::warn!(
+        signal,
+        pid = std::process::id(),
+        ppid = shutdown_parent_pid(),
+        exe = %exe,
+        cmdline = ?shutdown_cmdline(),
+        invocation_id = ?invocation_id,
+        "Shutdown signal received; marking running missions as interrupted"
+    );
 
     // Send graceful shutdown command to all control sessions
     let sessions = state.control.all_sessions().await;
+    tracing::info!(
+        signal,
+        control_sessions = sessions.len(),
+        "Dispatching graceful shutdown to control sessions"
+    );
     if sessions.is_empty() {
         tracing::info!("No active control sessions to shut down");
         return;
     }
+
+    // Grab a mission store reference before consuming sessions.
+    let mission_store = sessions.first().map(|cs| cs.mission_store.clone());
 
     let mut all_interrupted: Vec<Uuid> = Vec::new();
     for control in sessions {
@@ -867,14 +1055,73 @@ async fn shutdown_signal(state: Arc<AppState>) {
     if all_interrupted.is_empty() {
         tracing::info!("No running missions to interrupt");
     } else {
-        tracing::info!(
-            "Marked {} missions as interrupted: {:?}",
+        tracing::warn!(
+            "SHUTDOWN: Interrupted {} active mission(s):",
             all_interrupted.len(),
-            all_interrupted
+        );
+        // Log details for each interrupted mission so operators can resume them.
+        if let Some(store) = mission_store.as_ref() {
+            for mid in &all_interrupted {
+                let title = store
+                    .get_mission(*mid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.title)
+                    .unwrap_or_else(|| "<untitled>".to_string());
+                tracing::warn!("  SHUTDOWN: mission {} - \"{}\"", mid, title,);
+            }
+        }
+        // Log a single copy-pasteable line for easy resume.
+        let ids: Vec<String> = all_interrupted.iter().map(|id| id.to_string()).collect();
+        tracing::warn!(
+            "SHUTDOWN: To resume, reset these mission IDs: {}",
+            ids.join(" "),
         );
     }
 
     tracing::info!("Graceful shutdown complete");
+}
+
+#[cfg(target_os = "linux")]
+fn shutdown_parent_pid() -> Option<u32> {
+    // /proc/self/stat has the executable name in parentheses and the ppid as
+    // the fourth field. Split after the closing parenthesis so names containing
+    // spaces do not shift the field positions.
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shutdown_parent_pid() -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn shutdown_cmdline() -> Option<String> {
+    let bytes = std::fs::read("/proc/self/cmdline").ok()?;
+    let cmdline = bytes
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cmdline.is_empty() {
+        None
+    } else if cmdline.len() > 300 {
+        Some(format!(
+            "{}...",
+            cmdline.chars().take(300).collect::<String>()
+        ))
+    } else {
+        Some(cmdline)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shutdown_cmdline() -> Option<String> {
+    None
 }
 
 /// Health check endpoint.

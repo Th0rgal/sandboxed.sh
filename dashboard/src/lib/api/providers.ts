@@ -196,6 +196,8 @@ export async function updateAIProvider(
     base_url?: string | null;
     enabled?: boolean;
     use_for_backends?: string[];
+    /** Account email — set by frontend when server-side userinfo fetch fails */
+    account_email?: string;
   }
 ): Promise<AIProvider> {
   return apiPut(`/api/ai/providers/${id}`, data, "Failed to update AI provider");

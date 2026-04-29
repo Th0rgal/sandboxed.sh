@@ -298,6 +298,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
           ? selectedBackends
           : undefined
       );
+
       toast.success('Provider connected');
       onSuccess();
       onClose();

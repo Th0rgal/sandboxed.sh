@@ -41,3 +41,15 @@ Validates strong workspace skill isolation on the server (checks OpenCode env, g
 
 ### mission_debug_bundle.sh
 Collects a mission-focused diagnostic bundle from control API endpoints (mission snapshot, events, tree, automations, progress, OpenCode diagnostics) and outputs a `.tar.gz` archive for triage.
+
+### telegram_user_smoke.py
+Authenticates a real Telegram user account via Telethon and helps test a bot from
+the client side.
+
+Setup:
+- Create API credentials on `https://my.telegram.org`
+- Export `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and `TELEGRAM_PHONE`
+- Install Telethon: `python3 -m pip install telethon`
+
+Example:
+- `python3 scripts/telegram_user_smoke.py --chat -1001730152948 --send "@ana_lfgbot ping" --print-history`

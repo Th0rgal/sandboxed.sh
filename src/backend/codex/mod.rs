@@ -206,6 +206,33 @@ fn convert_codex_event(
         }
     }
 
+    fn command_execution_name() -> String {
+        "bash".to_string()
+    }
+
+    fn command_execution_args(
+        data: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "command": data.get("command").cloned().unwrap_or(serde_json::Value::Null),
+        })
+    }
+
+    fn command_execution_result(
+        data: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "output": data
+                .get("aggregated_output")
+                .or_else(|| data.get("output"))
+                .or_else(|| data.get("result"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "exit_code": data.get("exit_code").cloned().unwrap_or(serde_json::Value::Null),
+            "status": data.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        })
+    }
+
     let mut results = vec![];
 
     fn mcp_tool_name(
@@ -457,6 +484,15 @@ fn convert_codex_event(
                         });
                     }
                 }
+                "command_execution" => {
+                    if !mark_tool_call_emitted(item_content_cache, &item.id) {
+                        results.push(ExecutionEvent::ToolCall {
+                            id: item.id.clone(),
+                            name: command_execution_name(),
+                            args: command_execution_args(&item.data),
+                        });
+                    }
+                }
                 "mcp_tool_call" => {
                     if let Some(name) = mcp_tool_name(&item.data) {
                         let args = mcp_tool_args(&item.data)
@@ -489,6 +525,21 @@ fn convert_codex_event(
                             result,
                         });
                     }
+                }
+                "command_execution" => {
+                    let name = command_execution_name();
+                    if !mark_tool_call_emitted(item_content_cache, &item.id) {
+                        results.push(ExecutionEvent::ToolCall {
+                            id: item.id.clone(),
+                            name: name.clone(),
+                            args: command_execution_args(&item.data),
+                        });
+                    }
+                    results.push(ExecutionEvent::ToolResult {
+                        id: item.id.clone(),
+                        name,
+                        result: command_execution_result(&item.data),
+                    });
                 }
                 "mcp_tool_call" => {
                     if let Some(name) = mcp_tool_name(&item.data) {
@@ -914,6 +965,111 @@ mod tests {
             }
             other => panic!("Expected ToolCall, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn convert_codex_event_item_completed_command_execution_emits_call_and_result() {
+        let event: CodexEvent = serde_json::from_value(json!({
+            "type": "item.completed",
+            "item": {
+                "id": "cmd_exec1",
+                "type": "command_execution",
+                "command": "/bin/bash -lc \"ls -la\"",
+                "aggregated_output": "total 0\n",
+                "exit_code": 0,
+                "status": "completed"
+            }
+        }))
+        .unwrap();
+        let mut cache = HashMap::new();
+        let events = convert_codex_event(event, &mut cache);
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            ExecutionEvent::ToolCall { id, name, args } => {
+                assert_eq!(id, "cmd_exec1");
+                assert_eq!(name, "bash");
+                assert_eq!(args["command"], "/bin/bash -lc \"ls -la\"");
+            }
+            other => panic!("Expected ToolCall, got {:?}", other),
+        }
+        match &events[1] {
+            ExecutionEvent::ToolResult { id, name, result } => {
+                assert_eq!(id, "cmd_exec1");
+                assert_eq!(name, "bash");
+                assert_eq!(result["output"], "total 0\n");
+                assert_eq!(result["exit_code"], 0);
+                assert_eq!(result["status"], "completed");
+            }
+            other => panic!("Expected ToolResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn convert_codex_event_item_completed_command_execution_after_created_only_emits_result() {
+        let created_event: CodexEvent = serde_json::from_value(json!({
+            "type": "item.created",
+            "item": {
+                "id": "cmd_exec2",
+                "type": "command_execution",
+                "command": "pwd"
+            }
+        }))
+        .unwrap();
+        let completed_event: CodexEvent = serde_json::from_value(json!({
+            "type": "item.completed",
+            "item": {
+                "id": "cmd_exec2",
+                "type": "command_execution",
+                "command": "pwd",
+                "aggregated_output": "/tmp\n",
+                "exit_code": 0,
+                "status": "completed"
+            }
+        }))
+        .unwrap();
+        let mut cache = HashMap::new();
+        let created = convert_codex_event(created_event, &mut cache);
+        assert_eq!(created.len(), 1);
+        let completed = convert_codex_event(completed_event, &mut cache);
+        assert_eq!(completed.len(), 1);
+        match &completed[0] {
+            ExecutionEvent::ToolResult { id, name, result } => {
+                assert_eq!(id, "cmd_exec2");
+                assert_eq!(name, "bash");
+                assert_eq!(result["output"], "/tmp\n");
+            }
+            other => panic!("Expected ToolResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn convert_codex_event_repeated_command_execution_updates_emit_one_call() {
+        let created_event: CodexEvent = serde_json::from_value(json!({
+            "type": "item.created",
+            "item": {
+                "id": "cmd_exec_repeat",
+                "type": "command_execution",
+                "command": "pwd"
+            }
+        }))
+        .unwrap();
+        let updated_event: CodexEvent = serde_json::from_value(json!({
+            "type": "item.updated",
+            "item": {
+                "id": "cmd_exec_repeat",
+                "type": "command_execution",
+                "command": "pwd",
+                "aggregated_output": "/tmp\n"
+            }
+        }))
+        .unwrap();
+        let mut cache = HashMap::new();
+        let created = convert_codex_event(created_event, &mut cache);
+        let updated = convert_codex_event(updated_event, &mut cache);
+
+        assert_eq!(created.len(), 1);
+        assert!(matches!(created[0], ExecutionEvent::ToolCall { .. }));
+        assert!(updated.is_empty());
     }
 
     #[test]

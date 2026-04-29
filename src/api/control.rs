@@ -16,11 +16,15 @@ use std::sync::Arc;
 use axum::{
     body::Bytes,
     extract::{Extension, Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::sse::{Event, Sse},
+    http::{header, HeaderMap, StatusCode},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Response,
+    },
     Json,
 };
 use futures::stream::Stream;
+use serde::Deserializer;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -38,7 +42,7 @@ use super::desktop;
 use super::library::SharedLibrary;
 use super::mission_store::{
     self, create_mission_store, now_string, Mission, MissionHistoryEntry, MissionStore,
-    MissionStoreType, StoredEvent,
+    MissionStoreType,
 };
 use super::routes::AppState;
 
@@ -2646,6 +2650,17 @@ pub enum AgentEvent {
         metadata_model: Option<String>,
         metadata_version: Option<String>,
     },
+    /// Mission run settings changed (backend/model/agent/config profile)
+    MissionSettingsUpdated {
+        mission_id: Uuid,
+        backend: String,
+        agent: Option<String>,
+        model_override: Option<String>,
+        model_effort: Option<String>,
+        config_profile: Option<String>,
+        session_id: Option<String>,
+        updated_at: String,
+    },
     /// Agent phase update (for showing preparation steps)
     AgentPhase {
         /// Phase name: "executing", "delegating", etc.
@@ -2696,6 +2711,18 @@ pub enum AgentEvent {
         /// Mission this activity belongs to
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
+    },
+    /// FIDO signing approval request forwarded to the mobile app
+    FidoSignRequest {
+        request_id: Uuid,
+        key_type: String,
+        key_fingerprint: String,
+        origin: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        expires_at: String,
     },
 }
 
@@ -2779,6 +2806,8 @@ impl AgentEvent {
             AgentEvent::MissionActivity { .. } => "mission_activity",
             AgentEvent::MissionTitleChanged { .. } => "mission_title_changed",
             AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
+            AgentEvent::MissionSettingsUpdated { .. } => "mission_settings_updated",
+            AgentEvent::FidoSignRequest { .. } => "fido_sign_request",
         }
     }
 
@@ -2800,6 +2829,8 @@ impl AgentEvent {
             AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
             AgentEvent::MissionTitleChanged { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
+            AgentEvent::MissionSettingsUpdated { mission_id, .. } => Some(*mission_id),
+            AgentEvent::FidoSignRequest { .. } => None,
         }
     }
 }
@@ -2836,7 +2867,7 @@ pub enum ControlCommand {
         agent: Option<String>,
         /// Optional model override (provider/model)
         model_override: Option<String>,
-        /// Optional model effort override (e.g. low/medium/high)
+        /// Optional model effort override (e.g. low/medium/high/xhigh/max)
         model_effort: Option<String>,
         /// Backend to use for this mission ("opencode" or "claudecode")
         backend: Option<String>,
@@ -2859,6 +2890,17 @@ pub enum ControlCommand {
         id: Uuid,
         title: String,
         respond: oneshot::Sender<Result<(), String>>,
+    },
+    /// Update mission run settings
+    UpdateMissionSettings {
+        id: Uuid,
+        backend: Option<String>,
+        agent: Option<Option<String>>,
+        model_override: Option<Option<String>>,
+        model_effort: Option<Option<String>>,
+        config_profile: Option<Option<String>>,
+        session_id: String,
+        respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Start a mission in parallel (if slots available)
     StartParallel {
@@ -3079,6 +3121,7 @@ pub struct ControlHub {
     workspaces: workspace::SharedWorkspaceStore,
     library: SharedLibrary,
     secrets: Option<Arc<SecretsStore>>,
+    telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 }
 
 impl ControlHub {
@@ -3098,7 +3141,22 @@ impl ControlHub {
             workspaces,
             library,
             secrets,
+            telegram_bridge: None,
         }
+    }
+
+    /// Set the Telegram bridge reference (called after AppState is created).
+    pub fn set_telegram_bridge(&mut self, bridge: super::telegram::SharedTelegramBridge) {
+        self.telegram_bridge = Some(bridge);
+    }
+
+    /// Get the events broadcast sender from any active session.
+    /// Used by the FIDO signing hub to broadcast signing requests to all
+    /// connected SSE clients regardless of which user session they belong to.
+    pub fn get_any_session_events_tx(&self) -> Option<broadcast::Sender<AgentEvent>> {
+        // Try to read without blocking — best-effort for the FIDO relay.
+        let sessions = self.sessions.try_read().ok()?;
+        sessions.values().next().map(|s| s.events_tx.clone())
     }
 
     pub async fn get_or_spawn(&self, user: &AuthUser) -> ControlState {
@@ -3141,8 +3199,29 @@ impl ControlHub {
             Arc::clone(&self.library),
             mission_store,
             self.secrets.clone(),
+            self.telegram_bridge.clone(),
         );
         sessions.insert(user.id.clone(), state.clone());
+
+        // Drop the write lock before performing async I/O so concurrent
+        // callers of get_or_spawn / all_sessions are not blocked.
+        drop(sessions);
+
+        // Boot Telegram channels for this user's missions — ensures channels
+        // are registered before we start serving requests.
+        if let Some(ref bridge) = self.telegram_bridge {
+            let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+                .unwrap_or_else(|_| format!("http://{}:{}", self.config.host, self.config.port));
+            bridge
+                .boot_from_store(
+                    &state.mission_store,
+                    state.cmd_tx.clone(),
+                    state.events_tx.clone(),
+                    &public_url,
+                )
+                .await;
+        }
+
         state
     }
 
@@ -3169,7 +3248,8 @@ impl ControlHub {
             .join(".sandboxed-sh")
             .join("missions");
 
-        match create_mission_store(store_type, base_dir, "default").await {
+        let user = crate::api::auth::implicit_single_tenant_user(&self.config);
+        match create_mission_store(store_type, base_dir, &user.id).await {
             Ok(store) => Arc::from(store),
             Err(err) => {
                 tracing::warn!(
@@ -3789,7 +3869,7 @@ pub struct CreateMissionRequest {
     pub agent: Option<String>,
     /// Optional model override (provider/model) - deprecated, use config_profile instead
     pub model_override: Option<String>,
-    /// Optional model effort override (supports: low, medium, high)
+    /// Optional model effort override (supports: low, medium, high, xhigh, max)
     pub model_effort: Option<String>,
     /// Config profile to use for this mission (overrides workspace's default profile)
     pub config_profile: Option<String>,
@@ -3801,13 +3881,70 @@ pub struct CreateMissionRequest {
     pub working_directory: Option<String>,
 }
 
+fn deserialize_string_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateMissionSettingsRequest {
+    /// Backend to use on the next turn ("opencode", "claudecode", "codex", etc.).
+    pub backend: Option<String>,
+    /// Agent name. Omit to leave unchanged, null/empty string to clear.
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub agent: Option<Option<String>>,
+    /// Model override. Omit to leave unchanged, null/empty string to clear.
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub model_override: Option<Option<String>>,
+    /// Model effort. Omit to leave unchanged, null/empty string to clear.
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub model_effort: Option<Option<String>>,
+    /// Config profile. Omit to leave unchanged, null/empty string to clear.
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub config_profile: Option<Option<String>>,
+}
+
 fn normalize_model_effort(raw: &str) -> Option<String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "low" => Some("low".to_string()),
         "medium" => Some("medium".to_string()),
         "high" => Some("high".to_string()),
+        "xhigh" => Some("xhigh".to_string()),
+        "max" => Some("max".to_string()),
         _ => None,
     }
+}
+
+fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Option<String> {
+    let normalized = normalize_model_effort(raw)?;
+    match (backend, normalized.as_str()) {
+        (Some("claudecode"), "low" | "medium" | "high" | "xhigh" | "max") => Some(normalized),
+        (Some("codex"), "low" | "medium" | "high") => Some(normalized),
+        _ => None,
+    }
+}
+
+fn supported_model_efforts_for_backend(backend: Option<&str>) -> &'static str {
+    match backend {
+        Some("claudecode") => "low, medium, high, xhigh, max",
+        Some("codex") => "low, medium, high",
+        _ => "none",
+    }
+}
+
+fn normalize_string_patch(value: Option<Option<String>>) -> Option<Option<String>> {
+    value.map(|inner| {
+        inner.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    })
 }
 
 fn normalize_model_override_for_backend(backend: Option<&str>, raw_model: &str) -> Option<String> {
@@ -3862,14 +3999,6 @@ pub async fn create_mission(
     if let Some(value) = model_effort.as_ref() {
         if value.trim().is_empty() {
             model_effort = None;
-        } else {
-            model_effort = normalize_model_effort(value);
-            if model_effort.is_none() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "Invalid model_effort. Supported values: low, medium, high".to_string(),
-                ));
-            }
         }
     }
 
@@ -3883,6 +4012,18 @@ pub async fn create_mission(
     // Model effort is supported for Codex and Claude Code missions.
     if !matches!(backend.as_deref(), Some("codex") | Some("claudecode")) {
         model_effort = None;
+    } else if let Some(value) = model_effort.as_ref() {
+        model_effort = normalize_model_effort_for_backend(backend.as_deref(), value);
+        if model_effort.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid model_effort for backend '{}'. Supported values: {}",
+                    backend.as_deref().unwrap_or("unknown"),
+                    supported_model_efforts_for_backend(backend.as_deref())
+                ),
+            ));
+        }
     }
 
     // Normalize model override based on backend expectations.
@@ -3974,6 +4115,171 @@ pub async fn create_mission(
         .map_err(recv_failed)?
         .map(Json)
         .map_err(internal_error)
+}
+
+/// Update mission run settings for future turns.
+pub async fn update_mission_settings(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateMissionSettingsRequest>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let current = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
+
+    let backend = req.backend.as_ref().and_then(|backend| {
+        let trimmed = backend.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let backend_changed = backend
+        .as_deref()
+        .is_some_and(|backend| backend != current.backend);
+    let effective_backend = backend.clone().unwrap_or_else(|| current.backend.clone());
+
+    {
+        let registry = state.backend_registry.read().await;
+        if registry.get(&effective_backend).is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Unknown backend: {}", effective_backend),
+            ));
+        }
+    }
+
+    let agent = normalize_string_patch(req.agent);
+    let mut model_override = normalize_string_patch(req.model_override);
+    let mut model_effort = normalize_string_patch(req.model_effort);
+    let config_profile = normalize_string_patch(req.config_profile);
+
+    if backend_changed && model_override.is_none() {
+        model_override = Some(None);
+    }
+    if backend_changed && model_effort.is_none() {
+        model_effort = Some(None);
+    }
+    if effective_backend == "amp" {
+        model_override = Some(None);
+    }
+    if !matches!(effective_backend.as_str(), "codex" | "claudecode") {
+        model_effort = Some(None);
+    }
+
+    let workspace_config_profile = state
+        .workspaces
+        .get(current.workspace_id)
+        .await
+        .and_then(|ws| ws.config_profile);
+    let effective_config_profile = match &config_profile {
+        Some(Some(profile)) => Some(profile.clone()),
+        Some(None) => workspace_config_profile.clone(),
+        None => current
+            .config_profile
+            .clone()
+            .or_else(|| workspace_config_profile.clone()),
+    };
+
+    let effective_agent = match &agent {
+        Some(Some(agent)) => Some(agent.clone()),
+        Some(None) => None,
+        None => current.agent.clone(),
+    };
+    if let Some(ref agent_name) = effective_agent {
+        let skip_validation = matches!(
+            effective_backend.as_str(),
+            "claudecode" | "amp" | "codex" | "gemini"
+        );
+        if !skip_validation {
+            super::library::validate_agent_exists(
+                &state,
+                agent_name,
+                effective_config_profile.as_deref(),
+            )
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        }
+    }
+
+    if let Some(Some(raw_effort)) = model_effort.as_ref() {
+        let normalized = normalize_model_effort_for_backend(Some(&effective_backend), raw_effort)
+            .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid model_effort for backend '{}'. Supported values: {}",
+                    effective_backend,
+                    supported_model_efforts_for_backend(Some(&effective_backend))
+                ),
+            )
+        })?;
+        model_effort = Some(Some(normalized));
+    }
+
+    let mut effective_model = match &model_override {
+        Some(Some(model)) => normalize_model_override_for_backend(Some(&effective_backend), model),
+        Some(None) => None,
+        None => current.model_override.as_deref().and_then(|model| {
+            normalize_model_override_for_backend(Some(&effective_backend), model)
+        }),
+    };
+    if let Some(ref model) = effective_model {
+        if model_override.as_ref().and_then(|value| value.as_ref()) != Some(model) {
+            model_override = Some(Some(model.clone()));
+        }
+    }
+
+    if effective_backend == "claudecode" && effective_model.is_none() {
+        if let Some(default_model) =
+            resolve_claudecode_default_model(&state.library, effective_config_profile.as_deref())
+                .await
+        {
+            effective_model = Some(default_model.clone());
+            model_override = Some(Some(default_model));
+        }
+    }
+
+    if let Some(ref model) = effective_model {
+        if let Err(e) =
+            super::providers::validate_model_override(&state, &effective_backend, model).await
+        {
+            return Err((StatusCode::BAD_REQUEST, e));
+        }
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let session_id = Uuid::new_v4().to_string();
+    control
+        .cmd_tx
+        .send(ControlCommand::UpdateMissionSettings {
+            id,
+            backend,
+            agent,
+            model_override,
+            model_effort,
+            config_profile,
+            session_id,
+            respond: tx,
+        })
+        .await
+        .map_err(session_unavailable)?;
+
+    rx.await.map_err(recv_failed)?.map(Json).map_err(|e| {
+        if e.contains("not found") {
+            (StatusCode::NOT_FOUND, e)
+        } else if e.contains("running") {
+            (StatusCode::CONFLICT, e)
+        } else {
+            internal_error(e)
+        }
+    })
 }
 
 /// Load/switch to a mission.
@@ -4144,15 +4450,29 @@ pub struct GetEventsQuery {
     /// Offset for pagination
     #[serde(default)]
     pub offset: Option<usize>,
+    /// When true, return the latest N events (computes offset from total count)
+    #[serde(default)]
+    pub latest: Option<bool>,
+    /// If set, return only events with `sequence > since_seq`, ordered
+    /// by sequence ASC. Used by the client for delta reconnect to
+    /// avoid redownloading the full event tail on every focus/reopen.
+    /// Takes precedence over `offset`/`latest` when provided.
+    #[serde(default)]
+    pub since_seq: Option<i64>,
 }
 
 /// Get events for a mission (for debugging/replay).
+///
+/// Response includes `X-Total-Events` (total count matching the type
+/// filter) and `X-Max-Sequence` (highest sequence stored for this
+/// mission) headers so the client can decide whether it's caught up
+/// without issuing a second request.
 pub async fn get_mission_events(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(mission_id): Path<Uuid>,
     axum::extract::Query(query): axum::extract::Query<GetEventsQuery>,
-) -> Result<Json<Vec<StoredEvent>>, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
     // Check mission exists
@@ -4172,13 +4492,69 @@ pub async fn get_mission_events(
         .as_ref()
         .map(|s| s.split(',').map(|t| t.trim()).collect());
 
-    let events = control
-        .mission_store
-        .get_events(mission_id, types.as_deref(), query.limit, query.offset)
-        .await
-        .map_err(internal_error)?;
+    let events = if let Some(since_seq) = query.since_seq {
+        control
+            .mission_store
+            .get_events_since(mission_id, since_seq, types.as_deref(), query.limit)
+            .await
+            .map_err(internal_error)?
+    } else {
+        // When latest=true with a limit, compute offset to return the last N events
+        let offset = if query.latest.unwrap_or(false) {
+            if let Some(limit) = query.limit {
+                let total = control
+                    .mission_store
+                    .count_events(mission_id, types.as_deref())
+                    .await
+                    .map_err(internal_error)?;
+                Some(total.saturating_sub(limit))
+            } else {
+                query.offset
+            }
+        } else {
+            query.offset
+        };
 
-    Ok(Json(events))
+        control
+            .mission_store
+            .get_events(mission_id, types.as_deref(), query.limit, offset)
+            .await
+            .map_err(internal_error)?
+    };
+
+    // Metadata headers let the client decide whether it's caught up
+    // without a second round-trip. Failures here are non-fatal — we just
+    // skip the header rather than breaking the whole response.
+    let total = control
+        .mission_store
+        .count_events(mission_id, types.as_deref())
+        .await
+        .ok();
+    let max_seq = control
+        .mission_store
+        .max_event_sequence(mission_id)
+        .await
+        .ok();
+
+    let mut response = Json(events).into_response();
+    let headers = response.headers_mut();
+    if let Some(total) = total {
+        if let Ok(v) = header::HeaderValue::from_str(&total.to_string()) {
+            headers.insert("X-Total-Events", v);
+        }
+    }
+    if let Some(max_seq) = max_seq {
+        if let Ok(v) = header::HeaderValue::from_str(&max_seq.to_string()) {
+            headers.insert("X-Max-Sequence", v);
+        }
+    }
+    // CORS exposure so browsers can read these headers from JS.
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        header::HeaderValue::from_static("X-Total-Events, X-Max-Sequence"),
+    );
+
+    Ok(response)
 }
 
 // ==================== Diagnostic Endpoints ====================
@@ -4540,6 +4916,7 @@ pub async fn stream(
 }
 
 /// Spawn the global control session actor.
+#[allow(clippy::too_many_arguments)]
 fn spawn_control_session(
     config: Config,
     root_agent: AgentRef,
@@ -4548,6 +4925,7 @@ fn spawn_control_session(
     library: SharedLibrary,
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
+    telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
     let (events_tx, events_rx) = broadcast::channel::<AgentEvent>(1024);
@@ -4722,6 +5100,8 @@ fn spawn_control_session(
             library.clone(),
             state.cmd_tx.clone(),
             workspaces.clone(),
+            state.events_tx.clone(),
+            telegram_bridge.clone(),
         ));
     } else if state.mission_store.is_persistent() {
         tracing::info!("Automation scheduler disabled by config");
@@ -4741,6 +5121,7 @@ async fn cleanup_stale_active_missions_once(
     mission_store: &Arc<dyn MissionStore>,
     stale_hours: u64,
     events_tx: &broadcast::Sender<AgentEvent>,
+    cmd_tx: &mpsc::Sender<ControlCommand>,
 ) {
     match mission_store.get_stale_active_missions(stale_hours).await {
         Ok(stale_missions) => {
@@ -4751,6 +5132,28 @@ async fn cleanup_stale_active_missions_once(
                     mission.title.as_deref().unwrap_or("Untitled"),
                     mission.updated_at
                 );
+
+                // Ask the control actor to cancel any in-memory runner
+                // for this mission before we overwrite DB status. Without
+                // this, a frozen runner (e.g. stuck in `child.wait()` on
+                // an orphaned tool subprocess) would keep
+                // `running_mission_id` pinned and /api/control/running
+                // would keep reporting the mission as "running, stalled"
+                // until the daemon restarts. CancelMission is idempotent
+                // — it returns "not found" when there is no live runner,
+                // which is the common case for stale missions, and we
+                // ignore that error.
+                let (tx, rx) = oneshot::channel();
+                if cmd_tx
+                    .send(ControlCommand::CancelMission {
+                        mission_id: mission.id,
+                        respond: tx,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    let _ = rx.await;
+                }
 
                 if let Err(e) = mission_store
                     .update_mission_status(mission.id, MissionStatus::Completed)
@@ -4785,7 +5188,7 @@ async fn cleanup_stale_active_missions_once(
 async fn stale_mission_cleanup_loop(
     mission_store: Arc<dyn MissionStore>,
     stale_hours: u64,
-    _cmd_tx: mpsc::Sender<ControlCommand>,
+    cmd_tx: mpsc::Sender<ControlCommand>,
     events_tx: broadcast::Sender<AgentEvent>,
 ) {
     // Check every 5 minutes; the stale timeout remains a safety net for missions that
@@ -4799,7 +5202,60 @@ async fn stale_mission_cleanup_loop(
 
     loop {
         tokio::time::sleep(check_interval).await;
-        cleanup_stale_active_missions_once(&mission_store, stale_hours, &events_tx).await;
+        cleanup_stale_active_missions_once(&mission_store, stale_hours, &events_tx, &cmd_tx).await;
+    }
+}
+
+/// Resolve an IANA timezone string to a chrono::FixedOffset at a given UTC instant.
+///
+/// Falls back to UTC if the timezone is unknown.  We use a simple lookup table for
+/// common timezones to avoid pulling in chrono-tz (heavy dependency).  The offset is
+/// evaluated at `now_utc` to account for DST — though the lookup table doesn't model
+/// DST transitions, the most common use-case (Europe/Paris, America/New_York, etc.)
+/// is close enough for a 5-second poll cadence.
+/// Map a timezone string to a `chrono_tz::Tz`, handling common abbreviations
+/// and IANA names.  Returns `None` for fixed-offset strings like "+02:00".
+fn resolve_tz(tz: &str) -> Option<chrono_tz::Tz> {
+    // Fixed-offset strings ("+02:00", "-05:00") are not IANA timezones.
+    if tz.starts_with('+') || tz.starts_with('-') {
+        return None;
+    }
+
+    // Handle common abbreviations that chrono-tz doesn't know about.
+    let canonical = match tz {
+        "UTC" | "GMT" => "Etc/UTC",
+        "EST" => "America/New_York",
+        "CST" => "America/Chicago",
+        "MST" => "America/Denver",
+        "PST" => "America/Los_Angeles",
+        "CET" => "Europe/Paris",
+        "JST" => "Asia/Tokyo",
+        "AEST" => "Australia/Sydney",
+        other => other,
+    };
+
+    match canonical.parse::<chrono_tz::Tz>() {
+        Ok(timezone) => Some(timezone),
+        Err(_) => {
+            tracing::warn!(timezone = %tz, "Unknown timezone, rejecting");
+            None
+        }
+    }
+}
+
+fn resolve_tz_offset(tz: &str, now_utc: chrono::DateTime<chrono::Utc>) -> chrono::FixedOffset {
+    // Try to parse as a fixed offset first (e.g. "+02:00", "-05:00").
+    if let Ok(fo) = tz.parse::<chrono::FixedOffset>() {
+        return fo;
+    }
+
+    use chrono::Offset;
+    match resolve_tz(tz) {
+        Some(timezone) => {
+            let local_dt = now_utc.with_timezone(&timezone);
+            local_dt.offset().fix()
+        }
+        None => chrono::FixedOffset::east_opt(0).unwrap(),
     }
 }
 
@@ -4809,6 +5265,8 @@ async fn automation_scheduler_loop(
     library: SharedLibrary,
     cmd_tx: mpsc::Sender<ControlCommand>,
     workspaces: workspace::SharedWorkspaceStore,
+    events_tx: broadcast::Sender<AgentEvent>,
+    telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 ) {
     use super::automation_variables::{substitute_variables, SubstitutionContext};
     use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus, TriggerType};
@@ -4816,12 +5274,62 @@ async fn automation_scheduler_loop(
     // Check every 5 seconds for automations that need to run
     let check_interval = std::time::Duration::from_secs(5);
 
-    tracing::info!("Automation scheduler task started");
+    tracing::info!(
+        telegram_bridge_available = telegram_bridge.is_some(),
+        "Automation scheduler task started"
+    );
 
     let mut logged_unsupported = false;
+    let mut tick_count: u64 = 0;
 
     loop {
         tokio::time::sleep(check_interval).await;
+        tick_count += 1;
+
+        // Every ~60 seconds (12 ticks × 5s), run housekeeping sweeps.
+        if tick_count.is_multiple_of(12) {
+            // Timeout stale WaitingExternal workflows (older than 30 minutes).
+            match mission_store
+                .timeout_stale_telegram_workflows(30 * 60)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    tracing::info!("Timed out {} stale WaitingExternal Telegram workflows", n);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to timeout stale Telegram workflows: {}", e);
+                }
+                _ => {}
+            }
+
+            // Recover stale 'sending' scheduled messages (stuck >5 min after crash).
+            match mission_store
+                .recover_stale_sending_scheduled_messages(5 * 60)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    tracing::info!(
+                        "Recovered {} stale 'sending' scheduled messages back to 'pending'",
+                        n
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to recover stale sending messages: {}", e);
+                }
+                _ => {}
+            }
+
+            // Clean up old webhook dedup entries (older than 15 minutes).
+            match mission_store.cleanup_webhook_dedup(15 * 60).await {
+                Ok(n) if n > 0 => {
+                    tracing::debug!("Cleaned up {} expired webhook dedup entries", n);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to cleanup webhook dedup entries: {}", e);
+                }
+                _ => {}
+            }
+        }
 
         let automations = match mission_store.list_active_automations().await {
             Ok(automations) => automations,
@@ -4835,17 +5343,28 @@ async fn automation_scheduler_loop(
         };
 
         for automation in automations {
-            // Only trigger interval-based automations (webhooks are triggered via HTTP endpoint)
-            let interval_seconds = match &automation.trigger {
-                TriggerType::Interval { seconds } => *seconds,
-                TriggerType::Webhook { .. } => {
-                    // Skip webhook automations - they're triggered via HTTP
-                    continue;
-                }
-                TriggerType::AgentFinished => {
-                    // Skip agent_finished automations - they're triggered when a turn completes.
-                    continue;
-                }
+            // Only trigger interval-based and cron-based automations.
+            // Webhooks are triggered via HTTP, agent_finished via turn completion,
+            // Telegram via the Telegram bridge.
+            enum ScheduleKind {
+                Interval(u64),
+                Cron {
+                    expression: String,
+                    timezone: String,
+                },
+            }
+            let schedule = match &automation.trigger {
+                TriggerType::Interval { seconds } => ScheduleKind::Interval(*seconds),
+                TriggerType::Cron {
+                    expression,
+                    timezone,
+                } => ScheduleKind::Cron {
+                    expression: expression.clone(),
+                    timezone: timezone.clone(),
+                },
+                TriggerType::Webhook { .. } => continue,
+                TriggerType::AgentFinished => continue,
+                TriggerType::Telegram { .. } => continue,
             };
 
             let mission = match mission_store.get_mission(automation.mission_id).await {
@@ -4898,19 +5417,81 @@ async fn automation_scheduler_loop(
                 continue;
             }
 
-            // Check if enough time has passed since last trigger
-            let should_trigger = if let Some(ref last_triggered) = automation.last_triggered_at {
-                match chrono::DateTime::parse_from_rfc3339(last_triggered) {
-                    Ok(last_time) => {
-                        let elapsed = chrono::Utc::now()
-                            .signed_duration_since(last_time.with_timezone(&chrono::Utc));
-                        elapsed.num_seconds() >= interval_seconds as i64
+            // Check if it's time to trigger based on schedule type.
+            let should_trigger = match &schedule {
+                ScheduleKind::Interval(interval_seconds) => {
+                    if let Some(ref last_triggered) = automation.last_triggered_at {
+                        match chrono::DateTime::parse_from_rfc3339(last_triggered) {
+                            Ok(last_time) => {
+                                let elapsed = chrono::Utc::now()
+                                    .signed_duration_since(last_time.with_timezone(&chrono::Utc));
+                                elapsed.num_seconds() >= *interval_seconds as i64
+                            }
+                            Err(_) => true,
+                        }
+                    } else {
+                        true // Never triggered before
                     }
-                    Err(_) => true, // If we can't parse, trigger anyway
                 }
-            } else {
-                // Never triggered before, should trigger now
-                true
+                ScheduleKind::Cron {
+                    expression,
+                    timezone,
+                } => {
+                    match croner::Cron::new(expression).parse() {
+                        Ok(cron) => {
+                            // Determine "now" in the configured timezone.
+                            let now_utc = chrono::Utc::now();
+
+                            // If we've never triggered (start_immediately=true sets
+                            // last_triggered_at to None), fire right away.
+                            let reference = if let Some(ref lt) = automation.last_triggered_at {
+                                match chrono::DateTime::parse_from_rfc3339(lt) {
+                                    Ok(t) => t.with_timezone(&chrono::Utc),
+                                    Err(_) => now_utc - chrono::Duration::seconds(10),
+                                }
+                            } else {
+                                // Never triggered → fire immediately on next tick.
+                                // Using a very large lookback ensures the next cron
+                                // occurrence after this reference is in the past.
+                                now_utc - chrono::Duration::days(366)
+                            };
+
+                            // Find the next occurrence after the last trigger.
+                            // If that occurrence is <= now, it's time to fire.
+                            // Use real timezone (not a FixedOffset snapshot) so DST
+                            // transitions are evaluated correctly by croner.
+                            if let Some(tz) = resolve_tz(timezone) {
+                                let ref_with_tz = reference.with_timezone(&tz);
+                                match cron.find_next_occurrence(&ref_with_tz, false) {
+                                    Ok(next) => {
+                                        let next_utc = next.with_timezone(&chrono::Utc);
+                                        next_utc <= now_utc
+                                    }
+                                    Err(_) => false,
+                                }
+                            } else {
+                                // Fixed-offset timezone string (e.g. "+02:00")
+                                let tz_offset = resolve_tz_offset(timezone, now_utc);
+                                let ref_with_tz = reference.with_timezone(&tz_offset);
+                                match cron.find_next_occurrence(&ref_with_tz, false) {
+                                    Ok(next) => {
+                                        let next_utc = next.with_timezone(&chrono::Utc);
+                                        next_utc <= now_utc
+                                    }
+                                    Err(_) => false,
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                automation_id = %automation.id,
+                                expression = %expression,
+                                "Invalid cron expression, skipping: {}", e
+                            );
+                            false
+                        }
+                    }
+                }
             };
 
             if !should_trigger {
@@ -5110,6 +5691,52 @@ async fn automation_scheduler_loop(
                             );
                         }
 
+                        // Route response to Telegram if this mission has an
+                        // associated Telegram chat (proactive messaging).
+                        if let Some(ref bridge) = telegram_bridge {
+                            let mission_id = mission.id;
+                            let store = Arc::clone(&mission_store);
+                            let bridge = Arc::clone(bridge);
+                            let tg_events_rx = events_tx.subscribe();
+                            tokio::spawn(async move {
+                                // Look up the Telegram chat for this mission
+                                let chat_mapping = store
+                                    .get_telegram_chat_mission_by_mission_id(mission_id)
+                                    .await;
+                                if let Ok(Some(mapping)) = chat_mapping {
+                                    // Find the channel context to get the bot token
+                                    if let Some(ctx) =
+                                        bridge.get_channel_context(mapping.channel_id).await
+                                    {
+                                        tracing::info!(
+                                            "Routing automation response for mission {} to Telegram chat {}",
+                                            mission_id,
+                                            mapping.chat_id
+                                        );
+                                        if let Err(e) = super::telegram::stream_response(
+                                            tg_events_rx,
+                                            bridge.http(),
+                                            &ctx.channel.bot_token,
+                                            mapping.chat_id,
+                                            0, // no reply_to for proactive messages
+                                            None,
+                                            mission_id,
+                                            Some(Arc::clone(&bridge)),
+                                            Some(mapping.channel_id),
+                                            Some(Arc::clone(&store)),
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                "Failed to stream automation response to Telegram: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        }
+
                         break;
                     }
                     Err(e) => {
@@ -5259,6 +5886,7 @@ fn mission_status_for_terminal_reason(
         TerminalReason::InfiniteLoop => Some((MissionStatus::Failed, "infinite_loop")),
         TerminalReason::RateLimited => Some((MissionStatus::Failed, "rate_limited")),
         TerminalReason::CapacityLimited => Some((MissionStatus::Failed, "capacity_limited")),
+        TerminalReason::AuthError => Some((MissionStatus::Failed, "auth_error")),
     }
 }
 
@@ -5272,16 +5900,36 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
         TerminalReason::LlmError => Some("Model error".to_string()),
         TerminalReason::RateLimited => Some("Provider rate limited".to_string()),
         TerminalReason::CapacityLimited => Some("Provider capacity limit reached".to_string()),
+        TerminalReason::AuthError => Some("Authentication failed".to_string()),
     }
 }
 
-/// If the turn ended with `LlmError` but the agent produced substantive output,
-/// downgrade the reason to `TurnComplete` so the mission stays active and can
-/// be picked up by the next automation cycle or user message. This prevents
-/// transient backend errors (e.g. Codex "Failed to shutdown rollout recorder")
-/// from killing missions that actually completed their work.
+/// If the turn ended with `LlmError` or `AuthError` but the agent produced
+/// substantive output, downgrade the reason to `TurnComplete` so the mission
+/// stays active and can be picked up by the next automation cycle or user
+/// message.  This prevents transient backend errors (e.g. Codex "Failed to
+/// shutdown rollout recorder", or Claude Code exiting with code 1 after a
+/// successful turn that happens to contain an auth-error string in its
+/// output) from killing missions that actually completed their work.
 fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
-    if result.terminal_reason != Some(TerminalReason::LlmError) {
+    let is_recoverable = matches!(
+        result.terminal_reason,
+        Some(TerminalReason::LlmError) | Some(TerminalReason::AuthError)
+    );
+    if !is_recoverable {
+        return;
+    }
+    // Claude Code transport failures (startup timeout, incomplete turn, etc.)
+    // carry a structured `claudecode_transport_failure` marker. These are
+    // never a successful turn — treating them as TurnComplete lets the mission
+    // re-enter an automation loop where every retry fake-succeeds. Keep the
+    // failure classification so the mission is surfaced as failed.
+    if result
+        .data
+        .as_ref()
+        .and_then(|v| v.get("claudecode_transport_failure"))
+        .is_some()
+    {
         return;
     }
     let output = result.output.trim();
@@ -5290,15 +5938,103 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
     if output.len() >= 20
         && !output.starts_with("Codex produced no output")
         && !output.starts_with("Codex CLI produced no JSON")
+        && !output.starts_with("Codex CLI exited before completing the turn")
         && !output.starts_with("No response from")
+        && !output.starts_with("Claude Code error:")
+        && !output.starts_with("Claude Code produced no")
+        && !output.starts_with("Claude Code emitted malformed")
+        && !output.starts_with("Claude Code ended before startup")
+        && !output.starts_with("Claude Code exited without")
+        && !output.starts_with("Claude Code stopped producing output")
+        && !output.starts_with("No Claude Code credentials detected")
+        && !is_bare_llm_error_output(output)
     {
         tracing::info!(
             output_len = output.len(),
-            "Recovering from soft LlmError: agent produced valid output, upgrading to TurnComplete"
+            reason = ?result.terminal_reason,
+            "Recovering from soft error: agent produced valid output, upgrading to TurnComplete"
         );
         result.success = true;
         result.terminal_reason = Some(TerminalReason::TurnComplete);
     }
+}
+
+fn is_bare_llm_error_output(output: &str) -> bool {
+    if looks_like_structured_provider_error(output) {
+        return true;
+    }
+    if super::mission_runner::is_provider_payload_error(output) {
+        return true;
+    }
+
+    let normalized = output
+        .trim()
+        .trim_matches(|c: char| matches!(c, '.' | '!' | '"' | '\''))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return false;
+    }
+
+    matches!(
+        normalized.as_str(),
+        "internal server error"
+            | "invalid authentication credentials"
+            | "no claude code credentials detected"
+            | "unknown error"
+            | "service unavailable"
+            | "bad gateway"
+            | "gateway timeout"
+            | "request timeout"
+            | "upstream error"
+            | "model error"
+    ) || normalized.starts_with("api error:")
+        || normalized.starts_with("anthropic api error:")
+        || normalized.starts_with("claude code error:")
+        // Claude Code's canonical auth-failure surface: the CLI prints
+        // `Failed to authenticate. API Error: 401 ...` when Anthropic
+        // rejects the request mid-turn. Without this pattern the
+        // short auth-error string slipped past
+        // `maybe_recover_soft_llm_error` and got fake-promoted to
+        // TurnComplete, hiding rotation exhaustion from the UI.
+        || normalized.starts_with("failed to authenticate")
+        // Any short output whose only substantive content is an auth
+        // HTTP status from Anthropic/OpenAI — catches phrasings like
+        // `<some prefix>. API Error: 401 ...` without needing to
+        // enumerate the prefix.
+        || (normalized.len() < 200
+            && (normalized.contains("api error: 401")
+                || normalized.contains("api error: 403")
+                || normalized.contains("api error: 407")))
+}
+
+fn looks_like_structured_provider_error(output: &str) -> bool {
+    let trimmed = output.trim();
+    if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let has_error_shape = lower.contains("\"detail\"")
+        || lower.contains("\"error\"")
+        || lower.contains("\"message\"")
+        || lower.contains("\"type\"");
+    if !has_error_shape {
+        return false;
+    }
+
+    lower.contains("invalid_request_error")
+        || lower.contains("model is not supported")
+        || lower.contains("not supported when using codex")
+        || lower.contains("does not exist or you do not have access")
+        || lower.contains("invalid authentication credentials")
+        || lower.contains("rate limit")
+        || lower.contains("capacity")
+        || lower.contains("service unavailable")
+        || lower.contains("internal server error")
 }
 
 async fn maybe_finalize_terminal_mission(
@@ -5326,9 +6062,19 @@ async fn maybe_finalize_terminal_mission(
 
     match mission_store.get_mission(mission_id).await {
         Ok(Some(mission)) => {
+            if mission.status == MissionStatus::Interrupted {
+                tracing::debug!(
+                    mission_id = %mission_id,
+                    reason = ?reason,
+                    context = log_context,
+                    "Skipping mission finalization because mission is already interrupted"
+                );
+                return;
+            }
+
             if !matches!(
                 mission.status,
-                MissionStatus::Active | MissionStatus::Interrupted | MissionStatus::Pending
+                MissionStatus::Active | MissionStatus::Pending
             ) {
                 tracing::debug!(
                     mission_id = %mission_id,
@@ -5346,6 +6092,19 @@ async fn maybe_finalize_terminal_mission(
                     mission_id = %mission_id,
                     context = log_context,
                     "Skipping mission completion because active automations are enabled"
+                );
+                return;
+            }
+
+            // Assistant missions (e.g. Telegram-linked) should stay active
+            // after each reply — they are long-lived by design.
+            if new_status == MissionStatus::Completed
+                && mission.mission_mode == super::mission_store::MissionMode::Assistant
+            {
+                tracing::debug!(
+                    mission_id = %mission_id,
+                    context = log_context,
+                    "Skipping mission completion for assistant-mode mission"
                 );
                 return;
             }
@@ -5684,6 +6443,16 @@ async fn control_actor_loop(
     let mut main_runner_activity: Option<String> = None;
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
+    // Deadline for force-reaping a runner whose cancel token was fired
+    // but whose JoinHandle never resolved. This handles the "zombie
+    // runner" case: the underlying CLI subprocess died (or never reacts
+    // to the cancel because it's blocked on a closed pipe / dead
+    // child), so the spawned task never returns, `running` stays
+    // `Some`, the in-memory running list keeps reporting the mission,
+    // and `Stop` becomes a no-op. After this deadline we force-abort
+    // the JoinHandle and clean up the in-memory state.
+    let mut runner_force_clear_deadline: Option<tokio::time::Instant> = None;
+    const RUNNER_FORCE_CLEAR_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
     // Parallel mission runners - each runs independently
     let mut parallel_runners: std::collections::HashMap<
@@ -6068,12 +6837,17 @@ async fn control_actor_loop(
                             }
                         }
 
-                        // Case 2: Target differs from main AND main is running → start parallel
+                        // Case 2: Target differs from main → start parallel
+                        // When target_mission_id is explicitly set (e.g. from Telegram),
+                        // always use parallel execution to avoid hijacking the main session.
+                        // When the target is merely inferred (current differs from running),
+                        // only start parallel when main is busy.
+                        let force_parallel = target_mission_id.is_some(); // explicit target (e.g. Telegram)
                         if let Some(tid) = effective_target {
-                            if !target_is_main && main_is_running {
+                            if !target_is_main && (main_is_running || force_parallel) {
                                 // Check capacity
                                 let parallel_running = parallel_runners.values().filter(|r| r.is_running()).count();
-                                let total_running = parallel_running + 1; // +1 for main
+                                let total_running = parallel_running + if main_is_running { 1 } else { 0 };
                                 let max_parallel = crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
 
                                 if total_running >= max_parallel {
@@ -6658,6 +7432,46 @@ async fn control_actor_loop(
                         }
                         let _ = respond.send(result);
                     }
+                    ControlCommand::UpdateMissionSettings { id, backend, agent, model_override, model_effort, config_profile, session_id, respond } => {
+                        let main_running = running.is_some() && running_mission_id == Some(id);
+                        let parallel_running = parallel_runners
+                            .get(&id)
+                            .is_some_and(|runner| runner.is_running());
+                        if main_running || parallel_running {
+                            let _ = respond.send(Err(
+                                "Cannot update mission settings while the mission is running"
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
+
+                        let result = mission_store
+                            .update_mission_run_settings(
+                                id,
+                                backend.as_deref(),
+                                agent.as_ref().map(|value| value.as_deref()),
+                                model_override.as_ref().map(|value| value.as_deref()),
+                                model_effort.as_ref().map(|value| value.as_deref()),
+                                config_profile.as_ref().map(|value| value.as_deref()),
+                                &session_id,
+                            )
+                            .await;
+
+                        if let Ok(updated) = result.as_ref() {
+                            let _ = events_tx.send(AgentEvent::MissionSettingsUpdated {
+                                mission_id: id,
+                                backend: updated.backend.clone(),
+                                agent: updated.agent.clone(),
+                                model_override: updated.model_override.clone(),
+                                model_effort: updated.model_effort.clone(),
+                                config_profile: updated.config_profile.clone(),
+                                session_id: updated.session_id.clone(),
+                                updated_at: updated.updated_at.clone(),
+                            });
+                        }
+
+                        let _ = respond.send(result);
+                    }
                     ControlCommand::StartParallel { mission_id, content, respond } => {
                         tracing::info!("StartParallel requested for mission {}", mission_id);
 
@@ -6721,6 +7535,29 @@ async fn control_actor_loop(
                             );
 
                             if started {
+                                if mission.status != MissionStatus::Active {
+                                    tracing::info!(
+                                        "Activating parallel mission {} (was {})",
+                                        mission_id,
+                                        mission.status
+                                    );
+                                    if let Err(e) = mission_store
+                                        .update_mission_status(mission_id, MissionStatus::Active)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to activate parallel mission {}: {}",
+                                            mission_id,
+                                            e
+                                        );
+                                    } else {
+                                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            mission_id,
+                                            status: MissionStatus::Active,
+                                            summary: None,
+                                        });
+                                    }
+                                }
                                 tracing::info!("Mission {} started in parallel", mission_id);
                                 entry.insert(runner);
                                 let _ = respond.send(Ok(()));
@@ -6824,6 +7661,17 @@ async fn control_actor_loop(
                                 // Cancel the current execution
                                 if let Some(token) = &running_cancel {
                                     token.cancel();
+                                    // Arm the force-clear deadline. Most cancels
+                                    // wind down within a few seconds via the
+                                    // task's own observation of the cancel
+                                    // token; the deadline catches the zombie
+                                    // case where the underlying CLI subprocess
+                                    // is dead/blocked and the JoinHandle never
+                                    // resolves on its own.
+                                    runner_force_clear_deadline = Some(
+                                        tokio::time::Instant::now()
+                                            + RUNNER_FORCE_CLEAR_GRACE,
+                                    );
                                     close_mission_desktop_sessions(
                                         &mission_store,
                                         mission_id,
@@ -7296,6 +8144,8 @@ async fn control_actor_loop(
                     running_cancel = None;
                     running_mission_id = None;
                     main_runner_activity = None;
+                    // Runner cleared itself; cancel the force-clear watchdog.
+                    runner_force_clear_deadline = None;
                     let mut completed_terminal_reason = None;
                     match res {
                         Ok((_mid, _user_msg, mut agent_result)) => {
@@ -7518,11 +8368,21 @@ async fn control_actor_loop(
                     }
 
                     // If the mission is idle now, enqueue any agent_finished automations after a short delay.
+                    // Skip automations for transient infrastructure failures (auth errors,
+                    // rate limits, capacity limits) — these aren't "the agent finished work",
+                    // they're transient failures that the retry/recovery logic handles.
+                    // Firing automations on these creates noisy retry loops.
                     if let Some(mission_id) = completed_mission_id {
+                        let is_transient_infra_failure = matches!(
+                            completed_terminal_reason,
+                            Some(TerminalReason::AuthError)
+                                | Some(TerminalReason::RateLimited)
+                                | Some(TerminalReason::CapacityLimited)
+                        );
                         let already_queued_for_mission = queue
                             .iter()
                             .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id));
-                        if !already_queued_for_mission {
+                        if !already_queued_for_mission && !is_transient_infra_failure {
                             // Small delay so the UI can display the completion before restarting.
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             let messages = agent_finished_automation_messages(
@@ -7769,9 +8629,17 @@ async fn control_actor_loop(
                             )
                             .await;
 
-                            // Check if we should enqueue agent_finished automations
+                            // Check if we should enqueue agent_finished automations.
+                            // Skip for transient infrastructure failures (auth, rate limit,
+                            // capacity) to avoid noisy retry loops.
+                            let is_transient_infra_failure = matches!(
+                                result.terminal_reason,
+                                Some(TerminalReason::AuthError)
+                                    | Some(TerminalReason::RateLimited)
+                                    | Some(TerminalReason::CapacityLimited)
+                            );
                             let was_queue_empty = runner.queue.is_empty();
-                            if was_queue_empty {
+                            if was_queue_empty && !is_transient_infra_failure {
                                 // Small delay so the UI can display the completion before restarting.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                 let messages = agent_finished_automation_messages(
@@ -7856,6 +8724,76 @@ async fn control_actor_loop(
                     )
                     .await;
                     tracing::info!("Parallel mission {} removed from runners", mid);
+                }
+            }
+            // Force-reap a runner whose cancel was fired but whose
+            // JoinHandle never resolved within the grace window. See
+            // `runner_force_clear_deadline` for context.
+            _ = async {
+                match runner_force_clear_deadline {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if runner_force_clear_deadline.is_some() && running.is_some() => {
+                let stuck_mid = running_mission_id;
+                tracing::warn!(
+                    mission_id = ?stuck_mid,
+                    "Force-aborting stuck runner: cancel fired but JoinHandle never resolved within {}s",
+                    RUNNER_FORCE_CLEAR_GRACE.as_secs()
+                );
+                if let Some(handle) = running.take() {
+                    handle.abort();
+                }
+                running_cancel = None;
+                running_mission_id = None;
+                main_runner_activity = None;
+                runner_force_clear_deadline = None;
+                if let Some(mid) = stuck_mid {
+                    // Mark mission as Interrupted so it stays resumable.
+                    if let Err(e) = mission_store
+                        .update_mission_status(mid, MissionStatus::Interrupted)
+                        .await
+                    {
+                        tracing::warn!(
+                            mission_id = %mid,
+                            "Failed to mark force-cleared mission as Interrupted: {}",
+                            e
+                        );
+                    } else {
+                        maybe_schedule_mission_metadata_refresh_for_status(
+                            &mission_store,
+                            &events_tx,
+                            mid,
+                            MissionStatus::Interrupted,
+                        );
+                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                            mission_id: mid,
+                            status: MissionStatus::Interrupted,
+                            summary: Some(
+                                "Cancel timed out; force-aborted stuck runner.".to_string(),
+                            ),
+                        });
+                    }
+                    if let Err(e) = mission_store
+                        .complete_running_executions_for_mission(
+                            mid,
+                            false,
+                            Some("Force-aborted stuck runner after cancel timed out".to_string()),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            mission_id = %mid,
+                            "Failed to complete running executions on force-clear: {}",
+                            e
+                        );
+                    }
+                    close_mission_desktop_sessions(
+                        &mission_store,
+                        mid,
+                        &config.working_dir,
+                    )
+                    .await;
                 }
             }
             // Update last_activity for runners when we receive events for them
@@ -8321,6 +9259,32 @@ async fn run_single_control_turn(
         }
     }
 
+    // For Telegram missions, append channel instructions and memory awareness
+    // to CLAUDE.md so the backend LLM adopts the bot persona.
+    if user_message.contains("[Telegram from ") {
+        let claude_md_path = working_dir_path.join("CLAUDE.md");
+        tracing::info!(
+            mission_id = ?mission_id,
+            claude_md_path = %claude_md_path.display(),
+            claude_md_exists = claude_md_path.exists(),
+            "Telegram message detected in control path, attempting CLAUDE.md injection"
+        );
+        // Create the file if it doesn't exist so that non-Claude-Code
+        // backends (e.g. opencode) also get the identity injection.
+        if !claude_md_path.exists() {
+            let _ = std::fs::write(&claude_md_path, "");
+        }
+        let actions_available = mission_id
+            .and_then(crate::api::telegram::build_internal_telegram_action_token)
+            .is_some()
+            && super::mission_runner::localhost_api_base_url_from_env().is_some();
+        super::mission_runner::inject_telegram_identity_into_claude_md(
+            &claude_md_path,
+            &user_message,
+            actions_available,
+        );
+    }
+
     // Build a task prompt that includes conversation context with size limits.
     let history_for_prompt = match history.last() {
         Some((role, content)) if role == "user" && content == &user_message => {
@@ -8504,6 +9468,153 @@ async fn run_single_control_turn(
                 }
             }
 
+            // Auth error recovery: if the token was revoked server-side but the
+            // local expiry hadn't passed yet, invalidate stale credentials, force
+            // an OAuth refresh, and retry once.
+            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
+                tracing::warn!(
+                    mission_id = %mid,
+                    "Auth error detected — invalidating stale credentials and retrying"
+                );
+
+                super::mission_runner::refresh_claude_credentials_after_auth_error(
+                    &ctx.working_dir,
+                    "control_initial_auth_error",
+                )
+                .await;
+
+                // Retry with fresh credentials
+                result = Box::pin(super::mission_runner::run_claudecode_turn(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &effective_message,
+                    config.default_model.as_deref(),
+                    requested_model_effort.as_deref(),
+                    config.opencode_agent.as_deref(),
+                    mid,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    None,
+                    &config.working_dir,
+                    effective_session_id.as_deref(),
+                    is_continuation,
+                    Some(tool_hub.clone()),
+                    Some(status.clone()),
+                    None,
+                ))
+                .await;
+            }
+
+            // Account rotation: if rate-limited, try alternate Anthropic credentials.
+            // The first entry in the list is the highest-priority credential, which
+            // is almost certainly what the initial (override_auth=None) call used.
+            // Skip it to avoid a guaranteed duplicate rate-limit failure.
+            let mut rotated_anthropic_account = false;
+            if result.terminal_reason == Some(TerminalReason::RateLimited) && !cancel.is_cancelled()
+            {
+                let rotation_accounts = super::mission_runner::anthropic_rotation_accounts(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &config.working_dir,
+                );
+                if !rotation_accounts.accounts.is_empty() {
+                    tracing::info!(
+                        mission_id = %mid,
+                        total_accounts = rotation_accounts.total_accounts,
+                        alternate_accounts = rotation_accounts.accounts.len(),
+                        skipped_current = rotation_accounts.skipped_current,
+                        "Rate limited on primary account; trying alternate Anthropic credentials"
+                    );
+                    for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        rotated_anthropic_account = true;
+                        tracing::info!(
+                            mission_id = %mid,
+                            rotation_attempt = idx + 1,
+                            auth_type = match &alt_auth {
+                                super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
+                                super::ai_providers::ClaudeCodeAuth::OAuthToken(_) =>
+                                    "oauth_token",
+                            },
+                            "Rotating to alternate Anthropic account"
+                        );
+                        result = Box::pin(super::mission_runner::run_claudecode_turn(
+                            exec_workspace,
+                            &ctx.working_dir,
+                            &effective_message,
+                            config.default_model.as_deref(),
+                            requested_model_effort.as_deref(),
+                            config.opencode_agent.as_deref(),
+                            mid,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            None,
+                            &config.working_dir,
+                            effective_session_id.as_deref(),
+                            is_continuation,
+                            Some(tool_hub.clone()),
+                            Some(status.clone()),
+                            Some(alt_auth),
+                        ))
+                        .await;
+                        // Only continue rotating on rate-limit errors.
+                        match result.terminal_reason {
+                            Some(TerminalReason::RateLimited) => {
+                                tracing::info!(
+                                    mission_id = %mid,
+                                    rotation_attempt = idx + 1,
+                                    "Rate limited; rotating to next account"
+                                );
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+
+            // Account rotation can surface a revoked/expired alternate OAuth
+            // credential. Run the same stale-credential recovery after rotation
+            // so the mission retries with freshly refreshed host credentials
+            // instead of stopping on "Invalid authentication credentials".
+            if rotated_anthropic_account
+                && result.terminal_reason == Some(TerminalReason::AuthError)
+                && !cancel.is_cancelled()
+            {
+                tracing::warn!(
+                    mission_id = %mid,
+                    "Auth error detected after credential rotation - invalidating stale credentials and retrying"
+                );
+
+                super::mission_runner::refresh_claude_credentials_after_auth_error(
+                    &ctx.working_dir,
+                    "control_rotated_auth_error",
+                )
+                .await;
+
+                result = Box::pin(super::mission_runner::run_claudecode_turn(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &effective_message,
+                    config.default_model.as_deref(),
+                    requested_model_effort.as_deref(),
+                    config.opencode_agent.as_deref(),
+                    mid,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    None,
+                    &config.working_dir,
+                    effective_session_id.as_deref(),
+                    is_continuation,
+                    Some(tool_hub.clone()),
+                    Some(status.clone()),
+                    None,
+                ))
+                .await;
+            }
+
             result
         }
         Some("amp") => {
@@ -8578,6 +9689,30 @@ async fn run_single_control_turn(
                     None,
                 ))
                 .await;
+            } else if super::mission_runner::codex_tool_stall_should_retry_with_default_model(
+                requested_codex_model,
+                &result,
+            ) {
+                tracing::warn!(
+                    mission_id = %mid,
+                    requested_model = ?requested_codex_model,
+                    "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use (control path)"
+                );
+                result = Box::pin(super::mission_runner::run_codex_turn(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &convo,
+                    None,
+                    requested_model_effort.as_deref(),
+                    config.opencode_agent.as_deref(),
+                    mid,
+                    events_tx.clone(),
+                    cancel,
+                    &config.working_dir,
+                    session_id.as_deref(),
+                    None,
+                ))
+                .await;
             }
 
             result
@@ -8613,8 +9748,34 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
+            // Check profile's sandboxed config for disable_oh_my_opencode flag
+            let mut opencode_workspace = exec_workspace.clone();
+            if let Some(ref profile) = effective_config_profile {
+                let lib_guard = library.read().await;
+                if let Some(lib) = lib_guard.as_ref() {
+                    if let Ok(profile_data) = lib.get_config_profile(profile).await {
+                        if profile_data.sandboxed_config.disable_oh_my_opencode {
+                            tracing::info!(
+                                mission_id = ?mission_id,
+                                profile = %profile,
+                                "Enabling plain opencode mode from config profile"
+                            );
+                            let mut obj = opencode_workspace
+                                .config
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default();
+                            obj.insert(
+                                "disable_oh_my_opencode".to_string(),
+                                serde_json::json!(true),
+                            );
+                            opencode_workspace.config = serde_json::Value::Object(obj);
+                        }
+                    }
+                }
+            }
             Box::pin(super::mission_runner::run_opencode_turn(
-                exec_workspace,
+                &opencode_workspace,
                 &ctx.working_dir,
                 &user_message,
                 config.default_model.as_deref(),
@@ -8720,16 +9881,29 @@ pub async fn create_automation(
         other => other,
     };
 
+    // Validate cron expression before persisting
+    if let mission_store::TriggerType::Cron { ref expression, .. } = trigger {
+        if croner::Cron::new(expression).parse().is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid cron expression: {}", expression),
+            ));
+        }
+    }
+
     let start_immediately = req.start_immediately;
 
-    // For interval-based triggers, if start_immediately is false, set last_triggered_at
-    // to now so the scheduler waits for the full interval before the first trigger.
-    let last_triggered_at =
-        if !start_immediately && matches!(trigger, mission_store::TriggerType::Interval { .. }) {
-            Some(mission_store::now_string())
-        } else {
-            None
-        };
+    // For interval/cron triggers, if start_immediately is false, set last_triggered_at
+    // to now so the scheduler waits for the next occurrence before the first trigger.
+    let last_triggered_at = if !start_immediately
+        && matches!(
+            trigger,
+            mission_store::TriggerType::Interval { .. } | mission_store::TriggerType::Cron { .. }
+        ) {
+        Some(mission_store::now_string())
+    } else {
+        None
+    };
 
     // Build the complete Automation struct
     let fresh_session = req
@@ -9013,6 +10187,775 @@ pub async fn get_mission_automation_executions(
         .map_err(internal_error)?;
 
     Ok(Json(executions))
+}
+
+/// Export a mission as a portable bundle for transfer to another instance.
+///
+/// Response: JSON by default, or gzipped JSON when the caller sends
+/// `Accept-Encoding: gzip` (or explicitly forces it with `?gzip=true`).
+/// Gzipping typically shrinks bundles 5–10× — a 220 MB text-heavy bundle
+/// lands around 30 MB, comfortably under Cloudflare's 100 MB free-tier
+/// request cap. Clients that can't decompress pass `?gzip=false` to
+/// disable.
+#[derive(Debug, Deserialize, Default)]
+pub struct ExportMissionQuery {
+    /// Force gzip encoding regardless of Accept-Encoding. `None` defers to
+    /// the header; `Some(false)` disables even if Accept-Encoding asked.
+    #[serde(default)]
+    pub gzip: Option<bool>,
+}
+
+pub async fn export_mission(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<ExportMissionQuery>,
+    headers_in: axum::http::HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let control = control_for_user(&state, &user).await;
+    let source_public_url = std::env::var("SANDBOXED_PUBLIC_URL").ok();
+    let mut bundle = control
+        .mission_store
+        .export_mission_bundle(mission_id, source_public_url)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    // Ensure `workspace_name` is populated so the import side can resolve
+    // it against its own workspace store without requiring the caller to
+    // pass `?workspace_id=`. The stored `missions.workspace_name` column
+    // can be NULL (it's only populated opportunistically at display time).
+    if bundle.workspace_name.is_none() {
+        if let Some(ws) = state.workspaces.get(bundle.mission.workspace_id).await {
+            bundle.workspace_name = Some(ws.name.clone());
+            bundle.mission.workspace_name = Some(ws.name);
+        }
+    }
+    let mission_id_simple = bundle.mission.id.simple().to_string();
+
+    // Gzip opt-in:
+    //   1. `?gzip=true` always compresses
+    //   2. `?gzip=false` always skips
+    //   3. Otherwise honor Accept-Encoding: gzip, including q-values
+    //      (`gzip;q=0` explicitly disallows gzip even when present).
+    let accepts_gzip = headers_in
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(accept_encoding_allows_gzip)
+        .unwrap_or(false);
+    let use_gzip = query.gzip.unwrap_or(accepts_gzip);
+
+    // Stream the bundle out instead of materializing a full JSON string
+    // (and a full gzip buffer on top of that). For large missions the
+    // old approach held bundle + JSON + optional gzip — three in-memory
+    // copies at once — which could OOM the daemon on export. Here the
+    // serializer writes into a bounded mpsc channel in ~64 KB chunks;
+    // flate2 compresses on the fly when use_gzip is set.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+    tokio::task::spawn_blocking(move || {
+        let mut writer = ChannelWriter::new(tx);
+        let serialize_result: std::io::Result<()> = if use_gzip {
+            let mut encoder = GzEncoder::new(&mut writer, Compression::default());
+            serde_json::to_writer(&mut encoder, &bundle)
+                .map_err(std::io::Error::other)
+                .and_then(|_| encoder.finish().map(|_| ()))
+        } else {
+            serde_json::to_writer(&mut writer, &bundle).map_err(std::io::Error::other)
+        };
+        if let Err(e) = serialize_result.and_then(|_| writer.flush_all()) {
+            writer.send_error(e);
+        }
+    });
+    // Adapt the mpsc receiver into a `Stream` via futures::stream::unfold —
+    // tokio-stream isn't in the dep set, and this is a ~5-line adapter.
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let body = axum::body::Body::from_stream(stream);
+
+    let filename = if use_gzip {
+        format!("mission-{mission_id_simple}.json.gz")
+    } else {
+        format!("mission-{mission_id_simple}.json")
+    };
+
+    let mut resp = (StatusCode::OK, body).into_response();
+    let out_headers = resp.headers_mut();
+    out_headers.insert(
+        header::CONTENT_TYPE,
+        "application/json; charset=utf-8".parse().unwrap(),
+    );
+    if use_gzip {
+        out_headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        // Mark the response as varying on Accept-Encoding so caches
+        // don't serve a gzipped body to a client that didn't ask.
+        out_headers.insert(header::VARY, "Accept-Encoding".parse().unwrap());
+    }
+    out_headers.insert(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{filename}\"")
+            .parse()
+            .map_err(internal_error)?,
+    );
+    Ok(resp)
+}
+
+/// Import a mission bundle previously produced by [`export_mission`].
+///
+/// Body is the raw JSON bundle (no multipart wrapper — keep the happy path
+/// simple for curl / scripts). Optional query params:
+/// - `workspace_id=<uuid>` — override target workspace; otherwise we resolve
+///   the bundle's `workspace_name` against the local workspace store.
+/// - `keep_automations_active=true` — import automations enabled. Default is
+///   disabled so bundles don't immediately start firing on the target.
+#[derive(Debug, Deserialize, Default)]
+pub struct ImportMissionQuery {
+    pub workspace_id: Option<Uuid>,
+    #[serde(default)]
+    pub keep_automations_active: bool,
+}
+
+pub async fn import_mission(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    axum::extract::Query(query): axum::extract::Query<ImportMissionQuery>,
+    headers_in: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let bundle = parse_mission_bundle(&headers_in, &body)?;
+    if bundle.version != 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Unsupported bundle version {} (expected 1)", bundle.version),
+        ));
+    }
+
+    let target = resolve_import_target_workspace(
+        &state,
+        query.workspace_id,
+        bundle.workspace_name.as_deref(),
+    )
+    .await?;
+
+    let options = mission_store::MissionImportOptions {
+        target_workspace_id: Some(target.workspace_id),
+        target_workspace_name: target.workspace_name.clone(),
+        keep_automations_active: query.keep_automations_active,
+    };
+    let original_mission_id = bundle.mission.id;
+    let events_imported = bundle.events.len();
+    let automations_imported = bundle.automations.len();
+    let executions_imported = bundle.executions.len();
+    let new_id = control
+        .mission_store
+        .import_mission_bundle(bundle, options)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(serde_json::json!({
+        "mission_id": new_id,
+        "workspace_id": target.workspace_id,
+        "original_mission_id": original_mission_id,
+        "imported": {
+            "events": events_imported,
+            "automations": automations_imported,
+            "executions": executions_imported,
+        },
+        "automations_active": query.keep_automations_active,
+    })))
+}
+
+/// Resolve the workspace a mission import should land in.
+///
+/// Explicit `?workspace_id=` wins. Otherwise the bundle's
+/// `workspace_name` is matched against the local workspace list. A
+/// single match is used; zero matches or multiple matches return
+/// `BAD_REQUEST`/`CONFLICT` asking the caller to disambiguate — we
+/// never silently pick "the first" when workspace names aren't unique.
+/// Resolved import target: the workspace UUID the new mission will be
+/// attached to, plus its current display name (used so
+/// `mission.workspace_name` agrees with `mission.workspace_id`).
+struct ResolvedImportTarget {
+    workspace_id: Uuid,
+    workspace_name: Option<String>,
+}
+
+async fn resolve_import_target_workspace(
+    state: &Arc<AppState>,
+    explicit_id: Option<Uuid>,
+    bundle_workspace_name: Option<&str>,
+) -> Result<ResolvedImportTarget, (StatusCode, String)> {
+    if let Some(id) = explicit_id {
+        // Reject unknown IDs up front — the alternative is persisting a
+        // mission pointing at a nonexistent workspace, which later falls
+        // through to the default host workspace in resolve_workspace and
+        // silently executes in the wrong directory.
+        let workspaces = state.workspaces.list().await;
+        let Some(ws) = workspaces.iter().find(|w| w.id == id) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Workspace '{id}' not found on this instance. Pass a \
+                     valid ?workspace_id=<uuid> or omit it to resolve \
+                     by workspace_name."
+                ),
+            ));
+        };
+        return Ok(ResolvedImportTarget {
+            workspace_id: id,
+            workspace_name: Some(ws.name.clone()),
+        });
+    }
+    let Some(name) = bundle_workspace_name else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Bundle has no workspace_name and no ?workspace_id= override was provided.".to_string(),
+        ));
+    };
+    let workspaces = state.workspaces.list().await;
+    let matches: Vec<_> = workspaces.iter().filter(|w| w.name == name).collect();
+    match matches.as_slice() {
+        [] => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Workspace '{name}' not found on this instance. Pass \
+                 ?workspace_id=<uuid> to pick one explicitly."
+            ),
+        )),
+        [only] => Ok(ResolvedImportTarget {
+            workspace_id: only.id,
+            workspace_name: Some(only.name.clone()),
+        }),
+        _ => Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Workspace name '{name}' is ambiguous ({} matches). \
+                 Pass ?workspace_id=<uuid> to pick one explicitly.",
+                matches.len()
+            ),
+        )),
+    }
+}
+
+/// Parse a mission bundle from raw bytes, transparently decompressing
+/// `Content-Encoding: gzip` before JSON-decoding. Both the single-shot
+/// `/import` route and the chunked `/import-chunks/:id/commit` route
+/// share this helper — they both arrive as a `Bytes` blob that may or
+/// may not be gzipped.
+/// Hard cap on decompressed mission bundle size for the *chunked*
+/// import path, where the decoder streams from disk-staged chunks into
+/// `serde_json::from_reader` without ever buffering the full payload.
+/// 2 GiB bounds a zip-bomb there.
+const MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Tighter cap for the *single-shot* `/import` route. That path streams
+/// the decompressed body into `from_reader`, but the parser still
+/// allocates per-frame state up to this ceiling — and an attacker can
+/// drive it from a 128 MiB compressed body. Keep the ceiling small
+/// enough that even the worst-case allocation stays bounded; larger
+/// bundles must use the chunked route, which stages chunks on disk
+/// first.
+const MISSION_BUNDLE_SINGLE_SHOT_MAX_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Stream a mission bundle out of a staged chunk directory without ever
+/// holding the concatenated body in memory. Handles gzip transparently —
+/// either because the caller set `?gzip=true` or because the first chunk
+/// starts with the gzip magic header.
+fn parse_mission_bundle_from_chunk_dir(
+    dir: &std::path::Path,
+    total_chunks: u32,
+    gzip_hint: bool,
+) -> Result<mission_store::MissionBundle, (StatusCode, String)> {
+    use std::fs::File;
+    use std::io::{BufReader, Read};
+
+    if total_chunks == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "total_chunks must be > 0".to_string(),
+        ));
+    }
+
+    // Peek at the first chunk to auto-detect gzip when the caller
+    // forgot to pass the hint. A plain `[0x1f, 0x8b]` prefix is
+    // unambiguous for gzip and lets us decompress without buffering
+    // the whole upload first.
+    let first_path = dir.join(format!("chunk_{:06}", 0));
+    let mut first = File::open(&first_path).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Chunk 0 missing or unreadable: {e}"),
+        )
+    })?;
+    let mut magic = [0u8; 2];
+    let peeked = first.read(&mut magic).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read chunk 0: {e}"),
+        )
+    })?;
+    let is_gzipped = gzip_hint || (peeked == 2 && magic == [0x1f, 0x8b]);
+    // Seek back to start so the reader chain sees the full first chunk.
+    use std::io::Seek;
+    first
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("seek: {e}")))?;
+
+    // Build a chained reader across every chunk file in index order.
+    // `Read::chain` is associative, so we fold left across the remaining
+    // chunk indices without allocating intermediate buffers.
+    let mut reader: Box<dyn Read> = Box::new(BufReader::new(first));
+    for i in 1..total_chunks {
+        let path = dir.join(format!("chunk_{i:06}"));
+        let f = File::open(&path).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Chunk {i} missing or unreadable: {e}"),
+            )
+        })?;
+        reader = Box::new(reader.chain(BufReader::new(f)));
+    }
+
+    let bundle: mission_store::MissionBundle = if is_gzipped {
+        let decoder = flate2::read::GzDecoder::new(reader);
+        let bounded = decoder.take(MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES);
+        serde_json::from_reader(BufReader::new(bounded)).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid mission bundle (after gunzip): {e}"),
+            )
+        })?
+    } else {
+        // Cap the plain-JSON path at the same ceiling as the gzip
+        // branch. `/import-chunks` accepts many 128 MB chunks, so
+        // without a cap an attacker could chain them into an
+        // arbitrarily large payload and drive unbounded allocation
+        // inside serde_json::from_reader.
+        let bounded = reader.take(MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES);
+        serde_json::from_reader(BufReader::new(bounded)).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid mission bundle: {e}"),
+            )
+        })?
+    };
+
+    Ok(bundle)
+}
+
+/// `std::io::Write` adapter that pushes ~64 KB chunks into an mpsc
+/// channel consumed by the HTTP response body. Lets `export_mission`
+/// serialize (and optionally gzip) the bundle straight to the wire
+/// without ever holding the full payload in RAM.
+struct ChannelWriter {
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    buf: Vec<u8>,
+}
+
+impl ChannelWriter {
+    /// Flush threshold — large enough to amortize channel overhead,
+    /// small enough that stream backpressure is responsive.
+    const CHUNK_BYTES: usize = 64 * 1024;
+
+    fn new(tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>) -> Self {
+        Self {
+            tx,
+            buf: Vec::with_capacity(Self::CHUNK_BYTES * 2),
+        }
+    }
+
+    /// Drain whatever is in `buf`.
+    fn flush_all(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            let chunk = std::mem::take(&mut self.buf);
+            self.tx
+                .blocking_send(Ok(bytes::Bytes::from(chunk)))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Surface a late error (serialization or flush) to the consumer
+    /// by pushing it as a stream item. Best-effort: if the receiver is
+    /// already gone we swallow it.
+    fn send_error(&self, err: std::io::Error) {
+        let _ = self.tx.blocking_send(Err(err));
+    }
+}
+
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= Self::CHUNK_BYTES {
+            self.flush_all()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_all()
+    }
+}
+
+/// Parse an `Accept-Encoding` header and decide whether the client
+/// allows gzip. Treats `identity;q=0` / `*;q=0` semantics correctly —
+/// a token of the form `gzip;q=0` explicitly disallows gzip, so simply
+/// matching on `starts_with("gzip")` (the previous behavior) returns
+/// the wrong answer for proxies that send weighted encodings.
+fn accept_encoding_allows_gzip(header_value: &str) -> bool {
+    let mut gzip_seen = false;
+    let mut gzip_qzero = false;
+    let mut star_qzero = false;
+    for raw in header_value.split(',') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        // Split into `name` and optional `q=<float>` parameter.
+        let mut parts = token.split(';');
+        let name = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let mut q: f32 = 1.0;
+        for param in parts {
+            let p = param.trim();
+            if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                if let Ok(v) = rest.parse::<f32>() {
+                    q = v;
+                }
+            }
+        }
+        let disallowed = q <= 0.0;
+        match name.as_str() {
+            "gzip" | "x-gzip" => {
+                if disallowed {
+                    gzip_qzero = true;
+                } else {
+                    gzip_seen = true;
+                }
+            }
+            "*" => {
+                if disallowed {
+                    star_qzero = true;
+                } else if !gzip_qzero {
+                    gzip_seen = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // Explicit `gzip;q=0` always wins over `*`. Otherwise gzip is on
+    // only when the client named it with a positive q-value — a bare
+    // `*` (without q=0) could mean "any", but we stay conservative and
+    // only compress when explicitly asked.
+    if gzip_qzero {
+        return false;
+    }
+    let _ = star_qzero; // star handling is advisory only here
+    gzip_seen
+}
+
+fn parse_mission_bundle(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<mission_store::MissionBundle, (StatusCode, String)> {
+    use axum::http::header;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let is_gzipped = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("gzip")))
+        .unwrap_or(false)
+        // Also sniff the gzip magic header — CLIs uploading gzipped
+        // bodies via `curl --data-binary @file.gz` sometimes forget to
+        // set Content-Encoding, and hitting them with "invalid JSON"
+        // instead of decoding would be a confusing footgun.
+        || body.starts_with(&[0x1f, 0x8b]);
+
+    // Stream straight from the body into `from_reader` and cap both
+    // the compressed wire size (enforced at the route layer via
+    // DefaultBodyLimit) and the decompressed size (via `Read::take`)
+    // so a zip-bomb can't allocate more than the single-shot ceiling
+    // inside the JSON parser.
+    let bundle: mission_store::MissionBundle = if is_gzipped {
+        let decoder = GzDecoder::new(body).take(MISSION_BUNDLE_SINGLE_SHOT_MAX_DECOMPRESSED_BYTES);
+        serde_json::from_reader(std::io::BufReader::new(decoder)).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid mission bundle (after gunzip): {e}"),
+            )
+        })?
+    } else {
+        let reader = body.take(MISSION_BUNDLE_SINGLE_SHOT_MAX_DECOMPRESSED_BYTES);
+        serde_json::from_reader(std::io::BufReader::new(reader)).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid mission bundle: {e}"),
+            )
+        })?
+    };
+
+    Ok(bundle)
+}
+
+fn sanitize_upload_id(id: &str) -> Option<String> {
+    // Keep upload IDs to a conservative alphabet — these become path
+    // components under /tmp, so allowing only [A-Za-z0-9_-] avoids path
+    // traversal without sacrificing UUIDs or custom labels.
+    let trimmed = id.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn import_chunks_dir(upload_id: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("sandboxed_sh_mission_import_{upload_id}"))
+}
+
+/// Staging TTL. Any chunked import dir untouched for longer than this is
+/// considered abandoned (client disconnect, crash, never committed) and
+/// gets swept on the next `init_mission_import` call. Picked large
+/// enough that a slow human-driven upload won't get culled mid-flight.
+const MISSION_IMPORT_STAGING_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Best-effort cleanup of abandoned chunked-import staging dirs. Runs
+/// opportunistically on `init_mission_import`; errors are logged but not
+/// propagated because temp directory sweeping must never block an
+/// otherwise-valid new upload.
+fn sweep_stale_import_staging_dirs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(name_os) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name_os.starts_with("sandboxed_sh_mission_import_") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        // Prefer mtime over ctime — a chunk upload touches mtime, so a
+        // currently-active upload looks "fresh" even if init_ was hours
+        // ago. Fall back to created() if mtime isn't available.
+        let last_touched = metadata
+            .modified()
+            .or_else(|_| metadata.created())
+            .unwrap_or(now);
+        match now.duration_since(last_touched) {
+            Ok(age) if age > MISSION_IMPORT_STAGING_TTL => {
+                let path = entry.path();
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    tracing::warn!(?path, error = %e, "Failed to sweep stale mission-import staging dir");
+                } else {
+                    tracing::info!(
+                        ?path,
+                        age_secs = age.as_secs(),
+                        "Swept abandoned mission-import staging dir"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Initialize a chunked mission import.
+///
+/// Returns `{"upload_id": "..."}` — the caller then PUTs chunks in order
+/// to `/api/control/missions/import-chunks/:upload_id/:index`, and POSTs
+/// `/commit` to finalize. This exists for bundles that exceed
+/// Cloudflare's 100 MB per-request cap even after gzip (very long
+/// missions with binary-heavy payloads that don't compress well).
+///
+/// For bundles under ~90 MB gzipped, prefer the single-shot `/import`
+/// route — it's simpler and doesn't leave temp files on disk.
+pub async fn init_mission_import(
+    State(_state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Opportunistic cleanup of prior abandoned uploads so /tmp can't
+    // grow without bound. Runs on a blocking thread since it hits the
+    // filesystem synchronously.
+    tokio::task::spawn_blocking(sweep_stale_import_staging_dirs);
+
+    let upload_id = Uuid::new_v4().simple().to_string();
+    let dir = import_chunks_dir(&upload_id);
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create chunk staging dir: {e}"),
+        )
+    })?;
+    Ok(Json(serde_json::json!({
+        "upload_id": upload_id,
+        "recommended_chunk_bytes": 80 * 1024 * 1024,
+    })))
+}
+
+/// Upload one chunk of a mission import.
+///
+/// Path: `/api/control/missions/import-chunks/:upload_id/:index`.
+/// Chunks are written to `chunk_<index:06>` under the upload's staging
+/// directory. Index order determines assembly order — the commit step
+/// reads `chunk_000000`, `chunk_000001`, ... in sequence.
+pub async fn upload_mission_import_chunk(
+    State(_state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+    Path((upload_id, index)): Path<(String, u32)>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let safe_id = sanitize_upload_id(&upload_id)
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid upload_id".to_string()))?;
+    let dir = import_chunks_dir(&safe_id);
+    if !dir.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Unknown upload_id. Call /import-chunks first to initialize.".to_string(),
+        ));
+    }
+    let chunk_path = dir.join(format!("chunk_{index:06}"));
+    tokio::fs::write(&chunk_path, &body).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write chunk {index}: {e}"),
+        )
+    })?;
+    Ok(Json(serde_json::json!({
+        "upload_id": safe_id,
+        "chunk_index": index,
+        "chunk_bytes": body.len(),
+    })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CommitMissionImportQuery {
+    pub workspace_id: Option<Uuid>,
+    #[serde(default)]
+    pub keep_automations_active: bool,
+    /// Total number of chunks the client uploaded. Must match the files
+    /// present in the staging dir — any gap aborts the commit.
+    pub total_chunks: u32,
+    /// Hint: the bundle is gzipped (set `?gzip=true` when sending
+    /// compressed chunks; otherwise server sniffs the magic header).
+    #[serde(default)]
+    pub gzip: bool,
+}
+
+/// Assemble uploaded chunks, optionally decompress, and run the regular
+/// import.
+///
+/// Cleans up the staging directory on success or failure — a caller that
+/// wants to retry a failed commit must re-upload all chunks under a
+/// fresh `upload_id`.
+pub async fn commit_mission_import(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(upload_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<CommitMissionImportQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let safe_id = sanitize_upload_id(&upload_id)
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid upload_id".to_string()))?;
+    let dir = import_chunks_dir(&safe_id);
+    if !dir.exists() {
+        return Err((StatusCode::NOT_FOUND, "Unknown upload_id.".to_string()));
+    }
+
+    // Parse directly from the staged chunk files instead of concatenating
+    // them into one giant `Vec<u8>` in memory. For multi-hundred-MB or GB
+    // uploads that's the difference between "handled" and "OOM'd the
+    // daemon". The parser streams via `serde_json::from_reader` on a
+    // chained `File` iterator (optionally gzip-decoded in flight).
+    let total_chunks = query.total_chunks;
+    let gzip_hint = query.gzip;
+    let dir_for_parse = dir.clone();
+    let bundle_result = tokio::task::spawn_blocking(move || {
+        parse_mission_bundle_from_chunk_dir(&dir_for_parse, total_chunks, gzip_hint)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Join error while parsing import: {e}"),
+        )
+    })?;
+
+    // Chunks on disk are no longer needed — wipe staging regardless of
+    // parse outcome so /tmp doesn't hold the raw upload open.
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+
+    let bundle = bundle_result?;
+    if bundle.version != 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Unsupported bundle version {} (expected 1)", bundle.version),
+        ));
+    }
+
+    let target = resolve_import_target_workspace(
+        &state,
+        query.workspace_id,
+        bundle.workspace_name.as_deref(),
+    )
+    .await?;
+
+    let control = control_for_user(&state, &user).await;
+    let options = mission_store::MissionImportOptions {
+        target_workspace_id: Some(target.workspace_id),
+        target_workspace_name: target.workspace_name.clone(),
+        keep_automations_active: query.keep_automations_active,
+    };
+    let original_mission_id = bundle.mission.id;
+    let events_imported = bundle.events.len();
+    let automations_imported = bundle.automations.len();
+    let executions_imported = bundle.executions.len();
+    let new_id = control
+        .mission_store
+        .import_mission_bundle(bundle, options)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(serde_json::json!({
+        "mission_id": new_id,
+        "workspace_id": target.workspace_id,
+        "original_mission_id": original_mission_id,
+        "imported": {
+            "events": events_imported,
+            "automations": automations_imported,
+            "executions": executions_imported,
+        },
+        "automations_active": query.keep_automations_active,
+    })))
+}
+
+/// Cancel an in-progress chunked import and remove its staging dir.
+pub async fn cancel_mission_import(
+    State(_state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+    Path(upload_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let safe_id = sanitize_upload_id(&upload_id)
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid upload_id".to_string()))?;
+    let dir = import_chunks_dir(&safe_id);
+    if dir.exists() {
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .map_err(internal_error)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Webhook receiver endpoint for triggering automations.
@@ -9364,9 +11307,1153 @@ pub async fn webhook_receiver(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Assistant missions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// List all missions with MissionMode::Assistant.
+pub async fn list_assistant_missions(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<super::mission_store::Mission>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let missions = control
+        .mission_store
+        .list_assistant_missions()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(missions))
+}
+
+/// Set mission mode (task or assistant).
+pub async fn set_mission_mode(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SetMissionModeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use super::mission_store::MissionMode;
+
+    let mode = match req.mode.as_str() {
+        "task" => MissionMode::Task,
+        "assistant" => MissionMode::Assistant,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid mission mode: {other}. Must be 'task' or 'assistant'."),
+            ));
+        }
+    };
+
+    let control = control_for_user(&state, &user).await;
+    control
+        .mission_store
+        .update_mission_mode(id, mode)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(ok_json())
+}
+
+#[derive(Deserialize)]
+pub struct SetMissionModeRequest {
+    pub mode: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram Channel endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// List Telegram channels for a mission.
+pub async fn list_telegram_channels(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+) -> Result<Json<Vec<super::mission_store::TelegramChannel>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let channels = control
+        .mission_store
+        .list_telegram_channels(mission_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(channels))
+}
+
+/// Create a Telegram channel for a mission.
+pub async fn create_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    Json(req): Json<CreateTelegramChannelRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    use super::mission_store::{now_string, MissionMode, TelegramChannel};
+
+    let control = control_for_user(&state, &user).await;
+
+    // Verify mission exists
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+
+    // Auto-set mission to Assistant mode when adding a Telegram channel
+    if mission.mission_mode != MissionMode::Assistant {
+        if let Err(e) = control
+            .mission_store
+            .update_mission_mode(mission_id, MissionMode::Assistant)
+            .await
+        {
+            tracing::warn!(
+                "Failed to set assistant mode on mission {}: {}",
+                mission_id,
+                e
+            );
+        } else {
+            tracing::info!(
+                "Auto-set mission {} to Assistant mode (Telegram channel attached)",
+                mission_id
+            );
+        }
+    }
+
+    // Reject duplicate bot tokens to avoid webhook conflicts
+    let all_channels = control
+        .mission_store
+        .list_all_telegram_channels()
+        .await
+        .map_err(internal_error)?;
+    if all_channels.iter().any(|c| c.bot_token == req.bot_token) {
+        return Err((
+            StatusCode::CONFLICT,
+            "A channel with this bot token already exists".to_string(),
+        ));
+    }
+
+    let now = now_string();
+    let webhook_secret = Uuid::new_v4().to_string().replace('-', "");
+    let channel = TelegramChannel {
+        id: Uuid::new_v4(),
+        mission_id,
+        bot_token: req.bot_token,
+        bot_username: req.bot_username,
+        allowed_chat_ids: req.allowed_chat_ids.unwrap_or_default(),
+        trigger_mode: req.trigger_mode.unwrap_or_default(),
+        active: true,
+        webhook_secret: Some(webhook_secret),
+        instructions: req.instructions,
+        auto_create_missions: false,
+        default_backend: None,
+        default_model_override: None,
+        default_model_effort: None,
+        default_workspace_id: None,
+        default_config_profile: None,
+        default_agent: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    let created = control
+        .mission_store
+        .create_telegram_channel(channel)
+        .await
+        .map_err(internal_error)?;
+
+    // Register the webhook — roll back the channel if this fails
+    let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+        .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+    if let Err(e) = state
+        .telegram_bridge
+        .start_channel(
+            created.clone(),
+            control.cmd_tx.clone(),
+            control.events_tx.clone(),
+            control.mission_store.clone(),
+            &public_url,
+        )
+        .await
+    {
+        let _ = control
+            .mission_store
+            .delete_telegram_channel(created.id)
+            .await;
+        return Err(internal_error(e));
+    }
+
+    tracing::info!(
+        "Created Telegram channel {} for mission {}",
+        created.id,
+        mission_id
+    );
+
+    Ok(Json(created))
+}
+
+#[derive(Deserialize)]
+pub struct CreateTelegramChannelRequest {
+    pub bot_token: String,
+    #[serde(default)]
+    pub bot_username: Option<String>,
+    #[serde(default)]
+    pub allowed_chat_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub trigger_mode: Option<super::mission_store::TelegramTriggerMode>,
+    /// System instructions for the assistant (e.g. "Don't use markdown formatting")
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+/// Delete a Telegram channel.
+pub async fn delete_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    // Fetch channel first so we can clean up the placeholder mission for auto-create bots
+    let channel = control
+        .mission_store
+        .get_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?;
+
+    // Delete from store first (verifies ownership), then stop the poller
+    let deleted = control
+        .mission_store
+        .delete_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?;
+
+    if deleted {
+        state.telegram_bridge.stop_channel(channel_id).await;
+
+        // Clean up the placeholder mission for auto-create bots
+        if let Some(ch) = channel {
+            if ch.auto_create_missions {
+                let _ = control.mission_store.delete_mission(ch.mission_id).await;
+            }
+        }
+
+        tracing::info!("Deleted Telegram channel {}", channel_id);
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("Telegram channel {} not found", channel_id),
+        ))
+    }
+}
+
+/// Toggle a Telegram channel's active state.
+pub async fn toggle_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Json(req): Json<ToggleTelegramChannelRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let mut channel = control
+        .mission_store
+        .get_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Telegram channel {} not found", channel_id),
+            )
+        })?;
+
+    let previous_active = channel.active;
+    channel.active = req.active;
+    channel.updated_at = super::mission_store::now_string();
+
+    control
+        .mission_store
+        .update_telegram_channel(channel.clone())
+        .await
+        .map_err(internal_error)?;
+
+    if channel.active {
+        let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+            .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+        if let Err(e) = state
+            .telegram_bridge
+            .start_channel(
+                channel.clone(),
+                control.cmd_tx.clone(),
+                control.events_tx.clone(),
+                control.mission_store.clone(),
+                &public_url,
+            )
+            .await
+        {
+            // Roll back active state
+            channel.active = previous_active;
+            channel.updated_at = super::mission_store::now_string();
+            let _ = control.mission_store.update_telegram_channel(channel).await;
+            return Err(internal_error(e));
+        }
+    } else {
+        state.telegram_bridge.stop_channel(channel_id).await;
+    }
+
+    Ok(Json(channel))
+}
+
+#[derive(Deserialize)]
+pub struct ToggleTelegramChannelRequest {
+    pub active: bool,
+}
+
+/// Update a Telegram channel's settings (PATCH).
+pub async fn update_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Json(req): Json<UpdateTelegramChannelRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let original_channel = control
+        .mission_store
+        .get_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Telegram channel {} not found", channel_id),
+            )
+        })?;
+
+    let mut channel = original_channel.clone();
+
+    // Apply partial updates
+    if let Some(active) = req.active {
+        channel.active = active;
+    }
+    if let Some(trigger_mode) = req.trigger_mode {
+        channel.trigger_mode = trigger_mode;
+    }
+    if let Some(allowed_chat_ids) = req.allowed_chat_ids {
+        channel.allowed_chat_ids = allowed_chat_ids;
+    }
+    if let Some(instructions) = req.instructions {
+        channel.instructions = if instructions.is_empty() {
+            None
+        } else {
+            Some(instructions)
+        };
+    }
+    if let Some(backend) = req.default_backend {
+        channel.default_backend = if backend.is_empty() {
+            None
+        } else {
+            Some(backend)
+        };
+    }
+    if let Some(model) = req.default_model_override {
+        channel.default_model_override = if model.is_empty() { None } else { Some(model) };
+    }
+    if let Some(effort) = req.default_model_effort {
+        channel.default_model_effort = if effort.is_empty() {
+            None
+        } else {
+            Some(effort)
+        };
+    }
+    if let Some(ws_id) = req.default_workspace_id {
+        channel.default_workspace_id = if ws_id.is_empty() {
+            None
+        } else {
+            uuid::Uuid::parse_str(&ws_id).ok()
+        };
+    }
+    if let Some(profile) = req.default_config_profile {
+        channel.default_config_profile = if profile.is_empty() {
+            None
+        } else {
+            Some(profile)
+        };
+    }
+    if let Some(agent) = req.default_agent {
+        channel.default_agent = if agent.is_empty() { None } else { Some(agent) };
+    }
+    channel.updated_at = super::mission_store::now_string();
+
+    control
+        .mission_store
+        .update_telegram_channel(channel.clone())
+        .await
+        .map_err(internal_error)?;
+
+    // Re-register or stop webhook based on active state
+    if channel.active {
+        let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+            .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+        if let Err(e) = state
+            .telegram_bridge
+            .start_channel(
+                channel.clone(),
+                control.cmd_tx.clone(),
+                control.events_tx.clone(),
+                control.mission_store.clone(),
+                &public_url,
+            )
+            .await
+        {
+            // Roll back to original channel state
+            let _ = control
+                .mission_store
+                .update_telegram_channel(original_channel)
+                .await;
+            return Err(internal_error(e));
+        }
+    } else {
+        state.telegram_bridge.stop_channel(channel_id).await;
+    }
+
+    Ok(Json(channel))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateTelegramChannelRequest {
+    #[serde(default)]
+    pub active: Option<bool>,
+    #[serde(default)]
+    pub trigger_mode: Option<super::mission_store::TelegramTriggerMode>,
+    #[serde(default)]
+    pub allowed_chat_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub default_backend: Option<String>,
+    #[serde(default)]
+    pub default_model_override: Option<String>,
+    #[serde(default)]
+    pub default_model_effort: Option<String>,
+    #[serde(default)]
+    pub default_workspace_id: Option<String>,
+    #[serde(default)]
+    pub default_config_profile: Option<String>,
+    #[serde(default)]
+    pub default_agent: Option<String>,
+}
+
+// === Standalone Telegram Bot endpoints (auto-create missions per chat) ===
+
+/// Create a standalone Telegram bot configuration (auto-creates missions per chat).
+pub async fn create_telegram_bot(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<CreateTelegramBotRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    use super::mission_store::{now_string, MissionMode, TelegramChannel};
+
+    let control = control_for_user(&state, &user).await;
+
+    // Reject duplicate bot tokens to avoid webhook conflicts
+    let all_channels = control
+        .mission_store
+        .list_all_telegram_channels()
+        .await
+        .map_err(internal_error)?;
+    if all_channels.iter().any(|c| c.bot_token == req.bot_token) {
+        return Err((
+            StatusCode::CONFLICT,
+            "A bot with this token already exists".to_string(),
+        ));
+    }
+
+    // Create a placeholder mission so the FK constraint is satisfied.
+    // When auto_create_missions is true, individual chat missions are auto-created;
+    // this placeholder is only used to anchor the channel row.
+    let placeholder_mission = control
+        .mission_store
+        .create_mission(
+            Some("Telegram Bot (auto-create)"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(internal_error)?;
+    // Set placeholder to assistant mode
+    let _ = control
+        .mission_store
+        .update_mission_mode(placeholder_mission.id, MissionMode::Assistant)
+        .await;
+
+    let now = now_string();
+    let webhook_secret = Uuid::new_v4().to_string().replace('-', "");
+    let channel = TelegramChannel {
+        id: Uuid::new_v4(),
+        mission_id: placeholder_mission.id,
+        bot_token: req.bot_token,
+        bot_username: req.bot_username,
+        allowed_chat_ids: req.allowed_chat_ids.unwrap_or_default(),
+        trigger_mode: req.trigger_mode.unwrap_or_default(),
+        active: true,
+        webhook_secret: Some(webhook_secret),
+        instructions: req.instructions,
+        auto_create_missions: true,
+        default_backend: req.default_backend,
+        default_model_override: req.default_model_override,
+        default_model_effort: req.default_model_effort,
+        default_workspace_id: req.default_workspace_id,
+        default_config_profile: req.default_config_profile,
+        default_agent: req.default_agent,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    let created = match control.mission_store.create_telegram_channel(channel).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Clean up placeholder mission
+            let _ = control
+                .mission_store
+                .delete_mission(placeholder_mission.id)
+                .await;
+            return Err(internal_error(e));
+        }
+    };
+
+    // Register the webhook — roll back channel + placeholder on failure
+    let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+        .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+    if let Err(e) = state
+        .telegram_bridge
+        .start_channel(
+            created.clone(),
+            control.cmd_tx.clone(),
+            control.events_tx.clone(),
+            control.mission_store.clone(),
+            &public_url,
+        )
+        .await
+    {
+        let _ = control
+            .mission_store
+            .delete_telegram_channel(created.id)
+            .await;
+        let _ = control
+            .mission_store
+            .delete_mission(placeholder_mission.id)
+            .await;
+        return Err(internal_error(e));
+    }
+
+    tracing::info!("Created Telegram bot {} (auto-create missions)", created.id);
+
+    Ok(Json(created))
+}
+
+#[derive(Deserialize)]
+pub struct CreateTelegramBotRequest {
+    pub bot_token: String,
+    #[serde(default)]
+    pub bot_username: Option<String>,
+    #[serde(default)]
+    pub allowed_chat_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub trigger_mode: Option<super::mission_store::TelegramTriggerMode>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub default_backend: Option<String>,
+    #[serde(default)]
+    pub default_model_override: Option<String>,
+    #[serde(default)]
+    pub default_model_effort: Option<String>,
+    #[serde(default)]
+    pub default_workspace_id: Option<Uuid>,
+    #[serde(default)]
+    pub default_config_profile: Option<String>,
+    #[serde(default)]
+    pub default_agent: Option<String>,
+}
+
+/// List all Telegram bot configurations.
+pub async fn list_telegram_bots(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<super::mission_store::TelegramChannel>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let channels = control
+        .mission_store
+        .list_all_telegram_channels()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(channels))
+}
+
+/// List chat-to-mission mappings for a Telegram bot.
+pub async fn list_bot_chats(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+) -> Result<Json<Vec<super::mission_store::TelegramChatMission>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mappings = control
+        .mission_store
+        .list_telegram_chat_missions(channel_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(mappings))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramBotListQuery {
+    #[serde(default = "default_telegram_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub chat_id: Option<i64>,
+}
+
+fn default_telegram_limit() -> usize {
+    20
+}
+
+pub async fn list_bot_scheduled_messages(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramScheduledMessage>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let messages = control
+        .mission_store
+        .list_telegram_scheduled_messages(channel_id, query.chat_id, query.limit.clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(messages))
+}
+
+pub async fn list_bot_action_executions(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramActionExecution>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let executions = control
+        .mission_store
+        .list_telegram_action_executions(channel_id, query.chat_id, query.limit.clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(executions))
+}
+
+pub async fn list_bot_conversations(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramConversation>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let conversations = control
+        .mission_store
+        .list_telegram_conversations(channel_id, query.limit.clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(conversations))
+}
+
+pub async fn list_bot_workflows(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramWorkflow>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let workflows = control
+        .mission_store
+        .list_telegram_workflows(channel_id, query.limit.clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(workflows))
+}
+
+pub async fn list_telegram_conversation_messages(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(conversation_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramConversationMessage>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let messages = control
+        .mission_store
+        .list_telegram_conversation_messages(conversation_id, query.limit.clamp(1, 200))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(messages))
+}
+
+pub async fn list_telegram_workflow_events(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(workflow_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramWorkflowEvent>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let events = control
+        .mission_store
+        .list_telegram_workflow_events(workflow_id, query.limit.clamp(1, 200))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(events))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramMemoryQuery {
+    #[serde(default = "default_telegram_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub chat_id: Option<i64>,
+    #[serde(default)]
+    pub subject_user_id: Option<i64>,
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
+pub async fn list_bot_structured_memory(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramMemoryQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramStructuredMemoryEntry>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let limit = query.limit.clamp(1, 100);
+    let entries = if let Some(q) = query.q.as_deref().filter(|q| !q.trim().is_empty()) {
+        let mut entries = control
+            .mission_store
+            .search_telegram_structured_memory_hybrid(
+                channel_id,
+                query.chat_id,
+                query.subject_user_id,
+                q,
+                limit,
+            )
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .map(|hit| hit.entry)
+            .collect::<Vec<_>>();
+        if let Some(subject_user_id) = query.subject_user_id {
+            entries.retain(|entry| entry.subject_user_id == Some(subject_user_id));
+        }
+        entries
+    } else {
+        control
+            .mission_store
+            .list_telegram_structured_memory(
+                channel_id,
+                query.chat_id,
+                query.subject_user_id,
+                limit,
+            )
+            .await
+            .map_err(internal_error)?
+    };
+    Ok(Json(entries))
+}
+
+pub async fn search_bot_structured_memory(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramMemoryQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramStructuredMemorySearchHit>>, (StatusCode, String)>
+{
+    let control = control_for_user(&state, &user).await;
+    let Some(q) = query.q.as_deref().filter(|q| !q.trim().is_empty()) else {
+        return Ok(Json(Vec::new()));
+    };
+    let mut hits = control
+        .mission_store
+        .search_telegram_structured_memory_hybrid(
+            channel_id,
+            query.chat_id,
+            query.subject_user_id,
+            q,
+            query.limit.clamp(1, 100),
+        )
+        .await
+        .map_err(internal_error)?;
+    if let Some(subject_user_id) = query.subject_user_id {
+        hits.retain(|hit| hit.entry.subject_user_id == Some(subject_user_id));
+    }
+    Ok(Json(hits))
+}
+
+/// Send a message to a Telegram chat via the bot and optionally dispatch it to
+/// the associated mission. Used by agents (e.g. Paloma) to proactively message users.
+#[derive(Debug, Deserialize)]
+pub struct SendTelegramMessageRequest {
+    /// Telegram chat ID to send to
+    pub chat_id: i64,
+    /// Message text
+    pub text: String,
+    /// Bot channel ID (if omitted, uses the first active bot)
+    #[serde(default)]
+    pub channel_id: Option<Uuid>,
+    /// Also dispatch as a user message to the chat's associated mission
+    #[serde(default)]
+    pub dispatch_to_mission: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramActionRequest {
+    pub mission_id: Uuid,
+    pub text: String,
+    #[serde(default)]
+    pub delay_seconds: Option<u64>,
+    #[serde(default)]
+    pub target: Option<super::telegram::TelegramActionTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramWorkflowRequest {
+    pub mission_id: Uuid,
+    pub text: String,
+    #[serde(default)]
+    pub target: Option<super::telegram::TelegramActionTarget>,
+}
+
+pub async fn execute_telegram_action_api(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<TelegramActionRequest>,
+) -> Result<Json<super::telegram::TelegramActionExecutionResult>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let result = super::telegram::execute_native_telegram_action(
+        &state.telegram_bridge,
+        &control.mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
+        req.delay_seconds.unwrap_or(0),
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(result))
+}
+
+pub async fn execute_telegram_workflow_request_api(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<TelegramWorkflowRequest>,
+) -> Result<Json<super::telegram::TelegramWorkflowRequestResult>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let result = super::telegram::execute_native_telegram_request_workflow(
+        &state.telegram_bridge,
+        &control.mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(result))
+}
+
+fn internal_telegram_action_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-sandboxed-mission-token")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+async fn mission_store_for_telegram_mission(
+    state: &Arc<AppState>,
+    mission_id: Uuid,
+) -> Option<Arc<dyn MissionStore>> {
+    let sessions = state.control.all_sessions().await;
+    for session in sessions {
+        let has_chat_mapping = session
+            .mission_store
+            .get_telegram_chat_mission_by_mission_id(mission_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        let has_attached_channel = session
+            .mission_store
+            .list_telegram_channels(mission_id)
+            .await
+            .map(|channels| !channels.is_empty())
+            .unwrap_or(false);
+        if has_chat_mapping || has_attached_channel {
+            return Some(Arc::clone(&session.mission_store));
+        }
+    }
+    None
+}
+
+pub async fn execute_telegram_action_internal_api(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TelegramActionRequest>,
+) -> Result<Json<super::telegram::TelegramActionExecutionResult>, (StatusCode, String)> {
+    let token = internal_telegram_action_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Missing mission token".to_string(),
+        )
+    })?;
+    if !super::telegram::verify_internal_telegram_action_token(req.mission_id, token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid mission token".to_string(),
+        ));
+    }
+
+    let mission_store = mission_store_for_telegram_mission(&state, req.mission_id)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Mission {} is not linked to an active Telegram conversation",
+                    req.mission_id
+                ),
+            )
+        })?;
+
+    let result = super::telegram::execute_native_telegram_action(
+        &state.telegram_bridge,
+        &mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
+        req.delay_seconds.unwrap_or(0),
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
+    Ok(Json(result))
+}
+
+pub async fn execute_telegram_workflow_request_internal_api(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TelegramWorkflowRequest>,
+) -> Result<Json<super::telegram::TelegramWorkflowRequestResult>, (StatusCode, String)> {
+    let token = internal_telegram_action_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Missing mission token".to_string(),
+        )
+    })?;
+    if !super::telegram::verify_internal_telegram_action_token(req.mission_id, token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid mission token".to_string(),
+        ));
+    }
+
+    let mission_store = mission_store_for_telegram_mission(&state, req.mission_id)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Mission {} is not linked to an active Telegram conversation",
+                    req.mission_id
+                ),
+            )
+        })?;
+
+    let result = super::telegram::execute_native_telegram_request_workflow(
+        &state.telegram_bridge,
+        &mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
+    Ok(Json(result))
+}
+
+pub async fn send_telegram_message_api(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<SendTelegramMessageRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    // Resolve which bot to use
+    let channel = if let Some(channel_id) = req.channel_id {
+        control
+            .mission_store
+            .get_telegram_channel(channel_id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Telegram channel {} not found", channel_id),
+                )
+            })?
+    } else {
+        // Use first active bot
+        let channels = control
+            .mission_store
+            .list_all_telegram_channels()
+            .await
+            .map_err(internal_error)?;
+        channels.into_iter().find(|c| c.active).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "No active Telegram bot found".to_string(),
+            )
+        })?
+    };
+
+    // Send the message via Telegram Bot API with HTML rendering and chunking
+    let base_url = format!("https://api.telegram.org/bot{}", channel.bot_token);
+    let http = reqwest::Client::new();
+    let msg_id =
+        super::telegram::send_telegram_text(&http, &base_url, req.chat_id, &req.text, None)
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let resp_body = serde_json::json!({"ok": true, "message_id": msg_id});
+
+    // Optionally dispatch to the associated mission
+    if req.dispatch_to_mission {
+        if let Ok(Some(mapping)) = control
+            .mission_store
+            .get_telegram_chat_mission(channel.id, req.chat_id)
+            .await
+        {
+            let msg_id = Uuid::new_v4();
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            let content = format!(
+                "[Telegram from @{} in chat {}] {}",
+                channel.bot_username.as_deref().unwrap_or("bot"),
+                req.chat_id,
+                req.text
+            );
+            let _ = control
+                .cmd_tx
+                .send(ControlCommand::UserMessage {
+                    id: msg_id,
+                    content,
+                    agent: None,
+                    target_mission_id: Some(mapping.mission_id),
+                    respond: tx,
+                })
+                .await;
+        }
+    }
+
+    Ok(Json(resp_body))
+}
+
+/// Telegram webhook receiver (unauthenticated — verified via secret token header).
+pub async fn telegram_webhook_receiver(
+    State(state): State<Arc<AppState>>,
+    Path(channel_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    Json(update): Json<super::telegram::Update>,
+) -> StatusCode {
+    // Look up the channel context in the bridge
+    let ctx = match state.telegram_bridge.get_channel_context(channel_id).await {
+        Some(ctx) => ctx,
+        None => {
+            tracing::debug!("Telegram webhook for unknown channel {}", channel_id);
+            return StatusCode::NOT_FOUND;
+        }
+    };
+
+    // Verify the secret token if one was set
+    if let Some(ref expected_secret) = ctx.channel.webhook_secret {
+        let header_secret = headers
+            .get("x-telegram-bot-api-secret-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if header_secret != expected_secret {
+            tracing::warn!(
+                "Telegram webhook secret mismatch for channel {}",
+                channel_id
+            );
+            return StatusCode::FORBIDDEN;
+        }
+    }
+
+    // Deduplicate using the channel's own SQLite-backed store (survives restarts).
+    // Falls back to in-memory dedup if the mission store is unavailable.
+    let is_new = match ctx
+        .mission_store
+        .register_webhook_update(channel_id, update.update_id)
+        .await
+    {
+        Ok(new) => {
+            if new {
+                // Keep in-memory map in sync so a later SQLite failure
+                // doesn't cause duplicate processing.
+                state
+                    .telegram_bridge
+                    .register_update_once(channel_id, update.update_id)
+                    .await;
+            }
+            new
+        }
+        Err(_) => {
+            // Fallback to in-memory dedup if SQLite fails
+            state
+                .telegram_bridge
+                .register_update_once(channel_id, update.update_id)
+                .await
+        }
+    };
+    if !is_new {
+        tracing::info!(
+            channel_id = %channel_id,
+            update_id = update.update_id,
+            "Ignoring duplicate Telegram webhook update"
+        );
+        return StatusCode::OK;
+    }
+
+    if let Some(ref msg) = update.message {
+        let http = state.telegram_bridge.http().clone();
+        super::telegram::process_webhook_message(&ctx, msg, &http, &state.telegram_bridge).await;
+    }
+
+    StatusCode::OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::mission_store::MissionMode;
     use std::sync::Arc;
 
     fn test_automation_with_mode(
@@ -9587,7 +12674,8 @@ mod tests {
             .expect("mission should become active");
 
         let (events_tx, _events_rx) = broadcast::channel(8);
-        cleanup_stale_active_missions_once(&store, 24, &events_tx).await;
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        cleanup_stale_active_missions_once(&store, 24, &events_tx, &cmd_tx).await;
 
         let stored = store
             .get_mission(mission.id)
@@ -11829,6 +14917,24 @@ And the report:
             Some("medium".to_string())
         );
         assert_eq!(normalize_model_effort("HIGH"), Some("high".to_string()));
+        assert_eq!(normalize_model_effort("xhigh"), Some("xhigh".to_string()));
+        assert_eq!(normalize_model_effort("MAX"), Some("max".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_model_effort_for_backend_rejects_codex_max() {
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("codex"), "high"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("codex"), "max"),
+            None
+        );
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("claudecode"), "max"),
+            Some("max".to_string())
+        );
     }
 
     #[test]
@@ -11852,8 +14958,8 @@ And the report:
             Some("gpt-5-codex".to_string())
         );
         assert_eq!(
-            normalize_model_override_for_backend(Some("claudecode"), "anthropic/claude-opus-4-6"),
-            Some("claude-opus-4-6".to_string())
+            normalize_model_override_for_backend(Some("claudecode"), "anthropic/claude-opus-4-7"),
+            Some("claude-opus-4-7".to_string())
         );
         assert_eq!(
             normalize_model_override_for_backend(Some("codex"), "   "),
@@ -11892,6 +14998,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -11919,6 +15026,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let strong_score = mission_search_relevance_score(
@@ -11961,6 +15069,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12000,6 +15109,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12039,6 +15149,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12078,6 +15189,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12201,6 +15313,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {
@@ -12411,6 +15524,202 @@ Investigate <service/> failures.
             mission_status_for_terminal_reason(TerminalReason::TurnComplete, true),
             Some((MissionStatus::Completed, "completed"))
         );
+    }
+
+    #[tokio::test]
+    async fn maybe_finalize_terminal_mission_preserves_interrupted_status() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("Shutdown race"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Interrupted)
+            .await
+            .expect("mission should be interrupted");
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel(8);
+
+        maybe_finalize_terminal_mission(
+            &store,
+            &events_tx,
+            mission.id,
+            Some(TerminalReason::LlmError),
+            false,
+            "shutdown race test",
+        )
+        .await;
+
+        let updated = store
+            .get_mission(mission.id)
+            .await
+            .expect("mission lookup should succeed")
+            .expect("mission should exist");
+        assert_eq!(updated.status, MissionStatus::Interrupted);
+        assert_eq!(updated.terminal_reason, None);
+        assert!(updated.resumable);
+        assert!(events_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_bare_internal_server_error() {
+        let mut result =
+            crate::agents::AgentResult::failure("Internal server error".to_string(), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_missing_claude_credentials() {
+        let mut result = crate::agents::AgentResult::failure(
+            "No Claude Code credentials detected. Either run `claude /login` on the host, or authenticate in Settings → AI Providers / set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY."
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_structured_codex_model_error() {
+        let mut result = crate::agents::AgentResult::failure(
+            r#"{"detail":"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account."}"#
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_provider_payload_error() {
+        let mut result = crate::agents::AgentResult::failure(
+            "messages.13.content.88.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels"
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_claude_cli_401() {
+        // Regression: Claude Code CLI prints this exact string when
+        // Anthropic 401s mid-turn. It was previously upgraded to
+        // TurnComplete because the output exceeded 20 chars and
+        // didn't match a known bare-error prefix — users then saw the
+        // auth error as a successful assistant reply.
+        let mut result = crate::agents::AgentResult::failure(
+            "Failed to authenticate. API Error: 401 terminated".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::AuthError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::AuthError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_generic_api_error_401() {
+        // Any short output whose substantive content is an HTTP 401
+        // status from the underlying provider should stay classified
+        // as AuthError regardless of the leading prefix.
+        let mut result = crate::agents::AgentResult::failure(
+            "Anthropic returned an error. API Error: 401 Unauthorized".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::AuthError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::AuthError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_codex_process_exit() {
+        let mut result = crate::agents::AgentResult::failure(
+            "Codex CLI exited before completing the turn (exit_status: signal: 9 (SIGKILL)). Stderr: <empty> | Stdout: <empty>"
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_recovers_substantive_output() {
+        let mut result = crate::agents::AgentResult::failure(
+            "I completed the implementation and verified the focused build.".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::TurnComplete));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_claude_transport_failure() {
+        let mut result = crate::agents::AgentResult::failure(
+            "Claude Code produced no stream events after startup timeout. \
+             The Claude CLI started but did not emit any stream-json events."
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError)
+        .with_data(serde_json::json!({
+            "claudecode_transport_failure": {
+                "stage": "startup",
+                "idle_timeout_triggered": false,
+                "process_exited_without_result": false,
+                "pending_tool_names": [],
+            }
+        }));
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_claude_startup_timeout_message() {
+        let mut result = crate::agents::AgentResult::failure(
+            "Claude Code produced no stream events after startup timeout. \
+             More text that pushes it past the 20 char heuristic."
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
     }
 
     #[tokio::test]

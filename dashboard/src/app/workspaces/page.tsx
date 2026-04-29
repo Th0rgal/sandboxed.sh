@@ -1144,7 +1144,7 @@ export default function WorkspacesPage() {
             className="w-full max-w-md rounded-2xl bg-[#161618] border border-white/[0.06] shadow-[0_25px_100px_rgba(0,0,0,0.7)] overflow-hidden animate-scale-in-simple"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="px-6 pt-5 pb-4 border-b border-white/[0.06]">
+            <div className="px-6 py-6 pb-4 border-b border-white/[0.06]">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-indigo-500/20 to-indigo-600/10 border border-indigo-500/20 flex items-center justify-center">

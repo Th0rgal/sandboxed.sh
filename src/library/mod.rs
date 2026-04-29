@@ -57,6 +57,9 @@ struct WorkspaceTemplateConfig {
     /// MCP server names to enable for workspaces created from this template.
     #[serde(default)]
     mcps: Vec<String>,
+    /// `true` (default) = `mcps` list replaces defaults, `false` = additive.
+    #[serde(default = "crate::workspace::default_true")]
+    mcps_replace_defaults: bool,
     /// Config profile to use for workspaces created from this template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     config_profile: Option<String>,
@@ -82,6 +85,11 @@ pub struct LibraryStore {
 
 impl LibraryStore {
     /// Create a new LibraryStore, cloning the repo if needed.
+    /// Get the filesystem path to a config profile directory.
+    pub fn config_profile_path(&self, name: &str) -> PathBuf {
+        self.path.join(CONFIGS_DIR).join(name)
+    }
+
     pub async fn new(path: PathBuf, remote: &str) -> Result<Self> {
         // Clone if the repo doesn't exist
         git::clone_if_needed(&path, remote).await?;
@@ -1243,6 +1251,7 @@ impl LibraryStore {
             shared_network: config.shared_network,
             tailscale_mode: config.tailscale_mode,
             mcps: config.mcps,
+            mcps_replace_defaults: config.mcps_replace_defaults,
             config_profile: config.config_profile,
         })
     }
@@ -1295,6 +1304,7 @@ impl LibraryStore {
             shared_network: template.shared_network,
             tailscale_mode: template.tailscale_mode,
             mcps: template.mcps.clone(),
+            mcps_replace_defaults: template.mcps_replace_defaults,
             config_profile: template.config_profile.clone(),
         };
 

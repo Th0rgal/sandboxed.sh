@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,22 +26,19 @@ use tokio::process::Command;
 use super::{resolve_path_simple as resolve_path, Tool};
 use crate::nspawn;
 
-static RTK_COMMANDS_PROCESSED: AtomicU64 = AtomicU64::new(0);
-
 /// Return RTK stats: (commands_processed, original_tokens, compressed_tokens).
 ///
-/// Token counts come from `rtk gain -f json` which reads RTK's own SQLite
-/// database with accurate pre- and post-compression measurements.  The
-/// process-local command counter tracks how many commands we wrapped.
+/// All three values come from `rtk gain -f json`, which reads RTK's own SQLite
+/// database. This reflects the real compression activity regardless of which
+/// execution path invoked `rtk` (MCP terminal tool, Claude Code Bash hook, or
+/// any other caller that exec'd the binary).
 pub fn rtk_stats() -> (u64, u64, u64) {
-    let commands = RTK_COMMANDS_PROCESSED.load(Ordering::Relaxed);
-    let (original, compressed) = rtk_gain_stats().unwrap_or((0, 0));
-    (commands, original, compressed)
+    rtk_gain_stats().unwrap_or((0, 0, 0))
 }
 
 /// Query RTK's builtin stats via `rtk gain -f json`.
-/// Returns (total_input_tokens, total_output_tokens) on success.
-fn rtk_gain_stats() -> Option<(u64, u64)> {
+/// Returns (total_commands, total_input_tokens, total_output_tokens) on success.
+fn rtk_gain_stats() -> Option<(u64, u64, u64)> {
     let rtk_path = rtk_binary_path()?;
     let output = std::process::Command::new(rtk_path)
         .args(["gain", "-f", "json"])
@@ -56,9 +52,10 @@ fn rtk_gain_stats() -> Option<(u64, u64)> {
     }
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     let summary = json.get("summary")?;
+    let commands = summary.get("total_commands")?.as_u64()?;
     let input = summary.get("total_input")?.as_u64()?;
     let output_tokens = summary.get("total_output")?.as_u64()?;
-    Some((input, output_tokens))
+    Some((commands, input, output_tokens))
 }
 
 pub fn rtk_enabled() -> bool {
@@ -814,18 +811,23 @@ fn default_timeout_from_env() -> Duration {
 }
 
 fn parse_timeout(args: &Value) -> Duration {
-    if let Some(ms) = args.get("timeout_ms").and_then(|v| v.as_u64()) {
-        return Duration::from_millis(ms.max(1));
-    }
-    if let Some(secs) = args.get("timeout_secs").and_then(|v| v.as_u64()) {
-        return Duration::from_secs(secs.max(1));
-    }
-    if let Some(secs) = args.get("timeout").and_then(|v| v.as_f64()) {
+    // Cap at 1 hour to prevent near-infinite timeouts
+    const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+
+    let timeout = if let Some(ms) = args.get("timeout_ms").and_then(|v| v.as_u64()) {
+        Duration::from_millis(ms.max(1))
+    } else if let Some(secs) = args.get("timeout_secs").and_then(|v| v.as_u64()) {
+        Duration::from_secs(secs.max(1))
+    } else if let Some(secs) = args.get("timeout").and_then(|v| v.as_f64()) {
         if secs > 0.0 {
-            return Duration::from_secs_f64(secs);
+            Duration::from_secs_f64(secs)
+        } else {
+            return default_timeout_from_env();
         }
-    }
-    default_timeout_from_env()
+    } else {
+        return default_timeout_from_env();
+    };
+    timeout.min(MAX_TIMEOUT)
 }
 
 fn parse_env(args: &Value) -> HashMap<String, String> {
@@ -1426,7 +1428,6 @@ impl Tool for RunCommand {
         );
 
         if rtk_used {
-            RTK_COMMANDS_PROCESSED.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 compressed_stdout_len = stdout.len(),
                 "RTK-wrapped command completed"

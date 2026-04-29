@@ -9,8 +9,11 @@ import SwiftUI
 import os
 
 struct ControlView: View {
+    private static let draftTextKey = "control_draft_text"
+    private static let lastMissionIdKey = "control_last_mission_id"
+
     @State private var messages: [ChatMessage] = []
-    @State private var inputText = ""
+    @State private var inputText = UserDefaults.standard.string(forKey: ControlView.draftTextKey) ?? ""
     @State private var runState: ControlRunState = .idle
     @State private var queueLength = 0
     @State private var queuedItems: [QueuedMessage] = []
@@ -27,6 +30,17 @@ struct ControlView: View {
     @State private var shouldScrollImmediately = false
     @State private var isLoadingHistory = false  // Track when loading historical messages to prevent animated scroll
     @State private var pendingFocusedMessageId: String?
+
+    // Pagination state
+    @State private var hasMoreHistory = false
+    @State private var isLoadingEarlier = false
+    @State private var loadedEventCount = 0  // How many events we've loaded so far
+
+    // Cached grouped items (recomputed only when messages change)
+    @State private var groupedItems: [GroupedChatItem] = []
+
+    // Draft save debounce
+    @State private var draftSaveTask: Task<Void, Never>?
 
     // Connection state for SSE stream - starts as disconnected until first event received
     @State private var connectionState: ConnectionState = .disconnected
@@ -321,6 +335,10 @@ struct ControlView: View {
                 await loadMission(id: pendingId)
                 // Also load the current mission in the background for main-session context
                 await loadCurrentMission(updateViewing: false)
+            } else if let savedId = UserDefaults.standard.string(forKey: Self.lastMissionIdKey) {
+                // Restore last viewed mission from previous session
+                await loadMission(id: savedId)
+                await loadCurrentMission(updateViewing: false)
             } else {
                 await loadCurrentMission(updateViewing: true)
             }
@@ -352,6 +370,10 @@ struct ControlView: View {
             }
         }
         .onChange(of: scenePhase) { oldPhase, newPhase in
+            if newPhase != .active {
+                // Save draft text when leaving foreground
+                UserDefaults.standard.set(inputText, forKey: Self.draftTextKey)
+            }
             // Reload mission history when app becomes active (similar to web's visibility change handler)
             // This ensures we catch any missed SSE events while the app was in background
             if oldPhase != .active && newPhase == .active {
@@ -363,11 +385,29 @@ struct ControlView: View {
                 }
             }
         }
+        .onChange(of: viewingMissionId) { _, newId in
+            UserDefaults.standard.set(newId, forKey: Self.lastMissionIdKey)
+        }
+        .onChange(of: showThoughts) { _, _ in
+            recomputeGroupedItems()
+        }
+        .onChange(of: inputText) { _, newText in
+            // Debounced save: persist draft after 1 second of inactivity
+            draftSaveTask?.cancel()
+            draftSaveTask = Task {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+                UserDefaults.standard.set(newText, forKey: Self.draftTextKey)
+            }
+        }
         .onDisappear {
             streamTask?.cancel()
             connectionState = .disconnected
             reconnectAttempt = 0
             pollingTask?.cancel()
+            // Save draft immediately on disappear
+            UserDefaults.standard.set(inputText, forKey: Self.draftTextKey)
+            draftSaveTask?.cancel()
         }
         .sheet(isPresented: $showDesktopStream) {
             DesktopStreamView(displayId: desktopDisplayId)
@@ -535,6 +575,31 @@ struct ControlView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 20) {
+                        // "Load earlier messages" button when history is truncated
+                        if hasMoreHistory {
+                            Button {
+                                Task { await loadEarlierMessages() }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if isLoadingEarlier {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                            .tint(Theme.accent)
+                                    } else {
+                                        Image(systemName: "arrow.up.circle")
+                                    }
+                                    Text("Load earlier messages")
+                                }
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(Theme.accent)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .background(Theme.accent.opacity(0.08))
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            }
+                            .disabled(isLoadingEarlier)
+                        }
+
                         if messages.isEmpty && !isLoading {
                             // Show working indicator when this specific mission is running but no messages yet
                             if viewingMissionIsRunning {
@@ -586,10 +651,11 @@ struct ControlView: View {
                         }
                     )
                 }
+                .defaultScrollAnchor(.bottom)
                 .coordinateSpace(name: "scroll")
                 .onPreferenceChange(ScrollOffsetPreferenceKey.self) { maxY in
-                    // Check if we're at the bottom (within 100 points)
-                    isAtBottom = maxY < UIScreen.main.bounds.height + 100
+                    // Check if we're at the bottom (within 200 points for less flicker)
+                    isAtBottom = maxY < UIScreen.main.bounds.height + 200
                 }
                 .onTapGesture {
                     // Dismiss keyboard when tapping on messages area
@@ -654,7 +720,7 @@ struct ControlView: View {
     // MARK: - Message Grouping
 
     /// Groups consecutive tool calls together for collapsed display (like dashboard)
-    private var groupedItems: [GroupedChatItem] {
+    private static func buildGroupedItems(from messages: [ChatMessage], showThoughts: Bool) -> [GroupedChatItem] {
         var result: [GroupedChatItem] = []
         var currentToolGroup: [ChatMessage] = []
 
@@ -689,6 +755,10 @@ struct ControlView: View {
         // Flush any remaining group
         flushToolGroup()
         return result
+    }
+
+    private func recomputeGroupedItems() {
+        groupedItems = Self.buildGroupedItems(from: messages, showThoughts: showThoughts)
     }
 
     /// Check if the currently viewed mission is running (not just any mission)
@@ -819,17 +889,61 @@ struct ControlView: View {
 
     // MARK: - Input
 
+    private var hasInput: Bool {
+        !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private var inputView: some View {
         VStack(spacing: 0) {
-            // ChatGPT-style input: clean outline, no fill, integrated send button
+            // Queue indicator above input when agent is busy with queued messages
+            if runState != .idle && queueLength > 0 {
+                Button {
+                    Task { await loadQueueItems() }
+                    showQueueSheet = true
+                    HapticService.lightTap()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "clock.badge.questionmark")
+                            .font(.caption2)
+                        Text("\(queueLength) message\(queueLength == 1 ? "" : "s") queued")
+                            .font(.caption2.weight(.medium))
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                    }
+                    .foregroundStyle(Theme.warning)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Theme.warning.opacity(0.1))
+                    .clipShape(Capsule())
+                }
+                .padding(.top, 8)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
             HStack(alignment: .center, spacing: 0) {
-                // Text input - minimal style with just a border
-                TextField("Message the agent...", text: $inputText, axis: .vertical)
+                // Stop button - only visible when agent is running
+                if runState != .idle {
+                    Button {
+                        Task { await cancelRun() }
+                    } label: {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 32, height: 32)
+                            .background(Theme.error)
+                            .clipShape(Circle())
+                    }
+                    .padding(.leading, 8)
+                    .transition(.scale.combined(with: .opacity))
+                }
+
+                // Text input
+                TextField(runState != .idle ? "Queue a follow-up..." : "Message the agent...", text: $inputText, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(.body)
                     .foregroundStyle(Theme.textPrimary)
                     .lineLimit(1...5)
-                    .padding(.leading, 16)
+                    .padding(.leading, runState != .idle ? 8 : 16)
                     .padding(.trailing, 8)
                     .padding(.vertical, 12)
                     .focused($isInputFocused)
@@ -838,40 +952,26 @@ struct ControlView: View {
                         sendMessage()
                     }
 
-                // Send/Stop button inside the input area
+                // Send button - always available when there's text
                 Button {
-                    if runState != .idle {
-                        Task { await cancelRun() }
-                    } else {
-                        sendMessage()
-                    }
+                    sendMessage()
                 } label: {
-                    Image(systemName: runState != .idle ? "stop.fill" : "arrow.up")
+                    Image(systemName: "arrow.up")
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(
-                            runState != .idle ? .white :
-                            (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Theme.textMuted : .white)
-                        )
+                        .foregroundStyle(hasInput ? .white : Theme.textMuted)
                         .frame(width: 32, height: 32)
-                        .background(
-                            runState != .idle ? Theme.error :
-                            (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.clear : Theme.accent)
-                        )
+                        .background(hasInput ? Theme.accent : Color.clear)
                         .clipShape(Circle())
                         .overlay(
                             Circle()
-                                .stroke(
-                                    inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && runState == .idle
-                                    ? Theme.border : Color.clear,
-                                    lineWidth: 1
-                                )
+                                .stroke(!hasInput ? Theme.border : Color.clear, lineWidth: 1)
                         )
                 }
-                .disabled(runState == .idle && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .animation(.easeInOut(duration: 0.15), value: runState)
-                .animation(.easeInOut(duration: 0.15), value: inputText.isEmpty)
+                .disabled(!hasInput)
                 .padding(.trailing, 8)
             }
+            .animation(.easeInOut(duration: 0.15), value: runState)
+            .animation(.easeInOut(duration: 0.15), value: hasInput)
             .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
@@ -881,6 +981,7 @@ struct ControlView: View {
             .padding(.top, 12)
             .padding(.bottom, 16)
         }
+        .animation(.easeInOut(duration: 0.2), value: queueLength > 0 && runState != .idle)
     }
     
     // MARK: - Actions
@@ -958,6 +1059,8 @@ struct ControlView: View {
 
         viewingMission = mission
         viewingMissionId = mission.id
+        hasMoreHistory = false
+        loadedEventCount = 0
         messages = mission.history.enumerated().map { index, entry in
             ChatMessage(
                 id: "\(mission.id)-\(index)",
@@ -965,9 +1068,9 @@ struct ControlView: View {
                 content: entry.content
             )
         }
+        recomputeGroupedItems()
 
         if scrollToBottom {
-            // Use immediate synchronous scroll to prevent visible scrolling from top
             shouldScrollImmediately = true
             shouldScrollToBottom = true
         }
@@ -979,14 +1082,13 @@ struct ControlView: View {
         }
     }
 
+    private static let initialEventLimit = 50
+
     private func applyViewingMissionWithEvents(_ mission: Mission, events: [StoredEvent], scrollToBottom: Bool = true) {
         isLoadingHistory = true  // Prevent animated scroll during history load
 
         viewingMission = mission
         viewingMissionId = mission.id
-
-        // Clear messages and replay events to rebuild the full history
-        messages.removeAll()
 
         // Ensure deterministic replay order in case the backend returns unsorted results
         let orderedEvents = events.sorted { lhs, rhs in
@@ -999,10 +1101,13 @@ struct ControlView: View {
             return lhs.id < rhs.id
         }
 
-        // Process events in order to reconstruct the message history
+        // Track total event count for pagination
+        loadedEventCount = orderedEvents.count
+
+        // Clear and replay all events to rebuild message history
+        messages.removeAll()
+
         for event in orderedEvents {
-            // Convert StoredEvent metadata to [String: Any] for handleStreamEvent
-            // Start with metadata first, then add core fields to prevent overwrites
             var data: [String: Any] = [:]
 
             // Add metadata first (lower priority)
@@ -1014,7 +1119,6 @@ struct ControlView: View {
             data["mission_id"] = event.missionId
             data["content"] = event.content
 
-            // Add optional fields
             if let eventId = event.eventId {
                 data["id"] = eventId
             }
@@ -1022,16 +1126,16 @@ struct ControlView: View {
                 data["tool_call_id"] = toolCallId
             }
             if let toolName = event.toolName {
-                // Map toolName to "name" key for handleStreamEvent compatibility
                 data["name"] = toolName
             }
 
-            // Process the event using the existing stream event handler
             handleStreamEvent(type: event.eventType, data: data, isHistoricalReplay: true)
         }
 
+        // Recompute grouped items once after all events are processed
+        recomputeGroupedItems()
+
         if scrollToBottom {
-            // Use immediate synchronous scroll to prevent visible scrolling from top
             shouldScrollImmediately = true
             shouldScrollToBottom = true
         }
@@ -1070,13 +1174,14 @@ struct ControlView: View {
                 if updateViewing || viewingMissionId == nil || viewingMissionId == mission.id {
                     do {
                         let eventTypes = ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta", "thinking"]
-                        let events = try await api.getMissionEvents(id: mission.id, types: eventTypes)
+                        let events = try await api.getMissionEvents(id: mission.id, types: eventTypes, limit: Self.initialEventLimit, latest: true)
 
                         if events.isEmpty {
                             // Clear stale cache when events are empty
                             removeMissionFromCache(mission.id)
                             applyViewingMission(mission)
                         } else {
+                            hasMoreHistory = events.count >= Self.initialEventLimit
                             applyViewingMissionWithEvents(mission, events: events)
                             // Update cache with fresh data
                             cacheMissionWithEvents(mission, events: events)
@@ -1139,7 +1244,7 @@ struct ControlView: View {
             // Try to fetch full event history (optional - fall back to basic history if it fails)
             do {
                 // Fetch all relevant event types including thinking events (matching web dashboard behavior)
-                let events = try await api.getMissionEvents(id: id, types: historyEventTypes)
+                let events = try await api.getMissionEvents(id: id, types: historyEventTypes, limit: Self.initialEventLimit, latest: true)
 
                 // Race condition guard after the second await
                 guard fetchingMissionId == id else {
@@ -1151,6 +1256,7 @@ struct ControlView: View {
                     removeMissionFromCache(mission.id)
                     applyViewingMission(mission)
                 } else {
+                    hasMoreHistory = events.count >= Self.initialEventLimit
                     applyViewingMissionWithEvents(mission, events: events)
                     // Cache the mission with events for next time
                     cacheMissionWithEvents(mission, events: events)
@@ -1199,6 +1305,28 @@ struct ControlView: View {
         }
     }
 
+    // Load earlier messages when user taps "Load earlier" button
+    private func loadEarlierMessages() async {
+        guard let missionId = viewingMissionId, !isLoadingEarlier else { return }
+        isLoadingEarlier = true
+        defer { isLoadingEarlier = false }
+
+        do {
+            // Fetch all events (no limit) to get the full history
+            let allEvents = try await api.getMissionEvents(id: missionId, types: historyEventTypes)
+            guard viewingMissionId == missionId else { return }
+
+            if !allEvents.isEmpty, let mission = viewingMission {
+                hasMoreHistory = false
+                applyViewingMissionWithEvents(mission, events: allEvents, scrollToBottom: false)
+                cacheMissionWithEvents(mission, events: allEvents)
+            }
+        } catch {
+            print("Failed to load earlier messages: \(error)")
+            HapticService.error()
+        }
+    }
+
     // Reload mission from server without showing loading state or cache
     // Used when app becomes active to catch missed SSE events (like web's visibility change handler)
     private func reloadMissionFromServer(id: String) async {
@@ -1216,8 +1344,10 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            // Fetch events to get the complete updated history
-            if let events = try? await api.getMissionEvents(id: id, types: historyEventTypes), !events.isEmpty {
+            // Fetch events to get the updated history (use pagination if we haven't loaded full history)
+            let limit = hasMoreHistory ? Self.initialEventLimit : nil
+            let latest = hasMoreHistory
+            if let events = try? await api.getMissionEvents(id: id, types: historyEventTypes, limit: limit, latest: latest), !events.isEmpty {
                 // Final check before applying
                 guard viewingMissionId == id else { return }
                 applyViewingMissionWithEvents(mission, events: events, scrollToBottom: false)
@@ -1584,6 +1714,7 @@ struct ControlView: View {
         guard !content.isEmpty else { return }
 
         inputText = ""
+        UserDefaults.standard.removeObject(forKey: Self.draftTextKey)
         HapticService.lightTap()
 
         // Generate temp ID and add message optimistically BEFORE the API call
@@ -1591,17 +1722,23 @@ struct ControlView: View {
         let tempId = "temp-\(UUID().uuidString)"
         let tempMessage = ChatMessage(id: tempId, type: .user, content: content)
         messages.append(tempMessage)
+        recomputeGroupedItems()
         shouldScrollToBottom = true
 
         Task { @MainActor in
             do {
-                let (messageId, _) = try await api.sendMessage(content: content)
+                let (messageId, queued) = try await api.sendMessage(content: content)
 
                 // Replace temp ID with server-assigned ID, preserving timestamp
                 // This allows SSE handler to correctly deduplicate
                 if let index = messages.firstIndex(where: { $0.id == tempId }) {
                     let originalTimestamp = messages[index].timestamp
                     messages[index] = ChatMessage(id: messageId, type: .user, content: content, timestamp: originalTimestamp)
+                }
+
+                // Update queue count when message was queued
+                if queued {
+                    queueLength += 1
                 }
 
                 // If we don't have a current mission, the backend may have just created one
@@ -1613,6 +1750,7 @@ struct ControlView: View {
                 print("Failed to send message: \(error)")
                 // Remove the optimistic message on error
                 messages.removeAll { $0.id == tempId }
+                recomputeGroupedItems()
                 HapticService.error()
             }
         }
@@ -2434,8 +2572,16 @@ struct ControlView: View {
                 }
             }
 
+        case "fido_sign_request":
+            FidoApprovalState.shared.handleSignRequest(data)
+
         default:
             break
+        }
+
+        // Recompute grouped items for live events (history replay calls recomputeGroupedItems() once at the end)
+        if !isHistoricalReplay {
+            recomputeGroupedItems()
         }
     }
 

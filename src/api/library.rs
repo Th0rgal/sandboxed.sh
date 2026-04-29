@@ -362,6 +362,8 @@ pub struct SaveWorkspaceTemplateRequest {
     /// MCP server names to enable for workspaces created from this template.
     #[serde(default)]
     pub mcps: Option<Vec<String>>,
+    /// When true (the default), a non-empty `mcps` list replaces the defaults.
+    pub mcps_replace_defaults: Option<bool>,
     /// Config profile to use for workspaces created from this template.
     #[serde(default)]
     pub config_profile: Option<String>,
@@ -1203,6 +1205,7 @@ async fn save_workspace_template(
         shared_network: req.shared_network,
         tailscale_mode: req.tailscale_mode,
         mcps: req.mcps.unwrap_or_default(),
+        mcps_replace_defaults: req.mcps_replace_defaults.unwrap_or(true),
         config_profile: req.config_profile.clone(),
     };
 

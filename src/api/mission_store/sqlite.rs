@@ -2,14 +2,20 @@
 
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, ExecutionStatus,
-    FreshSession, Mission, MissionHistoryEntry, MissionStatus, MissionStore, RetryConfig,
-    StopPolicy, StoredEvent, TriggerType, WebhookConfig,
+    FreshSession, Mission, MissionHistoryEntry, MissionMode, MissionStatus, MissionStore,
+    RetryConfig, StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
+    TelegramActionExecutionStatus, TelegramChannel, TelegramChatMission, TelegramConversation,
+    TelegramConversationMessage, TelegramConversationMessageDirection, TelegramScheduledMessage,
+    TelegramScheduledMessageStatus, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
+    TelegramStructuredMemoryScope, TelegramStructuredMemorySearchHit, TelegramWorkflow,
+    TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus, TriggerType,
+    WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -18,6 +24,83 @@ use uuid::Uuid;
 type LegacyAutomationRow = (String, String, String, i64, i64, String, Option<String>);
 const COST_CURRENCY_USD: &str = "USD";
 const METADATA_SOURCE_USER: &str = "user";
+const TELEGRAM_MEMORY_SEARCH_MAX_CANDIDATES: usize = 256;
+const TELEGRAM_MEMORY_SEARCH_STOPWORDS: &[&str] = &[
+    "a",
+    "ai",
+    "alors",
+    "and",
+    "au",
+    "aux",
+    "avec",
+    "ce",
+    "ces",
+    "comment",
+    "dans",
+    "de",
+    "des",
+    "do",
+    "does",
+    "du",
+    "elle",
+    "en",
+    "est",
+    "et",
+    "for",
+    "how",
+    "i",
+    "il",
+    "is",
+    "je",
+    "la",
+    "le",
+    "les",
+    "ma",
+    "me",
+    "mes",
+    "mi",
+    "mon",
+    "my",
+    "of",
+    "on",
+    "ou",
+    "où",
+    "par",
+    "pas",
+    "pour",
+    "prefere",
+    "préféré",
+    "prefere",
+    "preference",
+    "preferences",
+    "preference",
+    "preferences",
+    "que",
+    "quel",
+    "quelle",
+    "quelles",
+    "quels",
+    "qui",
+    "remember",
+    "rappelle",
+    "rappelle-moi",
+    "souviens",
+    "sur",
+    "the",
+    "to",
+    "toi",
+    "tu",
+    "un",
+    "une",
+    "user",
+    "veux",
+    "veux-tu",
+    "what",
+    "when",
+    "where",
+    "with",
+    "you",
+];
 
 #[derive(serde::Serialize)]
 struct AssistantCostMetadata {
@@ -70,6 +153,236 @@ fn assistant_message_metadata(input: AssistantMessageMetadataInput<'_>) -> serde
         resumable: input.resumable,
     };
     serde_json::to_value(metadata).expect("assistant metadata should serialize")
+}
+
+fn fold_search_char(ch: char) -> char {
+    match ch {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+        'ç' => 'c',
+        'è' | 'é' | 'ê' | 'ë' => 'e',
+        'ì' | 'í' | 'î' | 'ï' => 'i',
+        'ñ' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' => 'o',
+        'ù' | 'ú' | 'û' | 'ü' => 'u',
+        'ý' | 'ÿ' => 'y',
+        _ => ch,
+    }
+}
+
+fn normalize_search_text(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut prev_space = true;
+    for ch in value.chars().flat_map(|ch| ch.to_lowercase()) {
+        let folded = fold_search_char(ch);
+        if folded.is_ascii_alphanumeric() {
+            normalized.push(folded);
+            prev_space = false;
+        } else if !prev_space {
+            normalized.push(' ');
+            prev_space = true;
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn tokenize_search_text(value: &str) -> Vec<String> {
+    normalize_search_text(value)
+        .split_whitespace()
+        .filter(|token| token.len() >= 2 && !TELEGRAM_MEMORY_SEARCH_STOPWORDS.contains(token))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn build_telegram_memory_search_text(entry: &TelegramStructuredMemoryEntry) -> String {
+    let mut parts = Vec::new();
+    if let Some(label) = entry.label.as_deref() {
+        parts.push(label);
+    }
+    parts.push(entry.value.as_str());
+    if let Some(display_name) = entry.subject_display_name.as_deref() {
+        parts.push(display_name);
+    }
+    if let Some(username) = entry.subject_username.as_deref() {
+        parts.push(username);
+    }
+    match entry.kind {
+        TelegramStructuredMemoryKind::Fact => parts.push("fact"),
+        TelegramStructuredMemoryKind::Preference => parts.push("preference"),
+        TelegramStructuredMemoryKind::Task => parts.push("task"),
+        TelegramStructuredMemoryKind::Note => parts.push("note"),
+    }
+    normalize_search_text(&parts.join(" "))
+}
+
+fn build_fts_query_from_tokens(tokens: &[String], normalized_query: &str) -> Option<String> {
+    if !tokens.is_empty() {
+        return Some(
+            tokens
+                .iter()
+                .map(|token| format!("\"{}\"*", token.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+
+    if normalized_query.is_empty() {
+        None
+    } else {
+        Some(format!("\"{}\"", normalized_query.replace('"', "\"\"")))
+    }
+}
+
+fn scope_rank(scope: &TelegramStructuredMemoryScope) -> i32 {
+    match scope {
+        TelegramStructuredMemoryScope::User => 0,
+        TelegramStructuredMemoryScope::Chat => 1,
+        TelegramStructuredMemoryScope::Channel => 2,
+    }
+}
+
+fn scope_score(scope: &TelegramStructuredMemoryScope) -> f64 {
+    match scope {
+        TelegramStructuredMemoryScope::User => 6.0,
+        TelegramStructuredMemoryScope::Chat => 5.0,
+        TelegramStructuredMemoryScope::Channel => 3.0,
+    }
+}
+
+fn recency_score(updated_at: &str) -> f64 {
+    let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+        return 0.0;
+    };
+    let age_hours = (Utc::now() - updated_at.with_timezone(&Utc))
+        .num_hours()
+        .max(0) as f64;
+    if age_hours <= 24.0 {
+        4.0
+    } else if age_hours <= 24.0 * 7.0 {
+        2.0
+    } else if age_hours <= 24.0 * 30.0 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn score_memory_entry(
+    entry: &TelegramStructuredMemoryEntry,
+    normalized_query: &str,
+    core_query: &str,
+    query_tokens: &[String],
+    fts_score: Option<f64>,
+) -> Option<TelegramStructuredMemorySearchHit> {
+    if normalized_query.is_empty() {
+        return None;
+    }
+
+    let normalized_label = entry
+        .label
+        .as_deref()
+        .map(normalize_search_text)
+        .unwrap_or_default();
+    let normalized_value = normalize_search_text(&entry.value);
+    let normalized_subject = normalize_search_text(
+        &[
+            entry.subject_display_name.as_deref().unwrap_or_default(),
+            entry.subject_username.as_deref().unwrap_or_default(),
+        ]
+        .join(" "),
+    );
+    let search_text = build_telegram_memory_search_text(entry);
+    let entry_tokens: HashSet<String> = tokenize_search_text(&search_text).into_iter().collect();
+
+    let mut score = 0.0;
+    let mut reasons = Vec::new();
+    let mut matched_terms = Vec::new();
+
+    if !core_query.is_empty() {
+        if !normalized_label.is_empty() && normalized_label == core_query {
+            score += 95.0;
+            reasons.push("exact_core_label".to_string());
+        } else if !normalized_label.is_empty() && normalized_label.contains(core_query) {
+            score += 48.0;
+            reasons.push("label_contains_core_query".to_string());
+        }
+
+        if normalized_value == core_query {
+            score += 80.0;
+            reasons.push("exact_core_value".to_string());
+        } else if normalized_value.contains(core_query) {
+            score += 42.0;
+            reasons.push("value_contains_core_query".to_string());
+        }
+    }
+
+    if !normalized_label.is_empty() && normalized_label == normalized_query {
+        score += 80.0;
+        reasons.push("exact_label".to_string());
+    } else if !normalized_label.is_empty() && normalized_label.contains(normalized_query) {
+        score += 40.0;
+        reasons.push("label_contains_query".to_string());
+    }
+
+    if normalized_value == normalized_query {
+        score += 70.0;
+        reasons.push("exact_value".to_string());
+    } else if normalized_value.contains(normalized_query) {
+        score += 35.0;
+        reasons.push("value_contains_query".to_string());
+    }
+
+    if !normalized_subject.is_empty() && normalized_subject.contains(normalized_query) {
+        score += 24.0;
+        reasons.push("subject_contains_query".to_string());
+    }
+
+    if !normalized_label.is_empty()
+        && normalized_label.split_whitespace().count() == 1
+        && TELEGRAM_MEMORY_SEARCH_STOPWORDS.contains(&normalized_label.as_str())
+    {
+        score -= 36.0;
+        reasons.push("suspicious_label".to_string());
+    }
+
+    let mut token_matches = 0usize;
+    for token in query_tokens {
+        if entry_tokens.contains(token) {
+            token_matches += 1;
+            matched_terms.push(token.clone());
+        }
+    }
+    if token_matches > 0 {
+        let ratio = token_matches as f64 / query_tokens.len().max(1) as f64;
+        score += 30.0 * ratio;
+        reasons.push("token_overlap".to_string());
+    }
+
+    if let Some(fts_score) = fts_score {
+        score += fts_score;
+        reasons.push("full_text".to_string());
+    }
+
+    // Require at least one relevance signal (token overlap or FTS match)
+    // before adding scope/recency bonuses. Without this gate, every
+    // candidate receives a positive base score from scope+recency alone.
+    if score <= 0.0 {
+        return None;
+    }
+
+    score += scope_score(&entry.scope);
+    score += recency_score(&entry.updated_at);
+
+    matched_terms.sort();
+    matched_terms.dedup();
+    reasons.sort();
+    reasons.dedup();
+
+    Some(TelegramStructuredMemorySearchHit {
+        entry: entry.clone(),
+        score,
+        matched_terms,
+        reasons,
+    })
 }
 
 /// Parse a UUID from a database string, logging a warning and falling back to
@@ -199,6 +512,33 @@ CREATE TABLE IF NOT EXISTS automation_executions (
 CREATE INDEX IF NOT EXISTS idx_executions_automation ON automation_executions(automation_id, triggered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_executions_mission ON automation_executions(mission_id, triggered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_executions_status ON automation_executions(status);
+
+-- Telegram channels (communication bridges between Telegram and missions)
+CREATE TABLE IF NOT EXISTS telegram_channels (
+    id TEXT PRIMARY KEY NOT NULL,
+    mission_id TEXT NOT NULL,
+    bot_token TEXT NOT NULL,
+    bot_username TEXT,
+    allowed_chat_ids TEXT NOT NULL DEFAULT '[]',
+    trigger_mode TEXT NOT NULL DEFAULT 'direct_message',
+    active INTEGER NOT NULL DEFAULT 1,
+    webhook_secret TEXT,
+    instructions TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    auto_create_missions INTEGER NOT NULL DEFAULT 0,
+    default_backend TEXT,
+    default_model_override TEXT,
+    default_model_effort TEXT,
+    default_workspace_id TEXT,
+    default_config_profile TEXT,
+    default_agent TEXT,
+    FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_channels_mission ON telegram_channels(mission_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_channels_active ON telegram_channels(active);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_channels_bot_token ON telegram_channels(bot_token);
 "#;
 
 /// Content size threshold for inline storage (64KB).
@@ -267,12 +607,28 @@ impl SqliteMissionStore {
                     seconds: data["seconds"].as_u64().unwrap_or(60),
                 }
             }
+            "cron" => {
+                let data: serde_json::Value = serde_json::from_str(&trigger_data)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                TriggerType::Cron {
+                    expression: data["expression"]
+                        .as_str()
+                        .unwrap_or("0 * * * *")
+                        .to_string(),
+                    timezone: data["timezone"].as_str().unwrap_or("UTC").to_string(),
+                }
+            }
             "webhook" => {
                 let config: WebhookConfig = serde_json::from_str(&trigger_data)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 TriggerType::Webhook { config }
             }
             "agent_finished" => TriggerType::AgentFinished,
+            "telegram" => {
+                let config: super::TelegramTriggerConfig = serde_json::from_str(&trigger_data)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                TriggerType::Telegram { config }
+            }
             _ => {
                 return Err(rusqlite::Error::ToSqlConversionFailure(
                     format!("Unknown trigger type: {}", trigger_type).into(),
@@ -455,6 +811,205 @@ impl SqliteMissionStore {
         } else {
             String::new()
         }
+    }
+
+    fn ensure_telegram_memory_search_index(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS telegram_structured_memory_fts
+             USING fts5(
+                entry_id UNINDEXED,
+                channel_id UNINDEXED,
+                chat_id UNINDEXED,
+                scope UNINDEXED,
+                subject_user_id UNINDEXED,
+                search_text,
+                tokenize = 'unicode61 remove_diacritics 2'
+             );",
+        )
+        .map_err(|e| {
+            format!(
+                "Failed to create telegram_structured_memory_fts table: {}",
+                e
+            )
+        })
+    }
+
+    fn rebuild_telegram_memory_search_index(conn: &Connection) -> Result<(), String> {
+        Self::ensure_telegram_memory_search_index(conn)?;
+
+        conn.execute("DELETE FROM telegram_structured_memory_fts", [])
+            .map_err(|e| format!("Failed to clear telegram memory search index: {}", e))?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory",
+            )
+            .map_err(|e| format!("Failed to scan telegram structured memory: {}", e))?;
+
+        let entries = stmt
+            .query_map([], row_to_telegram_structured_memory)
+            .map_err(|e| format!("Failed to query telegram structured memory: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect telegram structured memory rows: {}", e))?;
+
+        for entry in entries {
+            conn.execute(
+                "INSERT INTO telegram_structured_memory_fts (
+                    entry_id, channel_id, chat_id, scope, subject_user_id, search_text
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    entry.id.to_string(),
+                    entry.channel_id.to_string(),
+                    entry.chat_id,
+                    match entry.scope {
+                        TelegramStructuredMemoryScope::Chat => "chat",
+                        TelegramStructuredMemoryScope::User => "user",
+                        TelegramStructuredMemoryScope::Channel => "channel",
+                    },
+                    entry.subject_user_id,
+                    build_telegram_memory_search_text(&entry),
+                ],
+            )
+            .map_err(|e| format!("Failed to populate telegram memory search index: {}", e))?;
+        }
+
+        Ok(())
+    }
+
+    fn upsert_telegram_memory_search_index_entry(
+        conn: &Connection,
+        entry: &TelegramStructuredMemoryEntry,
+    ) -> Result<(), String> {
+        Self::ensure_telegram_memory_search_index(conn)?;
+
+        conn.execute(
+            "DELETE FROM telegram_structured_memory_fts WHERE entry_id = ?1",
+            params![entry.id.to_string()],
+        )
+        .map_err(|e| {
+            format!(
+                "Failed to replace telegram memory search index entry: {}",
+                e
+            )
+        })?;
+
+        conn.execute(
+            "INSERT INTO telegram_structured_memory_fts (
+                entry_id, channel_id, chat_id, scope, subject_user_id, search_text
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                entry.id.to_string(),
+                entry.channel_id.to_string(),
+                entry.chat_id,
+                match entry.scope {
+                    TelegramStructuredMemoryScope::Chat => "chat",
+                    TelegramStructuredMemoryScope::User => "user",
+                    TelegramStructuredMemoryScope::Channel => "channel",
+                },
+                entry.subject_user_id,
+                build_telegram_memory_search_text(entry),
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert telegram memory search index entry: {}", e))?;
+
+        Ok(())
+    }
+
+    fn load_telegram_structured_memory_for_upsert(
+        conn: &Connection,
+        entry: &TelegramStructuredMemoryEntry,
+        scope: &str,
+        kind: &str,
+        normalized_label: &str,
+    ) -> Result<Option<TelegramStructuredMemoryEntry>, String> {
+        let sql = match entry.scope {
+            TelegramStructuredMemoryScope::User if entry.subject_user_id.is_some() => {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1
+                   AND scope = ?2
+                   AND subject_user_id = ?3
+                   AND kind = ?4
+                   AND normalized_label = ?5
+                 LIMIT 1"
+            }
+            TelegramStructuredMemoryScope::Channel => {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1
+                   AND scope = ?2
+                   AND kind = ?3
+                   AND normalized_label = ?4
+                 LIMIT 1"
+            }
+            _ => {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1
+                   AND scope = ?2
+                   AND chat_id = ?3
+                   AND kind = ?4
+                   AND normalized_label = ?5
+                 LIMIT 1"
+            }
+        };
+
+        let mut stmt = conn.prepare(sql).map_err(|e| {
+            format!(
+                "Failed to prepare telegram structured memory lookup after upsert: {}",
+                e
+            )
+        })?;
+
+        let entry = match entry.scope {
+            TelegramStructuredMemoryScope::User if entry.subject_user_id.is_some() => stmt
+                .query_row(
+                    params![
+                        entry.channel_id.to_string(),
+                        scope,
+                        entry.subject_user_id,
+                        kind,
+                        normalized_label
+                    ],
+                    row_to_telegram_structured_memory,
+                )
+                .optional(),
+            TelegramStructuredMemoryScope::Channel => stmt
+                .query_row(
+                    params![entry.channel_id.to_string(), scope, kind, normalized_label],
+                    row_to_telegram_structured_memory,
+                )
+                .optional(),
+            _ => stmt
+                .query_row(
+                    params![
+                        entry.channel_id.to_string(),
+                        scope,
+                        entry.chat_id,
+                        kind,
+                        normalized_label
+                    ],
+                    row_to_telegram_structured_memory,
+                )
+                .optional(),
+        }
+        .map_err(|e| {
+            format!(
+                "Failed to load telegram structured memory row after upsert: {}",
+                e
+            )
+        })?;
+
+        Ok(entry)
     }
 
     /// Run database migrations for existing databases.
@@ -641,6 +1196,446 @@ impl SqliteMissionStore {
             conn.execute("ALTER TABLE missions ADD COLUMN working_directory TEXT", [])
                 .map_err(|e| format!("Failed to add working_directory column: {}", e))?;
         }
+
+        // Check if 'mission_mode' column exists in missions table
+        let has_mission_mode_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'mission_mode'")
+            .map_err(|e| format!("Failed to check for mission_mode column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+
+        if !has_mission_mode_column {
+            tracing::info!("Running migration: adding 'mission_mode' column to missions table");
+            conn.execute(
+                "ALTER TABLE missions ADD COLUMN mission_mode TEXT NOT NULL DEFAULT 'task'",
+                [],
+            )
+            .map_err(|e| format!("Failed to add mission_mode column: {}", e))?;
+        }
+
+        // Ensure telegram_channels table exists (for existing databases)
+        let has_telegram_channels: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='telegram_channels'")
+            .map_err(|e| format!("Failed to check for telegram_channels table: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query sqlite_master: {}", e))?;
+
+        if !has_telegram_channels {
+            tracing::info!("Running migration: creating 'telegram_channels' table");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS telegram_channels (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    mission_id TEXT NOT NULL,
+                    bot_token TEXT NOT NULL,
+                    bot_username TEXT,
+                    allowed_chat_ids TEXT NOT NULL DEFAULT '[]',
+                    trigger_mode TEXT NOT NULL DEFAULT 'mention_or_dm',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    webhook_secret TEXT,
+                    instructions TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    auto_create_missions INTEGER NOT NULL DEFAULT 0,
+                    default_backend TEXT,
+                    default_model_override TEXT,
+                    default_model_effort TEXT,
+                    default_workspace_id TEXT,
+                    default_config_profile TEXT,
+                    default_agent TEXT,
+                    FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_telegram_channels_mission ON telegram_channels(mission_id);
+                CREATE INDEX IF NOT EXISTS idx_telegram_channels_active ON telegram_channels(active);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_channels_bot_token ON telegram_channels(bot_token);",
+            )
+            .map_err(|e| format!("Failed to create telegram_channels table: {}", e))?;
+        } else {
+            // Add webhook_secret column if missing (migration for existing tables)
+            let has_webhook_secret: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('telegram_channels') WHERE name='webhook_secret'")
+                .map_err(|e| format!("Failed to check for webhook_secret column: {}", e))?
+                .exists([])
+                .map_err(|e| format!("Failed to query pragma_table_info: {}", e))?;
+            if !has_webhook_secret {
+                tracing::info!(
+                    "Running migration: adding 'webhook_secret' column to telegram_channels"
+                );
+                conn.execute(
+                    "ALTER TABLE telegram_channels ADD COLUMN webhook_secret TEXT",
+                    [],
+                )
+                .map_err(|e| format!("Failed to add webhook_secret column: {}", e))?;
+            }
+            // Add instructions column if missing (ignore "duplicate column" from concurrent init)
+            let has_instructions: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('telegram_channels') WHERE name='instructions'")
+                .map_err(|e| format!("Failed to check for instructions column: {}", e))?
+                .exists([])
+                .map_err(|e| format!("Failed to query pragma_table_info: {}", e))?;
+            if !has_instructions {
+                tracing::info!(
+                    "Running migration: adding 'instructions' column to telegram_channels"
+                );
+                match conn.execute(
+                    "ALTER TABLE telegram_channels ADD COLUMN instructions TEXT",
+                    [],
+                ) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("duplicate column") => {
+                        tracing::debug!(
+                            "instructions column already exists (concurrent migration)"
+                        );
+                    }
+                    Err(e) => return Err(format!("Failed to add instructions column: {}", e)),
+                }
+            }
+
+            // Add auto-create mission columns
+            let auto_create_cols = [
+                ("auto_create_missions", "INTEGER NOT NULL DEFAULT 0"),
+                ("default_backend", "TEXT"),
+                ("default_model_override", "TEXT"),
+                ("default_model_effort", "TEXT"),
+                ("default_workspace_id", "TEXT"),
+                ("default_config_profile", "TEXT"),
+                ("default_agent", "TEXT"),
+            ];
+            for (col_name, col_type) in &auto_create_cols {
+                let has_col: bool = conn
+                    .prepare(&format!(
+                        "SELECT 1 FROM pragma_table_info('telegram_channels') WHERE name='{}'",
+                        col_name
+                    ))
+                    .map_err(|e| format!("Failed to check for {} column: {}", col_name, e))?
+                    .exists([])
+                    .map_err(|e| format!("Failed to query pragma_table_info: {}", e))?;
+                if !has_col {
+                    tracing::info!(
+                        "Running migration: adding '{}' column to telegram_channels",
+                        col_name
+                    );
+                    match conn.execute(
+                        &format!(
+                            "ALTER TABLE telegram_channels ADD COLUMN {} {}",
+                            col_name, col_type
+                        ),
+                        [],
+                    ) {
+                        Ok(_) => {}
+                        Err(e) if e.to_string().contains("duplicate column") => {}
+                        Err(e) => return Err(format!("Failed to add {} column: {}", col_name, e)),
+                    }
+                }
+            }
+        }
+
+        if let Err(e) = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_channels_bot_token ON telegram_channels(bot_token)",
+            [],
+        ) {
+            tracing::warn!(
+                "Failed to enforce unique Telegram bot tokens at the database layer: {}",
+                e
+            );
+        }
+
+        // Create telegram_chat_missions table if it doesn't exist
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_chat_missions (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                mission_id TEXT NOT NULL,
+                chat_title TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tcm_channel_chat ON telegram_chat_missions(channel_id, chat_id);
+            CREATE INDEX IF NOT EXISTS idx_tcm_mission ON telegram_chat_missions(mission_id);",
+        )
+        .map_err(|e| format!("Failed to create telegram_chat_missions table: {}", e))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_scheduled_messages (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                source_mission_id TEXT,
+                chat_id INTEGER NOT NULL,
+                chat_title TEXT,
+                text TEXT NOT NULL,
+                send_at TEXT NOT NULL,
+                sent_at TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_mission_id) REFERENCES missions(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tsm_due
+                ON telegram_scheduled_messages(status, send_at);
+            CREATE INDEX IF NOT EXISTS idx_tsm_channel
+                ON telegram_scheduled_messages(channel_id, status, send_at);",
+        )
+        .map_err(|e| format!("Failed to create telegram_scheduled_messages table: {}", e))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_structured_memory (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                mission_id TEXT,
+                scope TEXT NOT NULL DEFAULT 'chat',
+                kind TEXT NOT NULL,
+                label TEXT,
+                normalized_label TEXT,
+                value TEXT NOT NULL,
+                subject_user_id INTEGER,
+                subject_username TEXT,
+                subject_display_name TEXT,
+                source_message_id INTEGER,
+                source_role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tmem_channel_search
+                ON telegram_structured_memory(channel_id, normalized_label, updated_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_structured_memory table: {}", e))?;
+
+        let telegram_memory_cols = [
+            ("scope", "TEXT NOT NULL DEFAULT 'chat'"),
+            ("subject_user_id", "INTEGER"),
+            ("subject_username", "TEXT"),
+            ("subject_display_name", "TEXT"),
+        ];
+        for (col_name, col_type) in &telegram_memory_cols {
+            let has_col: bool = conn
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('telegram_structured_memory') WHERE name='{}'",
+                    col_name
+                ))
+                .map_err(|e| format!("Failed to check for {} column: {}", col_name, e))?
+                .exists([])
+                .map_err(|e| format!("Failed to query pragma_table_info: {}", e))?;
+            if !has_col {
+                tracing::info!(
+                    "Running migration: adding '{}' column to telegram_structured_memory",
+                    col_name
+                );
+                match conn.execute(
+                    &format!(
+                        "ALTER TABLE telegram_structured_memory ADD COLUMN {} {}",
+                        col_name, col_type
+                    ),
+                    [],
+                ) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("duplicate column") => {}
+                    Err(e) => return Err(format!("Failed to add {} column: {}", col_name, e)),
+                }
+            }
+        }
+
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tmem_channel_chat_updated
+                ON telegram_structured_memory(channel_id, scope, chat_id, updated_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_tmem_channel_user_updated
+                ON telegram_structured_memory(channel_id, scope, subject_user_id, updated_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_structured_memory indexes: {}", e))?;
+
+        Self::ensure_telegram_memory_search_index(conn)?;
+        let memory_row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_structured_memory",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to count telegram structured memory rows: {}", e))?;
+        if memory_row_count > 0 {
+            let search_row_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM telegram_structured_memory_fts",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to count telegram memory search rows: {}", e))?;
+            if search_row_count == 0 {
+                Self::rebuild_telegram_memory_search_index(conn)?;
+            }
+        }
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_action_executions (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                source_mission_id TEXT,
+                source_chat_id INTEGER,
+                target_chat_id INTEGER NOT NULL,
+                target_chat_title TEXT,
+                action_kind TEXT NOT NULL,
+                target_kind TEXT NOT NULL,
+                target_value TEXT NOT NULL,
+                text TEXT NOT NULL,
+                delay_seconds INTEGER NOT NULL DEFAULT 0,
+                scheduled_message_id TEXT,
+                status TEXT NOT NULL,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_mission_id) REFERENCES missions(id) ON DELETE SET NULL,
+                FOREIGN KEY (scheduled_message_id) REFERENCES telegram_scheduled_messages(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tae_channel_updated
+                ON telegram_action_executions(channel_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tae_scheduled
+                ON telegram_action_executions(scheduled_message_id);",
+        )
+        .map_err(|e| format!("Failed to create telegram_action_executions table: {}", e))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_conversations (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                mission_id TEXT,
+                chat_title TEXT,
+                chat_type TEXT,
+                last_message_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE SET NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tconv_channel_chat
+                ON telegram_conversations(channel_id, chat_id);
+            CREATE INDEX IF NOT EXISTS idx_tconv_channel_updated
+                ON telegram_conversations(channel_id, updated_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_conversations table: {}", e))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_conversation_messages (
+                id TEXT PRIMARY KEY NOT NULL,
+                conversation_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                mission_id TEXT,
+                workflow_id TEXT,
+                telegram_message_id INTEGER,
+                direction TEXT NOT NULL,
+                role TEXT NOT NULL,
+                sender_user_id INTEGER,
+                sender_username TEXT,
+                sender_display_name TEXT,
+                reply_to_message_id INTEGER,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES telegram_conversations(id) ON DELETE CASCADE,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tconv_msg_conversation_created
+                ON telegram_conversation_messages(conversation_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tconv_msg_chat_created
+                ON telegram_conversation_messages(channel_id, chat_id, created_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_conversation_messages table: {}", e))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_workflows (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                origin_conversation_id TEXT NOT NULL,
+                origin_chat_id INTEGER NOT NULL,
+                origin_mission_id TEXT,
+                target_conversation_id TEXT,
+                target_chat_id INTEGER,
+                target_chat_title TEXT,
+                target_chat_type TEXT,
+                target_request_message_id INTEGER,
+                initiated_by_user_id INTEGER,
+                initiated_by_username TEXT,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                request_text TEXT NOT NULL,
+                latest_reply_text TEXT,
+                summary TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (channel_id) REFERENCES telegram_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (origin_conversation_id) REFERENCES telegram_conversations(id) ON DELETE CASCADE,
+                FOREIGN KEY (target_conversation_id) REFERENCES telegram_conversations(id) ON DELETE SET NULL,
+                FOREIGN KEY (origin_mission_id) REFERENCES missions(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_twf_channel_updated
+                ON telegram_workflows(channel_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_twf_target_status
+                ON telegram_workflows(channel_id, target_chat_id, status, updated_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_workflows table: {}", e))?;
+        for (col_name, col_type) in [
+            ("target_chat_type", "TEXT"),
+            ("target_request_message_id", "INTEGER"),
+        ] {
+            let has_col: bool = conn
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('telegram_workflows') WHERE name='{}'",
+                    col_name
+                ))
+                .map_err(|e| format!("Failed to check for {} column: {}", col_name, e))?
+                .exists([])
+                .map_err(|e| format!("Failed to query pragma_table_info: {}", e))?;
+            if !has_col {
+                tracing::info!(
+                    "Running migration: adding '{}' column to telegram_workflows",
+                    col_name
+                );
+                conn.execute(
+                    &format!(
+                        "ALTER TABLE telegram_workflows ADD COLUMN {} {}",
+                        col_name, col_type
+                    ),
+                    [],
+                )
+                .map_err(|e| format!("Failed to add {} column: {}", col_name, e))?;
+            }
+        }
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_workflow_events (
+                id TEXT PRIMARY KEY NOT NULL,
+                workflow_id TEXT NOT NULL,
+                conversation_id TEXT,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (workflow_id) REFERENCES telegram_workflows(id) ON DELETE CASCADE,
+                FOREIGN KEY (conversation_id) REFERENCES telegram_conversations(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_twf_events_workflow_created
+                ON telegram_workflow_events(workflow_id, created_at DESC);",
+        )
+        .map_err(|e| format!("Failed to create telegram_workflow_events table: {}", e))?;
+
+        // Telegram webhook dedup table (persists across restarts)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_webhook_dedup (
+                channel_id TEXT NOT NULL,
+                update_id INTEGER NOT NULL,
+                seen_at TEXT NOT NULL,
+                PRIMARY KEY (channel_id, update_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tg_dedup_seen
+                ON telegram_webhook_dedup(seen_at);",
+        )
+        .map_err(|e| format!("Failed to create telegram_webhook_dedup table: {}", e))?;
 
         // Migrate automations table to new schema
         Self::migrate_automations_table(conn)?;
@@ -899,7 +1894,8 @@ impl MissionStore for SqliteMissionStore {
                             model_effort,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
-                            config_profile, parent_mission_id, working_directory
+                            config_profile, parent_mission_id, working_directory,
+                            COALESCE(mission_mode, 'task') as mission_mode
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -946,6 +1942,9 @@ impl MissionStore for SqliteMissionStore {
                         terminal_reason,
                         parent_mission_id: row.get::<_, Option<String>>(22)?.and_then(|s| Uuid::parse_str(&s).ok()),
                         working_directory: row.get(23)?,
+                        mission_mode: row.get::<_, Option<String>>(24)?
+                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                            .unwrap_or_default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -972,7 +1971,8 @@ impl MissionStore for SqliteMissionStore {
                             model_effort,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
-                            config_profile, parent_mission_id, working_directory
+                            config_profile, parent_mission_id, working_directory,
+                            COALESCE(mission_mode, 'task') as mission_mode
                      FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
@@ -1017,6 +2017,9 @@ impl MissionStore for SqliteMissionStore {
                         terminal_reason,
                         parent_mission_id: row.get::<_, Option<String>>(22)?.and_then(|s| Uuid::parse_str(&s).ok()),
                         working_directory: row.get(23)?,
+                        mission_mode: row.get::<_, Option<String>>(24)?
+                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                            .unwrap_or_default(),
                     })
                 })
                 .optional()
@@ -1132,14 +2135,19 @@ impl MissionStore for SqliteMissionStore {
             terminal_reason: None,
             parent_mission_id,
             working_directory: working_directory.map(|s| s.to_string()),
+            mission_mode: MissionMode::default(),
         };
 
         let m = mission.clone();
+        let mission_mode_str = serde_json::to_value(&m.mission_mode)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "task".to_string());
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     m.id.to_string(),
                     status_to_string(m.status),
@@ -1161,6 +2169,7 @@ impl MissionStore for SqliteMissionStore {
                     m.session_id,
                     m.parent_mission_id.map(|id| id.to_string()),
                     m.working_directory,
+                    mission_mode_str,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -1178,7 +2187,7 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn
-                .prepare("SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, session_id, terminal_reason, parent_mission_id, working_directory FROM missions WHERE parent_mission_id = ?1")
+                .prepare("SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, session_id, terminal_reason, parent_mission_id, working_directory, COALESCE(mission_mode, 'task') as mission_mode FROM missions WHERE parent_mission_id = ?1")
                 .map_err(|e| e.to_string())?;
             let missions = stmt
                 .query_map(params![parent_id_str], |row| {
@@ -1208,6 +2217,9 @@ impl MissionStore for SqliteMissionStore {
                         terminal_reason: row.get(19)?,
                         parent_mission_id: row.get::<_, Option<String>>(20)?.and_then(|s| Uuid::parse_str(&s).ok()),
                         working_directory: row.get(21)?,
+                        mission_mode: row.get::<_, Option<String>>(22)?
+                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                            .unwrap_or_default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -1338,6 +2350,77 @@ impl MissionStore for SqliteMissionStore {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+
+    async fn update_mission_run_settings(
+        &self,
+        id: Uuid,
+        backend: Option<&str>,
+        agent: Option<Option<&str>>,
+        model_override: Option<Option<&str>>,
+        model_effort: Option<Option<&str>>,
+        config_profile: Option<Option<&str>>,
+        session_id: &str,
+    ) -> Result<Mission, String> {
+        let conn = self.conn.clone();
+        let now = now_string();
+        let backend_set = backend.is_some();
+        let agent_set = agent.is_some();
+        let model_override_set = model_override.is_some();
+        let model_effort_set = model_effort.is_some();
+        let config_profile_set = config_profile.is_some();
+        let backend = backend.map(ToString::to_string);
+        let agent = agent.flatten().map(ToString::to_string);
+        let model_override = model_override.flatten().map(ToString::to_string);
+        let model_effort = model_effort.flatten().map(ToString::to_string);
+        let config_profile = config_profile.flatten().map(ToString::to_string);
+        let session_id = session_id.to_string();
+        let id_str = id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let changed = conn
+                .execute(
+                    "UPDATE missions
+                     SET backend = CASE WHEN ?1 THEN ?2 ELSE backend END,
+                         agent = CASE WHEN ?3 THEN ?4 ELSE agent END,
+                         model_override = CASE WHEN ?5 THEN ?6 ELSE model_override END,
+                         model_effort = CASE WHEN ?7 THEN ?8 ELSE model_effort END,
+                         config_profile = CASE WHEN ?9 THEN ?10 ELSE config_profile END,
+                         session_id = ?11,
+                         resumable = 0,
+                         interrupted_at = NULL,
+                         terminal_reason = NULL,
+                         updated_at = ?12
+                     WHERE id = ?13",
+                    params![
+                        backend_set,
+                        backend,
+                        agent_set,
+                        agent,
+                        model_override_set,
+                        model_override,
+                        model_effort_set,
+                        model_effort,
+                        config_profile_set,
+                        config_profile,
+                        session_id,
+                        now,
+                        id_str,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            if changed == 0 {
+                return Err(format!("Mission {} not found", id_str));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+        self.get_mission(id)
+            .await?
+            .ok_or_else(|| format!("Mission {} not found", id))
     }
 
     async fn update_mission_metadata(
@@ -1583,6 +2666,7 @@ impl MissionStore for SqliteMissionStore {
                         terminal_reason: None,
                         parent_mission_id: None,
                         working_directory: None,
+                        mission_mode: MissionMode::default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -1646,6 +2730,7 @@ impl MissionStore for SqliteMissionStore {
                         session_id: None,
                         terminal_reason: None,
                         parent_mission_id: None,
+                        mission_mode: MissionMode::default(),
                         working_directory: None,
                     })
                 })
@@ -1835,6 +2920,31 @@ impl MissionStore for SqliteMissionStore {
                     "metadata_version": metadata_version
                 }),
             ),
+            AgentEvent::MissionSettingsUpdated {
+                backend,
+                agent,
+                model_override,
+                model_effort,
+                config_profile,
+                session_id,
+                updated_at,
+                ..
+            } => (
+                "mission_settings_updated",
+                None,
+                None,
+                None,
+                backend.clone(),
+                serde_json::json!({
+                    "backend": backend,
+                    "agent": agent,
+                    "model_override": model_override,
+                    "model_effort": model_effort,
+                    "config_profile": config_profile,
+                    "session_id": session_id,
+                    "updated_at": updated_at
+                }),
+            ),
             // Skip events that are less important for debugging
             AgentEvent::Status { .. }
             | AgentEvent::AgentPhase { .. }
@@ -1842,7 +2952,8 @@ impl MissionStore for SqliteMissionStore {
             | AgentEvent::Progress { .. }
             | AgentEvent::SessionIdUpdate { .. }
             | AgentEvent::MissionActivity { .. }
-            | AgentEvent::MissionTitleChanged { .. } => return Ok(()),
+            | AgentEvent::MissionTitleChanged { .. }
+            | AgentEvent::FidoSignRequest { .. } => return Ok(()),
         };
 
         let event_type = event_type.to_string();
@@ -2000,6 +3111,142 @@ impl MissionStore for SqliteMissionStore {
             };
 
             Ok(events)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_events_since(
+        &self,
+        mission_id: Uuid,
+        since_seq: i64,
+        event_types: Option<&[&str]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let types: Option<Vec<String>> =
+            event_types.map(|t| t.iter().map(|s| s.to_string()).collect());
+        let limit = limit.unwrap_or(50000) as i64;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+
+            let query = if types.is_some() {
+                "SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                 FROM mission_events
+                 WHERE mission_id = ?1 AND sequence > ?2 AND event_type IN (SELECT value FROM json_each(?3))
+                 ORDER BY sequence ASC
+                 LIMIT ?4"
+            } else {
+                "SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                 FROM mission_events
+                 WHERE mission_id = ?1 AND sequence > ?2
+                 ORDER BY sequence ASC
+                 LIMIT ?3"
+            };
+
+            fn parse_row(row: &rusqlite::Row<'_>) -> Result<StoredEvent, rusqlite::Error> {
+                let content: Option<String> = row.get(8)?;
+                let content_file: Option<String> = row.get(9)?;
+                let full_content = SqliteMissionStore::load_content(content.as_deref(), content_file.as_deref());
+                let metadata_str: String = row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "{}".to_string());
+                let mid_str: String = row.get(1)?;
+
+                Ok(StoredEvent {
+                    id: row.get(0)?,
+                    mission_id: parse_uuid_or_nil(&mid_str),
+                    sequence: row.get(2)?,
+                    event_type: row.get(3)?,
+                    timestamp: row.get(4)?,
+                    event_id: row.get(5)?,
+                    tool_call_id: row.get(6)?,
+                    tool_name: row.get(7)?,
+                    content: full_content,
+                    metadata: serde_json::from_str(&metadata_str).unwrap_or(serde_json::json!({})),
+                })
+            }
+
+            let events: Vec<StoredEvent> = if let Some(types) = types {
+                let types_json = serde_json::to_string(&types).unwrap_or_else(|_| "[]".to_string());
+                let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![&mid, since_seq, &types_json, limit], parse_row)
+                    .map_err(|e| e.to_string())?;
+                let mut result = Vec::new();
+                for row in rows {
+                    result.push(row.map_err(|e| e.to_string())?);
+                }
+                result
+            } else {
+                let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![&mid, since_seq, limit], parse_row)
+                    .map_err(|e| e.to_string())?;
+                let mut result = Vec::new();
+                for row in rows {
+                    result.push(row.map_err(|e| e.to_string())?);
+                }
+                result
+            };
+
+            Ok(events)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn max_event_sequence(&self, mission_id: Uuid) -> Result<i64, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let max_seq: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM mission_events WHERE mission_id = ?1",
+                    params![&mid],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            Ok(max_seq)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn count_events(
+        &self,
+        mission_id: Uuid,
+        event_types: Option<&[&str]>,
+    ) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let types: Option<Vec<String>> =
+            event_types.map(|t| t.iter().map(|s| s.to_string()).collect());
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+
+            let count: i64 = if let Some(types) = types {
+                let types_json =
+                    serde_json::to_string(&types).unwrap_or_else(|_| "[]".to_string());
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mission_events WHERE mission_id = ?1 AND event_type IN (SELECT value FROM json_each(?2))",
+                    params![&mid, &types_json],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mission_events WHERE mission_id = ?1",
+                    params![&mid],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?
+            };
+
+            Ok(count as usize)
         })
         .await
         .map_err(|e| e.to_string())?
@@ -2192,11 +3439,22 @@ impl MissionStore for SqliteMissionStore {
                 "interval",
                 serde_json::json!({ "seconds": seconds }).to_string(),
             ),
+            TriggerType::Cron {
+                expression,
+                timezone,
+            } => (
+                "cron",
+                serde_json::json!({ "expression": expression, "timezone": timezone }).to_string(),
+            ),
             TriggerType::Webhook { config } => (
                 "webhook",
                 serde_json::to_string(config).map_err(|e| e.to_string())?,
             ),
             TriggerType::AgentFinished => ("agent_finished", "{}".to_string()),
+            TriggerType::Telegram { config } => (
+                "telegram",
+                serde_json::to_string(config).map_err(|e| e.to_string())?,
+            ),
         };
 
         // Serialize variables
@@ -2402,11 +3660,22 @@ impl MissionStore for SqliteMissionStore {
                 "interval",
                 serde_json::json!({ "seconds": seconds }).to_string(),
             ),
+            TriggerType::Cron {
+                expression,
+                timezone,
+            } => (
+                "cron",
+                serde_json::json!({ "expression": expression, "timezone": timezone }).to_string(),
+            ),
             TriggerType::Webhook { config } => (
                 "webhook",
                 serde_json::to_string(config).map_err(|e| e.to_string())?,
             ),
             TriggerType::AgentFinished => ("agent_finished", "{}".to_string()),
+            TriggerType::Telegram { config } => (
+                "telegram",
+                serde_json::to_string(config).map_err(|e| e.to_string())?,
+            ),
         };
 
         // Serialize variables
@@ -2680,16 +3949,2890 @@ impl MissionStore for SqliteMissionStore {
         .await
         .map_err(|e| format!("Task join error: {}", e))?
     }
+
+    async fn update_mission_mode(&self, id: Uuid, mode: MissionMode) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let mode_str = serde_json::to_value(&mode)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "task".to_string());
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET mission_mode = ?1, updated_at = ?2 WHERE id = ?3",
+                params![mode_str, now, id_str],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn list_assistant_missions(&self) -> Result<Vec<Mission>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, status, title, workspace_id, agent, backend, created_at, updated_at, mission_mode, short_description
+                     FROM missions WHERE mission_mode = 'assistant' ORDER BY updated_at DESC",
+                )
+                .map_err(|e| e.to_string())?;
+            let missions = stmt
+                .query_map([], |row| {
+                    let id_str: String = row.get(0).unwrap_or_default();
+                    let status_str: String = row.get(1).unwrap_or_else(|_| "pending".to_string());
+                    let workspace_id_str: String = row.get(3).unwrap_or_default();
+                    let mode_str: String = row.get(8).unwrap_or_else(|_| "task".to_string());
+                    Ok(Mission {
+                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        status: serde_json::from_value(serde_json::Value::String(status_str))
+                            .unwrap_or(MissionStatus::Pending),
+                        title: row.get(2).unwrap_or_default(),
+                        short_description: row.get(9).unwrap_or_default(),
+                        metadata_updated_at: None,
+                        metadata_source: None,
+                        metadata_model: None,
+                        metadata_version: None,
+                        workspace_id: Uuid::parse_str(&workspace_id_str).unwrap_or_default(),
+                        workspace_name: None,
+                        agent: row.get(4).unwrap_or_default(),
+                        model_override: None,
+                        model_effort: None,
+                        backend: row.get(5).unwrap_or_else(|_| "claudecode".to_string()),
+                        config_profile: None,
+                        history: vec![],
+                        created_at: row.get(6).unwrap_or_default(),
+                        updated_at: row.get(7).unwrap_or_default(),
+                        interrupted_at: None,
+                        resumable: false,
+                        desktop_sessions: vec![],
+                        session_id: None,
+                        terminal_reason: None,
+                        parent_mission_id: None,
+                        working_directory: None,
+                        mission_mode: serde_json::from_value(serde_json::Value::String(mode_str))
+                            .unwrap_or_default(),
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(missions)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    // === Telegram Channel methods ===
+
+    async fn create_telegram_channel(
+        &self,
+        channel: TelegramChannel,
+    ) -> Result<TelegramChannel, String> {
+        let conn = self.conn.clone();
+        let c = channel.clone();
+        let allowed_chat_ids_json =
+            serde_json::to_string(&c.allowed_chat_ids).unwrap_or_else(|_| "[]".to_string());
+        let trigger_mode_str = serde_json::to_value(&c.trigger_mode)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "direct_message".to_string());
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_channels (id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, instructions, created_at, updated_at, auto_create_missions, default_backend, default_model_override, default_model_effort, default_workspace_id, default_config_profile, default_agent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                params![
+                    c.id.to_string(),
+                    c.mission_id.to_string(),
+                    c.bot_token,
+                    c.bot_username,
+                    allowed_chat_ids_json,
+                    trigger_mode_str,
+                    c.active as i32,
+                    c.webhook_secret,
+                    c.instructions,
+                    c.created_at,
+                    c.updated_at,
+                    c.auto_create_missions as i32,
+                    c.default_backend,
+                    c.default_model_override,
+                    c.default_model_effort,
+                    c.default_workspace_id.map(|u| u.to_string()),
+                    c.default_config_profile,
+                    c.default_agent,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+        Ok(channel)
+    }
+
+    async fn get_telegram_channel(&self, id: Uuid) -> Result<Option<TelegramChannel>, String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, instructions, created_at, updated_at, auto_create_missions, default_backend, default_model_override, default_model_effort, default_workspace_id, default_config_profile, default_agent
+                 FROM telegram_channels WHERE id = ?1",
+                params![id_str],
+                |row| Ok(row_to_telegram_channel(row)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_channels(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Vec<TelegramChannel>, String> {
+        let conn = self.conn.clone();
+        let mission_id_str = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, instructions, created_at, updated_at, auto_create_missions, default_backend, default_model_override, default_model_effort, default_workspace_id, default_config_profile, default_agent
+                     FROM telegram_channels WHERE mission_id = ?1 ORDER BY created_at DESC",
+                )
+                .map_err(|e| e.to_string())?;
+            let channels = stmt
+                .query_map(params![mission_id_str], |row| Ok(row_to_telegram_channel(row)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(channels)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_all_active_telegram_channels(&self) -> Result<Vec<TelegramChannel>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, instructions, created_at, updated_at, auto_create_missions, default_backend, default_model_override, default_model_effort, default_workspace_id, default_config_profile, default_agent
+                     FROM telegram_channels WHERE active = 1",
+                )
+                .map_err(|e| e.to_string())?;
+            let channels = stmt
+                .query_map([], |row| Ok(row_to_telegram_channel(row)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(channels)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn update_telegram_channel(&self, channel: TelegramChannel) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let allowed_chat_ids_json =
+            serde_json::to_string(&channel.allowed_chat_ids).unwrap_or_else(|_| "[]".to_string());
+        let trigger_mode_str = serde_json::to_value(&channel.trigger_mode)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "direct_message".to_string());
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_channels SET bot_token = ?1, bot_username = ?2, allowed_chat_ids = ?3, trigger_mode = ?4, active = ?5, webhook_secret = ?6, instructions = ?7, updated_at = ?8, auto_create_missions = ?10, default_backend = ?11, default_model_override = ?12, default_model_effort = ?13, default_workspace_id = ?14, default_config_profile = ?15, default_agent = ?16 WHERE id = ?9",
+                params![
+                    channel.bot_token,
+                    channel.bot_username,
+                    allowed_chat_ids_json,
+                    trigger_mode_str,
+                    channel.active as i32,
+                    channel.webhook_secret,
+                    channel.instructions,
+                    channel.updated_at,
+                    channel.id.to_string(),
+                    channel.auto_create_missions as i32,
+                    channel.default_backend,
+                    channel.default_model_override,
+                    channel.default_model_effort,
+                    channel.default_workspace_id.map(|u| u.to_string()),
+                    channel.default_config_profile,
+                    channel.default_agent,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn delete_telegram_channel(&self, id: Uuid) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let deleted = conn
+                .execute(
+                    "DELETE FROM telegram_channels WHERE id = ?1",
+                    params![id_str],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(deleted > 0)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_all_telegram_channels(&self) -> Result<Vec<TelegramChannel>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, instructions, created_at, updated_at, auto_create_missions, default_backend, default_model_override, default_model_effort, default_workspace_id, default_config_profile, default_agent
+                     FROM telegram_channels ORDER BY created_at DESC",
+                )
+                .map_err(|e| e.to_string())?;
+            let channels = stmt
+                .query_map([], |row| Ok(row_to_telegram_channel(row)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(channels)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_telegram_chat_mission(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+    ) -> Result<Option<TelegramChatMission>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT id, channel_id, chat_id, mission_id, chat_title, created_at
+                 FROM telegram_chat_missions WHERE channel_id = ?1 AND chat_id = ?2",
+                params![channel_id_str, chat_id],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    let ch_id_str: String = row.get(1)?;
+                    let m_id_str: String = row.get(3)?;
+                    Ok(TelegramChatMission {
+                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        channel_id: Uuid::parse_str(&ch_id_str).unwrap_or_default(),
+                        chat_id: row.get(2)?,
+                        mission_id: Uuid::parse_str(&m_id_str).unwrap_or_default(),
+                        chat_title: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_telegram_chat_mission(
+        &self,
+        mapping: TelegramChatMission,
+    ) -> Result<TelegramChatMission, String> {
+        let conn = self.conn.clone();
+        let m = mapping.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_chat_missions (id, channel_id, chat_id, mission_id, chat_title, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    m.id.to_string(),
+                    m.channel_id.to_string(),
+                    m.chat_id,
+                    m.mission_id.to_string(),
+                    m.chat_title,
+                    m.created_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(mapping)
+    }
+
+    async fn update_telegram_chat_mission_title(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        chat_title: Option<String>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_chat_missions
+                 SET chat_title = ?3
+                 WHERE channel_id = ?1 AND chat_id = ?2",
+                params![channel_id_str, chat_id, chat_title],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_telegram_chat_mission_by_mission_id(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Option<TelegramChatMission>, String> {
+        let conn = self.conn.clone();
+        let mission_id_str = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT id, channel_id, chat_id, mission_id, chat_title, created_at
+                 FROM telegram_chat_missions WHERE mission_id = ?1 LIMIT 1",
+                params![mission_id_str],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    let channel_id_str: String = row.get(1)?;
+                    let mission_id_str2: String = row.get(3)?;
+                    Ok(TelegramChatMission {
+                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        channel_id: Uuid::parse_str(&channel_id_str).unwrap_or_default(),
+                        chat_id: row.get(2)?,
+                        mission_id: Uuid::parse_str(&mission_id_str2).unwrap_or_default(),
+                        chat_title: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_chat_missions(
+        &self,
+        channel_id: Uuid,
+    ) -> Result<Vec<TelegramChatMission>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, chat_title, created_at
+                     FROM telegram_chat_missions WHERE channel_id = ?1 ORDER BY created_at DESC",
+                )
+                .map_err(|e| e.to_string())?;
+            let mappings = stmt
+                .query_map(params![channel_id_str], |row| {
+                    let id_str: String = row.get(0)?;
+                    let ch_id_str: String = row.get(1)?;
+                    let m_id_str: String = row.get(3)?;
+                    Ok(TelegramChatMission {
+                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        channel_id: Uuid::parse_str(&ch_id_str).unwrap_or_default(),
+                        chat_id: row.get(2)?,
+                        mission_id: Uuid::parse_str(&m_id_str).unwrap_or_default(),
+                        chat_title: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(mappings)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_telegram_scheduled_message(
+        &self,
+        message: TelegramScheduledMessage,
+    ) -> Result<TelegramScheduledMessage, String> {
+        let conn = self.conn.clone();
+        let msg = message.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_scheduled_messages (
+                    id, channel_id, source_mission_id, chat_id, chat_title, text,
+                    send_at, sent_at, status, last_error, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    msg.id.to_string(),
+                    msg.channel_id.to_string(),
+                    msg.source_mission_id.map(|id| id.to_string()),
+                    msg.chat_id,
+                    msg.chat_title,
+                    msg.text,
+                    msg.send_at,
+                    msg.sent_at,
+                    match msg.status {
+                        TelegramScheduledMessageStatus::Pending => "pending",
+                        TelegramScheduledMessageStatus::Sent => "sent",
+                        TelegramScheduledMessageStatus::Failed => "failed",
+                    },
+                    msg.last_error,
+                    msg.created_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(message)
+    }
+
+    async fn list_due_telegram_scheduled_messages(
+        &self,
+        channel_id: Uuid,
+        send_at: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramScheduledMessage>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        let send_at = send_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, source_mission_id, chat_id, chat_title, text,
+                            send_at, sent_at, status, last_error, created_at
+                     FROM telegram_scheduled_messages
+                     WHERE channel_id = ?1
+                       AND status = 'pending'
+                       AND send_at <= ?2
+                     ORDER BY send_at ASC
+                     LIMIT ?3",
+                )
+                .map_err(|e| e.to_string())?;
+            let messages = stmt
+                .query_map(
+                    params![channel_id_str, send_at, limit as i64],
+                    row_to_telegram_scheduled_message,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(messages)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_scheduled_messages(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramScheduledMessage>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let sql = if chat_id.is_some() {
+                "SELECT id, channel_id, source_mission_id, chat_id, chat_title, text,
+                        send_at, sent_at, status, last_error, created_at
+                 FROM telegram_scheduled_messages
+                 WHERE channel_id = ?1 AND chat_id = ?2
+                 ORDER BY created_at DESC
+                 LIMIT ?3"
+            } else {
+                "SELECT id, channel_id, source_mission_id, chat_id, chat_title, text,
+                        send_at, sent_at, status, last_error, created_at
+                 FROM telegram_scheduled_messages
+                 WHERE channel_id = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2"
+            };
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let limit_i64 = limit as i64;
+            let messages = if let Some(chat_id) = chat_id {
+                stmt.query_map(
+                    params![channel_id_str, chat_id, limit_i64],
+                    row_to_telegram_scheduled_message,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+            } else {
+                stmt.query_map(
+                    params![channel_id_str, limit_i64],
+                    row_to_telegram_scheduled_message,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+            };
+            Ok(messages)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn claim_telegram_scheduled_message(&self, id: Uuid) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let now = Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let updated = conn
+                .execute(
+                    "UPDATE telegram_scheduled_messages
+                     SET status = 'sending', sent_at = ?2
+                     WHERE id = ?1 AND status = 'pending'",
+                    params![id_str, now],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(updated > 0)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn recover_stale_sending_scheduled_messages(
+        &self,
+        max_age_secs: i64,
+    ) -> Result<u32, String> {
+        let conn = self.conn.clone();
+        let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(max_age_secs)).to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let updated = conn
+                .execute(
+                    "UPDATE telegram_scheduled_messages
+                     SET status = 'pending', sent_at = NULL
+                     WHERE status = 'sending'
+                       AND sent_at IS NOT NULL AND sent_at < ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(updated as u32)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn mark_telegram_scheduled_message_sent(
+        &self,
+        id: Uuid,
+        sent_at: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let sent_at = sent_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_scheduled_messages
+                 SET status = 'sent', sent_at = ?1, last_error = NULL
+                 WHERE id = ?2",
+                params![sent_at, id_str],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn mark_telegram_scheduled_message_failed(
+        &self,
+        id: Uuid,
+        error: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let error = error.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_scheduled_messages
+                 SET status = 'failed', last_error = ?1
+                 WHERE id = ?2",
+                params![error, id_str],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn upsert_telegram_structured_memory(
+        &self,
+        entry: TelegramStructuredMemoryEntry,
+    ) -> Result<TelegramStructuredMemoryEntry, String> {
+        let conn = self.conn.clone();
+        let entry_clone = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let normalized_label = entry_clone
+                .label
+                .as_deref()
+                .map(|label| label.trim().to_lowercase())
+                .filter(|label| !label.is_empty());
+            let kind = match entry_clone.kind {
+                TelegramStructuredMemoryKind::Fact => "fact",
+                TelegramStructuredMemoryKind::Note => "note",
+                TelegramStructuredMemoryKind::Task => "task",
+                TelegramStructuredMemoryKind::Preference => "preference",
+            };
+            let scope = match entry_clone.scope {
+                TelegramStructuredMemoryScope::Chat => "chat",
+                TelegramStructuredMemoryScope::User => "user",
+                TelegramStructuredMemoryScope::Channel => "channel",
+            };
+
+            let is_upsertable_kind = matches!(
+                entry_clone.kind,
+                TelegramStructuredMemoryKind::Fact | TelegramStructuredMemoryKind::Preference
+            ) && normalized_label.is_some();
+
+            if is_upsertable_kind {
+                let updated = match entry_clone.scope.clone() {
+                    TelegramStructuredMemoryScope::User
+                        if entry_clone.subject_user_id.is_some() =>
+                    {
+                        conn.execute(
+                            "UPDATE telegram_structured_memory
+                             SET mission_id = ?1,
+                                 chat_id = ?2,
+                                 value = ?3,
+                                 subject_username = ?4,
+                                 subject_display_name = ?5,
+                                 source_message_id = ?6,
+                                 source_role = ?7,
+                                 updated_at = ?8
+                             WHERE channel_id = ?9
+                               AND scope = ?10
+                               AND subject_user_id = ?11
+                               AND kind = ?12
+                               AND normalized_label = ?13",
+                            params![
+                                entry_clone.mission_id.map(|id| id.to_string()),
+                                entry_clone.chat_id,
+                                entry_clone.value.clone(),
+                                entry_clone.subject_username.clone(),
+                                entry_clone.subject_display_name.clone(),
+                                entry_clone.source_message_id,
+                                entry_clone.source_role.clone(),
+                                entry_clone.updated_at.clone(),
+                                entry_clone.channel_id.to_string(),
+                                scope,
+                                entry_clone.subject_user_id,
+                                kind,
+                                normalized_label,
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        conn.changes() > 0
+                    }
+                    TelegramStructuredMemoryScope::Channel => {
+                        conn.execute(
+                            "UPDATE telegram_structured_memory
+                             SET mission_id = ?1,
+                                 chat_id = ?2,
+                                 value = ?3,
+                                 source_message_id = ?4,
+                                 source_role = ?5,
+                                 updated_at = ?6
+                             WHERE channel_id = ?7
+                               AND scope = ?8
+                               AND kind = ?9
+                               AND normalized_label = ?10",
+                            params![
+                                entry_clone.mission_id.map(|id| id.to_string()),
+                                entry_clone.chat_id,
+                                entry_clone.value.clone(),
+                                entry_clone.source_message_id,
+                                entry_clone.source_role.clone(),
+                                entry_clone.updated_at.clone(),
+                                entry_clone.channel_id.to_string(),
+                                scope,
+                                kind,
+                                normalized_label,
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        conn.changes() > 0
+                    }
+                    _ => {
+                        conn.execute(
+                            "UPDATE telegram_structured_memory
+                             SET mission_id = ?1,
+                                 value = ?2,
+                                 source_message_id = ?3,
+                                 source_role = ?4,
+                                 updated_at = ?5
+                             WHERE channel_id = ?6
+                               AND scope = ?7
+                               AND chat_id = ?8
+                               AND kind = ?9
+                               AND normalized_label = ?10",
+                            params![
+                                entry_clone.mission_id.map(|id| id.to_string()),
+                                entry_clone.value.clone(),
+                                entry_clone.source_message_id,
+                                entry_clone.source_role.clone(),
+                                entry_clone.updated_at.clone(),
+                                entry_clone.channel_id.to_string(),
+                                scope,
+                                entry_clone.chat_id,
+                                kind,
+                                normalized_label,
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        conn.changes() > 0
+                    }
+                };
+
+                if updated {
+                    let updated_entry = Self::load_telegram_structured_memory_for_upsert(
+                        &conn,
+                        &entry_clone,
+                        scope,
+                        kind,
+                        normalized_label.as_deref().unwrap_or_default(),
+                    )?
+                    .ok_or_else(|| {
+                        "Updated telegram structured memory row could not be reloaded".to_string()
+                    })?;
+                    Self::upsert_telegram_memory_search_index_entry(&conn, &updated_entry)?;
+                    return Ok::<_, String>(());
+                }
+            }
+
+            conn.execute(
+                "INSERT INTO telegram_structured_memory (
+                    id, channel_id, chat_id, mission_id, scope, kind, label, normalized_label, value,
+                    subject_user_id, subject_username, subject_display_name,
+                    source_message_id, source_role, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    entry_clone.id.to_string(),
+                    entry_clone.channel_id.to_string(),
+                    entry_clone.chat_id,
+                    entry_clone.mission_id.map(|id| id.to_string()),
+                    scope,
+                    kind,
+                    entry_clone.label,
+                    normalized_label,
+                    entry_clone.value,
+                    entry_clone.subject_user_id,
+                    entry_clone.subject_username,
+                    entry_clone.subject_display_name,
+                    entry_clone.source_message_id,
+                    entry_clone.source_role,
+                    entry_clone.created_at,
+                    entry_clone.updated_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Self::upsert_telegram_memory_search_index_entry(&conn, &entry_clone)?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(entry)
+    }
+
+    async fn list_telegram_structured_memory(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        subject_user_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            // Build WHERE clause dynamically so all filters are applied
+            // before the LIMIT truncation.
+            let mut where_clauses = vec!["channel_id = ?1".to_string()];
+            let mut param_idx = 2u32;
+            if chat_id.is_some() {
+                where_clauses.push(format!("chat_id = ?{}", param_idx));
+                param_idx += 1;
+            }
+            if subject_user_id.is_some() {
+                where_clauses.push(format!("subject_user_id = ?{}", param_idx));
+                param_idx += 1;
+            }
+            let sql = format!(
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE {}
+                 ORDER BY updated_at DESC
+                 LIMIT ?{}",
+                where_clauses.join(" AND "),
+                param_idx,
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            // Build params vec dynamically matching the WHERE clause above.
+            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+                vec![Box::new(channel_id_str)];
+            if let Some(cid) = chat_id {
+                params_vec.push(Box::new(cid));
+            }
+            if let Some(suid) = subject_user_id {
+                params_vec.push(Box::new(suid));
+            }
+            params_vec.push(Box::new(limit as i64));
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+            let entries = stmt
+                .query_map(param_refs.as_slice(), row_to_telegram_structured_memory)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn search_telegram_structured_memory(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        let query = query.trim().to_lowercase();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let sql = if chat_id.is_some() {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1
+                   AND chat_id = ?2
+                   AND (
+                     instr(lower(coalesce(label, '')), ?3) > 0
+                     OR instr(lower(value), ?3) > 0
+                   )
+                 ORDER BY updated_at DESC
+                 LIMIT ?4"
+            } else {
+                "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                        subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                 FROM telegram_structured_memory
+                 WHERE channel_id = ?1
+                   AND (
+                     instr(lower(coalesce(label, '')), ?2) > 0
+                     OR instr(lower(value), ?2) > 0
+                   )
+                 ORDER BY updated_at DESC
+                 LIMIT ?3"
+            };
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let entries = if let Some(chat_id) = chat_id {
+                stmt.query_map(
+                    params![channel_id_str, chat_id, query, limit as i64],
+                    row_to_telegram_structured_memory,
+                )
+            } else {
+                stmt.query_map(
+                    params![channel_id_str, query, limit as i64],
+                    row_to_telegram_structured_memory,
+                )
+            }
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn search_telegram_structured_memory_hybrid(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        subject_user_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemorySearchHit>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        let normalized_query = normalize_search_text(query.trim());
+        let query_tokens = tokenize_search_text(query);
+        let core_query = query_tokens.join(" ");
+        let fts_query = build_fts_query_from_tokens(&query_tokens, &normalized_query);
+
+        tokio::task::spawn_blocking(move || {
+            if normalized_query.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let conn = conn.blocking_lock();
+            let candidate_limit = (limit.max(8) * 8).min(TELEGRAM_MEMORY_SEARCH_MAX_CANDIDATES);
+
+            let mut stmt = match chat_id {
+                Some(_) => conn.prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE channel_id = ?1
+                       AND (
+                         scope = 'channel'
+                         OR (scope = 'chat' AND chat_id = ?2)
+                         OR (?3 IS NOT NULL AND scope = 'user' AND subject_user_id = ?3)
+                       )
+                     ORDER BY updated_at DESC
+                     LIMIT ?4",
+                ),
+                None if subject_user_id.is_some() => conn.prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE channel_id = ?1
+                       AND (
+                         scope = 'channel'
+                         OR (scope = 'user' AND subject_user_id = ?2)
+                       )
+                     ORDER BY updated_at DESC
+                     LIMIT ?3",
+                ),
+                None => conn.prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE channel_id = ?1
+                     ORDER BY updated_at DESC
+                     LIMIT ?2",
+                ),
+            }
+            .map_err(|e| e.to_string())?;
+
+            let mut candidates = match (chat_id, subject_user_id) {
+                (Some(chat_id), subject_user_id) => stmt.query_map(
+                    params![
+                        channel_id_str.as_str(),
+                        chat_id,
+                        subject_user_id,
+                        candidate_limit as i64
+                    ],
+                    row_to_telegram_structured_memory,
+                ),
+                (None, Some(subject_user_id)) => stmt.query_map(
+                    params![
+                        channel_id_str.as_str(),
+                        subject_user_id,
+                        candidate_limit as i64
+                    ],
+                    row_to_telegram_structured_memory,
+                ),
+                (None, None) => stmt.query_map(
+                    params![channel_id_str.as_str(), candidate_limit as i64],
+                    row_to_telegram_structured_memory,
+                ),
+            }
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+
+            let mut fts_scores: HashMap<Uuid, f64> = HashMap::new();
+            if let Some(fts_query) = fts_query {
+                let mut stmt = match chat_id {
+                    Some(_) => conn.prepare(
+                        "SELECT entry_id, bm25(telegram_structured_memory_fts) AS rank
+                         FROM telegram_structured_memory_fts
+                         WHERE channel_id = ?1
+                           AND (
+                             scope = 'channel'
+                             OR (scope = 'chat' AND chat_id = ?2)
+                             OR (?3 IS NOT NULL AND scope = 'user' AND subject_user_id = ?3)
+                           )
+                           AND telegram_structured_memory_fts MATCH ?4
+                         ORDER BY rank
+                         LIMIT ?5",
+                    ),
+                    None if subject_user_id.is_some() => conn.prepare(
+                        "SELECT entry_id, bm25(telegram_structured_memory_fts) AS rank
+                         FROM telegram_structured_memory_fts
+                         WHERE channel_id = ?1
+                           AND (
+                             scope = 'channel'
+                             OR (scope = 'user' AND subject_user_id = ?2)
+                           )
+                           AND telegram_structured_memory_fts MATCH ?3
+                         ORDER BY rank
+                         LIMIT ?4",
+                    ),
+                    None => conn.prepare(
+                        "SELECT entry_id, bm25(telegram_structured_memory_fts) AS rank
+                         FROM telegram_structured_memory_fts
+                         WHERE channel_id = ?1
+                           AND telegram_structured_memory_fts MATCH ?2
+                         ORDER BY rank
+                         LIMIT ?3",
+                    ),
+                }
+                .map_err(|e| e.to_string())?;
+
+                let rows = match (chat_id, subject_user_id) {
+                    (Some(chat_id), subject_user_id) => stmt.query_map(
+                        params![
+                            channel_id_str.as_str(),
+                            chat_id,
+                            subject_user_id,
+                            fts_query.as_str(),
+                            limit.max(8) as i64
+                        ],
+                        row_to_telegram_memory_search_rank,
+                    ),
+                    (None, Some(subject_user_id)) => stmt.query_map(
+                        params![
+                            channel_id_str.as_str(),
+                            subject_user_id,
+                            fts_query.as_str(),
+                            limit.max(8) as i64
+                        ],
+                        row_to_telegram_memory_search_rank,
+                    ),
+                    (None, None) => stmt.query_map(
+                        params![
+                            channel_id_str.as_str(),
+                            fts_query.as_str(),
+                            limit.max(8) as i64
+                        ],
+                        row_to_telegram_memory_search_rank,
+                    ),
+                }
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+                for (entry_id, rank) in rows {
+                    let entry_uuid = parse_uuid_or_nil(&entry_id);
+                    if entry_uuid.is_nil() {
+                        continue;
+                    }
+                    let weight = 18.0 / (1.0 + rank.abs());
+                    fts_scores.insert(entry_uuid, weight);
+                }
+            }
+
+            // Inject FTS-matched entries that fell outside the recency window
+            // so older but highly relevant memories are not silently dropped.
+            let candidate_ids: std::collections::HashSet<Uuid> =
+                candidates.iter().map(|e| e.id).collect();
+            for fts_id in fts_scores.keys() {
+                if candidate_ids.contains(fts_id) {
+                    continue;
+                }
+                let id_str = fts_id.to_string();
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE id = ?1",
+                ) {
+                    if let Ok(mut rows) =
+                        stmt.query_map(params![id_str], row_to_telegram_structured_memory)
+                    {
+                        if let Some(Ok(entry)) = rows.next() {
+                            candidates.push(entry);
+                        }
+                    }
+                }
+            }
+
+            let mut hits = candidates
+                .into_iter()
+                .filter_map(|entry| {
+                    score_memory_entry(
+                        &entry,
+                        &normalized_query,
+                        &core_query,
+                        &query_tokens,
+                        fts_scores.get(&entry.id).copied(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            hits.sort_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| {
+                        scope_rank(&left.entry.scope).cmp(&scope_rank(&right.entry.scope))
+                    })
+                    .then_with(|| right.entry.updated_at.cmp(&left.entry.updated_at))
+            });
+            hits.truncate(limit);
+            Ok(hits)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_memory_context(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        subject_user_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE channel_id = ?1
+                       AND (
+                         scope = 'channel'
+                         OR (scope = 'chat' AND chat_id = ?2)
+                         OR (?3 IS NOT NULL AND scope = 'user' AND subject_user_id = ?3)
+                       )
+                     ORDER BY
+                       CASE scope
+                         WHEN 'chat' THEN 0
+                         WHEN 'user' THEN 1
+                         ELSE 2
+                       END,
+                       updated_at DESC
+                     LIMIT ?4",
+                )
+                .map_err(|e| e.to_string())?;
+            let entries = stmt
+                .query_map(
+                    params![channel_id_str, chat_id, subject_user_id, limit as i64],
+                    row_to_telegram_structured_memory,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn search_telegram_memory_context(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        subject_user_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        let query = query.trim().to_lowercase();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, scope, kind, label, value,
+                            subject_user_id, subject_username, subject_display_name,
+                            source_message_id, source_role, created_at, updated_at
+                     FROM telegram_structured_memory
+                     WHERE channel_id = ?1
+                       AND (
+                         scope = 'channel'
+                         OR (scope = 'chat' AND chat_id = ?2)
+                         OR (?3 IS NOT NULL AND scope = 'user' AND subject_user_id = ?3)
+                       )
+                       AND (
+                         instr(lower(coalesce(label, '')), ?4) > 0
+                         OR instr(lower(value), ?4) > 0
+                         OR instr(lower(coalesce(subject_display_name, '')), ?4) > 0
+                         OR instr(lower(coalesce(subject_username, '')), ?4) > 0
+                       )
+                     ORDER BY
+                       CASE scope
+                         WHEN 'chat' THEN 0
+                         WHEN 'user' THEN 1
+                         ELSE 2
+                       END,
+                       updated_at DESC
+                     LIMIT ?5",
+                )
+                .map_err(|e| e.to_string())?;
+            let entries = stmt
+                .query_map(
+                    params![
+                        channel_id_str,
+                        chat_id,
+                        subject_user_id,
+                        query,
+                        limit as i64
+                    ],
+                    row_to_telegram_structured_memory,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_telegram_action_execution(
+        &self,
+        execution: TelegramActionExecution,
+    ) -> Result<TelegramActionExecution, String> {
+        let conn = self.conn.clone();
+        let execution_clone = execution.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_action_executions (
+                    id, channel_id, source_mission_id, source_chat_id, target_chat_id, target_chat_title,
+                    action_kind, target_kind, target_value, text, delay_seconds, scheduled_message_id,
+                    status, last_error, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    execution_clone.id.to_string(),
+                    execution_clone.channel_id.to_string(),
+                    execution_clone.source_mission_id.map(|id| id.to_string()),
+                    execution_clone.source_chat_id,
+                    execution_clone.target_chat_id,
+                    execution_clone.target_chat_title,
+                    match execution_clone.action_kind {
+                        TelegramActionExecutionKind::Send => "send",
+                        TelegramActionExecutionKind::Reminder => "reminder",
+                    },
+                    execution_clone.target_kind,
+                    execution_clone.target_value,
+                    execution_clone.text,
+                    execution_clone.delay_seconds as i64,
+                    execution_clone.scheduled_message_id.map(|id| id.to_string()),
+                    match execution_clone.status {
+                        TelegramActionExecutionStatus::Pending => "pending",
+                        TelegramActionExecutionStatus::Sent => "sent",
+                        TelegramActionExecutionStatus::Failed => "failed",
+                    },
+                    execution_clone.last_error,
+                    execution_clone.created_at,
+                    execution_clone.updated_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(execution)
+    }
+
+    async fn list_telegram_action_executions(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramActionExecution>, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let sql = if chat_id.is_some() {
+                "SELECT id, channel_id, source_mission_id, source_chat_id, target_chat_id,
+                        target_chat_title, action_kind, target_kind, target_value, text,
+                        delay_seconds, scheduled_message_id, status, last_error, created_at, updated_at
+                 FROM telegram_action_executions
+                 WHERE channel_id = ?1 AND target_chat_id = ?2
+                 ORDER BY updated_at DESC
+                 LIMIT ?3"
+            } else {
+                "SELECT id, channel_id, source_mission_id, source_chat_id, target_chat_id,
+                        target_chat_title, action_kind, target_kind, target_value, text,
+                        delay_seconds, scheduled_message_id, status, last_error, created_at, updated_at
+                 FROM telegram_action_executions
+                 WHERE channel_id = ?1
+                 ORDER BY updated_at DESC
+                 LIMIT ?2"
+            };
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let limit_i64 = limit as i64;
+            let entries = if let Some(chat_id) = chat_id {
+                stmt.query_map(
+                    params![channel_id_str, chat_id, limit_i64],
+                    row_to_telegram_action_execution,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+            } else {
+                stmt.query_map(
+                    params![channel_id_str, limit_i64],
+                    row_to_telegram_action_execution,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+            };
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn mark_telegram_action_execution_by_scheduled_message(
+        &self,
+        scheduled_message_id: Uuid,
+        status: TelegramActionExecutionStatus,
+        last_error: Option<&str>,
+        updated_at: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let scheduled_message_id = scheduled_message_id.to_string();
+        let updated_at = updated_at.to_string();
+        let last_error = last_error.map(ToOwned::to_owned);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_action_executions
+                 SET status = ?1,
+                     last_error = ?2,
+                     updated_at = ?3
+                 WHERE scheduled_message_id = ?4",
+                params![
+                    match status {
+                        TelegramActionExecutionStatus::Pending => "pending",
+                        TelegramActionExecutionStatus::Sent => "sent",
+                        TelegramActionExecutionStatus::Failed => "failed",
+                    },
+                    last_error,
+                    updated_at,
+                    scheduled_message_id,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn upsert_telegram_conversation(
+        &self,
+        conversation: TelegramConversation,
+    ) -> Result<TelegramConversation, String> {
+        let conn = self.conn.clone();
+        let conversation_clone = conversation.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_conversations (
+                    id, channel_id, chat_id, mission_id, chat_title, chat_type, last_message_at, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(channel_id, chat_id) DO UPDATE SET
+                    mission_id = excluded.mission_id,
+                    chat_title = coalesce(excluded.chat_title, telegram_conversations.chat_title),
+                    chat_type = coalesce(excluded.chat_type, telegram_conversations.chat_type),
+                    last_message_at = coalesce(excluded.last_message_at, telegram_conversations.last_message_at),
+                    updated_at = excluded.updated_at",
+                params![
+                    conversation_clone.id.to_string(),
+                    conversation_clone.channel_id.to_string(),
+                    conversation_clone.chat_id,
+                    conversation_clone.mission_id.map(|id| id.to_string()),
+                    conversation_clone.chat_title.clone(),
+                    conversation_clone.chat_type.clone(),
+                    conversation_clone.last_message_at.clone(),
+                    conversation_clone.created_at.clone(),
+                    conversation_clone.updated_at.clone(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, chat_title, chat_type, last_message_at, created_at, updated_at
+                     FROM telegram_conversations
+                     WHERE channel_id = ?1 AND chat_id = ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_row(
+                params![
+                    conversation_clone.channel_id.to_string(),
+                    conversation_clone.chat_id
+                ],
+                row_to_telegram_conversation,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_telegram_conversation_by_chat(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+    ) -> Result<Option<TelegramConversation>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, chat_title, chat_type, last_message_at, created_at, updated_at
+                     FROM telegram_conversations
+                     WHERE channel_id = ?1 AND chat_id = ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_row(
+                params![channel_id.to_string(), chat_id],
+                row_to_telegram_conversation,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_conversations(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramConversation>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, chat_id, mission_id, chat_title, chat_type, last_message_at, created_at, updated_at
+                     FROM telegram_conversations
+                     WHERE channel_id = ?1
+                     ORDER BY coalesce(last_message_at, updated_at) DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                params![channel_id.to_string(), limit as i64],
+                row_to_telegram_conversation,
+            )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_telegram_conversation_message(
+        &self,
+        message: TelegramConversationMessage,
+    ) -> Result<TelegramConversationMessage, String> {
+        let conn = self.conn.clone();
+        let message_clone = message.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_conversation_messages (
+                    id, conversation_id, channel_id, chat_id, mission_id, workflow_id, telegram_message_id,
+                    direction, role, sender_user_id, sender_username, sender_display_name,
+                    reply_to_message_id, text, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    message_clone.id.to_string(),
+                    message_clone.conversation_id.to_string(),
+                    message_clone.channel_id.to_string(),
+                    message_clone.chat_id,
+                    message_clone.mission_id.map(|id| id.to_string()),
+                    message_clone.workflow_id.map(|id| id.to_string()),
+                    message_clone.telegram_message_id,
+                    match message_clone.direction {
+                        TelegramConversationMessageDirection::Inbound => "inbound",
+                        TelegramConversationMessageDirection::Outbound => "outbound",
+                    },
+                    message_clone.role.clone(),
+                    message_clone.sender_user_id,
+                    message_clone.sender_username.clone(),
+                    message_clone.sender_display_name.clone(),
+                    message_clone.reply_to_message_id,
+                    message_clone.text.clone(),
+                    message_clone.created_at.clone(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE telegram_conversations
+                 SET last_message_at = ?1, updated_at = ?1
+                 WHERE id = ?2",
+                params![message_clone.created_at, message_clone.conversation_id.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(message_clone)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_conversation_messages(
+        &self,
+        conversation_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramConversationMessage>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, conversation_id, channel_id, chat_id, mission_id, workflow_id, telegram_message_id,
+                            direction, role, sender_user_id, sender_username, sender_display_name,
+                            reply_to_message_id, text, created_at
+                     FROM telegram_conversation_messages
+                     WHERE conversation_id = ?1
+                     ORDER BY created_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                params![conversation_id.to_string(), limit as i64],
+                row_to_telegram_conversation_message,
+            )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_telegram_workflow(
+        &self,
+        workflow: TelegramWorkflow,
+    ) -> Result<TelegramWorkflow, String> {
+        let conn = self.conn.clone();
+        let workflow_clone = workflow.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_workflows (
+                    id, channel_id, origin_conversation_id, origin_chat_id, origin_mission_id,
+                    target_conversation_id, target_chat_id, target_chat_title, target_chat_type,
+                    target_request_message_id, initiated_by_user_id, initiated_by_username, kind,
+                    status, request_text, latest_reply_text, summary, last_error, created_at,
+                    updated_at, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                params![
+                    workflow_clone.id.to_string(),
+                    workflow_clone.channel_id.to_string(),
+                    workflow_clone.origin_conversation_id.to_string(),
+                    workflow_clone.origin_chat_id,
+                    workflow_clone.origin_mission_id.map(|id| id.to_string()),
+                    workflow_clone.target_conversation_id.map(|id| id.to_string()),
+                    workflow_clone.target_chat_id,
+                    workflow_clone.target_chat_title.clone(),
+                    workflow_clone.target_chat_type.clone(),
+                    workflow_clone.target_request_message_id,
+                    workflow_clone.initiated_by_user_id,
+                    workflow_clone.initiated_by_username.clone(),
+                    match workflow_clone.kind {
+                        TelegramWorkflowKind::RequestReply => "request_reply",
+                    },
+                    match workflow_clone.status {
+                        TelegramWorkflowStatus::WaitingExternal => "waiting_external",
+                        TelegramWorkflowStatus::RelayedToOrigin => "relayed_to_origin",
+                        TelegramWorkflowStatus::Completed => "completed",
+                        TelegramWorkflowStatus::Failed => "failed",
+                        TelegramWorkflowStatus::Cancelled => "cancelled",
+                    },
+                    workflow_clone.request_text.clone(),
+                    workflow_clone.latest_reply_text.clone(),
+                    workflow_clone.summary.clone(),
+                    workflow_clone.last_error.clone(),
+                    workflow_clone.created_at.clone(),
+                    workflow_clone.updated_at.clone(),
+                    workflow_clone.completed_at.clone(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(workflow_clone)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn update_telegram_workflow(&self, workflow: TelegramWorkflow) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_workflows
+                 SET target_conversation_id = ?1,
+                     target_chat_id = ?2,
+                     target_chat_title = ?3,
+                     target_chat_type = ?4,
+                     target_request_message_id = ?5,
+                     status = ?6,
+                     latest_reply_text = ?7,
+                     summary = ?8,
+                     last_error = ?9,
+                     updated_at = ?10,
+                     completed_at = ?11
+                 WHERE id = ?12",
+                params![
+                    workflow.target_conversation_id.map(|id| id.to_string()),
+                    workflow.target_chat_id,
+                    workflow.target_chat_title,
+                    workflow.target_chat_type,
+                    workflow.target_request_message_id,
+                    match workflow.status {
+                        TelegramWorkflowStatus::WaitingExternal => "waiting_external",
+                        TelegramWorkflowStatus::RelayedToOrigin => "relayed_to_origin",
+                        TelegramWorkflowStatus::Completed => "completed",
+                        TelegramWorkflowStatus::Failed => "failed",
+                        TelegramWorkflowStatus::Cancelled => "cancelled",
+                    },
+                    workflow.latest_reply_text,
+                    workflow.summary,
+                    workflow.last_error,
+                    workflow.updated_at,
+                    workflow.completed_at,
+                    workflow.id.to_string(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn timeout_stale_telegram_workflows(&self, max_age_secs: i64) -> Result<u32, String> {
+        let conn = self.conn.clone();
+        let now = now_string();
+        // Calculate the cutoff timestamp in Rust (RFC 3339 format sorts lexicographically)
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(max_age_secs);
+        let cutoff_str = cutoff.to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let updated = conn
+                .execute(
+                    "UPDATE telegram_workflows
+                     SET status = 'failed',
+                         last_error = 'Timed out waiting for external reply',
+                         updated_at = ?1,
+                         completed_at = ?1
+                     WHERE status = 'waiting_external'
+                       AND updated_at < ?2",
+                    params![now, cutoff_str],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(updated as u32)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn register_webhook_update(
+        &self,
+        channel_id: Uuid,
+        update_id: i64,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let channel_id_str = channel_id.to_string();
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            // INSERT OR IGNORE: if the row already exists, nothing happens
+            // and changes() returns 0.
+            let inserted = conn
+                .execute(
+                    "INSERT OR IGNORE INTO telegram_webhook_dedup (channel_id, update_id, seen_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![channel_id_str, update_id, now],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(inserted > 0)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn cleanup_webhook_dedup(&self, max_age_secs: i64) -> Result<u32, String> {
+        let conn = self.conn.clone();
+        let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(max_age_secs)).to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let deleted = conn
+                .execute(
+                    "DELETE FROM telegram_webhook_dedup
+                     WHERE seen_at < ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(deleted as u32)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn list_telegram_workflows(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramWorkflow>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, origin_conversation_id, origin_chat_id, origin_mission_id,
+                            target_conversation_id, target_chat_id, target_chat_title, target_chat_type,
+                            target_request_message_id, initiated_by_user_id, initiated_by_username,
+                            kind, status, request_text, latest_reply_text, summary, last_error,
+                            created_at, updated_at, completed_at
+                     FROM telegram_workflows
+                     WHERE channel_id = ?1
+                     ORDER BY updated_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                params![channel_id.to_string(), limit as i64],
+                row_to_telegram_workflow,
+            )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_pending_telegram_workflow_for_target_chat(
+        &self,
+        channel_id: Uuid,
+        target_chat_id: i64,
+    ) -> Result<Option<TelegramWorkflow>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, origin_conversation_id, origin_chat_id, origin_mission_id,
+                            target_conversation_id, target_chat_id, target_chat_title, target_chat_type,
+                            target_request_message_id, initiated_by_user_id, initiated_by_username,
+                            kind, status, request_text, latest_reply_text, summary, last_error,
+                            created_at, updated_at, completed_at
+                     FROM telegram_workflows
+                     WHERE channel_id = ?1
+                       AND target_chat_id = ?2
+                       AND status = 'waiting_external'
+                     ORDER BY updated_at DESC
+                     LIMIT 1",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_row(
+                params![channel_id.to_string(), target_chat_id],
+                row_to_telegram_workflow,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_pending_telegram_workflow_for_target_message(
+        &self,
+        channel_id: Uuid,
+        target_chat_id: i64,
+        request_message_id: i64,
+    ) -> Result<Option<TelegramWorkflow>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, channel_id, origin_conversation_id, origin_chat_id, origin_mission_id,
+                            target_conversation_id, target_chat_id, target_chat_title, target_chat_type,
+                            target_request_message_id, initiated_by_user_id, initiated_by_username,
+                            kind, status, request_text, latest_reply_text, summary, last_error,
+                            created_at, updated_at, completed_at
+                     FROM telegram_workflows
+                     WHERE channel_id = ?1
+                       AND target_chat_id = ?2
+                       AND target_request_message_id = ?3
+                       AND status = 'waiting_external'
+                     ORDER BY updated_at DESC
+                     LIMIT 1",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_row(
+                params![channel_id.to_string(), target_chat_id, request_message_id],
+                row_to_telegram_workflow,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_telegram_workflow_event(
+        &self,
+        event: TelegramWorkflowEvent,
+    ) -> Result<TelegramWorkflowEvent, String> {
+        let conn = self.conn.clone();
+        let event_clone = event.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_workflow_events (
+                    id, workflow_id, conversation_id, event_type, payload_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event_clone.id.to_string(),
+                    event_clone.workflow_id.to_string(),
+                    event_clone.conversation_id.map(|id| id.to_string()),
+                    event_clone.event_type.clone(),
+                    event_clone.payload_json.clone(),
+                    event_clone.created_at.clone(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(event_clone)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_workflow_events(
+        &self,
+        workflow_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramWorkflowEvent>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, workflow_id, conversation_id, event_type, payload_json, created_at
+                     FROM telegram_workflow_events
+                     WHERE workflow_id = ?1
+                     ORDER BY created_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    params![workflow_id.to_string(), limit as i64],
+                    row_to_telegram_workflow_event,
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn import_mission_bundle(
+        &self,
+        bundle: super::MissionBundle,
+        options: super::MissionImportOptions,
+    ) -> Result<Uuid, String> {
+        use super::MissionBundle;
+        // Always mint fresh IDs on import so a bundle can be re-imported
+        // into the same instance for debugging without collisions and
+        // without clobbering the source history if the bundle round-trips
+        // back. Mapping tables below rewrite child rows accordingly.
+        let new_mission_id = Uuid::new_v4();
+        let target_workspace_id = options
+            .target_workspace_id
+            .unwrap_or(bundle.mission.workspace_id);
+        // Prefer the caller-provided target name; only fall back to the
+        // bundle's own name when no override was passed. This keeps the
+        // stored workspace_name consistent with the target workspace_id.
+        let target_workspace_name = options
+            .target_workspace_name
+            .clone()
+            .or_else(|| bundle.mission.workspace_name.clone());
+        let keep_active = options.keep_automations_active;
+
+        // Remap automation IDs: bundle's automation_id -> freshly minted
+        // UUID, so imported automations are distinguishable from the
+        // originals and don't collide if the source lives on the same
+        // database.
+        let mut automation_id_map: HashMap<Uuid, Uuid> = HashMap::new();
+        for auto in &bundle.automations {
+            automation_id_map.insert(auto.id, Uuid::new_v4());
+        }
+
+        let MissionBundle {
+            mission,
+            events,
+            automations,
+            executions,
+            ..
+        } = bundle;
+
+        let conn = self.conn.clone();
+        let content_dir = self.content_dir.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Uuid, String> {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+            // --- mission row ---
+            let mission_mode_str = serde_json::to_value(&mission.mission_mode)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| "task".to_string());
+            // Normalize statuses that imply an attached runtime session.
+            // The bundle clears `session_id` (the CLI-level handles don't
+            // travel), so `active`/`pending` would leave the record
+            // looking running with nothing behind it — it couldn't be
+            // continued and couldn't be resumed via the normal path
+            // (which only accepts interrupted/failed/blocked). Rewrite to
+            // `interrupted` so the user can explicitly resume it.
+            use crate::api::control::MissionStatus;
+            let normalized_status = match mission.status {
+                MissionStatus::Active | MissionStatus::Pending => MissionStatus::Interrupted,
+                other => other,
+            };
+            let status_str = status_to_string(normalized_status);
+            let now = Utc::now().to_rfc3339();
+            let imported_title = mission
+                .title
+                .clone()
+                .map(|t| format!("{t} (imported)"))
+                .or_else(|| Some("Imported mission".to_string()));
+            tx.execute(
+                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, workspace_name, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, desktop_sessions, session_id, terminal_reason, parent_mission_id, working_directory, mission_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                rusqlite::params![
+                    new_mission_id.to_string(),
+                    status_str,
+                    imported_title,
+                    mission.short_description,
+                    mission.metadata_updated_at,
+                    mission.metadata_source,
+                    mission.metadata_model,
+                    mission.metadata_version,
+                    target_workspace_id.to_string(),
+                    target_workspace_name,
+                    mission.agent,
+                    mission.model_override,
+                    mission.model_effort,
+                    mission.backend,
+                    mission.config_profile,
+                    mission.created_at,
+                    now,
+                    mission.interrupted_at,
+                    if mission.resumable { 1 } else { 0 },
+                    serde_json::to_string(&mission.desktop_sessions).ok(),
+                    // Blank the session_id: the CLI-level session files
+                    // (.claude/.credentials.json, codex threads) don't
+                    // travel with the bundle, so resuming would reuse a
+                    // stale handle. Let the import side start fresh on
+                    // next turn.
+                    Option::<String>::None,
+                    mission.terminal_reason,
+                    // Skip parent_mission_id remapping — parent probably
+                    // doesn't exist on the target side.
+                    Option::<String>::None,
+                    mission.working_directory,
+                    mission_mode_str,
+                ],
+            )
+            .map_err(|e| format!("Failed to insert mission: {e}"))?;
+
+            // --- events ---
+            // Re-spill large content to the target's content_dir so the
+            // existing inline/file split logic stays consistent.
+            for event in &events {
+                let (content_inline, content_file) = SqliteMissionStore::store_content(
+                    &content_dir,
+                    new_mission_id,
+                    event.sequence,
+                    &event.event_type,
+                    &event.content,
+                );
+                let metadata_json =
+                    serde_json::to_string(&event.metadata).unwrap_or_else(|_| "{}".to_string());
+                tx.execute(
+                    "INSERT INTO mission_events
+                     (mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    rusqlite::params![
+                        new_mission_id.to_string(),
+                        event.sequence,
+                        event.event_type,
+                        event.timestamp,
+                        event.event_id,
+                        event.tool_call_id,
+                        event.tool_name,
+                        content_inline,
+                        content_file,
+                        metadata_json,
+                    ],
+                )
+                .map_err(|e| format!("Failed to insert event: {e}"))?;
+            }
+
+            // --- automations ---
+            for auto in &automations {
+                let new_auto_id = *automation_id_map
+                    .get(&auto.id)
+                    .expect("remap table built from this list");
+                let (command_source_type, command_source_data) = match &auto.command_source {
+                    CommandSource::Library { name } => (
+                        "library",
+                        serde_json::json!({ "name": name }).to_string(),
+                    ),
+                    CommandSource::LocalFile { path } => (
+                        "local_file",
+                        serde_json::json!({ "path": path }).to_string(),
+                    ),
+                    CommandSource::Inline { content } => (
+                        "inline",
+                        serde_json::json!({ "content": content }).to_string(),
+                    ),
+                };
+                let (trigger_type, trigger_data) = match &auto.trigger {
+                    TriggerType::Interval { seconds } => (
+                        "interval",
+                        serde_json::json!({ "seconds": seconds }).to_string(),
+                    ),
+                    TriggerType::Cron {
+                        expression,
+                        timezone,
+                    } => (
+                        "cron",
+                        serde_json::json!({
+                            "expression": expression,
+                            "timezone": timezone,
+                        })
+                        .to_string(),
+                    ),
+                    TriggerType::Webhook { config } => (
+                        "webhook",
+                        serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string()),
+                    ),
+                    TriggerType::AgentFinished => ("agent_finished", "{}".to_string()),
+                    TriggerType::Telegram { config } => (
+                        "telegram",
+                        serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string()),
+                    ),
+                };
+                let variables_json = serde_json::to_string(&auto.variables)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let stop_policy_str = match &auto.stop_policy {
+                    StopPolicy::Never => "never".to_string(),
+                    StopPolicy::WhenFailingConsecutively { count } => {
+                        format!("consecutive_failures:{}", count)
+                    }
+                    StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo } => {
+                        format!("all_issues_closed_and_prs_merged:{}", repo)
+                    }
+                };
+                let fresh_session_str = match auto.fresh_session {
+                    FreshSession::Always => "always",
+                    FreshSession::Switch => "switch",
+                    FreshSession::Keep => "keep",
+                };
+                tx.execute(
+                    "INSERT INTO automations (id, mission_id, command_source_type, command_source_data,
+                                             trigger_type, trigger_data, variables, active, stop_policy,
+                                             fresh_session, created_at, last_triggered_at, retry_max_retries,
+                                             retry_delay_seconds, retry_backoff_multiplier)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    rusqlite::params![
+                        new_auto_id.to_string(),
+                        new_mission_id.to_string(),
+                        command_source_type,
+                        command_source_data,
+                        trigger_type,
+                        trigger_data,
+                        variables_json,
+                        if keep_active && auto.active { 1 } else { 0 },
+                        stop_policy_str,
+                        fresh_session_str,
+                        auto.created_at,
+                        // Clear last_triggered_at so interval-based automations
+                        // get a full interval on the target before firing.
+                        Option::<String>::None,
+                        auto.retry_config.max_retries as i64,
+                        auto.retry_config.retry_delay_seconds as i64,
+                        auto.retry_config.backoff_multiplier,
+                    ],
+                )
+                .map_err(|e| format!("Failed to insert automation: {e}"))?;
+            }
+
+            // --- automation_executions ---
+            for exec in &executions {
+                let Some(new_auto_id) = automation_id_map.get(&exec.automation_id) else {
+                    // Execution referenced an automation not in the bundle
+                    // (shouldn't happen for bundles produced by export, but
+                    // stay defensive).
+                    continue;
+                };
+                let status_str = match exec.status {
+                    ExecutionStatus::Pending => "pending",
+                    ExecutionStatus::Running => "running",
+                    ExecutionStatus::Success => "success",
+                    ExecutionStatus::Failed => "failed",
+                    ExecutionStatus::Cancelled => "cancelled",
+                    ExecutionStatus::Skipped => "skipped",
+                };
+                let variables_json = serde_json::to_string(&exec.variables_used)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let webhook_payload = exec
+                    .webhook_payload
+                    .as_ref()
+                    .map(|v| v.to_string());
+                tx.execute(
+                    "INSERT INTO automation_executions (id, automation_id, mission_id, triggered_at,
+                                                        trigger_source, status, webhook_payload,
+                                                        variables_used, completed_at, error, retry_count)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        new_auto_id.to_string(),
+                        new_mission_id.to_string(),
+                        exec.triggered_at,
+                        exec.trigger_source,
+                        status_str,
+                        webhook_payload,
+                        variables_json,
+                        exec.completed_at,
+                        exec.error,
+                        exec.retry_count as i64,
+                    ],
+                )
+                .map_err(|e| format!("Failed to insert execution: {e}"))?;
+            }
+
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(new_mission_id)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+}
+
+/// Parse a Telegram channel from a SQLite row.
+/// Column order: id(0), mission_id(1), bot_token(2), bot_username(3),
+///   allowed_chat_ids(4), trigger_mode(5), active(6), webhook_secret(7),
+///   instructions(8), created_at(9), updated_at(10),
+///   auto_create_missions(11), default_backend(12), default_model_override(13),
+///   default_model_effort(14), default_workspace_id(15), default_config_profile(16),
+///   default_agent(17)
+fn row_to_telegram_channel(row: &rusqlite::Row<'_>) -> TelegramChannel {
+    let id_str: String = row.get(0).unwrap_or_default();
+    let mission_id_str: String = row.get(1).unwrap_or_default();
+    let allowed_chat_ids_json: String = row.get(4).unwrap_or_else(|_| "[]".to_string());
+    let trigger_mode_str: String = row.get(5).unwrap_or_else(|_| "direct_message".to_string());
+    let default_ws_str: Option<String> = row.get(15).unwrap_or_default();
+
+    TelegramChannel {
+        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+        mission_id: Uuid::parse_str(&mission_id_str).unwrap_or_default(),
+        bot_token: row.get(2).unwrap_or_default(),
+        bot_username: row.get(3).unwrap_or_default(),
+        allowed_chat_ids: serde_json::from_str(&allowed_chat_ids_json).unwrap_or_default(),
+        trigger_mode: serde_json::from_value(serde_json::Value::String(trigger_mode_str))
+            .unwrap_or_default(),
+        active: row.get::<_, i32>(6).unwrap_or(0) != 0,
+        webhook_secret: row.get(7).unwrap_or_default(),
+        instructions: row.get(8).unwrap_or_default(),
+        auto_create_missions: row.get::<_, i32>(11).unwrap_or(0) != 0,
+        default_backend: row.get(12).unwrap_or_default(),
+        default_model_override: row.get(13).unwrap_or_default(),
+        default_model_effort: row.get(14).unwrap_or_default(),
+        default_workspace_id: default_ws_str.and_then(|s| Uuid::parse_str(&s).ok()),
+        default_config_profile: row.get(16).unwrap_or_default(),
+        default_agent: row.get(17).unwrap_or_default(),
+        created_at: row.get(9).unwrap_or_default(),
+        updated_at: row.get(10).unwrap_or_default(),
+    }
+}
+
+fn parse_telegram_scheduled_status(raw: String) -> TelegramScheduledMessageStatus {
+    match raw.as_str() {
+        "sent" => TelegramScheduledMessageStatus::Sent,
+        "failed" => TelegramScheduledMessageStatus::Failed,
+        _ => TelegramScheduledMessageStatus::Pending,
+    }
+}
+
+fn row_to_telegram_scheduled_message(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramScheduledMessage, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let channel_id_str: String = row.get(1)?;
+    let source_mission_id_str: Option<String> = row.get(2)?;
+    let status_str: String = row.get(8)?;
+
+    Ok(TelegramScheduledMessage {
+        id: parse_uuid_or_nil(&id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        source_mission_id: source_mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        chat_id: row.get(3)?,
+        chat_title: row.get(4)?,
+        text: row.get(5)?,
+        send_at: row.get(6)?,
+        sent_at: row.get(7)?,
+        status: parse_telegram_scheduled_status(status_str),
+        last_error: row.get(9)?,
+        created_at: row.get(10)?,
+    })
+}
+
+fn parse_telegram_structured_memory_kind(raw: String) -> TelegramStructuredMemoryKind {
+    match raw.as_str() {
+        "fact" => TelegramStructuredMemoryKind::Fact,
+        "task" => TelegramStructuredMemoryKind::Task,
+        "preference" => TelegramStructuredMemoryKind::Preference,
+        _ => TelegramStructuredMemoryKind::Note,
+    }
+}
+
+fn parse_telegram_structured_memory_scope(raw: String) -> TelegramStructuredMemoryScope {
+    match raw.as_str() {
+        "user" => TelegramStructuredMemoryScope::User,
+        "channel" => TelegramStructuredMemoryScope::Channel,
+        _ => TelegramStructuredMemoryScope::Chat,
+    }
+}
+
+fn parse_telegram_action_execution_kind(raw: String) -> TelegramActionExecutionKind {
+    match raw.as_str() {
+        "reminder" => TelegramActionExecutionKind::Reminder,
+        _ => TelegramActionExecutionKind::Send,
+    }
+}
+
+fn parse_telegram_action_execution_status(raw: String) -> TelegramActionExecutionStatus {
+    match raw.as_str() {
+        "sent" => TelegramActionExecutionStatus::Sent,
+        "failed" => TelegramActionExecutionStatus::Failed,
+        _ => TelegramActionExecutionStatus::Pending,
+    }
+}
+
+fn parse_telegram_conversation_message_direction(
+    raw: String,
+) -> TelegramConversationMessageDirection {
+    match raw.as_str() {
+        "outbound" => TelegramConversationMessageDirection::Outbound,
+        _ => TelegramConversationMessageDirection::Inbound,
+    }
+}
+
+fn parse_telegram_workflow_kind(raw: String) -> TelegramWorkflowKind {
+    match raw.as_str() {
+        "request_reply" => TelegramWorkflowKind::RequestReply,
+        _ => TelegramWorkflowKind::RequestReply,
+    }
+}
+
+fn parse_telegram_workflow_status(raw: String) -> TelegramWorkflowStatus {
+    match raw.as_str() {
+        "relayed_to_origin" => TelegramWorkflowStatus::RelayedToOrigin,
+        "completed" => TelegramWorkflowStatus::Completed,
+        "failed" => TelegramWorkflowStatus::Failed,
+        "cancelled" => TelegramWorkflowStatus::Cancelled,
+        _ => TelegramWorkflowStatus::WaitingExternal,
+    }
+}
+
+fn row_to_telegram_structured_memory(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramStructuredMemoryEntry, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let channel_id_str: String = row.get(1)?;
+    let mission_id_str: Option<String> = row.get(3)?;
+    let scope_str: String = row.get(4)?;
+    let kind_str: String = row.get(5)?;
+    Ok(TelegramStructuredMemoryEntry {
+        id: parse_uuid_or_nil(&id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        chat_id: row.get(2)?,
+        mission_id: mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        scope: parse_telegram_structured_memory_scope(scope_str),
+        kind: parse_telegram_structured_memory_kind(kind_str),
+        label: row.get(6)?,
+        value: row.get(7)?,
+        subject_user_id: row.get(8)?,
+        subject_username: row.get(9)?,
+        subject_display_name: row.get(10)?,
+        source_message_id: row.get(11)?,
+        source_role: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+    })
+}
+
+fn row_to_telegram_memory_search_rank(
+    row: &rusqlite::Row<'_>,
+) -> Result<(String, f64), rusqlite::Error> {
+    Ok((row.get(0)?, row.get(1)?))
+}
+
+fn row_to_telegram_action_execution(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramActionExecution, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let channel_id_str: String = row.get(1)?;
+    let source_mission_id_str: Option<String> = row.get(2)?;
+    let action_kind_str: String = row.get(6)?;
+    let scheduled_message_id_str: Option<String> = row.get(11)?;
+    let status_str: String = row.get(12)?;
+
+    Ok(TelegramActionExecution {
+        id: parse_uuid_or_nil(&id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        source_mission_id: source_mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        source_chat_id: row.get(3)?,
+        target_chat_id: row.get(4)?,
+        target_chat_title: row.get(5)?,
+        action_kind: parse_telegram_action_execution_kind(action_kind_str),
+        target_kind: row.get(7)?,
+        target_value: row.get(8)?,
+        text: row.get(9)?,
+        delay_seconds: row.get::<_, i64>(10)?.max(0) as u64,
+        scheduled_message_id: scheduled_message_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        status: parse_telegram_action_execution_status(status_str),
+        last_error: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+    })
+}
+
+fn row_to_telegram_conversation(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramConversation, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let channel_id_str: String = row.get(1)?;
+    let mission_id_str: Option<String> = row.get(3)?;
+    Ok(TelegramConversation {
+        id: parse_uuid_or_nil(&id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        chat_id: row.get(2)?,
+        mission_id: mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        chat_title: row.get(4)?,
+        chat_type: row.get(5)?,
+        last_message_at: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn row_to_telegram_conversation_message(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramConversationMessage, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let conversation_id_str: String = row.get(1)?;
+    let channel_id_str: String = row.get(2)?;
+    let mission_id_str: Option<String> = row.get(4)?;
+    let workflow_id_str: Option<String> = row.get(5)?;
+    let direction_str: String = row.get(7)?;
+    Ok(TelegramConversationMessage {
+        id: parse_uuid_or_nil(&id_str),
+        conversation_id: parse_uuid_or_nil(&conversation_id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        chat_id: row.get(3)?,
+        mission_id: mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        workflow_id: workflow_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        telegram_message_id: row.get(6)?,
+        direction: parse_telegram_conversation_message_direction(direction_str),
+        role: row.get(8)?,
+        sender_user_id: row.get(9)?,
+        sender_username: row.get(10)?,
+        sender_display_name: row.get(11)?,
+        reply_to_message_id: row.get(12)?,
+        text: row.get(13)?,
+        created_at: row.get(14)?,
+    })
+}
+
+fn row_to_telegram_workflow(row: &rusqlite::Row<'_>) -> Result<TelegramWorkflow, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let channel_id_str: String = row.get(1)?;
+    let origin_conversation_id_str: String = row.get(2)?;
+    let origin_mission_id_str: Option<String> = row.get(4)?;
+    let target_conversation_id_str: Option<String> = row.get(5)?;
+    let kind_str: String = row.get(12)?;
+    let status_str: String = row.get(13)?;
+    Ok(TelegramWorkflow {
+        id: parse_uuid_or_nil(&id_str),
+        channel_id: parse_uuid_or_nil(&channel_id_str),
+        origin_conversation_id: parse_uuid_or_nil(&origin_conversation_id_str),
+        origin_chat_id: row.get(3)?,
+        origin_mission_id: origin_mission_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        target_conversation_id: target_conversation_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        target_chat_id: row.get(6)?,
+        target_chat_title: row.get(7)?,
+        target_chat_type: row.get(8)?,
+        target_request_message_id: row.get(9)?,
+        initiated_by_user_id: row.get(10)?,
+        initiated_by_username: row.get(11)?,
+        kind: parse_telegram_workflow_kind(kind_str),
+        status: parse_telegram_workflow_status(status_str),
+        request_text: row.get(14)?,
+        latest_reply_text: row.get(15)?,
+        summary: row.get(16)?,
+        last_error: row.get(17)?,
+        created_at: row.get(18)?,
+        updated_at: row.get(19)?,
+        completed_at: row.get(20)?,
+    })
+}
+
+fn row_to_telegram_workflow_event(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramWorkflowEvent, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let workflow_id_str: String = row.get(1)?;
+    let conversation_id_str: Option<String> = row.get(2)?;
+    Ok(TelegramWorkflowEvent {
+        id: parse_uuid_or_nil(&id_str),
+        workflow_id: parse_uuid_or_nil(&workflow_id_str),
+        conversation_id: conversation_id_str
+            .as_deref()
+            .map(parse_uuid_or_nil)
+            .filter(|id| !id.is_nil()),
+        event_type: row.get(3)?,
+        payload_json: row.get(4)?,
+        created_at: row.get(5)?,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{assistant_message_metadata, AssistantMessageMetadataInput, SqliteMissionStore};
     use crate::agents::CostSource;
-    use crate::api::mission_store::MissionStore;
+    use crate::api::mission_store::{
+        MissionStore, TelegramChannel, TelegramConversation, TelegramConversationMessage,
+        TelegramConversationMessageDirection, TelegramStructuredMemoryEntry,
+        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope, TelegramTriggerMode,
+        TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus,
+    };
     use crate::cost::TokenUsage;
     use rusqlite::params;
     use serde_json::json;
+    use uuid::Uuid;
+
+    fn test_memory_entry(
+        channel_id: Uuid,
+        chat_id: i64,
+        scope: TelegramStructuredMemoryScope,
+        kind: TelegramStructuredMemoryKind,
+        label: Option<&str>,
+        value: &str,
+        subject_user_id: Option<i64>,
+    ) -> TelegramStructuredMemoryEntry {
+        TelegramStructuredMemoryEntry {
+            id: Uuid::new_v4(),
+            channel_id,
+            chat_id,
+            mission_id: None,
+            scope,
+            kind,
+            label: label.map(|value| value.to_string()),
+            value: value.to_string(),
+            subject_user_id,
+            subject_username: subject_user_id.map(|_| "th0rgal".to_string()),
+            subject_display_name: subject_user_id.map(|_| "@th0rgal".to_string()),
+            source_message_id: Some(1),
+            source_role: "user".to_string(),
+            created_at: "2026-04-08T10:00:00Z".to_string(),
+            updated_at: "2026-04-08T10:00:00Z".to_string(),
+        }
+    }
+
+    async fn create_test_channel(store: &SqliteMissionStore) -> Uuid {
+        let mission = store
+            .create_mission(
+                Some("Telegram memory tests"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission");
+        let channel = TelegramChannel {
+            id: Uuid::new_v4(),
+            mission_id: mission.id,
+            bot_token: format!("test-token-{}", Uuid::new_v4()),
+            bot_username: Some("ana_lfgbot_test".to_string()),
+            allowed_chat_ids: vec![],
+            trigger_mode: TelegramTriggerMode::MentionOrDm,
+            active: true,
+            webhook_secret: None,
+            instructions: None,
+            auto_create_missions: true,
+            default_backend: Some("claudecode".to_string()),
+            default_model_override: None,
+            default_model_effort: None,
+            default_workspace_id: None,
+            default_config_profile: None,
+            default_agent: None,
+            created_at: "2026-04-08T10:00:00Z".to_string(),
+            updated_at: "2026-04-08T10:00:00Z".to_string(),
+        };
+        store
+            .create_telegram_channel(channel.clone())
+            .await
+            .expect("telegram channel");
+        channel.id
+    }
+
+    #[tokio::test]
+    async fn telegram_conversation_upsert_preserves_row_and_lists_latest_first() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+        let mission = store
+            .create_mission(Some("Origin"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        let created = store
+            .upsert_telegram_conversation(TelegramConversation {
+                id: Uuid::new_v4(),
+                channel_id,
+                chat_id: 101,
+                mission_id: Some(mission.id),
+                chat_title: Some("Paloma DM".to_string()),
+                chat_type: Some("private".to_string()),
+                last_message_at: Some("2026-04-08T10:00:00Z".to_string()),
+                created_at: "2026-04-08T10:00:00Z".to_string(),
+                updated_at: "2026-04-08T10:00:00Z".to_string(),
+            })
+            .await
+            .expect("create conversation");
+
+        let updated = store
+            .upsert_telegram_conversation(TelegramConversation {
+                id: Uuid::new_v4(),
+                channel_id,
+                chat_id: 101,
+                mission_id: Some(mission.id),
+                chat_title: None,
+                chat_type: None,
+                last_message_at: Some("2026-04-08T10:05:00Z".to_string()),
+                created_at: "2026-04-08T10:05:00Z".to_string(),
+                updated_at: "2026-04-08T10:05:00Z".to_string(),
+            })
+            .await
+            .expect("update conversation");
+
+        assert_eq!(updated.id, created.id);
+        assert_eq!(updated.chat_title.as_deref(), Some("Paloma DM"));
+        assert_eq!(updated.chat_type.as_deref(), Some("private"));
+        assert_eq!(
+            updated.last_message_at.as_deref(),
+            Some("2026-04-08T10:05:00Z")
+        );
+
+        let listed = store
+            .list_telegram_conversations(channel_id, 10)
+            .await
+            .expect("list conversations");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, created.id);
+    }
+
+    #[tokio::test]
+    async fn telegram_conversation_messages_round_trip_and_bump_last_message_at() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+        let mission = store
+            .create_mission(Some("Origin"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        let conversation = store
+            .upsert_telegram_conversation(TelegramConversation {
+                id: Uuid::new_v4(),
+                channel_id,
+                chat_id: 202,
+                mission_id: Some(mission.id),
+                chat_title: Some("Thread".to_string()),
+                chat_type: Some("private".to_string()),
+                last_message_at: Some("2026-04-08T10:00:00Z".to_string()),
+                created_at: "2026-04-08T10:00:00Z".to_string(),
+                updated_at: "2026-04-08T10:00:00Z".to_string(),
+            })
+            .await
+            .expect("conversation");
+
+        store
+            .create_telegram_conversation_message(TelegramConversationMessage {
+                id: Uuid::new_v4(),
+                conversation_id: conversation.id,
+                channel_id,
+                chat_id: 202,
+                mission_id: Some(mission.id),
+                workflow_id: None,
+                telegram_message_id: Some(11),
+                direction: TelegramConversationMessageDirection::Inbound,
+                role: "user".to_string(),
+                sender_user_id: Some(1),
+                sender_username: Some("marilyn".to_string()),
+                sender_display_name: Some("Marilyn".to_string()),
+                reply_to_message_id: None,
+                text: "First".to_string(),
+                created_at: "2026-04-08T10:01:00Z".to_string(),
+            })
+            .await
+            .expect("inbound message");
+
+        store
+            .create_telegram_conversation_message(TelegramConversationMessage {
+                id: Uuid::new_v4(),
+                conversation_id: conversation.id,
+                channel_id,
+                chat_id: 202,
+                mission_id: Some(mission.id),
+                workflow_id: None,
+                telegram_message_id: Some(12),
+                direction: TelegramConversationMessageDirection::Outbound,
+                role: "assistant".to_string(),
+                sender_user_id: None,
+                sender_username: Some("ana_lfgbot_test".to_string()),
+                sender_display_name: Some("@ana_lfgbot_test".to_string()),
+                reply_to_message_id: Some(11),
+                text: "Reply".to_string(),
+                created_at: "2026-04-08T10:02:00Z".to_string(),
+            })
+            .await
+            .expect("outbound message");
+
+        let messages = store
+            .list_telegram_conversation_messages(conversation.id, 10)
+            .await
+            .expect("list messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "Reply");
+        assert_eq!(
+            messages[0].direction,
+            TelegramConversationMessageDirection::Outbound
+        );
+        assert_eq!(messages[1].text, "First");
+
+        let refreshed = store
+            .get_telegram_conversation_by_chat(channel_id, 202)
+            .await
+            .expect("get conversation")
+            .expect("conversation exists");
+        assert_eq!(
+            refreshed.last_message_at.as_deref(),
+            Some("2026-04-08T10:02:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_workflow_round_trip_supports_pending_lookup_and_events() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+        let mission = store
+            .create_mission(Some("Origin"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        let origin = store
+            .upsert_telegram_conversation(TelegramConversation {
+                id: Uuid::new_v4(),
+                channel_id,
+                chat_id: 303,
+                mission_id: Some(mission.id),
+                chat_title: Some("Origin".to_string()),
+                chat_type: Some("private".to_string()),
+                last_message_at: Some("2026-04-08T10:00:00Z".to_string()),
+                created_at: "2026-04-08T10:00:00Z".to_string(),
+                updated_at: "2026-04-08T10:00:00Z".to_string(),
+            })
+            .await
+            .expect("origin conversation");
+        let target = store
+            .upsert_telegram_conversation(TelegramConversation {
+                id: Uuid::new_v4(),
+                channel_id,
+                chat_id: 404,
+                mission_id: None,
+                chat_title: Some("Marilyn".to_string()),
+                chat_type: Some("private".to_string()),
+                last_message_at: Some("2026-04-08T10:00:00Z".to_string()),
+                created_at: "2026-04-08T10:00:00Z".to_string(),
+                updated_at: "2026-04-08T10:00:00Z".to_string(),
+            })
+            .await
+            .expect("target conversation");
+
+        let workflow = store
+            .create_telegram_workflow(TelegramWorkflow {
+                id: Uuid::new_v4(),
+                channel_id,
+                origin_conversation_id: origin.id,
+                origin_chat_id: 303,
+                origin_mission_id: Some(mission.id),
+                target_conversation_id: Some(target.id),
+                target_chat_id: Some(404),
+                target_chat_title: Some("Marilyn".to_string()),
+                target_chat_type: Some("private".to_string()),
+                target_request_message_id: Some(9001),
+                initiated_by_user_id: Some(7),
+                initiated_by_username: Some("th0rgal".to_string()),
+                kind: TelegramWorkflowKind::RequestReply,
+                status: TelegramWorkflowStatus::WaitingExternal,
+                request_text: "Ask Marilyn for leads".to_string(),
+                latest_reply_text: None,
+                summary: None,
+                last_error: None,
+                created_at: "2026-04-08T10:00:00Z".to_string(),
+                updated_at: "2026-04-08T10:00:00Z".to_string(),
+                completed_at: None,
+            })
+            .await
+            .expect("create workflow");
+
+        let pending = store
+            .get_pending_telegram_workflow_for_target_chat(channel_id, 404)
+            .await
+            .expect("pending workflow")
+            .expect("workflow exists");
+        assert_eq!(pending.id, workflow.id);
+        assert_eq!(pending.target_request_message_id, Some(9001));
+
+        let pending_by_request = store
+            .get_pending_telegram_workflow_for_target_message(channel_id, 404, 9001)
+            .await
+            .expect("pending workflow by request")
+            .expect("workflow exists by request");
+        assert_eq!(pending_by_request.id, workflow.id);
+
+        store
+            .create_telegram_workflow_event(TelegramWorkflowEvent {
+                id: Uuid::new_v4(),
+                workflow_id: workflow.id,
+                conversation_id: Some(target.id),
+                event_type: "external_reply_received".to_string(),
+                payload_json: "{\"text\":\"Lead A\"}".to_string(),
+                created_at: "2026-04-08T10:03:00Z".to_string(),
+            })
+            .await
+            .expect("create workflow event");
+
+        let mut completed = workflow.clone();
+        completed.status = TelegramWorkflowStatus::RelayedToOrigin;
+        completed.latest_reply_text = Some("Lead A".to_string());
+        completed.summary = Some("Lead A relayed".to_string());
+        completed.updated_at = "2026-04-08T10:04:00Z".to_string();
+        completed.completed_at = Some("2026-04-08T10:04:00Z".to_string());
+        store
+            .update_telegram_workflow(completed.clone())
+            .await
+            .expect("update workflow");
+
+        let pending_after = store
+            .get_pending_telegram_workflow_for_target_chat(channel_id, 404)
+            .await
+            .expect("pending lookup after completion");
+        assert!(pending_after.is_none());
+
+        let listed = store
+            .list_telegram_workflows(channel_id, 10)
+            .await
+            .expect("list workflows");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, TelegramWorkflowStatus::RelayedToOrigin);
+        assert_eq!(listed[0].summary.as_deref(), Some("Lead A relayed"));
+
+        let events = store
+            .list_telegram_workflow_events(workflow.id, 10)
+            .await
+            .expect("list workflow events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "external_reply_received");
+    }
 
     #[test]
     fn assistant_message_metadata_uses_normalized_cost_shape() {
@@ -3385,5 +7528,400 @@ mod tests {
                 ("assistant".to_string(), "reply B".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn hybrid_memory_search_prioritizes_specific_fact_matches() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                10,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("identifiant prod"),
+                "POLARIS-19",
+                Some(42),
+            ))
+            .await
+            .expect("user fact");
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                10,
+                TelegramStructuredMemoryScope::Chat,
+                TelegramStructuredMemoryKind::Note,
+                None,
+                "Les logs prod sont sur le serveur principal",
+                None,
+            ))
+            .await
+            .expect("chat note");
+
+        let hits = store
+            .search_telegram_memory_context_hybrid(
+                channel_id,
+                10,
+                Some(42),
+                "Quel est mon identifiant prod ?",
+                5,
+            )
+            .await
+            .expect("hybrid search");
+
+        assert!(!hits.is_empty(), "expected at least one hybrid hit");
+        assert_eq!(hits[0].entry.label.as_deref(), Some("identifiant prod"));
+        assert_eq!(hits[0].entry.value, "POLARIS-19");
+        assert!(hits[0].score > hits.last().map(|hit| hit.score).unwrap_or(0.0));
+    }
+
+    #[tokio::test]
+    async fn hybrid_memory_search_keeps_user_scope_across_chat_contexts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                1,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("code universel"),
+                "ASTRA-42",
+                Some(42),
+            ))
+            .await
+            .expect("user fact");
+
+        let hits = store
+            .search_telegram_memory_context_hybrid(
+                channel_id,
+                999,
+                Some(42),
+                "Quel est mon code universel ?",
+                5,
+            )
+            .await
+            .expect("hybrid search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.scope, TelegramStructuredMemoryScope::User);
+        assert_eq!(hits[0].entry.value, "ASTRA-42");
+    }
+
+    #[tokio::test]
+    async fn hybrid_memory_search_reflects_updated_fact_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                1,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("code universel"),
+                "ASTRA-42",
+                Some(42),
+            ))
+            .await
+            .expect("initial fact");
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                1,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("code universel"),
+                "ASTRA-43",
+                Some(42),
+            ))
+            .await
+            .expect("updated fact");
+
+        let hits = store
+            .search_telegram_memory_context_hybrid(channel_id, 1, Some(42), "mon code universel", 5)
+            .await
+            .expect("hybrid search");
+
+        assert_eq!(hits[0].entry.value, "ASTRA-43");
+    }
+
+    #[tokio::test]
+    async fn telegram_memory_fts_upsert_replaces_existing_entry_in_place() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                1,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("code universel"),
+                "ASTRA-42",
+                Some(42),
+            ))
+            .await
+            .expect("initial fact");
+        store
+            .upsert_telegram_structured_memory(test_memory_entry(
+                channel_id,
+                1,
+                TelegramStructuredMemoryScope::User,
+                TelegramStructuredMemoryKind::Fact,
+                Some("code universel"),
+                "ASTRA-43",
+                Some(42),
+            ))
+            .await
+            .expect("updated fact");
+
+        let conn = store.conn.lock().await;
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_structured_memory_fts",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts row count");
+        let search_text: String = conn
+            .query_row(
+                "SELECT search_text FROM telegram_structured_memory_fts LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts search text");
+        drop(conn);
+
+        assert_eq!(row_count, 1);
+        assert!(search_text.contains("astra 43"));
+        assert!(!search_text.contains("astra 42"));
+    }
+
+    #[tokio::test]
+    async fn telegram_memory_migration_bootstraps_empty_fts_index_only_when_needed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().to_path_buf();
+        let channel_id;
+
+        {
+            let store = SqliteMissionStore::new(db_path.clone(), "test-user")
+                .await
+                .expect("sqlite store");
+            channel_id = create_test_channel(&store).await;
+            store
+                .upsert_telegram_structured_memory(test_memory_entry(
+                    channel_id,
+                    1,
+                    TelegramStructuredMemoryScope::User,
+                    TelegramStructuredMemoryKind::Fact,
+                    Some("code universel"),
+                    "ASTRA-42",
+                    Some(42),
+                ))
+                .await
+                .expect("user fact");
+
+            let conn = store.conn.lock().await;
+            conn.execute("DELETE FROM telegram_structured_memory_fts", [])
+                .expect("clear fts rows");
+        }
+
+        let store = SqliteMissionStore::new(db_path.clone(), "test-user")
+            .await
+            .expect("sqlite store reopen");
+        let conn = store.conn.lock().await;
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_structured_memory_fts",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts row count");
+        drop(conn);
+
+        assert_eq!(row_count, 1);
+
+        let hits = store
+            .search_telegram_memory_context_hybrid(channel_id, 1, Some(42), "code universel", 5)
+            .await
+            .expect("hybrid search");
+        assert_eq!(hits[0].entry.value, "ASTRA-42");
+    }
+
+    #[tokio::test]
+    async fn telegram_memory_migration_does_not_rebuild_populated_fts_index() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().to_path_buf();
+
+        {
+            let store = SqliteMissionStore::new(db_path.clone(), "test-user")
+                .await
+                .expect("sqlite store");
+            let channel_id = create_test_channel(&store).await;
+            store
+                .upsert_telegram_structured_memory(test_memory_entry(
+                    channel_id,
+                    1,
+                    TelegramStructuredMemoryScope::User,
+                    TelegramStructuredMemoryKind::Fact,
+                    Some("code universel"),
+                    "ASTRA-42",
+                    Some(42),
+                ))
+                .await
+                .expect("user fact");
+
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE telegram_structured_memory_fts SET search_text = 'stale marker' WHERE rowid IN (
+                    SELECT rowid FROM telegram_structured_memory_fts LIMIT 1
+                )",
+                [],
+            )
+            .expect("overwrite fts search text");
+        }
+
+        let store = SqliteMissionStore::new(db_path, "test-user")
+            .await
+            .expect("sqlite store reopen");
+        let conn = store.conn.lock().await;
+        let search_text: String = conn
+            .query_row(
+                "SELECT search_text FROM telegram_structured_memory_fts LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts search text");
+        drop(conn);
+
+        assert_eq!(search_text, "stale marker");
+    }
+
+    #[tokio::test]
+    async fn get_events_since_returns_only_events_after_seq() {
+        use crate::api::control::AgentEvent;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("seq test"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        for i in 0..5 {
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::UserMessage {
+                        id: Uuid::new_v4(),
+                        content: format!("msg {i}"),
+                        queued: false,
+                        mission_id: Some(mission.id),
+                    },
+                )
+                .await
+                .expect("log user message");
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::AssistantMessage {
+                        id: Uuid::new_v4(),
+                        content: format!("reply {i}"),
+                        success: true,
+                        cost_cents: 0,
+                        cost_source: CostSource::Unknown,
+                        usage: None,
+                        model: None,
+                        model_normalized: None,
+                        mission_id: Some(mission.id),
+                        shared_files: None,
+                        resumable: false,
+                    },
+                )
+                .await
+                .expect("log assistant");
+        }
+
+        // Max sequence should reflect all 10 events
+        let max = store.max_event_sequence(mission.id).await.expect("max seq");
+        assert_eq!(max, 10);
+
+        // since_seq=0 returns all 10 events, ordered ASC
+        let from_zero = store
+            .get_events_since(mission.id, 0, None, None)
+            .await
+            .expect("get_events_since zero");
+        assert_eq!(from_zero.len(), 10);
+        let seqs: Vec<i64> = from_zero.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, (1..=10).collect::<Vec<_>>());
+
+        // since_seq=5 returns events 6..=10
+        let tail = store
+            .get_events_since(mission.id, 5, None, None)
+            .await
+            .expect("get_events_since tail");
+        assert_eq!(tail.len(), 5);
+        assert_eq!(tail.first().map(|e| e.sequence), Some(6));
+        assert_eq!(tail.last().map(|e| e.sequence), Some(10));
+
+        // since_seq=10 returns empty (caller is already caught up)
+        let empty = store
+            .get_events_since(mission.id, 10, None, None)
+            .await
+            .expect("get_events_since empty");
+        assert!(empty.is_empty());
+
+        // limit clamps the response
+        let limited = store
+            .get_events_since(mission.id, 0, None, Some(3))
+            .await
+            .expect("get_events_since limited");
+        assert_eq!(limited.len(), 3);
+        assert_eq!(
+            limited.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        // event_types filter narrows further
+        let assistants_only = store
+            .get_events_since(mission.id, 0, Some(&["assistant_message"]), None)
+            .await
+            .expect("get_events_since types");
+        assert_eq!(assistants_only.len(), 5);
+        for e in &assistants_only {
+            assert_eq!(e.event_type, "assistant_message");
+        }
+    }
+
+    #[tokio::test]
+    async fn max_event_sequence_is_zero_for_mission_with_no_events() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("empty"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        let max = store.max_event_sequence(mission.id).await.expect("max seq");
+        assert_eq!(max, 0);
     }
 }

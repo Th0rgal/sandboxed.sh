@@ -18,6 +18,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   test:
@@ -26,24 +27,31 @@ jobs:
     # Skip CI on draft PRs unless explicitly requested
     if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-test-harness-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-test-harness-
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   clippy:
     name: Clippy
@@ -51,7 +59,7 @@ jobs:
     # Skip CI on draft PRs unless explicitly requested
     if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -59,18 +67,25 @@ jobs:
           components: clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-${{ github.job }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-${{ github.job }}-
 
       - name: Run clippy
-        run: cargo clippy --workspace -- -D clippy::all
+        run: cargo clippy --locked --workspace -- -D clippy::all
 
   fmt:
     name: Format
@@ -78,7 +93,7 @@ jobs:
     # Skip CI on draft PRs unless explicitly requested
     if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -94,21 +109,28 @@ jobs:
     # Skip CI on draft PRs unless explicitly requested
     if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-test-harness-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-test-harness-
 
       - name: Run harness contract tests
         run: scripts/harness_contract_tests.sh
@@ -119,7 +141,7 @@ jobs:
     # Skip CI on draft PRs unless explicitly requested
     if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Validate capability matrix and surface contract evidence
         run: scripts/check-capability-matrix.sh
@@ -133,12 +155,30 @@ jobs:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      - name: Cache dashboard dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.bun/install/cache
+            dashboard/node_modules
+          key: ${{ runner.os }}-dashboard-bun-${{ hashFiles('dashboard/bun.lock', 'dashboard/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-dashboard-bun-
+
+      - name: Cache Next.js build artifacts
+        uses: actions/cache@v5
+        with:
+          path: dashboard/.next/cache
+          key: ${{ runner.os }}-dashboard-next-${{ hashFiles('dashboard/bun.lock', 'dashboard/package.json') }}-${{ hashFiles('dashboard/next.config.ts', 'dashboard/src/**/*', 'dashboard/public/**/*') }}
+          restore-keys: |
+            ${{ runner.os }}-dashboard-next-
 
       - name: Install dependencies
         run: bun install --frozen-lockfile

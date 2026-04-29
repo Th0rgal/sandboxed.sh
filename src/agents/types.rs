@@ -178,6 +178,8 @@ pub enum TerminalReason {
     RateLimited,
     /// Provider rejected turn due to concurrent mission capacity exhaustion
     CapacityLimited,
+    /// Authentication credentials were rejected (expired/revoked token)
+    AuthError,
 }
 
 /// Errors that can occur in agent operations.

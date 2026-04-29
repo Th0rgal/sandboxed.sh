@@ -38,6 +38,7 @@ const GOOGLE_API_CLIENT: &str = "gl-node/22.17.0";
 const GOOGLE_CLIENT_METADATA: &str =
     "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI";
 const GOOGLE_PROJECT_CACHE_TTL: Duration = Duration::from_secs(600);
+const DEFAULT_CLI_PROXY_API_BASE_URL: &str = "http://127.0.0.1:8317";
 
 const TEXT_EVENT_STREAM: &str = "text/event-stream";
 const NO_CACHE: &str = "no-cache";
@@ -155,13 +156,53 @@ fn completions_url(provider_type: ProviderType, account_base_url: Option<&str>) 
     Some(format!("{}/chat/completions", base))
 }
 
-fn has_routable_proxy_credentials(
+fn cli_proxy_chat_completions_url() -> String {
+    // Alias precedence lives in `util::CLI_PROXY_BASE_URL_ENV_VARS` so every
+    // CLI-proxy code path agrees. `env_var_nonempty` (used by the helper)
+    // skips blank values so a templated empty first alias doesn't collapse
+    // the URL to just `/v1/chat/completions`.
+    let base = crate::util::cli_proxy_base_url_from_env()
+        .unwrap_or_else(|| DEFAULT_CLI_PROXY_API_BASE_URL.to_string());
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{}/chat/completions", base)
+    } else {
+        format!("{}/v1/chat/completions", base)
+    }
+}
+
+fn build_cli_proxy_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(api_key) = crate::util::cli_proxy_api_key_from_env() {
+        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", api_key)) {
+            headers.insert(header::AUTHORIZATION, value);
+        }
+    }
+    headers
+}
+
+pub(crate) fn has_routable_proxy_credentials(
     provider_type: ProviderType,
     has_api_key: bool,
     has_oauth: bool,
 ) -> bool {
     match provider_type {
         ProviderType::Custom => true,
+        ProviderType::Anthropic => has_api_key || has_oauth,
+        // OpenAI OAuth-only entries are only routable when the local
+        // CLI proxy is usable (Codex credential on disk). The
+        // CLI-proxy adapter doesn't forward the entry's own OAuth
+        // token — it relies on the global Codex credential — so
+        // without that we'd select the entry, fall through the
+        // non-adapter path, send no Authorization header, and burn
+        // through deterministic 401s. Keep it unroutable so chain
+        // resolution skips it and picks the next provider instead.
+        ProviderType::OpenAI => {
+            has_api_key
+                || (has_oauth && crate::api::ai_providers::openai_cli_proxy_account_available())
+        }
         ProviderType::Google => has_api_key || has_oauth,
         _ => has_api_key,
     }
@@ -439,8 +480,91 @@ async fn chat_completions(
             continue;
         }
 
+        // The synthetic "anthropic-cli-proxy" account is the only Anthropic
+        // entry without an api_key — `read_standard_accounts` hoists the
+        // access_token into `api_key` for real Anthropic OAuth records so we
+        // can forward it as a Bearer credential. Gate the CLI-proxy adapter on
+        // that distinction, otherwise direct Anthropic OAuth accounts get sent
+        // through the local CLI proxy with no credential and fail.
+        let use_anthropic_oauth_cli_proxy_adapter =
+            provider_type == ProviderType::Anthropic && entry.has_oauth && entry.api_key.is_none();
+        let use_anthropic_adapter =
+            provider_type == ProviderType::Anthropic && !use_anthropic_oauth_cli_proxy_adapter;
+        // OpenAI OAuth (Codex ChatGPT Plus/Pro tokens) can't authenticate at
+        // `api.openai.com/v1/chat/completions` directly — only at the Codex
+        // `/v1/responses` endpoint. The local CLI proxy knows how to translate
+        // between the two, so when we have OAuth but no `sk-...` key we route
+        // through it instead of burning through 401s upstream.
+        //
+        // The CLI-proxy adapter does NOT forward the selected entry's OAuth
+        // token — it relies on the global Codex credential on disk. If no
+        // such credential is available, routing here would just produce
+        // repeated 401/connection failures and cooldown churn, so also
+        // require a usable Codex CLI-proxy account before picking this
+        // adapter.
+        let use_openai_oauth_cli_proxy_adapter = provider_type == ProviderType::OpenAI
+            && entry.has_oauth
+            && entry.api_key.is_none()
+            && crate::api::ai_providers::openai_cli_proxy_account_available();
         let use_google_oauth_adapter = provider_type == ProviderType::Google && entry.has_oauth;
-        let (url, upstream_body, extra_headers) = if use_google_oauth_adapter {
+        let (url, upstream_body, extra_headers) = if use_anthropic_oauth_cli_proxy_adapter {
+            let upstream_body = match rewrite_model_for_anthropic_cli_proxy(&body, &entry.model_id)
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("Failed to rewrite model in request body: {}", e);
+                    server_error_count += 1;
+                    continue;
+                }
+            };
+            (
+                cli_proxy_chat_completions_url(),
+                upstream_body,
+                build_cli_proxy_headers(),
+            )
+        } else if use_openai_oauth_cli_proxy_adapter {
+            let upstream_body = match rewrite_model(&body, &entry.model_id) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("Failed to rewrite model in request body: {}", e);
+                    server_error_count += 1;
+                    continue;
+                }
+            };
+            (
+                cli_proxy_chat_completions_url(),
+                upstream_body,
+                build_cli_proxy_headers(),
+            )
+        } else if use_anthropic_adapter {
+            let credential = match entry.api_key.as_deref() {
+                Some(value) if !value.trim().is_empty() => value,
+                _ => {
+                    tracing::warn!(
+                        provider = %entry.provider_id,
+                        account_id = %entry.account_id,
+                        "Anthropic routing entry missing credential"
+                    );
+                    client_error_count += 1;
+                    continue;
+                }
+            };
+            let upstream_body =
+                match build_anthropic_upstream_request(&body, &entry.model_id, is_stream) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("Failed to build Anthropic upstream request: {}", e);
+                        server_error_count += 1;
+                        continue;
+                    }
+                };
+            let headers = build_anthropic_proxy_headers(credential, entry.has_oauth);
+            (
+                "https://api.anthropic.com/v1/messages".to_string(),
+                upstream_body,
+                headers,
+            )
+        } else if use_google_oauth_adapter {
             let access_token = match get_google_access_token().await {
                 Ok(token) => token,
                 Err(e) => {
@@ -512,7 +636,11 @@ async fn chat_completions(
             .post(&url)
             .header("Content-Type", "application/json")
             .body(upstream_body);
-        if !use_google_oauth_adapter {
+        if !use_google_oauth_adapter
+            && !use_anthropic_adapter
+            && !use_anthropic_oauth_cli_proxy_adapter
+            && !use_openai_oauth_cli_proxy_adapter
+        {
             if let Some(api_key) = &entry.api_key {
                 upstream_req = upstream_req.header("Authorization", format!("Bearer {}", api_key));
             }
@@ -562,7 +690,7 @@ async fn chat_completions(
                 };
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, reason, None)
+                    .record_entry_failure(entry, reason, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -583,6 +711,244 @@ async fn chat_completions(
         };
 
         let status = upstream_resp.status();
+
+        if use_anthropic_adapter {
+            if is_stream && status.is_success() {
+                let mut response_headers = HeaderMap::new();
+                response_headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static(TEXT_EVENT_STREAM),
+                );
+                response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(NO_CACHE));
+
+                let stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+                let stream_created = chrono::Utc::now().timestamp();
+                let model_id = entry.model_id.clone();
+                let response_stream = transform_anthropic_sse_to_openai(
+                    upstream_resp.bytes_stream(),
+                    stream_id,
+                    stream_created,
+                    model_id,
+                );
+
+                let ttft_ms = request_start.elapsed().as_millis() as u64;
+                state
+                    .health_tracker
+                    .record_latency(entry.account_id, ttft_ms)
+                    .await;
+                let account_id = entry.account_id;
+                let health_tracker = state.health_tracker.clone();
+                let tracked_stream = track_stream_health(
+                    response_stream,
+                    health_tracker,
+                    account_id,
+                    None,
+                    entry.subscription_key.clone(),
+                );
+
+                let success_provider = entry.provider_id.clone();
+                for evt in &mut pending_fallback_events {
+                    if evt.to_provider.is_none() {
+                        evt.to_provider = Some(success_provider.clone());
+                    }
+                }
+                for evt in pending_fallback_events {
+                    state.health_tracker.record_fallback_event(evt).await;
+                }
+
+                return (status, response_headers, Body::from_stream(tracked_stream))
+                    .into_response();
+            }
+
+            let response_headers = upstream_resp.headers().clone();
+            let resp_body = match upstream_resp.bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                    tracing::warn!(
+                        provider = %entry.provider_id,
+                        account_id = %entry.account_id,
+                        error = %e,
+                        "Failed to read Anthropic upstream response body"
+                    );
+                    let cooldown = state
+                        .health_tracker
+                        .record_entry_failure(entry, CooldownReason::ServerError, None)
+                        .await;
+                    pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                        timestamp: chrono::Utc::now(),
+                        chain_id: chain_id.clone(),
+                        from_provider: entry.provider_id.clone(),
+                        from_model: entry.model_id.clone(),
+                        from_account_id: entry.account_id,
+                        reason: CooldownReason::ServerError,
+                        cooldown_secs: Some(cooldown.as_secs_f64()),
+                        to_provider: None,
+                        latency_ms: Some(elapsed_ms),
+                        attempt_number: (entry_idx + 1) as u32,
+                        chain_length,
+                    });
+                    server_error_count += 1;
+                    continue;
+                }
+            };
+
+            if status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529 {
+                let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                let retry_after = parse_rate_limit_headers(&response_headers, provider_type);
+                let reason = if status.as_u16() == 529 {
+                    CooldownReason::Overloaded
+                } else {
+                    CooldownReason::RateLimit
+                };
+                let cooldown = state
+                    .health_tracker
+                    .record_entry_failure(entry, reason, retry_after)
+                    .await;
+                pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                    timestamp: chrono::Utc::now(),
+                    chain_id: chain_id.clone(),
+                    from_provider: entry.provider_id.clone(),
+                    from_model: entry.model_id.clone(),
+                    from_account_id: entry.account_id,
+                    reason,
+                    cooldown_secs: Some(cooldown.as_secs_f64()),
+                    to_provider: None,
+                    latency_ms: Some(elapsed_ms),
+                    attempt_number: (entry_idx + 1) as u32,
+                    chain_length,
+                });
+                rate_limit_count += 1;
+                continue;
+            }
+
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                let cooldown = state
+                    .health_tracker
+                    .record_entry_failure(entry, CooldownReason::AuthError, None)
+                    .await;
+                pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                    timestamp: chrono::Utc::now(),
+                    chain_id: chain_id.clone(),
+                    from_provider: entry.provider_id.clone(),
+                    from_model: entry.model_id.clone(),
+                    from_account_id: entry.account_id,
+                    reason: CooldownReason::AuthError,
+                    cooldown_secs: Some(cooldown.as_secs_f64()),
+                    to_provider: None,
+                    latency_ms: Some(elapsed_ms),
+                    attempt_number: (entry_idx + 1) as u32,
+                    chain_length,
+                });
+                client_error_count += 1;
+                continue;
+            }
+
+            if status.is_server_error() {
+                let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                let cooldown = state
+                    .health_tracker
+                    .record_entry_failure(entry, CooldownReason::ServerError, None)
+                    .await;
+                pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                    timestamp: chrono::Utc::now(),
+                    chain_id: chain_id.clone(),
+                    from_provider: entry.provider_id.clone(),
+                    from_model: entry.model_id.clone(),
+                    from_account_id: entry.account_id,
+                    reason: CooldownReason::ServerError,
+                    cooldown_secs: Some(cooldown.as_secs_f64()),
+                    to_provider: None,
+                    latency_ms: Some(elapsed_ms),
+                    attempt_number: (entry_idx + 1) as u32,
+                    chain_length,
+                });
+                server_error_count += 1;
+                continue;
+            }
+
+            if status.is_client_error() {
+                // 4xx outside 429/529/401/403 (e.g., 400 malformed request).
+                // Still a provider failure — track it so cooldown/backoff and
+                // FallbackEvent reporting kick in instead of silently burning
+                // through retries.
+                let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                let cooldown = state
+                    .health_tracker
+                    .record_entry_failure(entry, CooldownReason::ClientError, None)
+                    .await;
+                pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                    timestamp: chrono::Utc::now(),
+                    chain_id: chain_id.clone(),
+                    from_provider: entry.provider_id.clone(),
+                    from_model: entry.model_id.clone(),
+                    from_account_id: entry.account_id,
+                    reason: CooldownReason::ClientError,
+                    cooldown_secs: Some(cooldown.as_secs_f64()),
+                    to_provider: None,
+                    latency_ms: Some(elapsed_ms),
+                    attempt_number: (entry_idx + 1) as u32,
+                    chain_length,
+                });
+                client_error_count += 1;
+                continue;
+            }
+
+            let translated = translate_anthropic_json_to_openai(
+                &resp_body,
+                &entry.model_id,
+                chrono::Utc::now().timestamp(),
+            );
+            let (translated_body, usage) = match translated {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        provider = %entry.provider_id,
+                        account_id = %entry.account_id,
+                        error = %e,
+                        "Failed to translate Anthropic response to OpenAI format"
+                    );
+                    server_error_count += 1;
+                    continue;
+                }
+            };
+            let elapsed_ms = request_start.elapsed().as_millis() as u64;
+            state
+                .health_tracker
+                .record_latency(entry.account_id, elapsed_ms)
+                .await;
+            state.health_tracker.record_entry_success(entry).await;
+            if let Some((input, output)) = usage {
+                state
+                    .health_tracker
+                    .record_token_usage(entry.account_id, input, output)
+                    .await;
+            }
+            let success_provider = entry.provider_id.clone();
+            for evt in &mut pending_fallback_events {
+                if evt.to_provider.is_none() {
+                    evt.to_provider = Some(success_provider.clone());
+                }
+            }
+            for evt in pending_fallback_events {
+                state.health_tracker.record_fallback_event(evt).await;
+            }
+
+            let mut builder = Response::builder().status(StatusCode::OK);
+            if let Some(ct) = response_headers.get(header::CONTENT_TYPE) {
+                builder = builder.header(header::CONTENT_TYPE, ct);
+            }
+            return builder
+                .body(Body::from(translated_body))
+                .unwrap_or_else(|_| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to build response".to_string(),
+                        "internal_error",
+                    )
+                });
+        }
 
         if use_google_oauth_adapter {
             if is_stream && status.is_success() {
@@ -610,8 +976,13 @@ async fn chat_completions(
                     .await;
                 let account_id = entry.account_id;
                 let health_tracker = state.health_tracker.clone();
-                let tracked_stream =
-                    track_stream_health(response_stream, health_tracker, account_id, None);
+                let tracked_stream = track_stream_health(
+                    response_stream,
+                    health_tracker,
+                    account_id,
+                    None,
+                    entry.subscription_key.clone(),
+                );
 
                 let success_provider = entry.provider_id.clone();
                 for evt in &mut pending_fallback_events {
@@ -640,7 +1011,7 @@ async fn chat_completions(
                     );
                     let cooldown = state
                         .health_tracker
-                        .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                        .record_entry_failure(entry, CooldownReason::ServerError, None)
                         .await;
                     pending_fallback_events.push(crate::provider_health::FallbackEvent {
                         timestamp: chrono::Utc::now(),
@@ -666,7 +1037,7 @@ async fn chat_completions(
                     .or_else(|| parse_rate_limit_headers(&response_headers, provider_type));
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, CooldownReason::RateLimit, retry_after)
+                    .record_entry_failure(entry, CooldownReason::RateLimit, retry_after)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -700,7 +1071,7 @@ async fn chat_completions(
                 };
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, reason, retry_after)
+                    .record_entry_failure(entry, reason, retry_after)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -727,7 +1098,7 @@ async fn chat_completions(
                 let elapsed_ms = request_start.elapsed().as_millis() as u64;
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                    .record_entry_failure(entry, CooldownReason::ServerError, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -774,7 +1145,7 @@ async fn chat_completions(
                 .health_tracker
                 .record_latency(entry.account_id, elapsed_ms)
                 .await;
-            state.health_tracker.record_success(entry.account_id).await;
+            state.health_tracker.record_entry_success(entry).await;
             if let Some((input, output)) = usage {
                 state
                     .health_tracker
@@ -824,7 +1195,7 @@ async fn chat_completions(
             );
             let cooldown = state
                 .health_tracker
-                .record_failure(entry.account_id, reason, retry_after)
+                .record_entry_failure(entry, reason, retry_after)
                 .await;
             pending_fallback_events.push(crate::provider_health::FallbackEvent {
                 timestamp: chrono::Utc::now(),
@@ -853,7 +1224,7 @@ async fn chat_completions(
             );
             let cooldown = state
                 .health_tracker
-                .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                .record_entry_failure(entry, CooldownReason::ServerError, None)
                 .await;
             pending_fallback_events.push(crate::provider_health::FallbackEvent {
                 timestamp: chrono::Utc::now(),
@@ -883,7 +1254,7 @@ async fn chat_completions(
             );
             let cooldown = state
                 .health_tracker
-                .record_failure(entry.account_id, CooldownReason::AuthError, None)
+                .record_entry_failure(entry, CooldownReason::AuthError, None)
                 .await;
             pending_fallback_events.push(crate::provider_health::FallbackEvent {
                 timestamp: chrono::Utc::now(),
@@ -983,7 +1354,7 @@ async fn chat_completions(
                 let elapsed_ms = request_start.elapsed().as_millis() as u64;
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                    .record_entry_failure(entry, CooldownReason::ServerError, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -1025,7 +1396,7 @@ async fn chat_completions(
                 );
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, reason, None)
+                    .record_entry_failure(entry, reason, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -1086,8 +1457,13 @@ async fn chat_completions(
             let byte_stream = normalize_sse_stream(combined);
 
             // Wrap the stream to record success/failure on completion.
-            let tracked_stream =
-                track_stream_health(byte_stream, health_tracker, account_id, rate_limit_snapshot);
+            let tracked_stream = track_stream_health(
+                byte_stream,
+                health_tracker,
+                account_id,
+                rate_limit_snapshot,
+                entry.subscription_key.clone(),
+            );
 
             return (status, response_headers, Body::from_stream(tracked_stream)).into_response();
         }
@@ -1115,7 +1491,7 @@ async fn chat_completions(
                             );
                             let cooldown = state
                                 .health_tracker
-                                .record_failure(entry.account_id, reason, None)
+                                .record_entry_failure(entry, reason, None)
                                 .await;
                             pending_fallback_events.push(crate::provider_health::FallbackEvent {
                                 timestamp: chrono::Utc::now(),
@@ -1146,7 +1522,7 @@ async fn chat_completions(
                         .health_tracker
                         .record_latency(entry.account_id, elapsed_ms)
                         .await;
-                    state.health_tracker.record_success(entry.account_id).await;
+                    state.health_tracker.record_entry_success(entry).await;
 
                     // Extract rate-limit quota snapshot from response headers
                     if let Some(snapshot) =
@@ -1211,7 +1587,7 @@ async fn chat_completions(
                 );
                 let cooldown = state
                     .health_tracker
-                    .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                    .record_entry_failure(entry, CooldownReason::ServerError, None)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -1352,6 +1728,25 @@ fn rewrite_model(body: &[u8], new_model: &str) -> Result<bytes::Bytes, String> {
     let mut value: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
     value["model"] = serde_json::Value::String(new_model.to_string());
+    serde_json::to_vec(&value)
+        .map(bytes::Bytes::from)
+        .map_err(|e| format!("Failed to serialize: {}", e))
+}
+
+fn rewrite_model_for_anthropic_cli_proxy(
+    body: &[u8],
+    new_model: &str,
+) -> Result<bytes::Bytes, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
+    value["model"] = serde_json::Value::String(new_model.to_string());
+    if new_model.contains("claude-opus-4-7") {
+        if let Some(obj) = value.as_object_mut() {
+            for key in ["temperature", "top_p", "top_k"] {
+                obj.remove(key);
+            }
+        }
+    }
     serde_json::to_vec(&value)
         .map(bytes::Bytes::from)
         .map_err(|e| format!("Failed to serialize: {}", e))
@@ -1953,6 +2348,7 @@ fn track_stream_health(
     health_tracker: crate::provider_health::SharedProviderHealthTracker,
     account_id: uuid::Uuid,
     rate_limit_snapshot: Option<crate::provider_health::RateLimitSnapshot>,
+    subscription_key: Option<crate::provider_health::SubscriptionKey>,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
     async_stream::stream! {
         let mut stream = std::pin::pin!(inner);
@@ -1990,10 +2386,17 @@ fn track_stream_health(
         }
         if errored || !received_any {
             health_tracker
-                .record_failure(account_id, CooldownReason::ServerError, None)
+                .record_failure_with_subscription(
+                    account_id,
+                    subscription_key.as_ref(),
+                    CooldownReason::ServerError,
+                    None,
+                )
                 .await;
         } else {
-            health_tracker.record_success(account_id).await;
+            health_tracker
+                .record_success_with_subscription(account_id, subscription_key.as_ref())
+                .await;
             if input_tokens > 0 || output_tokens > 0 {
                 health_tracker.record_token_usage(account_id, input_tokens, output_tokens).await;
             }
@@ -2014,6 +2417,672 @@ fn apply_google_client_headers(builder: reqwest::RequestBuilder) -> reqwest::Req
         .header(header::USER_AGENT, GOOGLE_USER_AGENT)
         .header("X-Goog-Api-Client", GOOGLE_API_CLIENT)
         .header("Client-Metadata", GOOGLE_CLIENT_METADATA)
+}
+
+fn build_anthropic_proxy_headers(credential: &str, has_oauth: bool) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    if has_oauth {
+        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", credential)) {
+            headers.insert(header::AUTHORIZATION, v);
+        }
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("oauth-2025-04-20"),
+        );
+    } else if let Ok(v) = HeaderValue::from_str(credential) {
+        headers.insert("x-api-key", v);
+    }
+    headers
+}
+
+fn build_anthropic_upstream_request(
+    body: &[u8],
+    model_id: &str,
+    is_stream: bool,
+) -> Result<bytes::Bytes, String> {
+    let req: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
+    let mut out = serde_json::Map::new();
+    out.insert("model".to_string(), serde_json::json!(model_id));
+    out.insert(
+        "max_tokens".to_string(),
+        req.get("max_tokens")
+            .or_else(|| req.get("max_completion_tokens"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(4096)),
+    );
+    if is_stream {
+        out.insert("stream".to_string(), serde_json::Value::Bool(true));
+    }
+    let omit_sampling_params = model_id.contains("claude-opus-4-7");
+    for key in ["temperature", "top_p", "top_k"] {
+        if omit_sampling_params {
+            continue;
+        }
+        if let Some(value) = req.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(stop) = req.get("stop") {
+        let stop_sequences = if let Some(s) = stop.as_str() {
+            serde_json::json!([s])
+        } else {
+            stop.clone()
+        };
+        out.insert("stop_sequences".to_string(), stop_sequences);
+    }
+
+    let (system, messages) = anthropic_messages_from_openai(
+        req.get("messages")
+            .and_then(|v| v.as_array())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]),
+    );
+    if !system.is_empty() {
+        out.insert("system".to_string(), serde_json::Value::String(system));
+    }
+    out.insert("messages".to_string(), serde_json::Value::Array(messages));
+
+    if let Some(tools) = anthropic_tools_from_openai(req.get("tools")) {
+        out.insert("tools".to_string(), tools);
+    }
+    if let Some(tool_choice) = anthropic_tool_choice_from_openai(req.get("tool_choice")) {
+        out.insert("tool_choice".to_string(), tool_choice);
+    }
+
+    serde_json::to_vec(&serde_json::Value::Object(out))
+        .map(bytes::Bytes::from)
+        .map_err(|e| format!("Failed to serialize Anthropic request body: {}", e))
+}
+
+fn anthropic_messages_from_openai(
+    messages: &[serde_json::Value],
+) -> (String, Vec<serde_json::Value>) {
+    let mut system_parts = Vec::new();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user");
+        match role {
+            "system" => {
+                let text = extract_openai_message_text(message.get("content"));
+                if !text.trim().is_empty() {
+                    system_parts.push(text);
+                }
+            }
+            "assistant" => {
+                let mut content = anthropic_content_blocks_from_openai(message.get("content"));
+                if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+                    for call in tool_calls {
+                        let id = call
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("toolu_compat");
+                        let Some(function) = call.get("function").and_then(|v| v.as_object())
+                        else {
+                            continue;
+                        };
+                        let name = function
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tool");
+                        let input = function
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        content.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": input
+                        }));
+                    }
+                }
+                push_anthropic_message(&mut out, "assistant", content);
+            }
+            "tool" => {
+                let tool_use_id = message
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("toolu_compat");
+                let content_text = extract_openai_message_text(message.get("content"));
+                push_anthropic_message(
+                    &mut out,
+                    "user",
+                    vec![serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": content_text
+                    })],
+                );
+            }
+            _ => {
+                let content = anthropic_content_blocks_from_openai(message.get("content"));
+                push_anthropic_message(&mut out, "user", content);
+            }
+        }
+    }
+
+    if out.is_empty() {
+        out.push(serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": ""}]
+        }));
+    }
+
+    (system_parts.join("\n\n"), out)
+}
+
+fn push_anthropic_message(
+    out: &mut Vec<serde_json::Value>,
+    role: &str,
+    mut content: Vec<serde_json::Value>,
+) {
+    if content.is_empty() {
+        content.push(serde_json::json!({ "type": "text", "text": "" }));
+    }
+    if let Some(last) = out.last_mut() {
+        let same_role = last.get("role").and_then(|v| v.as_str()) == Some(role);
+        if same_role {
+            if let Some(existing) = last.get_mut("content").and_then(|v| v.as_array_mut()) {
+                existing.extend(content);
+                return;
+            }
+        }
+    }
+    out.push(serde_json::json!({ "role": role, "content": content }));
+}
+
+fn anthropic_content_blocks_from_openai(
+    content: Option<&serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let Some(content) = content else {
+        return Vec::new();
+    };
+    if let Some(text) = content.as_str() {
+        return vec![serde_json::json!({ "type": "text", "text": text })];
+    }
+    let Some(parts) = content.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for part in parts {
+        match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "text" => {
+                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                    out.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+            }
+            "image_url" => {
+                if let Some(url) = part
+                    .get("image_url")
+                    .and_then(|v| v.get("url"))
+                    .and_then(|v| v.as_str())
+                {
+                    // data URIs → Anthropic base64 source; regular URLs → url source.
+                    if let Some(rest) = url.strip_prefix("data:") {
+                        if let Some((meta, data)) = rest.split_once(',') {
+                            let media_type = meta
+                                .split(';')
+                                .next()
+                                .filter(|m| !m.is_empty())
+                                .unwrap_or("image/jpeg");
+                            out.push(serde_json::json!({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": data,
+                                }
+                            }));
+                            continue;
+                        }
+                    }
+                    out.push(serde_json::json!({
+                        "type": "image",
+                        "source": { "type": "url", "url": url }
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn anthropic_tools_from_openai(tools: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let mut out = Vec::new();
+    for tool in tools.and_then(|v| v.as_array())? {
+        if tool.get("type").and_then(|v| v.as_str()) != Some("function") {
+            continue;
+        }
+        let Some(function) = tool.get("function").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        let Some(name) = function.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let mut converted = serde_json::Map::new();
+        converted.insert("name".to_string(), serde_json::json!(name));
+        if let Some(description) = function.get("description").and_then(|v| v.as_str()) {
+            converted.insert("description".to_string(), serde_json::json!(description));
+        }
+        converted.insert(
+            "input_schema".to_string(),
+            function
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+        );
+        out.push(serde_json::Value::Object(converted));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Array(out))
+    }
+}
+
+fn anthropic_tool_choice_from_openai(
+    tool_choice: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let tool_choice = tool_choice?;
+    if let Some(choice) = tool_choice.as_str() {
+        return match choice {
+            "none" => Some(serde_json::json!({ "type": "none" })),
+            "required" => Some(serde_json::json!({ "type": "any" })),
+            "auto" => Some(serde_json::json!({ "type": "auto" })),
+            _ => None,
+        };
+    }
+    tool_choice
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|name| serde_json::json!({ "type": "tool", "name": name }))
+}
+
+fn finish_reason_from_anthropic(s: Option<&str>) -> &'static str {
+    match s.unwrap_or("end_turn") {
+        "max_tokens" => "length",
+        "tool_use" => "tool_calls",
+        "stop_sequence" | "end_turn" => "stop",
+        _ => "stop",
+    }
+}
+
+fn translate_anthropic_json_to_openai(
+    body: &[u8],
+    model_id: &str,
+    created: i64,
+) -> Result<(bytes::Bytes, Option<(u64, u64)>), String> {
+    let parsed: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
+
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(parts) = parsed.get("content").and_then(|v| v.as_array()) {
+        for part in parts {
+            match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "text" => {
+                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                        content.push_str(text);
+                    }
+                }
+                "tool_use" => {
+                    let id = part
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("toolu_compat");
+                    let name = part.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                    let input = part
+                        .get("input")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let arguments =
+                        serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                    tool_calls.push(serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let stop_reason = parsed.get("stop_reason").and_then(|v| v.as_str());
+    let input_tokens = parsed
+        .get("usage")
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_tokens = parsed
+        .get("usage")
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let openai = serde_json::json!({
+        "id": parsed
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4())),
+        "object": "chat.completion",
+        "created": created,
+        "model": model_id,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": if content.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(content) },
+                "tool_calls": if tool_calls.is_empty() { serde_json::Value::Null } else { serde_json::Value::Array(tool_calls) },
+            },
+            "finish_reason": finish_reason_from_anthropic(stop_reason),
+        }],
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+    });
+    let bytes = serde_json::to_vec(&openai)
+        .map(bytes::Bytes::from)
+        .map_err(|e| format!("Failed to serialize translated response: {}", e))?;
+    Ok((bytes, Some((input_tokens, output_tokens))))
+}
+
+fn transform_anthropic_sse_to_openai(
+    inner: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    stream_id: String,
+    created: i64,
+    model_id: String,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    // tool_blocks maps an Anthropic content_block index to the OpenAI
+    // tool_calls[].index we assigned for it. next_tool_idx is the next free
+    // OpenAI tool index. Tool indexing is independent of Anthropic block
+    // indexing because Anthropic interleaves text and tool_use blocks.
+    futures::stream::unfold(
+        (
+            Box::pin(inner),
+            Vec::<u8>::new(),
+            false,
+            stream_id,
+            model_id,
+            created,
+            std::collections::HashMap::<u64, u32>::new(),
+            0u32,
+            false,
+            false,
+        ),
+        |(
+            mut stream,
+            mut buf,
+            mut sent_role,
+            stream_id,
+            model_id,
+            created,
+            mut tool_blocks,
+            mut next_tool_idx,
+            mut stream_ended,
+            mut done_emitted,
+        )| async move {
+            if stream_ended {
+                return None;
+            }
+            loop {
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line = buf.drain(..=pos).collect::<Vec<u8>>();
+                    let trimmed = line
+                        .strip_suffix(b"\r\n")
+                        .or_else(|| line.strip_suffix(b"\n"))
+                        .unwrap_or(&line);
+                    if !trimmed.starts_with(b"data: ") {
+                        continue;
+                    }
+                    let payload = &trimmed[6..];
+                    let parsed = match serde_json::from_slice::<serde_json::Value>(payload) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let event_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let mut chunks = Vec::new();
+                    if !sent_role {
+                        let first = serde_json::json!({
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": serde_json::Value::Null }],
+                        });
+                        chunks.push(format!("data: {}\n\n", first));
+                        sent_role = true;
+                    }
+                    match event_type {
+                        "content_block_start" => {
+                            let block_index =
+                                parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let block = parsed.get("content_block");
+                            if block.and_then(|b| b.get("type")).and_then(|v| v.as_str())
+                                == Some("tool_use")
+                            {
+                                let tool_idx = next_tool_idx;
+                                next_tool_idx += 1;
+                                tool_blocks.insert(block_index, tool_idx);
+                                let id = block
+                                    .and_then(|b| b.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let name = block
+                                    .and_then(|b| b.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let chunk = serde_json::json!({
+                                    "id": stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [{
+                                                "index": tool_idx,
+                                                "id": id,
+                                                "type": "function",
+                                                "function": { "name": name, "arguments": "" }
+                                            }]
+                                        },
+                                        "finish_reason": serde_json::Value::Null
+                                    }],
+                                });
+                                chunks.push(format!("data: {}\n\n", chunk));
+                            }
+                        }
+                        "content_block_delta" => {
+                            let delta = parsed.get("delta");
+                            let delta_type = delta
+                                .and_then(|d| d.get("type"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            match delta_type {
+                                "text_delta" | "" => {
+                                    if let Some(text) =
+                                        delta.and_then(|d| d.get("text")).and_then(|v| v.as_str())
+                                    {
+                                        if !text.is_empty() {
+                                            let chunk = serde_json::json!({
+                                                "id": stream_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created,
+                                                "model": model_id,
+                                                "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": serde_json::Value::Null }],
+                                            });
+                                            chunks.push(format!("data: {}\n\n", chunk));
+                                        }
+                                    }
+                                }
+                                "input_json_delta" => {
+                                    let block_index =
+                                        parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let tool_idx = match tool_blocks.get(&block_index) {
+                                        Some(idx) => *idx,
+                                        None => continue,
+                                    };
+                                    if let Some(partial) = delta
+                                        .and_then(|d| d.get("partial_json"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        if !partial.is_empty() {
+                                            let chunk = serde_json::json!({
+                                                "id": stream_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created,
+                                                "model": model_id,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "tool_calls": [{
+                                                            "index": tool_idx,
+                                                            "function": { "arguments": partial }
+                                                        }]
+                                                    },
+                                                    "finish_reason": serde_json::Value::Null
+                                                }],
+                                            });
+                                            chunks.push(format!("data: {}\n\n", chunk));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        "message_delta" => {
+                            let finish_reason = finish_reason_from_anthropic(
+                                parsed
+                                    .get("delta")
+                                    .and_then(|d| d.get("stop_reason"))
+                                    .and_then(|v| v.as_str()),
+                            );
+                            let chunk = serde_json::json!({
+                                "id": stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
+                            });
+                            chunks.push(format!("data: {}\n\n", chunk));
+                        }
+                        "message_stop" if !done_emitted => {
+                            chunks.push("data: [DONE]\n\n".to_string());
+                            done_emitted = true;
+                            stream_ended = true;
+                        }
+                        "error" => {
+                            // Anthropic stream-time error. Surface as an OpenAI
+                            // error chunk followed by [DONE] so callers see the
+                            // failure instead of a silent empty completion.
+                            let err_obj = parsed.get("error").cloned().unwrap_or_else(
+                                || serde_json::json!({ "message": "upstream stream error" }),
+                            );
+                            let chunk = serde_json::json!({
+                                "id": stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{ "index": 0, "delta": {}, "finish_reason": "error" }],
+                                "error": err_obj,
+                            });
+                            chunks.push(format!("data: {}\n\n", chunk));
+                            if !done_emitted {
+                                chunks.push("data: [DONE]\n\n".to_string());
+                                done_emitted = true;
+                            }
+                            stream_ended = true;
+                        }
+                        _ => {}
+                    }
+                    if chunks.is_empty() {
+                        continue;
+                    }
+                    return Some((
+                        Ok(bytes::Bytes::from(chunks.concat())),
+                        (
+                            stream,
+                            buf,
+                            sent_role,
+                            stream_id,
+                            model_id,
+                            created,
+                            tool_blocks,
+                            next_tool_idx,
+                            stream_ended,
+                            done_emitted,
+                        ),
+                    ));
+                }
+
+                match stream.next().await {
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                    Some(Err(e)) => {
+                        return Some((
+                            Err(std::io::Error::other(e.to_string())),
+                            (
+                                stream,
+                                buf,
+                                sent_role,
+                                stream_id,
+                                model_id,
+                                created,
+                                tool_blocks,
+                                next_tool_idx,
+                                stream_ended,
+                                done_emitted,
+                            ),
+                        ));
+                    }
+                    None => {
+                        // Upstream closed. Promote any buffered bytes into a
+                        // final line (they may be a complete `data:` event
+                        // that just missed a trailing `\n`) so we don't drop
+                        // the last event, then terminate the stream. Only
+                        // synthesize `[DONE]` if we haven't already emitted
+                        // one via `message_stop`.
+                        stream_ended = true;
+                        if !buf.is_empty() && !buf.ends_with(b"\n") {
+                            buf.push(b'\n');
+                            stream_ended = false;
+                            continue;
+                        }
+                        if done_emitted {
+                            return None;
+                        }
+                        done_emitted = true;
+                        return Some((
+                            Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")),
+                            (
+                                stream,
+                                buf,
+                                sent_role,
+                                stream_id,
+                                model_id,
+                                created,
+                                tool_blocks,
+                                next_tool_idx,
+                                stream_ended,
+                                done_emitted,
+                            ),
+                        ));
+                    }
+                }
+            }
+        },
+    )
 }
 
 fn build_google_proxy_headers(access_token: &str, is_stream: bool) -> HeaderMap {
@@ -3101,13 +4170,111 @@ mod tests {
     }
 
     #[test]
+    fn build_anthropic_request_maps_openai_tools_and_tool_choice() {
+        let body = serde_json::json!({
+            "model": "opus",
+            "messages": [
+                { "role": "system", "content": "Be brief." },
+                { "role": "user", "content": "Use the echo tool." }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "description": "Echo text",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } },
+                        "required": ["text"]
+                    }
+                }
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": { "name": "echo" }
+            },
+            "max_tokens": 32,
+            "temperature": 0.0
+        });
+
+        let payload_bytes = build_anthropic_upstream_request(
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            "claude-opus-4-7",
+            false,
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(payload_bytes.as_ref()).unwrap();
+
+        assert_eq!(payload["model"], "claude-opus-4-7");
+        assert!(payload.get("temperature").is_none());
+        assert_eq!(payload["system"], "Be brief.");
+        assert_eq!(payload["messages"][0]["role"], "user");
+        assert_eq!(payload["tools"][0]["name"], "echo");
+        assert_eq!(payload["tools"][0]["input_schema"]["required"][0], "text");
+        assert_eq!(
+            payload["tool_choice"],
+            serde_json::json!({
+                "type": "tool",
+                "name": "echo"
+            })
+        );
+    }
+
+    #[test]
+    fn translate_anthropic_response_maps_tool_use_to_openai_tool_calls() {
+        let body = serde_json::json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-7",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_123",
+                "name": "echo",
+                "input": { "text": "ok" }
+            }],
+            "stop_reason": "tool_use",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 4
+            }
+        });
+
+        let (translated, usage) = translate_anthropic_json_to_openai(
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            "claude-opus-4-7",
+            1,
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(translated.as_ref()).unwrap();
+
+        assert_eq!(payload["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "echo"
+        );
+        assert_eq!(payload["usage"]["prompt_tokens"], 10);
+        assert_eq!(payload["usage"]["completion_tokens"], 4);
+        assert_eq!(usage, Some((10, 4)));
+    }
+
+    #[test]
     fn proxy_credential_gating_is_provider_aware_for_oauth() {
+        // OpenAI OAuth-only routability now also depends on whether a
+        // Codex CLI-proxy credential is available on disk — the
+        // adapter doesn't forward the entry's own OAuth token, so
+        // without a Codex cred the request would 401 anyway. The test
+        // environment has no such credential, so OpenAI OAuth-only
+        // should be unroutable here.
         assert!(!has_routable_proxy_credentials(
             ProviderType::OpenAI,
             false,
             true
         ));
-        assert!(!has_routable_proxy_credentials(
+        // Anthropic and Google OAuth entries keep the old contract —
+        // Anthropic CLI-proxy routing has its own fallback path and
+        // Google uses a proper refresh flow.
+        assert!(has_routable_proxy_credentials(
             ProviderType::Anthropic,
             false,
             true
@@ -3117,6 +4284,7 @@ mod tests {
             false,
             true
         ));
+        // API-key entries are always routable regardless of OAuth state.
         assert!(has_routable_proxy_credentials(
             ProviderType::OpenAI,
             true,
@@ -3127,5 +4295,84 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn cli_proxy_chat_completions_url_accepts_proxy_root_or_v1_base() {
+        // `CLAUDE_CODE_PROXY_BASE_URL` is the highest-priority alias, so the
+        // test must isolate it too — otherwise an ambient value from the
+        // test runner shadows everything this test sets and the assertions
+        // silently verify the wrong env var.
+        let original_claude_code = std::env::var("CLAUDE_CODE_PROXY_BASE_URL").ok();
+        let original_cli_proxy = std::env::var("CLI_PROXY_API_BASE_URL").ok();
+        let original_clip = std::env::var("CLIPROXY_API_BASE_URL").ok();
+        let original_legacy = std::env::var("CLIPROXY_BASE_URL").ok();
+
+        std::env::remove_var("CLAUDE_CODE_PROXY_BASE_URL");
+        std::env::remove_var("CLIPROXY_API_BASE_URL");
+        std::env::remove_var("CLIPROXY_BASE_URL");
+
+        std::env::set_var("CLI_PROXY_API_BASE_URL", "http://127.0.0.1:8317");
+        assert_eq!(
+            cli_proxy_chat_completions_url(),
+            "http://127.0.0.1:8317/v1/chat/completions"
+        );
+
+        std::env::set_var("CLI_PROXY_API_BASE_URL", "http://127.0.0.1:8317/v1/");
+        assert_eq!(
+            cli_proxy_chat_completions_url(),
+            "http://127.0.0.1:8317/v1/chat/completions"
+        );
+
+        std::env::set_var(
+            "CLI_PROXY_API_BASE_URL",
+            "http://127.0.0.1:8317/v1/chat/completions",
+        );
+        assert_eq!(
+            cli_proxy_chat_completions_url(),
+            "http://127.0.0.1:8317/v1/chat/completions"
+        );
+
+        match original_claude_code {
+            Some(value) => std::env::set_var("CLAUDE_CODE_PROXY_BASE_URL", value),
+            None => std::env::remove_var("CLAUDE_CODE_PROXY_BASE_URL"),
+        }
+        match original_cli_proxy {
+            Some(value) => std::env::set_var("CLI_PROXY_API_BASE_URL", value),
+            None => std::env::remove_var("CLI_PROXY_API_BASE_URL"),
+        }
+        match original_clip {
+            Some(value) => std::env::set_var("CLIPROXY_API_BASE_URL", value),
+            None => std::env::remove_var("CLIPROXY_API_BASE_URL"),
+        }
+        match original_legacy {
+            Some(value) => std::env::set_var("CLIPROXY_BASE_URL", value),
+            None => std::env::remove_var("CLIPROXY_BASE_URL"),
+        }
+    }
+
+    #[test]
+    fn anthropic_cli_proxy_rewrite_drops_deprecated_opus_47_sampling_params() {
+        let body = serde_json::json!({
+            "model": "opus",
+            "messages": [{ "role": "user", "content": "ok" }],
+            "max_tokens": 16,
+            "temperature": 0,
+            "top_p": 1,
+            "top_k": 1,
+            "thinking": { "type": "disabled" }
+        });
+        let payload = rewrite_model_for_anthropic_cli_proxy(
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            "claude-opus-4-7",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(payload.as_ref()).unwrap();
+
+        assert_eq!(value["model"], "claude-opus-4-7");
+        assert!(value.get("temperature").is_none());
+        assert!(value.get("top_p").is_none());
+        assert!(value.get("top_k").is_none());
+        assert_eq!(value["thinking"], serde_json::json!({ "type": "disabled" }));
     }
 }

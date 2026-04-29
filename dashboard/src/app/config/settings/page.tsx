@@ -460,15 +460,15 @@ export default function SettingsPage() {
     void loadHostFile();
   }, [loadHostFile, selectedFile, activeHarness, selectedProfile]);
 
-  const isTomlFile = selectedFile?.endsWith('.toml') ?? false;
+  const isJsonFile = selectedFile?.endsWith('.json') ?? false;
 
-  // Validate content on change (JSON validation for JSON files, skip for TOML)
+  // Validate content on change (JSON validation for JSON files only)
   useEffect(() => {
     if (!fileContent.trim()) {
       setParseError(null);
       return;
     }
-    if (isTomlFile) {
+    if (!isJsonFile) {
       setParseError(null);
       return;
     }
@@ -479,7 +479,7 @@ export default function SettingsPage() {
     } catch (err) {
       setParseError(err instanceof Error ? err.message : 'Invalid JSON');
     }
-  }, [fileContent, isTomlFile]);
+  }, [fileContent, isJsonFile]);
 
   useEffect(() => {
     if (!hostSyncSuccess) return;
@@ -1319,12 +1319,12 @@ export default function SettingsPage() {
             <ConfigCodeEditor
               value={fileContent}
               onChange={setFileContent}
-              placeholder={isTomlFile ? '[section]\nkey = "value"' : '{\n  "key": "value"\n}'}
+              placeholder={isJsonFile ? '{\n  "key": "value"\n}' : ''}
               disabled={saving || !selectedFile}
               className="h-full"
               height="100%"
               padding={16}
-              language={isTomlFile ? 'toml' : 'json'}
+              language={isJsonFile ? 'json' : selectedFile?.endsWith('.toml') ? 'toml' : 'markdown'}
             />
           </div>
         </div>

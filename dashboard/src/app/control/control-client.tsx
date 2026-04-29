@@ -12,12 +12,13 @@ import {
   type FilePasteContext,
 } from "@/components/enhanced-input";
 import { MissionAutomationsDialog } from "@/components/mission-automations-dialog";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { MissionDebugStats } from "./MissionDebugStats";
+import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
 import { getMissionShortName } from "@/lib/mission-display";
 import { inferMissionRole } from "@/lib/mission-role";
+import { isFinishedStatus } from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import {
@@ -28,8 +29,10 @@ import {
   loadMission,
   getMission,
   getMissionEvents,
+  getMissionEventsWithMeta,
   searchMissionMoments,
   createMission,
+  updateMissionSettings,
   listMissions,
   setMissionStatus,
   resumeMission,
@@ -57,6 +60,7 @@ import {
   type ControlRunState,
   type Mission,
   type MissionStatus,
+  type ModelEffort,
   type RunningMissionInfo,
   type UploadProgress,
   type Workspace,
@@ -193,16 +197,18 @@ import {
 import { useScrollToBottom } from "@/hooks/use-scroll-to-bottom";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import { useVisibilityPolling } from "@/hooks/use-visibility-polling";
 import { DesktopStream } from "@/components/desktop-stream";
 import { NewMissionDialog } from "@/components/new-mission-dialog";
 import { MissionSwitcher, normalizeMetadataText } from "@/components/mission-switcher";
 import { WorkerPanel } from "@/components/worker-panel";
+import { SubagentsPanel, type SubagentEntry } from "@/components/subagents-panel";
 
 import type { SharedFile } from "@/lib/api";
 
 type CostSource = "actual" | "estimated" | "unknown";
 
-type ChatItem =
+export type ChatItem =
   | {
       kind: "user";
       id: string;
@@ -268,6 +274,195 @@ type ChatItem =
 
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
+
+type ToolGroup = {
+  kind: "tool_group";
+  groupId: string;
+  tools: ToolItem[];
+};
+type ThinkingGroup = {
+  kind: "thinking_group";
+  groupId: string;
+  thoughts: SidePanelItem[];
+};
+type GroupedItem = ChatItem | ToolGroup | ThinkingGroup;
+
+type ItemViews = {
+  /** Items after dedup by `id`, in original order. */
+  dedupedItems: ChatItem[];
+  /** Deduped + queued-user items moved to the end. */
+  displayItems: ChatItem[];
+  /** `displayItems` with queued users filtered out (they render in
+   * the QueueStrip instead). */
+  chatDisplayItems: ChatItem[];
+  /** The last non-queued item; used by a few pinned UI bits. */
+  lastNonQueuedItem: ChatItem | undefined;
+  /** Thinking + streaming items, for the side panel. */
+  thinkingItems: SidePanelItem[];
+  /** Completed (de-duplicated by content) + in-flight thinking count. */
+  thinkingItemsCount: number;
+  /** Any in-flight (not done) thinking item present. */
+  hasActiveThinking: boolean;
+  /** `chatDisplayItems` collapsed into tool / thinking groups. */
+  groupedItems: GroupedItem[];
+};
+
+/**
+ * Single-pass derivation of every view we display from the raw `items`
+ * array. Replaces a cascade of 7–8 separate `useMemo` hooks that each
+ * looped over `items` independently — on a 5 000-item mission with a
+ * 10 Hz SSE stream that was ~35 000 ops/sec just to keep views in
+ * sync. Merging into one traversal is O(n) in `items.length` and runs
+ * exactly once per `(items, showThinkingPanel)` change.
+ *
+ * Keep this pure — it's called from a `useMemo` and must not touch
+ * React state or refs.
+ */
+function deriveItemViews(
+  items: ChatItem[],
+  showThinkingPanel: boolean
+): ItemViews {
+  // Pass 1: dedup by id (last occurrence wins, preserve original order).
+  // Record the last index per id, then emit items whose index matches.
+  // O(n) with a single map allocation.
+  const lastIndexById = new Map<string, number>();
+  for (let i = 0; i < items.length; i++) {
+    lastIndexById.set(items[i].id, i);
+  }
+  const dedupedItems: ChatItem[] = [];
+  for (let i = 0; i < items.length; i++) {
+    if (lastIndexById.get(items[i].id) === i) {
+      dedupedItems.push(items[i]);
+    }
+  }
+
+  // Pass 2: split queued user messages off the end, collect thinking
+  // items, find lastNonQueued — all in one sweep.
+  let hasQueuedUser = false;
+  const thinkingItems: SidePanelItem[] = [];
+  let hasActiveThinking = false;
+  for (const item of dedupedItems) {
+    if (item.kind === "user" && item.queued) {
+      hasQueuedUser = true;
+    }
+    if (item.kind === "thinking" || item.kind === "stream") {
+      thinkingItems.push(item as SidePanelItem);
+      if (!item.done) hasActiveThinking = true;
+    }
+  }
+
+  let displayItems: ChatItem[];
+  if (!hasQueuedUser) {
+    displayItems = dedupedItems;
+  } else {
+    const normal: ChatItem[] = [];
+    const queued: ChatItem[] = [];
+    for (const item of dedupedItems) {
+      if (item.kind === "user" && item.queued) queued.push(item);
+      else normal.push(item);
+    }
+    displayItems = normal.concat(queued);
+  }
+
+  // `chatDisplayItems` is `displayItems` minus queued users. When there
+  // are no queued users the two are identical; share the reference so
+  // downstream memos see stable identity on the common path.
+  const chatDisplayItems = hasQueuedUser
+    ? displayItems.filter((it) => !(it.kind === "user" && it.queued === true))
+    : displayItems;
+
+  let lastNonQueuedItem: ChatItem | undefined;
+  for (let i = displayItems.length - 1; i >= 0; i--) {
+    const item = displayItems[i];
+    if (!(item.kind === "user" && item.queued)) {
+      lastNonQueuedItem = item;
+      break;
+    }
+  }
+  if (!lastNonQueuedItem && displayItems.length > 0) {
+    lastNonQueuedItem = displayItems[displayItems.length - 1];
+  }
+
+  // Thinking-count dedup by content (matches the panel's own rule).
+  const seenThinkContent = new Set<string>();
+  let completedThinking = 0;
+  let activeThinking = 0;
+  for (const t of thinkingItems) {
+    if (!t.done) {
+      activeThinking += 1;
+      continue;
+    }
+    const trimmed = t.content.trim();
+    if (!trimmed || seenThinkContent.has(trimmed)) continue;
+    seenThinkContent.add(trimmed);
+    completedThinking += 1;
+  }
+  const thinkingItemsCount = completedThinking + activeThinking;
+
+  // Pass 3: group consecutive tool/thinking blocks for collapsed display.
+  const groupedItems: GroupedItem[] = [];
+  let currentToolGroup: ToolItem[] = [];
+  let currentThinkingGroup: SidePanelItem[] = [];
+  const flushToolGroup = () => {
+    if (currentToolGroup.length === 0) return;
+    if (currentToolGroup.length === 1) {
+      groupedItems.push(currentToolGroup[0]);
+    } else {
+      groupedItems.push({
+        kind: "tool_group",
+        groupId: currentToolGroup[0].id,
+        tools: currentToolGroup,
+      });
+    }
+    currentToolGroup = [];
+  };
+  const flushThinkingGroup = () => {
+    if (currentThinkingGroup.length === 0) return;
+    groupedItems.push({
+      kind: "thinking_group",
+      groupId: currentThinkingGroup[0].id,
+      thoughts: currentThinkingGroup,
+    });
+    currentThinkingGroup = [];
+  };
+  for (const item of chatDisplayItems) {
+    if (item.kind === "tool" && !item.isUiTool) {
+      flushThinkingGroup();
+      currentToolGroup.push(item);
+    } else if (item.kind === "thinking" || item.kind === "stream") {
+      if (showThinkingPanel) {
+        // Thinking/stream items are routed to the side panel in this
+        // mode — they don't render inline at all. Keep the tool group
+        // open across them so consecutive tool calls (with thinking
+        // between) stay collapsed into a single group in the main
+        // chat; otherwise the user sees every tool as an individual
+        // row with no "Show N previous tools" collapse button.
+        continue;
+      }
+      // Inline thinking: break the current tool group so ordering
+      // renders as tool → thinking → tool in the chat.
+      flushToolGroup();
+      currentThinkingGroup.push(item as SidePanelItem);
+    } else {
+      flushToolGroup();
+      flushThinkingGroup();
+      groupedItems.push(item);
+    }
+  }
+  flushToolGroup();
+  flushThinkingGroup();
+
+  return {
+    dedupedItems,
+    displayItems,
+    chatDisplayItems,
+    lastNonQueuedItem,
+    thinkingItems,
+    thinkingItemsCount,
+    hasActiveThinking,
+    groupedItems,
+  };
+}
 
 type QuestionOption = {
   label: string;
@@ -930,25 +1125,17 @@ function SharedFilePreviewModal({
             </div>
           ) : (
             <div className="text-sm">
-              <SyntaxHighlighter
+              <LazyCodeBlock
                 language={language}
-                style={oneDark}
                 showLineNumbers
                 customStyle={{
-                  margin: 0,
                   padding: "1rem",
                   background: "transparent",
                   fontSize: "0.8125rem",
                 }}
-                codeTagProps={{
-                  style: {
-                    fontFamily:
-                      'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-                  },
-                }}
               >
                 {text}
-              </SyntaxHighlighter>
+              </LazyCodeBlock>
             </div>
           )}
         </div>
@@ -1389,7 +1576,7 @@ function ThinkingGroupItem({
 // Threshold for collapsing long thoughts (in characters)
 const THOUGHT_COLLAPSE_THRESHOLD = 800;
 
-function ThinkingPanelItem({
+const ThinkingPanelItem = memo(function ThinkingPanelItem({
   item,
   isActive,
   basePath,
@@ -1499,7 +1686,7 @@ function ThinkingPanelItem({
       </div>
     </div>
   );
-}
+});
 
 // Thinking side panel component
 function ThinkingPanel({
@@ -1551,21 +1738,54 @@ function ThinkingPanel({
   // Performance: limit visible thoughts, load more on demand
   const INITIAL_VISIBLE_THOUGHTS = 10;
   const LOAD_MORE_THOUGHTS = 10;
-  const [visibleThoughtsLimit, setVisibleThoughtsLimit] = useState(INITIAL_VISIBLE_THOUGHTS);
-
-  // Reset limit when mission changes (not during streaming updates)
-  useEffect(() => {
-    setVisibleThoughtsLimit(INITIAL_VISIBLE_THOUGHTS);
+  const [visibleThoughtsState, setVisibleThoughtsState] = useState({
+    missionId,
+    limit: INITIAL_VISIBLE_THOUGHTS,
+  });
+  const visibleThoughtsLimit =
+    visibleThoughtsState.missionId === missionId
+      ? visibleThoughtsState.limit
+      : INITIAL_VISIBLE_THOUGHTS;
+  const loadMoreThoughts = useCallback(() => {
+    setVisibleThoughtsState((prev) => ({
+      missionId,
+      limit:
+        prev.missionId === missionId
+          ? prev.limit + LOAD_MORE_THOUGHTS
+          : INITIAL_VISIBLE_THOUGHTS + LOAD_MORE_THOUGHTS,
+    }));
   }, [missionId]);
+
+  // Memoize the visible slice to avoid re-rendering completed items when only active content changes
+  const visibleCompletedItems = useMemo(
+    () => completedItems.slice(-visibleThoughtsLimit),
+    [completedItems, visibleThoughtsLimit]
+  );
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to bottom when active thought content changes
-  useEffect(() => {
-    if (scrollRef.current && activeItems.length > 0) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  // Auto-scroll to bottom when active thought content changes.
+  // Use useLayoutEffect to set scroll before paint (prevents flicker).
+  // Only scroll if already near the bottom (user hasn't scrolled up to read history).
+  const userScrolledUpRef = useRef(false);
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el && activeItems.length > 0 && !userScrolledUpRef.current) {
+      el.scrollTop = el.scrollHeight;
     }
   }, [activeItems.map((i) => `${i.id}:${i.content.length}`).join("|")]);
+
+  // Track whether user has manually scrolled up
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const handleScroll = () => {
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      userScrolledUpRef.current = distanceFromBottom > 80;
+    };
+    el.addEventListener("scroll", handleScroll, { passive: true });
+    return () => el.removeEventListener("scroll", handleScroll);
+  }, []);
 
   // Handle Escape key
   useEffect(() => {
@@ -1626,7 +1846,7 @@ function ThinkingPanel({
                 {/* Load more button if there are hidden thoughts */}
                 {completedItems.length > visibleThoughtsLimit && (
                   <button
-                    onClick={() => setVisibleThoughtsLimit(prev => prev + LOAD_MORE_THOUGHTS)}
+                    onClick={loadMoreThoughts}
                     className="w-full py-1.5 px-3 text-[10px] text-white/40 hover:text-white/60 hover:bg-white/5 rounded-lg transition-colors flex items-center justify-center gap-1.5"
                   >
                     <ChevronUp className="w-3 h-3" />
@@ -1636,7 +1856,7 @@ function ThinkingPanel({
                     </span>
                   </button>
                 )}
-                {completedItems.slice(-visibleThoughtsLimit).map((item) => (
+                {visibleCompletedItems.map((item) => (
                   <ThinkingPanelItem key={item.id} item={item} isActive={false} basePath={basePath} />
                 ))}
                 {activeItems.length > 0 && (
@@ -1664,27 +1884,27 @@ function ThinkingPanel({
 }
 
 // Get icon for tool based on its name
-function getToolIcon(toolName: string) {
+function ToolIcon({ toolName, className }: { toolName: string; className?: string }) {
   const name = toolName.toLowerCase();
   if (name.includes("bash") || name.includes("shell") || name.includes("terminal") || name.includes("exec")) {
-    return Terminal;
+    return <Terminal className={className} />;
   }
   if (name.includes("read") || name.includes("file") || name.includes("write")) {
-    return FileText;
+    return <FileText className={className} />;
   }
   if (name.includes("search") || name.includes("grep") || name.includes("find")) {
-    return Search;
+    return <Search className={className} />;
   }
   if (name.includes("browser") || name.includes("web") || name.includes("http") || name.includes("url")) {
-    return Globe;
+    return <Globe className={className} />;
   }
   if (name.includes("code") || name.includes("edit") || name.includes("patch")) {
-    return Code;
+    return <Code className={className} />;
   }
   if (name.includes("list") || name.includes("dir") || name.includes("ls")) {
-    return FolderOpen;
+    return <FolderOpen className={className} />;
   }
-  return Wrench;
+  return <Wrench className={className} />;
 }
 
 // Format tool arguments for display
@@ -2144,7 +2364,6 @@ const ToolCallItem = memo(function ToolCallItem({
   const [expanded, setExpanded] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const isDone = item.result !== undefined;
-  const ToolIcon = getToolIcon(item.name);
 
   // Update elapsed time while tool is running
   useEffect(() => {
@@ -2241,6 +2460,7 @@ const ToolCallItem = memo(function ToolCallItem({
         )}
       >
         <ToolIcon
+          toolName={item.name}
           className={cn(
             "h-3 w-3",
             !isDone && "animate-pulse text-amber-400",
@@ -2421,6 +2641,384 @@ function CollapsedToolGroup({
   );
 }
 
+type ChatItemRowProps = {
+  item: GroupedItem;
+  highlighted: boolean;
+  workspaceId: string | undefined;
+  missionId: string | undefined;
+  basePath: string | undefined;
+  isToolGroupExpanded: boolean;
+  onToggleToolGroup: (groupId: string) => void;
+  onResume: () => void;
+  onToolResult: (
+    toolCallId: string,
+    name: string,
+    result: unknown
+  ) => Promise<void>;
+  onOptimisticToolResult: (toolCallId: string, result: unknown) => void;
+};
+
+/**
+ * Memoized row for the chat list. React.memo short-circuits when the
+ * row's props are shallow-equal — the common SSE-tick case, where only
+ * the tail of `items` is appended. Tool-group expansion is passed as a
+ * plain boolean per row so toggling one group doesn't invalidate any
+ * of the others.
+ */
+const ChatItemRow = memo(function ChatItemRow({
+  item,
+  highlighted,
+  workspaceId,
+  missionId,
+  basePath,
+  isToolGroupExpanded,
+  onToggleToolGroup,
+  onResume,
+  onToolResult,
+  onOptimisticToolResult,
+}: ChatItemRowProps) {
+  if (item.kind === "tool_group") {
+    return (
+      <div
+        id={`chat-item-${item.groupId}`}
+        data-chat-item-id={item.groupId}
+        className={cn(
+          "rounded-xl transition-colors",
+          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10"
+        )}
+      >
+        <CollapsedToolGroup
+          tools={item.tools}
+          isExpanded={isToolGroupExpanded}
+          onToggleExpand={() => onToggleToolGroup(item.groupId)}
+          workspaceId={workspaceId}
+          missionId={missionId}
+        />
+      </div>
+    );
+  }
+
+  if (item.kind === "user") {
+    return (
+      <div
+        id={`chat-item-${item.id}`}
+        data-chat-item-id={item.id}
+        className={cn(
+          "flex justify-end gap-3 group rounded-xl transition-colors",
+          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10"
+        )}
+      >
+        <CopyButton text={item.content} className="self-start mt-2" />
+        <div className="max-w-[80%]">
+          <div
+            className={cn(
+              "rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light",
+              item.queued
+                ? "border-2 border-dashed border-indigo-500/60 bg-indigo-500/20"
+                : "bg-indigo-500"
+            )}
+          >
+            <p className="whitespace-pre-wrap text-sm break-words">
+              {item.content}
+            </p>
+          </div>
+          <div className="mt-1 text-right flex items-center justify-end gap-2">
+            {item.queued === true && (
+              <span className="text-[10px] text-white/30">Queued</span>
+            )}
+            <span className="text-[10px] text-white/30">
+              {formatTime(item.timestamp)}
+            </span>
+          </div>
+        </div>
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.08]">
+          <User className="h-4 w-4 text-white/60" />
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === "assistant") {
+    const MessageStatusIcon = item.success ? CheckCircle : XCircle;
+    const displayModel = item.model
+      ? item.model.includes("/")
+        ? item.model.split("/").pop()
+        : item.model
+      : null;
+    return (
+      <div
+        id={`chat-item-${item.id}`}
+        data-chat-item-id={item.id}
+        className={cn(
+          "flex justify-start gap-3 group rounded-xl transition-colors",
+          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10"
+        )}
+      >
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+          <Bot className="h-4 w-4 text-indigo-400" />
+        </div>
+        <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+          <div className="mb-2 flex items-center gap-2 text-xs text-white/40">
+            <MessageStatusIcon
+              className={cn(
+                "h-3 w-3",
+                item.success ? "text-emerald-400" : "text-red-400"
+              )}
+            />
+            <span>{item.success ? "Turn complete" : "Failed"}</span>
+            {displayModel && (
+              <>
+                <span>•</span>
+                <span
+                  className="font-mono truncate max-w-[120px]"
+                  title={item.model ?? undefined}
+                >
+                  {displayModel}
+                </span>
+              </>
+            )}
+            <>
+              <span>•</span>
+              <span
+                className={
+                  item.costSource === "actual"
+                    ? "text-emerald-400"
+                    : item.costSource === "estimated"
+                      ? "text-amber-300"
+                      : "text-white/50"
+                }
+              >
+                {item.costSource === "unknown"
+                  ? item.costCents > 0
+                    ? `$${(item.costCents / 100).toFixed(4)}`
+                    : "N/A"
+                  : `$${(item.costCents / 100).toFixed(4)}`}
+              </span>
+              <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/60">
+                {item.costSource === "actual"
+                  ? "Actual"
+                  : item.costSource === "estimated"
+                    ? "Estimated"
+                    : "Unknown"}
+              </span>
+            </>
+            <span>•</span>
+            <span className="text-white/30">{formatTime(item.timestamp)}</span>
+          </div>
+          <MarkdownContent
+            content={item.content}
+            basePath={basePath}
+            workspaceId={workspaceId}
+            missionId={missionId}
+          />
+          {item.sharedFiles && item.sharedFiles.length > 0 && (
+            <div className="mt-2">
+              {item.sharedFiles.map((file, idx) => (
+                <SharedFileCard key={`${file.url}-${idx}`} file={file} />
+              ))}
+            </div>
+          )}
+          {!item.success && item.resumable && (
+            <div className="mt-3 flex gap-2">
+              <button
+                onClick={onResume}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded-lg transition-colors"
+              >
+                <RotateCcw className="h-3 w-3" />
+                Resume Mission
+              </button>
+            </div>
+          )}
+        </div>
+        <CopyButton text={item.content} className="self-start mt-8" />
+      </div>
+    );
+  }
+
+  if (item.kind === "phase") {
+    return <PhaseItem item={item} />;
+  }
+
+  if (item.kind === "thinking_group") {
+    return (
+      <ThinkingGroupItem
+        items={item.thoughts}
+        basePath={basePath}
+        workspaceId={workspaceId}
+        missionId={missionId}
+      />
+    );
+  }
+
+  if (item.kind === "thinking" || item.kind === "stream") {
+    return (
+      <ThinkingGroupItem
+        items={[item]}
+        basePath={basePath}
+        workspaceId={workspaceId}
+        missionId={missionId}
+      />
+    );
+  }
+
+  if (item.kind === "tool") {
+    if (item.isUiTool) {
+      if (item.name === "question" || item.name === "AskUserQuestion") {
+        return (
+          <QuestionToolItem
+            item={item}
+            onSubmit={async (toolCallId, answers) => {
+              onOptimisticToolResult(toolCallId, { answers });
+              await onToolResult(toolCallId, item.name, { answers });
+            }}
+          />
+        );
+      }
+      if (item.name === "ui_optionList") {
+        const toolCallId = item.toolCallId;
+        const rawArgs: Record<string, unknown> = isRecord(item.args)
+          ? item.args
+          : {};
+
+        let optionList: ReturnType<
+          typeof parseSerializableOptionList
+        > | null = null;
+        let parseErr: string | null = null;
+        try {
+          optionList = parseSerializableOptionList({
+            ...rawArgs,
+            id:
+              typeof rawArgs["id"] === "string" && rawArgs["id"]
+                ? (rawArgs["id"] as string)
+                : `option-list-${toolCallId}`,
+          });
+        } catch (e) {
+          parseErr =
+            e instanceof Error ? e.message : "Invalid option list payload";
+        }
+
+        const confirmed = item.result as OptionListSelection | undefined;
+
+        return (
+          <div className="flex justify-start gap-3">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+              <Bot className="h-4 w-4 text-indigo-400" />
+            </div>
+            <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+              <div className="mb-2 text-xs text-white/40">
+                Tool:{" "}
+                <span className="font-mono text-indigo-400">{item.name}</span>
+              </div>
+
+              {parseErr || !optionList ? (
+                <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
+                  {parseErr ?? "Failed to render OptionList"}
+                </div>
+              ) : (
+                <OptionListErrorBoundary>
+                  <OptionList
+                    {...optionList}
+                    value={undefined}
+                    confirmed={confirmed}
+                    onConfirm={async (selection) => {
+                      onOptimisticToolResult(toolCallId, selection);
+                      await onToolResult(toolCallId, item.name, selection);
+                    }}
+                    onCancel={async () => {
+                      onOptimisticToolResult(toolCallId, null);
+                      await onToolResult(toolCallId, item.name, null);
+                    }}
+                  />
+                </OptionListErrorBoundary>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      if (item.name === "ui_dataTable") {
+        const rawArgs: Record<string, unknown> = isRecord(item.args)
+          ? item.args
+          : {};
+        const dataTable = parseSerializableDataTable(rawArgs);
+
+        return (
+          <div className="flex justify-start gap-3">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+              <Bot className="h-4 w-4 text-indigo-400" />
+            </div>
+            <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+              <div className="mb-2 text-xs text-white/40">
+                Tool:{" "}
+                <span className="font-mono text-indigo-400">{item.name}</span>
+              </div>
+              {dataTable ? (
+                <DataTable
+                  id={dataTable.id}
+                  title={dataTable.title}
+                  columns={dataTable.columns}
+                  rows={dataTable.rows}
+                />
+              ) : (
+                <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
+                  Failed to render DataTable
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <ToolCallItem
+          item={item}
+          highlighted={highlighted}
+          workspaceId={workspaceId}
+          missionId={missionId}
+        />
+      );
+    }
+
+    if (isSubagentTool(item.name)) {
+      return <SubagentToolItem item={item} highlighted={highlighted} />;
+    }
+
+    return (
+      <ToolCallItem
+        item={item}
+        highlighted={highlighted}
+        workspaceId={workspaceId}
+        missionId={missionId}
+      />
+    );
+  }
+
+  // system
+  return (
+    <div className="flex justify-start gap-3">
+      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.04]">
+        <Ban className="h-4 w-4 text-white/40" />
+      </div>
+      <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.02] border border-white/[0.04] px-4 py-3">
+        <p className="whitespace-pre-wrap text-sm text-white/60 break-words">
+          {item.content}
+        </p>
+        {item.resumable && (
+          <div className="mt-3 flex gap-2">
+            <button
+              onClick={onResume}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded-lg transition-colors"
+            >
+              <RotateCcw className="h-3 w-3" />
+              Resume Mission
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
 // Attachment preview component
 function AttachmentPreview({
   file,
@@ -2479,6 +3077,59 @@ export default function ControlClient() {
   const INITIAL_VISIBLE_ITEMS = 30;
   const LOAD_MORE_INCREMENT = 30;
   const [visibleItemsLimit, setVisibleItemsLimit] = useState(INITIAL_VISIBLE_ITEMS);
+
+  // Memory pressure safety valve. Long-running missions (25k+ events, each
+  // with large tool_result payloads) have crashed the Brave/Chrome tab with
+  // "Can't open this page / Error code: 5" — a renderer OOM. The per-mission
+  // 5k event cap on the initial fetch isn't enough on its own because each
+  // tool_result can carry 100 KB+ of bash output. When `MissionDebugStats`
+  // reports a heap above ~1.2 GB, we trim `items` down to the most recent
+  // slice so the tab recovers instead of the user losing the whole session.
+  //
+  // Thresholds tuned against the observed crash profile (~1.5 GB heap before
+  // renderer exit): shed at 1.2 GB, keep the last 1500 items, and log so it's
+  // obvious in DevTools that trimming happened. Below-threshold ticks don't
+  // touch state at all.
+  useEffect(() => {
+    const SHED_HEAP_BYTES = 1_200_000_000;
+    const KEEP_TAIL_ITEMS = 1500;
+    function onStats(ev: Event) {
+      const detail = (ev as CustomEvent).detail as
+        | { heap?: { usedJSHeapSize?: number }; itemsCount?: number }
+        | undefined;
+      const used = detail?.heap?.usedJSHeapSize ?? 0;
+      if (used < SHED_HEAP_BYTES) return;
+      setItems((prev) => {
+        if (prev.length <= KEEP_TAIL_ITEMS) return prev;
+        console.warn(
+          `[mission-debug] heap ${(used / 1_048_576).toFixed(0)} MB exceeded ` +
+            `${SHED_HEAP_BYTES / 1_048_576} MB — trimming items ` +
+            `${prev.length} → ${KEEP_TAIL_ITEMS}`
+        );
+        return prev.slice(-KEEP_TAIL_ITEMS);
+      });
+      // Also trim every per-mission cache entry that exceeds the
+      // threshold, not just the one whose live `items` we just
+      // trimmed. The cache can be larger than current `items` from a
+      // prior snapshot (e.g. after a mission switch), so this must
+      // not depend on whether the live trim happened.
+      setMissionItems((prev) => {
+        let changed = false;
+        const next: Record<string, ChatItem[]> = {};
+        for (const [id, cached] of Object.entries(prev)) {
+          if (cached.length > KEEP_TAIL_ITEMS) {
+            next[id] = cached.slice(-KEEP_TAIL_ITEMS);
+            changed = true;
+          } else {
+            next[id] = cached;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }
+    window.addEventListener("mission-debug-stats", onStats);
+    return () => window.removeEventListener("mission-debug-stats", onStats);
+  }, []);
 
   // Connection state for SSE stream - starts as disconnected until first event received
   const [connectionState, setConnectionState] = useState<
@@ -2642,129 +3293,74 @@ export default function ControlClient() {
     ],
     []
   );
+  /**
+   * Per-mission high-water mark for `sequence`. When non-zero, reload
+   * paths pass it as `since_seq` to `/events` so the server returns
+   * only the tail that arrived while we were disconnected, not the
+   * whole history. The backend's own `sequence` column is monotonic
+   * per-mission (see mission_store/sqlite.rs), so a simple ordered
+   * compare is enough.
+   */
+  const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
+
   const loadHistoryEvents = useCallback(
-    async (id: string) => {
-      const PAGE_LIMIT = 1000;
+    async (id: string, opts?: { sinceSeq?: number }) => {
       const MAX_EVENTS = 5000;
-      const MAX_PAGES = 20;
 
-      // For very long missions (25k+ events), loading everything crashes the
-      // browser (Chrome Error code 11 / out-of-memory). We probe the total
-      // event count first and only load the most recent MAX_EVENTS events.
-      let startOffset = 0;
-      const firstPage = await getMissionEvents(id, {
+      if (opts?.sinceSeq !== undefined) {
+        // Delta load — used on reconnect/visibility/periodic sync.
+        // The server returns events with sequence > sinceSeq already
+        // ordered ASC, so we don't need to re-sort client-side.
+        //
+        // If the server does NOT support `since_seq` (older backend),
+        // it silently ignores the param and returns events from
+        // offset=0, which would pollute the tail with stale oldest-
+        // events. `X-Max-Sequence` is only set by backends that
+        // support delta reload — if it's missing, we clear the ref
+        // so callers fall back to full reload next time.
+        const { events, meta } = await getMissionEventsWithMeta(id, {
+          types: HISTORY_EVENT_TYPES,
+          sinceSeq: opts.sinceSeq,
+          limit: MAX_EVENTS,
+        });
+        if (meta.maxSequence === undefined) {
+          missionMaxSeqRef.current.delete(id);
+          return [];
+        }
+        // If the page was capped by `limit`, advance the cursor to the
+        // last returned event's sequence instead of `meta.maxSequence` —
+        // otherwise the next poll would skip every event between the
+        // returned tail and the true max.
+        const lastSeq =
+          events.length > 0 ? events[events.length - 1].sequence : opts.sinceSeq;
+        const cursor =
+          events.length >= MAX_EVENTS && lastSeq < meta.maxSequence
+            ? lastSeq
+            : meta.maxSequence;
+        missionMaxSeqRef.current.set(id, cursor);
+        return events;
+      }
+
+      // Initial load — request the most recent MAX_EVENTS events.
+      // `latest=true` lets the server compute the tail offset in one
+      // shot, so clients no longer need the binary-search probe loop
+      // to handle 25k+ event missions.
+      const { events, meta } = await getMissionEventsWithMeta(id, {
         types: HISTORY_EVENT_TYPES,
-        limit: PAGE_LIMIT,
-        offset: 0,
+        latest: true,
+        limit: MAX_EVENTS,
       });
-      if (!Array.isArray(firstPage) || firstPage.length === 0) return [];
-
-      if (firstPage.length === PAGE_LIMIT) {
-        // There may be more than one page — check if total exceeds MAX_EVENTS
-        const probe = await getMissionEvents(id, {
-          types: HISTORY_EVENT_TYPES,
-          limit: 1,
-          offset: MAX_EVENTS,
-        });
-        if (Array.isArray(probe) && probe.length > 0) {
-          // Total exceeds MAX_EVENTS. Binary-search for the end to compute
-          // a starting offset so we load only the tail.
-          let lo = MAX_EVENTS;
-          let hi = MAX_EVENTS * 4;
-          // Find upper bound where no events exist
-          for (let i = 0; i < 10; i++) {
-            const p = await getMissionEvents(id, {
-              types: HISTORY_EVENT_TYPES,
-              limit: 1,
-              offset: hi,
-            });
-            if (!Array.isArray(p) || p.length === 0) break;
-            lo = hi;
-            hi *= 2;
-          }
-          // Verify hi is actually an upper bound (no events at this offset).
-          // The doubling loop may have exited due to iteration limit.
-          {
-            const p = await getMissionEvents(id, {
-              types: HISTORY_EVENT_TYPES,
-              limit: 1,
-              offset: hi,
-            });
-            if (Array.isArray(p) && p.length > 0) {
-              // hi is not a true upper bound — can't determine total precisely.
-              // Fall back: just load the last MAX_EVENTS from hi as best-effort.
-              startOffset = Math.max(0, hi - MAX_EVENTS);
-            }
-          }
-          // Narrow down to find the precise total
-          if (startOffset === 0) {
-            for (let i = 0; i < 20; i++) {
-              if (hi - lo <= 1) break;
-              const mid = Math.floor((lo + hi) / 2);
-              const p = await getMissionEvents(id, {
-                types: HISTORY_EVENT_TYPES,
-                limit: 1,
-                offset: mid,
-              });
-              if (Array.isArray(p) && p.length > 0) {
-                lo = mid;
-              } else {
-                hi = mid;
-              }
-            }
-            // lo is the last offset with an event, hi is the first without.
-            // Total event count ≈ hi. Load the most recent MAX_EVENTS.
-            startOffset = Math.max(0, hi - MAX_EVENTS);
-          }
-        }
+      // Only seed `missionMaxSeqRef` when the server has confirmed it
+      // supports the resume protocol via `X-Max-Sequence`. Seeding from
+      // `event.sequence` alone would enable the delta path against old
+      // backends that ignore `since_seq`, causing them to return
+      // offset=0 rows that'd get appended as bogus "new" events.
+      if (meta.maxSequence !== undefined && meta.maxSequence > 0) {
+        missionMaxSeqRef.current.set(id, meta.maxSequence);
       }
-
-      const all: StoredEvent[] = [];
-      const seenIds = new Set<number>();
-
-      // If startOffset is 0, reuse the first page we already fetched
-      if (startOffset === 0) {
-        for (const event of firstPage) {
-          if (!seenIds.has(event.id)) {
-            seenIds.add(event.id);
-            all.push(event);
-          }
-        }
-      }
-
-      let offset = startOffset === 0 ? firstPage.length : startOffset;
-      const pageStart = startOffset === 0 ? 1 : 0; // skip page 0 if reused
-      for (let page = pageStart; page < MAX_PAGES; page += 1) {
-        const batch = await getMissionEvents(id, {
-          types: HISTORY_EVENT_TYPES,
-          limit: PAGE_LIMIT,
-          offset,
-        });
-        if (!Array.isArray(batch) || batch.length === 0) break;
-
-        let newCount = 0;
-        for (const event of batch) {
-          if (seenIds.has(event.id)) continue;
-          seenIds.add(event.id);
-          all.push(event);
-          newCount += 1;
-        }
-
-        if (batch.length < PAGE_LIMIT) break;
-        if (newCount === 0) break;
-        if (all.length >= MAX_EVENTS) break;
-        offset += batch.length;
-      }
-
-      all.sort((a, b) => {
-        if (a.sequence !== b.sequence) return a.sequence - b.sequence;
-        const ta = new Date(a.timestamp).getTime();
-        const tb = new Date(b.timestamp).getTime();
-        if (ta !== tb) return ta - tb;
-        return a.id - b.id;
-      });
-
-      return all;
+      // Defensive: sort by sequence ASC in case upstream contract changes.
+      const sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
+      return sorted;
     },
     [HISTORY_EVENT_TYPES]
   );
@@ -2772,81 +3368,21 @@ export default function ControlClient() {
   // Tool groups expansion state - tracks which groups are expanded by their first tool's id
   const [expandedToolGroups, setExpandedToolGroups] = useState<Set<string>>(new Set());
 
-  const dedupedItems = useMemo(() => {
-    if (items.length <= 1) return items;
-    const seen = new Set<string>();
-    const out: ChatItem[] = [];
-    for (let i = items.length - 1; i >= 0; i--) {
-      const item = items[i];
-      if (seen.has(item.id)) continue;
-      seen.add(item.id);
-      out.push(item);
-    }
-    return out.reverse();
-  }, [items]);
-
-  const displayItems = useMemo(() => {
-    if (!dedupedItems.some((item) => item.kind === "user" && item.queued)) {
-      return dedupedItems;
-    }
-    const queued: ChatItem[] = [];
-    const normal: ChatItem[] = [];
-    for (const item of dedupedItems) {
-      if (item.kind === "user" && item.queued) {
-        queued.push(item);
-      } else {
-        normal.push(item);
-      }
-    }
-    return [...normal, ...queued];
-  }, [dedupedItems]);
-
-  const lastNonQueuedItem = useMemo(() => {
-    for (let i = displayItems.length - 1; i >= 0; i--) {
-      const item = displayItems[i];
-      if (!(item.kind === "user" && item.queued)) {
-        return item;
-      }
-    }
-    return displayItems[displayItems.length - 1];
-  }, [displayItems]);
-
-  // Queued messages should render only in the QueueStrip above the input.
-  // When a queued message is dequeued (queued=false), it will appear in chat normally.
-  const chatDisplayItems = useMemo(
-    () => displayItems.filter((it) => !(it.kind === "user" && it.queued === true)),
-    [displayItems]
-  );
-
-  // Extract thinking + streaming items for the side panel.
-  const thinkingItems = useMemo(
-    () =>
-      dedupedItems.filter(
-        (it): it is SidePanelItem =>
-          it.kind === "thinking" || it.kind === "stream"
-      ),
-    [dedupedItems]
-  );
-
-  // Deduplicated count for display (same logic as ThinkingPanel)
-  const thinkingItemsCount = useMemo(() => {
-    const activeCount = thinkingItems.filter((t) => !t.done).length;
-    const seen = new Set<string>();
-    let completedCount = 0;
-    for (const t of thinkingItems) {
-      if (!t.done) continue;
-      const trimmed = t.content.trim();
-      if (!trimmed || seen.has(trimmed)) continue;
-      seen.add(trimmed);
-      completedCount++;
-    }
-    return completedCount + activeCount;
-  }, [thinkingItems]);
-
-  // Check if there's active thinking happening
-  const hasActiveThinking = useMemo(() =>
-    thinkingItems.some(t => !t.done),
-    [thinkingItems]
+  // Single O(n) pass derives every downstream view. Replaces 7 separate
+  // `useMemo` hooks that each looped over `items` (see `deriveItemViews`
+  // for the rationale).
+  const {
+    dedupedItems,
+    displayItems,
+    chatDisplayItems,
+    lastNonQueuedItem,
+    thinkingItems,
+    thinkingItemsCount,
+    hasActiveThinking,
+    groupedItems,
+  } = useMemo(
+    () => deriveItemViews(items, showThinkingPanel),
+    [items, showThinkingPanel]
   );
 
   // Auto-show thinking panel when thinking starts (only on transition to active)
@@ -2875,79 +3411,9 @@ export default function ControlClient() {
     setThinkingPanelManuallyHidden(false);
   }, [viewingMissionId]);
 
-  // Group consecutive tool items and thinking items for collapsed display
-  // Returns array of: original items OR { kind: "tool_group", tools: [...] } OR { kind: "thinking_group", thoughts: [...] }
-  type ToolGroup = {
-    kind: "tool_group";
-    groupId: string;
-    tools: Extract<ChatItem, { kind: "tool" }>[];
-  };
-  type ThinkingGroup = {
-    kind: "thinking_group";
-    groupId: string;
-    thoughts: SidePanelItem[];
-  };
-  type GroupedItem = ChatItem | ToolGroup | ThinkingGroup;
-
-  const groupedItems = useMemo((): GroupedItem[] => {
-    const result: GroupedItem[] = [];
-    let currentToolGroup: Extract<ChatItem, { kind: "tool" }>[] = [];
-    let currentThinkingGroup: SidePanelItem[] = [];
-
-    const flushToolGroup = () => {
-      if (currentToolGroup.length === 0) return;
-      if (currentToolGroup.length === 1) {
-        result.push(currentToolGroup[0]);
-      } else {
-        result.push({
-          kind: "tool_group",
-          groupId: currentToolGroup[0].id,
-          tools: currentToolGroup,
-        });
-      }
-      currentToolGroup = [];
-    };
-
-    const flushThinkingGroup = () => {
-      if (currentThinkingGroup.length === 0) return;
-      // Always create a group for thinking items (even for single items)
-      // This ensures consistent rendering through ThinkingGroupItem
-      result.push({
-        kind: "thinking_group",
-        groupId: currentThinkingGroup[0].id,
-        thoughts: currentThinkingGroup,
-      });
-      currentThinkingGroup = [];
-    };
-
-    for (const item of chatDisplayItems) {
-      if (item.kind === "tool" && !item.isUiTool) {
-        // Non-UI tool - flush thinking first, then add to tool group
-        flushThinkingGroup();
-        currentToolGroup.push(item);
-      } else if (item.kind === "thinking" || item.kind === "stream") {
-        if (showThinkingPanel) {
-          // When thinking panel is open, skip all thinking items entirely
-          // (they're shown in the side panel)
-          flushThinkingGroup();
-        } else {
-          // Add to thinking group
-          flushToolGroup();
-          currentThinkingGroup.push(item);
-        }
-      } else {
-        // Other item - flush any pending groups first
-        flushToolGroup();
-        flushThinkingGroup();
-        result.push(item);
-      }
-    }
-    // Flush any remaining groups
-    flushToolGroup();
-    flushThinkingGroup();
-
-    return result;
-  }, [chatDisplayItems, showThinkingPanel]);
+  // `groupedItems`, `thinkingItems`, etc. are all produced in the single
+  // `deriveItemViews` pass above. The old per-view `useMemo` hooks used
+  // to live here and have been removed.
 
   const runningMissionById = useMemo(() => {
     return new Map(runningMissions.map((m) => [m.mission_id, m]));
@@ -3020,8 +3486,20 @@ export default function ControlClient() {
     if (!viewingMissionId) return null;
     if (!viewingRunningInfo) return null;
     if (viewingRunningInfo.health?.status !== "stalled") return null;
+    // Suppress the stall banner only when the mission is in a truly
+    // terminal DB state (completed/failed/not_feasible). The backend's
+    // in-memory running-list can lag behind the DB (e.g. stale-cleanup
+    // marked the mission Completed but the orphan runner task never
+    // resolved), and nagging the user about a mission that's actually
+    // done is worse than missing a genuine stall. Interrupted/blocked
+    // are *not* terminal — they need user action — so a mission
+    // stalled in one of those states should keep showing the banner.
+    const status = viewingMission?.status;
+    if (status && isFinishedStatus(status)) {
+      return null;
+    }
     return viewingRunningInfo.health;
-  }, [viewingMissionId, viewingRunningInfo]);
+  }, [viewingMissionId, viewingRunningInfo, viewingMission?.status]);
 
   const hasPendingQuestion = useMemo(() => {
     // Find the index of the last user message — any question before it is
@@ -3060,6 +3538,7 @@ export default function ControlClient() {
 
   // Treat "waiting_for_tool" as not busy for message input (user should respond immediately)
   const isBusy = viewingRunState === "running";
+  const canSubmitComposer = canSubmitInput || input.trim().length > 0;
 
   const streamCleanupRef = useRef<null | (() => void)>(null);
   const enhancedInputRef = useRef<EnhancedInputHandle>(null);
@@ -4066,22 +4545,21 @@ export default function ControlClient() {
     setLastMissionId((prev) => (prev === id ? prev : id));
   }, [viewingMission?.id, currentMission?.id, setLastMissionId]);
 
-  // Poll for running parallel missions
-  useEffect(() => {
-    const pollRunning = async () => {
-      try {
-        const running = await getRunningMissions();
-        setRunningMissions(running);
-      } catch {
-        // Ignore errors
-      }
-    };
-
-    // Poll immediately and then every 3 seconds
-    pollRunning();
-    const interval = setInterval(pollRunning, 3000);
-    return () => clearInterval(interval);
+  // Fetch running parallel missions. Primary refresh path is now
+  // event-driven (see the `mission_status_changed` handler further
+  // down), but a slow visibility-gated interval keeps the list
+  // eventually-consistent in case we miss a state change (SSE lag,
+  // out-of-band cancel, etc.).
+  const refreshRunningMissions = useCallback(async () => {
+    try {
+      const running = await getRunningMissions();
+      setRunningMissions(running);
+    } catch {
+      // Ignore errors — next event or tick will retry.
+    }
   }, []);
+
+  useVisibilityPolling(refreshRunningMissions, { interval: 15_000 });
 
   const refreshRecentMissions = useCallback(async () => {
     try {
@@ -4179,12 +4657,11 @@ export default function ControlClient() {
     });
   }, []);
 
-  // Refresh recent missions periodically (after the callback is defined)
-  useEffect(() => {
-    refreshRecentMissions();
-    const interval = setInterval(refreshRecentMissions, 10000);
-    return () => clearInterval(interval);
-  }, [refreshRecentMissions]);
+  // Refresh recent missions periodically (after the callback is defined).
+  // Paused when the tab is hidden — there's nothing to update on screen
+  // and backgrounded tabs don't need to keep the list warm. Event-driven
+  // refresh on `mission_status_changed` keeps it live when visible.
+  useVisibilityPolling(refreshRecentMissions, { interval: 30_000 });
 
   // Fetch desktop sessions periodically for the enhanced dropdown
   const refreshDesktopSessions = useCallback(async () => {
@@ -4241,18 +4718,18 @@ export default function ControlClient() {
     }
   }, [hasDesktopSession, desktopDisplayId]);
 
+  useVisibilityPolling(refreshDesktopSessions, { interval: 30_000 });
+  // Tear down the rapid-poll interval (used while waiting for an
+  // expected desktop session to attach) on unmount, separate from the
+  // main visibility-gated poller above.
   useEffect(() => {
-    refreshDesktopSessions();
-    const interval = setInterval(refreshDesktopSessions, 10000);
     return () => {
-      clearInterval(interval);
-      // Also clean up rapid polling interval
       if (desktopRapidPollRef.current) {
         clearInterval(desktopRapidPollRef.current);
         desktopRapidPollRef.current = null;
       }
     };
-  }, [refreshDesktopSessions]);
+  }, []);
 
   // Handle closing a desktop session
   const handleCloseDesktopSession = useCallback(async (display: string) => {
@@ -4567,6 +5044,20 @@ export default function ControlClient() {
 
   const focusChatItem = useCallback(
     (itemId: string, entryIndex?: number) => {
+      // If the target sits inside a collapsed tool_group, the inner
+      // tool rows aren't in the DOM yet — expand the enclosing group
+      // so scrollIntoView has something to hit.
+      const enclosingGroup = groupedItems.find(
+        (g) => g.kind === "tool_group" && g.tools.some((t) => t.id === itemId)
+      );
+      if (enclosingGroup && enclosingGroup.kind === "tool_group") {
+        setExpandedToolGroups((prev) => {
+          if (prev.has(enclosingGroup.groupId)) return prev;
+          const next = new Set(prev);
+          next.add(enclosingGroup.groupId);
+          return next;
+        });
+      }
       let requiredVisible = groupedItems.length;
       if (typeof entryIndex === "number" && entryIndex >= 0) {
         let historyIndex = 0;
@@ -4728,8 +5219,8 @@ export default function ControlClient() {
     workspaceId?: string;
     agent?: string;
     modelOverride?: string;
-    modelEffort?: "low" | "medium" | "high";
-    configProfile?: string;
+    modelEffort?: ModelEffort;
+    configProfile?: string | null;
     backend?: string;
     openInNewTab?: boolean;
   }) => {
@@ -4740,7 +5231,7 @@ export default function ControlClient() {
         agent: options?.agent,
         modelOverride: options?.modelOverride,
         modelEffort: options?.modelEffort,
-        configProfile: options?.configProfile,
+        configProfile: options?.configProfile ?? undefined,
         backend: options?.backend,
       });
 
@@ -4766,6 +5257,58 @@ export default function ControlClient() {
       console.error("Failed to create mission:", err);
       toast.error(err instanceof Error ? err.message : "Failed to create new mission");
       throw err; // Re-throw so dialog knows creation failed
+    } finally {
+      setMissionLoading(false);
+    }
+  };
+
+  const handleUpdateMissionSettings = async (options?: {
+    workspaceId?: string;
+    agent?: string;
+    modelOverride?: string;
+    modelEffort?: ModelEffort;
+    configProfile?: string | null;
+    backend?: string;
+    openInNewTab?: boolean;
+  }) => {
+    const mission = viewingMission ?? currentMission;
+    if (!mission) {
+      throw new Error("No mission selected");
+    }
+    try {
+      setMissionLoading(true);
+      const updated = await updateMissionSettings(mission.id, {
+        backend: options?.backend,
+        agent: options?.agent ?? null,
+        modelOverride: options?.modelOverride ?? null,
+        modelEffort: options?.modelEffort ?? null,
+        configProfile: options?.configProfile ?? null,
+      });
+
+      if (currentMission?.id === updated.id) {
+        setCurrentMission(updated);
+      }
+      if (viewingMission?.id === updated.id) {
+        setViewingMission(updated);
+      }
+      setRecentMissions((prev) => {
+        let changed = false;
+        const next = prev.map((item) => {
+          if (item.id !== updated.id) return item;
+          changed = true;
+          return { ...item, ...updated };
+        });
+        return changed
+          ? [...next].sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+          : prev;
+      });
+      refreshRecentMissions();
+      toast.success("Mission run settings updated");
+      return { id: updated.id };
+    } catch (err) {
+      console.error("Failed to update mission settings:", err);
+      toast.error(err instanceof Error ? err.message : "Failed to update mission settings");
+      throw err;
     } finally {
       setMissionLoading(false);
     }
@@ -4862,6 +5405,55 @@ export default function ControlClient() {
     }
   };
 
+  // Stable handler refs for ChatItemRow. We keep `handleResumeMission`
+  // unstable (it captures a lot of scope) and bounce through a ref so
+  // the identity passed to memoized rows doesn't change each render.
+  const handleResumeMissionRef = useRef(handleResumeMission);
+  useEffect(() => {
+    handleResumeMissionRef.current = handleResumeMission;
+  });
+  const stableResumeMission = useCallback(() => {
+    void handleResumeMissionRef.current();
+  }, []);
+
+  const handleToggleToolGroup = useCallback((groupId: string) => {
+    startTransition(() => {
+      setExpandedToolGroups((prev) => {
+        const next = new Set(prev);
+        if (next.has(groupId)) {
+          next.delete(groupId);
+        } else {
+          next.add(groupId);
+        }
+        return next;
+      });
+    });
+  }, []);
+
+  const handleOptimisticToolResult = useCallback(
+    (toolCallId: string, result: unknown) => {
+      setItems((prev) =>
+        prev.map((it) =>
+          it.kind === "tool" && it.toolCallId === toolCallId
+            ? { ...it, result }
+            : it
+        )
+      );
+    },
+    []
+  );
+
+  const handleToolResultCommit = useCallback(
+    async (toolCallId: string, name: string, result: unknown) => {
+      await postControlToolResult({
+        tool_call_id: toolCallId,
+        name,
+        result,
+      });
+    },
+    []
+  );
+
   const handleOpenFailingToolCallById = useCallback(
     async (missionId: string) => {
       router.replace(`/control?mission=${missionId}&focus=failure`, { scroll: false });
@@ -4894,9 +5486,9 @@ export default function ControlClient() {
 
         const followUpMission = await createMission({
           workspaceId: sourceMission.workspace_id,
-          agent: sourceMission.agent,
-          modelOverride: sourceMission.model_override,
-          modelEffort: sourceMission.model_effort,
+          agent: sourceMission.agent || undefined,
+          modelOverride: sourceMission.model_override || undefined,
+          modelEffort: sourceMission.model_effort || undefined,
           backend: sourceMission.backend,
         });
 
@@ -5722,6 +6314,11 @@ export default function ControlClient() {
         const newStatus = String(data["status"] ?? "");
         const missionId = typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
 
+        // A mission starting/stopping changes the running-missions list.
+        // Fire-and-forget refresh so we don't have to rely on the 15 s
+        // background tick.
+        void refreshRunningMissions();
+
         // Always update mission status in state when it changes
         if (missionId) {
           setRecentMissions((prev) => {
@@ -5928,6 +6525,76 @@ export default function ControlClient() {
                   }
                 : prev
             );
+          }
+        }
+      }
+
+      if (event.type === "mission_settings_updated" && isRecord(data)) {
+        const missionId = typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+        if (missionId) {
+          const backend = typeof data["backend"] === "string" ? data["backend"] : undefined;
+          const agent =
+            data["agent"] === null
+              ? null
+              : typeof data["agent"] === "string"
+                ? data["agent"]
+                : undefined;
+          const modelOverride =
+            data["model_override"] === null
+              ? null
+              : typeof data["model_override"] === "string"
+                ? data["model_override"]
+                : undefined;
+          const modelEffort =
+            data["model_effort"] === null
+              ? null
+              : typeof data["model_effort"] === "string"
+                ? data["model_effort"]
+                : undefined;
+          const configProfile =
+            data["config_profile"] === null
+              ? null
+              : typeof data["config_profile"] === "string"
+                ? data["config_profile"]
+                : undefined;
+          const sessionId =
+            data["session_id"] === null
+              ? null
+              : typeof data["session_id"] === "string"
+                ? data["session_id"]
+                : undefined;
+          const updatedAt =
+            typeof data["updated_at"] === "string" ? data["updated_at"] : undefined;
+          const applySettings = (mission: Mission): Mission => ({
+            ...mission,
+            ...(backend !== undefined ? { backend } : {}),
+            ...(agent !== undefined ? { agent } : {}),
+            ...(modelOverride !== undefined ? { model_override: modelOverride } : {}),
+            ...(modelEffort !== undefined ? { model_effort: modelEffort as ModelEffort | null } : {}),
+            ...(configProfile !== undefined ? { config_profile: configProfile } : {}),
+            ...(sessionId !== undefined ? { session_id: sessionId } : {}),
+            ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
+            resumable: false,
+          });
+
+          setRecentMissions((prev) => {
+            let changed = false;
+            const next = prev.map((mission) => {
+              if (mission.id !== missionId) return mission;
+              changed = true;
+              return applySettings(mission);
+            });
+            return changed && updatedAt !== undefined
+              ? [...next].sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+              : changed
+                ? next
+                : prev;
+          });
+          if (currentMissionRef.current?.id === missionId) {
+            setCurrentMission((prev) => (prev ? applySettings(prev) : prev));
+          }
+          if (viewingMissionRef.current?.id === missionId) {
+            setViewingMission((prev) => (prev ? applySettings(prev) : prev));
           }
         }
       }
@@ -6146,7 +6813,8 @@ export default function ControlClient() {
   // Handler for EnhancedInput that takes a payload with content and optional agent
   const handleEnhancedSubmit = useCallback(async (payload: SubmitPayload) => {
     const { content, agent } = payload;
-    if (!content.trim()) return;
+    const trimmedContent = content.trim();
+    if (!trimmedContent) return;
 
     // Guard against double-submission (e.g., double-click, React StrictMode)
     if (submittingRef.current) {
@@ -6157,7 +6825,10 @@ export default function ControlClient() {
 
     const targetMissionId = viewingMissionIdRef.current;
 
-    // Sync mission state before sending (backend needs current_mission set correctly)
+    // Sync mission state before sending (backend needs current_mission set correctly).
+    // Mission-sync error paths below return early BEFORE we call
+    // `enhancedInputRef.current?.clear()`, so the user's typed draft
+    // stays intact and doesn't need to be explicitly restored.
     if (targetMissionId) {
       try {
         let mission = await loadMission(targetMissionId);
@@ -6192,31 +6863,31 @@ export default function ControlClient() {
       }
     }
 
-    setInput("");
-    setDraftInput("");
-
     const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const timestamp = Date.now();
     const hasExistingUserMessages = items.some((item) => item.kind === "user");
     const willBeQueued = isBusy && hasExistingUserMessages;
 
-    // Use raw content for optimistic message (not prefixed with agent)
-    // This ensures content matches what SSE echoes back, preventing duplicate messages
-    // when SSE arrives before API response and needs to dedupe by content
+    // Use trimmed content for optimistic message (not prefixed with agent)
+    // so it matches exactly what the backend stores and SSE echoes back,
+    // preventing duplicate messages when SSE arrives before the API response
     setItems((prev) => [
       ...prev,
       {
         kind: "user" as const,
         id: tempId,
-        content,
+        content: trimmedContent,
         timestamp,
         queued: willBeQueued,
       },
     ]);
+    enhancedInputRef.current?.clear();
+    setInput("");
+    setDraftInput("");
 
     try {
       // Send message with mission_id - backend handles routing (main vs parallel)
-      const { id, queued } = await postControlMessage(content, {
+      const { id, queued } = await postControlMessage(trimmedContent, {
         agent: agent || undefined,
         mission_id: targetMissionId || undefined,
       });
@@ -6238,6 +6909,15 @@ export default function ControlClient() {
     } catch (err) {
       console.error(err);
       setItems((prev) => prev.filter((item) => item.id !== tempId));
+      // Restore via the imperative handle so a locked-agent badge is
+      // reinstated instead of surfacing as a raw "@agent " prefix.
+      // Use `trimmedContent` — it's what the optimistic item and the
+      // failed API call carried, so the restored draft matches what
+      // the user actually sent. Leading/trailing whitespace in
+      // `content` is intentionally dropped here.
+      enhancedInputRef.current?.restoreDraft(trimmedContent, agent ?? null);
+      setInput(trimmedContent);
+      setDraftInput(trimmedContent);
       toast.error("Failed to send message");
     } finally {
       submittingRef.current = false;
@@ -6283,17 +6963,147 @@ export default function ControlClient() {
     }
   }, []);
 
-  // Reload full mission history from API (events + queue). Used for visibility
-  // change, periodic sync, and SSE reconnect catch-up.
+  // Reload mission history from the API. Used for visibility change,
+  // periodic sync, and SSE reconnect catch-up.
+  //
+  // Fast path: when we know our per-mission max `sequence`, we ask for
+  // `since_seq=N` and get back only the events we missed — typically a
+  // handful per 15s tick. We merge those into the existing items state
+  // in place instead of rebuilding it from scratch, so React only has
+  // to re-render appended rows.
+  //
+  // Slow path: first visit or missing seq — fall back to the old
+  // full-rebuild flow (last MAX_EVENTS events, recompute everything).
   const reloadMissionHistory = useCallback(
     async (missionId: string) => {
       try {
+        const knownSeq = missionMaxSeqRef.current.get(missionId) ?? 0;
+
+        if (knownSeq > 0) {
+          const [mission, deltaEvents, queuedMessages] = await Promise.all([
+            getMission(missionId),
+            loadHistoryEvents(missionId, { sinceSeq: knownSeq }).catch(() => null),
+            getQueue().catch(() => []),
+          ]);
+          if (viewingMissionIdRef.current !== missionId) return;
+
+          // The delta merge path is intentionally simple: it appends
+          // only items whose `id` is not already present. That's safe
+          // for purely additive event types (user_message,
+          // assistant_message of a finished turn, tool_call), but is
+          // wrong whenever the historical-derived item would need to
+          // *update* an existing live row instead of be appended:
+          //
+          //   1. `tool_result` whose matching `tool_call` arrived in a
+          //      prior tick — `eventsToItems` rebuilds `toolCallMap`
+          //      per pass, so the result has nothing to attach to and
+          //      a naive merge leaves the tool row stuck "running".
+          //   2. `thinking` / `text_delta` whose live counterpart in
+          //      `items` is the in-flight SSE row keyed off synthetic
+          //      ids (`text_delta_latest`, `thinking-…`). The
+          //      historical event materializes as `event-<id>` instead,
+          //      so the append path silently duplicates the row,
+          //      stale "active" thoughts pile up in the side panel,
+          //      and the live row's `done` flag never flips.
+          //   3. `assistant_message` whose live counterpart is the
+          //      same — the SSE-injected row gets shadowed by a
+          //      duplicate from history without its updated metadata.
+          //
+          // For (1) we have a structured signal (orphan tool_result).
+          // For (2)/(3) the cheapest correct thing is to fall through
+          // to the full reload whenever the delta touches an event
+          // type that we know lives in items under a synthetic id.
+          let needsFullReload = false;
+          if (deltaEvents && deltaEvents.length > 0) {
+            const deltaToolCallIds = new Set<string>();
+            for (const ev of deltaEvents) {
+              if (ev.event_type === "tool_call" && ev.tool_call_id) {
+                deltaToolCallIds.add(ev.tool_call_id);
+              }
+            }
+            const hasOrphanToolResult = deltaEvents.some(
+              (ev) =>
+                ev.event_type === "tool_result" &&
+                !!ev.tool_call_id &&
+                !deltaToolCallIds.has(ev.tool_call_id)
+            );
+            // Detect overlap with a live SSE row (case 2/3). We only
+            // care when an in-flight stream/thinking row is currently
+            // mounted; otherwise eventsToItems' `event-<id>` items can
+            // safely append.
+            const hasLiveStreamingRow = itemsRef.current.some(
+              (it) =>
+                (it.kind === "stream" && it.id === "text_delta_latest") ||
+                (it.kind === "thinking" && !it.done)
+            );
+            const deltaTouchesStreamingTypes = deltaEvents.some(
+              (ev) =>
+                ev.event_type === "thinking" ||
+                ev.event_type === "text_delta" ||
+                ev.event_type === "assistant_message"
+            );
+            needsFullReload =
+              hasOrphanToolResult ||
+              (hasLiveStreamingRow && deltaTouchesStreamingTypes);
+          }
+
+          if (!needsFullReload && deltaEvents && deltaEvents.length > 0) {
+            const deltaItems = eventsToItems(deltaEvents, mission);
+            setItems((prev) => {
+              const existingIds = new Set(prev.map((it) => it.id));
+              const additions = deltaItems.filter((it) => !existingIds.has(it.id));
+              if (additions.length === 0) return prev;
+              const merged = [...prev, ...additions];
+              adjustVisibleItemsLimit(merged);
+              updateMissionItems(missionId, merged);
+              return merged;
+            });
+            applyDesktopSessionFromEvents(deltaEvents);
+          }
+
+          // Queue reconciliation still needs every tick — a message
+          // could move from "queued" to "processing" with no new events.
+          const missionQueuedMessages = queuedMessages.filter(
+            (qm) => qm.mission_id === missionId
+          );
+          const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
+          setItems((prev) => {
+            let changed = false;
+            const next = prev.map((item) => {
+              if (item.kind !== "user") return item;
+              const shouldBeQueued = queuedIds.has(item.id);
+              if (!!item.queued === shouldBeQueued) return item;
+              changed = true;
+              return { ...item, queued: shouldBeQueued };
+            });
+            const existingIds = new Set(prev.map((it) => it.id));
+            const newQueued: ChatItem[] = missionQueuedMessages
+              .filter((qm) => !existingIds.has(qm.id))
+              .map((qm) => ({
+                kind: "user" as const,
+                id: qm.id,
+                content: qm.content,
+                timestamp: Date.now(),
+                agent: qm.agent ?? undefined,
+                queued: true,
+              }));
+            if (newQueued.length === 0 && !changed) return prev;
+            const merged = newQueued.length > 0 ? [...next, ...newQueued] : next;
+            updateMissionItems(missionId, merged);
+            return merged;
+          });
+          if (!needsFullReload) return;
+          // Orphan delta — clear the cursor and fall through to the
+          // full reload below so state reconstructs with full context.
+          missionMaxSeqRef.current.delete(missionId);
+        }
+
+        // Full reload fallback (first load or counter reset).
         const [mission, events, queuedMessages] = await Promise.all([
           getMission(missionId),
           loadHistoryEvents(missionId).catch(() => null),
           getQueue().catch(() => []),
         ]);
-        // Race guard: only apply if we're still viewing this mission
         if (viewingMissionIdRef.current !== missionId) return;
 
         let historyItems = events
@@ -6308,7 +7118,6 @@ export default function ControlClient() {
           }
         }
 
-        // Merge queued messages that belong to this mission
         const missionQueuedMessages = queuedMessages.filter(
           (qm) => qm.mission_id === missionId
         );
@@ -6442,14 +7251,48 @@ export default function ControlClient() {
     return recentMissions.filter((m) => m.parent_mission_id === activeMission.id);
   }, [activeMission, recentMissions]);
   const activeMissionRole = activeMission ? inferMissionRole(activeMission) : null;
-  const isBossMission = childMissions.length > 0 || activeMissionRole === "boss";
 
-  // Auto-show worker panel when viewing a boss mission with workers
+  // In-mission sub-agents (Claude Code `Task`, orchestrator MCP worker
+  // creators). These run inside the same harness process — not as
+  // separate missions with parent_mission_id — so the child-mission
+  // `WorkerPanel` can't represent them. We expose them through a
+  // lighter `SubagentsPanel` keyed off the current mission's own items.
+  const inMissionSubagents = useMemo<SubagentEntry[]>(() => {
+    const out: SubagentEntry[] = [];
+    for (const item of items) {
+      if (item.kind !== "tool") continue;
+      const name = item.name.toLowerCase();
+      const isOrchestratorWorker =
+        name.startsWith("mcp__orchestrator__create_worker") ||
+        name === "mcp__orchestrator__batch_create_workers" ||
+        name === "mcp__orchestrator__retask_worker";
+      if (!isSubagentTool(item.name) && !isOrchestratorWorker) continue;
+      out.push({
+        id: item.id,
+        toolCallId: item.toolCallId,
+        name: item.name,
+        args: item.args,
+        result: item.result,
+        startTime: item.startTime,
+        endTime: item.endTime,
+      });
+    }
+    return out;
+  }, [items]);
+
+  const hasInMissionSubagents = inMissionSubagents.length > 0;
+  const isBossMission =
+    childMissions.length > 0 ||
+    activeMissionRole === "boss" ||
+    hasInMissionSubagents;
+
+  // Auto-show the workers/sub-agents panel when the active mission
+  // first acquires workers or sub-agents.
   useEffect(() => {
-    if (childMissions.length > 0) {
+    if (childMissions.length > 0 || hasInMissionSubagents) {
       setShowWorkerPanel(true);
     }
-  }, [activeMission?.id, childMissions.length]);
+  }, [activeMission?.id, childMissions.length, hasInMissionSubagents]);
 
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
@@ -6474,6 +7317,12 @@ export default function ControlClient() {
 
   return (
     <div className="flex h-screen flex-col p-6">
+      {/* Always-on debug overlay so any OOM-style crash leaves a trail
+          we can reconstruct from sessionStorage after reload. Cheap:
+          a polling tick every 2s that reads performance.memory and
+          publishes a CustomEvent the parent listens to for shedding. */}
+      <MissionDebugStats items={items} visibleItems={visibleItemsLimit} />
+
       {/* Hidden file input */}
       <input
         ref={fileInputRef}
@@ -6565,12 +7414,31 @@ export default function ControlClient() {
             onCreate={handleNewMission}
             initialValues={activeMission ? {
               workspaceId: activeMission.workspace_id,
-              agent: activeMission.agent,
+              agent: activeMission.agent || undefined,
               backend: activeMission.backend,
-              modelOverride: activeMission.model_override,
-              modelEffort: activeMission.model_effort,
+              modelOverride: activeMission.model_override || undefined,
+              modelEffort: activeMission.model_effort || undefined,
+              configProfile: activeMission.config_profile,
             } : undefined}
           />
+
+          {activeMission && !viewingMissionIsRunning && (
+            <NewMissionDialog
+              workspaces={workspaces}
+              disabled={missionLoading}
+              onCreate={handleUpdateMissionSettings}
+              mode="edit"
+              lockWorkspace
+              initialValues={{
+                workspaceId: activeMission.workspace_id,
+                agent: activeMission.agent || undefined,
+                backend: activeMission.backend,
+                modelOverride: activeMission.model_override || undefined,
+                modelEffort: activeMission.model_effort || undefined,
+                configProfile: activeMission.config_profile,
+              }}
+            />
+          )}
 
           <button
             onClick={() => setShowAutomationsDialog(true)}
@@ -7196,447 +8064,45 @@ export default function ControlClient() {
                 </button>
               )}
               {groupedItems.slice(-visibleItemsLimit).map((item) => {
-                // Handle tool groups (multiple consecutive tools collapsed)
-                if (item.kind === "tool_group") {
-                  const isExpanded = expandedToolGroups.has(item.groupId);
-                  return (
-                    <div
-                      key={item.groupId}
-                      id={`chat-item-${item.groupId}`}
-                      data-chat-item-id={item.groupId}
-                      className={cn(
-                        "rounded-xl transition-colors",
-                        highlightedItemId === item.groupId && "ring-1 ring-amber-400/70 bg-amber-500/10"
-                      )}
-                    >
-                      <CollapsedToolGroup
-                        tools={item.tools}
-                        isExpanded={isExpanded}
-                        onToggleExpand={() => {
-                          // Use startTransition so expanding many tools
-                          // doesn't block the browser from painting the
-                          // button's click feedback first (issue #156).
-                          startTransition(() => {
-                            setExpandedToolGroups((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(item.groupId)) {
-                                next.delete(item.groupId);
-                              } else {
-                                next.add(item.groupId);
-                              }
-                              return next;
-                            });
-                          });
-                        }}
-                        workspaceId={missionForDownloads?.workspace_id}
-                        missionId={missionForDownloads?.id}
-                      />
-                    </div>
-                  );
-                }
-
-                if (item.kind === "user") {
-                  return (
-                    <div
-                      key={item.id}
-                      id={`chat-item-${item.id}`}
-                      data-chat-item-id={item.id}
-                      className={cn(
-                        "flex justify-end gap-3 group rounded-xl transition-colors",
-                        highlightedItemId === item.id && "ring-1 ring-amber-400/70 bg-amber-500/10"
-                      )}
-                    >
-                      <CopyButton
-                        text={item.content}
-                        className="self-start mt-2"
-                      />
-                      <div className="max-w-[80%]">
-                        <div
-                          className={cn(
-                            "rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light",
-                            item.queued
-                              ? "border-2 border-dashed border-indigo-500/60 bg-indigo-500/20"
-                              : "bg-indigo-500"
-                          )}
-                        >
-                          <p className="whitespace-pre-wrap text-sm break-words">
-                            {item.content}
-                          </p>
-                        </div>
-                        <div className="mt-1 text-right flex items-center justify-end gap-2">
-                          {item.queued === true && (
-                            <span className="text-[10px] text-white/30">
-                              Queued
-                            </span>
-                          )}
-                          <span className="text-[10px] text-white/30">
-                            {formatTime(item.timestamp)}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.08]">
-                        <User className="h-4 w-4 text-white/60" />
-                      </div>
-                    </div>
-                  );
-                }
-
-                if (item.kind === "assistant") {
-                  const statusIcon = item.success ? CheckCircle : XCircle;
-                  const MessageStatusIcon = statusIcon;
-                  const displayModel = item.model
-                    ? item.model.includes("/")
-                      ? item.model.split("/").pop()
-                      : item.model
-                    : null;
-                  return (
-                    <div
-                      key={item.id}
-                      id={`chat-item-${item.id}`}
-                      data-chat-item-id={item.id}
-                      className={cn(
-                        "flex justify-start gap-3 group rounded-xl transition-colors",
-                        highlightedItemId === item.id && "ring-1 ring-amber-400/70 bg-amber-500/10"
-                      )}
-                    >
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                        <Bot className="h-4 w-4 text-indigo-400" />
-                      </div>
-                      <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-                        <div className="mb-2 flex items-center gap-2 text-xs text-white/40">
-                          <MessageStatusIcon
-                            className={cn(
-                              "h-3 w-3",
-                              item.success ? "text-emerald-400" : "text-red-400"
-                            )}
-                          />
-                          <span>{item.success ? "Turn complete" : "Failed"}</span>
-                          {displayModel && (
-                            <>
-                              <span>•</span>
-                              <span
-                                className="font-mono truncate max-w-[120px]"
-                                title={item.model ?? undefined}
-                              >
-                                {displayModel}
-                              </span>
-                            </>
-                          )}
-                          <>
-                            <span>•</span>
-                            <span
-                              className={
-                                item.costSource === "actual"
-                                  ? "text-emerald-400"
-                                  : item.costSource === "estimated"
-                                    ? "text-amber-300"
-                                    : "text-white/50"
-                              }
-                            >
-                              {item.costSource === "unknown"
-                                ? item.costCents > 0
-                                  ? `$${(item.costCents / 100).toFixed(4)}`
-                                  : "N/A"
-                                : `$${(item.costCents / 100).toFixed(4)}`}
-                            </span>
-                            <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/60">
-                              {item.costSource === "actual"
-                                ? "Actual"
-                                : item.costSource === "estimated"
-                                  ? "Estimated"
-                                  : "Unknown"}
-                            </span>
-                          </>
-                          <span>•</span>
-                          <span className="text-white/30">
-                            {formatTime(item.timestamp)}
-                          </span>
-                        </div>
-                        <MarkdownContent
-                          content={item.content}
-                          basePath={missionWorkingDirectory}
-                          workspaceId={missionForDownloads?.workspace_id}
-                          missionId={missionForDownloads?.id}
-                        />
-                        {/* Render shared files */}
-                        {item.sharedFiles && item.sharedFiles.length > 0 && (
-                          <div className="mt-2">
-                            {item.sharedFiles.map((file, idx) => (
-                              <SharedFileCard key={`${file.url}-${idx}`} file={file} />
-                            ))}
-                          </div>
-                        )}
-                        {/* Resume button for failed messages */}
-                        {!item.success && item.resumable && (
-                          <div className="mt-3 flex gap-2">
-                            <button
-                              onClick={() => handleResumeMission()}
-                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded-lg transition-colors"
-                            >
-                              <RotateCcw className="h-3 w-3" />
-                              Resume Mission
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                      <CopyButton
-                        text={item.content}
-                        className="self-start mt-8"
-                      />
-                    </div>
-                  );
-                }
-
-                if (item.kind === "phase") {
-                  return <PhaseItem key={item.id} item={item} />;
-                }
-
-                if (item.kind === "thinking_group") {
-                  // Render grouped thinking items as a single merged block
-                  return (
-                    <ThinkingGroupItem
-                      key={item.groupId}
-                      items={item.thoughts}
-                      basePath={missionWorkingDirectory}
-                      workspaceId={missionForDownloads?.workspace_id}
-                      missionId={missionForDownloads?.id}
-                    />
-                  );
-                }
-
-                if (item.kind === "thinking") {
-                  // Fallback for individual thinking items (should be rare with grouping)
-                  return (
-                    <ThinkingGroupItem
-                      key={item.id}
-                      items={[item]}
-                      basePath={missionWorkingDirectory}
-                      workspaceId={missionForDownloads?.workspace_id}
-                      missionId={missionForDownloads?.id}
-                    />
-                  );
-                }
-
-                if (item.kind === "stream") {
-                  // Fallback for individual stream items (should be rare with grouping)
-                  return (
-                    <ThinkingGroupItem
-                      key={item.id}
-                      items={[item]}
-                      basePath={missionWorkingDirectory}
-                      workspaceId={missionForDownloads?.workspace_id}
-                      missionId={missionForDownloads?.id}
-                    />
-                  );
-                }
-
-                if (item.kind === "tool") {
-                  // UI tools get special interactive rendering
-                  if (item.isUiTool) {
-                    if (item.name === "question" || item.name === "AskUserQuestion") {
-                      return (
-                        <QuestionToolItem
-                          key={item.id}
-                          item={item}
-                          onSubmit={async (toolCallId, answers) => {
-                            setItems((prev) =>
-                              prev.map((it) =>
-                                it.kind === "tool" && it.toolCallId === toolCallId
-                                  ? { ...it, result: { answers } }
-                                  : it
-                              )
-                            );
-                            await postControlToolResult({
-                              tool_call_id: toolCallId,
-                              name: item.name,
-                              result: { answers },
-                            });
-                          }}
-                        />
-                      );
-                    }
-                    if (item.name === "ui_optionList") {
-                      const toolCallId = item.toolCallId;
-                      const rawArgs: Record<string, unknown> = isRecord(item.args)
-                        ? item.args
-                        : {};
-
-                      let optionList: ReturnType<
-                        typeof parseSerializableOptionList
-                      > | null = null;
-                      let parseErr: string | null = null;
-                      try {
-                        optionList = parseSerializableOptionList({
-                          ...rawArgs,
-                          id:
-                            typeof rawArgs["id"] === "string" && rawArgs["id"]
-                              ? (rawArgs["id"] as string)
-                              : `option-list-${toolCallId}`,
-                        });
-                      } catch (e) {
-                        parseErr =
-                          e instanceof Error
-                            ? e.message
-                            : "Invalid option list payload";
-                      }
-
-                      const confirmed = item.result as
-                        | OptionListSelection
-                        | undefined;
-
-                      return (
-                        <div key={item.id} className="flex justify-start gap-3">
-                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                            <Bot className="h-4 w-4 text-indigo-400" />
-                          </div>
-                          <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-                            <div className="mb-2 text-xs text-white/40">
-                              Tool:{" "}
-                              <span className="font-mono text-indigo-400">
-                                {item.name}
-                              </span>
-                            </div>
-
-                            {parseErr || !optionList ? (
-                              <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
-                                {parseErr ?? "Failed to render OptionList"}
-                              </div>
-                            ) : (
-                              <OptionListErrorBoundary>
-                                <OptionList
-                                  {...optionList}
-                                  value={undefined}
-                                  confirmed={confirmed}
-                                  onConfirm={async (selection) => {
-                                    setItems((prev) =>
-                                      prev.map((it) =>
-                                        it.kind === "tool" &&
-                                        it.toolCallId === toolCallId
-                                          ? { ...it, result: selection }
-                                          : it
-                                      )
-                                    );
-                                    await postControlToolResult({
-                                      tool_call_id: toolCallId,
-                                      name: item.name,
-                                      result: selection,
-                                    });
-                                  }}
-                                  onCancel={async () => {
-                                    setItems((prev) =>
-                                      prev.map((it) =>
-                                        it.kind === "tool" &&
-                                        it.toolCallId === toolCallId
-                                          ? { ...it, result: null }
-                                          : it
-                                      )
-                                    );
-                                    await postControlToolResult({
-                                      tool_call_id: toolCallId,
-                                      name: item.name,
-                                      result: null,
-                                    });
-                                  }}
-                                />
-                              </OptionListErrorBoundary>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    }
-
-                    if (item.name === "ui_dataTable") {
-                      const rawArgs: Record<string, unknown> = isRecord(item.args)
-                        ? item.args
-                        : {};
-                      const dataTable = parseSerializableDataTable(rawArgs);
-
-                      return (
-                        <div key={item.id} className="flex justify-start gap-3">
-                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                            <Bot className="h-4 w-4 text-indigo-400" />
-                          </div>
-                          <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-                            <div className="mb-2 text-xs text-white/40">
-                              Tool:{" "}
-                              <span className="font-mono text-indigo-400">
-                                {item.name}
-                              </span>
-                            </div>
-                            {dataTable ? (
-                              <DataTable
-                                id={dataTable.id}
-                                title={dataTable.title}
-                                columns={dataTable.columns}
-                                rows={dataTable.rows}
-                              />
-                            ) : (
-                              <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 text-sm text-red-400">
-                                Failed to render DataTable
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    }
-
-                    // Unknown UI tool - still show with ToolCallItem
-                    return (
-                      <ToolCallItem
-                        key={item.id}
-                        item={item}
-                        highlighted={highlightedItemId === item.id}
-                        workspaceId={missionForDownloads?.workspace_id}
-                        missionId={missionForDownloads?.id}
-                      />
-                    );
-                  }
-
-                  // Subagent/background task tools get enhanced rendering
-                  if (isSubagentTool(item.name)) {
-                    return (
-                      <SubagentToolItem
-                        key={item.id}
-                        item={item}
-                        highlighted={highlightedItemId === item.id}
-                      />
-                    );
-                  }
-
-                  // Non-UI tools use the collapsible ToolCallItem component
-                  return (
-                    <ToolCallItem
-                      key={item.id}
-                      item={item}
-                      highlighted={highlightedItemId === item.id}
-                      workspaceId={missionForDownloads?.workspace_id}
-                      missionId={missionForDownloads?.id}
-                    />
-                  );
-                }
-
-                // system
+                const key =
+                  item.kind === "tool_group" || item.kind === "thinking_group"
+                    ? item.groupId
+                    : item.id;
+                const isToolGroupExpanded =
+                  item.kind === "tool_group"
+                    ? expandedToolGroups.has(item.groupId)
+                    : false;
+                // `content-visibility: auto` tells the browser to skip
+                // layout and paint for rows that are scrolled off-screen,
+                // and `contain-intrinsic-size: auto 140px` tells it to
+                // reserve the last-rendered height (fallback 140px on
+                // first render) so scroll position stays stable when
+                // rows are re-entered. This is the CSS-level equivalent
+                // of windowing — a measurable paint-time win on missions
+                // with hundreds of messages without the refactor cost of
+                // a full virtualizer. See issue #156 (OOM on 5k-item
+                // missions). Supported in Chrome 107+ / Safari 17+;
+                // older browsers just render every row as before.
                 return (
-                  <div key={item.id} className="flex justify-start gap-3">
-                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.04]">
-                      <Ban className="h-4 w-4 text-white/40" />
-                    </div>
-                    <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.02] border border-white/[0.04] px-4 py-3">
-                      <p className="whitespace-pre-wrap text-sm text-white/60 break-words">
-                        {item.content}
-                      </p>
-                      {item.resumable && (
-                        <div className="mt-3 flex gap-2">
-                          <button
-                            onClick={() => handleResumeMission()}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded-lg transition-colors"
-                          >
-                            <RotateCcw className="h-3 w-3" />
-                            Resume Mission
-                          </button>
-                        </div>
-                      )}
-                    </div>
+                  <div
+                    key={key}
+                    style={{
+                      contentVisibility: "auto",
+                      containIntrinsicSize: "auto 140px",
+                    }}
+                  >
+                    <ChatItemRow
+                      item={item}
+                      highlighted={highlightedItemId === key}
+                      workspaceId={missionForDownloads?.workspace_id}
+                      missionId={missionForDownloads?.id}
+                      basePath={missionWorkingDirectory}
+                      isToolGroupExpanded={isToolGroupExpanded}
+                      onToggleToolGroup={handleToggleToolGroup}
+                      onResume={stableResumeMission}
+                      onToolResult={handleToolResultCommit}
+                      onOptimisticToolResult={handleOptimisticToolResult}
+                    />
                   </div>
                 );
               })}
@@ -7867,8 +8333,8 @@ export default function ControlClient() {
           )}
 
           {/* Show resume buttons for interrupted/blocked missions, otherwise show normal input */}
-          {/* Note: showResumeUI checks viewingMissionIsRunning and if the last turn completed */}
-          {showResumeUI ? (
+          {/* Both are always rendered to prevent unmounting the input (which loses typed text) */}
+          {showResumeUI && (
             <div className="mx-auto flex max-w-3xl gap-3 items-center justify-center py-2">
               <div className="flex items-center gap-2 text-sm text-white/50 mr-4">
                 <AlertTriangle className="h-4 w-4 text-amber-400" />
@@ -7890,8 +8356,8 @@ export default function ControlClient() {
                 Custom Message
               </button>
             </div>
-          ) : (
-            <div className="mx-auto max-w-3xl w-full space-y-2">
+          )}
+          <div className={cn("mx-auto max-w-3xl w-full space-y-2", showResumeUI && "hidden")}>
               {/* Queue Strip - shows queued messages when present */}
               <QueueStrip
                 items={queuedItems}
@@ -7938,7 +8404,7 @@ export default function ControlClient() {
                     <button
                       type="button"
                       onClick={() => enhancedInputRef.current?.submit()}
-                      disabled={!canSubmitInput}
+                      disabled={!canSubmitComposer}
                       className="flex items-center gap-2 rounded-xl bg-indigo-500/80 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500/80"
                     >
                       <ListPlus className="h-4 w-4" />
@@ -7957,7 +8423,7 @@ export default function ControlClient() {
                   <button
                     type="button"
                     onClick={() => enhancedInputRef.current?.submit()}
-                    disabled={!canSubmitInput}
+                    disabled={!canSubmitComposer}
                     className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500"
                   >
                     <Send className="h-4 w-4" />
@@ -7966,7 +8432,6 @@ export default function ControlClient() {
               )}
               </form>
             </div>
-          )}
         </div>
       </div>
 
@@ -7976,8 +8441,8 @@ export default function ControlClient() {
             "min-h-0 flex flex-col gap-4 transition-all duration-300 animate-fade-in shrink-0",
             showDesktopStream ? "flex-1 max-w-md" : "w-80"
           )}>
-            {/* Worker Panel */}
-            {showWorkerPanel && isBossMission && (
+            {/* Worker Panel — real child missions (parent_mission_id) */}
+            {showWorkerPanel && childMissions.length > 0 && (
               <WorkerPanel
                 childMissions={childMissions}
                 runningMissions={runningMissions}
@@ -7986,7 +8451,21 @@ export default function ControlClient() {
                 onSelectWorker={(missionId) => handleViewMission(missionId)}
                 onClose={() => setShowWorkerPanel(false)}
                 className={cn(
-                  showThinkingPanel || showDesktopStream
+                  showThinkingPanel || showDesktopStream || hasInMissionSubagents
+                    ? "flex-shrink-0 max-h-[50%]"
+                    : "flex-1"
+                )}
+              />
+            )}
+
+            {/* Sub-agents Panel — in-mission Task / orchestrator workers */}
+            {showWorkerPanel && hasInMissionSubagents && (
+              <SubagentsPanel
+                subagents={inMissionSubagents}
+                onFocusItem={focusChatItem}
+                onClose={() => setShowWorkerPanel(false)}
+                className={cn(
+                  showThinkingPanel || showDesktopStream || childMissions.length > 0
                     ? "flex-shrink-0 max-h-[50%]"
                     : "flex-1"
                 )}

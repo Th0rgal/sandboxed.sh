@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback, useMemo, forwardRef, useImperativeHandle } from 'react';
-import { listLibraryCommands, getBuiltinCommands as fetchBuiltinCommands, getVisibleAgents, type CommandSummary, type CommandParam, type BuiltinCommandsResponse } from '@/lib/api';
+import { useState, useEffect, useRef, useCallback, useMemo, forwardRef, useImperativeHandle, memo } from 'react';
+import { listLibraryCommands, getBuiltinCommands as fetchBuiltinCommands, getVisibleAgents, type CommandSummary, type CommandParam } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 // Fallback builtin commands (used if API fails)
@@ -24,6 +24,10 @@ export interface SubmitPayload {
 export interface EnhancedInputHandle {
   submit: () => void;
   canSubmit: () => boolean;
+  clear: () => void;
+  /** Restore a previously-submitted draft with its locked-agent badge
+   *  intact (used when the parent's send path fails after clear()). */
+  restoreDraft: (content: string, agent?: string | null) => void;
 }
 
 export interface FilePasteContext {
@@ -53,9 +57,46 @@ interface AutocompleteItem {
   params?: CommandParam[];
 }
 
-export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>(function EnhancedInput({
-  value,
-  onChange,
+const parseAgentNames = (payload: unknown): string[] => {
+  const normalizeEntry = (entry: unknown): string | null => {
+    if (typeof entry === 'string') return entry;
+    if (entry && typeof entry === 'object') {
+      const name = (entry as { name?: unknown }).name;
+      if (typeof name === 'string') return name;
+      const id = (entry as { id?: unknown }).id;
+      if (typeof id === 'string') return id;
+    }
+    return null;
+  };
+
+  const raw = Array.isArray(payload)
+    ? payload
+    : (payload as { agents?: unknown })?.agents;
+  if (!Array.isArray(raw)) return [];
+
+  const names = raw
+    .map(normalizeEntry)
+    .filter((name): name is string => Boolean(name));
+  return Array.from(new Set(names));
+};
+
+const getAgentDescription = (name: string): string => {
+  const descriptions: Record<string, string> = {
+    'Sisyphus': 'Main orchestrator with parallel execution',
+    'oracle': 'Architecture, code review, strategy (GPT)',
+    'explore': 'Fast codebase exploration and search',
+    'librarian': 'Documentation lookup and research',
+    'plan': 'Prometheus planner for structured work',
+    'frontend-ui-ux-engineer': 'UI/UX development specialist',
+    'document-writer': 'Technical documentation expert',
+    'multimodal-looker': 'Visual content analysis',
+  };
+  return descriptions[name] || 'Specialized agent';
+};
+
+export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputProps>(function EnhancedInput({
+  value: externalValue,
+  onChange: externalOnChange,
   onSubmit,
   onCanSubmitChange,
   onFilePaste,
@@ -64,12 +105,35 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
   className,
   backend,
 }, ref) {
+  // Internal state for the input value — immune to parent re-renders.
+  // Syncs FROM parent only when the parent explicitly pushes a new value
+  // (e.g., clearing after submit, inserting upload notes).
+  const [value, setValueState] = useState(externalValue);
+  const lastExternalValueRef = useRef(externalValue);
+
+  // Sync external → internal only when the parent pushes a genuinely new value
+  useEffect(() => {
+    if (externalValue !== lastExternalValueRef.current) {
+      lastExternalValueRef.current = externalValue;
+      // Parent-driven changes are explicit actions such as clearing after a send
+      // or inserting upload notes; mirror them into the local draft buffer.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setValueState(externalValue);
+    }
+  }, [externalValue]);
+
+  // Wrapper that updates both internal state and notifies parent
+  const onChange = useCallback((newValue: string) => {
+    setValueState(newValue);
+    lastExternalValueRef.current = newValue;
+    externalOnChange(newValue);
+  }, [externalOnChange]);
+
   const [commands, setCommands] = useState<CommandSummary[]>([]);
   const [agents, setAgents] = useState<string[]>([]);
   const [showAutocomplete, setShowAutocomplete] = useState(false);
   const [autocompleteItems, setAutocompleteItems] = useState<AutocompleteItem[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
-  const [autocompleteType, setAutocompleteType] = useState<'command' | 'agent' | null>(null);
   const [triggerPosition, setTriggerPosition] = useState(0);
   const [ghostText, setGhostText] = useState<string>('');
 
@@ -106,6 +170,14 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const autocompleteRef = useRef<HTMLDivElement>(null);
+  const resizeTextarea = useCallback((textarea: HTMLTextAreaElement) => {
+    textarea.style.height = "auto";
+    const lineHeight = 20;
+    const maxLines = 10;
+    const maxHeight = lineHeight * maxLines;
+    const newHeight = Math.min(textarea.scrollHeight, maxHeight);
+    textarea.style.height = `${newHeight}px`;
+  }, []);
 
   // Load commands and agents on mount or when backend changes
   useEffect(() => {
@@ -175,29 +247,6 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
     };
   }, [backend]);
 
-  const parseAgentNames = (payload: unknown): string[] => {
-    const normalizeEntry = (entry: unknown): string | null => {
-      if (typeof entry === 'string') return entry;
-      if (entry && typeof entry === 'object') {
-        const name = (entry as { name?: unknown }).name;
-        if (typeof name === 'string') return name;
-        const id = (entry as { id?: unknown }).id;
-        if (typeof id === 'string') return id;
-      }
-      return null;
-    };
-
-    const raw = Array.isArray(payload)
-      ? payload
-      : (payload as { agents?: unknown })?.agents;
-    if (!Array.isArray(raw)) return [];
-
-    const names = raw
-      .map(normalizeEntry)
-      .filter((name): name is string => Boolean(name));
-    return Array.from(new Set(names));
-  };
-
   // Check if an agent name is valid
   const isValidAgent = useCallback((name: string) => {
     return agents.some(a => a.toLowerCase() === name.toLowerCase());
@@ -229,14 +278,8 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
   const adjustTextareaHeight = useCallback(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
-
-    textarea.style.height = "auto";
-    const lineHeight = 20;
-    const maxLines = 10;
-    const maxHeight = lineHeight * maxLines;
-    const newHeight = Math.min(textarea.scrollHeight, maxHeight);
-    textarea.style.height = `${newHeight}px`;
-  }, []);
+    resizeTextarea(textarea);
+  }, [resizeTextarea]);
 
   useEffect(() => {
     adjustTextareaHeight();
@@ -264,7 +307,6 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
         source: cmd.path === 'builtin' ? 'oh-my-opencode' : cmd.path === 'builtin-claude' ? 'claude-code' : 'library',
         params: cmd.params,
       })));
-      setAutocompleteType('command');
       setTriggerPosition(cursorPos - commandMatch[1].length);
       setShowAutocomplete(filtered.length > 0);
       setSelectedIndex(0);
@@ -307,7 +349,6 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
           name: agent,
           description: getAgentDescription(agent),
         })));
-        setAutocompleteType('agent');
         setTriggerPosition(0);
         setShowAutocomplete(filtered.length > 0);
         setSelectedIndex(0);
@@ -334,23 +375,8 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
     }
 
     setShowAutocomplete(false);
-    setAutocompleteType(null);
     setGhostText('');
   }, [displayValue, commands, agents, lockedAgent]);
-
-  const getAgentDescription = (name: string): string => {
-    const descriptions: Record<string, string> = {
-      'Sisyphus': 'Main orchestrator with parallel execution',
-      'oracle': 'Architecture, code review, strategy (GPT)',
-      'explore': 'Fast codebase exploration and search',
-      'librarian': 'Documentation lookup and research',
-      'plan': 'Prometheus planner for structured work',
-      'frontend-ui-ux-engineer': 'UI/UX development specialist',
-      'document-writer': 'Technical documentation expert',
-      'multimodal-looker': 'Visual content analysis',
-    };
-    return descriptions[name] || 'Specialized agent';
-  };
 
   const navigateHistory = useCallback((direction: 'back' | 'forward') => {
     const history = sentHistoryRef.current;
@@ -522,10 +548,12 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
       onSubmit({ content: value });
     }
 
-    // Clear state after submit
-    setLockedAgent(null);
-    onChange('');
-  }, [displayValue, lockedAgent, disabled, onSubmit, parsedAgentFromValue, value, onChange]);
+    // Intentionally does NOT clear here. Clearing is driven by the
+    // parent via the imperative `clear()` handle so a submission that
+    // fails upstream (mission sync error, post rejection) can leave the
+    // user's draft intact. See enhanced-input.test.tsx — "does not
+    // clear text synchronously when submitted".
+  }, [displayValue, lockedAgent, disabled, onSubmit, parsedAgentFromValue, value, pushToHistory]);
 
   // Check if submission is valid (has content or locked agent)
   const canSubmit = useCallback(() => {
@@ -543,7 +571,15 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
   useImperativeHandle(ref, () => ({
     submit: handleSubmit,
     canSubmit,
-  }), [handleSubmit, canSubmit]);
+    clear: () => {
+      setLockedAgent(null);
+      onChange('');
+    },
+    restoreDraft: (content: string, agent?: string | null) => {
+      setLockedAgent(agent ?? null);
+      onChange(content);
+    },
+  }), [handleSubmit, canSubmit, onChange]);
 
   // Handle paste events for file uploads (e.g., pasting screenshots)
   useEffect(() => {
@@ -586,6 +622,8 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
     const newValue = e.target.value;
     const currentValue = lockedAgent ? displayValue : value;
 
+    resizeTextarea(e.currentTarget);
+
     // Skip if no actual change (prevents infinite render loops)
     if (newValue === currentValue) return;
 
@@ -595,6 +633,7 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
       if (match) {
         const agentName = match[1];
         setLockedAgent(agentName);
+        onCanSubmitChange?.(true);
         onChange(''); // Agent is now in badge, clear text
         return;
       }
@@ -602,6 +641,7 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
 
     // User is typing normally — exit history browsing mode
     historyIndexRef.current = -1;
+    onCanSubmitChange?.(!!(newValue.trim() || lockedAgent));
     onChange(newValue);
   };
 
@@ -736,4 +776,4 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
       )}
     </div>
   );
-});
+}));

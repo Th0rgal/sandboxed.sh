@@ -49,7 +49,7 @@ pub struct Mission {
     /// Optional model override (provider/model)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
-    /// Optional model effort override (e.g. low/medium/high)
+    /// Optional model effort override (e.g. low/medium/high/xhigh/max)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_effort: Option<String>,
     /// Backend to use for this mission ("opencode" or "claudecode")
@@ -82,6 +82,9 @@ pub struct Mission {
     /// Working directory override (for git worktrees etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+    /// Mission operating mode (task or assistant)
+    #[serde(default)]
+    pub mission_mode: MissionMode,
 }
 
 fn default_backend() -> String {
@@ -150,10 +153,27 @@ pub struct WebhookConfig {
 pub enum TriggerType {
     /// Fixed interval in seconds
     Interval { seconds: u64 },
+    /// Cron expression (e.g. "0 8 * * *" for daily at 8:00 UTC)
+    Cron {
+        /// Standard 5-field cron expression: minute hour day-of-month month day-of-week
+        expression: String,
+        /// IANA timezone (e.g. "Europe/Paris"). Defaults to UTC.
+        #[serde(default = "default_timezone")]
+        timezone: String,
+    },
     /// Webhook trigger
     Webhook { config: WebhookConfig },
     /// Trigger immediately after an agent turn finishes for the mission
     AgentFinished,
+    /// Telegram bot trigger (messages are routed via the Telegram bridge)
+    Telegram { config: TelegramTriggerConfig },
+}
+
+/// Configuration for a Telegram-triggered automation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelegramTriggerConfig {
+    /// The channel ID this automation is linked to
+    pub channel_id: Uuid,
 }
 
 /// Stop policy for automation lifecycle.
@@ -187,6 +207,10 @@ pub enum FreshSession {
     /// Keep session alive (default behavior).
     #[default]
     Keep,
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
 }
 
 fn default_stop_policy() -> StopPolicy {
@@ -301,6 +325,344 @@ pub struct AutomationExecution {
     pub retry_count: u32,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Mission Mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Mission operating mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionMode {
+    /// Standard task execution — agent works toward a goal and completes.
+    #[default]
+    Task,
+    /// Persistent assistant — mission stays alive, waits for messages indefinitely.
+    /// Used for chat-based assistants (Telegram, Slack, etc.)
+    Assistant,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Communication Channels
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A communication channel that connects external messaging platforms to a mission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramChannel {
+    pub id: Uuid,
+    /// Mission this channel is connected to (sentinel UUID when auto_create_missions is true)
+    pub mission_id: Uuid,
+    /// Bot token for the Telegram Bot API (never exposed in API responses)
+    #[serde(skip_serializing)]
+    pub bot_token: String,
+    /// Optional bot username (e.g. "ana_bot")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_username: Option<String>,
+    /// Chat IDs allowed to interact with this bot (empty = allow all)
+    #[serde(default)]
+    pub allowed_chat_ids: Vec<i64>,
+    /// How the bot should be triggered
+    #[serde(default)]
+    pub trigger_mode: TelegramTriggerMode,
+    /// Whether this channel is currently active
+    pub active: bool,
+    /// Secret token for Telegram webhook verification
+    #[serde(skip_serializing)]
+    pub webhook_secret: Option<String>,
+    /// System instructions prepended to every Telegram message for this channel.
+    /// Use this to customize assistant behavior (e.g. "Don't use markdown formatting").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// When true, each Telegram chat auto-creates its own mission using the default_* settings.
+    #[serde(default)]
+    pub auto_create_missions: bool,
+    /// Default backend for auto-created missions (e.g. "claudecode", "opencode")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_backend: Option<String>,
+    /// Default model override for auto-created missions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model_override: Option<String>,
+    /// Default model effort for auto-created missions (low/medium/high/xhigh/max)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model_effort: Option<String>,
+    /// Default workspace ID for auto-created missions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_workspace_id: Option<Uuid>,
+    /// Default config profile for auto-created missions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_config_profile: Option<String>,
+    /// Default agent for auto-created missions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A mapping from a Telegram chat to an auto-created mission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramChatMission {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    pub chat_id: i64,
+    pub mission_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_title: Option<String>,
+    pub created_at: String,
+}
+
+/// A Telegram message queued for immediate or delayed delivery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelegramScheduledMessage {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mission_id: Option<Uuid>,
+    pub chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_title: Option<String>,
+    pub text: String,
+    pub send_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<String>,
+    pub status: TelegramScheduledMessageStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramScheduledMessageStatus {
+    Pending,
+    Sent,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramStructuredMemoryKind {
+    Fact,
+    Note,
+    Task,
+    Preference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramStructuredMemoryScope {
+    #[default]
+    Chat,
+    User,
+    Channel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramStructuredMemoryEntry {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    pub chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<Uuid>,
+    #[serde(default)]
+    pub scope: TelegramStructuredMemoryScope,
+    pub kind: TelegramStructuredMemoryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_user_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<i64>,
+    pub source_role: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelegramStructuredMemorySearchHit {
+    pub entry: TelegramStructuredMemoryEntry,
+    pub score: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_terms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramActionExecutionStatus {
+    Pending,
+    Sent,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramActionExecutionKind {
+    Send,
+    Reminder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramActionExecution {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mission_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chat_id: Option<i64>,
+    pub target_chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_chat_title: Option<String>,
+    pub action_kind: TelegramActionExecutionKind,
+    pub target_kind: String,
+    pub target_value: String,
+    pub text: String,
+    pub delay_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_message_id: Option<Uuid>,
+    pub status: TelegramActionExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramConversationMessageDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramConversation {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    pub chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramConversationMessage {
+    pub id: Uuid,
+    pub conversation_id: Uuid,
+    pub channel_id: Uuid,
+    pub chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_message_id: Option<i64>,
+    pub direction: TelegramConversationMessageDirection,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_user_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<i64>,
+    pub text: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramWorkflowKind {
+    RequestReply,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramWorkflowStatus {
+    WaitingExternal,
+    RelayedToOrigin,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramWorkflow {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    pub origin_conversation_id: Uuid,
+    pub origin_chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_mission_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_conversation_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_chat_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_chat_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_chat_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_request_message_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiated_by_user_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiated_by_username: Option<String>,
+    pub kind: TelegramWorkflowKind,
+    pub status: TelegramWorkflowStatus,
+    pub request_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_reply_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramWorkflowEvent {
+    pub id: Uuid,
+    pub workflow_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<Uuid>,
+    pub event_type: String,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
+/// How Telegram messages trigger the assistant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramTriggerMode {
+    /// Trigger on @bot_username mentions in groups, replies to bot, or DMs (recommended default)
+    #[default]
+    MentionOrDm,
+    /// Trigger on @bot_username mentions in groups only
+    BotMention,
+    /// Trigger on replies to bot messages only
+    Reply,
+    /// Trigger on DMs only
+    DirectMessage,
+    /// Trigger on every message in allowed chats (no filtering)
+    #[serde(alias = "all")]
+    Always,
+}
+
 /// Get current timestamp as RFC3339 string.
 pub fn now_string() -> String {
     Utc::now().to_rfc3339()
@@ -321,6 +683,60 @@ pub fn sanitize_filename(value: &str) -> String {
     } else {
         out
     }
+}
+
+/// Portable snapshot of a mission for cross-environment transfer.
+///
+/// Produced by [`MissionStore::export_mission_bundle`] and consumed by
+/// [`MissionStore::import_mission_bundle`]. Designed to round-trip between
+/// instances that may disagree on workspace UUIDs — the bundle carries
+/// `workspace_name` so the import side can resolve against its own
+/// workspace store, and does *not* carry runtime session state (Claude/Codex
+/// `.credentials.json`, container mount points) which are per-environment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionBundle {
+    /// Bundle format version. Bump on breaking changes.
+    pub version: u32,
+    /// When this bundle was exported (ISO-8601 UTC).
+    pub exported_at: String,
+    /// Optional `SANDBOXED_PUBLIC_URL` of the source instance — purely for
+    /// auditing/debug; import logic ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_public_url: Option<String>,
+    /// Name of the workspace this mission ran in. The import side resolves
+    /// this to a local workspace UUID (or the caller can supply one).
+    pub workspace_name: Option<String>,
+    /// The mission row itself. On import its `id` may be replaced; the
+    /// exported value lets a consumer correlate to the source instance.
+    pub mission: Mission,
+    /// All `mission_events` rows for this mission, in sequence order.
+    /// Content is loaded inline — the import side stores it back through
+    /// the normal spill mechanism, so large payloads re-spill on the
+    /// target side regardless of where they lived originally.
+    pub events: Vec<StoredEvent>,
+    /// All `automations` for this mission. Imported as disabled so they
+    /// don't immediately fire on the target — the user re-enables
+    /// explicitly.
+    pub automations: Vec<Automation>,
+    /// Last N executions per automation, preserved for history context.
+    /// May be empty.
+    #[serde(default)]
+    pub executions: Vec<AutomationExecution>,
+}
+
+/// Options accepted by [`MissionStore::import_mission_bundle`].
+#[derive(Debug, Clone, Default)]
+pub struct MissionImportOptions {
+    /// Override the target workspace UUID. When `None`, the import resolves
+    /// `bundle.workspace_name` against the local workspace store.
+    pub target_workspace_id: Option<Uuid>,
+    /// Display name of the target workspace. When set, this is used
+    /// instead of the source bundle's `workspace_name` — otherwise a
+    /// `?workspace_id=` override would leave the stored name pointing
+    /// at the source workspace and confuse future exports/imports.
+    pub target_workspace_name: Option<String>,
+    /// Keep the bundle's automations enabled (default: import as disabled).
+    pub keep_automations_active: bool,
 }
 
 /// Mission store trait - implemented by all storage backends.
@@ -403,6 +819,22 @@ pub trait MissionStore: Send + Sync {
     /// Update mission title.
     async fn update_mission_title(&self, id: Uuid, title: &str) -> Result<(), String>;
 
+    /// Update mission run settings.
+    /// Field semantics for optional string settings are tri-state:
+    /// - `None` => leave unchanged
+    /// - `Some(Some(value))` => set value
+    /// - `Some(None)` => clear value
+    async fn update_mission_run_settings(
+        &self,
+        id: Uuid,
+        backend: Option<&str>,
+        agent: Option<Option<&str>>,
+        model_override: Option<Option<&str>>,
+        model_effort: Option<Option<&str>>,
+        config_profile: Option<Option<&str>>,
+        session_id: &str,
+    ) -> Result<Mission, String>;
+
     /// Update mission metadata generated by backend (title + short description).
     /// Field semantics are tri-state:
     /// - `None` => leave unchanged
@@ -475,6 +907,38 @@ pub trait MissionStore: Send + Sync {
     ) -> Result<Vec<StoredEvent>, String> {
         let _ = (mission_id, event_types, limit, offset);
         Ok(vec![])
+    }
+
+    /// Get events with `sequence > since_seq`, ordered by sequence ASC.
+    /// Used by the client for delta reconnect — pass the highest
+    /// sequence the client has seen and get only events that arrived
+    /// since. Cheaper than offset-based pagination for long missions.
+    async fn get_events_since(
+        &self,
+        mission_id: Uuid,
+        since_seq: i64,
+        event_types: Option<&[&str]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let _ = (mission_id, since_seq, event_types, limit);
+        Ok(vec![])
+    }
+
+    /// Count events for a mission, optionally filtered by type.
+    async fn count_events(
+        &self,
+        mission_id: Uuid,
+        event_types: Option<&[&str]>,
+    ) -> Result<usize, String> {
+        let _ = (mission_id, event_types);
+        Ok(0)
+    }
+
+    /// Return the highest `sequence` value for this mission, or 0 if
+    /// the mission has no events yet.
+    async fn max_event_sequence(&self, mission_id: Uuid) -> Result<i64, String> {
+        let _ = mission_id;
+        Ok(0)
     }
 
     /// Get total cost in cents across all missions.
@@ -607,6 +1071,511 @@ pub trait MissionStore: Send + Sync {
     ) -> Result<u32, String> {
         let _ = (mission_id, success, error);
         Ok(0)
+    }
+
+    /// Update the mission mode (Task/Assistant).
+    async fn update_mission_mode(&self, id: Uuid, mode: MissionMode) -> Result<(), String> {
+        let _ = (id, mode);
+        Err("Not supported".to_string())
+    }
+
+    /// List all missions in Assistant mode.
+    async fn list_assistant_missions(&self) -> Result<Vec<Mission>, String> {
+        Ok(vec![])
+    }
+
+    // === Export / Import ===
+
+    /// Assemble a portable snapshot of a mission for transfer to another
+    /// instance.
+    ///
+    /// Default implementation walks the public trait methods and works for
+    /// any store that implements them; backends are free to override for
+    /// efficiency (e.g. streaming directly from SQL).
+    async fn export_mission_bundle(
+        &self,
+        id: Uuid,
+        source_public_url: Option<String>,
+    ) -> Result<MissionBundle, String> {
+        let mission = self
+            .get_mission(id)
+            .await?
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+        // Paginate events so we capture the full log even when the mission
+        // exceeds the 50_000-event default cap used by `get_events`. Large
+        // long-running missions can easily cross 100_000 events; truncating
+        // silently during export would produce a bundle that looks complete
+        // but isn't.
+        let mut events = Vec::new();
+        let page = 25_000usize;
+        let mut offset = 0usize;
+        loop {
+            let batch = self.get_events(id, None, Some(page), Some(offset)).await?;
+            let len = batch.len();
+            events.extend(batch);
+            if len < page {
+                break;
+            }
+            offset += page;
+        }
+        let automations = self.get_mission_automations(id).await?;
+        // Cap execution history at 100 per mission so bundle size doesn't
+        // balloon on long-running missions. Callers that need the full log
+        // can pull /api/control/missions/:id/automation-executions directly.
+        let executions = self
+            .get_mission_automation_executions(id, Some(100))
+            .await?;
+        let workspace_name = mission.workspace_name.clone();
+        Ok(MissionBundle {
+            version: 1,
+            exported_at: Utc::now().to_rfc3339(),
+            source_public_url,
+            workspace_name,
+            mission,
+            events,
+            automations,
+            executions,
+        })
+    }
+
+    /// Import a mission bundle, returning the newly assigned mission UUID.
+    ///
+    /// Default implementation is a no-op error — backends must opt in. The
+    /// file/memory backends don't participate because they're debug-only.
+    async fn import_mission_bundle(
+        &self,
+        bundle: MissionBundle,
+        options: MissionImportOptions,
+    ) -> Result<Uuid, String> {
+        let _ = (bundle, options);
+        Err("Mission import is only supported by the sqlite backend".to_string())
+    }
+
+    // === Telegram Channel methods ===
+
+    /// Create a Telegram channel for a mission.
+    async fn create_telegram_channel(
+        &self,
+        channel: TelegramChannel,
+    ) -> Result<TelegramChannel, String> {
+        let _ = channel;
+        Err("Telegram channels not supported by this store".to_string())
+    }
+
+    /// Get a Telegram channel by ID.
+    async fn get_telegram_channel(&self, id: Uuid) -> Result<Option<TelegramChannel>, String> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// List Telegram channels for a mission.
+    async fn list_telegram_channels(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Vec<TelegramChannel>, String> {
+        let _ = mission_id;
+        Ok(vec![])
+    }
+
+    /// List all active Telegram channels across all missions.
+    async fn list_all_active_telegram_channels(&self) -> Result<Vec<TelegramChannel>, String> {
+        Ok(vec![])
+    }
+
+    /// Update a Telegram channel.
+    async fn update_telegram_channel(&self, channel: TelegramChannel) -> Result<(), String> {
+        let _ = channel;
+        Err("Telegram channels not supported by this store".to_string())
+    }
+
+    /// Delete a Telegram channel.
+    async fn delete_telegram_channel(&self, id: Uuid) -> Result<bool, String> {
+        let _ = id;
+        Ok(false)
+    }
+
+    /// List all Telegram channels (both legacy and auto-create).
+    async fn list_all_telegram_channels(&self) -> Result<Vec<TelegramChannel>, String> {
+        Ok(vec![])
+    }
+
+    // === Telegram Chat-Mission mapping methods ===
+
+    /// Look up the mission for a specific (channel, chat_id) pair.
+    async fn get_telegram_chat_mission(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+    ) -> Result<Option<TelegramChatMission>, String> {
+        let _ = (channel_id, chat_id);
+        Ok(None)
+    }
+
+    /// Create a mapping from (channel, chat_id) to mission.
+    async fn create_telegram_chat_mission(
+        &self,
+        mapping: TelegramChatMission,
+    ) -> Result<TelegramChatMission, String> {
+        let _ = mapping;
+        Err("Not supported".to_string())
+    }
+
+    /// Update the cached title/label for a Telegram chat mapping.
+    async fn update_telegram_chat_mission_title(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        chat_title: Option<String>,
+    ) -> Result<(), String> {
+        let _ = (channel_id, chat_id, chat_title);
+        Ok(())
+    }
+
+    /// Look up the Telegram chat mapping for a given mission_id (reverse lookup).
+    async fn get_telegram_chat_mission_by_mission_id(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Option<TelegramChatMission>, String> {
+        let _ = mission_id;
+        Ok(None)
+    }
+
+    /// List all chat-to-mission mappings for a channel.
+    async fn list_telegram_chat_missions(
+        &self,
+        channel_id: Uuid,
+    ) -> Result<Vec<TelegramChatMission>, String> {
+        let _ = channel_id;
+        Ok(vec![])
+    }
+
+    /// Queue a Telegram message for immediate or delayed delivery.
+    async fn create_telegram_scheduled_message(
+        &self,
+        message: TelegramScheduledMessage,
+    ) -> Result<TelegramScheduledMessage, String> {
+        let _ = message;
+        Err("Not supported".to_string())
+    }
+
+    /// List pending Telegram messages that should be delivered at or before `send_at`.
+    async fn list_due_telegram_scheduled_messages(
+        &self,
+        channel_id: Uuid,
+        send_at: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramScheduledMessage>, String> {
+        let _ = (channel_id, send_at, limit);
+        Ok(vec![])
+    }
+
+    /// List recent Telegram scheduled messages for a channel.
+    async fn list_telegram_scheduled_messages(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramScheduledMessage>, String> {
+        let _ = (channel_id, chat_id, limit);
+        Ok(vec![])
+    }
+
+    /// Atomically claim a pending scheduled message for delivery by setting
+    /// status to `'sending'`. Returns `true` if the row was claimed (was
+    /// still `'pending'`), `false` if another caller already claimed it.
+    async fn claim_telegram_scheduled_message(&self, id: Uuid) -> Result<bool, String> {
+        let _ = id;
+        Err("Not supported".to_string())
+    }
+
+    /// Recover stale `'sending'` scheduled messages back to `'pending'`
+    /// (e.g. after a crash). Messages in `'sending'` for longer than
+    /// `max_age_secs` are reset.
+    async fn recover_stale_sending_scheduled_messages(
+        &self,
+        max_age_secs: i64,
+    ) -> Result<u32, String> {
+        let _ = max_age_secs;
+        Ok(0)
+    }
+
+    /// Mark a scheduled Telegram message as sent.
+    async fn mark_telegram_scheduled_message_sent(
+        &self,
+        id: Uuid,
+        sent_at: &str,
+    ) -> Result<(), String> {
+        let _ = (id, sent_at);
+        Err("Not supported".to_string())
+    }
+
+    /// Mark a scheduled Telegram message as failed.
+    async fn mark_telegram_scheduled_message_failed(
+        &self,
+        id: Uuid,
+        error: &str,
+    ) -> Result<(), String> {
+        let _ = (id, error);
+        Err("Not supported".to_string())
+    }
+
+    /// Upsert a Telegram structured memory entry.
+    async fn upsert_telegram_structured_memory(
+        &self,
+        entry: TelegramStructuredMemoryEntry,
+    ) -> Result<TelegramStructuredMemoryEntry, String> {
+        let _ = entry;
+        Err("Not supported".to_string())
+    }
+
+    /// List recent Telegram structured memory entries for a channel/chat.
+    async fn list_telegram_structured_memory(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        subject_user_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let _ = (channel_id, chat_id, subject_user_id, limit);
+        Ok(vec![])
+    }
+
+    /// Search Telegram structured memory for a channel/chat.
+    async fn search_telegram_structured_memory(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let _ = (channel_id, chat_id, query, limit);
+        Ok(vec![])
+    }
+
+    /// Hybrid-search Telegram structured memory with scored matches.
+    async fn search_telegram_structured_memory_hybrid(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        subject_user_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemorySearchHit>, String> {
+        let _ = (channel_id, chat_id, subject_user_id, query, limit);
+        Ok(vec![])
+    }
+
+    /// Load memory context relevant to a Telegram chat and optional sender identity.
+    async fn list_telegram_memory_context(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        subject_user_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let _ = (channel_id, chat_id, subject_user_id, limit);
+        Ok(vec![])
+    }
+
+    /// Search memory context relevant to a Telegram chat and optional sender identity.
+    async fn search_telegram_memory_context(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        subject_user_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemoryEntry>, String> {
+        let _ = (channel_id, chat_id, subject_user_id, query, limit);
+        Ok(vec![])
+    }
+
+    /// Hybrid-search memory context relevant to a Telegram chat and optional sender identity.
+    async fn search_telegram_memory_context_hybrid(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+        subject_user_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramStructuredMemorySearchHit>, String> {
+        self.search_telegram_structured_memory_hybrid(
+            channel_id,
+            Some(chat_id),
+            subject_user_id,
+            query,
+            limit,
+        )
+        .await
+    }
+
+    /// Record a Telegram action execution for observability/admin tooling.
+    async fn create_telegram_action_execution(
+        &self,
+        execution: TelegramActionExecution,
+    ) -> Result<TelegramActionExecution, String> {
+        let _ = execution;
+        Err("Not supported".to_string())
+    }
+
+    /// List recent Telegram action executions for a channel.
+    async fn list_telegram_action_executions(
+        &self,
+        channel_id: Uuid,
+        chat_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TelegramActionExecution>, String> {
+        let _ = (channel_id, chat_id, limit);
+        Ok(vec![])
+    }
+
+    /// Update action execution status by the linked scheduled message.
+    async fn mark_telegram_action_execution_by_scheduled_message(
+        &self,
+        scheduled_message_id: Uuid,
+        status: TelegramActionExecutionStatus,
+        last_error: Option<&str>,
+        updated_at: &str,
+    ) -> Result<(), String> {
+        let _ = (scheduled_message_id, status, last_error, updated_at);
+        Err("Not supported".to_string())
+    }
+
+    /// Upsert a Telegram conversation (one per channel/chat).
+    async fn upsert_telegram_conversation(
+        &self,
+        conversation: TelegramConversation,
+    ) -> Result<TelegramConversation, String> {
+        let _ = conversation;
+        Err("Not supported".to_string())
+    }
+
+    /// Get a Telegram conversation by (channel, chat).
+    async fn get_telegram_conversation_by_chat(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+    ) -> Result<Option<TelegramConversation>, String> {
+        let _ = (channel_id, chat_id);
+        Ok(None)
+    }
+
+    /// List recent Telegram conversations for a channel.
+    async fn list_telegram_conversations(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramConversation>, String> {
+        let _ = (channel_id, limit);
+        Ok(vec![])
+    }
+
+    /// Append a message to the Telegram conversation log.
+    async fn create_telegram_conversation_message(
+        &self,
+        message: TelegramConversationMessage,
+    ) -> Result<TelegramConversationMessage, String> {
+        let _ = message;
+        Err("Not supported".to_string())
+    }
+
+    /// List recent messages for a Telegram conversation.
+    async fn list_telegram_conversation_messages(
+        &self,
+        conversation_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramConversationMessage>, String> {
+        let _ = (conversation_id, limit);
+        Ok(vec![])
+    }
+
+    /// Timeout stale WaitingExternal Telegram workflows older than `max_age_secs`.
+    /// Returns the number of workflows timed out.
+    async fn timeout_stale_telegram_workflows(&self, max_age_secs: i64) -> Result<u32, String> {
+        let _ = max_age_secs;
+        Ok(0)
+    }
+
+    /// Register a Telegram webhook update for dedup. Returns true if the
+    /// update was not seen before (first occurrence).
+    async fn register_webhook_update(
+        &self,
+        channel_id: Uuid,
+        update_id: i64,
+    ) -> Result<bool, String> {
+        let _ = (channel_id, update_id);
+        Ok(true)
+    }
+
+    /// Remove webhook dedup entries older than `max_age_secs`.
+    async fn cleanup_webhook_dedup(&self, max_age_secs: i64) -> Result<u32, String> {
+        let _ = max_age_secs;
+        Ok(0)
+    }
+
+    /// Create a Telegram workflow.
+    async fn create_telegram_workflow(
+        &self,
+        workflow: TelegramWorkflow,
+    ) -> Result<TelegramWorkflow, String> {
+        let _ = workflow;
+        Err("Not supported".to_string())
+    }
+
+    /// Update a Telegram workflow.
+    async fn update_telegram_workflow(&self, workflow: TelegramWorkflow) -> Result<(), String> {
+        let _ = workflow;
+        Err("Not supported".to_string())
+    }
+
+    /// List recent Telegram workflows for a channel.
+    async fn list_telegram_workflows(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramWorkflow>, String> {
+        let _ = (channel_id, limit);
+        Ok(vec![])
+    }
+
+    /// Find the newest workflow waiting on a specific target chat.
+    async fn get_pending_telegram_workflow_for_target_chat(
+        &self,
+        channel_id: Uuid,
+        target_chat_id: i64,
+    ) -> Result<Option<TelegramWorkflow>, String> {
+        let _ = (channel_id, target_chat_id);
+        Ok(None)
+    }
+
+    /// Get a pending Telegram workflow for a target chat that expects a reply to a specific request message.
+    async fn get_pending_telegram_workflow_for_target_message(
+        &self,
+        channel_id: Uuid,
+        target_chat_id: i64,
+        request_message_id: i64,
+    ) -> Result<Option<TelegramWorkflow>, String> {
+        let _ = (channel_id, target_chat_id, request_message_id);
+        Ok(None)
+    }
+
+    /// Append an event to a Telegram workflow.
+    async fn create_telegram_workflow_event(
+        &self,
+        event: TelegramWorkflowEvent,
+    ) -> Result<TelegramWorkflowEvent, String> {
+        let _ = event;
+        Err("Not supported".to_string())
+    }
+
+    /// List recent events for a Telegram workflow.
+    async fn list_telegram_workflow_events(
+        &self,
+        workflow_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<TelegramWorkflowEvent>, String> {
+        let _ = (workflow_id, limit);
+        Ok(vec![])
     }
 }
 

@@ -27,7 +27,9 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::ai_providers::{AuthMethod, PendingOAuth, ProviderType};
-use crate::util::{home_dir, internal_error, strip_jsonc_comments, AI_PROVIDERS_PATH};
+use crate::util::{
+    env_var_bool, home_dir, internal_error, strip_jsonc_comments, AI_PROVIDERS_PATH,
+};
 
 /// Anthropic OAuth client ID (from opencode-anthropic-auth plugin)
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -317,7 +319,7 @@ fn google_authorize_url(challenge: &str, state: &str) -> Result<String, String> 
 }
 
 /// Build [`StandardAccount`] entries for all standard (non-custom) providers
-/// that have credentials in OpenCode's `auth.json`.
+/// that have credentials in OpenCode's `auth.json` or the local CLI proxy.
 ///
 /// These are used by chain resolution to include standard providers alongside
 /// custom providers from `AIProviderStore`.
@@ -330,90 +332,278 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
     let mut accounts = Vec::new();
     let mut seen_types = std::collections::HashSet::new();
 
-    // Iterate over all keys in auth.json
-    let Some(auth_map) = auth_obj else {
-        return accounts;
-    };
-
-    for (key, value) in auth_map {
-        let Some(provider_type) = ProviderType::from_id(key.as_str()) else {
-            continue;
-        };
-        // Skip custom/amp providers — they live in AIProviderStore / backend config
-        if provider_type == ProviderType::Custom || provider_type == ProviderType::Amp {
-            continue;
-        }
-        // Extract actual API key from the auth entry.
-        // Check all field name variants for consistency with get_api_key_for_provider.
-        let mut api_key = value
-            .get("key")
-            .or_else(|| value.get("api_key"))
-            .or_else(|| value.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.to_string());
-        let has_oauth = value
-            .get("type")
-            .and_then(|v| v.as_str())
-            .map(|t| t == "oauth")
-            .unwrap_or(false)
-            || value
-                .get("refresh")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.trim().is_empty());
-
-        // OpenAI/Anthropic OAuth entries include an access token that can be
-        // forwarded as a Bearer token for proxy routing.
-        if api_key.is_none()
-            && has_oauth
-            && matches!(
-                provider_type,
-                ProviderType::OpenAI | ProviderType::Anthropic
-            )
-        {
-            api_key = value
-                .get("access")
-                .or_else(|| value.get("access_token"))
-                .or_else(|| value.get("accessToken"))
+    if let Some(auth_map) = auth_obj {
+        // Iterate over all keys in auth.json.
+        for (key, value) in auth_map {
+            let Some(provider_type) = ProviderType::from_id(key.as_str()) else {
+                continue;
+            };
+            // Skip custom/amp providers — they live in AIProviderStore / backend config
+            if provider_type == ProviderType::Custom || provider_type == ProviderType::Amp {
+                continue;
+            }
+            // Extract actual API key from the auth entry.
+            // Check all field name variants for consistency with get_api_key_for_provider.
+            let mut api_key = value
+                .get("key")
+                .or_else(|| value.get("api_key"))
+                .or_else(|| value.get("apiKey"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.to_string());
-        }
+            let original_api_key_present = api_key.is_some();
+            let account_has_oauth = value
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|t| t == "oauth")
+                .unwrap_or(false)
+                || value
+                    .get("refresh")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty());
 
-        // Only include accounts that have credentials we can route with.
-        let has_routable_credentials =
-            api_key.is_some() || (provider_type == ProviderType::Google && has_oauth);
-        if !has_routable_credentials {
-            continue;
-        }
+            // Anthropic OAuth entries include an access token that works as a
+            // Bearer credential at `/v1/messages` (with the oauth-2025-04-20
+            // beta header). OpenAI OAuth JWTs look similar but are only valid
+            // against the Codex `/v1/responses` path — `/v1/chat/completions`
+            // rejects them with 401. Don't hoist OpenAI OAuth to `api_key`
+            // or the chain resolver will route to an endpoint that can never
+            // succeed; leave OpenAI OAuth accounts without an `api_key` so
+            // `has_routable_credentials` excludes them from the pool.
+            let mut oauth_expires_at: Option<i64> = None;
+            if api_key.is_none() && account_has_oauth && provider_type == ProviderType::Anthropic {
+                api_key = value
+                    .get("access")
+                    .or_else(|| value.get("access_token"))
+                    .or_else(|| value.get("accessToken"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string());
+                oauth_expires_at = value
+                    .get("expires")
+                    .or_else(|| value.get("expires_at"))
+                    .and_then(|v| v.as_i64());
+            }
 
-        // Skip duplicates — e.g. "openai" and "codex" both map to OpenAI.
-        // Must come after the api_key check so a keyless alias doesn't
-        // shadow a valid one.
-        if !seen_types.insert(provider_type) {
-            continue;
-        }
+            // `has_oauth` on the resolved account must reflect the credential
+            // we'll actually send, not just whether OAuth info existed in
+            // auth.json. If the user has both an API key and a refresh token
+            // for the same provider, we route with the API key (`x-api-key`),
+            // so `has_oauth=false` to stop the proxy from attaching OAuth-only
+            // Bearer + beta headers. It stays true for hoisted Anthropic OAuth
+            // (api_key was originally None and now holds the access token) and
+            // for Google OAuth-only entries (no api_key; adapter refreshes
+            // from auth.json at request time).
+            let has_oauth = account_has_oauth && !original_api_key_present;
 
-        // Check if this provider is disabled in opencode.json
-        let config_entry = get_provider_config_entry(&opencode_config, provider_type);
-        if let Some(ref entry) = config_entry {
-            if entry.enabled == Some(false) {
+            // Only include accounts that have credentials we can route with.
+            let has_routable_credentials =
+                api_key.is_some() || (provider_type == ProviderType::Google && has_oauth);
+            if !has_routable_credentials {
                 continue;
             }
+
+            // Skip duplicates — e.g. "openai" and "codex" both map to OpenAI.
+            // Must come after the api_key check so a keyless alias doesn't
+            // shadow a valid one.
+            if !seen_types.insert(provider_type) {
+                continue;
+            }
+
+            // Check if this provider is disabled in opencode.json
+            let config_entry = get_provider_config_entry(&opencode_config, provider_type);
+            if let Some(ref entry) = config_entry {
+                if entry.enabled == Some(false) {
+                    continue;
+                }
+            }
+
+            let base_url = config_entry.and_then(|e| e.base_url);
+
+            accounts.push(crate::provider_health::StandardAccount {
+                account_id: crate::provider_health::stable_provider_uuid(provider_type.id()),
+                provider_type,
+                api_key,
+                has_oauth,
+                base_url,
+                oauth_expires_at,
+            });
         }
+    }
 
-        let base_url = config_entry.and_then(|e| e.base_url);
-
+    // Anthropic subscription routing is served by CLI Proxy API, which exposes
+    // an Anthropic/OpenAI-compatible local endpoint backed by Claude accounts.
+    // Those credentials do not live in OpenCode auth.json, so synthesize a
+    // standard Anthropic OAuth account when the proxy has a usable Claude
+    // account. This keeps model-routing chains like `opus` and `opus-6`
+    // selectable without depending on direct Anthropic OAuth/API-key records.
+    //
+    // Respect `enabled == false` in opencode.json — if the user explicitly
+    // disabled Anthropic, don't reintroduce it through the synthetic path.
+    let anthropic_disabled = get_provider_config_entry(&opencode_config, ProviderType::Anthropic)
+        .and_then(|e| e.enabled)
+        == Some(false);
+    if !seen_types.contains(&ProviderType::Anthropic)
+        && !anthropic_disabled
+        && anthropic_cli_proxy_account_available()
+    {
         accounts.push(crate::provider_health::StandardAccount {
-            account_id: crate::provider_health::stable_provider_uuid(provider_type.id()),
-            provider_type,
-            api_key,
-            has_oauth,
-            base_url,
+            account_id: crate::provider_health::stable_provider_uuid("anthropic-cli-proxy"),
+            provider_type: ProviderType::Anthropic,
+            api_key: None,
+            has_oauth: true,
+            base_url: None,
+            // Freshness of the underlying CLI-proxy credential is checked
+            // at availability time (`has_fresh_cli_proxy_*`); once this
+            // synthetic entry is added we don't want the chain resolver
+            // to drop it for "missing expiry". Use a far-future sentinel
+            // so any future code that defaults None to 0 still keeps it.
+            oauth_expires_at: Some(i64::MAX),
+        });
+    }
+
+    // Same pattern for OpenAI (ChatGPT Plus/Pro OAuth). The Codex OAuth JWT
+    // isn't valid against `api.openai.com/v1/chat/completions` directly, but
+    // the CLI proxy exposes an OpenAI-compatible endpoint that translates it
+    // to the Codex `/v1/responses` API internally. So when we have no API
+    // key and the proxy has fresh codex credentials, let chains route through
+    // the proxy instead of giving up.
+    let openai_disabled = get_provider_config_entry(&opencode_config, ProviderType::OpenAI)
+        .and_then(|e| e.enabled)
+        == Some(false);
+    if !seen_types.contains(&ProviderType::OpenAI)
+        && !openai_disabled
+        && openai_cli_proxy_account_available()
+    {
+        accounts.push(crate::provider_health::StandardAccount {
+            account_id: crate::provider_health::stable_provider_uuid("openai-cli-proxy"),
+            provider_type: ProviderType::OpenAI,
+            api_key: None,
+            has_oauth: true,
+            base_url: None,
+            // Freshness of the underlying CLI-proxy credential is checked
+            // at availability time (`has_fresh_cli_proxy_*`); once this
+            // synthetic entry is added we don't want the chain resolver
+            // to drop it for "missing expiry". Use a far-future sentinel
+            // so any future code that defaults None to 0 still keeps it.
+            oauth_expires_at: Some(i64::MAX),
         });
     }
 
     accounts
+}
+
+pub(crate) fn anthropic_cli_proxy_account_available() -> bool {
+    if env_var_bool("CLAUDE_CODE_DISABLE_CLI_PROXY", false) {
+        return false;
+    }
+
+    crate::util::any_cli_proxy_env_configured() || has_fresh_cli_proxy_claude_account()
+}
+
+fn has_fresh_cli_proxy_claude_account() -> bool {
+    has_fresh_cli_proxy_account_of_type("claude-", "claude")
+}
+
+/// True when the CLI Proxy API has at least one fresh Codex (ChatGPT
+/// Plus/Pro OAuth) credential on disk. Used to decide whether the
+/// `openai-cli-proxy` synthetic standard account is worth adding to
+/// chains — without a live upstream credential the proxy would 401 on
+/// every request, so keeping it out of the chain avoids wasted attempts.
+pub(crate) fn has_fresh_cli_proxy_codex_account() -> bool {
+    has_fresh_cli_proxy_account_of_type("codex-", "codex")
+}
+
+/// Scan the CLI proxy's auth directory for entries with
+/// `name.starts_with(file_prefix)` and `type == type_tag`, returning true
+/// as soon as one is enabled and has a non-empty access_token that hasn't
+/// expired. Shared by Claude and Codex because the directory layout and
+/// file shape are identical across providers.
+fn has_fresh_cli_proxy_account_of_type(file_prefix: &str, type_tag: &str) -> bool {
+    let mut dirs = Vec::new();
+    if let Ok(dir) = std::env::var("CLI_PROXY_AUTH_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            dirs.push(std::path::PathBuf::from(trimmed));
+        }
+    }
+    dirs.push(std::path::PathBuf::from("/root/.cli-proxy-api"));
+
+    let now = chrono::Utc::now();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with(file_prefix) && name.ends_with(".json")) {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                continue;
+            };
+            if value
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if value.get("type").and_then(|v| v.as_str()) != Some(type_tag) {
+                continue;
+            }
+            let has_access = value
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_access {
+                continue;
+            }
+            // CLIProxyAPI writes the expiry as `expired` (an RFC3339 string)
+            // today, but also check `expires`/`expires_at` so a future rename
+            // or an alternate proxy schema is caught.
+            //
+            // Missing or unparseable expiry fields are treated as **not
+            // fresh** — if we can't tell, assume expired. Otherwise a
+            // malformed credential file would force traffic through a
+            // proxy that's about to 401 on every request.
+            let expiry_str = value
+                .get("expired")
+                .or_else(|| value.get("expires"))
+                .or_else(|| value.get("expires_at"))
+                .and_then(|v| v.as_str());
+            let Some(expired) = expiry_str else {
+                continue;
+            };
+            if let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expired) {
+                if expires_at.with_timezone(&chrono::Utc) > now {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Equivalent of `anthropic_cli_proxy_account_available` for OpenAI
+/// (Codex) OAuth. The OpenAI CLI-proxy path only makes sense when a
+/// Codex OAuth JWT is available on disk — the proxy translates that
+/// token into Codex `/v1/responses` calls. Explicit `CLAUDE_CODE_PROXY_*`
+/// env vars alone (common for Anthropic-only deployments) are *not*
+/// enough: without a Codex credential the proxy 401s on every request.
+pub(crate) fn openai_cli_proxy_account_available() -> bool {
+    if env_var_bool("CLAUDE_CODE_DISABLE_CLI_PROXY", false) {
+        return false;
+    }
+
+    has_fresh_cli_proxy_codex_account()
 }
 
 /// Create AI provider routes.
@@ -442,7 +632,7 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Claude Code authentication material.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeCodeAuth {
     ApiKey(String),
     OAuthToken(String),
@@ -916,6 +1106,8 @@ fn load_ai_providers(working_dir: &Path) -> Vec<serde_json::Value> {
 /// Get all Anthropic credentials from ai_providers.json, sorted by priority.
 fn get_all_anthropic_auth_from_ai_providers(working_dir: &Path) -> Vec<ClaudeCodeAuth> {
     let providers = load_ai_providers(working_dir);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let freshness_buffer_ms = 60_000;
 
     // Collect (priority, insertion_index, auth) for deterministic sorting.
     // The insertion index breaks ties when multiple accounts share the same priority.
@@ -949,6 +1141,18 @@ fn get_all_anthropic_auth_from_ai_providers(working_dir: &Path) -> Vec<ClaudeCod
         // Check for OAuth access token
         if let Some(oauth) = provider.get("oauth") {
             if let Some(access_token) = oauth.get("access_token").and_then(|v| v.as_str()) {
+                let expires_at = oauth
+                    .get("expires_at")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                if expires_at <= now_ms + freshness_buffer_ms {
+                    tracing::warn!(
+                        provider_id = provider.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                        expires_at = expires_at,
+                        "Skipping expired Anthropic OAuth credential from ai_providers.json"
+                    );
+                    continue;
+                }
                 if !access_token.is_empty() {
                     entries.push((
                         priority,
@@ -1161,7 +1365,7 @@ fn get_all_amp_keys_from_ai_providers(working_dir: &Path) -> Vec<String> {
 ///     "accessToken": "sk-ant-oat01-...",
 ///     "expiresAt": 1769395897294,
 ///     "refreshToken": "sk-ant-ort01-...",
-///     "scopes": ["user:inference", "user:profile"]
+///     "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
 ///   }
 /// }
 /// ```
@@ -1725,6 +1929,8 @@ pub struct UpdateProviderRequest {
     pub enabled: Option<bool>,
     /// Which backends this provider is used for (e.g., ["opencode", "claudecode"])
     pub use_for_backends: Option<Vec<String>>,
+    /// Account identifier (email) — set by frontend when server-side userinfo fails
+    pub account_email: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2308,7 +2514,7 @@ pub(crate) fn write_claudecode_credentials_from_entry(
         "accessToken": access_token,
         "refreshToken": refresh_token,
         "expiresAt": expires_at,
-        "scopes": ["user:inference", "user:profile"]
+        "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
     });
 
     let contents = serde_json::to_string_pretty(&credentials)
@@ -2836,6 +3042,10 @@ fn acquire_oauth_refresh_lock(provider_type: ProviderType) -> Result<std::fs::Fi
 /// Updates auth.json with the new access token and expiry.
 /// Uses file-based locking to prevent concurrent refresh attempts.
 pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
+    refresh_anthropic_oauth_token_inner(false).await
+}
+
+async fn refresh_anthropic_oauth_token_inner(force: bool) -> Result<(), String> {
     // Acquire exclusive lock to prevent race conditions
     let _lock = match acquire_oauth_refresh_lock(ProviderType::Anthropic) {
         Ok(lock) => lock,
@@ -2867,7 +3077,7 @@ pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
     let entry = read_oauth_token_entry(ProviderType::Anthropic)
         .ok_or_else(|| "No Anthropic OAuth entry found".to_string())?;
 
-    if !oauth_token_expired(entry.expires_at) {
+    if !force && !oauth_token_expired(entry.expires_at) {
         tracing::info!("Token is no longer expired, skipping refresh");
         return Ok(());
     }
@@ -2914,7 +3124,9 @@ pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
             || status == reqwest::StatusCode::UNAUTHORIZED)
             && lower.contains("invalid_grant")
         {
-            // Before deleting credentials, check if another process just refreshed the token
+            // Before deleting credentials, check if another process just refreshed the token.
+            // Anthropic rotates refresh tokens, so an unchanged token is still the revoked one
+            // even if its local expiry timestamp is in the future.
             tracing::warn!(
                 "Received invalid_grant error. Checking if token was recently refreshed..."
             );
@@ -2922,17 +3134,12 @@ pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
             // Wait a moment and re-read credentials
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-            // Re-read token entry to see if it was updated
+            // Re-read token entry to see if it was updated.
             if let Some(updated_entry) = read_oauth_token_entry(ProviderType::Anthropic) {
-                // Check if the refresh token changed (indicating a recent refresh)
-                if updated_entry.refresh_token != refresh_token {
+                let token_changed = updated_entry.refresh_token != refresh_token
+                    || updated_entry.access_token != entry.access_token;
+                if token_changed && !oauth_token_expired(updated_entry.expires_at) {
                     tracing::info!("Token was refreshed by another process after invalid_grant");
-                    return Ok(());
-                }
-
-                // Check if access token is now valid
-                if !oauth_token_expired(updated_entry.expires_at) {
-                    tracing::info!("Token is now valid after invalid_grant");
                     return Ok(());
                 }
             }
@@ -3002,6 +3209,56 @@ pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
     Ok(())
 }
 
+/// Exchange an Anthropic refresh token for fresh credentials.
+///
+/// Pure HTTP exchange — no side effects on any credential store. Callers are
+/// responsible for persisting the returned credentials wherever they're
+/// needed (per-provider record, opencode auth.json, etc.).
+pub async fn exchange_anthropic_refresh_token(
+    refresh_token: &str,
+) -> Result<crate::ai_providers::OAuthCredentials, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://console.anthropic.com/v1/oauth/token")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", ANTHROPIC_CLIENT_ID),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("Failed to refresh token: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Token refresh failed ({}): {}", status, body));
+    }
+
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse token response: {}", e))?;
+
+    let access_token = data["access_token"]
+        .as_str()
+        .ok_or_else(|| "No access_token in refresh response".to_string())?
+        .to_string();
+    let new_refresh_token = data["refresh_token"]
+        .as_str()
+        .ok_or_else(|| "No refresh_token in refresh response".to_string())?
+        .to_string();
+    let expires_in = data["expires_in"].as_i64().unwrap_or(3600);
+    let expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
+
+    Ok(crate::ai_providers::OAuthCredentials {
+        access_token,
+        refresh_token: new_refresh_token,
+        expires_at,
+    })
+}
+
 /// Ensure the Anthropic OAuth token is valid, refreshing if needed.
 /// This should be called before starting a mission that uses Claude Code.
 pub async fn ensure_anthropic_oauth_token_valid() -> Result<(), String> {
@@ -3011,6 +3268,14 @@ pub async fn ensure_anthropic_oauth_token_valid() -> Result<(), String> {
 
     tracing::info!("Anthropic OAuth token is expired or expiring soon, refreshing...");
     refresh_anthropic_oauth_token().await
+}
+
+/// Force-refresh the Anthropic OAuth token regardless of local expiry.
+/// Used when the API rejects a token that hasn't locally expired yet
+/// (e.g., token was revoked server-side or rotated by another process).
+pub async fn force_refresh_anthropic_oauth_token() -> Result<(), String> {
+    tracing::info!("Force-refreshing Anthropic OAuth token (server-side revocation suspected)");
+    refresh_anthropic_oauth_token_inner(true).await
 }
 
 /// Refresh the OpenAI OAuth token using the refresh token.
@@ -3331,7 +3596,7 @@ pub async fn ensure_google_oauth_token_valid() -> Result<(), String> {
 ///     "accessToken": "sk-ant-oat01-...",
 ///     "refreshToken": "sk-ant-ort01-...",
 ///     "expiresAt": 1748658860401,
-///     "scopes": ["user:inference", "user:profile"]
+///     "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
 ///   }
 /// }
 /// ```
@@ -3362,7 +3627,7 @@ pub fn write_claudecode_credentials_to_path(
         "accessToken": entry.access_token,
         "refreshToken": entry.refresh_token,
         "expiresAt": entry.expires_at,
-        "scopes": ["user:inference", "user:profile"]
+        "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
     });
 
     let contents = serde_json::to_string_pretty(&credentials)
@@ -4038,29 +4303,70 @@ fn extract_email_from_jwt(token: &str) -> Option<String> {
 /// Anthropic's OAuth token response doesn't include an `id_token` or email claim.
 pub async fn fetch_anthropic_account_email(access_token: &str) -> Option<String> {
     let client = reqwest::Client::new();
-    let resp = client
-        .get("https://console.anthropic.com/v1/oauth/userinfo")
-        .header("Authorization", format!("Bearer {}", access_token))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        tracing::debug!(
-            status = %resp.status(),
-            "Anthropic userinfo endpoint returned non-success"
-        );
-        return None;
+
+    // Try GET first, then POST if Cloudflare blocks GET
+    for method in &["GET", "POST"] {
+        let req = if *method == "GET" {
+            client
+                .get("https://console.anthropic.com/v1/oauth/userinfo")
+                .header("Authorization", format!("Bearer {}", access_token))
+        } else {
+            client
+                .post("https://console.anthropic.com/v1/oauth/userinfo")
+                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Content-Type", "application/json")
+                .body("{}")
+        };
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    method = method,
+                    error = %e,
+                    "Anthropic userinfo request failed (network error)"
+                );
+                continue;
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body_preview = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>();
+            tracing::warn!(
+                method = method,
+                status = %status,
+                body_preview = %body_preview,
+                "Anthropic userinfo endpoint returned non-success (Cloudflare block?)"
+            );
+            continue;
+        }
+        let data: serde_json::Value = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(method = method, error = %e, "Failed to parse userinfo response");
+                continue;
+            }
+        };
+        let email = data
+            .get("email")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                data.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+        if email.is_some() {
+            return email;
+        }
     }
-    let data: serde_json::Value = resp.json().await.ok()?;
-    data.get("email")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            // Some providers use "name" or "id" as fallback identifier
-            data.get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
+    None
 }
 
 /// Fetch account email from Google's userinfo endpoint using an access token.
@@ -4113,6 +4419,14 @@ fn extract_and_save_account_email(
         .or_else(|| {
             token_data
                 .get("email")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            // Anthropic token responses include account.email_address
+            token_data
+                .get("account")
+                .and_then(|a| a.get("email_address"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         });
@@ -4790,111 +5104,116 @@ async fn get_provider_usage(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Resolve provider credentials: check AIProviderStore first, then OpenCode auth
-    let (provider_type, api_key_opt, oauth, account_email, provider_name) = if let Ok(uuid) =
-        uuid::Uuid::parse_str(&id)
-    {
-        // UUID lookup for custom providers
-        let provider = state
-            .ai_providers
-            .get(uuid)
-            .await
-            .ok_or((StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
-        (
-            provider.provider_type,
-            provider.api_key.clone(),
-            provider.oauth.clone(),
-            provider.account_email.clone(),
-            provider.name.clone(),
-        )
-    } else if let Some(pt) = ProviderType::from_id(&id) {
-        // Try AIProviderStore first
-        if let Some(provider) = state.ai_providers.get_by_type(pt).await {
+    // Resolve provider credentials: check AIProviderStore first, then OpenCode auth.
+    // `provider_uuid` is `Some` when the credentials live in AIProviderStore and we
+    // can persist a refreshed OAuth back into that specific record.
+    let (provider_type, api_key_opt, oauth, account_email, provider_name, provider_uuid) =
+        if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+            // UUID lookup for custom providers
+            let provider = state
+                .ai_providers
+                .get(uuid)
+                .await
+                .ok_or((StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
             (
                 provider.provider_type,
                 provider.api_key.clone(),
                 provider.oauth.clone(),
                 provider.account_email.clone(),
                 provider.name.clone(),
+                Some(uuid),
             )
-        } else {
-            // Fall back to OpenCode auth: check both central auth.json
-            // and per-provider auth files (~/.opencode/auth/{provider}.json)
-            let auth = read_opencode_auth().map_err(internal_error)?;
-            let accounts_state = read_provider_accounts_state(&state.config.working_dir);
-            let account_email = accounts_state.get(pt.id()).cloned();
-
-            // Collect all auth entries: central + per-provider file
-            let mut auth_entries: Vec<&serde_json::Value> = opencode_auth_keys(pt)
-                .into_iter()
-                .filter_map(|key| auth.get(key))
-                .collect();
-            // Also read per-provider auth file
-            let provider_auth_path = get_opencode_provider_auth_path(pt);
-            let provider_auth_value: Option<serde_json::Value> = if provider_auth_path.exists() {
-                std::fs::read_to_string(&provider_auth_path)
-                    .ok()
-                    .and_then(|c| serde_json::from_str(&c).ok())
+        } else if let Some(pt) = ProviderType::from_id(&id) {
+            // Try AIProviderStore first
+            if let Some(provider) = state.ai_providers.get_by_type(pt).await {
+                (
+                    provider.provider_type,
+                    provider.api_key.clone(),
+                    provider.oauth.clone(),
+                    provider.account_email.clone(),
+                    provider.name.clone(),
+                    Some(provider.id),
+                )
             } else {
-                None
-            };
-            if let Some(ref pav) = provider_auth_value {
-                auth_entries.push(pav);
+                // Fall back to OpenCode auth: check both central auth.json
+                // and per-provider auth files (~/.opencode/auth/{provider}.json)
+                let auth = read_opencode_auth().map_err(internal_error)?;
+                let accounts_state = read_provider_accounts_state(&state.config.working_dir);
+                let account_email = accounts_state.get(pt.id()).cloned();
+
+                // Collect all auth entries: central + per-provider file
+                let mut auth_entries: Vec<&serde_json::Value> = opencode_auth_keys(pt)
+                    .into_iter()
+                    .filter_map(|key| auth.get(key))
+                    .collect();
+                // Also read per-provider auth file
+                let provider_auth_path = get_opencode_provider_auth_path(pt);
+                let provider_auth_value: Option<serde_json::Value> = if provider_auth_path.exists()
+                {
+                    std::fs::read_to_string(&provider_auth_path)
+                        .ok()
+                        .and_then(|c| serde_json::from_str(&c).ok())
+                } else {
+                    None
+                };
+                if let Some(ref pav) = provider_auth_value {
+                    auth_entries.push(pav);
+                }
+
+                let api_key = auth_entries.iter().find_map(|v| {
+                    v.get("key")
+                        .or_else(|| v.get("api_key"))
+                        .or_else(|| v.get("apiKey"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                });
+
+                let oauth_creds = auth_entries.iter().find_map(|entry| {
+                    let access = entry
+                        .get("access")
+                        .or_else(|| entry.get("access_token"))
+                        .and_then(|v| v.as_str())?;
+                    let refresh = entry
+                        .get("refresh")
+                        .or_else(|| entry.get("refresh_token"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let expires_at = entry
+                        .get("expires")
+                        .or_else(|| entry.get("expires_at"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    Some(crate::ai_providers::OAuthCredentials {
+                        access_token: access.to_string(),
+                        refresh_token: refresh,
+                        expires_at,
+                    })
+                });
+
+                if api_key.is_none() && oauth_creds.is_none() {
+                    return Ok(Json(serde_json::json!({
+                        "provider_type": pt.id(),
+                        "provider_name": pt.display_name(),
+                        "error": "No credentials found"
+                    })));
+                }
+
+                (
+                    pt,
+                    api_key,
+                    oauth_creds,
+                    account_email,
+                    pt.display_name().to_string(),
+                    None,
+                )
             }
-
-            let api_key = auth_entries.iter().find_map(|v| {
-                v.get("key")
-                    .or_else(|| v.get("api_key"))
-                    .or_else(|| v.get("apiKey"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            });
-
-            let oauth_creds = auth_entries.iter().find_map(|entry| {
-                let access = entry
-                    .get("access")
-                    .or_else(|| entry.get("access_token"))
-                    .and_then(|v| v.as_str())?;
-                let refresh = entry
-                    .get("refresh")
-                    .or_else(|| entry.get("refresh_token"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let expires_at = entry
-                    .get("expires")
-                    .or_else(|| entry.get("expires_at"))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                Some(crate::ai_providers::OAuthCredentials {
-                    access_token: access.to_string(),
-                    refresh_token: refresh,
-                    expires_at,
-                })
-            });
-
-            if api_key.is_none() && oauth_creds.is_none() {
-                return Ok(Json(serde_json::json!({
-                    "provider_type": pt.id(),
-                    "provider_name": pt.display_name(),
-                    "error": "No credentials found"
-                })));
-            }
-
-            (
-                pt,
-                api_key,
-                oauth_creds,
-                account_email,
-                pt.display_name().to_string(),
-            )
-        }
-    } else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("Invalid provider ID: {}", id),
-        ));
-    };
+        } else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("Invalid provider ID: {}", id),
+            ));
+        };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -4904,24 +5223,82 @@ async fn get_provider_usage(
     // Determine how to call each provider for rate-limit info
     let usage_result = match provider_type {
         ProviderType::Anthropic => {
-            // Use API key or OAuth access token
-            let auth = if let Some(ref key) = api_key_opt {
-                key.clone()
+            // Use API key or OAuth access token. OAuth credentials must be
+            // sent as a Bearer token with the oauth-2025-04-20 beta header
+            // — sending them as `x-api-key` gets rejected with 401, which
+            // is what users on a Claude subscription (no api_key, OAuth only)
+            // were seeing while their missions still worked via Claude Code.
+            let (auth, is_oauth) = if let Some(ref key) = api_key_opt {
+                (key.clone(), false)
             } else if let Some(ref o) = oauth {
-                // Refresh the token if expired before using it
+                // Refresh the token if expired before using it.
+                //
+                // When the provider lives in AIProviderStore (UUID-based
+                // lookup), refresh using that record's own refresh_token and
+                // persist the new credentials back into the same record —
+                // refresh_anthropic_oauth_token() only touches the shared
+                // opencode auth.json, so without this we'd silently reuse a
+                // months-stale access_token and surface as HTTP 401.
                 if oauth_token_expired(o.expires_at) {
-                    if let Err(e) = refresh_anthropic_oauth_token().await {
-                        tracing::warn!(
-                            "Failed to refresh Anthropic OAuth token for usage check: {}",
-                            e
-                        );
+                    let (token, refresh_err) = if let Some(uuid) = provider_uuid {
+                        match exchange_anthropic_refresh_token(&o.refresh_token).await {
+                            Ok(fresh) => {
+                                let access = fresh.access_token.clone();
+                                if state
+                                    .ai_providers
+                                    .set_oauth_credentials(uuid, fresh)
+                                    .await
+                                    .is_none()
+                                {
+                                    tracing::warn!(
+                                        provider_id = %uuid,
+                                        "Provider disappeared while persisting refreshed OAuth credentials"
+                                    );
+                                }
+                                (access, None)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    provider_id = %uuid,
+                                    "Per-provider Anthropic OAuth refresh failed: {}",
+                                    e
+                                );
+                                (o.access_token.clone(), Some(e))
+                            }
+                        }
+                    } else {
+                        if let Err(e) = refresh_anthropic_oauth_token().await {
+                            tracing::warn!(
+                                "Failed to refresh Anthropic OAuth token for usage check: {}",
+                                e
+                            );
+                        }
+                        let tok = read_oauth_token_entry(ProviderType::Anthropic)
+                            .map(|entry| entry.access_token)
+                            .unwrap_or_else(|| o.access_token.clone());
+                        (tok, None)
+                    };
+                    // If the refresh_token itself is dead, short-circuit with a
+                    // clear message — probing Anthropic with the stale
+                    // access_token would just return HTTP 401 and hide the real
+                    // problem (the user needs to re-authenticate).
+                    if let Some(err) = refresh_err {
+                        let lower = err.to_lowercase();
+                        if lower.contains("invalid_grant")
+                            || lower.contains("refresh token not found")
+                        {
+                            return Ok(Json(serde_json::json!({
+                                "provider_type": "anthropic",
+                                "provider_name": provider_name,
+                                "account_email": account_email,
+                                "status_code": 401,
+                                "error": "Refresh token revoked — please re-authenticate this account",
+                            })));
+                        }
                     }
-                    // Re-read the fresh token from auth.json
-                    read_oauth_token_entry(ProviderType::Anthropic)
-                        .map(|entry| entry.access_token)
-                        .unwrap_or_else(|| o.access_token.clone())
+                    (token, true)
                 } else {
-                    o.access_token.clone()
+                    (o.access_token.clone(), true)
                 }
             } else {
                 return Ok(Json(serde_json::json!({
@@ -4933,18 +5310,35 @@ async fn get_provider_usage(
             };
 
             // Minimal messages API call to get rate limit headers
-            let resp = client
+            let mut req_builder = client
                 .post("https://api.anthropic.com/v1/messages")
-                .header("x-api-key", &auth)
                 .header("anthropic-version", "2023-06-01")
-                .header("Content-Type", "application/json")
-                .json(&serde_json::json!({
+                .header("Content-Type", "application/json");
+            if is_oauth {
+                req_builder = req_builder
+                    .header("Authorization", format!("Bearer {}", auth))
+                    .header("anthropic-beta", "oauth-2025-04-20");
+            } else {
+                req_builder = req_builder.header("x-api-key", &auth);
+            }
+            // OAuth subscription tokens are only accepted when the request
+            // identifies itself as Claude Code via the system prompt; API-key
+            // requests don't need it, but including it is harmless.
+            let body = if is_oauth {
+                serde_json::json!({
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1,
+                    "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+            } else {
+                serde_json::json!({
                     "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 1,
                     "messages": [{"role": "user", "content": "hi"}]
-                }))
-                .send()
-                .await;
+                })
+            };
+            let resp = req_builder.json(&body).send().await;
 
             match resp {
                 Ok(r) => {
@@ -4971,6 +5365,24 @@ async fn get_provider_usage(
                         .and_then(|v| v.to_str().ok())
                     {
                         map.insert("organization_id".to_string(), serde_json::json!(org));
+
+                        // Persist the org onto the provider record so the
+                        // chain resolver can group credentials of the same
+                        // subscription under one shared cooldown — see
+                        // `store_account_subscription_key`.
+                        if let Some(uuid) = provider_uuid {
+                            if state
+                                .ai_providers
+                                .set_organization_id(uuid, org.to_string())
+                                .await
+                                .is_none()
+                            {
+                                tracing::warn!(
+                                    provider_id = %uuid,
+                                    "Provider disappeared while persisting organization_id"
+                                );
+                            }
+                        }
                     }
 
                     // Try new unified rate limit headers (Anthropic 2025+)
@@ -5596,6 +6008,19 @@ async fn update_provider(
     }
     if let Some(ref backends) = req.use_for_backends {
         updated.use_for_backends = Some(backends.clone());
+    }
+    if let Some(ref email) = req.account_email {
+        updated.account_email = Some(email.clone());
+        // Also persist to provider_accounts.json for list endpoint
+        if let Err(e) =
+            update_provider_account(&state.config.working_dir, &uuid.to_string(), email.clone())
+        {
+            tracing::warn!(
+                provider = %uuid,
+                error = %e,
+                "Failed to persist provider account email"
+            );
+        }
     }
 
     let result = state
@@ -6337,7 +6762,7 @@ async fn oauth_callback_inner(
                     Some(AuthKind::ApiKey),
                     default_provider,
                     backends,
-                    account_email,
+                    account_email.clone(),
                 );
 
                 tracing::info!("Created API key for provider: {} ({})", response.name, id);
@@ -6458,7 +6883,7 @@ async fn oauth_callback_inner(
                     Some(AuthKind::OAuth),
                     default_provider,
                     backends,
-                    account_email,
+                    account_email.clone(),
                 );
 
                 Ok(Json(response))
