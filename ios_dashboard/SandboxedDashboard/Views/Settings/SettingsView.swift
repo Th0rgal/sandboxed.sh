@@ -131,6 +131,10 @@ struct SettingsView: View {
                                         .textInputAutocapitalization(.never)
                                         .autocorrectionDisabled()
                                         .keyboardType(.URL)
+                                        .submitLabel(.done)
+                                        .onSubmit {
+                                            Task { await testConnection() }
+                                        }
                                         .padding(.horizontal, 16)
                                         .padding(.vertical, 14)
                                         .background(Color.white.opacity(0.05))
@@ -225,10 +229,30 @@ struct SettingsView: View {
                                             .tint(Theme.accent)
                                     }
 
-                                    if !FidoApprovalState.shared.autoApprovalRules.isEmpty {
-                                        Divider()
-                                            .background(Theme.border)
+                                    Divider()
+                                        .background(Theme.border)
 
+                                    if FidoApprovalState.shared.autoApprovalRules.isEmpty {
+                                        // Without this hint, an empty Auto-Approval section is
+                                        // invisible — users can't tell the feature exists, let
+                                        // alone how rules accumulate. Surface the explanation
+                                        // up-front so first-run state isn't a blank divider.
+                                        HStack(alignment: .top, spacing: 10) {
+                                            Image(systemName: "checkmark.shield")
+                                                .font(.system(size: 16, weight: .medium))
+                                                .foregroundStyle(Theme.textTertiary)
+                                                .frame(width: 24)
+                                            VStack(alignment: .leading, spacing: 4) {
+                                                Text("No auto-approval rules yet")
+                                                    .font(.subheadline.weight(.medium))
+                                                    .foregroundStyle(Theme.textPrimary)
+                                                Text("When you approve a signing request, you can save the choice as a rule so future identical requests skip the prompt.")
+                                                    .font(.caption)
+                                                    .foregroundStyle(Theme.textSecondary)
+                                                    .fixedSize(horizontal: false, vertical: true)
+                                            }
+                                        }
+                                    } else {
                                         AutoApprovalRulesView()
 
                                         Button {

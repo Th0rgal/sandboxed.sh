@@ -924,12 +924,18 @@ struct ControlView: View {
                     .font(.title2.bold())
                     .foregroundStyle(Theme.textPrimary)
 
-                Text(emptyStateSubtitle)
+                Text("Send a message to start a new mission")
                     .font(.subheadline)
                     .foregroundStyle(Theme.textSecondary)
                     .multilineTextAlignment(.center)
                     .lineSpacing(4)
             }
+
+            // Context chips: gives a first-run user visual confirmation of
+            // *where* the next message lands and *which* agent will pick it
+            // up. Without these, the empty state hides this state behind
+            // the toolbar — easy to miss on a fresh install.
+            emptyStateContextChips
 
             Spacer()
             Spacer()
@@ -937,15 +943,62 @@ struct ControlView: View {
         .padding(.horizontal, 32)
     }
 
-    private var emptyStateSubtitle: String {
-        if let workspace = workspaceState.selectedWorkspace {
-            if workspace.isDefault {
-                return "Send a message to start working\non the host environment"
-            } else {
-                return "Send a message to start working\nin \(workspace.name)"
+    private var emptyStateContextChips: some View {
+        HStack(spacing: 8) {
+            if let workspace = workspaceState.selectedWorkspace {
+                emptyStateChip(
+                    icon: workspace.isDefault ? "macbook" : "shippingbox",
+                    label: workspace.isDefault ? "Host" : workspace.name,
+                    tint: Theme.accent
+                )
+            }
+            if let agentChip = defaultAgentChipInfo {
+                emptyStateChip(
+                    icon: agentChip.icon,
+                    label: agentChip.label,
+                    tint: agentChip.tint
+                )
             }
         }
-        return "Send a message to start working\nwith the AI agent"
+    }
+
+    private func emptyStateChip(icon: String, label: String, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+            Text(label)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(tint.opacity(0.12))
+        .clipShape(Capsule())
+        .overlay(
+            Capsule().stroke(tint.opacity(0.25), lineWidth: 0.5)
+        )
+    }
+
+    /// Resolve the saved default agent into a chip, or `nil` if the user
+    /// hasn't saved one (in which case the picker fires on first send).
+    private var defaultAgentChipInfo: (icon: String, label: String, tint: Color)? {
+        guard
+            let saved = UserDefaults.standard.string(forKey: "default_agent"),
+            !saved.isEmpty,
+            let parsed = CombinedAgent.parse(saved)
+        else {
+            return nil
+        }
+        let icon: String
+        let tint: Color
+        switch parsed.backend {
+        case "opencode": icon = "terminal"; tint = Theme.success
+        case "claudecode": icon = "brain"; tint = Theme.accent
+        case "amp": icon = "bolt.fill"; tint = .orange
+        default: icon = "cpu"; tint = Theme.accent
+        }
+        return (icon, parsed.agent, tint)
     }
     
     private func suggestionChip(_ text: String) -> some View {
@@ -2916,6 +2969,13 @@ private struct MessageBubble: View {
                             topTrailingRadius: 20
                         )
                     )
+                    .contextMenu {
+                        Button {
+                            onCopy?()
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                        }
+                    }
 
                 // Timestamp
                 Text(message.timestamp, style: .time)
@@ -2924,7 +2984,7 @@ private struct MessageBubble: View {
             }
         }
     }
-    
+
     private var assistantBubble: some View {
         HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 8) {
@@ -2984,6 +3044,13 @@ private struct MessageBubble: View {
                         RoundedRectangle(cornerRadius: 20, style: .continuous)
                             .stroke(Theme.border, lineWidth: 0.5)
                     )
+                    .contextMenu {
+                        Button {
+                            onCopy?()
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                        }
+                    }
 
                 // Render shared files
                 if let files = message.sharedFiles, !files.isEmpty {
@@ -3225,19 +3292,22 @@ private struct SharedFileCardView: View {
 private struct CopyButton: View {
     let isCopied: Bool
     let onCopy: (() -> Void)?
-    
+
     var body: some View {
         Button {
             onCopy?()
         } label: {
             Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
-                .font(.system(size: 12))
-                .foregroundStyle(isCopied ? Theme.success : Theme.textMuted)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(isCopied ? Theme.success : Theme.textSecondary)
                 .frame(width: 28, height: 28)
                 .background(Theme.backgroundSecondary)
                 .clipShape(Circle())
+                .overlay(
+                    Circle().stroke(Theme.border, lineWidth: 0.5)
+                )
         }
-        .opacity(0.7)
+        .accessibilityLabel(isCopied ? "Copied" : "Copy message")
     }
 }
 
@@ -3599,7 +3669,11 @@ private struct ThinkingBubble: View {
             // Expandable content
             if isExpanded && !message.content.isEmpty {
                 ScrollView {
-                    Text(message.content)
+                    // Inline a blinking caret while streaming so the user can
+                    // distinguish in-flight tokens from a settled thought.
+                    // Without this, a paused stream looks identical to a
+                    // completed one.
+                    (Text(message.content) + (message.thinkingDone ? Text("") : Text(" ▍").foregroundColor(Theme.accent)))
                         .font(.caption)
                         .foregroundStyle(Theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .leading)

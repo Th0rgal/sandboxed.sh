@@ -16,7 +16,7 @@ struct WorkspacesView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            Theme.backgroundPrimary.ignoresSafeArea()
 
             if isLoading {
                 ProgressView()
@@ -172,7 +172,7 @@ struct WorkspaceDetailView: View {
     var body: some View {
         NavigationView {
             ZStack {
-                Color.black.ignoresSafeArea()
+                Theme.backgroundPrimary.ignoresSafeArea()
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
@@ -251,11 +251,17 @@ struct NewWorkspaceSheet: View {
     var body: some View {
         NavigationView {
             ZStack {
-                Color.black.ignoresSafeArea()
+                Theme.backgroundPrimary.ignoresSafeArea()
 
                 VStack(spacing: 20) {
                     TextField("Workspace Name", text: $name)
                         .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .submitLabel(.done)
+                        .onSubmit {
+                            if !name.isEmpty && !isCreating { createWorkspace() }
+                        }
 
                     Picker("Type", selection: $workspaceType) {
                         Text("Host").tag(WorkspaceType.host)

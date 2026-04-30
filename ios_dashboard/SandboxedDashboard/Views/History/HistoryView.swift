@@ -139,10 +139,19 @@ struct HistoryView: View {
                             actionLabel: "Retry"
                         )
                     } else if filteredMissions.isEmpty && tasks.isEmpty {
+                        // Empty state used to be a dead end; the "Start a
+                        // mission" CTA gives the user a one-tap path back to
+                        // Control on first launch instead of leaving them
+                        // stuck on a tab with nothing in it.
                         EmptyStateView(
                             icon: "clock.arrow.circlepath",
                             title: "No History",
-                            message: "Your missions will appear here"
+                            message: "Missions you run will show up here once you've started one.",
+                            action: {
+                                nav.selectedTab = .control
+                                HapticService.lightTap()
+                            },
+                            actionLabel: "Start a mission"
                         )
                     } else {
                         missionsList
