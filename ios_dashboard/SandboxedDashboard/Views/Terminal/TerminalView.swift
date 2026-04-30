@@ -217,7 +217,7 @@ struct TerminalView: View {
                 .font(.system(size: 15, weight: .bold, design: .monospaced))
                 .foregroundStyle(Theme.success)
             
-            TextField("", text: $inputText, prompt: Text("command").foregroundStyle(Color.white.opacity(0.3)))
+            TextField("", text: $inputText, prompt: Text("command").foregroundStyle(Theme.textMuted))
                 .textFieldStyle(.plain)
                 .font(.system(size: 15, weight: .regular, design: .monospaced))
                 .foregroundStyle(.white)
@@ -246,7 +246,7 @@ struct TerminalView: View {
         .overlay(
             Rectangle()
                 .frame(height: 1)
-                .foregroundStyle(Color.white.opacity(0.1)),
+                .foregroundStyle(Theme.borderElevated),
             alignment: .top
         )
     }

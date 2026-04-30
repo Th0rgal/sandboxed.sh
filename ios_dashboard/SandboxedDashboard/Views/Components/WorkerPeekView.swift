@@ -111,7 +111,7 @@ struct WorkerPeekView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.white.opacity(0.03))
+        .background(Theme.borderSubtle)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 

@@ -94,7 +94,7 @@ struct RunningMissionsBar: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(isViewing ? Theme.accent.opacity(0.15) : Color.white.opacity(0.05))
+            .background(isViewing ? Theme.accent.opacity(0.15) : Theme.backgroundTertiary)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -191,10 +191,11 @@ struct RunningMissionsBar: View {
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(Theme.textMuted)
                     .frame(width: 18, height: 18)
-                    .background(Color.white.opacity(0.08))
+                    .background(Theme.borderElevated)
                     .clipShape(Circle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Cancel mission")
         }
         .padding(.leading, 12)
         .padding(.trailing, 6)

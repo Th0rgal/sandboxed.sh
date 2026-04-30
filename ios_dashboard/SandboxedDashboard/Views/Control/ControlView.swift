@@ -990,15 +990,11 @@ struct ControlView: View {
         else {
             return nil
         }
-        let icon: String
-        let tint: Color
-        switch parsed.backend {
-        case "opencode": icon = "terminal"; tint = Theme.success
-        case "claudecode": icon = "brain"; tint = Theme.accent
-        case "amp": icon = "bolt.fill"; tint = .orange
-        default: icon = "cpu"; tint = Theme.accent
-        }
-        return (icon, parsed.agent, tint)
+        return (
+            BackendAgentService.icon(for: parsed.backend),
+            parsed.agent,
+            BackendAgentService.color(for: parsed.backend)
+        )
     }
     
     private func suggestionChip(_ text: String) -> some View {
@@ -1970,23 +1966,13 @@ struct ControlView: View {
     }
     
     // MARK: - Backend Helpers
-    
+
     private func missionBackendColor(_ mission: Mission) -> Color {
-        switch mission.backend {
-        case "opencode": return Theme.success
-        case "claudecode": return Theme.accent
-        case "amp": return .orange
-        default: return Theme.accent
-        }
+        BackendAgentService.color(for: mission.backend)
     }
-    
+
     private func missionBackendIcon(_ mission: Mission) -> String {
-        switch mission.backend {
-        case "opencode": return "terminal"
-        case "claudecode": return "brain"
-        case "amp": return "bolt.fill"
-        default: return "cpu"
-        }
+        BackendAgentService.icon(for: mission.backend)
     }
     
     private func sendMessage() {
