@@ -285,7 +285,13 @@ struct ChatMessage: Identifiable {
             // Don't show cost for unknown sources — avoids misleading "$0.0000"
             guard costSource != .unknown else { return nil }
             guard costCents > 0 else { return nil }
-            let formatted = String(format: "$%.4f", Double(costCents) / 100.0)
+            let dollars = Double(costCents) / 100.0
+            // Sub-cent amounts (< $0.005) collapse to a sentinel rather than
+            // rendering as "$0.00" — matches receipt-style readability while
+            // avoiding the four-decimal "$4.2200" debug-overlay look.
+            let formatted: String = dollars < 0.005
+                ? "<$0.01"
+                : String(format: "$%.2f", dollars)
             return costSource == .estimated ? "~\(formatted)" : formatted
         }
         return nil

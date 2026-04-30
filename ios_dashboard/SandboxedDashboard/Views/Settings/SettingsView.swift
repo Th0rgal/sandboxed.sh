@@ -22,6 +22,7 @@ struct SettingsView: View {
     @State private var selectedDefaultAgent: String = ""
     @State private var isLoadingAgents = true
     @State private var skipAgentSelection = false
+    @State private var showClearRulesConfirm = false
 
     private let api = APIService.shared
     private let originalURL: String
@@ -231,10 +232,8 @@ struct SettingsView: View {
                                         AutoApprovalRulesView()
 
                                         Button {
-                                            withAnimation {
-                                                FidoApprovalState.shared.autoApprovalRules.removeAll()
-                                            }
-                                            HapticService.mediumTap()
+                                            showClearRulesConfirm = true
+                                            HapticService.lightTap()
                                         } label: {
                                             HStack {
                                                 Image(systemName: "trash")
@@ -246,6 +245,21 @@ struct SettingsView: View {
                                             .padding(.vertical, 10)
                                             .background(Theme.error.opacity(0.1))
                                             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                        }
+                                        .confirmationDialog(
+                                            "Clear all auto-approval rules?",
+                                            isPresented: $showClearRulesConfirm,
+                                            titleVisibility: .visible
+                                        ) {
+                                            Button("Clear All Rules", role: .destructive) {
+                                                withAnimation {
+                                                    FidoApprovalState.shared.autoApprovalRules.removeAll()
+                                                }
+                                                HapticService.mediumTap()
+                                            }
+                                            Button("Cancel", role: .cancel) {}
+                                        } message: {
+                                            Text("This permanently removes every saved auto-approval rule. Future signing requests will require manual approval until you create new rules. This can't be undone.")
                                         }
                                     }
                                 }

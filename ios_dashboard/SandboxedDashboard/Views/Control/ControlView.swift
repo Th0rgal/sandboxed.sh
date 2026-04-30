@@ -110,6 +110,15 @@ struct ControlView: View {
             backgroundGlows
             
             VStack(spacing: 0) {
+                // Persistent connection banner. The 9pt wifi-slash glyph in
+                // the principal toolbar is too easy to miss when the SSE
+                // stream drops; a sticky strip across the top keeps the
+                // disconnected state in peripheral vision until reconnect.
+                if !connectionState.isConnected {
+                    connectionBanner
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
                 // Messages
                 ZStack(alignment: .bottom) {
                     messagesView
@@ -133,69 +142,79 @@ struct ControlView: View {
                 // Input area
                 inputView
             }
+            .animation(.easeInOut(duration: 0.2), value: connectionState.isConnected)
         }
         .navigationTitle(viewingMission?.displayTitle ?? "Control")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 2) {
-                    Text(viewingMission?.displayTitle ?? "Control")
+                    // Use the raw title with `.lineLimit(1)` rather than the
+                    // pre-truncated `displayTitle` (which silently slices at
+                    // 60 chars with no escape hatch). SwiftUI handles tail
+                    // truncation against the actual nav-bar width, and the
+                    // context menu lets the user pull up the full string.
+                    let trimmed = viewingMission?.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let fullTitle = trimmed.isEmpty ? "Control" : trimmed
+                    Text(fullTitle)
                         .font(.headline)
                         .foregroundStyle(Theme.textPrimary)
-
-                    HStack(spacing: 4) {
-                        // Show connection state or run state
-                        if !connectionState.isConnected {
-                            // Connection issue - show reconnecting/disconnected state
-                            Image(systemName: connectionState.icon)
-                                .font(.system(size: 9))
-                                .foregroundStyle(Theme.warning)
-                                .symbolEffect(.pulse, options: .repeating)
-                            Text(connectionState.label)
-                                .font(.caption2)
-                                .foregroundStyle(Theme.warning)
-                        } else {
-                            // Show backend/agent info if available
-                            if let mission = viewingMission {
-                                let backendColor = missionBackendColor(mission)
-                                if let agent = mission.agent, !agent.isEmpty {
-                                    Image(systemName: missionBackendIcon(mission))
-                                        .font(.system(size: 9))
-                                        .foregroundStyle(backendColor)
-                                    Text(agent)
-                                        .font(.caption2)
-                                        .foregroundStyle(backendColor)
-                                    Text("•")
-                                        .foregroundStyle(Theme.textMuted)
-                                }
-                            }
-                            
-                            // Connected - show normal run state
-                            StatusDot(status: runState.statusType, size: 5)
-                            Text(runState.label)
-                                .font(.caption2)
-                                .foregroundStyle(Theme.textSecondary)
-
-                            if queueLength > 0 {
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .contextMenu {
+                            if fullTitle != "Control" {
+                                Section(fullTitle) {}
                                 Button {
-                                    Task { await loadQueueItems() }
-                                    showQueueSheet = true
+                                    UIPasteboard.general.string = fullTitle
                                     HapticService.lightTap()
                                 } label: {
-                                    Text("• \(queueLength) queued")
-                                        .font(.caption2)
-                                        .foregroundStyle(Theme.warning)
+                                    Label("Copy title", systemImage: "doc.on.doc")
                                 }
                             }
+                        }
 
-                            // Progress indicator
-                            if let progress = progress, progress.total > 0 {
+                    HStack(spacing: 4) {
+                        // Connection state moved to a persistent banner above the
+                        // conversation; this row always shows backend + run state
+                        // so a disconnect doesn't blank out the run-state context.
+                        if let mission = viewingMission {
+                            let backendColor = missionBackendColor(mission)
+                            if let agent = mission.agent, !agent.isEmpty {
+                                Image(systemName: missionBackendIcon(mission))
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(backendColor)
+                                Text(agent)
+                                    .font(.caption2)
+                                    .foregroundStyle(backendColor)
                                 Text("•")
                                     .foregroundStyle(Theme.textMuted)
-                                Text(progress.displayText)
-                                    .font(.caption2.weight(.medium))
-                                    .foregroundStyle(Theme.success)
                             }
+                        }
+
+                        StatusDot(status: runState.statusType, size: 5)
+                        Text(runState.label)
+                            .font(.caption2)
+                            .foregroundStyle(Theme.textSecondary)
+
+                        if queueLength > 0 {
+                            Button {
+                                Task { await loadQueueItems() }
+                                showQueueSheet = true
+                                HapticService.lightTap()
+                            } label: {
+                                Text("• \(queueLength) queued")
+                                    .font(.caption2)
+                                    .foregroundStyle(Theme.warning)
+                            }
+                        }
+
+                        // Progress indicator
+                        if let progress, progress.total > 0 {
+                            Text("•")
+                                .foregroundStyle(Theme.textMuted)
+                            Text(progress.displayText)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(Theme.success)
                         }
                     }
                 }
@@ -574,11 +593,36 @@ struct ControlView: View {
     }
     
     // MARK: - Header (now in toolbar)
-    
+
     private var headerView: some View {
         EmptyView() // Moved to navigation bar
     }
-    
+
+    // MARK: - Connection banner
+
+    /// Sticky strip rendered above the conversation when the SSE stream is
+    /// down. The toolbar already shows a small wifi-slash glyph, but it's
+    /// easy to miss on a long page; this strip stays in peripheral vision.
+    private var connectionBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: connectionState.icon)
+                .font(.system(size: 11, weight: .semibold))
+                .symbolEffect(.pulse, options: .repeating)
+            Text(connectionState.label)
+                .font(.caption.weight(.medium))
+            Spacer()
+        }
+        .foregroundStyle(Theme.warning)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background(Theme.warning.opacity(0.12))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Theme.warning.opacity(0.25))
+                .frame(height: 0.5)
+        }
+    }
+
     // MARK: - Messages
     
     private var messagesView: some View {
@@ -2900,19 +2944,18 @@ private struct MessageBubble: View {
                         if let cost = message.costFormatted {
                             Text("•")
                                 .foregroundStyle(Theme.textMuted)
-                            Text(cost)
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(message.costIsEstimated ? Theme.textSecondary : Theme.success)
-                            if let badge = message.costSourceLabel {
-                                Text(badge)
-                                    .font(.system(size: 8, weight: .medium))
-                                    .textCase(.uppercase)
-                                    .tracking(0.4)
-                                    .foregroundStyle(Theme.textMuted)
-                                    .padding(.horizontal, 4)
-                                    .padding(.vertical, 2)
-                                    .background(Color.white.opacity(0.08))
-                                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                            // Cost + source as one calm chip: "$4.22 actual" — the
+                            // ALL-CAPS pill version of "ACTUAL" was visually shouting
+                            // louder than the cost itself.
+                            HStack(spacing: 4) {
+                                Text(cost)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(message.costIsEstimated ? Theme.textSecondary : Theme.success)
+                                if let badge = message.costSourceLabel {
+                                    Text(badge.lowercased())
+                                        .font(.caption2)
+                                        .foregroundStyle(Theme.textMuted)
+                                }
                             }
                         }
 

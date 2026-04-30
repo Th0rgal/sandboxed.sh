@@ -197,6 +197,12 @@ struct FilesView: View {
             Button("Delete", role: .destructive) {
                 Task { await deleteSelected() }
             }
+        } message: {
+            if selectedEntry?.isDirectory == true {
+                Text("This permanently deletes the folder and everything inside it. This can't be undone.")
+            } else {
+                Text("This permanently deletes the file. This can't be undone.")
+            }
         }
         .fileImporter(
             isPresented: $isImporting,
