@@ -154,15 +154,26 @@ struct ControlView: View {
                     // 60 chars with no escape hatch). SwiftUI handles tail
                     // truncation against the actual nav-bar width, and the
                     // context menu lets the user pull up the full string.
-                    let trimmed = viewingMission?.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    let fullTitle = trimmed.isEmpty ? "Control" : trimmed
+                    //
+                    // Fall back to "Untitled Mission" — not "Control" — when a
+                    // mission is being viewed but its title is empty. Showing
+                    // "Control" would falsely imply no mission is active and
+                    // diverges from `.navigationTitle` (which uses
+                    // `displayTitle`, returning "Untitled Mission").
+                    let fullTitle: String = {
+                        if let mission = viewingMission {
+                            let trimmed = mission.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            return trimmed.isEmpty ? "Untitled Mission" : trimmed
+                        }
+                        return "Control"
+                    }()
                     Text(fullTitle)
                         .font(.headline)
                         .foregroundStyle(Theme.textPrimary)
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .contextMenu {
-                            if fullTitle != "Control" {
+                            if viewingMission != nil {
                                 Section(fullTitle) {}
                                 Button {
                                     UIPasteboard.general.string = fullTitle
