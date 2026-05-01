@@ -10,10 +10,14 @@ on:
   schedule:
     - cron: '0 */6 * * *' # Every 6 hours
 
-# Cancel in-progress runs when new commits are pushed
+# Cancel in-progress runs only on PR pushes — pushes to master and the
+# 6-hour scheduled cron share the same `ref` group, so blanket
+# `cancel-in-progress: true` had the schedule killing the post-merge
+# push run (e.g. PR #400's master push CI was cancelled by the cron
+# that fired ~1 min later, leaving master with a non-green badge).
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
