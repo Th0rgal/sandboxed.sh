@@ -433,8 +433,61 @@ const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+/// A codex auth credential — either a raw OpenAI API key (rotation slot keyed
+/// on the secret string) or a ChatGPT OAuth identity (rotation slot keyed on
+/// `chatgpt_account_id`, since that's what OpenAI's usage cap is keyed on).
+///
+/// Used to drive rotation across mixed credential types: API keys and OAuth
+/// identities share the same lease/semaphore pool, fingerprinted distinctly.
+#[derive(Debug, Clone)]
+pub(crate) enum CodexCredential {
+    ApiKey(String),
+    OAuth(crate::api::ai_providers::CodexOAuthAccount),
+}
+
+impl CodexCredential {
+    /// Stable identity key used for the rotation tried-set and the per-slot
+    /// concurrency semaphore. API keys keep their previous fingerprint so
+    /// existing pool entries stay hot; OAuth accounts use a prefixed
+    /// `chatgpt_account_id` so they can't collide with an API key.
+    fn fingerprint(&self) -> String {
+        match self {
+            CodexCredential::ApiKey(k) => format!("apikey:{}", k),
+            CodexCredential::OAuth(acc) => format!("oauth:{}", acc.chatgpt_account_id),
+        }
+    }
+
+    fn label_for_logs(&self) -> String {
+        match self {
+            CodexCredential::ApiKey(k) => codex_key_fingerprint(k),
+            CodexCredential::OAuth(acc) => {
+                let suffix = if acc.chatgpt_account_id.len() > 8 {
+                    &acc.chatgpt_account_id[..8]
+                } else {
+                    &acc.chatgpt_account_id
+                };
+                match acc.account_email.as_deref() {
+                    Some(email) => format!("oauth:{}@{}", suffix, email),
+                    None => format!("oauth:{}", suffix),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn as_override(&self) -> crate::api::ai_providers::CodexCredentialOverride<'_> {
+        match self {
+            CodexCredential::ApiKey(k) => {
+                crate::api::ai_providers::CodexCredentialOverride::ApiKey(k.as_str())
+            }
+            CodexCredential::OAuth(acc) => {
+                crate::api::ai_providers::CodexCredentialOverride::OAuth(acc)
+            }
+        }
+    }
+}
+
 struct LeasedCodexAccount {
-    key: String,
+    credential: CodexCredential,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -501,11 +554,11 @@ pub(crate) fn codex_tool_stall_should_retry_with_default_model(
     requested_model.is_some_and(is_generic_gpt_codex_model)
 }
 
-fn codex_account_semaphore_for_key(api_key: &str) -> Arc<Semaphore> {
+fn codex_account_semaphore_for_fingerprint(fingerprint: &str) -> Arc<Semaphore> {
     let mut pool = CODEX_ACCOUNT_POOL
         .lock()
         .expect("Codex account pool mutex poisoned");
-    pool.entry(api_key.to_string())
+    pool.entry(fingerprint.to_string())
         .or_insert_with(|| Arc::new(Semaphore::new(CODEX_ACCOUNT_CONCURRENCY_LIMIT)))
         .clone()
 }
@@ -800,23 +853,45 @@ fn claudecode_pre_turn_transport_message(
     message
 }
 
+/// Build the list of all rotatable codex credentials in priority order:
+/// API keys first (from env / OpenCode auth.json / ai_providers.json), then
+/// ChatGPT-OAuth identities (de-duplicated by `chatgpt_account_id`).
+///
+/// API keys carry concrete usage quota independent of the ChatGPT plan cap,
+/// so they're tried first when present. OAuth identities share their cap
+/// with the user's ChatGPT subscription; rotating across distinct
+/// `chatgpt_account_id`s spreads load across separate caps.
+pub(crate) fn collect_codex_credentials(working_dir: &std::path::Path) -> Vec<CodexCredential> {
+    let mut creds: Vec<CodexCredential> =
+        super::ai_providers::get_all_openai_keys_for_codex(working_dir)
+            .into_iter()
+            .map(CodexCredential::ApiKey)
+            .collect();
+    creds.extend(
+        super::ai_providers::get_all_openai_oauth_accounts(working_dir)
+            .into_iter()
+            .map(CodexCredential::OAuth),
+    );
+    creds
+}
+
 async fn lease_codex_account(
     working_dir: &std::path::Path,
-    tried_keys: &HashSet<String>,
+    tried_fingerprints: &HashSet<String>,
     cancel: &CancellationToken,
 ) -> Option<LeasedCodexAccount> {
-    let keys = super::ai_providers::get_all_openai_keys_for_codex(working_dir);
-    if keys.is_empty() {
+    let creds = collect_codex_credentials(working_dir);
+    if creds.is_empty() {
         return None;
     }
 
-    let mut candidates: Vec<(String, Arc<Semaphore>, usize)> = keys
+    let mut candidates: Vec<(CodexCredential, Arc<Semaphore>, usize)> = creds
         .into_iter()
-        .filter(|key| !tried_keys.contains(key))
-        .map(|key| {
-            let sem = codex_account_semaphore_for_key(&key);
+        .filter(|cred| !tried_fingerprints.contains(&cred.fingerprint()))
+        .map(|cred| {
+            let sem = codex_account_semaphore_for_fingerprint(&cred.fingerprint());
             let available = sem.available_permits();
-            (key, sem, available)
+            (cred, sem, available)
         })
         .collect();
 
@@ -824,26 +899,26 @@ async fn lease_codex_account(
         return None;
     }
 
-    // Prefer the currently least-loaded key (highest available permits).
+    // Prefer the currently least-loaded credential (highest available permits).
     candidates.sort_by_key(|candidate| Reverse(candidate.2));
 
-    for (key, sem, available) in &candidates {
+    for (cred, sem, available) in &candidates {
         if let Ok(permit) = sem.clone().try_acquire_owned() {
             tracing::debug!(
-                key = %codex_key_fingerprint(key),
+                credential = %cred.label_for_logs(),
                 available_permits_before_acquire = *available,
                 "Leased Codex account slot without waiting"
             );
             return Some(LeasedCodexAccount {
-                key: key.clone(),
+                credential: cred.clone(),
                 _permit: permit,
             });
         }
     }
 
-    let (key, sem, available) = candidates.into_iter().next()?;
+    let (cred, sem, available) = candidates.into_iter().next()?;
     tracing::info!(
-        key = %codex_key_fingerprint(&key),
+        credential = %cred.label_for_logs(),
         available_permits = available,
         timeout_secs = CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT.as_secs(),
         "All Codex account slots busy; waiting for lease"
@@ -864,11 +939,11 @@ async fn lease_codex_account(
     };
 
     tracing::debug!(
-        key = %codex_key_fingerprint(&key),
+        credential = %cred.label_for_logs(),
         "Leased Codex account slot after wait"
     );
     Some(LeasedCodexAccount {
-        key,
+        credential: cred,
         _permit: permit,
     })
 }
@@ -3041,8 +3116,11 @@ async fn run_mission_turn(
                 convo.clone()
             };
             let codex_message: &str = codex_message_owned.as_str();
-            let all_keys = super::ai_providers::get_all_openai_keys_for_codex(&config.working_dir);
-            if all_keys.is_empty() {
+            // Unified credential pool: API keys + ChatGPT-OAuth identities,
+            // de-duplicated by chatgpt_account_id. Empty only when neither
+            // an OpenAI API key nor a connected ChatGPT account is available.
+            let all_creds = collect_codex_credentials(&config.working_dir);
+            if all_creds.is_empty() {
                 let mut result = run_codex_turn(
                     &workspace,
                     &mission_work_dir,
@@ -3109,7 +3187,7 @@ async fn run_mission_turn(
 
                 result
             } else {
-                let mut attempted_keys = HashSet::new();
+                let mut attempted_credentials: HashSet<String> = HashSet::new();
                 let mut attempt_idx = 0usize;
                 let mut last_constrained_result: Option<AgentResult> = None;
 
@@ -3122,7 +3200,8 @@ async fn run_mission_turn(
                     }
 
                     let lease =
-                        lease_codex_account(&config.working_dir, &attempted_keys, &cancel).await;
+                        lease_codex_account(&config.working_dir, &attempted_credentials, &cancel)
+                            .await;
                     let Some(lease) = lease else {
                         if let Some(prev) = last_constrained_result {
                             break prev;
@@ -3136,14 +3215,15 @@ async fn run_mission_turn(
                     };
 
                     attempt_idx += 1;
-                    let key_fingerprint = codex_key_fingerprint(&lease.key);
-                    attempted_keys.insert(lease.key.clone());
+                    let credential_label = lease.credential.label_for_logs();
+                    attempted_credentials.insert(lease.credential.fingerprint());
+                    let credential_override = lease.credential.as_override();
 
                     tracing::info!(
                         mission_id = %mission_id,
                         attempt = attempt_idx,
-                        key = %key_fingerprint,
-                        total_keys = all_keys.len(),
+                        credential = %credential_label,
+                        total_credentials = all_creds.len(),
                         "Running Codex turn with leased account slot"
                     );
 
@@ -3159,7 +3239,7 @@ async fn run_mission_turn(
                         cancel.clone(),
                         &config.working_dir,
                         session_id.as_deref(),
-                        Some(&lease.key),
+                        Some(&credential_override),
                     )
                     .await;
 
@@ -3171,7 +3251,7 @@ async fn run_mission_turn(
                             attempt = attempt_idx,
                             requested_model = ?requested_model,
                             fallback_model,
-                            key = %key_fingerprint,
+                            credential = %credential_label,
                             "Retrying Codex turn with fallback model for ChatGPT account compatibility"
                         );
                         result = run_codex_turn(
@@ -3186,7 +3266,7 @@ async fn run_mission_turn(
                             cancel.clone(),
                             &config.working_dir,
                             session_id.as_deref(),
-                            Some(&lease.key),
+                            Some(&credential_override),
                         )
                         .await;
                     } else if codex_tool_stall_should_retry_with_default_model(
@@ -3197,7 +3277,7 @@ async fn run_mission_turn(
                             mission_id = %mission_id,
                             attempt = attempt_idx,
                             requested_model = ?requested_model,
-                            key = %key_fingerprint,
+                            credential = %credential_label,
                             "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
                         );
                         result = run_codex_turn(
@@ -3212,7 +3292,7 @@ async fn run_mission_turn(
                             cancel.clone(),
                             &config.working_dir,
                             session_id.as_deref(),
-                            Some(&lease.key),
+                            Some(&credential_override),
                         )
                         .await;
                     }
@@ -3221,7 +3301,7 @@ async fn run_mission_turn(
 
                     match result.terminal_reason {
                         Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
-                            if attempted_keys.len() < all_keys.len() =>
+                            if attempted_credentials.len() < all_creds.len() =>
                         {
                             let reason = match result.terminal_reason {
                                 Some(TerminalReason::CapacityLimited) => "capacity limited",
@@ -13123,7 +13203,7 @@ pub async fn run_codex_turn(
     cancel: CancellationToken,
     app_working_dir: &std::path::Path,
     _session_id: Option<&str>,
-    override_api_key: Option<&str>,
+    override_credential: Option<&crate::api::ai_providers::CodexCredentialOverride<'_>>,
 ) -> AgentResult {
     use crate::backend::codex::CodexBackend;
     use crate::backend::events::ExecutionEvent;
@@ -13157,7 +13237,7 @@ pub async fn run_codex_turn(
     if let Err(e) = crate::api::ai_providers::write_codex_credentials_for_workspace(
         workspace,
         app_working_dir,
-        override_api_key,
+        override_credential,
     ) {
         tracing::error!("Failed to write Codex credentials: {}", e);
         return AgentResult::failure(
