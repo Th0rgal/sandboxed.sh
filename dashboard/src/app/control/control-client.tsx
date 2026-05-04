@@ -4708,15 +4708,6 @@ export default function ControlClient() {
           return;
         }
 
-        const sortedOlder = olderEvents
-          .slice()
-          .sort((a, b) => a.sequence - b.sequence);
-
-        missionMinSeqRef.current.set(id, sortedOlder[0].sequence);
-        const existing = missionHistoricEventsRef.current.get(id) ?? [];
-        const merged = [...sortedOlder, ...existing];
-        missionHistoricEventsRef.current.set(id, merged);
-
         // After the await, the user may have switched missions. Read the
         // *currently-viewing* mission from refs (which the keep-in-sync
         // useEffects update synchronously from state), NOT from the
@@ -4725,24 +4716,35 @@ export default function ControlClient() {
         // mission's items.
         const liveCurrent = currentMissionRef.current;
         const liveViewing = viewingMissionRef.current;
-        const mission =
-          liveCurrent?.id === id
-            ? liveCurrent
-            : liveViewing?.id === id
-              ? liveViewing
-              : null;
-        const newHistoricItems = eventsToItems(merged, mission);
-        const oldHistoricCount = historicItemsCountRef.current.get(id) ?? 0;
-        historicItemsCountRef.current.set(id, newHistoricItems.length);
-
-        // The user may have switched missions during the await. Capture
-        // the still-active gate once and use it for *every* state write
-        // below — `setOlderLoadState` is single-shared (not per-mission),
-        // so an old-mission completion would otherwise clobber the new
-        // mission's pagination UI state set by `seedPaginationStateAfterInitialLoad`.
+        // Single shared gate. If false, this completion belongs to a
+        // mission the user has already navigated away from — every side
+        // effect below (cursor advance, cache merge, items splice,
+        // `olderLoadState` reset, scroll restore) MUST be skipped, or a
+        // stale-mission completion will corrupt refs that
+        // `loadHistoryEvents`/`reloadMissionHistory` may not reset on the
+        // user's eventual return path.
         const stillActiveForId = liveCurrent?.id === id || liveViewing?.id === id;
 
         if (stillActiveForId) {
+          const sortedOlder = olderEvents
+            .slice()
+            .sort((a, b) => a.sequence - b.sequence);
+
+          missionMinSeqRef.current.set(id, sortedOlder[0].sequence);
+          const existing = missionHistoricEventsRef.current.get(id) ?? [];
+          const merged = [...sortedOlder, ...existing];
+          missionHistoricEventsRef.current.set(id, merged);
+
+          const mission =
+            liveCurrent?.id === id
+              ? liveCurrent
+              : liveViewing?.id === id
+                ? liveViewing
+                : null;
+          const newHistoricItems = eventsToItems(merged, mission);
+          const oldHistoricCount = historicItemsCountRef.current.get(id) ?? 0;
+          historicItemsCountRef.current.set(id, newHistoricItems.length);
+
           // Snapshot scroll geometry FIRST, then setItems. The
           // `useLayoutEffect` watching `items` reads
           // `pendingScrollRestoreRef` synchronously after commit and
