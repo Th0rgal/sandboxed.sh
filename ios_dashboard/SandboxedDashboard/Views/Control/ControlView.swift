@@ -3826,19 +3826,6 @@ private struct ThoughtsSheet: View {
                 } else {
                     ScrollView {
                         VStack(spacing: 14) {
-                            HStack(spacing: 10) {
-                                ThoughtSummaryCard(
-                                    title: "Active",
-                                    value: "\(activeThoughts.count)",
-                                    tint: hasActiveThinking ? Theme.accent : Theme.textMuted
-                                )
-                                ThoughtSummaryCard(
-                                    title: "Completed",
-                                    value: "\(completedThoughts.count)",
-                                    tint: Theme.success
-                                )
-                            }
-
                             if !activeThoughts.isEmpty {
                                 ThoughtSection(title: "Thinking Now", icon: "brain") {
                                     ForEach(activeThoughts) { msg in
@@ -3880,27 +3867,6 @@ private struct ThoughtsSheet: View {
                 }
             }
         }
-    }
-}
-
-private struct ThoughtSummaryCard: View {
-    let title: String
-    let value: String
-    let tint: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(Theme.textMuted)
-            Text(value)
-                .font(.headline.monospacedDigit())
-                .foregroundStyle(tint)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(Theme.backgroundSecondary)
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }
 
@@ -4870,25 +4836,71 @@ private struct MissionRow: View {
         }
     }
 
+    /// Whether the visible name above the title is just the 8-char short id.
+    /// In that case we suppress it: the title carries the meaning and the short
+    /// id can live in the trailing metadata as a caption.
+    private var displayLabelIsShortId: Bool {
+        let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed == nil || trimmed?.isEmpty == true
+    }
+
+    /// "<description> · <backend>" collapsed onto one line so we don't stack
+    /// four lineLimit-1 captions in a narrow row.
+    private var secondaryMetadataLine: String? {
+        var parts: [String] = []
+        if let shortDescription = shortDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !shortDescription.isEmpty {
+            parts.append(shortDescription)
+        }
+        if let backend = backend?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !backend.isEmpty {
+            parts.append(backend)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private var trailingStatusPill: some View {
+        Group {
+            if isRunning, let state = runningState {
+                Text(state)
+                    .font(.caption2)
+                    .foregroundStyle(Theme.textMuted)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Theme.backgroundSecondary)
+                    .clipShape(Capsule())
+            } else {
+                Text(status.displayLabel)
+                    .font(.caption2)
+                    .foregroundStyle(statusColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(statusColor.opacity(0.1))
+                    .clipShape(Capsule())
+            }
+        }
+    }
+
     var body: some View {
         Button {
             onSelect()
             HapticService.selectionChanged()
         } label: {
             HStack(spacing: 12) {
-                // Status icon indicator
                 Image(systemName: statusIcon)
                     .font(.system(size: 18))
                     .foregroundStyle(statusColor)
                     .symbolEffect(.pulse, options: (isRunning && runningState == "running") ? .repeating : .nonRepeating)
                     .frame(width: 24, height: 24)
 
-                // Mission info
                 VStack(alignment: .leading, spacing: 2) {
+                    // Title (or short id when there is no title) is the primary
+                    // line. The viewing checkmark sits right next to it.
                     HStack(spacing: 6) {
-                        Text(missionDisplayLabel)
-                            .font(.subheadline.monospaced().weight(.medium))
+                        Text(title?.isEmpty == false ? title! : shortId)
+                            .font(.subheadline.weight(.medium))
                             .foregroundStyle(Theme.textPrimary)
+                            .lineLimit(1)
 
                         if isViewing {
                             Image(systemName: "checkmark.circle.fill")
@@ -4897,82 +4909,78 @@ private struct MissionRow: View {
                         }
                     }
 
-                    if let title = title, !title.isEmpty {
-                        Text(title)
-                            .font(.caption)
+                    // Secondary line: optional human display name when distinct
+                    // from the short id, plus collapsed description+backend.
+                    if !displayLabelIsShortId,
+                       let displayName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !displayName.isEmpty,
+                       displayName != title {
+                        Text(displayName)
+                            .font(.caption.monospaced())
                             .foregroundStyle(Theme.textSecondary)
                             .lineLimit(1)
                     }
 
-                    if let shortDescription = shortDescription, !shortDescription.isEmpty {
-                        Text(shortDescription)
+                    if let secondaryMetadataLine {
+                        Text(secondaryMetadataLine)
                             .font(.caption2)
                             .foregroundStyle(Theme.textMuted)
                             .lineLimit(1)
-                    }
-
-                    if let backend = backend?.trimmingCharacters(in: .whitespacesAndNewlines), !backend.isEmpty {
-                        Text(backend)
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(Theme.textMuted)
-                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
                 }
 
-                Spacer()
+                Spacer(minLength: 8)
 
-                // Running state or status
-                if isRunning, let state = runningState {
-                    Text(state)
-                        .font(.caption2)
-                        .foregroundStyle(Theme.textMuted)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Theme.backgroundSecondary)
-                        .clipShape(Capsule())
-                } else {
-                    Text(status.displayLabel)
-                        .font(.caption2)
-                        .foregroundStyle(statusColor)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(statusColor.opacity(0.1))
-                        .clipShape(Capsule())
-                }
-
-                if !quickActions.isEmpty, let onQuickAction {
-                    ForEach(quickActions, id: \.self) { action in
-                        Button {
-                            onQuickAction(action)
-                            HapticService.lightTap()
-                        } label: {
-                            Label(action.label, systemImage: action.icon)
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Theme.accent.opacity(0.14))
-                                .foregroundStyle(Theme.accent)
-                                .clipShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-
-                // Cancel button for running missions
-                if let onCancel = onCancel {
-                    Button {
-                        onCancel()
-                        HapticService.lightTap()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(Theme.textMuted)
-                    }
-                    .buttonStyle(.plain)
-                }
+                trailingStatusPill
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            // Cancel ships first so it occupies the leftmost (closest)
+            // trailing slot when the user swipes — matches Mail's destructive
+            // affordance placement.
+            if let onCancel {
+                Button(role: .destructive) {
+                    onCancel()
+                    HapticService.lightTap()
+                } label: {
+                    Label("Cancel", systemImage: "xmark.circle.fill")
+                }
+            }
+            if let onQuickAction {
+                ForEach(quickActions, id: \.self) { action in
+                    Button {
+                        onQuickAction(action)
+                        HapticService.lightTap()
+                    } label: {
+                        Label(action.label, systemImage: action.icon)
+                    }
+                    .tint(Theme.accent)
+                }
+            }
+        }
+        .contextMenu {
+            // Long-press fallback: keeps every action discoverable for
+            // accessibility and for users who don't know about swipes.
+            if let onQuickAction {
+                ForEach(quickActions, id: \.self) { action in
+                    Button {
+                        onQuickAction(action)
+                    } label: {
+                        Label(action.label, systemImage: action.icon)
+                    }
+                }
+            }
+            if let onCancel {
+                Button(role: .destructive) {
+                    onCancel()
+                } label: {
+                    Label("Cancel Mission", systemImage: "xmark.circle.fill")
+                }
+            }
+        }
     }
 }
 
