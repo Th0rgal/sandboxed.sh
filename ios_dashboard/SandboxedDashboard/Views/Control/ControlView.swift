@@ -2570,7 +2570,16 @@ struct ControlView: View {
             // Remove phase items when thinking starts
             messages.removeAll { $0.isPhase }
 
-            // Find existing thinking message or create new
+            // Skip if we've already seen this server-supplied event id —
+            // delta resume can re-deliver completed thinking events we already
+            // appended, and the active-message fast path won't catch them
+            // because the existing one is already `done: true`.
+            let eventId = data["id"] as? String
+            if let eventId, messages.contains(where: { $0.id == eventId }) {
+                break
+            }
+
+            // Find existing active thinking message or create new
             if let index = messages.lastIndex(where: { $0.isThinking && !$0.thinkingDone }) {
                 let existing = messages[index]
                 let existingStartTime = existing.thinkingStartTime ?? existing.timestamp
@@ -2591,7 +2600,6 @@ struct ControlView: View {
                 // to a UUID. A wall-clock-second id can collide during history replay
                 // (many thinking events landing in the same instant), which then crashes
                 // the Thoughts sheet's `ForEach` with a duplicate-id assertion.
-                let eventId = data["id"] as? String
                 let messageId = eventId ?? "thinking-\(UUID().uuidString)"
                 let message = ChatMessage(
                     id: messageId,
@@ -4797,14 +4805,6 @@ private struct MissionRow: View {
         String(missionId.prefix(8))
     }
 
-    private var missionDisplayLabel: String {
-        let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let trimmed, !trimmed.isEmpty {
-            return trimmed
-        }
-        return shortId
-    }
-
     private var statusColor: Color {
         if isRunning {
             return Theme.success
@@ -4836,12 +4836,17 @@ private struct MissionRow: View {
         }
     }
 
-    /// Whether the visible name above the title is just the 8-char short id.
-    /// In that case we suppress it: the title carries the meaning and the short
-    /// id can live in the trailing metadata as a caption.
+    /// Whether the supplied `displayName` is just the uppercased short id.
+    /// `missionDisplayName(for:)` always returns at least the uppercased
+    /// 8-char short id (with an optional `"<workspace> · "` prefix), so we
+    /// can't detect the bare-id case by checking for nil/empty — we have to
+    /// compare against the actual short id. When it matches we suppress the
+    /// secondary line: the title above already carries the meaning.
     private var displayLabelIsShortId: Bool {
-        let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed == nil || trimmed?.isEmpty == true
+        guard let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return true }
+        return trimmed.caseInsensitiveCompare(shortId) == .orderedSame
     }
 
     /// "<description> · <backend>" collapsed onto one line so we don't stack
