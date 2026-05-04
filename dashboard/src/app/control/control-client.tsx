@@ -3651,6 +3651,13 @@ export default function ControlClient() {
    * (so a later "load older" page-replace can find the live tail) and
    * publishes the "more older messages exist" state to the UI.
    */
+  // `historyItemsLen` MUST count only items derived from server events
+  // (i.e. the result of `eventsToItems` / `missionHistoryToItems`), NOT
+  // the post-queue-merge length. `loadOlderHistoryEvents` later splices
+  // via `prev.slice(oldHistoricCount)`; if queued messages were counted
+  // here, they'd land before the splice point, get rebuilt by
+  // `eventsToItems` (which doesn't see queued messages), and silently
+  // disappear from the UI on the next page-back.
   const seedPaginationStateAfterInitialLoad = useCallback(
     (id: string, historyItemsLen: number) => {
       historicItemsCountRef.current.set(id, historyItemsLen);
@@ -4670,11 +4677,19 @@ export default function ControlClient() {
         const merged = [...sortedOlder, ...existing];
         missionHistoricEventsRef.current.set(id, merged);
 
+        // After the await, the user may have switched missions. Read the
+        // *currently-viewing* mission from refs (which the keep-in-sync
+        // useEffects update synchronously from state), NOT from the
+        // closure-captured `viewingMission` — that's stale across renders
+        // and would happily prepend the old mission's events into the new
+        // mission's items.
+        const liveCurrent = currentMissionRef.current;
+        const liveViewing = viewingMissionRef.current;
         const mission =
-          currentMissionRef.current?.id === id
-            ? currentMissionRef.current
-            : viewingMission?.id === id
-              ? viewingMission
+          liveCurrent?.id === id
+            ? liveCurrent
+            : liveViewing?.id === id
+              ? liveViewing
               : null;
         const newHistoricItems = eventsToItems(merged, mission);
         const oldHistoricCount = historicItemsCountRef.current.get(id) ?? 0;
@@ -4689,7 +4704,7 @@ export default function ControlClient() {
         const oldScrollTop = scrollEl?.scrollTop ?? 0;
         const oldScrollHeight = scrollEl?.scrollHeight ?? 0;
 
-        if (currentMissionRef.current?.id === id || viewingMission?.id === id) {
+        if (liveCurrent?.id === id || liveViewing?.id === id) {
           setItems((prev) => {
             const liveTail = prev.slice(oldHistoricCount);
             return [...newHistoricItems, ...liveTail];
@@ -4713,7 +4728,11 @@ export default function ControlClient() {
         setOlderLoadState((prev) => ({ ...prev, loading: false }));
       }
     },
-    [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder, viewingMission]
+    // Note: `viewingMission` is intentionally NOT in deps — the body now
+    // reads `viewingMissionRef.current` (synced from state by an effect
+    // above), so capturing the state value would re-introduce the stale
+    // closure that bugbot flagged.
+    [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder]
   );
 
   // Load mission from URL param on mount (and retry on auth success)
@@ -4833,6 +4852,10 @@ export default function ControlClient() {
             historyItems = missionHistoryToItems(mission);
           }
         }
+        // Capture the events-derived count BEFORE the queue merge — this is
+        // what `loadOlderHistoryEvents` needs to find the live tail
+        // correctly (see `seedPaginationStateAfterInitialLoad`).
+        const historicEventsLen = historyItems.length;
         // Merge queued messages that belong to this mission
         const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === id);
         if (missionQueuedMessages.length > 0) {
@@ -4857,7 +4880,7 @@ export default function ControlClient() {
         }
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
-        seedPaginationStateAfterInitialLoad(id, historyItems.length);
+        seedPaginationStateAfterInitialLoad(id, historicEventsLen);
         applyDesktopSessionState(mission);
         // Also check events for desktop sessions (in case mission.desktop_sessions isn't populated yet)
         if (events) {
@@ -4920,6 +4943,9 @@ export default function ControlClient() {
                   historyItems = missionHistoryToItems(mission);
                 }
               }
+              // Capture pre-queue length so pagination doesn't clip
+              // queued items (see `seedPaginationStateAfterInitialLoad`).
+              const historicEventsLen = historyItems.length;
               // Merge queued messages that belong to this mission
               const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === mission.id);
               if (missionQueuedMessages.length > 0) {
@@ -4942,7 +4968,7 @@ export default function ControlClient() {
               }
               setItems(historyItems);
               adjustVisibleItemsLimit(historyItems);
-              seedPaginationStateAfterInitialLoad(mission.id, historyItems.length);
+              seedPaginationStateAfterInitialLoad(mission.id, historicEventsLen);
               // Also check events for desktop sessions
               applyDesktopSessionFromEvents(events);
             })
@@ -5318,6 +5344,9 @@ export default function ControlClient() {
           }
         }
 
+        // Capture pre-queue length so pagination doesn't clip queued items
+        // (see `seedPaginationStateAfterInitialLoad`).
+        const historicEventsLen = historyItems.length;
         // Merge queued messages that belong to this mission
         const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === missionId);
         if (missionQueuedMessages.length > 0) {
@@ -5341,7 +5370,7 @@ export default function ControlClient() {
 
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
-        seedPaginationStateAfterInitialLoad(missionId, historyItems.length);
+        seedPaginationStateAfterInitialLoad(missionId, historicEventsLen);
         // Check if mission has an active desktop session (stored metadata or fallback to history)
         applyDesktopSessionState(mission);
         // Also check events for desktop sessions
@@ -7639,6 +7668,9 @@ export default function ControlClient() {
           }
         }
 
+        // Pre-queue length: pagination uses this to find the live tail
+        // without clipping queued items (see `seedPaginationStateAfterInitialLoad`).
+        const historicEventsLen = historyItems.length;
         const missionQueuedMessages = queuedMessages.filter(
           (qm) => qm.mission_id === missionId
         );
@@ -7665,7 +7697,7 @@ export default function ControlClient() {
 
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
-        seedPaginationStateAfterInitialLoad(missionId, historyItems.length);
+        seedPaginationStateAfterInitialLoad(missionId, historicEventsLen);
         updateMissionItems(missionId, historyItems);
         if (events) {
           applyDesktopSessionFromEvents(events);
