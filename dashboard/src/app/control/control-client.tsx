@@ -3313,10 +3313,18 @@ export default function ControlClient() {
     oldScrollTop: number;
     oldScrollHeight: number;
   } | null>(null);
+  // Pagination UI state carries `missionId` so a stale-mission completion
+  // (or a stuck `loading: true` from a fetch the user navigated away
+  // from) can't surface on a different mission's button. The JSX reads
+  // through `activeOlderLoadState` below, which only honors the state
+  // when the recorded mission id matches what the user is currently
+  // viewing — otherwise it falls back to the safe defaults
+  // (`hasMore=false`, `loading=false`).
   const [olderLoadState, setOlderLoadState] = useState<{
+    missionId: string | null;
     hasMore: boolean;
     loading: boolean;
-  }>({ hasMore: false, loading: false });
+  }>({ missionId: null, hasMore: false, loading: false });
 
   // Performance optimization: limit rendered items for large conversations
   const INITIAL_VISIBLE_ITEMS = 30;
@@ -3671,6 +3679,7 @@ export default function ControlClient() {
     (id: string, historyItemsLen: number) => {
       historicItemsCountRef.current.set(id, historyItemsLen);
       setOlderLoadState({
+        missionId: id,
         hasMore: computeHasMoreOlder(id),
         loading: false,
       });
@@ -4684,10 +4693,21 @@ export default function ControlClient() {
     async (id: string) => {
       const beforeSeq = missionMinSeqRef.current.get(id);
       if (beforeSeq === undefined || beforeSeq <= 1) {
-        setOlderLoadState({ hasMore: false, loading: false });
+        setOlderLoadState({ missionId: id, hasMore: false, loading: false });
         return;
       }
-      setOlderLoadState((prev) => ({ ...prev, loading: true }));
+      // The button click that fired this is for the currently-viewing
+      // mission, so writing `missionId: id` here is correct. If the user
+      // switches missions during the in-flight fetch, the UI's
+      // `activeOlderLoadState` selector will discard this loading state
+      // (it filters on `missionId === viewingMissionId`), so a fetch
+      // that never gets to clear `loading: false` can't pin the new
+      // mission's button to a stuck "Loading…" state.
+      setOlderLoadState((prev) => ({
+        missionId: id,
+        hasMore: prev.missionId === id ? prev.hasMore : false,
+        loading: true,
+      }));
       try {
         const { events: olderEvents } = await getMissionEventsWithMeta(id, {
           types: HISTORY_EVENT_TYPES,
@@ -4703,7 +4723,7 @@ export default function ControlClient() {
             currentMissionRef.current?.id === id ||
             viewingMissionRef.current?.id === id
           ) {
-            setOlderLoadState({ hasMore: false, loading: false });
+            setOlderLoadState({ missionId: id, hasMore: false, loading: false });
           }
           return;
         }
@@ -4765,6 +4785,7 @@ export default function ControlClient() {
           });
 
           setOlderLoadState({
+            missionId: id,
             hasMore: computeHasMoreOlder(id),
             loading: false,
           });
@@ -4774,12 +4795,16 @@ export default function ControlClient() {
         toast.error("Failed to load older messages");
         // Only clear the loading flag if the active mission is still the
         // one we were paginating — otherwise we'd wipe state set for a
-        // newer, unrelated mission.
+        // newer, unrelated mission. (The missionId-tagged read selector
+        // also protects the UI here, but we keep this guard so we don't
+        // gratuitously rewrite state for a mission that isn't viewable.)
         const stillActive =
           currentMissionRef.current?.id === id ||
           viewingMissionRef.current?.id === id;
         if (stillActive) {
-          setOlderLoadState((prev) => ({ ...prev, loading: false }));
+          setOlderLoadState((prev) =>
+            prev.missionId === id ? { ...prev, loading: false } : prev
+          );
         }
       }
     },
@@ -8596,8 +8621,16 @@ export default function ControlClient() {
           {/* Backwards pagination — only when there's actually more older
               history to fetch and the chat isn't empty. Click prepends the
               previous page; scroll position is preserved so the message
-              currently in view stays put. */}
-          {items.length > 0 && olderLoadState.hasMore && viewingMissionId && (
+              currently in view stays put.
+              `olderLoadState` is single-shared but tagged with `missionId`,
+              so we ignore it unless it's for the mission the user is
+              actually viewing. Otherwise a stale completion (or a
+              still-in-flight fetch from a previously-viewed mission)
+              could pin this button to a wrong "Loading…" / hidden state. */}
+          {items.length > 0 &&
+            olderLoadState.missionId === viewingMissionId &&
+            olderLoadState.hasMore &&
+            viewingMissionId && (
             <div className="flex justify-center mb-4">
               <button
                 type="button"
