@@ -2396,9 +2396,12 @@ struct ControlView: View {
                 timestamp: existing.timestamp
             )
         } else {
+            // Append a UUID-suffixed id so concurrent fallback thoughts can't collide
+            // and crash the Thoughts sheet's `ForEach`. The "stream-thinking-" prefix
+            // is preserved because `isStreamingFallbackThought` still checks it.
             messages.append(
                 ChatMessage(
-                    id: "\(streamingThoughtPrefix)\(Date().timeIntervalSince1970)",
+                    id: "\(streamingThoughtPrefix)\(UUID().uuidString)",
                     type: .thinking(done: done, startTime: Date()),
                     content: content
                 )
@@ -2580,28 +2583,36 @@ struct ControlView: View {
                     timestamp: existing.timestamp
                 )
             } else {
-                // Create new thinking message - whether done or not
-                // This handles the case where we receive a completed thought without seeing it active first
-                // (e.g., when joining a mission mid-thought or reconnecting)
+                // Create new thinking message - whether done or not.
+                // Handles the case where we receive a completed thought without seeing it
+                // active first (joining mid-thought or reconnecting).
+                //
+                // Prefer the server-supplied event id when available; otherwise fall back
+                // to a UUID. A wall-clock-second id can collide during history replay
+                // (many thinking events landing in the same instant), which then crashes
+                // the Thoughts sheet's `ForEach` with a duplicate-id assertion.
+                let eventId = data["id"] as? String
+                let messageId = eventId ?? "thinking-\(UUID().uuidString)"
                 let message = ChatMessage(
-                    id: "thinking-\(Date().timeIntervalSince1970)",
+                    id: messageId,
                     type: .thinking(done: done, startTime: Date()),
                     content: content
                 )
                 messages.append(message)
             }
-            
+
         case "agent_phase":
             let phase = data["phase"] as? String ?? ""
             let detail = data["detail"] as? String
             let agent = data["agent"] as? String
-            
+
             // Remove existing phase messages
             messages.removeAll { $0.isPhase }
-            
-            // Add new phase message
+
+            // Add new phase message. UUID-suffixed id so back-to-back phase events in the
+            // same instant cannot collide and crash a `ForEach`.
             let message = ChatMessage(
-                id: "phase-\(Date().timeIntervalSince1970)",
+                id: "phase-\(UUID().uuidString)",
                 type: .phase(phase: phase, detail: detail, agent: agent),
                 content: ""
             )
