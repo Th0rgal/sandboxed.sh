@@ -1624,20 +1624,28 @@ fn write_codex_auth_json_apikey(config_dir: &std::path::Path, api_key: &str) -> 
 ///
 /// This is the standard auth mode for ChatGPT Plus/Pro users who do not have
 /// an OpenAI API platform organization.
-fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), String> {
-    let entry = read_oauth_token_entry(ProviderType::OpenAI)
-        .ok_or_else(|| "No OpenAI OAuth credentials found in credential store".to_string())?;
-    if entry.access_token.trim().is_empty() {
-        return Err("OpenAI OAuth access token is empty".to_string());
+/// Shared writer for chatgpt-mode `auth.json`. Both
+/// `write_codex_auth_json_chatgpt` (reads tokens from the canonical
+/// credential store) and `write_codex_auth_json_chatgpt_with_tokens`
+/// (gets tokens passed in for per-attempt rotation) delegate here so the
+/// two paths cannot drift on payload shape, atomic-rename semantics, or
+/// permissions.
+fn write_codex_chatgpt_auth_file(
+    config_dir: &std::path::Path,
+    access_token: &str,
+    refresh_token: &str,
+    source_label: &str,
+) -> Result<(), String> {
+    if access_token.trim().is_empty() {
+        return Err("OAuth access_token is empty".to_string());
     }
 
-    // Extract chatgpt_account_id from the access_token JWT claims.
-    let account_id = extract_chatgpt_account_id(&entry.access_token);
-
-    // The Codex CLI stores an id_token in its tokens object.  We use the
-    // access_token as the id_token since both are JWTs from the same issuer
-    // and the CLI only reads claims from the id_token (chatgpt_account_id etc).
-    let id_token_value = entry.access_token.clone();
+    // The Codex CLI stores an id_token in its tokens object. We use the
+    // access_token as the id_token since both are JWTs from the same
+    // issuer and the CLI only reads claims from the id_token
+    // (chatgpt_account_id etc).
+    let account_id = extract_chatgpt_account_id(access_token);
+    let id_token_value = access_token.to_string();
 
     std::fs::create_dir_all(config_dir)
         .map_err(|e| format!("Failed to create Codex config dir: {}", e))?;
@@ -1651,8 +1659,8 @@ fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), Str
         "OPENAI_API_KEY": null,
         "tokens": {
             "id_token": id_token_value,
-            "access_token": entry.access_token,
-            "refresh_token": entry.refresh_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
             "account_id": account_id,
         },
         "last_refresh": now,
@@ -1673,9 +1681,21 @@ fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), Str
     tracing::info!(
         path = %auth_path.display(),
         account_id = ?account_id,
+        source = %source_label,
         "Wrote Codex auth.json (chatgpt mode)"
     );
     Ok(())
+}
+
+fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), String> {
+    let entry = read_oauth_token_entry(ProviderType::OpenAI)
+        .ok_or_else(|| "No OpenAI OAuth credentials found in credential store".to_string())?;
+    write_codex_chatgpt_auth_file(
+        config_dir,
+        &entry.access_token,
+        &entry.refresh_token,
+        "credential_store",
+    )
 }
 
 /// Extract `chatgpt_account_id` from an OpenAI JWT access token.
@@ -1888,49 +1908,7 @@ pub(crate) fn write_codex_auth_json_chatgpt_with_tokens(
     access_token: &str,
     refresh_token: &str,
 ) -> Result<(), String> {
-    if access_token.trim().is_empty() {
-        return Err("OAuth access_token is empty".to_string());
-    }
-    let account_id = extract_chatgpt_account_id(access_token);
-    let id_token = access_token.to_string();
-
-    std::fs::create_dir_all(config_dir)
-        .map_err(|e| format!("Failed to create Codex config dir: {}", e))?;
-
-    let auth_path = config_dir.join("auth.json");
-    let tmp_path = config_dir.join("auth.json.tmp");
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let payload = serde_json::json!({
-        "auth_mode": "chatgpt",
-        "OPENAI_API_KEY": null,
-        "tokens": {
-            "id_token": id_token,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "account_id": account_id,
-        },
-        "last_refresh": now,
-    });
-    let contents = serde_json::to_string_pretty(&payload)
-        .map_err(|e| format!("Failed to serialize auth.json: {}", e))?;
-    std::fs::write(&tmp_path, contents)
-        .map_err(|e| format!("Failed to write Codex auth.json: {}", e))?;
-    std::fs::rename(&tmp_path, &auth_path)
-        .map_err(|e| format!("Failed to finalize Codex auth.json: {}", e))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600));
-    }
-
-    tracing::info!(
-        path = %auth_path.display(),
-        account_id = ?account_id,
-        "Wrote Codex auth.json (chatgpt mode, explicit tokens)"
-    );
-    Ok(())
+    write_codex_chatgpt_auth_file(config_dir, access_token, refresh_token, "rotation_override")
 }
 
 /// Write Codex credentials to a workspace.

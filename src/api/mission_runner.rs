@@ -461,11 +461,10 @@ impl CodexCredential {
         match self {
             CodexCredential::ApiKey(k) => codex_key_fingerprint(k),
             CodexCredential::OAuth(acc) => {
-                let suffix = if acc.chatgpt_account_id.len() > 8 {
-                    &acc.chatgpt_account_id[..8]
-                } else {
-                    &acc.chatgpt_account_id
-                };
+                // Truncate by char count, not byte index — `chatgpt_account_id`
+                // is an ASCII UUID in practice, but a stray multi-byte char
+                // would otherwise panic via mid-codepoint slicing.
+                let suffix: String = acc.chatgpt_account_id.chars().take(8).collect();
                 match acc.account_email.as_deref() {
                     Some(email) => format!("oauth:{}@{}", suffix, email),
                     None => format!("oauth:{}", suffix),
