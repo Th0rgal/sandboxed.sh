@@ -2567,17 +2567,20 @@ struct ControlView: View {
                 break
             }
 
-            // Remove phase items when thinking starts
-            messages.removeAll { $0.isPhase }
-
             // Skip if we've already seen this server-supplied event id —
             // delta resume can re-deliver completed thinking events we already
             // appended, and the active-message fast path won't catch them
-            // because the existing one is already `done: true`.
+            // because the existing one is already `done: true`. Run this
+            // *before* stripping phase messages, otherwise a duplicate-event
+            // break would silently clear a still-relevant `agent_phase`
+            // indicator without adding any new content.
             let eventId = data["id"] as? String
             if let eventId, messages.contains(where: { $0.id == eventId }) {
                 break
             }
+
+            // Remove phase items now that we know we're committing this event.
+            messages.removeAll { $0.isPhase }
 
             // Find existing active thinking message or create new
             if let index = messages.lastIndex(where: { $0.isThinking && !$0.thinkingDone }) {
