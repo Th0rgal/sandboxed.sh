@@ -4664,7 +4664,16 @@ export default function ControlClient() {
           limit: HISTORY_PAGE_SIZE,
         });
         if (olderEvents.length === 0) {
-          setOlderLoadState({ hasMore: false, loading: false });
+          // Same per-mission gate as below — see comment on
+          // `stillActiveForId`. If the user switched missions while we
+          // were fetching, don't pin the new mission's UI to "no more
+          // older messages" based on the old mission's empty page.
+          if (
+            currentMissionRef.current?.id === id ||
+            viewingMissionRef.current?.id === id
+          ) {
+            setOlderLoadState({ hasMore: false, loading: false });
+          }
           return;
         }
 
@@ -4704,28 +4713,43 @@ export default function ControlClient() {
         const oldScrollTop = scrollEl?.scrollTop ?? 0;
         const oldScrollHeight = scrollEl?.scrollHeight ?? 0;
 
-        if (liveCurrent?.id === id || liveViewing?.id === id) {
+        // The user may have switched missions during the await. Capture
+        // the still-active gate once and use it for *every* state write
+        // below — `setOlderLoadState` is single-shared (not per-mission),
+        // so an old-mission completion would otherwise clobber the new
+        // mission's pagination UI state set by `seedPaginationStateAfterInitialLoad`.
+        const stillActiveForId = liveCurrent?.id === id || liveViewing?.id === id;
+
+        if (stillActiveForId) {
           setItems((prev) => {
             const liveTail = prev.slice(oldHistoricCount);
             return [...newHistoricItems, ...liveTail];
           });
+
+          requestAnimationFrame(() => {
+            if (!scrollEl) return;
+            const newScrollHeight = scrollEl.scrollHeight;
+            scrollEl.scrollTop =
+              newScrollHeight - oldScrollHeight + oldScrollTop;
+          });
+
+          setOlderLoadState({
+            hasMore: computeHasMoreOlder(id),
+            loading: false,
+          });
         }
-
-        requestAnimationFrame(() => {
-          if (!scrollEl) return;
-          const newScrollHeight = scrollEl.scrollHeight;
-          scrollEl.scrollTop =
-            newScrollHeight - oldScrollHeight + oldScrollTop;
-        });
-
-        setOlderLoadState({
-          hasMore: computeHasMoreOlder(id),
-          loading: false,
-        });
       } catch (err) {
         console.error("Failed to load older events:", err);
         toast.error("Failed to load older messages");
-        setOlderLoadState((prev) => ({ ...prev, loading: false }));
+        // Only clear the loading flag if the active mission is still the
+        // one we were paginating — otherwise we'd wipe state set for a
+        // newer, unrelated mission.
+        const stillActive =
+          currentMissionRef.current?.id === id ||
+          viewingMissionRef.current?.id === id;
+        if (stillActive) {
+          setOlderLoadState((prev) => ({ ...prev, loading: false }));
+        }
       }
     },
     // Note: `viewingMission` is intentionally NOT in deps — the body now
