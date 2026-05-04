@@ -3304,6 +3304,15 @@ export default function ControlClient() {
   const missionHistoricEventsRef = useRef<Map<string, StoredEvent[]>>(new Map());
   const historicItemsCountRef = useRef<Map<string, number>>(new Map());
   const missionTotalHistoryRef = useRef<Map<string, number>>(new Map());
+  // Captured scroll geometry from the moment of `setItems` during a
+  // paginate-back. Consumed by a `useLayoutEffect` watching `items` so the
+  // restoration runs synchronously after commit but BEFORE the browser
+  // paints — using `requestAnimationFrame` here would let the user see a
+  // one-frame jump against the longer DOM before the scroll adjusts.
+  const pendingScrollRestoreRef = useRef<{
+    oldScrollTop: number;
+    oldScrollHeight: number;
+  } | null>(null);
   const [olderLoadState, setOlderLoadState] = useState<{
     hasMore: boolean;
     loading: boolean;
@@ -3903,6 +3912,28 @@ export default function ControlClient() {
     if (items.length > 0 && isAtBottom) {
       scrollToBottomImmediate();
     }
+  }, [items]);
+
+  // Backwards-pagination scroll restore. `loadOlderHistoryEvents` snapshots
+  // `scrollTop` + `scrollHeight` BEFORE prepending items into this ref;
+  // after React commits the longer list, we adjust `scrollTop` to keep the
+  // previously-visible message in the viewport. This MUST run in a
+  // `useLayoutEffect` (synchronously after commit, before browser paint) —
+  // doing it in `requestAnimationFrame` produces a one-frame flash where
+  // the user sees the old `scrollTop` against the new (taller) DOM before
+  // the adjustment lands. Declared after the scroll-to-bottom effect on
+  // purpose so React runs it second; the bottom-scroll only fires when
+  // `isAtBottom`, which is never true during a paginate-back.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useLayoutEffect(() => {
+    const pending = pendingScrollRestoreRef.current;
+    if (!pending) return;
+    pendingScrollRestoreRef.current = null;
+    const scrollEl = containerRef.current;
+    if (!scrollEl) return;
+    const newScrollHeight = scrollEl.scrollHeight;
+    scrollEl.scrollTop =
+      newScrollHeight - pending.oldScrollHeight + pending.oldScrollTop;
   }, [items]);
 
   // Sync input to localStorage draft
@@ -4704,15 +4735,6 @@ export default function ControlClient() {
         const oldHistoricCount = historicItemsCountRef.current.get(id) ?? 0;
         historicItemsCountRef.current.set(id, newHistoricItems.length);
 
-        // Capture scroll geometry so we can preserve the in-viewport
-        // message after React commits the longer list (otherwise the
-        // user's scroll position would jump to the now-distant top).
-        // `containerRef` is the messages-pane scroll container (see
-        // `useScrollToBottom` and the JSX below near `ref={containerRef}`).
-        const scrollEl = containerRef.current;
-        const oldScrollTop = scrollEl?.scrollTop ?? 0;
-        const oldScrollHeight = scrollEl?.scrollHeight ?? 0;
-
         // The user may have switched missions during the await. Capture
         // the still-active gate once and use it for *every* state write
         // below — `setOlderLoadState` is single-shared (not per-mission),
@@ -4721,16 +4743,23 @@ export default function ControlClient() {
         const stillActiveForId = liveCurrent?.id === id || liveViewing?.id === id;
 
         if (stillActiveForId) {
+          // Snapshot scroll geometry FIRST, then setItems. The
+          // `useLayoutEffect` watching `items` reads
+          // `pendingScrollRestoreRef` synchronously after commit and
+          // BEFORE paint, so the user never sees the longer DOM with
+          // the old scrollTop. (Doing this in `requestAnimationFrame`
+          // would land one frame late and produce a visible jump.)
+          const scrollEl = containerRef.current;
+          if (scrollEl) {
+            pendingScrollRestoreRef.current = {
+              oldScrollTop: scrollEl.scrollTop,
+              oldScrollHeight: scrollEl.scrollHeight,
+            };
+          }
+
           setItems((prev) => {
             const liveTail = prev.slice(oldHistoricCount);
             return [...newHistoricItems, ...liveTail];
-          });
-
-          requestAnimationFrame(() => {
-            if (!scrollEl) return;
-            const newScrollHeight = scrollEl.scrollHeight;
-            scrollEl.scrollTop =
-              newScrollHeight - oldScrollHeight + oldScrollTop;
           });
 
           setOlderLoadState({
