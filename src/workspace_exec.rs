@@ -548,7 +548,11 @@ impl WorkspaceExec {
             .lines()
             .next()
             .map(|s| s.trim().to_string())?;
-        if leader.is_empty() { None } else { Some(leader) }
+        if leader.is_empty() {
+            None
+        } else {
+            Some(leader)
+        }
     }
 
     fn leader_has_keepalive_marker(&self, leader: &str) -> bool {
