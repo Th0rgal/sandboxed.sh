@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo, startTransition } from "react";
+import { useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo, startTransition } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
 import { MarkdownContent } from "@/components/markdown-content";
@@ -3498,6 +3498,9 @@ export default function ControlClient() {
 
   // Thinking panel state
   const [showThinkingPanel, setShowThinkingPanel] = useState(false);
+  // Deferred mirror used by the heavy chat-list regrouping memo so the toggle
+  // click stays interactive even on long missions.
+  const deferredShowThinkingPanel = useDeferredValue(showThinkingPanel);
   const [thinkingPanelManuallyHidden, setThinkingPanelManuallyHidden] = useState(false);
   const [showWorkbenchPanel, setShowWorkbenchPanel] = useState(
     () => searchParams.get("workbench") === "1"
@@ -3706,8 +3709,14 @@ export default function ControlClient() {
     hasActiveThinking,
     groupedItems,
   } = useMemo(
-    () => deriveItemViews(items, showThinkingPanel),
-    [items, showThinkingPanel]
+    // `showThinkingPanel` reroutes thinking items between the inline chat
+    // and the side panel, which flips the structure of `groupedItems` and
+    // forces React to reconcile every chat row. On long missions that can
+    // block the main thread for several seconds, so feed it through
+    // `useDeferredValue`: the toggle button + panel mount react instantly
+    // while the chat-list regrouping is treated as a non-urgent transition.
+    () => deriveItemViews(items, deferredShowThinkingPanel),
+    [items, deferredShowThinkingPanel]
   );
 
   // Auto-show thinking panel when thinking starts (only on transition to active)
@@ -8090,21 +8099,6 @@ export default function ControlClient() {
           )}
 
           <button
-            onClick={() => setShowAutomationsDialog(true)}
-            disabled={!activeMission}
-            className={cn(
-              "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
-              activeMission
-                ? "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
-                : "border-white/[0.04] bg-white/[0.01] text-white/30 cursor-not-allowed"
-            )}
-            title={activeMission ? "Manage mission automations" : "Select a mission to manage automations"}
-          >
-            <Clock className="h-4 w-4" />
-            <span className="hidden lg:inline">Automations</span>
-          </button>
-
-          <button
             onClick={() => setShowWorkbenchPanel((prev) => !prev)}
             className={cn(
               "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
@@ -9182,7 +9176,7 @@ export default function ControlClient() {
                 onOpenSwitcher={() => setShowMissionSwitcher(true)}
                 onViewMission={handleViewMission}
                 onSetStatus={handleSetStatus}
-                className={showThinkingPanel || showDesktopStream || (showWorkerPanel && isBossMission) ? "flex-shrink-0 max-h-[40%]" : "flex-1"}
+                className="flex-1 min-h-0"
               />
             )}
 
