@@ -4784,6 +4784,20 @@ export default function ControlClient() {
             return [...newHistoricItems, ...liveTail];
           });
 
+          // The render path uses `groupedItems.slice(-visibleItemsLimit)` —
+          // the LAST N items. Prepended older items land at the START of
+          // the array, so without expanding the limit they'd never
+          // actually render and the chat would visually be unchanged
+          // (and the scroll-restore would no-op against an unchanged
+          // DOM). Grow the limit by exactly the number of newly-added
+          // historic items so the visible window now also covers the
+          // older page. We don't shrink it past `prev` — other code
+          // may have already grown it for unrelated reasons.
+          const addedHistoricItems = newHistoricItems.length - oldHistoricCount;
+          if (addedHistoricItems > 0) {
+            setVisibleItemsLimit((prev) => prev + addedHistoricItems);
+          }
+
           setOlderLoadState({
             missionId: id,
             hasMore: computeHasMoreOlder(id),
@@ -8076,21 +8090,6 @@ export default function ControlClient() {
           )}
 
           <button
-            onClick={() => setShowAutomationsDialog(true)}
-            disabled={!activeMission}
-            className={cn(
-              "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
-              activeMission
-                ? "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
-                : "border-white/[0.04] bg-white/[0.01] text-white/30 cursor-not-allowed"
-            )}
-            title={activeMission ? "Manage mission automations" : "Select a mission to manage automations"}
-          >
-            <Clock className="h-4 w-4" />
-            <span className="hidden lg:inline">Automations</span>
-          </button>
-
-          <button
             onClick={() => setShowWorkbenchPanel((prev) => !prev)}
             className={cn(
               "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
@@ -9168,7 +9167,7 @@ export default function ControlClient() {
                 onOpenSwitcher={() => setShowMissionSwitcher(true)}
                 onViewMission={handleViewMission}
                 onSetStatus={handleSetStatus}
-                className={showThinkingPanel || showDesktopStream || (showWorkerPanel && isBossMission) ? "flex-shrink-0 max-h-[40%]" : "flex-1"}
+                className="flex-1 min-h-0"
               />
             )}
 
