@@ -30,35 +30,93 @@ interface MarkdownContentProps {
   missionId?: string;
 }
 
-// Global cache for fetched image URLs with automatic cleanup
-// Uses a simple LRU-style eviction: when cache exceeds limit, oldest entries are revoked
+// Global, refcounted cache of fetched image blob URLs.
+//
+// Why refcounted: the previous implementation revoked the oldest URL on
+// LRU eviction, but that URL was often still the `src=` of a mounted
+// `<img>` element somewhere on the page (the URL lives in component
+// state, not just in this map). Revoking it under the running DOM made
+// the browser show its broken-image icon — but a click-through to the
+// preview modal triggered a fresh fetch and worked, which matched the
+// reported "image fails until I click the broken icon" symptom exactly.
+//
+// New contract: every consumer that uses a URL from this cache must call
+// `acquireCachedImageUrl` (or `cacheAndAcquireImageUrl` if it just
+// fetched) and pair it with a later `releaseImageUrl`. The cache only
+// revokes a URL when its refcount reaches zero AND the entry has been
+// LRU-evicted, so a URL stuck in a mounted `<img>` keeps working until
+// that `<img>` unmounts.
 const IMAGE_CACHE_LIMIT = 50;
-const imageUrlCache = new Map<string, string>();
 
-function cacheImageUrl(path: string, url: string): void {
-  // If already cached, revoke the duplicate URL and update access order
-  if (imageUrlCache.has(path)) {
-    // Revoke the incoming duplicate URL to prevent memory leak from concurrent fetches
+interface ImageCacheEntry {
+  url: string;
+  refCount: number;
+  /** Marked when LRU-evicted but kept alive because refCount > 0. The
+   *  next `releaseImageUrl` that drops refCount to 0 will revoke and
+   *  drop the entry instead of leaving it indefinitely. */
+  evicted: boolean;
+}
+
+const imageUrlCache = new Map<string, ImageCacheEntry>();
+
+/** Try to read a cached URL for `path` and acquire a reference. Returns
+ *  null when not cached. Callers must pair every successful return with
+ *  exactly one `releaseImageUrl(path)` on unmount. */
+function acquireCachedImageUrl(path: string): string | null {
+  const entry = imageUrlCache.get(path);
+  if (!entry) return null;
+  entry.refCount++;
+  return entry.url;
+}
+
+/** Insert a freshly-fetched blob URL and acquire one reference. Caller
+ *  owns the reference and must release it on unmount. Concurrent fetches
+ *  for the same path collapse onto the existing entry — the duplicate
+ *  URL is revoked here so the caller's later `releaseImageUrl` decrements
+ *  the canonical entry's refCount instead of leaking. */
+function cacheAndAcquireImageUrl(path: string, url: string): string {
+  const existing = imageUrlCache.get(path);
+  if (existing) {
     URL.revokeObjectURL(url);
-    const existingUrl = imageUrlCache.get(path)!;
-    imageUrlCache.delete(path);
-    imageUrlCache.set(path, existingUrl);
-    return;
+    existing.refCount++;
+    return existing.url;
   }
 
-  // Evict oldest entries if at limit
-  while (imageUrlCache.size >= IMAGE_CACHE_LIMIT) {
-    const oldestKey = imageUrlCache.keys().next().value;
-    if (oldestKey) {
-      const oldUrl = imageUrlCache.get(oldestKey);
-      if (oldUrl) {
-        URL.revokeObjectURL(oldUrl);
+  // LRU eviction: drop entries with refCount === 0 first (safe to revoke).
+  // For entries still in use, mark them `evicted` and let
+  // `releaseImageUrl` revoke them when the last consumer unmounts. If
+  // every entry is referenced we stop trying — better to leak the URL
+  // bookkeeping than break a live `<img>`.
+  let attempts = imageUrlCache.size;
+  while (imageUrlCache.size >= IMAGE_CACHE_LIMIT && attempts > 0) {
+    let dropped = false;
+    for (const [key, entry] of imageUrlCache) {
+      if (entry.refCount === 0) {
+        URL.revokeObjectURL(entry.url);
+        imageUrlCache.delete(key);
+        dropped = true;
+        break;
       }
-      imageUrlCache.delete(oldestKey);
+      entry.evicted = true;
     }
+    if (!dropped) break;
+    attempts--;
   }
 
-  imageUrlCache.set(path, url);
+  imageUrlCache.set(path, { url, refCount: 1, evicted: false });
+  return url;
+}
+
+/** Decrement the refcount for `path`. If it reaches zero AND the entry
+ *  was previously LRU-evicted, revoke the URL and drop it. */
+function releaseImageUrl(path: string): void {
+  const entry = imageUrlCache.get(path);
+  if (!entry) return;
+  entry.refCount = Math.max(0, entry.refCount - 1);
+  if (entry.refCount === 0 && entry.evicted) {
+    URL.revokeObjectURL(entry.url);
+    imageUrlCache.delete(path);
+  }
 }
 
 function isFilePath(str: string): boolean {
@@ -155,8 +213,13 @@ function FilePreviewModalContent({
   const FileIcon = getFileIcon(path);
   const fileName = path.split("/").pop() || "file";
 
-  const [imageUrl, setImageUrl] = useState<string | null>(imageUrlCache.get(resolvedPath) || null);
-  const [loading, setLoading] = useState(!imageUrl && isImage);
+  // imageUrl initial state is null on purpose — the effect below acquires
+  // (and refcounts) the cached URL on mount instead of reading the cache
+  // directly here. Reading cache without acquiring would let LRU eviction
+  // revoke the URL out from under this component's `<img src>`, which is
+  // the bug this refcount fix is closing.
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(isImage);
   const [error, setError] = useState<string | null>(null);
   const [fileSize, setFileSize] = useState<number | null>(null);
   const [downloading, setDownloading] = useState(false);
@@ -167,9 +230,22 @@ function FilePreviewModalContent({
 
   // Fetch image on mount
   useEffect(() => {
-    if (!isImage || imageUrl) return;
+    if (!isImage) return;
 
     let cancelled = false;
+    let acquired = false;
+
+    const cached = acquireCachedImageUrl(resolvedPath);
+    if (cached) {
+      setImageUrl(cached);
+      setLoading(false);
+      acquired = true;
+      return () => {
+        cancelled = true;
+        if (acquired) releaseImageUrl(resolvedPath);
+      };
+    }
+
     const fetchImage = async () => {
       const API_BASE = getRuntimeApiBase();
       const params = new URLSearchParams({ path: resolvedPath });
@@ -187,8 +263,15 @@ function FilePreviewModalContent({
         const blob = await res.blob();
         if (!cancelled) setFileSize(blob.size);
         const url = URL.createObjectURL(blob);
-        cacheImageUrl(resolvedPath, url);
-        if (!cancelled) setImageUrl(url);
+        if (cancelled) {
+          // Component unmounted before fetch landed — don't put this URL
+          // into the cache where it would leak; just revoke it directly.
+          URL.revokeObjectURL(url);
+          return;
+        }
+        const stored = cacheAndAcquireImageUrl(resolvedPath, url);
+        acquired = true;
+        setImageUrl(stored);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load");
       } finally {
@@ -197,8 +280,11 @@ function FilePreviewModalContent({
     };
 
     fetchImage();
-    return () => { cancelled = true; };
-  }, [isImage, imageUrl, resolvedPath]);
+    return () => {
+      cancelled = true;
+      if (acquired) releaseImageUrl(resolvedPath);
+    };
+  }, [isImage, resolvedPath, workspaceId, missionId]);
 
   // Fetch text preview on mount
   useEffect(() => {
@@ -546,13 +632,25 @@ function InlineImagePreview({
   missionId?: string;
 }) {
   const resolvedPath = resolvePath(path, basePath);
-  const [imageUrl, setImageUrl] = useState<string | null>(imageUrlCache.get(resolvedPath) || null);
-  const [loading, setLoading] = useState(!imageUrl);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (imageUrl) return;
     let cancelled = false;
+    let acquired = false;
+
+    const cached = acquireCachedImageUrl(resolvedPath);
+    if (cached) {
+      setImageUrl(cached);
+      setLoading(false);
+      acquired = true;
+      return () => {
+        cancelled = true;
+        if (acquired) releaseImageUrl(resolvedPath);
+      };
+    }
+
     const fetchImage = async () => {
       const API_BASE = getRuntimeApiBase();
       const params = new URLSearchParams({ path: resolvedPath });
@@ -569,8 +667,13 @@ function InlineImagePreview({
         }
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
-        cacheImageUrl(resolvedPath, url);
-        if (!cancelled) setImageUrl(url);
+        if (cancelled) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        const stored = cacheAndAcquireImageUrl(resolvedPath, url);
+        acquired = true;
+        setImageUrl(stored);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load");
       } finally {
@@ -578,8 +681,11 @@ function InlineImagePreview({
       }
     };
     fetchImage();
-    return () => { cancelled = true; };
-  }, [imageUrl, resolvedPath, workspaceId, missionId]);
+    return () => {
+      cancelled = true;
+      if (acquired) releaseImageUrl(resolvedPath);
+    };
+  }, [resolvedPath, workspaceId, missionId]);
 
   if (error) {
     return (
