@@ -66,6 +66,10 @@ function acquireCachedImageUrl(path: string): string | null {
   const entry = imageUrlCache.get(path);
   if (!entry) return null;
   entry.refCount++;
+  // Re-acquired by a new consumer, so the entry is back to useful —
+  // clear any stale eviction mark from a prior overflow that didn't
+  // actually need to revoke this URL after all.
+  entry.evicted = false;
   return entry.url;
 }
 
@@ -79,16 +83,26 @@ function cacheAndAcquireImageUrl(path: string, url: string): string {
   if (existing) {
     URL.revokeObjectURL(url);
     existing.refCount++;
+    // The entry is being acquired again, so it's clearly still useful —
+    // clear any prior eviction mark so a subsequent release doesn't
+    // revoke a URL we're actively re-using.
+    existing.evicted = false;
     return existing.url;
   }
 
-  // LRU eviction: drop entries with refCount === 0 first (safe to revoke).
-  // For entries still in use, mark them `evicted` and let
-  // `releaseImageUrl` revoke them when the last consumer unmounts. If
-  // every entry is referenced we stop trying — better to leak the URL
-  // bookkeeping than break a live `<img>`.
-  let attempts = imageUrlCache.size;
-  while (imageUrlCache.size >= IMAGE_CACHE_LIMIT && attempts > 0) {
+  // LRU eviction strategy:
+  //   1. Drop refCount=0 entries first — they're safe to revoke immediately.
+  //   2. If everything is referenced, mark only the OLDEST entry (first
+  //      in insertion order) as `evicted`, so its last consumer's
+  //      `releaseImageUrl` revokes it. We don't mark more than one —
+  //      that would needlessly destroy cache effectiveness for entries
+  //      that callers might still re-acquire. If the working set really
+  //      exceeds the cap, future inserts will mark additional entries
+  //      one-by-one as they overflow.
+  //   3. The cache may temporarily exceed `IMAGE_CACHE_LIMIT` when all
+  //      entries are referenced; that's fine and self-corrects as
+  //      consumers unmount.
+  while (imageUrlCache.size >= IMAGE_CACHE_LIMIT) {
     let dropped = false;
     for (const [key, entry] of imageUrlCache) {
       if (entry.refCount === 0) {
@@ -97,10 +111,19 @@ function cacheAndAcquireImageUrl(path: string, url: string): string {
         dropped = true;
         break;
       }
-      entry.evicted = true;
     }
-    if (!dropped) break;
-    attempts--;
+    if (dropped) continue;
+
+    // No droppable entries — every URL is live. Mark only the oldest
+    // for revoke-on-last-release and stop.
+    const oldestKey = imageUrlCache.keys().next().value;
+    if (oldestKey) {
+      const oldest = imageUrlCache.get(oldestKey);
+      if (oldest && !oldest.evicted) {
+        oldest.evicted = true;
+      }
+    }
+    break;
   }
 
   imageUrlCache.set(path, { url, refCount: 1, evicted: false });
