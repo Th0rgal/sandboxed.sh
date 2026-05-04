@@ -177,6 +177,10 @@ export async function getMissionEvents(
     /** When set, request only events with `sequence > sinceSeq`.
      * Takes precedence over `offset`/`latest` on the server. */
     sinceSeq?: number;
+    /** When set, request only events with `sequence < beforeSeq`,
+     * returned ASC. Takes precedence over `sinceSeq`/`offset`/`latest`.
+     * Used for backwards pagination. */
+    beforeSeq?: number;
   }
 ): Promise<StoredEvent[]> {
   const { events } = await getMissionEventsWithMeta(id, options);
@@ -208,6 +212,7 @@ export async function getMissionEventsWithMeta(
     offset?: number;
     latest?: boolean;
     sinceSeq?: number;
+    beforeSeq?: number;
   }
 ): Promise<{ events: StoredEvent[]; meta: MissionEventsMeta }> {
   const params = new URLSearchParams();
@@ -216,6 +221,7 @@ export async function getMissionEventsWithMeta(
   if (options?.offset) params.set("offset", String(options.offset));
   if (options?.latest) params.set("latest", "true");
   if (options?.sinceSeq !== undefined) params.set("since_seq", String(options.sinceSeq));
+  if (options?.beforeSeq !== undefined) params.set("before_seq", String(options.beforeSeq));
   const query = params.toString();
   const res = await apiFetch(
     `/api/control/missions/${id}/events${query ? `?${query}` : ""}`

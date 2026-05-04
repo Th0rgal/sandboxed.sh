@@ -3279,6 +3279,36 @@ export default function ControlClient() {
   const lastQueueLenRef = useRef<number | null>(null);
   const syncingQueueRef = useRef(false);
 
+  // Backwards-pagination state. Long missions can have 20k+ history events
+  // and the initial load is capped at HISTORY_PAGE_SIZE for memory + render
+  // perf. These caches let the user click "Load older messages" to fetch
+  // the next page back without re-fetching the whole history.
+  //
+  // missionMinSeqRef            — lowest `sequence` currently loaded; used
+  //                               as the next `before_seq` cursor.
+  // missionHistoricEventsRef    — accumulated raw history events for the
+  //                               mission (initial + paginated older). Kept
+  //                               so we can replay `eventsToItems` over the
+  //                               full set when prepending older events,
+  //                               which preserves tool_call/result linkage
+  //                               and thinking-delta consolidation.
+  // historicItemsCountRef       — number of items in `items` that came
+  //                               from the current historic snapshot, so a
+  //                               paginate-older replace knows where the
+  //                               live SSE-appended tail starts.
+  // missionTotalHistoryRef      — server-reported total count (matching
+  //                               the type filter); compared against
+  //                               accumulated cache size to decide whether
+  //                               more older events exist.
+  const missionMinSeqRef = useRef<Map<string, number>>(new Map());
+  const missionHistoricEventsRef = useRef<Map<string, StoredEvent[]>>(new Map());
+  const historicItemsCountRef = useRef<Map<string, number>>(new Map());
+  const missionTotalHistoryRef = useRef<Map<string, number>>(new Map());
+  const [olderLoadState, setOlderLoadState] = useState<{
+    hasMore: boolean;
+    loading: boolean;
+  }>({ hasMore: false, loading: false });
+
   // Performance optimization: limit rendered items for large conversations
   const INITIAL_VISIBLE_ITEMS = 30;
   const LOAD_MORE_INCREMENT = 30;
@@ -3517,10 +3547,13 @@ export default function ControlClient() {
    */
   const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
 
+  // Page size for both the initial history load and each backwards-
+  // paginate-older fetch. Tuned for memory headroom on long missions —
+  // see the `chatScrollContainerRef` comment block above.
+  const HISTORY_PAGE_SIZE = 5000;
+
   const loadHistoryEvents = useCallback(
     async (id: string, opts?: { sinceSeq?: number }) => {
-      const MAX_EVENTS = 5000;
-
       if (opts?.sinceSeq !== undefined) {
         // Delta load — used on reconnect/visibility/periodic sync.
         // The server returns events with sequence > sinceSeq already
@@ -3535,7 +3568,7 @@ export default function ControlClient() {
         const { events, meta } = await getMissionEventsWithMeta(id, {
           types: HISTORY_EVENT_TYPES,
           sinceSeq: opts.sinceSeq,
-          limit: MAX_EVENTS,
+          limit: HISTORY_PAGE_SIZE,
         });
         if (meta.maxSequence === undefined) {
           missionMaxSeqRef.current.delete(id);
@@ -3548,21 +3581,21 @@ export default function ControlClient() {
         const lastSeq =
           events.length > 0 ? events[events.length - 1].sequence : opts.sinceSeq;
         const cursor =
-          events.length >= MAX_EVENTS && lastSeq < meta.maxSequence
+          events.length >= HISTORY_PAGE_SIZE && lastSeq < meta.maxSequence
             ? lastSeq
             : meta.maxSequence;
         missionMaxSeqRef.current.set(id, cursor);
         return events;
       }
 
-      // Initial load — request the most recent MAX_EVENTS events.
+      // Initial load — request the most recent HISTORY_PAGE_SIZE events.
       // `latest=true` lets the server compute the tail offset in one
       // shot, so clients no longer need the binary-search probe loop
       // to handle 25k+ event missions.
       const { events, meta } = await getMissionEventsWithMeta(id, {
         types: HISTORY_EVENT_TYPES,
         latest: true,
-        limit: MAX_EVENTS,
+        limit: HISTORY_PAGE_SIZE,
       });
       // Only seed `missionMaxSeqRef` when the server has confirmed it
       // supports the resume protocol via `X-Max-Sequence`. Seeding from
@@ -3574,10 +3607,63 @@ export default function ControlClient() {
       }
       // Defensive: sort by sequence ASC in case upstream contract changes.
       const sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
+      // Seed pagination caches: snapshot of historic events, lowest seq
+      // (cursor for next backwards page), and total filtered count from
+      // the server (so we know when the user has reached the start).
+      missionHistoricEventsRef.current.set(id, sorted);
+      if (sorted.length > 0) {
+        missionMinSeqRef.current.set(id, sorted[0].sequence);
+      } else {
+        missionMinSeqRef.current.delete(id);
+      }
+      if (meta.totalEvents !== undefined) {
+        missionTotalHistoryRef.current.set(id, meta.totalEvents);
+      } else {
+        missionTotalHistoryRef.current.delete(id);
+      }
       return sorted;
     },
     [HISTORY_EVENT_TYPES]
   );
+
+  /**
+   * Recompute "is there more older history to load" for a mission, by
+   * comparing the locally-cached event count against the server's total.
+   * `undefined` total (e.g. older backend without `X-Total-Events`) is
+   * treated as "unknown → assume yes" if we got a full page on the last
+   * fetch — gives the user the option to try, and the next fetch will
+   * surface emptiness.
+   */
+  const computeHasMoreOlder = useCallback((id: string): boolean => {
+    const accumulated = missionHistoricEventsRef.current.get(id)?.length ?? 0;
+    const total = missionTotalHistoryRef.current.get(id);
+    if (total === undefined) {
+      // Heuristic: a full page suggests there could be more. Empty/short
+      // page rules it out.
+      return accumulated >= HISTORY_PAGE_SIZE;
+    }
+    return accumulated < total;
+  }, []);
+
+  /**
+   * Bookkeeping after an initial history load completes and `setItems`
+   * has been called. Records how many items were derived from history
+   * (so a later "load older" page-replace can find the live tail) and
+   * publishes the "more older messages exist" state to the UI.
+   */
+  const seedPaginationStateAfterInitialLoad = useCallback(
+    (id: string, historyItemsLen: number) => {
+      historicItemsCountRef.current.set(id, historyItemsLen);
+      setOlderLoadState({
+        hasMore: computeHasMoreOlder(id),
+        loading: false,
+      });
+    },
+    [computeHasMoreOlder]
+  );
+
+  // `loadOlderHistoryEvents` is declared further down, after
+  // `eventsToItems` (TDZ). Search for its definition there.
 
   // Tool groups expansion state - tracks which groups are expanded by their first tool's id
   const [expandedToolGroups, setExpandedToolGroups] = useState<Set<string>>(new Set());
@@ -4545,6 +4631,91 @@ export default function ControlClient() {
     return items;
   }, []);
 
+  /**
+   * Fetch the next page of older history events (events with `sequence`
+   * strictly less than the lowest currently loaded). Replays
+   * `eventsToItems` over the full accumulated event set so tool-call /
+   * tool-result linkage and thinking-delta consolidation stay coherent
+   * across the page boundary, then splices the new historic prefix in
+   * front of the SSE-appended live tail.
+   *
+   * Defined after `eventsToItems` so the callback's dependency array can
+   * reference it without hitting `const` TDZ at component init.
+   */
+  const loadOlderHistoryEvents = useCallback(
+    async (id: string) => {
+      const beforeSeq = missionMinSeqRef.current.get(id);
+      if (beforeSeq === undefined || beforeSeq <= 1) {
+        setOlderLoadState({ hasMore: false, loading: false });
+        return;
+      }
+      setOlderLoadState((prev) => ({ ...prev, loading: true }));
+      try {
+        const { events: olderEvents } = await getMissionEventsWithMeta(id, {
+          types: HISTORY_EVENT_TYPES,
+          beforeSeq,
+          limit: HISTORY_PAGE_SIZE,
+        });
+        if (olderEvents.length === 0) {
+          setOlderLoadState({ hasMore: false, loading: false });
+          return;
+        }
+
+        const sortedOlder = olderEvents
+          .slice()
+          .sort((a, b) => a.sequence - b.sequence);
+
+        missionMinSeqRef.current.set(id, sortedOlder[0].sequence);
+        const existing = missionHistoricEventsRef.current.get(id) ?? [];
+        const merged = [...sortedOlder, ...existing];
+        missionHistoricEventsRef.current.set(id, merged);
+
+        const mission =
+          currentMissionRef.current?.id === id
+            ? currentMissionRef.current
+            : viewingMission?.id === id
+              ? viewingMission
+              : null;
+        const newHistoricItems = eventsToItems(merged, mission);
+        const oldHistoricCount = historicItemsCountRef.current.get(id) ?? 0;
+        historicItemsCountRef.current.set(id, newHistoricItems.length);
+
+        // Capture scroll geometry so we can preserve the in-viewport
+        // message after React commits the longer list (otherwise the
+        // user's scroll position would jump to the now-distant top).
+        // `containerRef` is the messages-pane scroll container (see
+        // `useScrollToBottom` and the JSX below near `ref={containerRef}`).
+        const scrollEl = containerRef.current;
+        const oldScrollTop = scrollEl?.scrollTop ?? 0;
+        const oldScrollHeight = scrollEl?.scrollHeight ?? 0;
+
+        if (currentMissionRef.current?.id === id || viewingMission?.id === id) {
+          setItems((prev) => {
+            const liveTail = prev.slice(oldHistoricCount);
+            return [...newHistoricItems, ...liveTail];
+          });
+        }
+
+        requestAnimationFrame(() => {
+          if (!scrollEl) return;
+          const newScrollHeight = scrollEl.scrollHeight;
+          scrollEl.scrollTop =
+            newScrollHeight - oldScrollHeight + oldScrollTop;
+        });
+
+        setOlderLoadState({
+          hasMore: computeHasMoreOlder(id),
+          loading: false,
+        });
+      } catch (err) {
+        console.error("Failed to load older events:", err);
+        toast.error("Failed to load older messages");
+        setOlderLoadState((prev) => ({ ...prev, loading: false }));
+      }
+    },
+    [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder, viewingMission]
+  );
+
   // Load mission from URL param on mount (and retry on auth success)
   const [authRetryTrigger, setAuthRetryTrigger] = useState(0);
 
@@ -4686,6 +4857,7 @@ export default function ControlClient() {
         }
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
+        seedPaginationStateAfterInitialLoad(id, historyItems.length);
         applyDesktopSessionState(mission);
         // Also check events for desktop sessions (in case mission.desktop_sessions isn't populated yet)
         if (events) {
@@ -4770,6 +4942,7 @@ export default function ControlClient() {
               }
               setItems(historyItems);
               adjustVisibleItemsLimit(historyItems);
+              seedPaginationStateAfterInitialLoad(mission.id, historyItems.length);
               // Also check events for desktop sessions
               applyDesktopSessionFromEvents(events);
             })
@@ -4802,6 +4975,7 @@ export default function ControlClient() {
     missionHistoryToItems,
     adjustVisibleItemsLimit,
     loadHistoryEvents,
+    seedPaginationStateAfterInitialLoad,
     applyDesktopSessionState,
     applyDesktopSessionFromEvents,
     authRetryTrigger,
@@ -5167,6 +5341,7 @@ export default function ControlClient() {
 
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
+        seedPaginationStateAfterInitialLoad(missionId, historyItems.length);
         // Check if mission has an active desktop session (stored metadata or fallback to history)
         applyDesktopSessionState(mission);
         // Also check events for desktop sessions
@@ -5221,6 +5396,7 @@ export default function ControlClient() {
       applyDesktopSessionState,
       adjustVisibleItemsLimit,
       loadHistoryEvents,
+      seedPaginationStateAfterInitialLoad,
       router,
     ]
   );
@@ -7489,6 +7665,7 @@ export default function ControlClient() {
 
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
+        seedPaginationStateAfterInitialLoad(missionId, historyItems.length);
         updateMissionItems(missionId, historyItems);
         if (events) {
           applyDesktopSessionFromEvents(events);
@@ -7502,6 +7679,7 @@ export default function ControlClient() {
       eventsToItems,
       missionHistoryToItems,
       adjustVisibleItemsLimit,
+      seedPaginationStateAfterInitialLoad,
       updateMissionItems,
       applyDesktopSessionFromEvents,
     ]
@@ -8328,6 +8506,28 @@ export default function ControlClient() {
         )}>
         {/* Messages */}
         <div ref={containerRef} className="flex-1 overflow-y-auto p-6">
+          {/* Backwards pagination — only when there's actually more older
+              history to fetch and the chat isn't empty. Click prepends the
+              previous page; scroll position is preserved so the message
+              currently in view stays put. */}
+          {items.length > 0 && olderLoadState.hasMore && viewingMissionId && (
+            <div className="flex justify-center mb-4">
+              <button
+                type="button"
+                disabled={olderLoadState.loading}
+                onClick={() => {
+                  void loadOlderHistoryEvents(viewingMissionId);
+                }}
+                className={cn(
+                  "px-4 py-1.5 text-xs rounded-full border transition-colors",
+                  "border-white/10 bg-white/[0.03] text-white/60 hover:bg-white/[0.06] hover:text-white/80",
+                  olderLoadState.loading && "opacity-60 cursor-wait"
+                )}
+              >
+                {olderLoadState.loading ? "Loading older messages…" : "Load older messages"}
+              </button>
+            </div>
+          )}
           {items.length === 0 ? (
             <div className="flex h-full items-center justify-center">
               <div className="text-center">

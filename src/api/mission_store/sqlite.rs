@@ -3323,6 +3323,99 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn get_events_before(
+        &self,
+        mission_id: Uuid,
+        before_seq: i64,
+        event_types: Option<&[&str]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let types: Option<Vec<String>> =
+            event_types.map(|t| t.iter().map(|s| s.to_string()).collect());
+        let limit = limit.unwrap_or(50000) as i64;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+
+            // We want the N events immediately preceding `before_seq`,
+            // but in chronological (ASC) order so the client can prepend
+            // them without re-sorting. SQLite has no `ORDER BY DESC LIMIT
+            // ... ORDER BY ASC` form, so do the DESC selection in a
+            // subquery and reverse it in the outer query.
+            let query = if types.is_some() {
+                "SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                 FROM (
+                   SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                   FROM mission_events
+                   WHERE mission_id = ?1 AND sequence < ?2 AND event_type IN (SELECT value FROM json_each(?3))
+                   ORDER BY sequence DESC
+                   LIMIT ?4
+                 )
+                 ORDER BY sequence ASC"
+            } else {
+                "SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                 FROM (
+                   SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                   FROM mission_events
+                   WHERE mission_id = ?1 AND sequence < ?2
+                   ORDER BY sequence DESC
+                   LIMIT ?3
+                 )
+                 ORDER BY sequence ASC"
+            };
+
+            fn parse_row(row: &rusqlite::Row<'_>) -> Result<StoredEvent, rusqlite::Error> {
+                let content: Option<String> = row.get(8)?;
+                let content_file: Option<String> = row.get(9)?;
+                let full_content = SqliteMissionStore::load_content(content.as_deref(), content_file.as_deref());
+                let metadata_str: String = row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "{}".to_string());
+                let mid_str: String = row.get(1)?;
+
+                Ok(StoredEvent {
+                    id: row.get(0)?,
+                    mission_id: parse_uuid_or_nil(&mid_str),
+                    sequence: row.get(2)?,
+                    event_type: row.get(3)?,
+                    timestamp: row.get(4)?,
+                    event_id: row.get(5)?,
+                    tool_call_id: row.get(6)?,
+                    tool_name: row.get(7)?,
+                    content: full_content,
+                    metadata: serde_json::from_str(&metadata_str).unwrap_or(serde_json::json!({})),
+                })
+            }
+
+            let events: Vec<StoredEvent> = if let Some(types) = types {
+                let types_json = serde_json::to_string(&types).unwrap_or_else(|_| "[]".to_string());
+                let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![&mid, before_seq, &types_json, limit], parse_row)
+                    .map_err(|e| e.to_string())?;
+                let mut result = Vec::new();
+                for row in rows {
+                    result.push(row.map_err(|e| e.to_string())?);
+                }
+                result
+            } else {
+                let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![&mid, before_seq, limit], parse_row)
+                    .map_err(|e| e.to_string())?;
+                let mut result = Vec::new();
+                for row in rows {
+                    result.push(row.map_err(|e| e.to_string())?);
+                }
+                result
+            };
+
+            Ok(events)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn max_event_sequence(&self, mission_id: Uuid) -> Result<i64, String> {
         let conn = self.conn.clone();
         let mid = mission_id.to_string();
@@ -8039,6 +8132,111 @@ mod tests {
         for e in &assistants_only {
             assert_eq!(e.event_type, "assistant_message");
         }
+    }
+
+    #[tokio::test]
+    async fn get_events_before_returns_only_events_below_seq_in_ascending_order() {
+        use crate::api::control::AgentEvent;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("before test"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        for i in 0..5 {
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::UserMessage {
+                        id: Uuid::new_v4(),
+                        content: format!("msg {i}"),
+                        queued: false,
+                        mission_id: Some(mission.id),
+                    },
+                )
+                .await
+                .expect("log user message");
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::AssistantMessage {
+                        id: Uuid::new_v4(),
+                        content: format!("reply {i}"),
+                        success: true,
+                        cost_cents: 0,
+                        cost_source: CostSource::Unknown,
+                        usage: None,
+                        model: None,
+                        model_normalized: None,
+                        mission_id: Some(mission.id),
+                        shared_files: None,
+                        resumable: false,
+                    },
+                )
+                .await
+                .expect("log assistant");
+        }
+
+        // before_seq=11 returns all 10 events, ordered ASC.
+        let all = store
+            .get_events_before(mission.id, 11, None, None)
+            .await
+            .expect("get_events_before all");
+        assert_eq!(all.len(), 10);
+        let seqs: Vec<i64> = all.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, (1..=10).collect::<Vec<_>>());
+
+        // before_seq=6 returns sequences 1..=5, ordered ASC.
+        let head = store
+            .get_events_before(mission.id, 6, None, None)
+            .await
+            .expect("get_events_before head");
+        assert_eq!(head.len(), 5);
+        assert_eq!(head.first().map(|e| e.sequence), Some(1));
+        assert_eq!(head.last().map(|e| e.sequence), Some(5));
+
+        // before_seq=1 returns empty (caller already at the start).
+        let empty = store
+            .get_events_before(mission.id, 1, None, None)
+            .await
+            .expect("get_events_before empty");
+        assert!(empty.is_empty());
+
+        // With limit=3 and before_seq=11 we want the 3 events IMMEDIATELY
+        // preceding seq=11 — i.e. seqs 8, 9, 10 — returned in ASC order.
+        // This is the contract that drives backwards pagination: each page
+        // must be the latest N below the cursor, then sorted oldest-first.
+        let last_three = store
+            .get_events_before(mission.id, 11, None, Some(3))
+            .await
+            .expect("get_events_before limited");
+        assert_eq!(last_three.len(), 3);
+        assert_eq!(
+            last_three.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+
+        // event_types filter narrows further (asks for only the assistant
+        // events strictly before seq=11; sequences 2,4,6,8,10).
+        let assistants_only = store
+            .get_events_before(mission.id, 11, Some(&["assistant_message"]), None)
+            .await
+            .expect("get_events_before types");
+        assert_eq!(assistants_only.len(), 5);
+        for e in &assistants_only {
+            assert_eq!(e.event_type, "assistant_message");
+        }
+        assert_eq!(
+            assistants_only
+                .iter()
+                .map(|e| e.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 4, 6, 8, 10]
+        );
     }
 
     #[tokio::test]

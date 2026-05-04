@@ -936,6 +936,22 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Get events with `sequence < before_seq`, ordered by sequence ASC.
+    /// Used by the client for backwards pagination — load the most
+    /// recent N events first (`latest=true`), then page older by
+    /// passing the lowest sequence already seen as `before_seq`.
+    /// Sequence-based so it's robust against concurrent inserts.
+    async fn get_events_before(
+        &self,
+        mission_id: Uuid,
+        before_seq: i64,
+        event_types: Option<&[&str]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let _ = (mission_id, before_seq, event_types, limit);
+        Ok(vec![])
+    }
+
     /// Count events for a mission, optionally filtered by type.
     async fn count_events(
         &self,

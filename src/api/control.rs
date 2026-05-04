@@ -4480,6 +4480,13 @@ pub struct GetEventsQuery {
     /// Takes precedence over `offset`/`latest` when provided.
     #[serde(default)]
     pub since_seq: Option<i64>,
+    /// If set, return only events with `sequence < before_seq`, ordered
+    /// by sequence ASC (oldest first). Used by the client for backwards
+    /// pagination — pass the lowest sequence already seen to fetch the
+    /// next page of older events. Takes precedence over `since_seq` /
+    /// `offset` / `latest` when provided.
+    #[serde(default)]
+    pub before_seq: Option<i64>,
 }
 
 /// Get events for a mission (for debugging/replay).
@@ -4513,7 +4520,13 @@ pub async fn get_mission_events(
         .as_ref()
         .map(|s| s.split(',').map(|t| t.trim()).collect());
 
-    let events = if let Some(since_seq) = query.since_seq {
+    let events = if let Some(before_seq) = query.before_seq {
+        control
+            .mission_store
+            .get_events_before(mission_id, before_seq, types.as_deref(), query.limit)
+            .await
+            .map_err(internal_error)?
+    } else if let Some(since_seq) = query.since_seq {
         control
             .mission_store
             .get_events_since(mission_id, since_seq, types.as_deref(), query.limit)
