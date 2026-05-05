@@ -6084,6 +6084,7 @@ fn mission_status_for_terminal_reason(
         TerminalReason::TurnComplete => None,
         TerminalReason::Completed => Some((MissionStatus::Completed, "completed")),
         TerminalReason::Cancelled => Some((MissionStatus::Interrupted, "cancelled")),
+        TerminalReason::ServerShutdown => Some((MissionStatus::Interrupted, "server_shutdown")),
         TerminalReason::MaxIterations => Some((MissionStatus::Blocked, "max_iterations")),
         TerminalReason::LlmError => Some((MissionStatus::Failed, "llm_error")),
         TerminalReason::Stalled => Some((MissionStatus::Failed, "stalled")),
@@ -6099,6 +6100,9 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
         TerminalReason::TurnComplete | TerminalReason::Completed => None,
         TerminalReason::MaxIterations => Some("Reached iteration limit".to_string()),
         TerminalReason::Cancelled => Some("Cancelled by user".to_string()),
+        TerminalReason::ServerShutdown => {
+            Some("Paused for server restart — click Resume to continue".to_string())
+        }
         TerminalReason::Stalled => Some("No progress detected".to_string()),
         TerminalReason::InfiniteLoop => Some("Detected repetitive behavior".to_string()),
         TerminalReason::LlmError => Some("Model error".to_string()),
@@ -8116,7 +8120,11 @@ async fn control_actor_loop(
                                 // belongs to current_mission, not running_mission_id
 
                                 if mission_store
-                                    .update_mission_status(mission_id, MissionStatus::Interrupted)
+                                    .update_mission_status_with_reason(
+                                        mission_id,
+                                        MissionStatus::Interrupted,
+                                        Some("server_shutdown"),
+                                    )
                                     .await
                                     .is_ok()
                                 {
@@ -8156,7 +8164,11 @@ async fn control_actor_loop(
                             )
                             .await;
                             if mission_store
-                                .update_mission_status(*mission_id, MissionStatus::Interrupted)
+                                .update_mission_status_with_reason(
+                                    *mission_id,
+                                    MissionStatus::Interrupted,
+                                    Some("server_shutdown"),
+                                )
                                 .await
                                 .is_ok()
                             {

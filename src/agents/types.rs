@@ -166,6 +166,11 @@ pub enum TerminalReason {
     Completed,
     /// Task was cancelled by user
     Cancelled,
+    /// Mission was interrupted because the server is shutting down
+    /// (SIGTERM, deploy, package upgrade). Distinct from `Cancelled`
+    /// so the UI can show a "paused, click Resume" affordance instead
+    /// of the user-initiated cancel wording.
+    ServerShutdown,
     /// LLM/OpenCode API error
     LlmError,
     /// Agent stalled (no progress)

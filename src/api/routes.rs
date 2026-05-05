@@ -2,7 +2,21 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Process-wide flag set when the server has begun a graceful shutdown.
+/// Cancel-aware code paths (e.g. mission runners that observe a cancel
+/// token) read this to distinguish a server-initiated interruption from
+/// a user-initiated cancel, so they can emit a friendlier resume message
+/// and a `server_shutdown` terminal reason instead of `cancelled`.
+static SHUTDOWN_INITIATED: AtomicBool = AtomicBool::new(false);
+
+/// Returns `true` if `handle_shutdown_signal` has begun draining missions
+/// for a graceful shutdown.
+pub fn is_shutdown_initiated() -> bool {
+    SHUTDOWN_INITIATED.load(Ordering::Acquire)
+}
 use tokio::sync::RwLock;
 
 use axum::middleware;
@@ -1005,6 +1019,12 @@ async fn shutdown_signal(state: Arc<AppState>) {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "<unknown>".to_string());
     let invocation_id = std::env::var("INVOCATION_ID").ok();
+    // Flip the global shutdown flag *before* we cancel any mission runners
+    // so the cancel-aware return paths can pick the friendlier
+    // `server_shutdown` terminal reason instead of treating this like a
+    // user-initiated cancel.
+    SHUTDOWN_INITIATED.store(true, Ordering::Release);
+
     tracing::warn!(
         signal,
         pid = std::process::id(),

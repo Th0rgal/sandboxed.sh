@@ -41,6 +41,24 @@ use super::control::{
 };
 use super::library::SharedLibrary;
 
+/// Build the synthetic `AgentResult::failure` produced when a turn is
+/// cancelled. If the process has begun a graceful shutdown, return a
+/// friendlier "paused for restart" message and a `ServerShutdown` reason
+/// so the dashboard can render a Resume affordance instead of a
+/// user-cancel banner; otherwise behave as before.
+fn cancel_or_shutdown_failure() -> AgentResult {
+    if super::routes::is_shutdown_initiated() {
+        AgentResult::failure(
+            "Server restart — paused. Click Resume to continue.".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::ServerShutdown)
+    } else {
+        AgentResult::failure("Mission cancelled".to_string(), 0)
+            .with_terminal_reason(TerminalReason::Cancelled)
+    }
+}
+
 #[derive(Debug, Default)]
 struct OpencodeSseState {
     message_roles: HashMap<String, String>,
@@ -3192,10 +3210,7 @@ async fn run_mission_turn(
 
                 loop {
                     if cancel.is_cancelled() {
-                        break last_constrained_result.unwrap_or_else(|| {
-                            AgentResult::failure("Mission cancelled".to_string(), 0)
-                                .with_terminal_reason(TerminalReason::Cancelled)
-                        });
+                        break last_constrained_result.unwrap_or_else(cancel_or_shutdown_failure);
                     }
 
                     let lease =
@@ -13340,8 +13355,7 @@ pub async fn run_codex_turn(
             _ = cancel.cancelled() => {
                 tracing::info!("Codex turn cancelled for mission {}", mission_id);
                 // Note: Codex process will be cleaned up automatically when the event stream task ends
-                return AgentResult::failure("Mission cancelled".to_string(), 0)
-                    .with_terminal_reason(TerminalReason::Cancelled);
+                return cancel_or_shutdown_failure();
             }
             Some(event) = event_rx.recv() => {
                 match event {
@@ -13837,8 +13851,7 @@ pub async fn run_gemini_turn(
                 backend.kill().await;
                 // Abort the event-conversion task
                 handle.abort();
-                return AgentResult::failure("Mission cancelled".to_string(), 0)
-                    .with_terminal_reason(TerminalReason::Cancelled);
+                return cancel_or_shutdown_failure();
             }
             Some(event) = event_rx.recv() => {
                 match event {
