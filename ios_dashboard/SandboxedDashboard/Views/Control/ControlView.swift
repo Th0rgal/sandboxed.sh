@@ -4006,10 +4006,10 @@ private struct ThoughtsSheet: View {
                     )
                 } else {
                     ScrollView {
-                        VStack(spacing: 14) {
+                        LazyVStack(spacing: 14) {
                             if !activeThoughts.isEmpty {
                                 ThoughtSection(title: "Thinking Now", icon: "brain") {
-                                    ForEach(activeThoughts) { msg in
+                                    ForEach(Array(activeThoughts.enumerated()), id: \.offset) { _, msg in
                                         ThoughtTimelineRow(message: msg, emphasize: true)
                                     }
                                 }
@@ -4017,7 +4017,7 @@ private struct ThoughtsSheet: View {
 
                             if !completedThoughts.isEmpty {
                                 ThoughtSection(title: "Recent Thoughts", icon: "clock.arrow.circlepath") {
-                                    ForEach(Array(completedThoughts.reversed())) { msg in
+                                    ForEach(Array(completedThoughts.reversed().enumerated()), id: \.offset) { _, msg in
                                         ThoughtTimelineRow(message: msg, emphasize: false)
                                     }
                                 }
@@ -4067,7 +4067,7 @@ private struct ThoughtSection<Content: View>: View {
                     .foregroundStyle(Theme.textSecondary)
             }
 
-            VStack(spacing: 10) {
+            LazyVStack(spacing: 10) {
                 content()
             }
         }
@@ -4078,9 +4078,15 @@ private struct ThoughtSection<Content: View>: View {
 private struct ThoughtTimelineRow: View {
     let message: ChatMessage
     let emphasize: Bool
-    @State private var isExpanded = true
+    @State private var isExpanded: Bool
     @State private var elapsedSeconds: Int = 0
     @State private var timerTask: Task<Void, Never>?
+
+    init(message: ChatMessage, emphasize: Bool) {
+        self.message = message
+        self.emphasize = emphasize
+        _isExpanded = State(initialValue: emphasize)
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {

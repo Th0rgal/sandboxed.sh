@@ -315,8 +315,11 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
     const cursorPos = textarea.selectionStart;
     const textBeforeCursor = displayValue.substring(0, cursorPos);
 
-    // Check for / command trigger at start of line or after whitespace
-    const commandMatch = textBeforeCursor.match(/(?:^|\s)(\/[\w-]*)$/);
+    // Check for / command trigger — only at the very start of the input.
+    // A `/` mid-message (e.g. inside a URL like `https://...`) shouldn't pop
+    // the autocomplete; users only ever invoke a slash command as the first
+    // token of the message.
+    const commandMatch = textBeforeCursor.match(/^(\/[\w-]*)$/);
     if (commandMatch) {
       const searchTerm = commandMatch[1].substring(1).toLowerCase();
       const filtered = commands.filter(cmd =>
@@ -329,7 +332,7 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
         source: cmd.path === 'builtin' ? 'oh-my-opencode' : cmd.path === 'builtin-claude' ? 'claude-code' : 'library',
         params: cmd.params,
       })));
-      setTriggerPosition(cursorPos - commandMatch[1].length);
+      setTriggerPosition(0);
       setShowAutocomplete(filtered.length > 0);
       setSelectedIndex(0);
 
