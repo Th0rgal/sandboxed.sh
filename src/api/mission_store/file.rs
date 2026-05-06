@@ -231,6 +231,23 @@ impl MissionStore for FileMissionStore {
         self.persist().await
     }
 
+    async fn update_mission_goal(
+        &self,
+        id: Uuid,
+        goal_mode: bool,
+        goal_objective: Option<&str>,
+    ) -> Result<(), String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+        mission.goal_mode = goal_mode;
+        mission.goal_objective = goal_objective.map(|s| s.to_string());
+        mission.updated_at = now_string();
+        drop(missions);
+        self.persist().await
+    }
+
     async fn update_mission_title(&self, id: Uuid, title: &str) -> Result<(), String> {
         let mut missions = self.missions.write().await;
         let mission = missions

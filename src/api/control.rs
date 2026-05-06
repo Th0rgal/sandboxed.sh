@@ -46,6 +46,8 @@ use super::mission_store::{
 };
 use super::routes::AppState;
 
+const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
+
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
 pub(super) fn safe_truncate_index(s: &str, max: usize) -> usize {
     if s.len() <= max {
@@ -5017,63 +5019,15 @@ fn spawn_control_session(
         secrets,
     ));
 
-    // Recover orphaned missions from previous run.
-    // Any mission still marked "active" in the DB cannot be running because
-    // we just started — mark them as interrupted.
+    // Recover missions stopped by the previous backend process. Graceful
+    // shutdown marks live runners as `interrupted/server_shutdown`; a hard
+    // stop can leave task-mode missions as `active`.
     if state.mission_store.is_persistent() {
         let store = Arc::clone(&state.mission_store);
         let tx = events_tx.clone();
+        let cmd = state.cmd_tx.clone();
         tokio::spawn(async move {
-            match store.get_all_active_missions().await {
-                Ok(orphans) if !orphans.is_empty() => {
-                    tracing::info!(
-                        "Startup recovery: marking {} orphaned active missions as interrupted",
-                        orphans.len()
-                    );
-                    for mission in orphans {
-                        tracing::info!(
-                            "  → {} '{}' (last update: {})",
-                            mission.id,
-                            mission.title.as_deref().unwrap_or("Untitled"),
-                            mission.updated_at
-                        );
-                        if let Err(e) = store
-                            .update_mission_status(mission.id, MissionStatus::Interrupted)
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to mark orphaned mission {} as interrupted: {}",
-                                mission.id,
-                                e
-                            );
-                        } else {
-                            maybe_schedule_mission_metadata_refresh_for_status(
-                                &store,
-                                &tx,
-                                mission.id,
-                                MissionStatus::Interrupted,
-                            );
-                            let _ = tx.send(AgentEvent::MissionStatusChanged {
-                                mission_id: mission.id,
-                                status: MissionStatus::Interrupted,
-                                summary: Some(
-                                    "Interrupted: server restarted while mission was active"
-                                        .to_string(),
-                                ),
-                            });
-                        }
-                    }
-                }
-                Ok(_) => {
-                    tracing::debug!("Startup recovery: no orphaned active missions found");
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Startup recovery: failed to check for orphaned missions: {}",
-                        e
-                    );
-                }
-            }
+            recover_server_shutdown_missions(store, tx, cmd).await;
         });
     }
 
@@ -5162,6 +5116,147 @@ fn spawn_control_session(
     }
 
     state
+}
+
+async fn recover_server_shutdown_missions(
+    mission_store: Arc<dyn MissionStore>,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cmd_tx: mpsc::Sender<ControlCommand>,
+) {
+    let mut to_resume = Vec::new();
+    let mut seen = HashSet::new();
+
+    match mission_store.get_all_active_missions().await {
+        Ok(active_missions) => {
+            for mission in active_missions {
+                if mission.mission_mode == super::mission_store::MissionMode::Assistant {
+                    tracing::debug!(
+                        mission_id = %mission.id,
+                        "Startup recovery: leaving assistant-mode active mission idle"
+                    );
+                    continue;
+                }
+
+                tracing::warn!(
+                    mission_id = %mission.id,
+                    title = %mission.title.as_deref().unwrap_or("Untitled"),
+                    updated_at = %mission.updated_at,
+                    "Startup recovery: active task mission survived restart; marking server_shutdown and auto-resuming"
+                );
+                if let Err(e) = mission_store
+                    .update_mission_status_with_reason(
+                        mission.id,
+                        MissionStatus::Interrupted,
+                        Some("server_shutdown"),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        mission_id = %mission.id,
+                        "Startup recovery: failed to mark active mission interrupted: {}",
+                        e
+                    );
+                    continue;
+                }
+
+                maybe_schedule_mission_metadata_refresh_for_status(
+                    &mission_store,
+                    &events_tx,
+                    mission.id,
+                    MissionStatus::Interrupted,
+                );
+                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    mission_id: mission.id,
+                    status: MissionStatus::Interrupted,
+                    summary: Some(
+                        "Interrupted: server restarted while mission was active".to_string(),
+                    ),
+                });
+
+                if seen.insert(mission.id) {
+                    to_resume.push(mission.id);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Startup recovery: failed to check for active missions: {}",
+                e
+            );
+        }
+    }
+
+    match mission_store
+        .get_recent_server_shutdown_mission_ids(SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS)
+        .await
+    {
+        Ok(mission_ids) => {
+            for mission_id in mission_ids {
+                if seen.insert(mission_id) {
+                    to_resume.push(mission_id);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Startup recovery: failed to check for server-shutdown missions: {}",
+                e
+            );
+        }
+    }
+
+    if to_resume.is_empty() {
+        tracing::debug!("Startup recovery: no server-shutdown missions to auto-resume");
+        return;
+    }
+
+    tracing::warn!(
+        count = to_resume.len(),
+        "Startup recovery: auto-resuming server-shutdown mission(s)"
+    );
+
+    for mission_id in to_resume {
+        let (tx, rx) = oneshot::channel();
+        if let Err(e) = cmd_tx
+            .send(ControlCommand::ResumeMission {
+                mission_id,
+                clean_workspace: false,
+                skip_message: false,
+                respond: tx,
+            })
+            .await
+        {
+            tracing::warn!(
+                mission_id = %mission_id,
+                "Startup recovery: failed to enqueue auto-resume: {}",
+                e
+            );
+            continue;
+        }
+
+        match rx.await {
+            Ok(Ok(_)) => {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    "Startup recovery: auto-resume queued"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    "Startup recovery: auto-resume failed: {}",
+                    e
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    "Startup recovery: auto-resume response dropped: {}",
+                    e
+                );
+            }
+        }
+    }
 }
 
 /// Apply the stale-mission safety net once.
@@ -6112,6 +6207,49 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
     }
 }
 
+fn parse_goal_objective(message: &str) -> Option<String> {
+    message
+        .trim_start()
+        .strip_prefix("/goal ")
+        .map(str::trim)
+        .filter(|objective| !objective.is_empty())
+        .map(ToString::to_string)
+}
+
+fn stored_goal_objective(mission: &Mission) -> Option<String> {
+    mission
+        .goal_objective
+        .as_deref()
+        .map(str::trim)
+        .filter(|objective| !objective.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            mission
+                .history
+                .iter()
+                .find(|entry| entry.role == "user")
+                .and_then(|entry| parse_goal_objective(&entry.content))
+        })
+}
+
+fn resume_prompt_for_mission(mission: &Mission, resume_prompt: String) -> String {
+    if mission.goal_mode
+        || mission
+            .history
+            .iter()
+            .any(|entry| entry.role == "user" && parse_goal_objective(&entry.content).is_some())
+    {
+        if let Some(objective) = stored_goal_objective(mission) {
+            return format!(
+                "/goal {}\n\nThe server restarted while this goal was active. Continue the same goal using the recovery context below. Do not restart from scratch.\n\n{}",
+                objective, resume_prompt
+            );
+        }
+    }
+
+    resume_prompt
+}
+
 /// If the turn ended with `LlmError` or `AuthError` but the agent produced
 /// substantive output, downgrade the reason to `TurnComplete` so the mission
 /// stays active and can be picked up by the next automation cycle or user
@@ -6962,7 +7100,7 @@ async fn control_actor_loop(
                 .to_string()
         );
 
-        let resume_prompt = resume_parts.join("\n");
+        let resume_prompt = resume_prompt_for_mission(&mission, resume_parts.join("\n"));
 
         Ok((mission, resume_prompt))
     }
@@ -7961,6 +8099,113 @@ async fn control_actor_loop(
                         )
                         .await {
                             Ok((mission, resume_prompt)) => {
+                                let already_running_main =
+                                    running.is_some() && running_mission_id == Some(mission_id);
+                                let already_running_parallel = parallel_runners
+                                    .get(&mission_id)
+                                    .is_some_and(|runner| runner.is_running());
+                                if already_running_main || already_running_parallel {
+                                    let _ = respond.send(Err(format!(
+                                        "Mission {} is already running",
+                                        mission_id
+                                    )));
+                                    continue;
+                                }
+
+                                // If another main mission is running, resume this one in a
+                                // parallel runner so its history stays isolated. This is
+                                // important for startup recovery when several missions were
+                                // interrupted by the same service restart.
+                                if running.is_some() {
+                                    let parallel_running = parallel_runners
+                                        .values()
+                                        .filter(|runner| runner.is_running())
+                                        .count();
+                                    let total_running = parallel_running + 1;
+                                    let max_parallel =
+                                        crate::settings::max_parallel_missions_cached_or(
+                                            config.max_parallel_missions,
+                                        );
+
+                                    if total_running >= max_parallel {
+                                        let _ = respond.send(Err(format!(
+                                            "Maximum parallel missions ({}) reached. {} running.",
+                                            max_parallel, total_running
+                                        )));
+                                        continue;
+                                    }
+
+                                    let mut runner = super::mission_runner::MissionRunner::new(
+                                        mission_id,
+                                        mission.workspace_id,
+                                        mission.agent.clone(),
+                                        Some(mission.backend.clone()),
+                                        mission.session_id.clone(),
+                                        mission.config_profile.clone(),
+                                        mission.model_override.clone(),
+                                        mission.model_effort.clone(),
+                                    );
+                                    runner.working_directory = mission.working_directory.clone();
+                                    for entry in &mission.history {
+                                        runner
+                                            .history
+                                            .push((entry.role.clone(), entry.content.clone()));
+                                    }
+                                    runner.queue_message(Uuid::new_v4(), resume_prompt, None);
+
+                                    let started = runner.start_next(
+                                        config.clone(),
+                                        Arc::clone(&root_agent),
+                                        Arc::clone(&mcp),
+                                        Arc::clone(&workspaces),
+                                        library.clone(),
+                                        events_tx.clone(),
+                                        Arc::clone(&tool_hub),
+                                        Arc::clone(&status),
+                                        mission_cmd_tx.clone(),
+                                        Arc::new(RwLock::new(Some(mission_id))),
+                                        secrets.clone(),
+                                    );
+
+                                    if !started {
+                                        let _ = respond.send(Err(
+                                            "Failed to start mission execution".to_string(),
+                                        ));
+                                        continue;
+                                    }
+
+                                    if let Err(e) = mission_store
+                                        .update_mission_status(mission_id, MissionStatus::Active)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to resume parallel mission {}: {}",
+                                            mission_id,
+                                            e
+                                        );
+                                    } else {
+                                        maybe_schedule_mission_metadata_refresh_for_status(
+                                            &mission_store,
+                                            &events_tx,
+                                            mission_id,
+                                            MissionStatus::Active,
+                                        );
+                                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            mission_id,
+                                            status: MissionStatus::Active,
+                                            summary: None,
+                                        });
+                                    }
+
+                                    parallel_runners.insert(mission_id, runner);
+                                    let mut updated_mission = mission;
+                                    updated_mission.status = MissionStatus::Active;
+                                    updated_mission.resumable = false;
+                                    updated_mission.interrupted_at = None;
+                                    let _ = respond.send(Ok(updated_mission));
+                                    continue;
+                                }
+
                                 // First persist current mission history (if any)
                                 persist_mission_history(
                                     &mission_store,
@@ -9030,6 +9275,8 @@ async fn control_actor_loop(
                         AgentEvent::Progress { mission_id, .. } => *mission_id,
                         AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
                         AgentEvent::SessionIdUpdate { mission_id, .. } => Some(*mission_id),
+                        AgentEvent::GoalIteration { mission_id, .. } => *mission_id,
+                        AgentEvent::GoalStatus { mission_id, .. } => *mission_id,
                         _ => None,
                     };
                     // Update last_activity for matching runner (main or parallel)
@@ -9355,6 +9602,49 @@ async fn control_actor_loop(
                         // next turn picks up the new value instead of the stale one.
                         if let Some(runner) = parallel_runners.get_mut(mission_id) {
                             runner.session_id = Some(session_id.clone());
+                        }
+                    }
+
+                    // Persist `/goal` metadata so refreshes and restart recovery
+                    // can continue through codex goal mode instead of a plain turn.
+                    if let AgentEvent::UserMessage {
+                        content,
+                        mission_id: Some(mid),
+                        ..
+                    } = &event
+                    {
+                        if let Some(objective) = parse_goal_objective(content) {
+                            if let Err(err) = mission_store
+                                .update_mission_goal(*mid, true, Some(&objective))
+                                .await
+                            {
+                                tracing::warn!(
+                                    mission_id = %mid,
+                                    "Failed to persist goal metadata from user message: {}",
+                                    err
+                                );
+                            }
+                        }
+                    }
+
+                    if let AgentEvent::GoalStatus {
+                        status,
+                        objective,
+                        mission_id: Some(mid),
+                    } = &event
+                    {
+                        let goal_mode = status != "cleared";
+                        let objective = goal_mode.then_some(objective.as_str());
+                        if let Err(err) = mission_store
+                            .update_mission_goal(*mid, goal_mode, objective)
+                            .await
+                        {
+                            tracing::warn!(
+                                mission_id = %mid,
+                                status = %status,
+                                "Failed to persist goal metadata from goal status: {}",
+                                err
+                            );
                         }
                     }
                 }

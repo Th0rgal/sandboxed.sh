@@ -1,5 +1,6 @@
 "use client";
 
+import type React from "react";
 import { useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo, startTransition } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
@@ -1894,6 +1895,7 @@ function MissionWorkbenchPanel({
   onOpenSwitcher,
   onViewMission,
   onSetStatus,
+  runSettingsSlot,
   className,
 }: {
   mission: Mission | null;
@@ -1908,6 +1910,12 @@ function MissionWorkbenchPanel({
   onOpenSwitcher: () => void;
   onViewMission: (missionId: string) => void;
   onSetStatus: (status: MissionStatus) => void;
+  /**
+   * Optional slot for the mission's run-settings editor (the
+   * `<NewMissionDialog mode="edit">` trigger). Rendered next to Resume/Stop
+   * so it's accessible without a separate toolbar button.
+   */
+  runSettingsSlot?: React.ReactNode;
   className?: string;
 }) {
   const title = mission?.title?.trim() || (mission ? getMissionShortName(mission.id) : "No mission selected");
@@ -2030,6 +2038,11 @@ function MissionWorkbenchPanel({
                   <Layers className="h-3.5 w-3.5" />
                   Switch
                 </button>
+                {runSettingsSlot && (
+                  <div className="col-span-2 [&>div]:w-full [&>div>button]:w-full [&>div>button]:justify-center">
+                    {runSettingsSlot}
+                  </div>
+                )}
               </div>
             </section>
 
@@ -4079,7 +4092,13 @@ export default function ControlClient() {
       }
     } catch (error) {
       console.error("Upload failed:", error);
-      toast.error(`Failed to upload ${displayName}`);
+      const detail = error instanceof Error
+        ? error.message.replace(/^Upload failed:\s*/, "").trim()
+        : "";
+      const suffix = detail
+        ? `: ${detail.slice(0, 180)}${detail.length > 180 ? "..." : ""}`
+        : "";
+      toast.error(`Failed to upload ${displayName}${suffix}`);
     } finally {
       setUploadQueue((prev) => prev.filter((name) => name !== displayName));
       setUploadProgress(null);
@@ -8080,25 +8099,8 @@ export default function ControlClient() {
             } : undefined}
           />
 
-          {activeMission && !viewingMissionIsRunning && (
-            <NewMissionDialog
-              workspaces={workspaces}
-              disabled={missionLoading}
-              onCreate={handleUpdateMissionSettings}
-              mode="edit"
-              lockWorkspace
-              initialValues={{
-                workspaceId: activeMission.workspace_id,
-                agent: activeMission.agent || undefined,
-                backend: activeMission.backend,
-                modelOverride: activeMission.model_override || undefined,
-                modelEffort: activeMission.model_effort || undefined,
-                configProfile: activeMission.config_profile,
-              }}
-            />
-          )}
-
           <button
+            type="button"
             onClick={() => setShowWorkbenchPanel((prev) => !prev)}
             className={cn(
               "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
@@ -9176,6 +9178,25 @@ export default function ControlClient() {
                 onOpenSwitcher={() => setShowMissionSwitcher(true)}
                 onViewMission={handleViewMission}
                 onSetStatus={handleSetStatus}
+                runSettingsSlot={
+                  activeMission && !viewingMissionIsRunning ? (
+                    <NewMissionDialog
+                      workspaces={workspaces}
+                      disabled={missionLoading}
+                      onCreate={handleUpdateMissionSettings}
+                      mode="edit"
+                      lockWorkspace
+                      initialValues={{
+                        workspaceId: activeMission.workspace_id,
+                        agent: activeMission.agent || undefined,
+                        backend: activeMission.backend,
+                        modelOverride: activeMission.model_override || undefined,
+                        modelEffort: activeMission.model_effort || undefined,
+                        configProfile: activeMission.config_profile,
+                      }}
+                    />
+                  ) : undefined
+                }
                 className="flex-1 min-h-0"
               />
             )}

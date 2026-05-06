@@ -209,13 +209,66 @@ fn is_context_upload_path(path: &str) -> bool {
 }
 
 fn is_context_upload_path_for_dir(path: &str, context_dir_name: &str) -> bool {
-    let normalized = path.trim().trim_start_matches("./");
-    normalized == context_dir_name
-        || normalized.starts_with(&format!("{}/", context_dir_name))
-        || normalized == format!("root/{}", context_dir_name)
-        || normalized.starts_with(&format!("root/{}/", context_dir_name))
-        || path == format!("/root/{}", context_dir_name)
-        || path.starts_with(&format!("/root/{}/", context_dir_name))
+    context_upload_suffix_for_dir(path, context_dir_name).is_some()
+}
+
+fn context_upload_suffix_for_dir<'a>(path: &'a str, context_dir_name: &str) -> Option<&'a str> {
+    let trimmed = path.trim();
+    let normalized = trimmed.strip_prefix("./").unwrap_or(trimmed);
+
+    if normalized == context_dir_name {
+        return Some("");
+    }
+    if let Some(suffix) = normalized.strip_prefix(context_dir_name) {
+        if let Some(rest) = suffix.strip_prefix('/') {
+            return Some(rest);
+        }
+    }
+
+    let workspace_root_prefix = format!("root/{}", context_dir_name);
+    if normalized == workspace_root_prefix {
+        return Some("");
+    }
+    if let Some(suffix) = normalized.strip_prefix(&workspace_root_prefix) {
+        if let Some(rest) = suffix.strip_prefix('/') {
+            return Some(rest);
+        }
+    }
+
+    let container_root_prefix = format!("/root/{}", context_dir_name);
+    if trimmed == container_root_prefix {
+        return Some("");
+    }
+    if let Some(suffix) = trimmed.strip_prefix(&container_root_prefix) {
+        if let Some(rest) = suffix.strip_prefix('/') {
+            return Some(rest);
+        }
+    }
+
+    None
+}
+
+fn api_context_root_for_config(config: &crate::config::Config) -> PathBuf {
+    let root = config
+        .context
+        .context_dir(&config.working_dir.to_string_lossy());
+    let root = PathBuf::from(root);
+
+    if root.is_absolute() {
+        root
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(root)
+    } else {
+        root
+    }
+}
+
+fn api_context_root(state: &AppState) -> PathBuf {
+    api_context_root_for_config(&state.config)
+}
+
+fn canonicalize_or_original(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn configured_context_root(config_working_dir: &Path) -> PathBuf {
@@ -372,39 +425,20 @@ pub async fn resolve_path_for_workspace(
         } else {
             input.to_path_buf()
         }
-    } else if path.starts_with("./context") || path.starts_with("context") {
+    } else if let Some(suffix) =
+        context_upload_suffix_for_dir(path, &state.config.context.context_dir_name)
+    {
         // For "context" paths, use the mission-specific context directory if mission_id provided
-        let suffix = path
-            .trim_start_matches("./")
-            .trim_start_matches("context/")
-            .trim_start_matches("context");
-
         // If mission_id is provided, use mission-specific context directory
         // This ensures uploaded files go to the right place for the agent to find them
         let context_path = if let Some(mid) = mission_id {
-            if workspace.workspace_type == WorkspaceType::Container {
-                // For container workspaces, write to the HOST context root
-                // (config.working_dir/context/<mid>/).  This directory is
-                // bind-mounted into the container at /root/context, so the
-                // agent sees the files.  Writing to the container rootfs does
-                // NOT work because the bind-mount shadows the rootfs path.
-                let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| "context".to_string());
-                let global_context_root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| state.config.working_dir.join(&context_dir_name));
-                global_context_root.join(mid.to_string())
-            } else {
-                // For host workspaces, use the global context root
-                let context_root = state.config.working_dir.join("context");
-                context_root.join(mid.to_string())
-            }
+            // Mission context uploads must use the HTTP server's configured
+            // context root. The process env variant can be rewritten by
+            // workspace/tool execution and may point at a specific mission or
+            // container path while the API server continues handling requests.
+            api_context_root(state).join(mid.to_string())
         } else {
-            workspace_root.join("context")
+            workspace_root.join(&state.config.context.context_dir_name)
         };
 
         if suffix.is_empty() {
@@ -434,7 +468,7 @@ pub async fn resolve_path_for_workspace(
                     .map(|m| m.is_symlink())
                     .unwrap_or(false)
                 {
-                    let context_root_check = state.config.working_dir.join("context");
+                    let context_root_check = api_context_root(state);
                     let in_bounds = resolved.starts_with(&workspace_root)
                         || (mission_id.is_some() && resolved.starts_with(&context_root_check));
                     if in_bounds {
@@ -481,12 +515,14 @@ pub async fn resolve_path_for_workspace(
         if !parent.exists() {
             // For context paths, create the directory tree automatically
             // (the mission context directory may not exist yet on the first upload)
-            let is_context_path = path.starts_with("./context") || path.starts_with("context");
+            let is_context_path =
+                context_upload_suffix_for_dir(path, &state.config.context.context_dir_name)
+                    .is_some();
             if is_context_path && mission_id.is_some() {
                 // The context root (e.g. /root/context) may be a stale symlink
                 // from a previous mission's workspace prep. Remove it so
                 // create_dir_all can create the real directory tree.
-                let context_root = state.config.working_dir.join("context");
+                let context_root = api_context_root(state);
                 if context_root.is_symlink() {
                     let _ = tokio::fs::remove_file(&context_root).await;
                 }
@@ -519,7 +555,7 @@ pub async fn resolve_path_for_workspace(
 
     // Validate that the resolved path is within an allowed location
     // This can be either the workspace root or the global context directory for missions
-    let context_root = state.config.working_dir.join("context");
+    let context_root = canonicalize_or_original(&api_context_root(state));
     let in_workspace = canonical.starts_with(&workspace_root);
     let in_context = mission_id.is_some() && canonical.starts_with(&context_root);
 
@@ -1347,7 +1383,11 @@ pub async fn download_from_url(
 
 #[cfg(test)]
 mod tests {
-    use super::{context_mirror_suffix, is_context_upload_path_for_dir};
+    use super::{
+        api_context_root_for_config, context_mirror_suffix, context_upload_suffix_for_dir,
+        is_context_upload_path_for_dir,
+    };
+    use crate::config::Config;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
@@ -1374,6 +1414,41 @@ mod tests {
             "/root/context/file.pdf",
             "ctx"
         ));
+    }
+
+    #[test]
+    fn context_upload_suffix_respects_context_boundaries() {
+        assert_eq!(
+            context_upload_suffix_for_dir("./context/paper.pdf", "context"),
+            Some("paper.pdf")
+        );
+        assert_eq!(
+            context_upload_suffix_for_dir("context/nested/paper.pdf", "context"),
+            Some("nested/paper.pdf")
+        );
+        assert_eq!(
+            context_upload_suffix_for_dir("/root/context/paper.pdf", "context"),
+            Some("paper.pdf")
+        );
+        assert_eq!(
+            context_upload_suffix_for_dir("contextual/paper.pdf", "context"),
+            None
+        );
+    }
+
+    #[test]
+    fn api_context_root_ignores_runtime_context_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config::new(temp.path().to_path_buf());
+
+        std::env::set_var(
+            "SANDBOXED_SH_CONTEXT_ROOT",
+            "/tmp/mission-specific-context-root",
+        );
+        let root = api_context_root_for_config(&config);
+        std::env::remove_var("SANDBOXED_SH_CONTEXT_ROOT");
+
+        assert_eq!(root, temp.path().join("context"));
     }
 
     #[test]

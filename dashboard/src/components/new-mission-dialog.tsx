@@ -1,6 +1,8 @@
 'use client';
 
-import { useEffect, useRef, useState, useMemo } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'react';
+import type { CSSProperties } from 'react';
+import { createPortal } from 'react-dom';
 import { useRouter } from 'next/navigation';
 import { Plus, X, ExternalLink, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import useSWR from 'swr';
@@ -120,8 +122,15 @@ export function NewMissionDialog({
   const [submitting, setSubmitting] = useState(false);
   const [defaultSet, setDefaultSet] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const [mounted, setMounted] = useState(false);
+  const [popoverStyle, setPopoverStyle] = useState<CSSProperties | null>(null);
   const prevBackendRef = useRef<string | null>(null);
   const isEditMode = mode === 'edit';
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
 
   // SWR: fetch backends
   const { data: backends } = useSWR<Backend[]>('backends', listBackends, {
@@ -392,12 +401,41 @@ export function NewMissionDialog({
   const formatWorkspaceType = (type: Workspace['workspace_type']) =>
     type === 'host' ? 'host' : 'isolated';
 
+  const updatePopoverPosition = useCallback(() => {
+    const trigger = dialogRef.current;
+    if (!trigger || typeof window === 'undefined') return;
+
+    const rect = trigger.getBoundingClientRect();
+    const margin = 12;
+    const width = Math.min(384, window.innerWidth - margin * 2);
+    const left = Math.min(
+      Math.max(margin, rect.right - width),
+      Math.max(margin, window.innerWidth - width - margin)
+    );
+    const estimatedHeight = popoverRef.current?.offsetHeight ?? 620;
+    const spaceBelow = window.innerHeight - rect.bottom - margin;
+    const top = spaceBelow >= Math.min(estimatedHeight, 420)
+      ? rect.bottom + 4
+      : Math.max(margin, rect.top - estimatedHeight - 4);
+
+    setPopoverStyle({
+      position: 'fixed',
+      top,
+      left,
+      width,
+      zIndex: 1000,
+    });
+  }, []);
+
   // Click outside and Escape key handler
   useEffect(() => {
     if (!open) return;
 
     const handleClickOutside = (event: MouseEvent) => {
-      if (dialogRef.current && !dialogRef.current.contains(event.target as Node)) {
+      const target = event.target as Node;
+      const clickedTrigger = dialogRef.current?.contains(target);
+      const clickedPopover = popoverRef.current?.contains(target);
+      if (!clickedTrigger && !clickedPopover) {
         setOpen(false);
         setDefaultSet(false);
         onClose?.();
@@ -419,6 +457,17 @@ export function NewMissionDialog({
       document.removeEventListener('keydown', handleKeyDown);
     };
   }, [open, onClose]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePopoverPosition();
+    window.addEventListener('resize', updatePopoverPosition);
+    window.addEventListener('scroll', updatePopoverPosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePopoverPosition);
+      window.removeEventListener('scroll', updatePopoverPosition, true);
+    };
+  }, [open, updatePopoverPosition]);
 
   // Revalidate backend model options when dialog opens to pick up chain configuration changes
   useEffect(() => {
@@ -638,8 +687,12 @@ export function NewMissionDialog({
         {isEditMode ? <SlidersHorizontal className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
         <span className="hidden lg:inline">{isEditMode ? 'Run Settings' : 'New Mission'}</span>
       </button>
-      {open && (
-        <div className="absolute right-0 top-full mt-1 w-96 rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl z-50">
+      {open && mounted && popoverStyle && createPortal(
+        <div
+          ref={popoverRef}
+          style={popoverStyle}
+          className="max-h-[calc(100vh-1.5rem)] overflow-y-auto rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl"
+        >
           {/* Header with refresh and close buttons */}
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-medium text-white">
@@ -770,7 +823,6 @@ export function NewMissionDialog({
                 </option>
                 {(() => {
                   // Group options by provider
-                  const providers = (providersResponse?.providers || []) as Provider[];
                   const groupedOptions = new Map<string, Array<{ value: string; label: string; description?: string; provider_id?: string }>>();
 
                   for (const option of modelOptions) {
@@ -870,7 +922,8 @@ export function NewMissionDialog({
               )}
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );

@@ -865,6 +865,14 @@ pub trait MissionStore: Send + Sync {
     /// Update mission session ID (for backends like Amp that generate their own IDs).
     async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String>;
 
+    /// Update cached goal-mode metadata for missions started with `/goal`.
+    async fn update_mission_goal(
+        &self,
+        id: Uuid,
+        goal_mode: bool,
+        goal_objective: Option<&str>,
+    ) -> Result<(), String>;
+
     /// Update mission agent tree.
     async fn update_mission_tree(&self, id: Uuid, tree: &AgentTreeNode) -> Result<(), String>;
 
@@ -891,6 +899,29 @@ pub trait MissionStore: Send + Sync {
 
     /// Get all missions currently in active status (for startup recovery).
     async fn get_all_active_missions(&self) -> Result<Vec<Mission>, String>;
+
+    /// Get recently interrupted missions that were stopped by server shutdown.
+    async fn get_recent_server_shutdown_mission_ids(
+        &self,
+        max_age_hours: u64,
+    ) -> Result<Vec<Uuid>, String> {
+        let cutoff = Utc::now() - chrono::Duration::hours(max_age_hours as i64);
+        let missions = self.list_missions(1000, 0).await?;
+        Ok(missions
+            .into_iter()
+            .filter(|m| {
+                m.status == MissionStatus::Interrupted
+                    && m.resumable
+                    && m.terminal_reason.as_deref() == Some("server_shutdown")
+                    && m.interrupted_at
+                        .as_deref()
+                        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                        .map(|value| value.with_timezone(&Utc) >= cutoff)
+                        .unwrap_or(false)
+            })
+            .map(|m| m.id)
+            .collect())
+    }
 
     /// Insert a mission summary (for historical lookup).
     async fn insert_mission_summary(

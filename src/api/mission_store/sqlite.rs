@@ -1960,7 +1960,8 @@ impl MissionStore for SqliteMissionStore {
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
-                            COALESCE(mission_mode, 'task') as mission_mode
+                            COALESCE(mission_mode, 'task') as mission_mode,
+                            COALESCE(goal_mode, 0) as goal_mode, goal_objective
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2580,6 +2581,34 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn update_mission_goal(
+        &self,
+        id: Uuid,
+        goal_mode: bool,
+        goal_objective: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let now = now_string();
+        let goal_objective = goal_objective.map(|s| s.to_string());
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET goal_mode = ?1, goal_objective = ?2, updated_at = ?3 WHERE id = ?4",
+                params![
+                    if goal_mode { 1i64 } else { 0i64 },
+                    goal_objective,
+                    now,
+                    id.to_string()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn update_mission_tree(&self, id: Uuid, tree: &AgentTreeNode) -> Result<(), String> {
         let conn = self.conn.clone();
         let now = now_string();
@@ -2791,7 +2820,10 @@ impl MissionStore for SqliteMissionStore {
                 .prepare(
                     "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
-                            COALESCE(backend, 'opencode') as backend
+                            COALESCE(backend, 'opencode') as backend,
+                            COALESCE(mission_mode, 'task') as mission_mode,
+                            COALESCE(goal_mode, 0) as goal_mode,
+                            goal_objective
                      FROM missions
                      WHERE status = 'active'",
                 )
@@ -2833,10 +2865,13 @@ impl MissionStore for SqliteMissionStore {
                         session_id: None,
                         terminal_reason: None,
                         parent_mission_id: None,
-                        mission_mode: MissionMode::default(),
                         working_directory: None,
-                        goal_mode: false,
-                        goal_objective: None,
+                        mission_mode: row
+                            .get::<_, Option<String>>(13)?
+                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                            .unwrap_or_default(),
+                        goal_mode: row.get::<_, i32>(14).unwrap_or(0) != 0,
+                        goal_objective: row.get(15).ok().flatten(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2844,6 +2879,44 @@ impl MissionStore for SqliteMissionStore {
                 .map_err(|e| e.to_string())?;
 
             Ok(missions)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_recent_server_shutdown_mission_ids(
+        &self,
+        max_age_hours: u64,
+    ) -> Result<Vec<Uuid>, String> {
+        let conn = self.conn.clone();
+        let cutoff = Utc::now() - chrono::Duration::hours(max_age_hours as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id
+                     FROM missions
+                     WHERE status = 'interrupted'
+                       AND resumable = 1
+                       AND terminal_reason = 'server_shutdown'
+                       AND interrupted_at IS NOT NULL
+                       AND interrupted_at >= ?1
+                     ORDER BY interrupted_at ASC",
+                )
+                .map_err(|e| e.to_string())?;
+
+            let mission_ids = stmt
+                .query_map(params![cutoff_str], |row| {
+                    let id_str: String = row.get(0)?;
+                    Ok(parse_uuid_or_nil(&id_str))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            Ok(mission_ids)
         })
         .await
         .map_err(|e| e.to_string())?
