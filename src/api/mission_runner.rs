@@ -6207,6 +6207,58 @@ fn is_capacity_limited_error(message: &str) -> bool {
     has_concurrent && has_mission && has_limit
 }
 
+const CODEX_PENDING_TOOLS_ERROR_PREFIX: &str = "Codex stopped while tool calls were still pending";
+
+fn is_codex_generic_exit_wrapper(message: &str) -> bool {
+    message.contains("Codex CLI exited before completing the turn")
+}
+
+fn codex_pending_tools_error_message(
+    message: &str,
+    pending_tools: &HashMap<String, String>,
+) -> String {
+    let mut pending_tool_names: Vec<&str> = pending_tools.values().map(String::as_str).collect();
+    pending_tool_names.sort_unstable();
+    pending_tool_names.dedup();
+
+    if pending_tool_names.is_empty() {
+        format!("{CODEX_PENDING_TOOLS_ERROR_PREFIX}: {message}")
+    } else {
+        format!(
+            "{CODEX_PENDING_TOOLS_ERROR_PREFIX} ({}): {message}",
+            pending_tool_names.join(", ")
+        )
+    }
+}
+
+fn codex_error_message_to_surface(
+    assistant_message: &str,
+    pending_tools: &HashMap<String, String>,
+    message: &str,
+) -> Option<String> {
+    if assistant_message.trim().is_empty() {
+        Some(message.to_string())
+    } else if !pending_tools.is_empty() {
+        Some(codex_pending_tools_error_message(message, pending_tools))
+    } else {
+        None
+    }
+}
+
+fn record_codex_error_message(error_message: &mut Option<String>, message: String) -> bool {
+    let new_is_generic_exit_wrapper = is_codex_generic_exit_wrapper(&message);
+    let already_have_specific = error_message
+        .as_deref()
+        .is_some_and(|existing| !is_codex_generic_exit_wrapper(existing));
+
+    if new_is_generic_exit_wrapper && already_have_specific {
+        false
+    } else {
+        *error_message = Some(message);
+        true
+    }
+}
+
 fn strip_opencode_banner_lines(output: &str) -> Cow<'_, str> {
     let no_ansi = strip_ansi_codes(output);
     let source = no_ansi.as_ref();
@@ -13453,11 +13505,13 @@ pub async fn run_codex_turn(
                         //      consequence of the in-stream disconnect we
                         //      already decided to swallow.
                         //
-                        // Rule: if we have assistant output, ignore the error.
-                        // The empty-output branch still surfaces startup /
-                        // auth / config failures (which produce no text at
-                        // all) and mid-turn disconnects that happened before
-                        // any real content streamed.
+                        // Rule: if we have assistant output and no pending
+                        // tools, ignore the error. The empty-output branch
+                        // still surfaces startup / auth / config failures
+                        // (which produce no text at all). If a tool call is
+                        // still pending, the assistant's text is only a
+                        // progress update; swallowing a provider error would
+                        // mark unfinished work as completed.
                         //
                         // When we do surface an error, prefer the *first*
                         // meaningful message we saw — Codex CLI usually emits
@@ -13471,26 +13525,29 @@ pub async fn run_codex_turn(
                         // forces the user (and our `is_*_error` classifiers)
                         // to debug from log lines instead of the surfaced
                         // assistant_message.
-                        if assistant_message.trim().is_empty() {
-                            let new_is_generic_exit_wrapper = message.contains(
-                                "Codex CLI exited before completing the turn",
+                        if let Some(surfaced_message) =
+                            codex_error_message_to_surface(&assistant_message, &pending_tools, &message)
+                        {
+                            let recorded = record_codex_error_message(
+                                &mut error_message,
+                                surfaced_message.clone(),
                             );
-                            let already_have_specific = error_message
-                                .as_deref()
-                                .is_some_and(|existing| {
-                                    !existing.contains(
-                                        "Codex CLI exited before completing the turn",
-                                    )
-                                });
-                            if new_is_generic_exit_wrapper && already_have_specific {
+                            if recorded {
+                                if pending_tools.is_empty() {
+                                    tracing::error!("Codex error: {}", surfaced_message);
+                                } else {
+                                    tracing::warn!(
+                                        pending_tool_count = pending_tools.len(),
+                                        "Treating post-response Codex error as fatal because tool calls are still pending: {}",
+                                        surfaced_message
+                                    );
+                                }
+                            } else {
                                 tracing::warn!(
                                     "Keeping prior specific Codex error over generic exit wrapper: existing={}, ignored={}",
                                     error_message.as_deref().unwrap_or(""),
                                     message
                                 );
-                            } else {
-                                error_message = Some(message.clone());
-                                tracing::error!("Codex error: {}", message);
                             }
                         } else {
                             tracing::warn!(
@@ -13560,6 +13617,8 @@ pub async fn run_codex_turn(
     let stopped_on_progress_update = success
         && tool_activity_required
         && codex_final_message_looks_like_progress_update(&final_message);
+    let stopped_with_pending_tool_error =
+        !success && final_message.starts_with(CODEX_PENDING_TOOLS_ERROR_PREFIX);
     if stopped_before_required_tools || stopped_on_progress_update {
         tracing::warn!(
             mission_id = %mission_id,
@@ -13612,6 +13671,8 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
             TerminalReason::CapacityLimited
         } else if is_rate_limited_error(&final_message) {
             TerminalReason::RateLimited
+        } else if stopped_with_pending_tool_error {
+            TerminalReason::Stalled
         } else {
             TerminalReason::LlmError
         };
@@ -14378,22 +14439,23 @@ mod tests {
         claudecode_resume_current_session_message, claudecode_transport_failure_data,
         claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
         claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
-        codex_chatgpt_fallback_model, codex_final_message_looks_like_progress_update,
-        codex_key_fingerprint, codex_tool_stall_should_retry_with_default_model,
-        codex_turn_requires_tool_activity, extract_model_from_message, extract_opencode_session_id,
-        extract_part_text, extract_str, extract_thought_line, is_capacity_limited_error,
-        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_provider_payload_error,
-        is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
+        codex_chatgpt_fallback_model, codex_error_message_to_surface,
+        codex_final_message_looks_like_progress_update, codex_key_fingerprint,
+        codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
+        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
+        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
+        is_codex_node_wrapper, is_provider_payload_error, is_rate_limited_error,
+        is_session_corruption_error, is_success_path_auth_error,
         is_success_path_provider_payload_error, is_success_path_rate_limited_error,
         is_tool_call_only_output, opencode_idle_timeout_result_message,
         opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
-        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        preferred_model_for_cost, record_codex_error_message, resolve_cost_cents_and_source,
+        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
+        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
+        sync_opencode_agent_config, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
+        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
+        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, inject_telegram_identity_into_claude_md,
@@ -14793,6 +14855,57 @@ mod tests {
         assert!(is_capacity_limited_error(
             "SOMETHING upstream: SELECTED MODEL IS AT CAPACITY. retry later."
         ));
+    }
+
+    #[test]
+    fn codex_post_response_error_with_pending_tool_is_surfaceable() {
+        let mut pending_tools = std::collections::HashMap::new();
+        pending_tools.insert("call_1".to_string(), "bash".to_string());
+
+        let surfaced = codex_error_message_to_surface(
+            "The caller-side destructuring is updated. I’m rebuilding now.",
+            &pending_tools,
+            "Selected model is at capacity. Please try a different model.",
+        )
+        .expect("pending tool error should be surfaced");
+
+        assert!(surfaced.contains("tool calls were still pending (bash)"));
+        assert!(is_capacity_limited_error(&surfaced));
+
+        let mut error_message = None;
+        assert!(record_codex_error_message(
+            &mut error_message,
+            surfaced.clone()
+        ));
+        assert_eq!(error_message.as_deref(), Some(surfaced.as_str()));
+    }
+
+    #[test]
+    fn codex_post_response_error_without_pending_tools_stays_ignored() {
+        let pending_tools = std::collections::HashMap::new();
+
+        assert!(codex_error_message_to_surface(
+            "I completed the requested work.",
+            &pending_tools,
+            "Failed to shutdown rollout recorder",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn codex_error_recording_keeps_specific_error_over_exit_wrapper() {
+        let mut error_message =
+            Some("Selected model is at capacity. Please try a different model.".to_string());
+
+        assert!(!record_codex_error_message(
+            &mut error_message,
+            "Codex CLI exited before completing the turn (exit_status: exit status: 1)."
+                .to_string(),
+        ));
+        assert_eq!(
+            error_message.as_deref(),
+            Some("Selected model is at capacity. Please try a different model.")
+        );
     }
 
     #[test]
