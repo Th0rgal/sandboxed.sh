@@ -3684,10 +3684,10 @@ export default function ControlClient() {
    * (so a later "load older" page-replace can find the live tail) and
    * publishes the "more older messages exist" state to the UI.
    */
-  // `historyItemsLen` MUST count only items derived from server events
-  // (i.e. the result of `eventsToItems` / `missionHistoryToItems`), NOT
-  // the post-queue-merge length. `loadOlderHistoryEvents` later splices
-  // via `prev.slice(oldHistoricCount)`; if queued messages were counted
+  // `historyItemsLen` MUST count only the history-derived prefix
+  // (event replay plus any coarse mission-history fallback), NOT the
+  // post-queue-merge length. `loadOlderHistoryEvents` later splices via
+  // `prev.slice(oldHistoricCount)`; if queued messages were counted
   // here, they'd land before the splice point, get rebuilt by
   // `eventsToItems` (which doesn't see queued messages), and silently
   // disappear from the UI on the next page-back.
@@ -4452,6 +4452,35 @@ export default function ControlClient() {
     });
   }, []);
 
+  const mergeEventItemsWithMissionHistoryFallback = useCallback(
+    (eventItems: ChatItem[], mission: Mission): ChatItem[] => {
+      if (eventItems.some((item) => item.kind === "assistant")) {
+        return eventItems;
+      }
+
+      const historyHasAssistant = mission.history.some((entry) => entry.role === "assistant");
+      if (!historyHasAssistant) {
+        return eventItems;
+      }
+
+      const basicItems = missionHistoryToItems(mission);
+      if (eventItems.length === 0) {
+        return basicItems;
+      }
+
+      // Long Codex `/goal` missions can spend thousands of events in
+      // tool/thinking/status loops without a fresh assistant_message.
+      // The latest event page is still valuable: it contains the
+      // completed thought history and tool rows. Keep that replay and
+      // prepend coarse mission history so the chat still has prior
+      // user/assistant context.
+      const basicIds = new Set(basicItems.map((item) => item.id));
+      const eventOnlyItems = eventItems.filter((item) => !basicIds.has(item.id));
+      return [...basicItems, ...eventOnlyItems];
+    },
+    [missionHistoryToItems]
+  );
+
   // Convert stored events (from SQLite) to ChatItems for display
   // This enables full history replay including tool calls on page refresh
   const eventsToItems = useCallback((events: StoredEvent[], mission?: Mission | null): ChatItem[] => {
@@ -4965,15 +4994,9 @@ export default function ControlClient() {
           }
         }
         // Use events if available, otherwise fall back to basic history
-        let historyItems = events ? eventsToItems(events, mission) : missionHistoryToItems(mission);
-        if (events && !historyItems.some((item) => item.kind === "assistant")) {
-          const historyHasAssistant = mission.history.some(
-            (entry) => entry.role === "assistant"
-          );
-          if (historyHasAssistant) {
-            historyItems = missionHistoryToItems(mission);
-          }
-        }
+        let historyItems = events
+          ? mergeEventItemsWithMissionHistoryFallback(eventsToItems(events, mission), mission)
+          : missionHistoryToItems(mission);
         // Capture the events-derived count BEFORE the queue merge — this is
         // what `loadOlderHistoryEvents` needs to find the live tail
         // correctly (see `seedPaginationStateAfterInitialLoad`).
@@ -5056,15 +5079,10 @@ export default function ControlClient() {
           Promise.all([loadHistoryEvents(mission.id), getQueue().catch(() => [])])
             .then(([events, queuedMessages]) => {
               if (cancelled) return;
-              let historyItems = eventsToItems(events, mission);
-              if (!historyItems.some((item) => item.kind === "assistant")) {
-                const historyHasAssistant = mission.history.some(
-                  (entry) => entry.role === "assistant"
-                );
-                if (historyHasAssistant) {
-                  historyItems = missionHistoryToItems(mission);
-                }
-              }
+              let historyItems = mergeEventItemsWithMissionHistoryFallback(
+                eventsToItems(events, mission),
+                mission
+              );
               // Capture pre-queue length so pagination doesn't clip
               // queued items (see `seedPaginationStateAfterInitialLoad`).
               const historicEventsLen = historyItems.length;
@@ -5121,6 +5139,8 @@ export default function ControlClient() {
     searchParams,
     router,
     missionHistoryToItems,
+    mergeEventItemsWithMissionHistoryFallback,
+    eventsToItems,
     adjustVisibleItemsLimit,
     loadHistoryEvents,
     seedPaginationStateAfterInitialLoad,
@@ -5456,15 +5476,9 @@ export default function ControlClient() {
         }
 
         // Use events if available, otherwise fall back to basic history
-        let historyItems = events ? eventsToItems(events, mission) : missionHistoryToItems(mission);
-        if (events && !historyItems.some((item) => item.kind === "assistant")) {
-          const historyHasAssistant = mission.history.some(
-            (entry) => entry.role === "assistant"
-          );
-          if (historyHasAssistant) {
-            historyItems = missionHistoryToItems(mission);
-          }
-        }
+        let historyItems = events
+          ? mergeEventItemsWithMissionHistoryFallback(eventsToItems(events, mission), mission)
+          : missionHistoryToItems(mission);
 
         // Capture pre-queue length so pagination doesn't clip queued items
         // (see `seedPaginationStateAfterInitialLoad`).
@@ -5543,11 +5557,14 @@ export default function ControlClient() {
     [
       missionItems,
       missionHistoryToItems,
+      mergeEventItemsWithMissionHistoryFallback,
       eventsToItems,
       applyDesktopSessionState,
+      applyDesktopSessionFromEvents,
       adjustVisibleItemsLimit,
       loadHistoryEvents,
       seedPaginationStateAfterInitialLoad,
+      updateMissionItems,
       router,
     ]
   );
@@ -5956,15 +5973,10 @@ export default function ControlClient() {
       // Load full events in background (including tool calls)
       loadHistoryEvents(resumed.id)
         .then((events) => {
-          let fullItems = eventsToItems(events, resumed);
-          if (!fullItems.some((item) => item.kind === "assistant")) {
-            const historyHasAssistant = resumed.history.some(
-              (entry) => entry.role === "assistant"
-            );
-            if (historyHasAssistant) {
-              fullItems = missionHistoryToItems(resumed);
-            }
-          }
+          const fullItems = mergeEventItemsWithMissionHistoryFallback(
+            eventsToItems(events, resumed),
+            resumed
+          );
           setItems(fullItems);
           adjustVisibleItemsLimit(fullItems);
           updateMissionItems(resumed.id, fullItems);
@@ -7779,16 +7791,8 @@ export default function ControlClient() {
         if (viewingMissionIdRef.current !== missionId) return;
 
         let historyItems = events
-          ? eventsToItems(events, mission)
+          ? mergeEventItemsWithMissionHistoryFallback(eventsToItems(events, mission), mission)
           : missionHistoryToItems(mission);
-        if (events && !historyItems.some((item) => item.kind === "assistant")) {
-          const historyHasAssistant = mission.history.some(
-            (entry) => entry.role === "assistant"
-          );
-          if (historyHasAssistant) {
-            historyItems = missionHistoryToItems(mission);
-          }
-        }
 
         // Pre-queue length: pagination uses this to find the live tail
         // without clipping queued items (see `seedPaginationStateAfterInitialLoad`).
@@ -7832,6 +7836,7 @@ export default function ControlClient() {
       loadHistoryEvents,
       eventsToItems,
       missionHistoryToItems,
+      mergeEventItemsWithMissionHistoryFallback,
       adjustVisibleItemsLimit,
       seedPaginationStateAfterInitialLoad,
       updateMissionItems,
