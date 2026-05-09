@@ -47,6 +47,7 @@ use super::mission_store::{
 use super::routes::AppState;
 
 const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
+const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
 
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
 pub(super) fn safe_truncate_index(s: &str, max: usize) -> usize {
@@ -2945,7 +2946,7 @@ pub enum ControlCommand {
         mission_id: Uuid,
         /// If true, clean the mission's work directory before resuming
         clean_workspace: bool,
-        /// If true, only update status without sending the "MISSION RESUMED" message
+        /// If true, only update status without sending the automatic resume message
         skip_message: bool,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
@@ -4701,7 +4702,7 @@ pub struct ResumeMissionRequest {
     /// If true, clean the mission's work directory before resuming
     #[serde(default)]
     pub clean_workspace: bool,
-    /// If true, only update the mission status without sending the "MISSION RESUMED" message.
+    /// If true, only update the mission status without sending the automatic resume message.
     /// Useful when the user is about to send their own custom message.
     #[serde(default)]
     pub skip_message: bool,
@@ -6216,40 +6217,6 @@ fn parse_goal_objective(message: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn stored_goal_objective(mission: &Mission) -> Option<String> {
-    mission
-        .goal_objective
-        .as_deref()
-        .map(str::trim)
-        .filter(|objective| !objective.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| {
-            mission
-                .history
-                .iter()
-                .find(|entry| entry.role == "user")
-                .and_then(|entry| parse_goal_objective(&entry.content))
-        })
-}
-
-fn resume_prompt_for_mission(mission: &Mission, resume_prompt: String) -> String {
-    if mission.goal_mode
-        || mission
-            .history
-            .iter()
-            .any(|entry| entry.role == "user" && parse_goal_objective(&entry.content).is_some())
-    {
-        if let Some(objective) = stored_goal_objective(mission) {
-            return format!(
-                "/goal {}\n\nThe server restarted while this goal was active. Continue the same goal using the recovery context below. Do not restart from scratch.\n\n{}",
-                objective, resume_prompt
-            );
-        }
-    }
-
-    resume_prompt
-}
-
 /// If the turn ended with `LlmError` or `AuthError` but the agent produced
 /// substantive output, downgrade the reason to `TurnComplete` so the mission
 /// stays active and can be picked up by the next automation cycle or user
@@ -6929,11 +6896,10 @@ async fn control_actor_loop(
             .await
     }
 
-    // Helper to build resume context for an interrupted or blocked mission
+    // Helper to validate and prepare an interrupted or blocked mission for resume.
     async fn resume_mission_impl(
         mission_store: &Arc<dyn MissionStore>,
         config: &Config,
-        workspaces: &workspace::SharedWorkspaceStore,
         mission_id: Uuid,
         clean_workspace: bool,
     ) -> Result<(Mission, String), String> {
@@ -6950,9 +6916,6 @@ async fn control_actor_loop(
                 mission_id, mission.status
             ));
         }
-
-        let workspace_root =
-            workspace::resolve_workspace_root(workspaces, config, Some(mission.workspace_id)).await;
 
         // Clean mission context if requested.
         // Missions share the workspace directory, so we avoid deleting project files.
@@ -6976,133 +6939,7 @@ async fn control_actor_loop(
             let _ = std::fs::remove_file(runtime_file);
         }
 
-        // Build resume context
-        let mut resume_parts = Vec::new();
-
-        // Add resumption notice based on status
-        let resume_reason = match mission.status {
-            MissionStatus::Blocked => "reached its iteration limit",
-            MissionStatus::Failed => "failed due to an error (retrying)",
-            _ => "was interrupted",
-        };
-
-        let workspace_note = if clean_workspace {
-            " (context cleaned)"
-        } else {
-            ""
-        };
-
-        if let Some(interrupted_at) = &mission.interrupted_at {
-            resume_parts.push(format!(
-                "**MISSION RESUMED**{}\nThis mission {} at {} and is now being continued.",
-                workspace_note, resume_reason, interrupted_at
-            ));
-        } else {
-            resume_parts.push(format!(
-                "**MISSION RESUMED**{}\nThis mission {} and is now being continued.",
-                workspace_note, resume_reason
-            ));
-        }
-
-        // Add history summary
-        if !mission.history.is_empty() {
-            resume_parts.push("\n## Previous Conversation Summary".to_string());
-
-            // Include the original user request
-            if let Some(first_user) = mission.history.iter().find(|h| h.role == "user") {
-                resume_parts.push(format!("\n**Original Request:**\n{}", first_user.content));
-            }
-
-            // Include last assistant response (what was being worked on)
-            if let Some(last_assistant) =
-                mission.history.iter().rev().find(|h| h.role == "assistant")
-            {
-                let truncated = if last_assistant.content.len() > 2000 {
-                    let end = safe_truncate_index(&last_assistant.content, 2000);
-                    format!("{}...", &last_assistant.content[..end])
-                } else {
-                    last_assistant.content.clone()
-                };
-                resume_parts.push(format!("\n**Last Progress:**\n{}", truncated));
-            }
-        }
-
-        // Scan work directory for a compact top-level overview (not full file listing)
-        if workspace_root.exists() {
-            resume_parts.push("\n## Workspace Layout".to_string());
-
-            let mut top_level_dirs = Vec::new();
-            let mut top_level_files = Vec::new();
-            const SKIP_DIRS: &[&str] = &[
-                "venv",
-                ".venv",
-                ".sandboxed_sh",
-                ".sandboxed-sh",
-                ".git",
-                ".claude",
-                ".cargo",
-                ".rustup",
-                "node_modules",
-                "target",
-                "__pycache__",
-                ".next",
-                ".cache",
-                "temp",
-                ".local",
-                ".config",
-            ];
-
-            if let Ok(entries) = std::fs::read_dir(&workspace_root) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let path = entry.path();
-                    if path.is_dir() {
-                        if SKIP_DIRS.contains(&name.as_str()) {
-                            continue;
-                        }
-                        top_level_dirs.push(format!("{}/ ", name));
-                    } else if path.is_file() {
-                        top_level_files.push(name);
-                    }
-                }
-            }
-
-            top_level_dirs.sort();
-            top_level_files.sort();
-
-            if top_level_dirs.is_empty() && top_level_files.is_empty() {
-                resume_parts.push("Empty workspace.".to_string());
-            } else {
-                let mut listing = Vec::new();
-                for d in &top_level_dirs {
-                    listing.push(format!("- {}", d));
-                }
-                // Cap files at 20 to avoid token bloat
-                let file_cap = 20;
-                for f in top_level_files.iter().take(file_cap) {
-                    listing.push(format!("- {}", f));
-                }
-                if top_level_files.len() > file_cap {
-                    listing.push(format!(
-                        "- ... and {} more files",
-                        top_level_files.len() - file_cap
-                    ));
-                }
-                resume_parts.push(listing.join("\n"));
-            }
-        }
-
-        // Add instructions
-        resume_parts.push("\n## Instructions".to_string());
-        resume_parts.push(
-            "Please continue from where you left off. Review the previous progress and work directory contents, \
-            then continue working towards completing the original request. Do not repeat work that was already done."
-                .to_string()
-        );
-
-        let resume_prompt = resume_prompt_for_mission(&mission, resume_parts.join("\n"));
-
-        Ok((mission, resume_prompt))
+        Ok((mission, INTERRUPTED_RESUME_PROMPT.to_string()))
     }
 
     loop {
@@ -8093,7 +7930,6 @@ async fn control_actor_loop(
                         match resume_mission_impl(
                             &mission_store,
                             &config,
-                            &workspaces,
                             mission_id,
                             clean_workspace,
                         )

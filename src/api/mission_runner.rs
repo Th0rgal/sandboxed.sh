@@ -817,6 +817,27 @@ fn claudecode_incomplete_turn_message(
     message
 }
 
+fn apply_terminal_result_text(final_result: &mut String, terminal_result: Option<String>) {
+    if let Some(result) = terminal_result {
+        if !result.trim().is_empty() || final_result.trim().is_empty() {
+            *final_result = result;
+        }
+    }
+}
+
+fn use_thinking_only_fallback(
+    final_result: &mut String,
+    thinking_fallback: &str,
+    pending_tools_empty: bool,
+) -> bool {
+    if final_result.trim().is_empty() && !thinking_fallback.trim().is_empty() && pending_tools_empty
+    {
+        *final_result = thinking_fallback.to_string();
+        return true;
+    }
+    false
+}
+
 fn claudecode_malformed_startup_message(
     diagnostics: &[String],
     use_resume: bool,
@@ -5018,6 +5039,7 @@ pub fn run_claudecode_turn<'a>(
                                         total_cache_read_tokens +=
                                             usage.cache_read_input_tokens.unwrap_or(0);
                                     }
+                                    let mut assistant_thinking_fallback = String::new();
                                     for (content_idx, block) in evt.message.content.into_iter().enumerate() {
                                         let content_idx = content_idx as u32;
                                         match block {
@@ -5164,6 +5186,10 @@ pub fn run_claudecode_turn<'a>(
                                                     && !finalized_thinking_indices
                                                         .contains(&content_idx) =>
                                             {
+                                                if !assistant_thinking_fallback.is_empty() {
+                                                    assistant_thinking_fallback.push('\n');
+                                                }
+                                                assistant_thinking_fallback.push_str(&thinking);
                                                 // Only send done:true for the last active thinking block.
                                                 // Earlier blocks were already finalized during streaming
                                                 // (via the block-transition mechanism) and re-sending them
@@ -5199,6 +5225,17 @@ pub fn run_claudecode_turn<'a>(
                                         tracing::info!(
                                             mission_id = %mission_id,
                                             "Using thinking buffer as final result ({} chars, no text content in this turn)",
+                                            final_result.len()
+                                        );
+                                    }
+                                    if use_thinking_only_fallback(
+                                        &mut final_result,
+                                        &assistant_thinking_fallback,
+                                        pending_tools.is_empty(),
+                                    ) {
+                                        tracing::info!(
+                                            mission_id = %mission_id,
+                                            "Using assistant thinking-only block as final result ({} chars, no text content in this turn)",
                                             final_result.len()
                                         );
                                     }
@@ -5275,8 +5312,8 @@ pub fn run_claudecode_turn<'a>(
                                         // with success=false which the UI displays as a failure message.
                                         // Sending Error here would cause duplicate messages.
                                         final_result = error_msg;
-                                    } else if let Some(result) = res.result {
-                                        final_result = result;
+                                    } else {
+                                        apply_terminal_result_text(&mut final_result, res.result);
                                     }
                                     tracing::info!(
                                         mission_id = %mission_id,
@@ -12757,8 +12794,8 @@ pub async fn run_amp_turn(
                                     // with success=false which the UI displays as a failure message.
                                     // Sending Error here would cause duplicate messages.
                                     final_result = err_msg;
-                                } else if let Some(result) = res.result {
-                                    final_result = result;
+                                } else {
+                                    apply_terminal_result_text(&mut final_result, res.result);
                                 }
 
                                 tracing::debug!(
@@ -14433,7 +14470,7 @@ fn cleanup_old_debug_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        actual_cost_cents_from_total_cost_usd, bind_command_params,
+        actual_cost_cents_from_total_cost_usd, apply_terminal_result_text, bind_command_params,
         claudecode_idle_timeout_for_state, claudecode_incomplete_turn_message,
         claudecode_malformed_startup_message, claudecode_pre_turn_transport_message,
         claudecode_resume_current_session_message, claudecode_transport_failure_data,
@@ -14453,9 +14490,10 @@ mod tests {
         preferred_model_for_cost, record_codex_error_message, resolve_cost_cents_and_source,
         running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
         strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
-        sync_opencode_agent_config, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
-        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
-        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        sync_opencode_agent_config, use_thinking_only_fallback, ClaudeIncompleteTurnContext,
+        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
+        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
+        STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, inject_telegram_identity_into_claude_md,
@@ -15978,6 +16016,51 @@ mod tests {
         let message = claudecode_resume_current_session_message();
         assert!(message.contains("Continue from the current session state"));
         assert!(message.contains("without restarting completed tool calls"));
+    }
+
+    #[test]
+    fn terminal_result_empty_text_does_not_erase_captured_assistant_output() {
+        let mut final_result = "Captured assistant output from stream".to_string();
+
+        apply_terminal_result_text(&mut final_result, Some(String::new()));
+
+        assert_eq!(final_result, "Captured assistant output from stream");
+    }
+
+    #[test]
+    fn terminal_result_non_empty_text_replaces_stream_fallback() {
+        let mut final_result = "stream fallback".to_string();
+
+        apply_terminal_result_text(&mut final_result, Some("terminal result".to_string()));
+
+        assert_eq!(final_result, "terminal result");
+    }
+
+    #[test]
+    fn thinking_only_fallback_can_supply_final_result_when_no_tools_pending() {
+        let mut final_result = String::new();
+
+        let used = use_thinking_only_fallback(
+            &mut final_result,
+            "Final answer emitted as a thinking-only assistant block.",
+            true,
+        );
+
+        assert!(used);
+        assert_eq!(
+            final_result,
+            "Final answer emitted as a thinking-only assistant block."
+        );
+    }
+
+    #[test]
+    fn thinking_only_fallback_waits_when_tools_are_pending() {
+        let mut final_result = String::new();
+
+        let used = use_thinking_only_fallback(&mut final_result, "Need tool output first.", false);
+
+        assert!(!used);
+        assert!(final_result.is_empty());
     }
 
     #[test]

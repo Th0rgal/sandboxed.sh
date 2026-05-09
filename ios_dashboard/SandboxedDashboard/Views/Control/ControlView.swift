@@ -4009,7 +4009,7 @@ private struct ThoughtsSheet: View {
                         LazyVStack(spacing: 14) {
                             if !activeThoughts.isEmpty {
                                 ThoughtSection(title: "Thinking Now", icon: "brain") {
-                                    ForEach(Array(activeThoughts.enumerated()), id: \.offset) { _, msg in
+                                    ForEach(activeThoughts) { msg in
                                         ThoughtTimelineRow(message: msg, emphasize: true)
                                     }
                                 }
@@ -4017,7 +4017,7 @@ private struct ThoughtsSheet: View {
 
                             if !completedThoughts.isEmpty {
                                 ThoughtSection(title: "Recent Thoughts", icon: "clock.arrow.circlepath") {
-                                    ForEach(Array(completedThoughts.reversed().enumerated()), id: \.offset) { _, msg in
+                                    ForEach(completedThoughts.reversed()) { msg in
                                         ThoughtTimelineRow(message: msg, emphasize: false)
                                     }
                                 }

@@ -913,6 +913,7 @@ pub trait MissionStore: Send + Sync {
                 m.status == MissionStatus::Interrupted
                     && m.resumable
                     && m.terminal_reason.as_deref() == Some("server_shutdown")
+                    && m.mission_mode != MissionMode::Assistant
                     && m.interrupted_at
                         .as_deref()
                         .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())

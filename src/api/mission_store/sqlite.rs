@@ -2901,6 +2901,7 @@ impl MissionStore for SqliteMissionStore {
                      WHERE status = 'interrupted'
                        AND resumable = 1
                        AND terminal_reason = 'server_shutdown'
+                       AND COALESCE(mission_mode, 'task') != 'assistant'
                        AND interrupted_at IS NOT NULL
                        AND interrupted_at >= ?1
                      ORDER BY interrupted_at ASC",
@@ -6776,10 +6777,11 @@ mod tests {
     use super::{assistant_message_metadata, AssistantMessageMetadataInput, SqliteMissionStore};
     use crate::agents::CostSource;
     use crate::api::mission_store::{
-        MissionStore, TelegramChannel, TelegramConversation, TelegramConversationMessage,
-        TelegramConversationMessageDirection, TelegramStructuredMemoryEntry,
-        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope, TelegramTriggerMode,
-        TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus,
+        MissionMode, MissionStatus, MissionStore, TelegramChannel, TelegramConversation,
+        TelegramConversationMessage, TelegramConversationMessageDirection,
+        TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
+        TelegramTriggerMode, TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind,
+        TelegramWorkflowStatus,
     };
     use crate::cost::TokenUsage;
     use rusqlite::params;
@@ -8424,6 +8426,52 @@ mod tests {
             stale.iter().any(|m| m.id == mission.id),
             "mission with no recent events and old updated_at must still be flagged"
         );
+    }
+
+    #[tokio::test]
+    async fn recent_server_shutdown_query_skips_assistant_missions() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+
+        let task_mission = store
+            .create_mission(Some("task"), None, None, None, None, None, None)
+            .await
+            .expect("task mission");
+        store
+            .update_mission_status_with_reason(
+                task_mission.id,
+                MissionStatus::Interrupted,
+                Some("server_shutdown"),
+            )
+            .await
+            .expect("mark task interrupted");
+
+        let assistant_mission = store
+            .create_mission(Some("assistant"), None, None, None, None, None, None)
+            .await
+            .expect("assistant mission");
+        store
+            .update_mission_mode(assistant_mission.id, MissionMode::Assistant)
+            .await
+            .expect("set assistant mode");
+        store
+            .update_mission_status_with_reason(
+                assistant_mission.id,
+                MissionStatus::Interrupted,
+                Some("server_shutdown"),
+            )
+            .await
+            .expect("mark assistant interrupted");
+
+        let mission_ids = store
+            .get_recent_server_shutdown_mission_ids(48)
+            .await
+            .expect("recent server-shutdown missions");
+
+        assert!(mission_ids.contains(&task_mission.id));
+        assert!(!mission_ids.contains(&assistant_mission.id));
     }
 
     #[tokio::test]
