@@ -7953,6 +7953,43 @@ async fn control_actor_loop(
                                 // important for startup recovery when several missions were
                                 // interrupted by the same service restart.
                                 if running.is_some() {
+                                    if skip_message {
+                                        if let Err(e) = mission_store
+                                            .update_mission_status(
+                                                mission_id,
+                                                MissionStatus::Active,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                "Failed to resume mission {}: {}",
+                                                mission_id,
+                                                e
+                                            );
+                                        } else {
+                                            maybe_schedule_mission_metadata_refresh_for_status(
+                                                &mission_store,
+                                                &events_tx,
+                                                mission_id,
+                                                MissionStatus::Active,
+                                            );
+                                            let _ = events_tx.send(
+                                                AgentEvent::MissionStatusChanged {
+                                                    mission_id,
+                                                    status: MissionStatus::Active,
+                                                    summary: None,
+                                                },
+                                            );
+                                        }
+
+                                        let mut updated_mission = mission;
+                                        updated_mission.status = MissionStatus::Active;
+                                        updated_mission.resumable = false;
+                                        updated_mission.interrupted_at = None;
+                                        let _ = respond.send(Ok(updated_mission));
+                                        continue;
+                                    }
+
                                     let parallel_running = parallel_runners
                                         .values()
                                         .filter(|runner| runner.is_running())
