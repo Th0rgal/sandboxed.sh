@@ -89,6 +89,7 @@ describe("EnhancedInput composer behavior", () => {
       key: "Enter",
       code: "Enter",
       shiftKey: false,
+      metaKey: true,
     });
 
     expect(onSubmit).toHaveBeenCalledWith({ content: "draft message" });

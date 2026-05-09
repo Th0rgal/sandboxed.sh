@@ -516,8 +516,8 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
       return;
     }
 
-    // Normal Enter to submit (without Shift)
-    if (e.key === 'Enter' && !e.shiftKey && !showAutocomplete) {
+    // Cmd+Enter (or Ctrl+Enter) to submit; plain Enter inserts a newline
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !showAutocomplete) {
       e.preventDefault();
       handleSubmit();
     }
