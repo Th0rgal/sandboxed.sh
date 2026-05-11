@@ -248,9 +248,12 @@ async fn send_message_streaming_app_server(
     // through the codex backend config would silently get codex's built-in
     // default in app-server mode.
     let resolved_model = resolve_model(session.model.as_deref(), cfg.default_model.as_deref());
+    let thread_cwd = workspace_exec
+        .map(|exec| exec.translate_path_for_container(std::path::Path::new(&session.directory)))
+        .unwrap_or_else(|| session.directory.clone());
     let thread_start_params = ThreadStartParams {
         model: resolved_model,
-        cwd: Some(session.directory.clone()),
+        cwd: Some(thread_cwd),
         reasoning_effort: cfg.model_effort.clone(),
         ephemeral: None,
         // Match exec-mode's `--dangerously-bypass-approvals-and-sandbox`.
