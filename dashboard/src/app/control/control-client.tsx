@@ -7524,7 +7524,7 @@ export default function ControlClient() {
         }
 
         // If the mission is in a resumable state (failed/interrupted/blocked),
-        // resume it first to update the status before sending the message.
+        // Resume/sync it first before sending the message.
         // Use skipMessage to avoid the automatic resume message
         // since the user is about to send their own custom message.
         if (["failed", "interrupted", "blocked"].includes(mission.status)) {
