@@ -2755,6 +2755,14 @@ async fn run_mission_turn(
             .await;
 
             loop {
+                if cancel.is_cancelled() || super::routes::is_shutdown_initiated() {
+                    tracing::debug!(
+                        mission_id = %mission_id,
+                        "Skipping Claude transport recovery because execution is cancelling or shutting down"
+                    );
+                    break;
+                }
+
                 match claudecode_transport_recovery_strategy(
                     &result,
                     effective_sid.is_some(),

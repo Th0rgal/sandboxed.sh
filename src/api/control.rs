@@ -4869,12 +4869,25 @@ pub async fn stream(
             }
         }
 
-        // Keepalive interval to prevent connection timeouts during long LLM calls
+        // Keepalive interval to prevent connection timeouts during long LLM calls.
         let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut shutdown_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        shutdown_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
+                _ = shutdown_check_interval.tick() => {
+                    if super::routes::is_shutdown_initiated() {
+                        tracing::info!(
+                            stream_id = %stream_id,
+                            user_id = %user.id,
+                            username = %user.username,
+                            "Control SSE stream closing for graceful shutdown"
+                        );
+                        break;
+                    }
+                }
                 result = rx.recv() => {
                     match result {
                         Ok(ev) => {
@@ -9712,6 +9725,14 @@ async fn run_single_control_turn(
             .await;
 
             loop {
+                if cancel.is_cancelled() || super::routes::is_shutdown_initiated() {
+                    tracing::debug!(
+                        mission_id = %mid,
+                        "Skipping Claude transport recovery because execution is cancelling or shutting down"
+                    );
+                    break;
+                }
+
                 match super::mission_runner::claudecode_transport_recovery_strategy(
                     &result,
                     effective_session_id.is_some(),
