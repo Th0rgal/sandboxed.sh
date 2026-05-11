@@ -641,6 +641,10 @@ export function NewMissionDialog({
 
   const handleCreate = async (openInNewTab: boolean) => {
     if (disabled || submitting) return;
+    const pendingTab = openInNewTab ? window.open('about:blank', '_blank') : null;
+    if (pendingTab) {
+      pendingTab.opener = null;
+    }
     setSubmitting(true);
     try {
       const options = getCreateOptions();
@@ -653,7 +657,18 @@ export function NewMissionDialog({
       const url = `${controlPath}?mission=${mission.id}`;
 
       if (openInNewTab) {
-        window.open(url, '_blank');
+        let opened = false;
+        if (pendingTab && !pendingTab.closed) {
+          try {
+            pendingTab.location.href = url;
+            opened = true;
+          } catch {
+            opened = false;
+          }
+        }
+        if (!opened && !window.open(url, '_blank')) {
+          router.push(url);
+        }
         setOpen(false);
         resetForm();
         onClose?.();
@@ -666,6 +681,11 @@ export function NewMissionDialog({
         resetForm();
         router.push(url);
       }
+    } catch (err) {
+      if (pendingTab && !pendingTab.closed) {
+        pendingTab.close();
+      }
+      throw err;
     } finally {
       setSubmitting(false);
     }
