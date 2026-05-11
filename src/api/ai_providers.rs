@@ -1095,12 +1095,37 @@ fn get_anthropic_auth_from_ai_providers(working_dir: &Path) -> Option<ClaudeCode
 }
 
 /// Load the ai_providers.json array, returning an empty vec on any failure.
+///
+/// Read/parse failures previously vanished silently which made post-mortem
+/// debugging of credential-rotation incidents impossible. We now emit a warn
+/// so the journal records exactly why the credential pool ended up empty.
 fn load_ai_providers(working_dir: &Path) -> Vec<serde_json::Value> {
     let path = working_dir.join(AI_PROVIDERS_PATH);
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default()
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            // ENOENT is the common case before the user has connected any
+            // provider, so only escalate other errors to warn level.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                tracing::debug!(path = %path.display(), "ai_providers.json not present");
+            } else {
+                tracing::warn!(path = %path.display(), error = %e, "Failed to read ai_providers.json");
+            }
+            return Vec::new();
+        }
+    };
+    match serde_json::from_str::<Vec<serde_json::Value>>(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                bytes = contents.len(),
+                "Failed to parse ai_providers.json as JSON array; treating as empty",
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Get all Anthropic credentials from ai_providers.json, sorted by priority.

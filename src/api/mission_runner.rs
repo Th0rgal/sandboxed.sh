@@ -900,16 +900,24 @@ fn claudecode_pre_turn_transport_message(
 /// with the user's ChatGPT subscription; rotating across distinct
 /// `chatgpt_account_id`s spreads load across separate caps.
 pub(crate) fn collect_codex_credentials(working_dir: &std::path::Path) -> Vec<CodexCredential> {
-    let mut creds: Vec<CodexCredential> =
-        super::ai_providers::get_all_openai_keys_for_codex(working_dir)
-            .into_iter()
-            .map(CodexCredential::ApiKey)
-            .collect();
-    creds.extend(
-        super::ai_providers::get_all_openai_oauth_accounts(working_dir)
-            .into_iter()
-            .map(CodexCredential::OAuth),
+    let api_keys: Vec<CodexCredential> = super::ai_providers::get_all_openai_keys_for_codex(working_dir)
+        .into_iter()
+        .map(CodexCredential::ApiKey)
+        .collect();
+    let oauths: Vec<CodexCredential> = super::ai_providers::get_all_openai_oauth_accounts(working_dir)
+        .into_iter()
+        .map(CodexCredential::OAuth)
+        .collect();
+    // Emit at debug so we can correlate rotation behaviour with the pool
+    // state for any given mission. Counts only; never the credentials.
+    tracing::debug!(
+        working_dir = %working_dir.display(),
+        api_keys = api_keys.len(),
+        oauth_accounts = oauths.len(),
+        "collect_codex_credentials"
     );
+    let mut creds = api_keys;
+    creds.extend(oauths);
     creds
 }
 
@@ -3157,7 +3165,16 @@ async fn run_mission_turn(
             // Unified credential pool: API keys + ChatGPT-OAuth identities,
             // de-duplicated by chatgpt_account_id. Empty only when neither
             // an OpenAI API key nor a connected ChatGPT account is available.
-            let all_creds = collect_codex_credentials(&config.working_dir);
+            //
+            // Defensive: if the pool was empty and the turn hits a rate
+            // limit, re-query once and rerun via rotation if credentials are
+            // now visible. The May 2026 incident showed the empty branch can
+            // be taken transiently even when accounts exist on disk, leaving
+            // the user with no rotation. The recheck guards against that
+            // without changing the happy-path behaviour.
+            'codex_arm: {
+            let mut all_creds = collect_codex_credentials(&config.working_dir);
+            let mut prior_empty_result: Option<AgentResult> = None;
             if all_creds.is_empty() {
                 let mut result = run_codex_turn(
                     &workspace,
@@ -3223,11 +3240,35 @@ async fn run_mission_turn(
                     .await;
                 }
 
-                result
-            } else {
+                // Defensive re-query: if this turn was rate/capacity limited
+                // and a fresh enumeration now returns accounts, fall through
+                // to the rotation loop instead of surfacing the failure.
+                let constrained = matches!(
+                    result.terminal_reason,
+                    Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
+                );
+                if constrained {
+                    let recheck = collect_codex_credentials(&config.working_dir);
+                    if !recheck.is_empty() {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            recovered_credentials = recheck.len(),
+                            "Codex credential pool was empty on first attempt but re-query found accounts after a rate-limited turn; retrying with rotation"
+                        );
+                        all_creds = recheck;
+                        prior_empty_result = Some(result);
+                        // fall through to rotation loop below
+                    } else {
+                        break 'codex_arm result;
+                    }
+                } else {
+                    break 'codex_arm result;
+                }
+            }
+            {
                 let mut attempted_credentials: HashSet<String> = HashSet::new();
                 let mut attempt_idx = 0usize;
-                let mut last_constrained_result: Option<AgentResult> = None;
+                let mut last_constrained_result: Option<AgentResult> = prior_empty_result;
 
                 loop {
                     if cancel.is_cancelled() {
@@ -3353,6 +3394,7 @@ async fn run_mission_turn(
                         _ => break result,
                     }
                 }
+            }
             }
         }
         "gemini" => {
