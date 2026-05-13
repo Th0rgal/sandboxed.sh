@@ -205,6 +205,10 @@ pub enum StopPolicy {
         /// GitHub repository in "owner/repo" format
         repo: String,
     },
+    /// Auto-disable after the automation fires for the first time. Used by
+    /// `schedule_wakeup` to make one-shot wake-ups; the scheduler sets the
+    /// automation inactive on the tick after an execution record exists.
+    AfterFirstFire,
 }
 
 /// Whether to start a fresh session for each automation trigger.

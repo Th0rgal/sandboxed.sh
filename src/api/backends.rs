@@ -102,6 +102,9 @@ pub struct BackendConfig {
     /// Whether the CLI for this backend is available on the system
     #[serde(default)]
     pub cli_available: bool,
+    /// Whether authentication for this backend is configured (None = not applicable / not checked)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_configured: Option<bool>,
 }
 
 /// Check if a CLI command is available on the system
@@ -119,6 +122,136 @@ fn check_cli_available(cli_name: &str) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+/// Check whether Gemini has any usable credentials available.
+///
+/// Mirrors the precedence used by `get_google_credentials_for_gemini` in
+/// `mission_runner.rs` but returns only a boolean: env vars, the AI provider
+/// store (Google provider targeting the gemini backend with an API key),
+/// the sandboxed-sh credentials store, and OpenCode's auth.json.
+fn check_gemini_auth_configured(working_dir: &std::path::Path) -> bool {
+    // 1. Environment variables
+    for var in [
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+    ] {
+        if let Ok(key) = std::env::var(var) {
+            if !key.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+
+    // 2. AI provider store: Google provider targeting "gemini" with a non-empty api_key
+    if crate::api::ai_providers::provider_targets_backend(
+        working_dir,
+        crate::ai_providers::ProviderType::Google,
+        "gemini",
+    ) {
+        let store_path = working_dir.join(crate::util::AI_PROVIDERS_PATH);
+        if let Ok(store) = std::fs::read_to_string(&store_path) {
+            if let Ok(providers) = serde_json::from_str::<serde_json::Value>(&store) {
+                if let Some(arr) = providers.as_array() {
+                    for provider in arr {
+                        if provider.get("provider_type").and_then(|v| v.as_str()) != Some("google")
+                        {
+                            continue;
+                        }
+                        let enabled = provider
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        if !enabled {
+                            continue;
+                        }
+                        if let Some(key) = provider.get("api_key").and_then(|v| v.as_str()) {
+                            if !key.is_empty() {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Sandboxed-sh credentials store (Google OAuth)
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let candidates = [
+        std::path::PathBuf::from(&home)
+            .join(".sandboxed-sh")
+            .join("credentials.json"),
+        std::path::PathBuf::from("/var/lib/opencode")
+            .join(".sandboxed-sh")
+            .join("credentials.json"),
+    ];
+    if let Some(creds_path) = candidates.iter().find(|p| p.exists()) {
+        if let Ok(contents) = std::fs::read_to_string(creds_path) {
+            if let Ok(auth) = serde_json::from_str::<serde_json::Value>(&contents) {
+                for key_name in ["google", "gemini"] {
+                    if let Some(entry) = auth.get(key_name) {
+                        let access = entry.get("access").and_then(|v| v.as_str()).unwrap_or("");
+                        let refresh = entry.get("refresh").and_then(|v| v.as_str()).unwrap_or("");
+                        if !access.is_empty() && !refresh.is_empty() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. OpenCode's auth.json (API key or OAuth)
+    let mut opencode_candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+        opencode_candidates.push(
+            std::path::PathBuf::from(data_home)
+                .join("opencode")
+                .join("auth.json"),
+        );
+    }
+    opencode_candidates.push(
+        std::path::PathBuf::from(&home)
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json"),
+    );
+    opencode_candidates.push(
+        std::path::PathBuf::from("/var/lib/opencode")
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json"),
+    );
+    if let Some(auth_path) = opencode_candidates.iter().find(|p| p.exists()) {
+        if let Ok(contents) = std::fs::read_to_string(auth_path) {
+            if let Ok(auth) = serde_json::from_str::<serde_json::Value>(&contents) {
+                for key_name in ["google", "gemini"] {
+                    if let Some(entry) = auth.get(key_name) {
+                        for field in ["key", "api_key"] {
+                            if let Some(key) = entry.get(field).and_then(|v| v.as_str()) {
+                                if !key.is_empty()
+                                    && entry.get("type").and_then(|v| v.as_str()) != Some("oauth")
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        let access = entry.get("access").and_then(|v| v.as_str()).unwrap_or("");
+                        let refresh = entry.get("refresh").and_then(|v| v.as_str()).unwrap_or("");
+                        if !access.is_empty() && !refresh.is_empty() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Get backend configuration
@@ -185,6 +318,12 @@ pub async fn get_backend_config(
         settings = serde_json::Value::Object(obj);
     }
 
+    // Auth-state check for backends that ship without account-level guards.
+    let auth_configured: Option<bool> = match id.as_str() {
+        "gemini" => Some(check_gemini_auth_configured(&state.config.working_dir)),
+        _ => None,
+    };
+
     // Check CLI availability based on backend type
     let cli_available = match id.as_str() {
         "claudecode" => {
@@ -225,6 +364,7 @@ pub async fn get_backend_config(
         enabled: config_entry.enabled,
         settings,
         cli_available,
+        auth_configured,
     }))
 }
 

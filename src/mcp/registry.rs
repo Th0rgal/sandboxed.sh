@@ -230,23 +230,27 @@ impl McpRegistry {
         orchestrator.scope = McpScope::Workspace;
         orchestrator.default_enabled = true;
 
-        let automation_manager_command = {
-            let release = working_dir
-                .join("target")
-                .join("release")
-                .join("automation-manager-mcp");
-            let debug = working_dir
-                .join("target")
-                .join("debug")
-                .join("automation-manager-mcp");
-            if release.exists() {
-                release.to_string_lossy().to_string()
-            } else if debug.exists() {
-                debug.to_string_lossy().to_string()
-            } else {
-                "automation-manager-mcp".to_string()
-            }
-        };
+        let automation_manager_command = std::env::var("AUTOMATION_MANAGER_MCP_BIN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                let release = working_dir
+                    .join("target")
+                    .join("release")
+                    .join("automation-manager-mcp");
+                let debug = working_dir
+                    .join("target")
+                    .join("debug")
+                    .join("automation-manager-mcp");
+                if release.exists() {
+                    release.to_string_lossy().to_string()
+                } else if debug.exists() {
+                    debug.to_string_lossy().to_string()
+                } else {
+                    "automation-manager-mcp".to_string()
+                }
+            });
         let mut automation_manager_env = HashMap::new();
         if let Ok(api_url) = std::env::var("API_URL") {
             if !api_url.trim().is_empty() {

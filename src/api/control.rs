@@ -2132,6 +2132,7 @@ async fn stop_policy_matches_status(
     stop_policy: &mission_store::StopPolicy,
     _status: MissionStatus,
     consecutive_failures: u32,
+    has_fired: bool,
 ) -> bool {
     match stop_policy {
         mission_store::StopPolicy::Never => false,
@@ -2140,6 +2141,27 @@ async fn stop_policy_matches_status(
         }
         mission_store::StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo } => {
             check_github_all_issues_closed_and_prs_merged(repo).await
+        }
+        mission_store::StopPolicy::AfterFirstFire => has_fired,
+    }
+}
+
+async fn automation_has_fired(
+    mission_store: &Arc<dyn mission_store::MissionStore>,
+    automation_id: Uuid,
+) -> bool {
+    match mission_store
+        .get_automation_executions(automation_id, Some(1))
+        .await
+    {
+        Ok(executions) => !executions.is_empty(),
+        Err(e) => {
+            tracing::warn!(
+                "Failed to load executions for automation {} while evaluating stop policy: {}",
+                automation_id,
+                e
+            );
+            false
         }
     }
 }
@@ -5714,11 +5736,20 @@ async fn automation_scheduler_loop(
 
             let consecutive_failures =
                 consecutive_failure_count_for_automation(&mission_store, &automation).await;
+            let has_fired = if matches!(
+                automation.stop_policy,
+                mission_store::StopPolicy::AfterFirstFire
+            ) {
+                automation_has_fired(&mission_store, automation.id).await
+            } else {
+                false
+            };
 
             if stop_policy_matches_status(
                 &automation.stop_policy,
                 mission.status,
                 consecutive_failures,
+                has_fired,
             )
             .await
             {
@@ -6578,11 +6609,20 @@ async fn agent_finished_automation_messages(
     for automation in active {
         let consecutive_failures =
             consecutive_failure_count_for_automation(mission_store, &automation).await;
+        let has_fired = if matches!(
+            automation.stop_policy,
+            mission_store::StopPolicy::AfterFirstFire
+        ) {
+            automation_has_fired(mission_store, automation.id).await
+        } else {
+            false
+        };
 
         if stop_policy_matches_status(
             &automation.stop_policy,
             mission.status,
             consecutive_failures,
+            has_fired,
         )
         .await
         {
@@ -10403,8 +10443,8 @@ pub async fn create_automation(
         )
     {
         if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
-            // Newly created automation has 0 consecutive failures
-            if stop_policy_matches_status(&automation.stop_policy, mission.status, 0).await {
+            // Newly created automation has 0 consecutive failures and has never fired.
+            if stop_policy_matches_status(&automation.stop_policy, mission.status, 0, false).await {
                 let mut updated = automation.clone();
                 updated.active = false;
                 if let Err(e) = control.mission_store.update_automation(updated).await {
@@ -11536,11 +11576,20 @@ pub async fn webhook_receiver(
 
     let consecutive_failures =
         consecutive_failure_count_for_automation(&control.mission_store, &automation).await;
+    let has_fired = if matches!(
+        automation.stop_policy,
+        mission_store::StopPolicy::AfterFirstFire
+    ) {
+        automation_has_fired(&control.mission_store, automation.id).await
+    } else {
+        false
+    };
 
     if stop_policy_matches_status(
         &automation.stop_policy,
         mission.status,
         consecutive_failures,
+        has_fired,
     )
     .await
     {
@@ -16188,7 +16237,8 @@ Investigate <service/> failures.
             stop_policy_matches_status(
                 &mission_store::StopPolicy::WhenFailingConsecutively { count: 2 },
                 MissionStatus::Failed,
-                2
+                2,
+                false,
             )
             .await
         );
@@ -16196,7 +16246,8 @@ Investigate <service/> failures.
             !stop_policy_matches_status(
                 &mission_store::StopPolicy::WhenFailingConsecutively { count: 2 },
                 MissionStatus::Failed,
-                1
+                1,
+                false,
             )
             .await
         );
@@ -16204,7 +16255,8 @@ Investigate <service/> failures.
             stop_policy_matches_status(
                 &mission_store::StopPolicy::WhenFailingConsecutively { count: 3 },
                 MissionStatus::Failed,
-                3
+                3,
+                false,
             )
             .await
         );
@@ -16212,7 +16264,8 @@ Investigate <service/> failures.
             !stop_policy_matches_status(
                 &mission_store::StopPolicy::WhenFailingConsecutively { count: 3 },
                 MissionStatus::Failed,
-                2
+                2,
+                false,
             )
             .await
         );
@@ -16224,7 +16277,8 @@ Investigate <service/> failures.
             !stop_policy_matches_status(
                 &mission_store::StopPolicy::Never,
                 MissionStatus::Completed,
-                0
+                0,
+                false,
             )
             .await
         );
@@ -16232,9 +16286,34 @@ Investigate <service/> failures.
             !stop_policy_matches_status(
                 &mission_store::StopPolicy::Never,
                 MissionStatus::Failed,
-                5
+                5,
+                false,
             )
             .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_policy_after_first_fire() {
+        assert!(
+            !stop_policy_matches_status(
+                &mission_store::StopPolicy::AfterFirstFire,
+                MissionStatus::Active,
+                0,
+                false,
+            )
+            .await,
+            "never-fired one-shot stays armed"
+        );
+        assert!(
+            stop_policy_matches_status(
+                &mission_store::StopPolicy::AfterFirstFire,
+                MissionStatus::Active,
+                0,
+                true,
+            )
+            .await,
+            "one-shot disables on the tick after it fires"
         );
     }
 

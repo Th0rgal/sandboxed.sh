@@ -70,6 +70,7 @@ import {
   type StoredEvent,
 } from "@/lib/api";
 import { QueueStrip, type QueueItem } from "@/components/queue-strip";
+import { AsyncButton } from "@/components/ui/async-button";
 import {
   Send,
   Square,
@@ -122,6 +123,7 @@ import {
   Users,
   BriefcaseBusiness,
   Inbox,
+  Flag,
 } from "lucide-react";
 import { IMAGE_PATH_PATTERN } from "@/lib/file-extensions";
 import { insertTextAtSelection, type TextSelection } from "@/lib/text-selection";
@@ -1909,7 +1911,7 @@ function MissionWorkbenchPanel({
   onOpenAutomations: () => void;
   onOpenSwitcher: () => void;
   onViewMission: (missionId: string) => void;
-  onSetStatus: (status: MissionStatus) => void;
+  onSetStatus: (status: MissionStatus) => void | Promise<void>;
   /**
    * Optional slot for the mission's run-settings editor (the
    * `<NewMissionDialog mode="edit">` trigger). Rendered next to Resume/Stop
@@ -1925,6 +1927,31 @@ function MissionWorkbenchPanel({
     !isRunning &&
     mission.resumable &&
     (mission.status === "interrupted" || mission.status === "blocked" || mission.status === "failed");
+
+  const [markAsOpen, setMarkAsOpen] = useState(false);
+  const markAsRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!markAsOpen) return;
+    function handlePointerDown(event: MouseEvent) {
+      if (markAsRef.current && !markAsRef.current.contains(event.target as Node)) {
+        setMarkAsOpen(false);
+      }
+    }
+    function handleKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setMarkAsOpen(false);
+    }
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [markAsOpen]);
+
+  useEffect(() => {
+    setMarkAsOpen(false);
+  }, [mission?.id]);
 
   return (
     <aside
@@ -2038,6 +2065,48 @@ function MissionWorkbenchPanel({
                   <Layers className="h-3.5 w-3.5" />
                   Switch
                 </button>
+                <div ref={markAsRef} className="relative">
+                  <button
+                    onClick={() => setMarkAsOpen((prev) => !prev)}
+                    aria-haspopup="menu"
+                    aria-expanded={markAsOpen}
+                    className={cn(
+                      "inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs font-medium text-white/70 hover:bg-white/[0.04]",
+                      markAsOpen && "bg-white/[0.06] text-white"
+                    )}
+                  >
+                    <Flag className="h-3.5 w-3.5" />
+                    Mark As
+                  </button>
+                  {markAsOpen && (
+                    <div
+                      role="menu"
+                      className="absolute right-0 top-full z-20 mt-1 w-40 overflow-hidden rounded-lg border border-white/[0.08] bg-[#1a1a1a] shadow-xl"
+                    >
+                      {(["completed", "blocked", "failed"] as MissionStatus[]).map((nextStatus) => (
+                        <AsyncButton
+                          key={nextStatus}
+                          role="menuitem"
+                          onClick={async () => {
+                            try {
+                              await onSetStatus(nextStatus);
+                            } finally {
+                              setMarkAsOpen(false);
+                            }
+                          }}
+                          disabled={mission.status === nextStatus}
+                          spinnerClassName="h-3 w-3"
+                          className="flex w-full items-center justify-between gap-2 px-3 py-2 text-xs capitalize text-white/70 transition-colors hover:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+                        >
+                          <span>{nextStatus.replace("_", " ")}</span>
+                          {mission.status === nextStatus && (
+                            <CheckCircle className="h-3 w-3 text-white/40" />
+                          )}
+                        </AsyncButton>
+                      ))}
+                    </div>
+                  )}
+                </div>
                 {runSettingsSlot && (
                   <div className="col-span-2 [&>div]:w-full [&>div>button]:w-full [&>div>button]:justify-center">
                     {runSettingsSlot}
@@ -2046,32 +2115,12 @@ function MissionWorkbenchPanel({
               </div>
             </section>
 
-            <section className="space-y-2">
-              <p className="text-[10px] uppercase tracking-wide text-white/30">Mark As</p>
-              <div className="flex flex-wrap gap-1.5">
-                {(["completed", "blocked", "failed"] as MissionStatus[]).map((nextStatus) => (
-                  <button
-                    key={nextStatus}
-                    onClick={() => onSetStatus(nextStatus)}
-                    disabled={mission.status === nextStatus}
-                    className="rounded-md border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-[10px] capitalize text-white/55 transition-colors hover:bg-white/[0.04] disabled:cursor-not-allowed disabled:opacity-40"
-                  >
-                    {nextStatus.replace("_", " ")}
-                  </button>
-                ))}
-              </div>
-            </section>
-
-            <section className="space-y-2">
-              <div className="flex items-center justify-between">
-                <p className="text-[10px] uppercase tracking-wide text-white/30">Worker Missions</p>
-                <span className="text-[10px] tabular-nums text-white/30">{childMissions.length}</span>
-              </div>
-              {childMissions.length === 0 ? (
-                <div className="rounded-md border border-white/[0.04] bg-white/[0.01] px-3 py-4 text-center text-xs text-white/30">
-                  No workers attached to this mission.
+            {childMissions.length > 0 && (
+              <section className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <p className="text-[10px] uppercase tracking-wide text-white/30">Worker Missions</p>
+                  <span className="text-[10px] tabular-nums text-white/30">{childMissions.length}</span>
                 </div>
-              ) : (
                 <div className="space-y-1.5">
                   {childMissions.slice(0, 6).map((child) => (
                     <button
@@ -2087,8 +2136,8 @@ function MissionWorkbenchPanel({
                     </button>
                   ))}
                 </div>
-              )}
-            </section>
+              </section>
+            )}
           </>
         )}
       </div>
@@ -7911,6 +7960,11 @@ export default function ControlClient() {
   }, [workspaces]);
   const activeWorkspaceLabel = activeMission?.workspace_name
     || (activeMission?.workspace_id ? workspaceNameById[activeMission.workspace_id] : undefined);
+  const activeMissionSelectorLabel = activeMission
+    ? activeMission.short_description?.trim()
+      || activeMission.title?.trim()
+      || getMissionShortName(activeMission.id)
+    : null;
   const missionStatus = activeMission
     ? missionStatusLabel(activeMission.status, viewingMissionIsRunning)
     : null;
@@ -8066,16 +8120,11 @@ export default function ControlClient() {
                     )}
                     title={missionStatus?.label}
                   />
-                  {activeWorkspaceLabel && (
-                    <>
-                      <span className="text-sm font-medium text-white/50 truncate max-w-[160px] sm:max-w-[220px]">
-                        {activeWorkspaceLabel}
-                      </span>
-                      <span className="text-white/40">·</span>
-                    </>
-                  )}
-                  <span className="text-sm font-medium text-white/70 truncate max-w-[140px] sm:max-w-[180px]" title={activeMission.title ?? undefined}>
-                    {activeMission.title || getMissionShortName(activeMission.id)}
+                  <span
+                    className="text-sm font-medium text-white/70 truncate max-w-[180px] sm:max-w-[260px]"
+                    title={activeMissionSelectorLabel ?? undefined}
+                  >
+                    {activeMissionSelectorLabel}
                   </span>
                 </>
               ) : (
@@ -8302,7 +8351,7 @@ export default function ControlClient() {
                         {desktopSessions.some(s => s.status === 'orphaned' && s.process_running) && (
                           <>
                             <div className="my-1 h-px bg-white/[0.06]" />
-                            <button
+                            <AsyncButton
                               onClick={async () => {
                                 try {
                                   await cleanupOrphanedDesktopSessions();
@@ -8312,11 +8361,11 @@ export default function ControlClient() {
                                   toast.error('Failed to cleanup sessions');
                                 }
                               }}
-                              className="flex w-full items-center gap-2 px-3 py-2 text-xs text-amber-500/70 hover:bg-white/[0.04] transition-colors"
+                              className="flex w-full items-center gap-2 px-3 py-2 text-xs text-amber-500/70 hover:bg-white/[0.04] transition-colors disabled:cursor-not-allowed"
                             >
                               <Trash2 className="h-3.5 w-3.5" />
                               Close all orphaned
-                            </button>
+                            </AsyncButton>
                           </>
                         )}
 
@@ -8324,7 +8373,7 @@ export default function ControlClient() {
                         {desktopSessions.some(s => !s.process_running || s.status === 'stopped') && (
                           <>
                             <div className="my-1 h-px bg-white/[0.06]" />
-                            <button
+                            <AsyncButton
                               onClick={async () => {
                                 try {
                                   await cleanupStoppedDesktopSessions();
@@ -8334,11 +8383,11 @@ export default function ControlClient() {
                                   toast.error('Failed to clear stopped sessions');
                                 }
                               }}
-                              className="flex w-full items-center gap-2 px-3 py-2 text-xs text-white/40 hover:bg-white/[0.04] transition-colors"
+                              className="flex w-full items-center gap-2 px-3 py-2 text-xs text-white/40 hover:bg-white/[0.04] transition-colors disabled:cursor-not-allowed"
                             >
                               <Trash2 className="h-3.5 w-3.5" />
                               Clear stopped sessions
-                            </button>
+                            </AsyncButton>
                           </>
                         )}
                       </>

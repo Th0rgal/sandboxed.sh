@@ -657,6 +657,7 @@ impl SqliteMissionStore {
         } else {
             match stop_policy_str.as_str() {
                 "never" => StopPolicy::Never,
+                "after_first_fire" => StopPolicy::AfterFirstFire,
                 _ => StopPolicy::Never,
             }
         };
@@ -3762,6 +3763,7 @@ impl MissionStore for SqliteMissionStore {
                 StopPolicy::Never => "never".to_string(),
                 StopPolicy::WhenFailingConsecutively { count } => format!("consecutive_failures:{}", count),
                 StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo } => format!("all_issues_closed_and_prs_merged:{}", repo),
+                StopPolicy::AfterFirstFire => "after_first_fire".to_string(),
             };
             let fresh_session_str = match a.fresh_session {
                 FreshSession::Always => "always",
@@ -3982,6 +3984,7 @@ impl MissionStore for SqliteMissionStore {
                 StopPolicy::Never => "never".to_string(),
                 StopPolicy::WhenFailingConsecutively { count } => format!("consecutive_failures:{}", count),
                 StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo } => format!("all_issues_closed_and_prs_merged:{}", repo),
+                StopPolicy::AfterFirstFire => "after_first_fire".to_string(),
             };
             let fresh_session_str = match automation.fresh_session {
                 FreshSession::Always => "always",
@@ -6370,6 +6373,7 @@ impl MissionStore for SqliteMissionStore {
                     StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo } => {
                         format!("all_issues_closed_and_prs_merged:{}", repo)
                     }
+                    StopPolicy::AfterFirstFire => "after_first_fire".to_string(),
                 };
                 let fresh_session_str = match auto.fresh_session {
                     FreshSession::Always => "always",

@@ -30,6 +30,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AddProviderModal } from '@/components/ui/add-provider-modal';
+import { AsyncButton } from '@/components/ui/async-button';
 
 const providerConfig: Record<string, { color: string; icon: string }> = {
   anthropic: { color: 'bg-orange-500/10 text-orange-400', icon: '🧠' },
@@ -685,13 +686,13 @@ export default function ProvidersPage() {
                               </button>
                             )}
                             {!provider.is_default && provider.enabled && (
-                              <button
+                              <AsyncButton
                                 onClick={() => handleSetDefault(provider.id)}
-                                className="p-1.5 rounded-md text-white/30 hover:text-white/60 hover:bg-white/[0.04] transition-colors cursor-pointer"
+                                className="p-1.5 rounded-md text-white/30 hover:text-white/60 hover:bg-white/[0.04] transition-colors cursor-pointer disabled:cursor-not-allowed"
                                 title="Set as default"
                               >
                                 <Star className="h-3.5 w-3.5" />
-                              </button>
+                              </AsyncButton>
                             )}
                             <button
                               onClick={() => handleStartEdit(provider)}
@@ -700,13 +701,13 @@ export default function ProvidersPage() {
                             >
                               <Key className="h-3.5 w-3.5" />
                             </button>
-                            <button
+                            <AsyncButton
                               onClick={() => handleDeleteProvider(provider.id)}
-                              className="p-1.5 rounded-md text-white/30 hover:text-red-400 hover:bg-white/[0.04] transition-colors cursor-pointer"
+                              className="p-1.5 rounded-md text-white/30 hover:text-red-400 hover:bg-white/[0.04] transition-colors cursor-pointer disabled:cursor-not-allowed"
                               title="Delete"
                             >
                               <Trash2 className="h-3.5 w-3.5" />
-                            </button>
+                            </AsyncButton>
                           </div>
                         </div>
 

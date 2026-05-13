@@ -25,6 +25,7 @@ export type StopPolicy =
   | { type: "never" }
   | { type: "when_failing_consecutively"; count: number }
   | { type: "when_all_issues_closed_and_prs_merged"; repo: string }
+  | { type: "after_first_fire" }
   // Legacy value kept for backward compatibility with older payloads.
   | { type: "on_consecutive_failures"; count: number };
 

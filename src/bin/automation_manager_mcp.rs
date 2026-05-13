@@ -191,6 +191,17 @@ fn default_limit() -> usize {
     20
 }
 
+#[derive(Debug, Deserialize)]
+struct ScheduleWakeupParams {
+    #[serde(rename = "delaySeconds", alias = "delay_seconds")]
+    delay_seconds: u64,
+    prompt: String,
+    reason: String,
+}
+
+const WAKEUP_MIN_SECONDS: u64 = 60;
+const WAKEUP_MAX_SECONDS: u64 = 3600;
+
 // =============================================================================
 // MCP Server Implementation
 // =============================================================================
@@ -331,6 +342,37 @@ impl AutomationManagerMcp {
                     "properties": {
                         "automation_id": {"type": "string", "description": "Filter by specific automation ID (optional)"},
                         "limit": {"type": "number", "description": "Maximum number of executions to return (default: 20)"}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_wakeup".to_string(),
+                description: concat!(
+                    "Schedule a one-shot wake-up that delivers `prompt` back into this ",
+                    "mission after `delaySeconds`. Use this when you need to pause and ",
+                    "resume work later (polling a build, checking back after a wait, ",
+                    "self-paced iteration). The wake-up fires exactly once and then ",
+                    "auto-disables — call schedule_wakeup again from the resumed turn ",
+                    "to keep looping. delaySeconds is clamped to [60, 3600]."
+                ).to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["delaySeconds", "prompt", "reason"],
+                    "properties": {
+                        "delaySeconds": {
+                            "type": "integer",
+                            "minimum": WAKEUP_MIN_SECONDS,
+                            "maximum": WAKEUP_MAX_SECONDS,
+                            "description": "Seconds from now to wake up. Clamped to [60, 3600]."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "The message delivered to the mission when the wake-up fires."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "One short sentence explaining the chosen delay (for telemetry / UI)."
+                        }
                     }
                 }),
             },
@@ -509,6 +551,57 @@ impl AutomationManagerMcp {
         Ok(serde_json::to_value(executions).unwrap())
     }
 
+    async fn schedule_wakeup(&self, params: ScheduleWakeupParams) -> Result<Value, String> {
+        let delay = params
+            .delay_seconds
+            .clamp(WAKEUP_MIN_SECONDS, WAKEUP_MAX_SECONDS);
+
+        let client = reqwest::Client::new();
+        let url = format!(
+            "{}/api/control/missions/{}/automations",
+            self.api_url, self.mission_id
+        );
+
+        let mut variables = HashMap::new();
+        variables.insert("__wakeup_reason".to_string(), params.reason.clone());
+
+        let body = json!({
+            "command_source": { "type": "inline", "content": params.prompt },
+            "trigger": { "type": "interval", "seconds": delay },
+            "stop_policy": { "type": "after_first_fire" },
+            "fresh_session": "keep",
+            "variables": variables,
+            "start_immediately": false,
+        });
+
+        let mut request = client.post(&url).json(&body);
+        if let Some(ref token) = self.api_token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(format!("API returned error: {}", error_text));
+        }
+
+        let automation: Automation = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(json!({
+            "automation_id": automation.id,
+            "delay_seconds": delay,
+            "reason": params.reason,
+            "fires_once": true,
+        }))
+    }
+
     async fn handle_call(&self, method: &str, params: Value) -> Result<Value, String> {
         match method {
             "list_automations" => {
@@ -535,6 +628,11 @@ impl AutomationManagerMcp {
                 let params: GetExecutionHistoryParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.get_execution_history(params).await
+            }
+            "schedule_wakeup" => {
+                let params: ScheduleWakeupParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.schedule_wakeup(params).await
             }
             _ => Err(format!("Unknown method: {}", method)),
         }

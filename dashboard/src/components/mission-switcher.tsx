@@ -14,6 +14,7 @@ import { cn } from '@/lib/utils';
 import { searchMissions, type Mission, type RunningMissionInfo } from '@/lib/api';
 import { getMissionShortName } from '@/lib/mission-display';
 import { STATUS_LABELS, getMissionDotColor, getMissionTitle } from '@/lib/mission-status';
+import { AsyncButton } from '@/components/ui/async-button';
 
 interface MissionSwitcherProps {
   open: boolean;
@@ -1203,21 +1204,25 @@ export function MissionSwitcher({
                               : Boolean(onFollowUpMission)
                         )
                         .map((action) => (
-                          <button
+                          <AsyncButton
                             key={`${item.id}-${action.action}`}
-                            onClick={(e) => {
+                            onClick={async (e) => {
                               e.preventDefault();
                               e.stopPropagation();
-                              if (action.action === 'resume') {
-                                void onResumeMission?.(item.id);
-                              } else if (action.action === 'open_failure') {
-                                void onOpenFailingToolCall?.(item.id);
-                              } else {
-                                void onFollowUpMission?.(item.id);
+                              try {
+                                if (action.action === 'resume') {
+                                  await onResumeMission?.(item.id);
+                                } else if (action.action === 'open_failure') {
+                                  await onOpenFailingToolCall?.(item.id);
+                                } else {
+                                  await onFollowUpMission?.(item.id);
+                                }
+                              } finally {
+                                onClose();
                               }
-                              onClose();
                             }}
-                            className="px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-white/[0.08] text-[10px] text-white/40 hover:text-emerald-300 transition-all shrink-0 inline-flex items-center gap-1"
+                            spinnerClassName="h-3 w-3"
+                            className="px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-white/[0.08] text-[10px] text-white/40 hover:text-emerald-300 transition-all shrink-0 inline-flex items-center gap-1 data-[busy=true]:opacity-100"
                             title={action.title}
                           >
                             {action.action === 'resume' ? (
@@ -1228,7 +1233,7 @@ export function MissionSwitcher({
                               <MessageSquarePlus className="h-3 w-3" />
                             )}
                             {action.label}
-                          </button>
+                          </AsyncButton>
                         ))}
                     </a>
                   </div>

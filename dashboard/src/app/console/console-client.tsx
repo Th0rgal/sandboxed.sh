@@ -11,6 +11,7 @@ import { authHeader, getValidJwt } from "@/lib/auth";
 import { formatBytes } from "@/lib/format";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { CopyButton } from "@/components/ui/copy-button";
+import { AsyncButton } from "@/components/ui/async-button";
 import { LazyCodeBlock } from "@/components/lazy-code-block";
 
 const isTerminalDebugEnabled = () => {
@@ -1325,8 +1326,8 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
         <div className="flex-1" />
 
         {/* Action buttons */}
-        <button
-          className="flex h-7 items-center gap-1.5 rounded-md px-2 text-xs text-[var(--foreground-muted)] hover:bg-white/[0.05] hover:text-[var(--foreground)] transition-colors"
+        <AsyncButton
+          className="flex h-7 items-center gap-1.5 rounded-md px-2 text-xs text-[var(--foreground-muted)] hover:bg-white/[0.05] hover:text-[var(--foreground)] transition-colors disabled:cursor-not-allowed"
           onClick={async () => {
             const name = prompt("New folder name");
             if (!name) return;
@@ -1345,7 +1346,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 13h6m-3-3v6m-9 1V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z" />
           </svg>
           <span>Folder</span>
-        </button>
+        </AsyncButton>
 
         <input
           ref={fileInputRef}
@@ -1570,8 +1571,8 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
                     </svg>
                   </button>
                 )}
-                <button
-                  className="flex h-6 items-center gap-1 rounded bg-red-500/15 px-2 text-red-300 hover:bg-red-500/25 transition-colors"
+                <AsyncButton
+                  className="flex h-6 items-center gap-1 rounded bg-red-500/15 px-2 text-red-300 hover:bg-red-500/25 transition-colors disabled:cursor-not-allowed"
                   onClick={async () => {
                     if (!confirm(`Delete ${selected.name}?`)) return;
                     try {
@@ -1587,7 +1588,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
                   <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                   </svg>
-                </button>
+                </AsyncButton>
               </div>
             </div>
           )}

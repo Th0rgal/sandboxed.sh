@@ -28,7 +28,6 @@ import {
   type CreateAutomationInput,
   type TriggerType,
   type StopPolicy,
-  type FreshSession,
   listMissionAutomations,
   createMissionAutomation,
   updateAutomation,
@@ -429,7 +428,17 @@ export function MissionAutomationsDialog({
     if (policy.type === 'when_all_issues_closed_and_prs_merged') {
       return `When all issues closed + PRs merged (${policy.repo})`;
     }
+    if (policy.type === 'after_first_fire') {
+      return 'One-shot (after first fire)';
+    }
     return 'Never';
+  }, []);
+
+  const isWakeupAutomation = useCallback((automation: Automation) => {
+    return (
+      automation.stop_policy?.type === 'after_first_fire' &&
+      automation.command_source?.type === 'inline'
+    );
   }, []);
 
   // -- Data loading --
@@ -1010,7 +1019,7 @@ export function MissionAutomationsDialog({
                     </option>
                   </select>
                   <div className="mt-1 text-[11px] text-white/30">
-                    Auto-disables this automation after repeated failures. Use "Never" for automations that should keep running.
+                    Auto-disables this automation after repeated failures. Use &quot;Never&quot; for automations that should keep running.
                   </div>
                 </div>
 
@@ -1241,11 +1250,15 @@ export function MissionAutomationsDialog({
                               <span className="text-sm font-medium text-white truncate max-w-[300px]">
                                 {label}
                               </span>
-                              {sourceTag && (
+                              {isWakeupAutomation(automation) ? (
+                                <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium bg-indigo-500/15 text-indigo-300">
+                                  Wake-up
+                                </span>
+                              ) : sourceTag ? (
                                 <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium bg-white/[0.06] text-white/50">
                                   {sourceTag}
                                 </span>
-                              )}
+                              ) : null}
                               {automation.command_source?.type === 'library' && !command && (
                                 <span className="flex items-center gap-1 text-[11px] text-amber-300">
                                   <AlertTriangle className="h-3 w-3" />
@@ -1463,8 +1476,9 @@ export function MissionAutomationsDialog({
         open={!!pendingDelete}
         title={`Delete automation "${pendingDelete ? getAutomationLabel(pendingDelete) : ''}"?`}
         description="This will permanently remove the automation and stop scheduled runs."
-        confirmLabel={deleting ? 'Deleting...' : 'Delete'}
+        confirmLabel="Delete"
         variant="danger"
+        busy={deleting}
         onConfirm={handleDelete}
         onCancel={() => {
           if (deleting) return;

@@ -188,7 +188,9 @@ export function NewMissionDialog({
         return codexConfig?.enabled !== false && codexConfig?.cli_available !== false;
       }
       if (b.id === 'gemini') {
-        return geminiConfig?.enabled !== false && geminiConfig?.cli_available !== false;
+        return geminiConfig?.enabled !== false
+          && geminiConfig?.cli_available !== false
+          && geminiConfig?.auth_configured !== false;
       }
       return true;
     }) || [];

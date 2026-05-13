@@ -565,7 +565,7 @@ export function streamControl(
         if (value) {
           bytesRead += value.length;
         }
-        let chunk = decoder.decode(value, { stream: true });
+        const chunk = decoder.decode(value, { stream: true });
         if (buffer.endsWith("\r") && chunk.startsWith("\n")) {
           buffer = buffer.slice(0, -1);
         }
@@ -2493,6 +2493,8 @@ export interface BackendConfig {
   settings: Record<string, unknown>;
   /** Whether the CLI for this backend is available on the system */
   cli_available?: boolean;
+  /** Whether authentication for this backend is configured (omitted when not applicable) */
+  auth_configured?: boolean;
 }
 
 // List all available backends

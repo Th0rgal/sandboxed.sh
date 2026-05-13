@@ -3,6 +3,7 @@
 import { useEffect, useRef } from 'react';
 import { X, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { AsyncButton } from './async-button';
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -11,7 +12,9 @@ interface ConfirmDialogProps {
   confirmLabel?: string;
   cancelLabel?: string;
   variant?: 'danger' | 'warning' | 'default';
-  onConfirm: () => void;
+  /** Externally-controlled busy override (e.g. for non-promise handlers). */
+  busy?: boolean;
+  onConfirm: () => void | Promise<unknown>;
   onCancel: () => void;
 }
 
@@ -22,6 +25,7 @@ export function ConfirmDialog({
   confirmLabel = 'Confirm',
   cancelLabel = 'Cancel',
   variant = 'default',
+  busy,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -30,17 +34,18 @@ export function ConfirmDialog({
   // Handle escape key
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && open) {
+      if (e.key === 'Escape' && open && !busy) {
         onCancel();
       }
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [open, onCancel]);
+  }, [open, onCancel, busy]);
 
   // Handle click outside
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
+      if (busy) return;
       if (dialogRef.current && !dialogRef.current.contains(e.target as Node)) {
         onCancel();
       }
@@ -49,7 +54,7 @@ export function ConfirmDialog({
       document.addEventListener('mousedown', handleClickOutside);
       return () => document.removeEventListener('mousedown', handleClickOutside);
     }
-  }, [open, onCancel]);
+  }, [open, onCancel, busy]);
 
   if (!open) return null;
 
@@ -85,7 +90,8 @@ export function ConfirmDialog({
       >
         <button
           onClick={onCancel}
-          className="absolute right-4 top-4 p-1 rounded-lg text-white/40 hover:text-white/70 hover:bg-white/[0.08] transition-colors"
+          disabled={busy}
+          className="absolute right-4 top-4 p-1 rounded-lg text-white/40 hover:text-white/70 hover:bg-white/[0.08] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
         >
           <X className="h-4 w-4" />
         </button>
@@ -103,16 +109,18 @@ export function ConfirmDialog({
         <div className="mt-6 flex items-center justify-end gap-3">
           <button
             onClick={onCancel}
-            className="px-4 py-2 rounded-lg text-sm font-medium text-white/70 hover:text-white hover:bg-white/[0.08] transition-colors"
+            disabled={busy}
+            className="px-4 py-2 rounded-lg text-sm font-medium text-white/70 hover:text-white hover:bg-white/[0.08] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
             {cancelLabel}
           </button>
-          <button
+          <AsyncButton
             onClick={onConfirm}
+            busy={busy}
             className={cn('px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors', styles.button)}
           >
             {confirmLabel}
-          </button>
+          </AsyncButton>
         </div>
       </div>
     </div>
