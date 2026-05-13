@@ -7961,8 +7961,8 @@ export default function ControlClient() {
   const activeWorkspaceLabel = activeMission?.workspace_name
     || (activeMission?.workspace_id ? workspaceNameById[activeMission.workspace_id] : undefined);
   const activeMissionSelectorLabel = activeMission
-    ? activeMission.short_description?.trim()
-      || activeMission.title?.trim()
+    ? activeMission.title?.trim()
+      || activeMission.short_description?.trim()
       || getMissionShortName(activeMission.id)
     : null;
   const missionStatus = activeMission
