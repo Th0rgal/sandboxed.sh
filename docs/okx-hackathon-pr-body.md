@@ -16,6 +16,10 @@ Why this matters for OKX:
 - Isolation matches the threat model: each autonomous run gets a separate workspace boundary.
 - This is a shipped product, not a hackathon toy: sandboxed.sh already has users, docs, a dashboard, iOS app, Git-backed Library, encrypted secrets, and multi-runtime mission orchestration.
 
+Screenshot:
+
+![OKX security risk report running inside sandboxed.sh Mission Control](https://raw.githubusercontent.com/Th0rgal/sandboxed.sh/hackathon/okx-integration/screenshots/okx-security-report.png)
+
 No new dependencies.
 
 Try it in 60 seconds:
