@@ -2018,9 +2018,7 @@ fn stream_oh_my_opencode_uninstall() -> impl Stream<Item = Result<Event, std::co
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        extract_version_token, is_safe_repo_path, normalize_repo_path, select_repo_path,
-    };
+    use super::{extract_version_token, is_safe_repo_path, normalize_repo_path, select_repo_path};
 
     #[test]
     fn extract_version_token_basic_semver() {
