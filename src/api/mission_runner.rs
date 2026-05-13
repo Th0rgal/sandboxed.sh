@@ -9297,14 +9297,25 @@ async fn ensure_claudecode_cli_available(
     // Some bun versions (e.g. 1.3.x) report success but silently fail to create
     // the bin symlink, so we manually link it as a workaround.
     let install_cmd = if let Some(bun) = bun_command.as_deref() {
+        // Two bun quirks bite us here:
+        // 1. `bun install -g pkg@X.Y.Z` silently keeps any already-installed version
+        //    that's near enough — so the pin is ignored. Pre-rm the global package
+        //    so the version actually updates.
+        // 2. Bun doesn't run npm postinstall scripts, leaving `bin/claude.exe` as a
+        //    stub that prints "claude native binary not installed" and exits 1.
+        //    Run install.cjs ourselves so the platform-specific native binary is
+        //    copied into place.
         format!(
-            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && {} install -g @anthropic-ai/claude-code@{} && {{ test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null || true; }}"#,
-            shell_quote(bun),
-            shell_quote(&desired_version)
+            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && rm -rf /root/.bun/install/global/node_modules/@anthropic-ai/claude-code* && {bun} install -g @anthropic-ai/claude-code@{ver} && PKG_DIR=/root/.bun/install/global/node_modules/@anthropic-ai/claude-code && if [ -f "$PKG_DIR/install.cjs" ]; then (cd "$PKG_DIR" && (command -v node >/dev/null 2>&1 && node install.cjs || {bun} run install.cjs) 2>&1 | tail -20) || true; fi"#,
+            bun = shell_quote(bun),
+            ver = shell_quote(&desired_version)
         )
     } else {
+        // npm install -g normally fails with EEXIST if /usr/local/bin/<bin> is a
+        // regular file (e.g. a binary release left over from a different install
+        // path). --force overwrites it so the per-workspace sync stays idempotent.
         format!(
-            "npm install -g @anthropic-ai/claude-code@{}",
+            "npm install -g --force @anthropic-ai/claude-code@{}",
             shell_quote(&desired_version)
         )
     };
@@ -9340,6 +9351,23 @@ async fn ensure_claudecode_cli_available(
     {
         return Ok(cli_path.to_string());
     }
+    // npm-managed installs (host-side or via the per-workspace component sync
+    // endpoint) land at /usr/local/bin/claude. The pre-install loop above already
+    // checks these, but only with the *previous* on-disk version — after the
+    // install step we may have a freshly-overwritten binary that now matches.
+    for direct_claude_path in ["/usr/local/bin/claude", "/usr/bin/claude"] {
+        if command_available(workspace_exec, cwd, direct_claude_path).await
+            && claude_cli_matches_desired_version(
+                workspace_exec,
+                cwd,
+                direct_claude_path,
+                &desired_version,
+            )
+            .await
+        {
+            return Ok(direct_claude_path.to_string());
+        }
+    }
     for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS
         .iter()
         .copied()
@@ -9368,7 +9396,7 @@ async fn ensure_claudecode_cli_available(
     }
 
     Err(format!(
-        "Claude Code install completed but '{}' is still not available in workspace PATH. Checked: {:?} and {}",
+        "Claude Code install completed but '{}' is still not available in workspace PATH. Checked: /usr/local/bin/claude, /usr/bin/claude, {:?} and {}",
         cli_path, BUN_GLOBAL_CLAUDE_PATHS, BUN_GLOBAL_CLAUDE_CLI_JS,
     ))
 }

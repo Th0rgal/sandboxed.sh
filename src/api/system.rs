@@ -820,11 +820,14 @@ async fn check_claude_code_update(current_version: Option<&str>) -> Option<Strin
     (latest != current && version_is_newer(&latest, &current)).then_some(latest)
 }
 
+/// Pinned Claude Code version. Must match `mission_runner::desired_claudecode_version` so a
+/// per-workspace sync from this module leaves the workspace at the version mission_runner expects;
+/// otherwise mission_runner reinstalls on the next run.
 fn desired_claude_code_version() -> String {
     std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "2.1.139".to_string())
+        .unwrap_or_else(|| "2.1.140".to_string())
 }
 
 /// Check if there's a newer version of Codex available.
