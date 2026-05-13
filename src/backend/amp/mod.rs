@@ -66,6 +66,22 @@ impl Backend for AmpBackend {
         &self.name
     }
 
+    fn cli_names(&self) -> &'static [&'static str] {
+        &["amp"]
+    }
+
+    async fn check_auth_configured(&self, ctx: &crate::backend::AuthContext<'_>) -> Option<bool> {
+        // Amp stores its API key directly in the settings JSON; treat masked or
+        // empty values as not-configured.
+        let has_key = ctx
+            .settings
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty() && !s.starts_with("[REDACTED") && s != "********")
+            .unwrap_or(false);
+        Some(has_key)
+    }
+
     async fn list_agents(&self) -> Result<Vec<AgentInfo>, Error> {
         // Amp has built-in modes rather than agents
         Ok(vec![

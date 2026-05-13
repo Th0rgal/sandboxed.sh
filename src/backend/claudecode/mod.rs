@@ -91,6 +91,23 @@ impl Backend for ClaudeCodeBackend {
         &self.name
     }
 
+    fn cli_names(&self) -> &'static [&'static str] {
+        &["claude"]
+    }
+
+    async fn check_auth_configured(&self, ctx: &crate::backend::AuthContext<'_>) -> Option<bool> {
+        // Claude Code keeps its api_key in the secrets store under the
+        // "claudecode" namespace. A non-expired entry means we have auth.
+        let Some(store) = ctx.secrets else {
+            return Some(false);
+        };
+        let has_key = match store.list_secrets("claudecode").await {
+            Ok(secrets) => secrets.iter().any(|s| s.key == "api_key" && !s.is_expired),
+            Err(_) => false,
+        };
+        Some(has_key)
+    }
+
     async fn list_agents(&self) -> Result<Vec<AgentInfo>, Error> {
         // Claude Code has built-in agents
         Ok(vec![

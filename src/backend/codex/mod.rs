@@ -80,6 +80,10 @@ impl Backend for CodexBackend {
         &self.name
     }
 
+    fn cli_names(&self) -> &'static [&'static str] {
+        &["codex"]
+    }
+
     async fn list_agents(&self) -> Result<Vec<AgentInfo>, Error> {
         // Codex doesn't have separate agent types like Claude Code
         // Return a single general-purpose agent

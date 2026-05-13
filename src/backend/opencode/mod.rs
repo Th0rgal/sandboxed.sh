@@ -95,6 +95,11 @@ impl Backend for OpenCodeBackend {
         &self.name
     }
 
+    fn cli_names(&self) -> &'static [&'static str] {
+        // OpenCode ships under two binary names depending on install path.
+        &["oh-my-opencode", "opencode"]
+    }
+
     async fn list_agents(&self) -> Result<Vec<AgentInfo>, Error> {
         match self.fetch_agents().await {
             Ok(payload) => Ok(Self::parse_agents(payload)),

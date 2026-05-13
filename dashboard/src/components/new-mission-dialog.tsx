@@ -6,8 +6,11 @@ import { createPortal } from 'react-dom';
 import { useRouter } from 'next/navigation';
 import { Plus, X, ExternalLink, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import useSWR from 'swr';
-import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getBackendConfig, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
+import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
+import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
+
+const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'amp', 'codex', 'gemini'] as const;
 
 /** Options returned by the dialog's getCreateOptions() method */
 export interface NewMissionDialogOptions {
@@ -139,27 +142,9 @@ export function NewMissionDialog({
     fallbackData: [{ id: 'opencode', name: 'OpenCode' }, { id: 'claudecode', name: 'Claude Code' }, { id: 'amp', name: 'Amp' }, { id: 'gemini', name: 'Gemini CLI' }],
   });
 
-  // SWR: fetch backend configs to check enabled status
-  const { data: opencodeConfig } = useSWR('backend-opencode-config', () => getBackendConfig('opencode'), {
-    revalidateOnFocus: false,
-    dedupingInterval: 30000,
-  });
-  const { data: claudecodeConfig } = useSWR('backend-claudecode-config', () => getBackendConfig('claudecode'), {
-    revalidateOnFocus: false,
-    dedupingInterval: 30000,
-  });
-  const { data: ampConfig } = useSWR('backend-amp-config', () => getBackendConfig('amp'), {
-    revalidateOnFocus: false,
-    dedupingInterval: 30000,
-  });
-  const { data: codexConfig } = useSWR('backend-codex-config', () => getBackendConfig('codex'), {
-    revalidateOnFocus: false,
-    dedupingInterval: 30000,
-  });
-  const { data: geminiConfig } = useSWR('backend-gemini-config', () => getBackendConfig('gemini'), {
-    revalidateOnFocus: false,
-    dedupingInterval: 30000,
-  });
+  // SWR: fetch backend configs to check enabled / cli / auth status for every
+  // known backend in one request.
+  const backendConfigs = useBackendConfigs(KNOWN_BACKEND_IDS);
 
   const { data: providersResponse } = useSWR(
     'model-providers',
@@ -172,29 +157,10 @@ export function NewMissionDialog({
     { revalidateOnFocus: false, dedupingInterval: 60000 }
   );
 
-  // Filter to only enabled backends with CLI available
+  // Filter to only enabled backends with CLI available and (when reported) auth configured.
   const enabledBackends = useMemo(() => {
-    return backends?.filter((b) => {
-      if (b.id === 'opencode') {
-        return opencodeConfig?.enabled !== false && opencodeConfig?.cli_available !== false;
-      }
-      if (b.id === 'claudecode') {
-        return claudecodeConfig?.enabled !== false && claudecodeConfig?.cli_available !== false;
-      }
-      if (b.id === 'amp') {
-        return ampConfig?.enabled !== false && ampConfig?.cli_available !== false;
-      }
-      if (b.id === 'codex') {
-        return codexConfig?.enabled !== false && codexConfig?.cli_available !== false;
-      }
-      if (b.id === 'gemini') {
-        return geminiConfig?.enabled !== false
-          && geminiConfig?.cli_available !== false
-          && geminiConfig?.auth_configured !== false;
-      }
-      return true;
-    }) || [];
-  }, [backends, opencodeConfig, claudecodeConfig, ampConfig, codexConfig, geminiConfig]);
+    return backends?.filter((b) => isBackendAvailable(backendConfigs[b.id])) || [];
+  }, [backends, backendConfigs]);
 
   // SWR: fetch agents for each enabled backend
   const { data: opencodeAgents, mutate: mutateOpencodeAgents } = useSWR<BackendAgent[]>(
