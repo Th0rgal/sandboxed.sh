@@ -1372,12 +1372,21 @@ pub async fn download_from_url(
     // Validate URL to prevent SSRF attacks
     validate_url_for_ssrf(&req.url).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-    // Download to temp file
+    // Download to temp file. Follow up to 5 redirects, but re-validate each
+    // hop's URL with the same SSRF rules so a public redirect cannot bounce us
+    // to an internal host. Many file hosts (GitHub releases, CDNs) rely on
+    // redirects, so disabling them outright breaks common downloads.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300)) // 5 min timeout
-        // Do not follow redirects automatically. A redirected request to an
-        // internal host would already be an SSRF before post-response validation.
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many redirects");
+            }
+            if let Err(e) = validate_url_for_ssrf(attempt.url().as_str()) {
+                return attempt.error(format!("redirect blocked: {}", e));
+            }
+            attempt.follow()
+        }))
         .build()
         .map_err(|e| {
             (

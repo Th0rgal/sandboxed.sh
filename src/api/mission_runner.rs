@@ -9226,10 +9226,14 @@ async fn ensure_claudecode_cli_available(
 }
 
 fn desired_claudecode_version() -> String {
+    // 2.1.140 ships the bug-fixed native `/goal` slash command (added in
+    // 2.1.139, hardened against `disableAllHooks` / `allowManagedHooksOnly`
+    // in 2.1.140). Bumping the pin so the per-workspace install matches what
+    // `run_claudecode_native_goal` relies on.
     std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "2.1.139".to_string())
+        .unwrap_or_else(|| "2.1.140".to_string())
 }
 
 async fn claude_cli_matches_desired_version(
@@ -10648,24 +10652,30 @@ pub async fn run_opencode_turn(
     // Vanilla `opencode` is the default. oh-my-opencode wraps opencode with extra
     // features (todo enforcement, background tasks, opinionated agent profiles)
     // and is opt-in per workspace/profile via `enable_oh_my_opencode`.
-    // The `sisyphus` agent name is an oh-my-opencode-only identifier; if it is
-    // selected explicitly, fall back to plain opencode (the wrapper is not
-    // available) rather than failing.
     let oh_my_opencode_enabled = workspace
         .config
         .get("enable_oh_my_opencode")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let agent_needs_plain_opencode = agent
-        .map(|a| a.eq_ignore_ascii_case("sisyphus"))
-        .unwrap_or(false);
-    let use_plain_opencode = !oh_my_opencode_enabled || agent_needs_plain_opencode;
+    let use_plain_opencode = !oh_my_opencode_enabled;
+
+    // `sisyphus` only exists inside the oh-my-opencode wrapper. Warn loudly when
+    // it is requested without the wrapper so the failure mode is obvious.
+    if use_plain_opencode
+        && agent
+            .map(|a| a.eq_ignore_ascii_case("sisyphus"))
+            .unwrap_or(false)
+    {
+        tracing::warn!(
+            mission_id = %mission_id,
+            "Agent 'sisyphus' requires oh-my-opencode, but enable_oh_my_opencode is false; mission will likely fail"
+        );
+    }
 
     tracing::info!(
         mission_id = %mission_id,
         use_plain_opencode = use_plain_opencode,
         oh_my_opencode_enabled = oh_my_opencode_enabled,
-        agent_needs_plain_opencode = agent_needs_plain_opencode,
         "OpenCode mode selection"
     );
 
