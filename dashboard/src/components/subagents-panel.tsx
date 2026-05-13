@@ -307,9 +307,14 @@ export function SubagentsPanel({
           <>
             {visible.map(({ entry, status }) => {
               const badge = statusBadge(status);
-              const agentName = extractAgentName(entry.args);
-              const description = extractDescription(entry.args);
+              const agentName = extractAgentName(entry.args, entry.name);
+              const description = extractDescription(entry.args, entry.name);
               const duration = formatDuration(entry.startTime, entry.endTime);
+              const childMissionId = extractChildMissionId(entry.result);
+              const toolLabel = prettyToolName(entry.name);
+              // Show the tool label as a tiny tag only when it differs from
+              // the heading — otherwise it's redundant noise.
+              const showToolTag = toolLabel !== agentName;
               return (
                 // `content-visibility: auto` lets the browser skip layout
                 // and paint for off-screen rows — significant on missions
@@ -333,7 +338,7 @@ export function SubagentsPanel({
                     <div className="flex items-center gap-2">
                       <span className={cn('shrink-0', badge.color)}>{badge.icon}</span>
                       <span className="text-xs font-medium text-white/90 truncate">
-                        {agentName ?? entry.name ?? 'Task'}
+                        {agentName}
                       </span>
                       <span className={cn('ml-auto text-[10px] shrink-0', badge.color)}>
                         {badge.label}
@@ -344,9 +349,29 @@ export function SubagentsPanel({
                         {description}
                       </p>
                     )}
-                    {duration && (
-                      <p className="mt-1 text-[10px] text-white/30 font-mono">{duration}</p>
-                    )}
+                    <div className="mt-1 flex items-center gap-2">
+                      {showToolTag && (
+                        <span className="text-[10px] text-white/30 font-mono">
+                          {toolLabel}
+                        </span>
+                      )}
+                      {duration && (
+                        <span className="text-[10px] text-white/30 font-mono">
+                          {duration}
+                        </span>
+                      )}
+                      {childMissionId && (
+                        <Link
+                          href={`/control?mission=${childMissionId}`}
+                          onClick={(event) => event.stopPropagation()}
+                          className="ml-auto inline-flex items-center gap-1 text-[10px] text-violet-400/80 hover:text-violet-300"
+                          title="Open spawned mission"
+                        >
+                          Open mission
+                          <ExternalLink className="h-3 w-3" />
+                        </Link>
+                      )}
+                    </div>
                   </button>
                 </div>
               );
