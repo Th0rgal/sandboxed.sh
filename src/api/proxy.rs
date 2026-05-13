@@ -42,6 +42,63 @@ const DEFAULT_CLI_PROXY_API_BASE_URL: &str = "http://127.0.0.1:8317";
 
 const TEXT_EVENT_STREAM: &str = "text/event-stream";
 const NO_CACHE: &str = "no-cache";
+const MAX_PROXY_UPSTREAM_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn validate_upstream_content_length(
+    content_length: Option<u64>,
+) -> Result<(), (StatusCode, String)> {
+    if content_length
+        .map(|len| len > MAX_PROXY_UPSTREAM_RESPONSE_BYTES)
+        .unwrap_or(false)
+    {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Upstream response body too large: max {} bytes",
+                MAX_PROXY_UPSTREAM_RESPONSE_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn read_limited_upstream_response(
+    response: reqwest::Response,
+) -> Result<bytes::Bytes, (StatusCode, String)> {
+    validate_upstream_content_length(response.content_length())?;
+
+    let mut stream = response.bytes_stream();
+    let mut chunks = Vec::new();
+    let mut total: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to read upstream response body: {}", e),
+            )
+        })?;
+        total = total.checked_add(chunk.len() as u64).ok_or((
+            StatusCode::BAD_GATEWAY,
+            "Upstream response body too large".to_string(),
+        ))?;
+        if total > MAX_PROXY_UPSTREAM_RESPONSE_BYTES {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Upstream response body too large: max {} bytes",
+                    MAX_PROXY_UPSTREAM_RESPONSE_BYTES
+                ),
+            ));
+        }
+        chunks.push(chunk);
+    }
+
+    let mut body = bytes::BytesMut::with_capacity(total as usize);
+    for chunk in chunks {
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -761,9 +818,9 @@ async fn chat_completions(
             }
 
             let response_headers = upstream_resp.headers().clone();
-            let resp_body = match upstream_resp.bytes().await {
+            let resp_body = match read_limited_upstream_response(upstream_resp).await {
                 Ok(bytes) => bytes,
-                Err(e) => {
+                Err((_, e)) => {
                     let elapsed_ms = request_start.elapsed().as_millis() as u64;
                     tracing::warn!(
                         provider = %entry.provider_id,
@@ -999,9 +1056,9 @@ async fn chat_completions(
             }
 
             let response_headers = upstream_resp.headers().clone();
-            let resp_body = match upstream_resp.bytes().await {
+            let resp_body = match read_limited_upstream_response(upstream_resp).await {
                 Ok(bytes) => bytes,
-                Err(e) => {
+                Err((_, e)) => {
                     let elapsed_ms = request_start.elapsed().as_millis() as u64;
                     tracing::warn!(
                         provider = %entry.provider_id,
@@ -1471,7 +1528,7 @@ async fn chat_completions(
         // Non-streaming: read full body before recording success, so a
         // body-read failure doesn't incorrectly clear cooldown state.
         let response_headers = upstream_resp.headers().clone();
-        match upstream_resp.bytes().await {
+        match read_limited_upstream_response(upstream_resp).await {
             Ok(resp_body) => {
                 // Check for in-body errors (some providers return 200 with
                 // an error payload in the JSON body).
@@ -1577,7 +1634,7 @@ async fn chat_completions(
                     )
                 });
             }
-            Err(e) => {
+            Err((_, e)) => {
                 let elapsed_ms = request_start.elapsed().as_millis() as u64;
                 tracing::warn!(
                     provider = %entry.provider_id,
@@ -4337,6 +4394,15 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn upstream_content_length_rejects_oversized_non_streaming_responses() {
+        assert!(validate_upstream_content_length(None).is_ok());
+        assert!(validate_upstream_content_length(Some(MAX_PROXY_UPSTREAM_RESPONSE_BYTES)).is_ok());
+        let err = validate_upstream_content_length(Some(MAX_PROXY_UPSTREAM_RESPONSE_BYTES + 1))
+            .expect_err("oversized response should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
     }
 
     #[test]

@@ -31,6 +31,17 @@ fn validate_storage_name(kind: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+async fn restrict_private_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .with_context(|| format!("Failed to restrict permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
 const UNLOCK_FAILURE_THRESHOLD: u32 = 5;
 const UNLOCK_BACKOFF_DURATION: Duration = Duration::from_secs(30);
 
@@ -135,6 +146,7 @@ impl SecretsStore {
 
         let content = serde_json::to_string_pretty(&*config)?;
         fs::write(&config_path, content).await?;
+        restrict_private_file(&config_path).await?;
 
         Ok(())
     }
@@ -148,6 +160,7 @@ impl SecretsStore {
         let path = registries_dir.join(format!("{}.json", registry.name));
         let content = serde_json::to_string_pretty(registry)?;
         fs::write(&path, content).await?;
+        restrict_private_file(&path).await?;
 
         Ok(())
     }
@@ -204,6 +217,7 @@ impl SecretsStore {
         // Create a marker file for the key (just to track that it exists)
         let key_marker = keys_dir.join(format!("{}.key", key_id));
         fs::write(&key_marker, format!("# Key: {}\n# Created: {}\n# This file marks that this key exists.\n# The actual passphrase must be provided via SANDBOXED_SECRET_PASSPHRASE (or legacy OPENAGENT_SECRET_PASSPHRASE) env var.\n", key_id, chrono::Utc::now())).await?;
+        restrict_private_file(&key_marker).await?;
 
         // Update config
         {
@@ -519,6 +533,7 @@ impl SecretsStore {
         let export_path = workspace_path.join(".mcp-secrets.json");
         let content = serde_json::to_string_pretty(&exported)?;
         fs::write(&export_path, content).await?;
+        restrict_private_file(&export_path).await?;
 
         Ok(export_path)
     }
@@ -554,6 +569,36 @@ impl SecretsStore {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn persisted_secret_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let store = SecretsStore::new(temp.path()).await.unwrap();
+        store.initialize("default").await.unwrap();
+        store.unlock("correct-passphrase").await.unwrap();
+        store
+            .set_secret("test-registry", "api-key", "sk-12345", None)
+            .await
+            .unwrap();
+        let export_path = store
+            .export_to_workspace(temp.path(), "test-registry", None)
+            .await
+            .unwrap();
+
+        for path in [
+            temp.path().join(".sandboxed-sh/secrets/config.json"),
+            temp.path()
+                .join(".sandboxed-sh/secrets/registries/test-registry.json"),
+            temp.path().join(".sandboxed-sh/secrets/keys/default.key"),
+            export_path,
+        ] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+    }
 
     #[tokio::test]
     async fn test_secrets_store_lifecycle() {

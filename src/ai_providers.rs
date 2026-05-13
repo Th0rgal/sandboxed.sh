@@ -9,6 +9,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+const MAX_AI_PROVIDERS: usize = 256;
+const MAX_AI_PROVIDER_STORE_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Authentication Methods
 // ─────────────────────────────────────────────────────────────────────────────
@@ -407,6 +410,14 @@ impl AIProvider {
     }
 }
 
+fn sanitize_loaded_providers(providers: &mut Vec<AIProvider>) {
+    providers.sort_by_key(|provider| provider.created_at);
+    if providers.len() > MAX_AI_PROVIDERS {
+        let drop_count = providers.len() - MAX_AI_PROVIDERS;
+        providers.drain(0..drop_count);
+    }
+}
+
 /// In-memory store for AI providers.
 #[derive(Debug, Clone)]
 pub struct AIProviderStore {
@@ -439,9 +450,22 @@ impl AIProviderStore {
             return Ok(HashMap::new());
         }
 
+        let metadata = std::fs::metadata(&self.storage_path)?;
+        if metadata.len() > MAX_AI_PROVIDER_STORE_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "AI provider store file is too large ({} bytes, max {})",
+                    metadata.len(),
+                    MAX_AI_PROVIDER_STORE_FILE_BYTES
+                ),
+            ));
+        }
+
         let contents = std::fs::read_to_string(&self.storage_path)?;
-        let providers: Vec<AIProvider> = serde_json::from_str(&contents)
+        let mut providers: Vec<AIProvider> = serde_json::from_str(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        sanitize_loaded_providers(&mut providers);
 
         Ok(providers.into_iter().map(|p| (p.id, p)).collect())
     }
@@ -724,3 +748,37 @@ impl AIProviderStore {
 
 /// Shared store type.
 pub type SharedAIProviderStore = Arc<AIProviderStore>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ai_provider_store_ignores_oversized_store_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ai_providers.json");
+        let file = std::fs::File::create(&path).expect("create store file");
+        file.set_len(MAX_AI_PROVIDER_STORE_FILE_BYTES + 1)
+            .expect("grow store file");
+
+        let store = AIProviderStore::new(path).await;
+        assert!(store.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ai_provider_store_prunes_loaded_records_to_capacity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ai_providers.json");
+        let mut providers = Vec::new();
+        let now = chrono::Utc::now();
+        for idx in 0..(MAX_AI_PROVIDERS + 5) {
+            let mut provider = AIProvider::new(ProviderType::OpenAI, format!("Provider {idx}"));
+            provider.created_at = now + chrono::Duration::seconds(idx as i64);
+            providers.push(provider);
+        }
+        std::fs::write(&path, serde_json::to_string(&providers).expect("json")).expect("write");
+
+        let store = AIProviderStore::new(path).await;
+        assert!(store.list().await.len() <= MAX_AI_PROVIDERS);
+    }
+}

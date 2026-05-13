@@ -294,7 +294,7 @@ impl TelegramBridge {
     /// Register a webhook for a Telegram channel and store routing context.
     pub async fn start_channel(
         self: &Arc<Self>,
-        channel: TelegramChannel,
+        mut channel: TelegramChannel,
         cmd_tx: mpsc::Sender<ControlCommand>,
         events_tx: broadcast::Sender<AgentEvent>,
         mission_store: Arc<dyn MissionStore>,
@@ -303,6 +303,26 @@ impl TelegramBridge {
         self.stop_channel(channel.id).await;
 
         let base_url = format!("https://api.telegram.org/bot{}", channel.bot_token);
+
+        if channel
+            .webhook_secret
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            channel.webhook_secret = Some(Uuid::new_v4().to_string().replace('-', ""));
+            channel.updated_at = now_string();
+            mission_store
+                .update_telegram_channel(channel.clone())
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to persist Telegram webhook secret for channel {}: {}",
+                        channel.id, e
+                    )
+                })?;
+        }
 
         // Resolve bot username
         let bot_username = if let Some(ref u) = channel.bot_username {

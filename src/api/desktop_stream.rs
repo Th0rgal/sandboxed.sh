@@ -25,6 +25,8 @@ use super::routes::AppState;
 const MAX_SCROLL_STEPS_PER_COMMAND: i32 = 20;
 const MAX_INPUT_DELAY_MS: u64 = 1_000;
 const MAX_TYPE_TEXT_CHARS: usize = 10_000;
+const MAX_CLIENT_MESSAGE_BYTES: usize = 128 * 1024;
+const MAX_KEY_CHARS: usize = 128;
 
 /// Query parameters for the desktop stream endpoint
 #[derive(Debug, Deserialize)]
@@ -61,7 +63,7 @@ fn extract_jwt_from_protocols(headers: &HeaderMap) -> Option<String> {
     // Client sends: ["sandboxed", "jwt.<token>"]
     for part in raw.split(',').map(|s| s.trim()) {
         if let Some(rest) = part.strip_prefix("jwt.") {
-            if !rest.is_empty() {
+            if !rest.is_empty() && rest.len() <= auth::MAX_JWT_TOKEN_BYTES {
                 return Some(rest.to_string());
             }
         }
@@ -164,6 +166,30 @@ enum ClickButton {
     Number(u8),
 }
 
+fn parse_client_command(text: &str) -> Option<ClientCommand> {
+    if text.len() > MAX_CLIENT_MESSAGE_BYTES {
+        tracing::warn!(
+            size = text.len(),
+            max = MAX_CLIENT_MESSAGE_BYTES,
+            "Dropping oversized desktop websocket message"
+        );
+        return None;
+    }
+
+    let command = serde_json::from_str::<ClientCommand>(text).ok()?;
+    match &command {
+        ClientCommand::Key { key, .. } if key.chars().count() > MAX_KEY_CHARS => {
+            tracing::warn!(
+                size = key.chars().count(),
+                max = MAX_KEY_CHARS,
+                "Dropping oversized desktop key command"
+            );
+            None
+        }
+        _ => Some(command),
+    }
+}
+
 /// Handle the WebSocket connection for desktop streaming
 async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
     let x11_display = params.display;
@@ -192,7 +218,7 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 Message::Text(t) => {
-                    if let Ok(cmd) = serde_json::from_str::<ClientCommand>(&t) {
+                    if let Some(cmd) = parse_client_command(&t) {
                         match cmd {
                             ClientCommand::Pause
                             | ClientCommand::Resume
@@ -644,5 +670,42 @@ mod tests {
         assert!(!valid_x11_display("localhost:99"));
         assert!(!valid_x11_display(":../../tmp/x"));
         assert!(!valid_x11_display(":999999"));
+    }
+
+    #[test]
+    fn parse_client_command_rejects_oversized_frames() {
+        let oversized = "x".repeat(MAX_CLIENT_MESSAGE_BYTES + 1);
+        assert!(parse_client_command(&oversized).is_none());
+    }
+
+    #[test]
+    fn parse_client_command_rejects_oversized_keys() {
+        let payload = serde_json::json!({
+            "t": "key",
+            "key": "A".repeat(MAX_KEY_CHARS + 1),
+        })
+        .to_string();
+
+        assert!(parse_client_command(&payload).is_none());
+    }
+
+    #[test]
+    fn parse_client_command_allows_valid_control_command() {
+        assert!(matches!(
+            parse_client_command(r#"{"t":"pause"}"#),
+            Some(ClientCommand::Pause)
+        ));
+    }
+
+    #[test]
+    fn websocket_jwt_extractor_rejects_oversized_tokens() {
+        let mut headers = HeaderMap::new();
+        let token = "x".repeat(auth::MAX_JWT_TOKEN_BYTES + 1);
+        headers.insert(
+            "sec-websocket-protocol",
+            format!("sandboxed, jwt.{token}").parse().unwrap(),
+        );
+
+        assert!(extract_jwt_from_protocols(&headers).is_none());
     }
 }

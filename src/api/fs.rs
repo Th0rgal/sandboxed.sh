@@ -11,6 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
@@ -22,6 +23,7 @@ use crate::workspace::WorkspaceType;
 const MAX_CHUNK_UPLOAD_CHUNKS: u32 = 4096;
 const MAX_CHUNK_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_CHUNK_UPLOAD_CHUNK_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_DOWNLOAD_URL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct RuntimeWorkspace {
@@ -94,11 +96,62 @@ fn remap_context_path(path: &str) -> Option<PathBuf> {
 /// Move a file from `src` to `dst`, falling back to copy+delete when a rename
 /// fails (e.g. across filesystem boundaries).
 async fn move_file(src: &Path, dst: &Path) -> Result<(), (StatusCode, String)> {
+    if tokio::fs::symlink_metadata(dst)
+        .await
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Refusing to overwrite symlink: {}", dst.display()),
+        ));
+    }
+
     if tokio::fs::rename(src, dst).await.is_err() {
         tokio::fs::copy(src, dst).await.map_err(internal_error)?;
         let _ = tokio::fs::remove_file(src).await;
     }
     Ok(())
+}
+
+async fn reject_symlink_path(path: &Path, description: &str) -> Result<(), (StatusCode, String)> {
+    if tokio::fs::symlink_metadata(path)
+        .await
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Refusing to use symlink {}: {}",
+                description,
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn create_new_temp_file(
+    path: &Path,
+    description: &str,
+) -> Result<tokio::fs::File, (StatusCode, String)> {
+    reject_symlink_path(path, description).await?;
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+        .map_err(|e| {
+            (
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                format!("Failed to create {}: {}", description, e),
+            )
+        })
 }
 
 fn map_container_path_to_host(path: &Path, state: &RuntimeWorkspace) -> Option<PathBuf> {
@@ -1152,9 +1205,7 @@ pub async fn upload(
         };
         // Stream to temp file first (avoid buffering large uploads in memory).
         let tmp = std::env::temp_dir().join(format!("sandboxed_sh_ul_{}", uuid::Uuid::new_v4()));
-        let mut f = tokio::fs::File::create(&tmp)
-            .await
-            .map_err(internal_error)?;
+        let mut f = create_new_temp_file(&tmp, "upload temp file").await?;
 
         let mut field = field;
         while let Some(chunk) = field
@@ -1241,12 +1292,14 @@ pub async fn upload_chunk(
 
     // Store chunks in temp directory organized by upload_id
     let chunk_dir = std::env::temp_dir().join(format!("sandboxed_sh_chunks_{}", safe_upload_id));
+    reject_symlink_path(&chunk_dir, "chunk directory").await?;
     tokio::fs::create_dir_all(&chunk_dir).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to create chunk dir: {}", e),
         )
     })?;
+    reject_symlink_path(&chunk_dir, "chunk directory").await?;
 
     if let Some(field) = multipart
         .next_field()
@@ -1254,9 +1307,7 @@ pub async fn upload_chunk(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
     {
         let chunk_path = chunk_dir.join(format!("chunk_{:06}", q.chunk_index));
-        let mut f = tokio::fs::File::create(&chunk_path)
-            .await
-            .map_err(internal_error)?;
+        let mut f = create_new_temp_file(&chunk_path, "chunk file").await?;
 
         let mut field = field;
         let mut written: u64 = 0;
@@ -1335,24 +1386,20 @@ pub async fn upload_finalize(
     let chunk_dir = std::env::temp_dir().join(format!("sandboxed_sh_chunks_{}", safe_upload_id));
     let assembled_path =
         std::env::temp_dir().join(format!("sandboxed_sh_assembled_{}", safe_upload_id));
+    reject_symlink_path(&chunk_dir, "chunk directory").await?;
+    reject_symlink_path(&assembled_path, "assembled upload file").await?;
 
     // Inner block so that temp files are cleaned up on both success and error paths.
     // Returns the resolved remote_path on success so the response matches the
     // non-chunked upload handler (which returns the full destination path).
     let result = async {
         // Assemble chunks into single file
-        let mut assembled = tokio::fs::File::create(&assembled_path)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create assembled file: {}", e),
-                )
-            })?;
+        let mut assembled = create_new_temp_file(&assembled_path, "assembled upload file").await?;
 
         let mut assembled_bytes: u64 = 0;
         for i in 0..req.total_chunks {
             let chunk_path = chunk_dir.join(format!("chunk_{:06}", i));
+            reject_symlink_path(&chunk_path, "chunk file").await?;
             let chunk_len = tokio::fs::metadata(&chunk_path)
                 .await
                 .map_err(|e| {
@@ -1457,6 +1504,23 @@ pub struct DownloadUrlRequest {
     pub mission_id: Option<uuid::Uuid>,
 }
 
+fn validate_download_url_content_length(
+    content_length: Option<u64>,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(length) = content_length {
+        if length > MAX_DOWNLOAD_URL_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "Downloaded file too large: limit is {} bytes",
+                    MAX_DOWNLOAD_URL_BYTES
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // Download file from URL to server filesystem
 pub async fn download_from_url(
     State(state): State<Arc<AppState>>,
@@ -1492,6 +1556,7 @@ pub async fn download_from_url(
             format!("URL returned error: {}", response.status()),
         ));
     }
+    validate_download_url_content_length(response.content_length())?;
 
     // Try to get filename from Content-Disposition header or URL
     let raw_file_name = req.file_name.clone().unwrap_or_else(|| {
@@ -1546,18 +1611,33 @@ pub async fn download_from_url(
     };
 
     let tmp = std::env::temp_dir().join(format!("sandboxed_sh_url_{}", uuid::Uuid::new_v4()));
-    let mut f = tokio::fs::File::create(&tmp)
-        .await
-        .map_err(internal_error)?;
+    let mut f = create_new_temp_file(&tmp, "URL download temp file").await?;
 
-    let bytes = response.bytes().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read response: {}", e),
-        )
-    })?;
-
-    f.write_all(&bytes).await.map_err(internal_error)?;
+    let mut downloaded_bytes: u64 = 0;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read response: {}", e),
+            )
+        })?;
+        downloaded_bytes = downloaded_bytes.checked_add(chunk.len() as u64).ok_or((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Downloaded file too large".to_string(),
+        ))?;
+        if downloaded_bytes > MAX_DOWNLOAD_URL_BYTES {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "Downloaded file too large: limit is {} bytes",
+                    MAX_DOWNLOAD_URL_BYTES
+                ),
+            ));
+        }
+        f.write_all(&chunk).await.map_err(internal_error)?;
+    }
     f.flush().await.map_err(internal_error)?;
     drop(f);
 
@@ -1607,10 +1687,13 @@ pub async fn download_from_url(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
+
     use super::{
         api_context_root_for_config, content_disposition_filename, context_mirror_suffix,
         context_upload_suffix_for_dir, is_context_upload_path_for_dir, path_is_under_allowed_roots,
-        sanitize_path_component, validate_chunk_upload_shape, MAX_CHUNK_UPLOAD_CHUNKS,
+        sanitize_path_component, validate_chunk_upload_shape, validate_download_url_content_length,
+        MAX_CHUNK_UPLOAD_CHUNKS, MAX_DOWNLOAD_URL_BYTES,
     };
     use crate::config::Config;
     use std::path::{Path, PathBuf};
@@ -1708,6 +1791,67 @@ mod tests {
         assert!(validate_chunk_upload_shape(None, MAX_CHUNK_UPLOAD_CHUNKS + 1).is_err());
         assert!(validate_chunk_upload_shape(Some(0), 1).is_ok());
         assert!(validate_chunk_upload_shape(Some(15), 16).is_ok());
+    }
+
+    #[test]
+    fn download_url_content_length_rejects_oversized_responses() {
+        assert!(validate_download_url_content_length(None).is_ok());
+        assert!(validate_download_url_content_length(Some(MAX_DOWNLOAD_URL_BYTES)).is_ok());
+
+        let err = validate_download_url_content_length(Some(MAX_DOWNLOAD_URL_BYTES + 1))
+            .expect_err("oversized content length should be rejected");
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn move_file_rejects_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("upload.tmp");
+        let outside = temp.path().join("outside.txt");
+        let dst = temp.path().join("target.txt");
+        tokio::fs::write(&src, b"new").await.unwrap();
+        tokio::fs::write(&outside, b"outside").await.unwrap();
+        symlink(&outside, &dst).unwrap();
+
+        let err = super::move_file(&src, &dst)
+            .await
+            .expect_err("symlink destination should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(tokio::fs::read(&outside).await.unwrap(), b"outside");
+        assert!(tokio::fs::symlink_metadata(&src).await.is_ok());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn reject_symlink_path_rejects_temp_upload_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_dir = temp.path().join("real");
+        let symlink_dir = temp.path().join("chunk-dir");
+        tokio::fs::create_dir_all(&real_dir).await.unwrap();
+        symlink(&real_dir, &symlink_dir).unwrap();
+
+        let err = super::reject_symlink_path(&symlink_dir, "chunk directory")
+            .await
+            .expect_err("symlink temp path should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_new_temp_file_rejects_existing_temp_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("chunk_000000");
+        tokio::fs::write(&path, b"existing").await.unwrap();
+
+        let err = super::create_new_temp_file(&path, "chunk file")
+            .await
+            .expect_err("existing temp file should be rejected");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"existing");
     }
 
     #[test]

@@ -24,6 +24,7 @@ use super::routes::AppState;
 
 const MAX_PROXY_API_KEYS: usize = 128;
 const MAX_PROXY_KEY_NAME_LEN: usize = 128;
+const MAX_PROXY_KEY_STORE_FILE_BYTES: u64 = 1024 * 1024;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -100,6 +101,17 @@ impl ProxyApiKeyStore {
         if !self.storage_path.exists() {
             return Ok(Vec::new());
         }
+        let metadata = std::fs::metadata(&self.storage_path)?;
+        if metadata.len() > MAX_PROXY_KEY_STORE_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "proxy API key store file is too large ({} bytes, max {})",
+                    metadata.len(),
+                    MAX_PROXY_KEY_STORE_FILE_BYTES
+                ),
+            ));
+        }
         let contents = std::fs::read_to_string(&self.storage_path)?;
         let mut keys: Vec<ProxyApiKey> = serde_json::from_str(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -116,6 +128,7 @@ impl ProxyApiKeyStore {
         let tmp_path = self.storage_path.with_extension("tmp");
         std::fs::write(&tmp_path, &contents)?;
         std::fs::rename(&tmp_path, &self.storage_path)?;
+        restrict_private_file(&self.storage_path)?;
         Ok(())
     }
 
@@ -203,6 +216,15 @@ fn hex_sha256(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn restrict_private_file(path: &std::path::Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn validate_key_name(name: &str) -> Result<String, String> {
@@ -356,5 +378,38 @@ mod tests {
         let loaded = store.list().await;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "valid");
+    }
+
+    #[tokio::test]
+    async fn proxy_key_store_ignores_oversized_store_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("proxy_keys.json");
+        let file = std::fs::File::create(&path).expect("create store file");
+        file.set_len(MAX_PROXY_KEY_STORE_FILE_BYTES + 1)
+            .expect("grow store file");
+
+        let store = ProxyApiKeyStore::new(path).await;
+        assert!(store.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn proxy_key_store_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("proxy_keys.json");
+        let store = ProxyApiKeyStore::new(path.clone()).await;
+        store
+            .create("private-key-store".to_string())
+            .await
+            .expect("create key");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

@@ -1076,6 +1076,132 @@ pub struct ExecCommandResponse {
     pub timed_out: bool,
 }
 
+const EXEC_COMMAND_MAX_BYTES: usize = 128 * 1024;
+const EXEC_STDIN_MAX_BYTES: usize = 1024 * 1024;
+const EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const EXEC_ENV_MAX_ENTRIES: usize = 128;
+const EXEC_ENV_VALUE_MAX_BYTES: usize = 16 * 1024;
+
+fn validate_exec_request(req: &ExecCommandRequest) -> Result<(), (StatusCode, String)> {
+    if req.command.trim().is_empty() || req.command.len() > EXEC_COMMAND_MAX_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Command must be non-empty and at most {} bytes",
+                EXEC_COMMAND_MAX_BYTES
+            ),
+        ));
+    }
+    if req
+        .stdin
+        .as_ref()
+        .map(|stdin| stdin.len() > EXEC_STDIN_MAX_BYTES)
+        .unwrap_or(false)
+    {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("stdin is too large: max {} bytes", EXEC_STDIN_MAX_BYTES),
+        ));
+    }
+    if let Some(env) = req.env.as_ref() {
+        if env.len() > EXEC_ENV_MAX_ENTRIES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Too many environment variables: max {}",
+                    EXEC_ENV_MAX_ENTRIES
+                ),
+            ));
+        }
+        for (key, value) in env {
+            if !valid_env_pair(key, value) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid environment variable name or value: {}", key),
+                ));
+            }
+            if value.len() > EXEC_ENV_VALUE_MAX_BYTES {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "Environment variable '{}' is too large: max {} bytes",
+                        key, EXEC_ENV_VALUE_MAX_BYTES
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_exec_cwd(
+    workspace_path: &Path,
+    cwd: Option<&str>,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let workspace_root = workspace_path.canonicalize().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to resolve workspace path: {}", e),
+        )
+    })?;
+    let requested = match cwd {
+        Some(path) if !path.trim().is_empty() => {
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                workspace_path.join(path)
+            }
+        }
+        _ => workspace_path.to_path_buf(),
+    };
+    let canonical = requested.canonicalize().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to resolve command working directory: {}", e),
+        )
+    })?;
+    if !canonical.starts_with(&workspace_root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Command working directory escapes workspace".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
+async fn read_limited_exec_output<R>(mut reader: R) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let remaining = EXEC_OUTPUT_MAX_BYTES.saturating_sub(out.len());
+        if remaining > 0 {
+            let keep = remaining.min(read);
+            out.extend_from_slice(&buf[..keep]);
+        }
+        if read > remaining {
+            truncated = true;
+        }
+    }
+
+    let mut result = String::from_utf8_lossy(&out).to_string();
+    if truncated {
+        result.push_str("\n... [output truncated]");
+    }
+    result
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Debug Types (for template development)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1156,6 +1282,7 @@ async fn exec_workspace_command(
     use tokio::process::Command;
 
     let workspace = require_workspace(&state.workspaces, id).await?;
+    validate_exec_request(&req)?;
 
     // For container workspaces, ensure container is ready
     if workspace.workspace_type == WorkspaceType::Container
@@ -1173,17 +1300,7 @@ async fn exec_workspace_command(
     let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(300).min(600));
 
     // Determine working directory
-    let cwd = match &req.cwd {
-        Some(path) => {
-            let path = Path::new(path);
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                workspace.path.join(path)
-            }
-        }
-        None => workspace.path.clone(),
-    };
+    let cwd = resolve_exec_cwd(&workspace.path, req.cwd.as_deref())?;
 
     let container_root = workspace.path.clone();
     let rel_cwd = if cwd.starts_with(&container_root) {
@@ -1239,32 +1356,29 @@ async fn exec_workspace_command(
         }
     }
 
-    // Take stdout/stderr handles before waiting
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
+    // Read stdout/stderr concurrently while the process runs. Waiting first can
+    // deadlock if either pipe fills before the child exits.
+    let stdout_task = child
+        .stdout
+        .take()
+        .map(|stdout| tokio::spawn(read_limited_exec_output(stdout)));
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(read_limited_exec_output(stderr)));
 
     // Wait with timeout
     let wait_result = tokio::time::timeout(timeout, child.wait()).await;
 
     match wait_result {
         Ok(Ok(status)) => {
-            // Read output after process completes
-            let stdout = if let Some(mut handle) = stdout_handle {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                let _ = handle.read_to_end(&mut buf).await;
-                String::from_utf8_lossy(&buf).to_string()
-            } else {
-                String::new()
+            let stdout = match stdout_task {
+                Some(task) => task.await.unwrap_or_default(),
+                None => String::new(),
             };
-
-            let stderr = if let Some(mut handle) = stderr_handle {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                let _ = handle.read_to_end(&mut buf).await;
-                String::from_utf8_lossy(&buf).to_string()
-            } else {
-                String::new()
+            let stderr = match stderr_task {
+                Some(task) => task.await.unwrap_or_default(),
+                None => String::new(),
             };
 
             let exit_code = status.code().unwrap_or(-1);
@@ -1283,10 +1397,26 @@ async fn exec_workspace_command(
         Err(_) => {
             // Timeout - try to kill the process
             let _ = child.kill().await;
+            let _ = child.wait().await;
+            let stdout = match stdout_task {
+                Some(task) => task.await.unwrap_or_default(),
+                None => String::new(),
+            };
+            let mut stderr = match stderr_task {
+                Some(task) => task.await.unwrap_or_default(),
+                None => String::new(),
+            };
+            if !stderr.is_empty() {
+                stderr.push('\n');
+            }
+            stderr.push_str(&format!(
+                "Command timed out after {} seconds",
+                timeout.as_secs()
+            ));
             Ok(Json(ExecCommandResponse {
                 exit_code: -1,
-                stdout: String::new(),
-                stderr: format!("Command timed out after {} seconds", timeout.as_secs()),
+                stdout,
+                stderr,
                 timed_out: true,
             }))
         }
@@ -1914,5 +2044,44 @@ mod tests {
         assert!(!valid_env_pair("BAD-NAME", "x"));
         assert!(!valid_env_pair("BAD=NAME", "x"));
         assert!(!valid_env_pair("GOOD", "a\0b"));
+    }
+
+    #[test]
+    fn validate_exec_request_rejects_oversized_command_and_env() {
+        let oversized = ExecCommandRequest {
+            command: "x".repeat(EXEC_COMMAND_MAX_BYTES + 1),
+            cwd: None,
+            timeout_secs: None,
+            env: None,
+            stdin: None,
+        };
+        assert!(validate_exec_request(&oversized).is_err());
+
+        let mut env = HashMap::new();
+        env.insert("BAD-NAME".to_string(), "value".to_string());
+        let invalid_env = ExecCommandRequest {
+            command: "echo ok".to_string(),
+            cwd: None,
+            timeout_secs: None,
+            env: Some(env),
+            stdin: None,
+        };
+        assert!(validate_exec_request(&invalid_env).is_err());
+    }
+
+    #[test]
+    fn resolve_exec_cwd_rejects_workspace_escape() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path().join("workspace");
+        let inside = workspace.join("inside");
+        std::fs::create_dir_all(&inside).unwrap();
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        assert_eq!(
+            resolve_exec_cwd(&workspace, Some("inside")).unwrap(),
+            inside.canonicalize().unwrap()
+        );
+        assert!(resolve_exec_cwd(&workspace, Some(outside.to_str().unwrap())).is_err());
     }
 }

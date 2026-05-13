@@ -32,6 +32,7 @@ const PASSWORD_HASH_ITERATIONS: u32 = 100_000;
 const MAX_PASSWORD_HASH_ITERATIONS: u32 = 600_000;
 const LOGIN_FAILURE_THRESHOLD: u32 = 8;
 const LOGIN_BACKOFF_DURATION: StdDuration = StdDuration::from_secs(60);
+pub const MAX_JWT_TOKEN_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Default)]
 struct LoginThrottle {
@@ -252,6 +253,9 @@ pub fn verify_token_for_config(token: &str, config: &Config) -> bool {
     if !config.auth.auth_required(config.dev_mode) {
         return true;
     }
+    if token.len() > MAX_JWT_TOKEN_BYTES {
+        return false;
+    }
     let secret = match config.auth.jwt_secret.as_deref() {
         Some(s) => s,
         None => return false,
@@ -261,7 +265,10 @@ pub fn verify_token_for_config(token: &str, config: &Config) -> bool {
     };
     match config.auth.auth_mode(config.dev_mode) {
         AuthMode::MultiUser => user_for_claims(&claims, &config.auth.users).is_some(),
-        AuthMode::SingleTenant => true,
+        AuthMode::SingleTenant => {
+            let expected = implicit_single_tenant_user(config);
+            claims.sub == expected.id && claims.usr == expected.username
+        }
         AuthMode::Disabled => true,
     }
 }
@@ -408,6 +415,9 @@ pub async fn require_auth(
     if token.is_empty() {
         return (StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response();
     }
+    if token.len() > MAX_JWT_TOKEN_BYTES {
+        return (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response();
+    }
 
     match verify_jwt(token, secret) {
         Ok(claims) => {
@@ -418,10 +428,13 @@ pub async fn require_auth(
                         return (StatusCode::UNAUTHORIZED, "Invalid user").into_response();
                     }
                 },
-                AuthMode::SingleTenant => AuthUser {
-                    id: claims.sub,
-                    username: claims.usr,
-                },
+                AuthMode::SingleTenant => {
+                    let expected = implicit_single_tenant_user(&state.config);
+                    if claims.sub != expected.id || claims.usr != expected.username {
+                        return (StatusCode::UNAUTHORIZED, "Invalid user").into_response();
+                    }
+                    expected
+                }
                 AuthMode::Disabled => implicit_single_tenant_user(&state.config),
             };
             req.extensions_mut().insert(user);
@@ -668,5 +681,46 @@ mod tests {
             implicit_single_tenant_user_from_id(&test_config(false), Some("legacy-prod".into()));
         assert_eq!(user.id, "legacy-prod");
         assert_eq!(user.username, "legacy-prod");
+    }
+
+    #[test]
+    fn single_tenant_token_verification_rejects_wrong_subject() {
+        let mut config = test_config(false);
+        config.auth.dashboard_password = Some("password".to_string());
+        config.auth.jwt_secret = Some("0123456789abcdef0123456789abcdef".to_string());
+
+        let wrong_user = AuthUser {
+            id: "attacker".to_string(),
+            username: "attacker".to_string(),
+        };
+        let (token, _) = issue_jwt(
+            config.auth.jwt_secret.as_deref().unwrap(),
+            config.auth.jwt_ttl_days,
+            &wrong_user,
+        )
+        .expect("issue jwt");
+
+        assert!(!verify_token_for_config(&token, &config));
+    }
+
+    #[test]
+    fn token_verification_rejects_oversized_tokens_before_decoding() {
+        let mut config = test_config(false);
+        config.auth.dashboard_password = Some("password".to_string());
+        config.auth.jwt_secret = Some("0123456789abcdef0123456789abcdef".to_string());
+
+        let oversized = "x".repeat(MAX_JWT_TOKEN_BYTES + 1);
+        assert!(!verify_token_for_config(&oversized, &config));
+    }
+
+    #[test]
+    fn jwt_secret_strength_rejects_short_secrets() {
+        let auth = AuthConfig {
+            dashboard_password: Some("password".to_string()),
+            jwt_secret: Some("short".to_string()),
+            jwt_ttl_days: 30,
+            users: Vec::new(),
+        };
+        assert!(auth.validate_jwt_secret_strength().is_err());
     }
 }

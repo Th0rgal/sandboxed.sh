@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+const SETTINGS_STORE_MAX_FILE_BYTES: u64 = 1024 * 1024;
+
 /// Global cached RTK enabled state, updated when settings change.
 /// This allows synchronous checks from non-async contexts.
 static RTK_ENABLED_CACHED: AtomicBool = AtomicBool::new(false);
@@ -64,6 +66,29 @@ pub struct Settings {
 pub struct SettingsStore {
     settings: RwLock<Settings>,
     storage_path: PathBuf,
+}
+
+fn write_private_json_file(path: &Path, contents: &str) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+    let write_result = (|| {
+        std::fs::write(&tmp_path, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
 }
 
 impl SettingsStore {
@@ -140,6 +165,18 @@ impl SettingsStore {
 
     /// Load settings from a file path.
     fn load_from_path(path: &PathBuf) -> Result<Settings, std::io::Error> {
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() > SETTINGS_STORE_MAX_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "settings file is too large ({} bytes, max {})",
+                    metadata.len(),
+                    SETTINGS_STORE_MAX_FILE_BYTES
+                ),
+            ));
+        }
+
         let contents = std::fs::read_to_string(path)?;
         serde_json::from_str(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -149,15 +186,10 @@ impl SettingsStore {
     async fn save_to_disk(&self) -> Result<(), std::io::Error> {
         let settings = self.settings.read().await;
 
-        // Ensure parent directory exists
-        if let Some(parent) = self.storage_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let contents = serde_json::to_string_pretty(&*settings)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        std::fs::write(&self.storage_path, contents)?;
+        write_private_json_file(&self.storage_path, &contents)?;
         tracing::debug!("Saved settings to {}", self.storage_path.display());
         Ok(())
     }
@@ -345,6 +377,42 @@ impl SettingsStore {
 
 /// Shared settings store wrapped in Arc for concurrent access.
 pub type SharedSettingsStore = Arc<SettingsStore>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_store_rejects_oversized_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            vec![b'x'; SETTINGS_STORE_MAX_FILE_BYTES as usize + 1],
+        )
+        .expect("write oversized settings");
+
+        let err = SettingsStore::load_from_path(&path).expect_err("oversized file should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_private_json_file_restricts_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        write_private_json_file(&path, "{}").expect("write settings");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
 
 /// Get the cached RTK enabled state.
 /// This is a synchronous check that uses a cached value updated when settings change.

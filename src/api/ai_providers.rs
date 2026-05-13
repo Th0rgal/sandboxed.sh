@@ -43,6 +43,7 @@ const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const OPENAI_SCOPE: &str = "openid profile email offline_access";
 const OPENAI_TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const OPENAI_ID_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
+const MAX_OAUTH_CALLBACK_CODE_BYTES: usize = 16 * 1024;
 
 /// Returns the OpenAI OAuth redirect URI.
 /// Checks OPENAI_REDIRECT_URI env var first, then falls back to default.
@@ -69,6 +70,27 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn validate_required_oauth_state_rejects_missing_or_wrong_state() {
+        let expected = "expected-state".to_string();
+        let wrong = "wrong-state".to_string();
+
+        assert!(validate_required_oauth_state(Some(&expected), None).is_err());
+        assert!(validate_required_oauth_state(Some(&expected), Some(&wrong)).is_err());
+        assert!(validate_required_oauth_state(Some(&expected), Some(&expected)).is_ok());
+    }
+
+    #[test]
+    fn validate_oauth_callback_input_rejects_oversized_codes() {
+        let req = OAuthCallbackRequest {
+            method_index: 0,
+            code: "x".repeat(MAX_OAUTH_CALLBACK_CODE_BYTES + 1),
+            use_for_backends: None,
+        };
+
+        assert!(validate_oauth_callback_input(&req).is_err());
     }
 }
 
@@ -6506,6 +6528,30 @@ fn parse_openai_authorization_input(input: &str) -> (Option<String>, Option<Stri
     (Some(value.to_string()), None)
 }
 
+fn validate_oauth_callback_input(req: &OAuthCallbackRequest) -> Result<(), (StatusCode, String)> {
+    if req.code.len() > MAX_OAUTH_CALLBACK_CODE_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "OAuth callback input is too large".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_required_oauth_state(
+    expected: Option<&String>,
+    actual: Option<&String>,
+) -> Result<(), (StatusCode, String)> {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) if expected == actual => Ok(()),
+        (Some(_), _) => Err((
+            StatusCode::BAD_REQUEST,
+            "OAuth state mismatch. Please start the OAuth flow again.".to_string(),
+        )),
+        (None, _) => Ok(()),
+    }
+}
+
 /// POST /api/ai/providers/:id/oauth/authorize - Initiate OAuth authorization.
 async fn oauth_authorize(
     State(state): State<Arc<super::routes::AppState>>,
@@ -6754,6 +6800,8 @@ async fn oauth_callback_inner(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<OAuthCallbackRequest>,
 ) -> Result<Json<ProviderResponse>, (axum::http::StatusCode, String)> {
+    validate_oauth_callback_input(&req)?;
+
     // Resolve provider type from UUID or type ID
     let provider_type = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
         state
@@ -7128,14 +7176,7 @@ async fn oauth_callback_inner(
                 ));
             };
 
-            if let (Some(expected), Some(actual)) = (pending.state.as_ref(), state_opt.as_ref()) {
-                if expected != actual {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        "OAuth state mismatch. Please start the OAuth flow again.".to_string(),
-                    ));
-                }
-            }
+            validate_required_oauth_state(pending.state.as_ref(), state_opt.as_ref())?;
 
             let client = reqwest::Client::new();
             let redirect_uri = openai_redirect_uri();
@@ -7281,15 +7322,7 @@ async fn oauth_callback_inner(
                 ));
             };
 
-            // Validate state if present
-            if let (Some(expected), Some(actual)) = (pending.state.as_ref(), state_opt.as_ref()) {
-                if expected != actual {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        "OAuth state mismatch. Please start the OAuth flow again.".to_string(),
-                    ));
-                }
-            }
+            validate_required_oauth_state(pending.state.as_ref(), state_opt.as_ref())?;
 
             // Exchange code for tokens
             let client = reqwest::Client::new();

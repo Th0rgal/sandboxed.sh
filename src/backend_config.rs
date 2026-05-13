@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+const BACKEND_CONFIG_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_BACKEND_CONFIG_ENTRIES: usize = 128;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfigEntry {
     pub id: String,
@@ -39,6 +42,38 @@ impl BackendConfigEntry {
 pub struct BackendConfigStore {
     configs: Arc<RwLock<HashMap<String, BackendConfigEntry>>>,
     storage_path: PathBuf,
+}
+
+fn sanitize_backend_config_entries(entries: &mut Vec<BackendConfigEntry>) {
+    entries.retain(|entry| !entry.id.trim().is_empty() && entry.id.len() <= 128);
+    entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    entries.dedup_by(|a, b| a.id == b.id);
+    if entries.len() > MAX_BACKEND_CONFIG_ENTRIES {
+        entries.truncate(MAX_BACKEND_CONFIG_ENTRIES);
+    }
+}
+
+fn write_private_json_file(path: &Path, contents: &str) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+    let write_result = (|| {
+        std::fs::write(&tmp_path, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
 }
 
 impl BackendConfigStore {
@@ -88,9 +123,22 @@ impl BackendConfigStore {
     }
 
     fn load_from_disk(path: &Path) -> Result<HashMap<String, BackendConfigEntry>, std::io::Error> {
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() > BACKEND_CONFIG_MAX_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "backend config file is too large ({} bytes, max {})",
+                    metadata.len(),
+                    BACKEND_CONFIG_MAX_FILE_BYTES
+                ),
+            ));
+        }
+
         let contents = std::fs::read_to_string(path)?;
-        let entries: Vec<BackendConfigEntry> = serde_json::from_str(&contents)
+        let mut entries: Vec<BackendConfigEntry> = serde_json::from_str(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        sanitize_backend_config_entries(&mut entries);
         Ok(entries
             .into_iter()
             .map(|entry| (entry.id.clone(), entry))
@@ -108,7 +156,7 @@ impl BackendConfigStore {
 
         let contents = serde_json::to_string_pretty(&entries)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&self.storage_path, contents)?;
+        write_private_json_file(&self.storage_path, &contents)?;
         Ok(())
     }
 
@@ -149,3 +197,58 @@ impl BackendConfigStore {
 }
 
 pub type SharedBackendConfigStore = Arc<BackendConfigStore>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_config_store_rejects_oversized_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("backend_config.json");
+        std::fs::write(
+            &path,
+            vec![b'x'; BACKEND_CONFIG_MAX_FILE_BYTES as usize + 1],
+        )
+        .expect("write oversized config");
+
+        let err =
+            BackendConfigStore::load_from_disk(&path).expect_err("oversized file should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn backend_config_store_prunes_loaded_entries_to_capacity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("backend_config.json");
+        let entries: Vec<_> = (0..(MAX_BACKEND_CONFIG_ENTRIES + 8))
+            .map(|i| BackendConfigEntry {
+                id: format!("backend-{i:03}"),
+                name: format!("Backend {i:03}"),
+                enabled: true,
+                settings: serde_json::json!({"api_key": "secret"}),
+            })
+            .collect();
+        std::fs::write(&path, serde_json::to_string(&entries).unwrap()).expect("write config");
+
+        let loaded = BackendConfigStore::load_from_disk(&path).expect("load config");
+        assert_eq!(loaded.len(), MAX_BACKEND_CONFIG_ENTRIES);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_private_json_file_restricts_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("backend_config.json");
+        write_private_json_file(&path, "[]").expect("write config");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}

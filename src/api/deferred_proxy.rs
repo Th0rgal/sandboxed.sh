@@ -14,6 +14,7 @@ const WORKER_POLL_INTERVAL_SECS: u64 = 2;
 const WORKER_FALLBACK_RETRY_SECS: i64 = 10;
 const MAX_DEFERRED_REQUESTS: usize = 256;
 const MAX_DEFERRED_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DEFERRED_STORE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -65,7 +66,7 @@ pub struct DeferredRequestStore {
 
 impl DeferredRequestStore {
     pub async fn new(path: PathBuf) -> Self {
-        let requests = match tokio::fs::read_to_string(&path).await {
+        let requests = match read_deferred_store_file(&path).await {
             Ok(content) => match serde_json::from_str::<DeferredRequestStoreFile>(&content) {
                 Ok(file) => file,
                 Err(err) => {
@@ -86,6 +87,7 @@ impl DeferredRequestStore {
         for req in requests.requests {
             map.insert(req.id, req);
         }
+        prune_deferred_records(&mut map);
 
         Self {
             path,
@@ -294,6 +296,25 @@ impl DeferredRequestStore {
             }
         }
     }
+}
+
+async fn read_deferred_store_file(path: &PathBuf) -> Result<String, std::io::Error> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.len() > MAX_DEFERRED_STORE_FILE_BYTES => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "deferred request store file is too large ({} bytes, max {})",
+                    metadata.len(),
+                    MAX_DEFERRED_STORE_FILE_BYTES
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(err),
+        Err(err) => return Err(err),
+    }
+    tokio::fs::read_to_string(path).await
 }
 
 fn terminal_status(status: &DeferredRequestStatus) -> bool {
@@ -589,6 +610,46 @@ mod tests {
                 .expect("enqueue");
         }
 
+        assert!(store.inner.read().await.len() <= MAX_DEFERRED_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn deferred_store_ignores_oversized_store_file_on_load() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("deferred_requests.json");
+        let file = std::fs::File::create(&path).expect("create store file");
+        file.set_len(MAX_DEFERRED_STORE_FILE_BYTES + 1)
+            .expect("grow store file");
+
+        let store = DeferredRequestStore::new(path).await;
+        assert_eq!(store.inner.read().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_store_prunes_loaded_records_to_capacity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("deferred_requests.json");
+        let now = Utc::now();
+        let requests: Vec<DeferredRequestRecord> = (0..(MAX_DEFERRED_REQUESTS + 5))
+            .map(|idx| DeferredRequestRecord {
+                id: Uuid::new_v4(),
+                chain_id: "builtin/smart".to_string(),
+                request_payload: serde_json::json!({ "model": "builtin/smart", "messages": [] }),
+                openai_organization: None,
+                status: DeferredRequestStatus::Queued,
+                attempt_count: 0,
+                last_error: None,
+                next_attempt_at: now,
+                created_at: now + chrono::Duration::seconds(idx as i64),
+                updated_at: now,
+                expires_at: now + chrono::Duration::hours(1),
+                response_payload: None,
+            })
+            .collect();
+        let file = DeferredRequestStoreFile { requests };
+        std::fs::write(&path, serde_json::to_string(&file).expect("json")).expect("write store");
+
+        let store = DeferredRequestStore::new(path).await;
         assert!(store.inner.read().await.len() <= MAX_DEFERRED_REQUESTS);
     }
 }

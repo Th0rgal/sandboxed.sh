@@ -28,6 +28,8 @@ use super::auth;
 use super::routes::AppState;
 use crate::workspace::{SharedWorkspaceStore, WorkspaceStatus, WorkspaceType};
 
+const MAX_CLIENT_MESSAGE_BYTES: usize = 4 * 1024;
+
 /// How many historical samples to keep (at 1 sample/sec = 60 seconds of history)
 const HISTORY_SIZE: usize = 60;
 
@@ -468,7 +470,7 @@ fn extract_jwt_from_protocols(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())?;
     for part in raw.split(',').map(|s| s.trim()) {
         if let Some(rest) = part.strip_prefix("jwt.") {
-            if !rest.is_empty() {
+            if !rest.is_empty() && rest.len() <= auth::MAX_JWT_TOKEN_BYTES {
                 return Some(rest.to_string());
             }
         }
@@ -509,6 +511,18 @@ enum ClientCommand {
     Resume,
 }
 
+fn parse_client_command(text: &str) -> Option<ClientCommand> {
+    if text.len() > MAX_CLIENT_MESSAGE_BYTES {
+        tracing::warn!(
+            size = text.len(),
+            max = MAX_CLIENT_MESSAGE_BYTES,
+            "Dropping oversized monitoring websocket message"
+        );
+        return None;
+    }
+    serde_json::from_str::<ClientCommand>(text).ok()
+}
+
 /// Handle the WebSocket connection for system monitoring
 async fn handle_monitoring_stream(socket: WebSocket) {
     tracing::info!("New monitoring stream client connected");
@@ -547,7 +561,7 @@ async fn handle_monitoring_stream(socket: WebSocket) {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 Message::Text(t) => {
-                    if let Ok(cmd) = serde_json::from_str::<ClientCommand>(&t) {
+                    if let Some(cmd) = parse_client_command(&t) {
                         let _ = cmd_tx_clone.send(cmd);
                     }
                 }
@@ -650,4 +664,39 @@ fn systemd_escape(name: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_client_command_rejects_oversized_frames() {
+        let oversized = "x".repeat(MAX_CLIENT_MESSAGE_BYTES + 1);
+        assert!(parse_client_command(&oversized).is_none());
+    }
+
+    #[test]
+    fn parse_client_command_allows_pause_and_resume() {
+        assert!(matches!(
+            parse_client_command(r#"{"t":"pause"}"#),
+            Some(ClientCommand::Pause)
+        ));
+        assert!(matches!(
+            parse_client_command(r#"{"t":"resume"}"#),
+            Some(ClientCommand::Resume)
+        ));
+    }
+
+    #[test]
+    fn websocket_jwt_extractor_rejects_oversized_tokens() {
+        let mut headers = HeaderMap::new();
+        let token = "x".repeat(auth::MAX_JWT_TOKEN_BYTES + 1);
+        headers.insert(
+            "sec-websocket-protocol",
+            format!("sandboxed, jwt.{token}").parse().unwrap(),
+        );
+
+        assert!(extract_jwt_from_protocols(&headers).is_none());
+    }
 }

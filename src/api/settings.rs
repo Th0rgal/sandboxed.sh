@@ -1,11 +1,12 @@
 //! API endpoints for global settings management.
 
 use std::io::{Read as IoRead, Write as IoWrite};
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Multipart, State},
+    extract::{DefaultBodyLimit, Multipart, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post, put},
@@ -26,7 +27,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/library-remote", put(update_library_remote))
         .route("/rtk-enabled", put(update_rtk_enabled))
         .route("/backup", get(download_backup))
-        .route("/restore", post(restore_backup))
+        .route(
+            "/restore",
+            post(restore_backup).layer(DefaultBodyLimit::max(SETTINGS_BACKUP_RESTORE_MAX_BYTES)),
+        )
 }
 
 /// Response for settings endpoints.
@@ -279,12 +283,80 @@ const BACKUP_FILES: &[&str] = &[
 /// Directories included in the backup (relative to .sandboxed-sh/)
 const BACKUP_DIRS: &[&str] = &["secrets"];
 
+const SETTINGS_BACKUP_RESTORE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const SETTINGS_BACKUP_RESTORE_MAX_UNCOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+const SETTINGS_BACKUP_RESTORE_MAX_ENTRIES: usize = 4096;
+
+fn validate_backup_restore_size(size: usize) -> Result<(), (StatusCode, String)> {
+    if size > SETTINGS_BACKUP_RESTORE_MAX_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Backup archive is too large. Maximum allowed size is {} bytes.",
+                SETTINGS_BACKUP_RESTORE_MAX_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn restrict_restored_file_permissions(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
+}
+
+fn read_limited_restore_entry<R: IoRead>(
+    reader: R,
+    name: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let mut limited = reader.take(max_bytes as u64 + 1);
+    let mut contents = Vec::new();
+    limited
+        .read_to_end(&mut contents)
+        .map_err(|e| format!("Failed to read {}: {}", name, e))?;
+
+    if contents.len() > max_bytes {
+        return Err(format!(
+            "Skipped {}: restored content exceeds the remaining {} byte limit.",
+            name, max_bytes
+        ));
+    }
+
+    Ok(contents)
+}
+
+fn validate_restore_target_path(target_path: &Path, allowed_root: &Path) -> Result<(), String> {
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| format!("Restore target has no parent: {}", target_path.display()))?;
+    let canonical_root = allowed_root
+        .canonicalize()
+        .map_err(|e| format!("Failed to validate restore root: {}", e))?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Failed to validate restore directory: {}", e))?;
+
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(format!(
+            "Restore target escapes allowed directory: {}",
+            target_path.display()
+        ));
+    }
+
+    if let Ok(metadata) = std::fs::symlink_metadata(target_path) {
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Refusing to overwrite symlink during restore: {}",
+                target_path.display()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Find Claude credentials file from various possible locations.
@@ -479,6 +551,7 @@ async fn restore_backup(
         StatusCode::BAD_REQUEST,
         "No backup file provided. Expected field 'backup' or 'file'.".to_string(),
     ))?;
+    validate_backup_restore_size(archive_data.len())?;
 
     // Open the zip archive
     let cursor = std::io::Cursor::new(archive_data);
@@ -488,9 +561,19 @@ async fn restore_backup(
             format!("Invalid zip archive: {}", e),
         )
     })?;
+    if archive.len() > SETTINGS_BACKUP_RESTORE_MAX_ENTRIES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Backup archive contains too many entries. Maximum allowed is {}.",
+                SETTINGS_BACKUP_RESTORE_MAX_ENTRIES
+            ),
+        ));
+    }
 
     let mut restored_files = Vec::new();
     let mut errors = Vec::new();
+    let mut restored_uncompressed_bytes = 0usize;
 
     // Determine Claude credentials restore path
     // Prefer /var/lib/opencode/.claude if it exists (for isolated OpenCode home), else use /root/.claude
@@ -502,7 +585,7 @@ async fn restore_backup(
 
     // Extract files
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| {
+        let file = archive.by_index(i).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to read archive entry: {}", e),
@@ -516,7 +599,7 @@ async fn restore_backup(
         let name = enclosed_name.to_string_lossy().to_string();
 
         // Determine target path based on archive name
-        let (target_path, display_name) =
+        let (target_path, display_name, restore_root) =
             if let Ok(relative_path) = enclosed_name.strip_prefix(".sandboxed-sh") {
                 // Standard .sandboxed-sh files
                 if relative_path.as_os_str().is_empty() {
@@ -525,10 +608,15 @@ async fn restore_backup(
                 (
                     sandboxed_dir.join(relative_path),
                     relative_path.to_string_lossy().to_string(),
+                    sandboxed_dir.as_path(),
                 )
             } else if enclosed_name == std::path::Path::new(".claude/.credentials.json") {
                 // Claude credentials file - restore to the appropriate .claude directory
-                (claude_creds_dir.join(".credentials.json"), name.clone())
+                (
+                    claude_creds_dir.join(".credentials.json"),
+                    name.clone(),
+                    claude_creds_dir.as_path(),
+                )
             } else {
                 // Skip unknown files
                 continue;
@@ -541,18 +629,34 @@ async fn restore_backup(
                 continue;
             }
         }
+        if let Err(e) = validate_restore_target_path(&target_path, restore_root) {
+            errors.push(e);
+            continue;
+        }
 
         // Skip directories (they're created automatically)
         if file.is_dir() {
             continue;
         }
 
-        // Read and write the file
-        let mut contents = Vec::new();
-        if let Err(e) = file.read_to_end(&mut contents) {
-            errors.push(format!("Failed to read {}: {}", name, e));
+        let remaining_restore_bytes = SETTINGS_BACKUP_RESTORE_MAX_UNCOMPRESSED_BYTES
+            .saturating_sub(restored_uncompressed_bytes);
+        if remaining_restore_bytes == 0 {
+            errors.push(format!(
+                "Skipped {}: restored content exceeds the {} byte limit.",
+                name, SETTINGS_BACKUP_RESTORE_MAX_UNCOMPRESSED_BYTES
+            ));
             continue;
         }
+
+        let contents = match read_limited_restore_entry(file, &name, remaining_restore_bytes) {
+            Ok(contents) => contents,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+        restored_uncompressed_bytes = restored_uncompressed_bytes.saturating_add(contents.len());
 
         match std::fs::write(&target_path, &contents) {
             Ok(()) => {
@@ -639,5 +743,61 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn backup_restore_upload_size_limit_rejects_oversized_archives() {
+        assert!(validate_backup_restore_size(SETTINGS_BACKUP_RESTORE_MAX_BYTES).is_ok());
+
+        let err = validate_backup_restore_size(SETTINGS_BACKUP_RESTORE_MAX_BYTES + 1)
+            .expect_err("oversized archive should be rejected");
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn restore_entry_reader_stops_after_uncompressed_limit() {
+        let err = read_limited_restore_entry(&b"abcd"[..], "settings.json", 3)
+            .expect_err("entry above uncompressed limit should be rejected");
+        assert!(err.contains("settings.json"));
+
+        let contents =
+            read_limited_restore_entry(&b"abc"[..], "settings.json", 3).expect("within limit");
+        assert_eq!(contents, b"abc");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_target_validation_rejects_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join(".sandboxed-sh");
+        std::fs::create_dir_all(&root).expect("create root");
+        let outside = temp.path().join("outside.json");
+        std::fs::write(&outside, b"outside").expect("write outside");
+        let target = root.join("settings.json");
+        symlink(&outside, &target).expect("symlink");
+
+        let err = validate_restore_target_path(&target, &root)
+            .expect_err("symlink restore target should be rejected");
+        assert!(err.contains("Refusing to overwrite symlink"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_target_validation_rejects_parent_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join(".sandboxed-sh");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        symlink(&outside, root.join("secrets")).expect("symlink");
+        let target = root.join("secrets/config.json");
+
+        let err = validate_restore_target_path(&target, &root)
+            .expect_err("parent symlink escape should be rejected");
+        assert!(err.contains("escapes allowed directory"));
     }
 }

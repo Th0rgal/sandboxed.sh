@@ -36,6 +36,9 @@ const SESSION_POOL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often to run the cleanup task.
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_CLIENT_MESSAGE_BYTES: usize = 128 * 1024;
+const MAX_PTY_INPUT_BYTES: usize = 64 * 1024;
+const MAX_PTY_DIMENSION: u16 = 1_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t")]
@@ -44,6 +47,41 @@ enum ClientMsg {
     Input { d: String },
     #[serde(rename = "r")]
     Resize { c: u16, r: u16 },
+}
+
+fn parse_client_msg(text: &str) -> Option<ClientMsg> {
+    if text.len() > MAX_CLIENT_MESSAGE_BYTES {
+        tracing::warn!(
+            size = text.len(),
+            max = MAX_CLIENT_MESSAGE_BYTES,
+            "Dropping oversized console websocket message"
+        );
+        return None;
+    }
+
+    let parsed = serde_json::from_str::<ClientMsg>(text).ok()?;
+    match &parsed {
+        ClientMsg::Input { d } if d.len() > MAX_PTY_INPUT_BYTES => {
+            tracing::warn!(
+                size = d.len(),
+                max = MAX_PTY_INPUT_BYTES,
+                "Dropping oversized console PTY input"
+            );
+            None
+        }
+        ClientMsg::Resize { c, r }
+            if *c == 0 || *r == 0 || *c > MAX_PTY_DIMENSION || *r > MAX_PTY_DIMENSION =>
+        {
+            tracing::warn!(
+                cols = *c,
+                rows = *r,
+                max = MAX_PTY_DIMENSION,
+                "Dropping invalid console PTY resize"
+            );
+            None
+        }
+        _ => Some(parsed),
+    }
 }
 
 /// A pooled console session that can be reused across WebSocket reconnections.
@@ -133,7 +171,7 @@ fn extract_jwt_from_protocols(headers: &HeaderMap) -> Option<String> {
     // Client sends: ["sandboxed", "jwt.<token>"]
     for part in raw.split(',').map(|s| s.trim()) {
         if let Some(rest) = part.strip_prefix("jwt.") {
-            if !rest.is_empty() {
+            if !rest.is_empty() && rest.len() <= auth::MAX_JWT_TOKEN_BYTES {
                 return Some(rest.to_string());
             }
         }
@@ -241,7 +279,7 @@ async fn handle_existing_session(
     while let Some(Ok(msg)) = ws_receiver.next().await {
         match msg {
             Message::Text(t) => {
-                if let Ok(parsed) = serde_json::from_str::<ClientMsg>(&t) {
+                if let Some(parsed) = parse_client_msg(&t) {
                     let _ = to_pty_tx.send(parsed);
                 }
             }
@@ -461,7 +499,7 @@ async fn handle_new_session(mut socket: WebSocket, state: Arc<AppState>, session
     while let Some(Ok(msg)) = ws_receiver.next().await {
         match msg {
             Message::Text(t) => {
-                if let Ok(parsed) = serde_json::from_str::<ClientMsg>(&t) {
+                if let Some(parsed) = parse_client_msg(&t) {
                     let _ = to_pty_tx.send(parsed);
                 }
             }
@@ -492,6 +530,66 @@ async fn handle_new_session(mut socket: WebSocket, state: Arc<AppState>, session
     // Writer and reader tasks will continue running in the background.
     std::mem::drop(writer_task);
     std::mem::drop(reader_task);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_client_msg_rejects_oversized_frames() {
+        let oversized = "x".repeat(MAX_CLIENT_MESSAGE_BYTES + 1);
+        assert!(parse_client_msg(&oversized).is_none());
+    }
+
+    #[test]
+    fn parse_client_msg_rejects_oversized_input() {
+        let payload = serde_json::json!({
+            "t": "i",
+            "d": "a".repeat(MAX_PTY_INPUT_BYTES + 1),
+        })
+        .to_string();
+
+        assert!(parse_client_msg(&payload).is_none());
+    }
+
+    #[test]
+    fn parse_client_msg_rejects_invalid_resize() {
+        let zero = r#"{"t":"r","c":0,"r":24}"#;
+        let too_large = serde_json::json!({
+            "t": "r",
+            "c": MAX_PTY_DIMENSION + 1,
+            "r": 24,
+        })
+        .to_string();
+
+        assert!(parse_client_msg(zero).is_none());
+        assert!(parse_client_msg(&too_large).is_none());
+    }
+
+    #[test]
+    fn parse_client_msg_allows_valid_input_and_resize() {
+        assert!(matches!(
+            parse_client_msg(r#"{"t":"i","d":"echo ok\n"}"#),
+            Some(ClientMsg::Input { .. })
+        ));
+        assert!(matches!(
+            parse_client_msg(r#"{"t":"r","c":120,"r":40}"#),
+            Some(ClientMsg::Resize { c: 120, r: 40 })
+        ));
+    }
+
+    #[test]
+    fn websocket_jwt_extractor_rejects_oversized_tokens() {
+        let mut headers = HeaderMap::new();
+        let token = "x".repeat(auth::MAX_JWT_TOKEN_BYTES + 1);
+        headers.insert(
+            "sec-websocket-protocol",
+            format!("sandboxed, jwt.{token}").parse().unwrap(),
+        );
+
+        assert!(extract_jwt_from_protocols(&headers).is_none());
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -988,7 +1086,7 @@ async fn handle_new_workspace_shell(
     while let Some(Ok(msg)) = ws_receiver.next().await {
         match msg {
             Message::Text(t) => {
-                if let Ok(parsed) = serde_json::from_str::<ClientMsg>(&t) {
+                if let Some(parsed) = parse_client_msg(&t) {
                     let _ = to_pty_tx.send(parsed);
                 }
             }

@@ -11,13 +11,14 @@
 //! - Migration
 
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -38,6 +39,9 @@ pub type SharedLibrary = Arc<RwLock<Option<Arc<LibraryStore>>>>;
 const LIBRARY_REMOTE_HEADER: &str = "x-sandboxed-library-remote";
 const GIT_AUTHOR_NAME_HEADER: &str = "x-sandboxed-git-author-name";
 const GIT_AUTHOR_EMAIL_HEADER: &str = "x-sandboxed-git-author-email";
+const SKILL_IMPORT_MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
+const SKILL_IMPORT_MAX_UNCOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
+const SKILL_IMPORT_MAX_ENTRIES: usize = 2048;
 
 fn extract_library_remote(headers: &HeaderMap) -> Option<String> {
     headers
@@ -170,7 +174,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/mcps", put(save_mcps))
         // Skills
         .route("/skill", get(list_skills))
-        .route("/skill/import", post(import_skill))
+        .route(
+            "/skill/import",
+            post(import_skill).layer(DefaultBodyLimit::max(SKILL_IMPORT_MAX_UPLOAD_BYTES)),
+        )
         .route("/skill/:name", get(get_skill))
         .route("/skill/:name", put(save_skill))
         .route("/skill/:name", delete(delete_skill))
@@ -179,7 +186,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/skill/:name/files/*path", delete(delete_skill_reference))
         // Legacy skills routes (dashboard still calls /skills)
         .route("/skills", get(list_skills))
-        .route("/skills/import", post(import_skill))
+        .route(
+            "/skills/import",
+            post(import_skill).layer(DefaultBodyLimit::max(SKILL_IMPORT_MAX_UPLOAD_BYTES)),
+        )
         .route("/skills/:name", get(get_skill))
         .route("/skills/:name", put(save_skill))
         .route("/skills/:name", delete(delete_skill))
@@ -743,6 +753,7 @@ async fn import_skill(
 
     let (filename, data) =
         file_data.ok_or_else(|| (StatusCode::BAD_REQUEST, "No file uploaded".to_string()))?;
+    validate_skill_import_upload_size(data.len())?;
 
     // Create skill directory
     tokio::fs::create_dir_all(&skill_dir).await.map_err(|e| {
@@ -805,17 +816,26 @@ async fn import_skill(
 
 /// Extract a ZIP file into the skill directory.
 async fn import_skill_from_zip(skill_dir: &std::path::Path, data: &[u8]) -> Result<(), String> {
-    use std::io::{Cursor, Read};
+    use std::io::Cursor;
+
+    validate_skill_import_upload_size(data.len()).map_err(|(_, message)| message)?;
 
     let cursor = Cursor::new(data);
     let mut archive =
         zip::ZipArchive::new(cursor).map_err(|e| format!("Invalid ZIP file: {}", e))?;
+    if archive.len() > SKILL_IMPORT_MAX_ENTRIES {
+        return Err(format!(
+            "ZIP archive contains too many entries. Maximum allowed is {}.",
+            SKILL_IMPORT_MAX_ENTRIES
+        ));
+    }
 
     // Find the common prefix (for archives with a single root folder)
     let prefix = find_zip_prefix(&mut archive);
+    let mut extracted_uncompressed_bytes = 0usize;
 
     for i in 0..archive.len() {
-        let mut file = archive
+        let file = archive
             .by_index(i)
             .map_err(|e| format!("Failed to read ZIP entry: {}", e))?;
 
@@ -859,13 +879,86 @@ async fn import_skill_from_zip(skill_dir: &std::path::Path, data: &[u8]) -> Resu
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create directory: {}", e))?;
         }
+        validate_skill_import_target_path(&target_path, skill_dir)?;
 
         // Extract file
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)
-            .map_err(|e| format!("Failed to read file from ZIP: {}", e))?;
+        let remaining_bytes =
+            SKILL_IMPORT_MAX_UNCOMPRESSED_BYTES.saturating_sub(extracted_uncompressed_bytes);
+        if remaining_bytes == 0 {
+            return Err(format!(
+                "ZIP archive expands beyond the {} byte limit.",
+                SKILL_IMPORT_MAX_UNCOMPRESSED_BYTES
+            ));
+        }
+        let contents = read_limited_skill_import_entry(file, &name, remaining_bytes)?;
+        extracted_uncompressed_bytes = extracted_uncompressed_bytes.saturating_add(contents.len());
         std::fs::write(&target_path, contents)
             .map_err(|e| format!("Failed to write file: {}", e))?;
+    }
+
+    Ok(())
+}
+
+fn validate_skill_import_upload_size(size: usize) -> Result<(), (StatusCode, String)> {
+    if size > SKILL_IMPORT_MAX_UPLOAD_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Skill import upload is too large. Maximum allowed size is {} bytes.",
+                SKILL_IMPORT_MAX_UPLOAD_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn read_limited_skill_import_entry<R: std::io::Read>(
+    reader: R,
+    name: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let mut limited = reader.take(max_bytes as u64 + 1);
+    let mut contents = Vec::new();
+    limited
+        .read_to_end(&mut contents)
+        .map_err(|e| format!("Failed to read {} from ZIP: {}", name, e))?;
+    if contents.len() > max_bytes {
+        return Err(format!(
+            "ZIP entry {} exceeds the remaining {} byte extraction limit.",
+            name, max_bytes
+        ));
+    }
+    Ok(contents)
+}
+
+fn validate_skill_import_target_path(
+    target_path: &std::path::Path,
+    skill_dir: &std::path::Path,
+) -> Result<(), String> {
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| format!("Import target has no parent: {}", target_path.display()))?;
+    let canonical_skill_dir = skill_dir
+        .canonicalize()
+        .map_err(|e| format!("Failed to validate skill directory: {}", e))?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Failed to validate import directory: {}", e))?;
+
+    if !canonical_parent.starts_with(&canonical_skill_dir) {
+        return Err(format!(
+            "Import target escapes skill directory: {}",
+            target_path.display()
+        ));
+    }
+
+    if let Ok(metadata) = std::fs::symlink_metadata(target_path) {
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Refusing to overwrite symlink during skill import: {}",
+                target_path.display()
+            ));
+        }
     }
 
     Ok(())
@@ -2519,5 +2612,61 @@ mod tests {
         assert!(skill_dir.join("SKILL.md").exists());
         assert!(!dir.path().join("outside.md").exists());
         assert!(!dir.path().join("outside2.md").exists());
+    }
+
+    #[test]
+    fn test_skill_import_upload_size_limit_rejects_oversized_uploads() {
+        assert!(validate_skill_import_upload_size(SKILL_IMPORT_MAX_UPLOAD_BYTES).is_ok());
+
+        let err = validate_skill_import_upload_size(SKILL_IMPORT_MAX_UPLOAD_BYTES + 1)
+            .expect_err("oversized skill import should be rejected");
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn test_skill_import_entry_reader_stops_after_uncompressed_limit() {
+        let err = read_limited_skill_import_entry(&b"abcd"[..], "SKILL.md", 3)
+            .expect_err("entry above uncompressed limit should be rejected");
+        assert!(err.contains("SKILL.md"));
+
+        let contents =
+            read_limited_skill_import_entry(&b"abc"[..], "SKILL.md", 3).expect("within limit");
+        assert_eq!(contents, b"abc");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_skill_import_target_validation_rejects_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("test-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, b"outside").unwrap();
+        let target = skill_dir.join("SKILL.md");
+        symlink(&outside, &target).unwrap();
+
+        let err = validate_skill_import_target_path(&target, &skill_dir)
+            .expect_err("symlink target should be rejected");
+        assert!(err.contains("Refusing to overwrite symlink"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_skill_import_target_validation_rejects_parent_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("test-skill");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, skill_dir.join("refs")).unwrap();
+        let target = skill_dir.join("refs/example.md");
+
+        let err = validate_skill_import_target_path(&target, &skill_dir)
+            .expect_err("parent symlink escape should be rejected");
+        assert!(err.contains("escapes skill directory"));
     }
 }

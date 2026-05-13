@@ -26,6 +26,7 @@ use axum::{
 use futures::stream::Stream;
 use serde::Deserializer;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -2080,6 +2081,122 @@ async fn require_automation(
         ))
 }
 
+const AUTOMATION_INLINE_COMMAND_MAX_BYTES: usize = 256 * 1024;
+const AUTOMATION_RESOLVED_COMMAND_MAX_BYTES: usize = 512 * 1024;
+const AUTOMATION_LOCAL_COMMAND_MAX_BYTES: u64 = 512 * 1024;
+const AUTOMATION_VARIABLES_MAX_COUNT: usize = 128;
+const AUTOMATION_VARIABLE_KEY_MAX_BYTES: usize = 128;
+const AUTOMATION_VARIABLE_VALUE_MAX_BYTES: usize = 16 * 1024;
+const AUTOMATION_WEBHOOK_ID_MAX_BYTES: usize = 128;
+
+fn validate_automation_variables(
+    variables: &HashMap<String, String>,
+    description: &str,
+) -> Result<(), (StatusCode, String)> {
+    if variables.len() > AUTOMATION_VARIABLES_MAX_COUNT {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} has too many entries: max {}",
+                description, AUTOMATION_VARIABLES_MAX_COUNT
+            ),
+        ));
+    }
+
+    for (key, value) in variables {
+        if key.trim().is_empty() || key.len() > AUTOMATION_VARIABLE_KEY_MAX_BYTES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{} contains an invalid key: keys must be 1-{} bytes",
+                    description, AUTOMATION_VARIABLE_KEY_MAX_BYTES
+                ),
+            ));
+        }
+        if value.len() > AUTOMATION_VARIABLE_VALUE_MAX_BYTES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{} value for '{}' is too large: max {} bytes",
+                    description, key, AUTOMATION_VARIABLE_VALUE_MAX_BYTES
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_automation_command_content(content: &str) -> Result<(), (StatusCode, String)> {
+    if content.len() > AUTOMATION_INLINE_COMMAND_MAX_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Inline automation command is too large: max {} bytes",
+                AUTOMATION_INLINE_COMMAND_MAX_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resolved_automation_command(content: &str) -> Result<(), (StatusCode, String)> {
+    if content.len() > AUTOMATION_RESOLVED_COMMAND_MAX_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Resolved automation command is too large: max {} bytes",
+                AUTOMATION_RESOLVED_COMMAND_MAX_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_webhook_config(
+    config: &mission_store::WebhookConfig,
+) -> Result<(), (StatusCode, String)> {
+    if !config.webhook_id.is_empty() {
+        let valid_id = config.webhook_id.len() <= AUTOMATION_WEBHOOK_ID_MAX_BYTES
+            && config
+                .webhook_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !valid_id {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Webhook ID may only contain ASCII letters, numbers, '-' and '_'".to_string(),
+            ));
+        }
+    }
+
+    if config
+        .secret
+        .as_deref()
+        .map(|secret| secret.len() > AUTOMATION_VARIABLE_VALUE_MAX_BYTES)
+        .unwrap_or(false)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Webhook secret is too large: max {} bytes",
+                AUTOMATION_VARIABLE_VALUE_MAX_BYTES
+            ),
+        ));
+    }
+
+    validate_automation_variables(&config.variable_mappings, "webhook variable mappings")
+}
+
+fn validate_automation_trigger(
+    trigger: &mission_store::TriggerType,
+) -> Result<(), (StatusCode, String)> {
+    if let mission_store::TriggerType::Webhook { config } = trigger {
+        validate_webhook_config(config)?;
+    }
+    Ok(())
+}
+
 /// Validate that a command exists in the library.
 async fn validate_library_command(
     state: &AppState,
@@ -2162,6 +2279,35 @@ fn resolve_local_automation_path(
     Ok(canonical)
 }
 
+async fn read_local_automation_command_file(
+    file_path: &std::path::Path,
+) -> Result<String, (StatusCode, String)> {
+    let metadata = tokio::fs::metadata(file_path).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to inspect local automation command file: {e}"),
+        )
+    })?;
+    if metadata.len() > AUTOMATION_LOCAL_COMMAND_MAX_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Local automation command file is too large: max {} bytes",
+                AUTOMATION_LOCAL_COMMAND_MAX_BYTES
+            ),
+        ));
+    }
+
+    let content = tokio::fs::read_to_string(file_path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read file '{}': {}", file_path.display(), e),
+        )
+    })?;
+    validate_resolved_automation_command(&content)?;
+    Ok(content)
+}
+
 async fn validate_automation_command_source(
     state: &AppState,
     _control: &ControlState,
@@ -2176,7 +2322,9 @@ async fn validate_automation_command_source(
             validate_local_automation_path(path)?;
             Ok(())
         }
-        mission_store::CommandSource::Inline { .. } => Ok(()),
+        mission_store::CommandSource::Inline { content } => {
+            validate_automation_command_content(content)
+        }
     }
 }
 
@@ -5967,7 +6115,21 @@ async fn automation_scheduler_loop(
                 CommandSource::Library { name } => {
                     if let Some(lib) = library.read().await.as_ref() {
                         match lib.get_command(name).await {
-                            Ok(command) => automation_library_command_body(&command.content),
+                            Ok(command) => {
+                                let content = automation_library_command_body(&command.content);
+                                if let Err((_, error)) =
+                                    validate_resolved_automation_command(&content)
+                                {
+                                    tracing::warn!(
+                                        "Library command '{}' for automation {} is too large: {}",
+                                        name,
+                                        automation.id,
+                                        error
+                                    );
+                                    continue;
+                                }
+                                content
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     "Failed to fetch command '{}' for automation {}: {}",
@@ -6006,9 +6168,9 @@ async fn automation_scheduler_loop(
                         continue;
                     };
 
-                    match tokio::fs::read_to_string(&file_path).await {
+                    match read_local_automation_command_file(&file_path).await {
                         Ok(content) => content,
-                        Err(e) => {
+                        Err((_, e)) => {
                             tracing::warn!(
                                 "Failed to read file '{}' for automation {}: {}",
                                 file_path.display(),
@@ -6034,6 +6196,14 @@ async fn automation_scheduler_loop(
 
             // Apply variable substitution
             let substituted_content = substitute_variables(&command_content, &context);
+            if let Err((_, error)) = validate_resolved_automation_command(&substituted_content) {
+                tracing::warn!(
+                    "Skipping automation {} because substituted command is too large: {}",
+                    automation.id,
+                    error
+                );
+                continue;
+            }
 
             // Create execution record before execution
             let execution_id = Uuid::new_v4();
@@ -6253,15 +6423,18 @@ async fn resolve_automation_command(
         CommandSource::Library { name } => {
             let lib = state.library.read().await;
             let lib = lib.as_ref()?;
-            lib.get_command(name)
+            let content = lib
+                .get_command(name)
                 .await
                 .ok()
-                .map(|c| automation_library_command_body(&c.content))?
+                .map(|c| automation_library_command_body(&c.content))?;
+            validate_resolved_automation_command(&content).ok()?;
+            content
         }
         CommandSource::LocalFile { path } => {
             let ws = workspace.as_ref()?;
             let file_path = resolve_local_automation_path(&ws.path, path).ok()?;
-            tokio::fs::read_to_string(file_path).await.ok()?
+            read_local_automation_command_file(&file_path).await.ok()?
         }
         CommandSource::Inline { content } => content.clone(),
     };
@@ -6275,7 +6448,9 @@ async fn resolve_automation_command(
     }
     context = context.with_custom_variables(automation.variables.clone());
 
-    Some(substitute_variables(&command_content, &context))
+    let substituted = substitute_variables(&command_content, &context);
+    validate_resolved_automation_command(&substituted).ok()?;
+    Some(substituted)
 }
 
 #[derive(Debug, Clone)]
@@ -6748,7 +6923,20 @@ async fn agent_finished_automation_messages(
             CommandSource::Library { name } => {
                 if let Some(lib) = library.read().await.as_ref() {
                     match lib.get_command(name).await {
-                        Ok(command) => automation_library_command_body(&command.content),
+                        Ok(command) => {
+                            let content = automation_library_command_body(&command.content);
+                            if let Err((_, error)) = validate_resolved_automation_command(&content)
+                            {
+                                tracing::warn!(
+                                    "Library command '{}' for automation {} is too large: {}",
+                                    name,
+                                    automation.id,
+                                    error
+                                );
+                                continue;
+                            }
+                            content
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 "Failed to fetch command '{}' for automation {}: {}",
@@ -6787,9 +6975,9 @@ async fn agent_finished_automation_messages(
                     );
                     continue;
                 };
-                match tokio::fs::read_to_string(&file_path).await {
+                match read_local_automation_command_file(&file_path).await {
                     Ok(content) => content,
-                    Err(e) => {
+                    Err((_, e)) => {
                         tracing::warn!(
                             "Failed to read file '{}' for automation {}: {}",
                             file_path.display(),
@@ -6814,6 +7002,14 @@ async fn agent_finished_automation_messages(
         context = context.with_custom_variables(automation.variables.clone());
 
         let substituted_content = substitute_variables(&command_content, &context);
+        if let Err((_, error)) = validate_resolved_automation_command(&substituted_content) {
+            tracing::warn!(
+                "Skipping automation {} because substituted command is too large: {}",
+                automation.id,
+                error
+            );
+            continue;
+        }
 
         let target_mission_id =
             resolve_agent_finished_target_mission(mission.id, mission.status, &automation);
@@ -10485,6 +10681,8 @@ pub async fn create_automation(
     let control = control_for_user(&state, &user).await;
 
     validate_automation_command_source(&state, &control, mission_id, &req.command_source).await?;
+    validate_automation_trigger(&req.trigger)?;
+    validate_automation_variables(&req.variables, "automation variables")?;
 
     // Generate webhook_id if trigger type is Webhook
     let trigger = match req.trigger {
@@ -10681,6 +10879,12 @@ pub async fn update_automation(
     if let Some(command_source) = req.command_source.as_ref() {
         validate_automation_command_source(&state, &control, automation.mission_id, command_source)
             .await?;
+    }
+    if let Some(trigger) = req.trigger.as_ref() {
+        validate_automation_trigger(trigger)?;
+    }
+    if let Some(variables) = req.variables.as_ref() {
+        validate_automation_variables(variables, "automation variables")?;
     }
 
     // Update fields if provided
@@ -11135,6 +11339,7 @@ fn parse_mission_bundle_from_chunk_dir(
     // unambiguous for gzip and lets us decompress without buffering
     // the whole upload first.
     let first_path = dir.join(format!("chunk_{:06}", 0));
+    reject_mission_import_symlink_path(&first_path, "mission import chunk")?;
     let mut first = File::open(&first_path).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -11161,6 +11366,7 @@ fn parse_mission_bundle_from_chunk_dir(
     let mut reader: Box<dyn Read> = Box::new(BufReader::new(first));
     for i in 1..total_chunks {
         let path = dir.join(format!("chunk_{i:06}"));
+        reject_mission_import_symlink_path(&path, "mission import chunk")?;
         let f = File::open(&path).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
@@ -11373,6 +11579,69 @@ fn import_chunks_dir(upload_id: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("sandboxed_sh_mission_import_{upload_id}"))
 }
 
+fn reject_mission_import_symlink_path(
+    path: &std::path::Path,
+    description: &str,
+) -> Result<(), (StatusCode, String)> {
+    if std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Refusing to use symlink {}: {}",
+                description,
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn reject_mission_import_symlink_path_async(
+    path: &std::path::Path,
+    description: &str,
+) -> Result<(), (StatusCode, String)> {
+    if tokio::fs::symlink_metadata(path)
+        .await
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Refusing to use symlink {}: {}",
+                description,
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn create_new_mission_import_file(
+    path: &std::path::Path,
+    description: &str,
+) -> Result<tokio::fs::File, (StatusCode, String)> {
+    reject_mission_import_symlink_path_async(path, description).await?;
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+        .map_err(|e| {
+            (
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                format!("Failed to create {}: {}", description, e),
+            )
+        })
+}
+
 /// Staging TTL. Any chunked import dir untouched for longer than this is
 /// considered abandoned (client disconnect, crash, never committed) and
 /// gets swept on the next `init_mission_import` call. Picked large
@@ -11444,12 +11713,14 @@ pub async fn init_mission_import(
 
     let upload_id = Uuid::new_v4().simple().to_string();
     let dir = import_chunks_dir(&upload_id);
-    tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+    reject_mission_import_symlink_path_async(&dir, "mission import staging directory").await?;
+    tokio::fs::create_dir(&dir).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to create chunk staging dir: {e}"),
         )
     })?;
+    reject_mission_import_symlink_path_async(&dir, "mission import staging directory").await?;
     Ok(Json(serde_json::json!({
         "upload_id": upload_id,
         "recommended_chunk_bytes": 80 * 1024 * 1024,
@@ -11481,6 +11752,7 @@ pub async fn upload_mission_import_chunk(
         ));
     }
     let dir = import_chunks_dir(&safe_id);
+    reject_mission_import_symlink_path_async(&dir, "mission import staging directory").await?;
     if !dir.exists() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -11488,12 +11760,9 @@ pub async fn upload_mission_import_chunk(
         ));
     }
     let chunk_path = dir.join(format!("chunk_{index:06}"));
-    tokio::fs::write(&chunk_path, &body).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write chunk {index}: {e}"),
-        )
-    })?;
+    let mut file = create_new_mission_import_file(&chunk_path, "mission import chunk").await?;
+    file.write_all(&body).await.map_err(internal_error)?;
+    file.flush().await.map_err(internal_error)?;
     Ok(Json(serde_json::json!({
         "upload_id": safe_id,
         "chunk_index": index,
@@ -11530,6 +11799,7 @@ pub async fn commit_mission_import(
     let safe_id = sanitize_upload_id(&upload_id)
         .ok_or((StatusCode::BAD_REQUEST, "Invalid upload_id".to_string()))?;
     let dir = import_chunks_dir(&safe_id);
+    reject_mission_import_symlink_path_async(&dir, "mission import staging directory").await?;
     if !dir.exists() {
         return Err((StatusCode::NOT_FOUND, "Unknown upload_id.".to_string()));
     }
@@ -11611,6 +11881,7 @@ pub async fn cancel_mission_import(
     let safe_id = sanitize_upload_id(&upload_id)
         .ok_or((StatusCode::BAD_REQUEST, "Invalid upload_id".to_string()))?;
     let dir = import_chunks_dir(&safe_id);
+    reject_mission_import_symlink_path_async(&dir, "mission import staging directory").await?;
     if dir.exists() {
         tokio::fs::remove_dir_all(&dir)
             .await
@@ -11794,7 +12065,11 @@ pub async fn webhook_receiver(
         CommandSource::Library { name } => {
             if let Some(lib) = state.library.read().await.as_ref() {
                 match lib.get_command(name.as_str()).await {
-                    Ok(command) => automation_library_command_body(&command.content),
+                    Ok(command) => {
+                        let content = automation_library_command_body(&command.content);
+                        validate_resolved_automation_command(&content)?;
+                        content
+                    }
                     Err(e) => {
                         return Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -11820,15 +12095,7 @@ pub async fn webhook_receiver(
                 ));
             };
 
-            match tokio::fs::read_to_string(&file_path).await {
-                Ok(content) => content,
-                Err(e) => {
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to read file '{}': {}", file_path.display(), e),
-                    ));
-                }
-            }
+            read_local_automation_command_file(&file_path).await?
         }
         CommandSource::Inline { content } => content.clone(),
     };
@@ -11865,6 +12132,7 @@ pub async fn webhook_receiver(
 
     // Apply variable substitution
     let substituted_content = substitute_variables(&command_content, &context);
+    validate_resolved_automation_command(&substituted_content)?;
 
     // Create execution record
     let execution_id = Uuid::new_v4();
@@ -13062,19 +13330,31 @@ pub async fn telegram_webhook_receiver(
         }
     };
 
-    // Verify the secret token if one was set
-    if let Some(ref expected_secret) = ctx.channel.webhook_secret {
-        let header_secret = headers
-            .get("x-telegram-bot-api-secret-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !super::auth::constant_time_eq(header_secret, expected_secret) {
-            tracing::warn!(
-                "Telegram webhook secret mismatch for channel {}",
-                channel_id
-            );
-            return StatusCode::FORBIDDEN;
-        }
+    // Verify the Telegram webhook secret. New channels always have one, and
+    // TelegramBridge::start_channel backfills legacy rows before registering
+    // the webhook. If a context somehow lacks a secret, fail closed.
+    let Some(expected_secret) = ctx
+        .channel
+        .webhook_secret
+        .as_deref()
+        .filter(|secret| !secret.trim().is_empty())
+    else {
+        tracing::warn!(
+            "Rejecting Telegram webhook for channel {} without a configured secret",
+            channel_id
+        );
+        return StatusCode::FORBIDDEN;
+    };
+    let header_secret = headers
+        .get("x-telegram-bot-api-secret-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !super::auth::constant_time_eq(header_secret, expected_secret) {
+        tracing::warn!(
+            "Telegram webhook secret mismatch for channel {}",
+            channel_id
+        );
+        return StatusCode::FORBIDDEN;
     }
 
     // Deduplicate using the channel's own SQLite-backed store (survives restarts).
@@ -15692,12 +15972,74 @@ And the report:
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_reject_mission_import_symlink_path_rejects_symlink_chunks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real_chunk");
+        let link = temp.path().join("chunk_000000");
+        std::fs::write(&real, b"{}").unwrap();
+        symlink(&real, &link).unwrap();
+
+        let err = reject_mission_import_symlink_path(&link, "mission import chunk")
+            .expect_err("symlink chunk should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_new_mission_import_file_rejects_existing_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("chunk_000000");
+        tokio::fs::write(&path, b"existing").await.unwrap();
+
+        let err = create_new_mission_import_file(&path, "mission import chunk")
+            .await
+            .expect_err("existing chunk should be rejected");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"existing");
+    }
+
+    #[test]
     fn test_validate_local_automation_path_rejects_escape() {
         assert!(validate_local_automation_path("../secret.md").is_err());
         assert!(validate_local_automation_path("commands/../../secret.md").is_err());
         assert!(validate_local_automation_path("/etc/passwd").is_err());
         assert!(validate_local_automation_path("").is_err());
         assert!(validate_local_automation_path("commands/reminder.md").is_ok());
+    }
+
+    #[test]
+    fn test_validate_automation_variables_bounds() {
+        let mut variables = HashMap::new();
+        variables.insert("ok".to_string(), "value".to_string());
+        assert!(validate_automation_variables(&variables, "automation variables").is_ok());
+
+        variables.insert("".to_string(), "value".to_string());
+        assert!(validate_automation_variables(&variables, "automation variables").is_err());
+
+        let too_many: HashMap<_, _> = (0..=AUTOMATION_VARIABLES_MAX_COUNT)
+            .map(|i| (format!("key{i}"), "value".to_string()))
+            .collect();
+        assert!(validate_automation_variables(&too_many, "automation variables").is_err());
+    }
+
+    #[test]
+    fn test_validate_automation_command_content_bounds() {
+        let oversized = "x".repeat(AUTOMATION_INLINE_COMMAND_MAX_BYTES + 1);
+        let err = validate_automation_command_content(&oversized)
+            .expect_err("oversized inline command should fail");
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn test_validate_webhook_config_rejects_invalid_id() {
+        let config = mission_store::WebhookConfig {
+            webhook_id: "../secret".to_string(),
+            secret: Some("secret".to_string()),
+            variable_mappings: HashMap::new(),
+        };
+        assert!(validate_webhook_config(&config).is_err());
     }
 
     #[test]

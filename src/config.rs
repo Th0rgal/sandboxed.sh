@@ -284,6 +284,8 @@ pub struct UserAccount {
 }
 
 impl AuthConfig {
+    pub const MIN_JWT_SECRET_BYTES: usize = 32;
+
     /// Whether auth is required for API requests.
     pub fn auth_required(&self, dev_mode: bool) -> bool {
         matches!(
@@ -304,6 +306,18 @@ impl AuthConfig {
             return AuthMode::SingleTenant;
         }
         AuthMode::Disabled
+    }
+
+    pub fn validate_jwt_secret_strength(&self) -> Result<(), ConfigError> {
+        if let Some(secret) = self.jwt_secret.as_deref() {
+            if secret.as_bytes().len() < Self::MIN_JWT_SECRET_BYTES {
+                return Err(ConfigError::InvalidValue(
+                    "JWT_SECRET".to_string(),
+                    format!("must be at least {} bytes", Self::MIN_JWT_SECRET_BYTES),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -427,6 +441,7 @@ impl Config {
                 .unwrap_or(30),
             users,
         };
+        auth.validate_jwt_secret_strength()?;
 
         // In non-dev mode, require auth secrets to be set.
         if !dev_mode {
