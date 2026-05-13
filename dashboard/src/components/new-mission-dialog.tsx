@@ -6,9 +6,21 @@ import { createPortal } from 'react-dom';
 import { useRouter } from 'next/navigation';
 import { Plus, X, ExternalLink, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import useSWR from 'swr';
-import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
+import { getVisibleAgents, getOpenAgentConfig, listBackends, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
-import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
+import { isBackendAvailable, useBackendAgents, useBackendConfigs } from '@/lib/use-backend-configs';
+
+// Fallback agent rows shown while the per-backend /agents endpoint is loading.
+// Once the fetch resolves the live list replaces the fallback (even if empty —
+// matching the prior `agents || fallback` semantics).
+const BACKEND_AGENT_FALLBACKS: Record<string, BackendAgent[]> = {
+  amp: [
+    { id: 'smart', name: 'Smart Mode' },
+    { id: 'rush', name: 'Rush Mode' },
+  ],
+  codex: [{ id: 'default', name: 'Codex Agent' }],
+  gemini: [{ id: 'default', name: 'Gemini Agent' }],
+};
 
 const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'amp', 'codex', 'gemini'] as const;
 
@@ -162,32 +174,13 @@ export function NewMissionDialog({
     return backends?.filter((b) => isBackendAvailable(backendConfigs[b.id])) || [];
   }, [backends, backendConfigs]);
 
-  // SWR: fetch agents for each enabled backend
-  const { data: opencodeAgents, mutate: mutateOpencodeAgents } = useSWR<BackendAgent[]>(
-    enabledBackends.some(b => b.id === 'opencode') ? 'backend-opencode-agents' : null,
-    () => listBackendAgents('opencode'),
-    { revalidateOnFocus: true, dedupingInterval: 5000 }
+  // SWR: fetch agents for every enabled backend in one entry.
+  const enabledBackendIds = useMemo(
+    () => enabledBackends.map((b) => b.id),
+    [enabledBackends]
   );
-  const { data: claudecodeAgents, mutate: mutateClaudecodeAgents } = useSWR<BackendAgent[]>(
-    enabledBackends.some(b => b.id === 'claudecode') ? 'backend-claudecode-agents' : null,
-    () => listBackendAgents('claudecode'),
-    { revalidateOnFocus: true, dedupingInterval: 5000 }
-  );
-  const { data: ampAgents, mutate: mutateAmpAgents } = useSWR<BackendAgent[]>(
-    enabledBackends.some(b => b.id === 'amp') ? 'backend-amp-agents' : null,
-    () => listBackendAgents('amp'),
-    { revalidateOnFocus: true, dedupingInterval: 5000 }
-  );
-  const { data: codexAgents, mutate: mutateCodexAgents } = useSWR<BackendAgent[]>(
-    enabledBackends.some(b => b.id === 'codex') ? 'backend-codex-agents' : null,
-    () => listBackendAgents('codex'),
-    { revalidateOnFocus: true, dedupingInterval: 5000 }
-  );
-  const { data: geminiAgents, mutate: mutateGeminiAgents } = useSWR<BackendAgent[]>(
-    enabledBackends.some(b => b.id === 'gemini') ? 'backend-gemini-agents' : null,
-    () => listBackendAgents('gemini'),
-    { revalidateOnFocus: true, dedupingInterval: 5000 }
-  );
+  const { agents: backendAgentsMap, refresh: refreshBackendAgents } =
+    useBackendAgents(enabledBackendIds);
 
   // SWR: fallback for opencode agents
   const { data: agentsPayload, mutate: mutateAgentsPayload } = useSWR('opencode-agents', getVisibleAgents, {
@@ -227,57 +220,48 @@ export function NewMissionDialog({
     [opencodeProfileSettings]
   );
 
-  // Combine all agents from enabled backends
+  // Combine all agents from enabled backends.
+  //
+  // OpenCode is a special case: its agent list is profile-aware and has a
+  // multi-step fallback (profile → backend → raw payload). Every other
+  // backend follows the same shape — fetched list, with a hidden-agent
+  // filter for claudecode, and a static fallback when the fetch hasn't
+  // returned yet (see BACKEND_AGENT_FALLBACKS at module scope).
   const allAgents = useMemo((): CombinedAgent[] => {
     const result: CombinedAgent[] = [];
     const openCodeHiddenAgents = config?.hidden_agents || [];
     const claudeCodeHiddenAgents = claudeCodeLibConfig?.hidden_agents || [];
 
     for (const backend of enabledBackends) {
-      // Use consistent {id, name} format for all backends
-      let agents: { id: string; name: string }[] = [];
+      let agents: BackendAgent[];
 
       if (backend.id === 'opencode') {
-        // Filter out hidden OpenCode agents by name
-        const profileAgents = opencodeProfileAgentNames.map(name => ({ id: name, name }));
-        const backendAgents = profileAgents.length > 0 ? profileAgents : (opencodeAgents || []);
-        const visibleAgents = backendAgents.filter(a => !openCodeHiddenAgents.includes(a.name));
+        const profileAgents = opencodeProfileAgentNames.map((name) => ({ id: name, name }));
+        const backendAgents = profileAgents.length > 0
+          ? profileAgents
+          : (backendAgentsMap['opencode'] ?? []);
+        const visibleAgents = backendAgents.filter(
+          (a) => !openCodeHiddenAgents.includes(a.name)
+        );
         if (visibleAgents.length > 0) {
           agents = visibleAgents;
         } else if (backendAgents.length > 0) {
-          // If all OpenCode agents are hidden, fall back to the raw list so the backend remains usable.
+          // All OpenCode agents are hidden — keep the raw list so the backend stays usable.
           agents = backendAgents;
         } else {
-          // Fallback to parsing agent names from raw payload
           const fallbackNames = parseAgentNames(agentsPayload).filter(
-            name => !openCodeHiddenAgents.includes(name)
+            (name) => !openCodeHiddenAgents.includes(name)
           );
-          agents = fallbackNames.map(name => ({ id: name, name }));
+          agents = fallbackNames.map((name) => ({ id: name, name }));
         }
-
-      } else if (backend.id === 'claudecode') {
-        // Filter out hidden Claude Code agents by name
-        const allClaudeAgents = claudecodeAgents || [];
-        agents = allClaudeAgents.filter(a => !claudeCodeHiddenAgents.includes(a.name));
-      } else if (backend.id === 'amp') {
-        // Amp has built-in modes: smart and rush
-        agents = ampAgents || [
-          { id: 'smart', name: 'Smart Mode' },
-          { id: 'rush', name: 'Rush Mode' },
-        ];
-      } else if (backend.id === 'codex') {
-        // Codex agents
-        agents = codexAgents || [
-          { id: 'default', name: 'Codex Agent' },
-        ];
-      } else if (backend.id === 'gemini') {
-        // Gemini agents
-        agents = geminiAgents || [
-          { id: 'default', name: 'Gemini Agent' },
-        ];
+      } else {
+        const fetched = backendAgentsMap[backend.id];
+        agents = fetched ?? BACKEND_AGENT_FALLBACKS[backend.id] ?? [];
+        if (backend.id === 'claudecode' && claudeCodeHiddenAgents.length > 0) {
+          agents = agents.filter((a) => !claudeCodeHiddenAgents.includes(a.name));
+        }
       }
 
-      // Use agent.id for CLI value, agent.name for display (consistent across all backends)
       for (const agent of agents) {
         result.push({
           backend: backend.id,
@@ -290,7 +274,14 @@ export function NewMissionDialog({
     }
 
     return result;
-  }, [enabledBackends, opencodeAgents, opencodeProfileAgentNames, claudecodeAgents, ampAgents, codexAgents, geminiAgents, agentsPayload, config, claudeCodeLibConfig]);
+  }, [
+    enabledBackends,
+    backendAgentsMap,
+    opencodeProfileAgentNames,
+    agentsPayload,
+    config,
+    claudeCodeLibConfig,
+  ]);
 
   // Group agents by backend for display
   const agentsByBackend = useMemo(() => {
@@ -566,13 +557,9 @@ export function NewMissionDialog({
   };
 
   const handleRefreshAgents = async () => {
-    // Revalidate all agent lists
+    // Revalidate every agent source in one go.
     await Promise.all([
-      mutateOpencodeAgents?.(),
-      mutateClaudecodeAgents?.(),
-      mutateAmpAgents?.(),
-      mutateCodexAgents?.(),
-      mutateGeminiAgents?.(),
+      refreshBackendAgents(),
       mutateAgentsPayload?.(),
       mutateConfig?.(),
     ]);

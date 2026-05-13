@@ -1,6 +1,11 @@
 import useSWR from 'swr';
 
-import { type BackendConfig, getBackendConfig } from './api';
+import {
+  type BackendAgent,
+  type BackendConfig,
+  getBackendConfig,
+  listBackendAgents,
+} from './api';
 
 const DEDUPING_MS = 30000;
 
@@ -32,6 +37,39 @@ export function useBackendConfigs(ids: readonly string[]): BackendConfigsHandle 
   );
   return {
     configs: data ?? {},
+    refresh: async () => {
+      await mutate();
+    },
+  };
+}
+
+export interface BackendAgentsHandle {
+  /** Agents per backend id. Missing key = not yet loaded for that id. */
+  agents: Record<string, BackendAgent[] | undefined>;
+  /** Force a refetch of agents for every backend in the active id list. */
+  refresh: () => Promise<void>;
+}
+
+/**
+ * Fetch the agent list for every enabled backend in one SWR entry.
+ *
+ * Pass the currently-enabled backend ids — the cache key changes when the
+ * set changes, so disabling a backend doesn't keep stale entries pinned.
+ */
+export function useBackendAgents(ids: readonly string[]): BackendAgentsHandle {
+  const key = ids.length > 0 ? `backend-agents|${[...ids].sort().join(',')}` : null;
+  const { data, mutate } = useSWR<Record<string, BackendAgent[]>>(
+    key,
+    async () => {
+      const entries = await Promise.all(
+        ids.map(async (id) => [id, await listBackendAgents(id)] as const)
+      );
+      return Object.fromEntries(entries);
+    },
+    { revalidateOnFocus: true, dedupingInterval: 5000 }
+  );
+  return {
+    agents: data ?? {},
     refresh: async () => {
       await mutate();
     },
