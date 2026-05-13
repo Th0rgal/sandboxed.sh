@@ -831,6 +831,10 @@ fn sanitize_env_vars(env_vars: HashMap<String, String>) -> HashMap<String, Strin
         .collect()
 }
 
+fn valid_env_pair(key: &str, value: &str) -> bool {
+    is_valid_env_name(key) && !value.contains('\0')
+}
+
 fn is_valid_env_name(key: &str) -> bool {
     let mut chars = key.chars();
     match chars.next() {
@@ -903,11 +907,17 @@ pub fn build_nspawn_command(
 
             // Inject workspace env vars
             for (key, value) in &workspace.env_vars {
+                if !valid_env_pair(key, value) {
+                    continue;
+                }
                 nspawn_args.push(format!("--setenv={}={}", key, value));
             }
             // Inject any caller-supplied extra env vars
             if let Some(env) = extra_env {
                 for (key, value) in env {
+                    if !valid_env_pair(key, value) {
+                        continue;
+                    }
                     nspawn_args.push(format!("--setenv={}={}", key, value));
                 }
             }
@@ -916,7 +926,7 @@ pub fn build_nspawn_command(
                 let tailnet_only = tailscale_mode == crate::workspace::TailscaleMode::TailnetOnly;
                 let mut bootstrap_cmd = String::new();
                 for (k, v) in &workspace.env_vars {
-                    if k.starts_with("TS_") && !v.trim().is_empty() {
+                    if valid_env_pair(k, v) && k.starts_with("TS_") && !v.trim().is_empty() {
                         bootstrap_cmd.push_str(&format!("export {}={}; ", k, shell_escape(v)));
                     }
                 }
@@ -1200,10 +1210,16 @@ async fn exec_workspace_command(
     if workspace.workspace_type == WorkspaceType::Host {
         cmd.current_dir(&cwd);
         for (key, value) in &workspace.env_vars {
+            if !valid_env_pair(key, value) {
+                continue;
+            }
             cmd.env(key, value);
         }
         if let Some(env) = &req.env {
             for (key, value) in env {
+                if !valid_env_pair(key, value) {
+                    continue;
+                }
                 cmd.env(key, value);
             }
         }
@@ -1887,5 +1903,16 @@ mod tests {
     #[test]
     fn test_validate_workspace_name_rejects_empty() {
         assert!(validate_workspace_name("").is_err());
+    }
+
+    #[test]
+    fn env_pair_validation_rejects_unsafe_keys_and_nul_values() {
+        assert!(valid_env_pair("TS_AUTHKEY", "abc"));
+        assert!(valid_env_pair("_NAME_1", "value with spaces"));
+        assert!(!valid_env_pair("", "x"));
+        assert!(!valid_env_pair("1BAD", "x"));
+        assert!(!valid_env_pair("BAD-NAME", "x"));
+        assert!(!valid_env_pair("BAD=NAME", "x"));
+        assert!(!valid_env_pair("GOOD", "a\0b"));
     }
 }

@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::RwLock;
 
@@ -30,6 +31,15 @@ fn validate_storage_name(kind: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+const UNLOCK_FAILURE_THRESHOLD: u32 = 5;
+const UNLOCK_BACKOFF_DURATION: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default)]
+struct UnlockThrottle {
+    failed_attempts: u32,
+    locked_until: Option<Instant>,
+}
+
 /// Store for managing encrypted secrets.
 pub struct SecretsStore {
     /// Base directory (.sandboxed-sh/secrets)
@@ -40,6 +50,8 @@ pub struct SecretsStore {
     crypto: RwLock<SecretsCrypto>,
     /// Cached registries
     registries: RwLock<HashMap<String, SecretRegistry>>,
+    /// In-memory throttle for failed unlock attempts.
+    unlock_throttle: RwLock<UnlockThrottle>,
 }
 
 impl SecretsStore {
@@ -73,6 +85,7 @@ impl SecretsStore {
             config: RwLock::new(config),
             crypto: RwLock::new(crypto),
             registries: RwLock::new(HashMap::new()),
+            unlock_throttle: RwLock::new(UnlockThrottle::default()),
         };
 
         // Load existing registries
@@ -217,6 +230,18 @@ impl SecretsStore {
 
     /// Unlock the secrets system with a passphrase.
     pub async fn unlock(&self, passphrase: &str) -> Result<()> {
+        {
+            let throttle = self.unlock_throttle.read().await;
+            if let Some(locked_until) = throttle.locked_until {
+                if let Some(remaining) = locked_until.checked_duration_since(Instant::now()) {
+                    anyhow::bail!(
+                        "Too many failed unlock attempts. Try again in {} seconds.",
+                        remaining.as_secs().max(1)
+                    );
+                }
+            }
+        }
+
         // If we have existing secrets, verify the passphrase works
         let registries = self.registries.read().await;
 
@@ -228,9 +253,13 @@ impl SecretsStore {
 
                 if crypto.decrypt(secret).is_err() {
                     crypto.clear_passphrase();
+                    drop(crypto);
+                    self.record_failed_unlock().await;
                     anyhow::bail!("Invalid passphrase");
                 }
 
+                drop(crypto);
+                self.record_successful_unlock().await;
                 return Ok(());
             }
         }
@@ -238,8 +267,24 @@ impl SecretsStore {
         // No existing secrets to verify against, just set the passphrase
         let mut crypto = self.crypto.write().await;
         crypto.set_passphrase(passphrase.to_string());
+        drop(crypto);
+        self.record_successful_unlock().await;
 
         Ok(())
+    }
+
+    async fn record_failed_unlock(&self) {
+        let mut throttle = self.unlock_throttle.write().await;
+        throttle.failed_attempts = throttle.failed_attempts.saturating_add(1);
+        if throttle.failed_attempts >= UNLOCK_FAILURE_THRESHOLD {
+            throttle.locked_until = Some(Instant::now() + UNLOCK_BACKOFF_DURATION);
+        }
+    }
+
+    async fn record_successful_unlock(&self) {
+        let mut throttle = self.unlock_throttle.write().await;
+        throttle.failed_attempts = 0;
+        throttle.locked_until = None;
     }
 
     /// Lock the secrets system (clear passphrase).
@@ -593,5 +638,25 @@ mod tests {
 
         assert!(store.initialize("../outside").await.is_err());
         assert!(store.initialize(".hidden").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn throttles_repeated_failed_unlock_attempts() {
+        let temp = tempdir().unwrap();
+        let store = SecretsStore::new(temp.path()).await.unwrap();
+        store.initialize("default").await.unwrap();
+        store.unlock("correct-passphrase").await.unwrap();
+        store
+            .set_secret("test-registry", "api-key", "sk-12345", None)
+            .await
+            .unwrap();
+        store.lock().await;
+
+        for _ in 0..UNLOCK_FAILURE_THRESHOLD {
+            assert!(store.unlock("wrong-passphrase").await.is_err());
+        }
+
+        let err = store.unlock("correct-passphrase").await.unwrap_err();
+        assert!(err.to_string().contains("Too many failed unlock attempts"));
     }
 }

@@ -6,6 +6,28 @@ use tokio::process::Command;
 
 use super::types::LibraryStatus;
 
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn validate_sparse_subpath(subpath: &str) -> Result<()> {
+    let candidate = Path::new(subpath);
+    if subpath.trim().is_empty() || subpath.contains(['\0', '\r', '\n']) || candidate.is_absolute()
+    {
+        anyhow::bail!("Invalid sparse checkout path");
+    }
+
+    for component in candidate.components() {
+        match component {
+            std::path::Component::Normal(part) if !part.is_empty() => {}
+            std::path::Component::CurDir => {}
+            _ => anyhow::bail!("Invalid sparse checkout path"),
+        }
+    }
+
+    Ok(())
+}
+
 /// Get the GIT_SSH_COMMAND value for git operations.
 ///
 /// - If `LIBRARY_GIT_SSH_KEY` is set to a path, uses that key with `-o IdentitiesOnly=yes`
@@ -20,7 +42,10 @@ fn get_ssh_command() -> Option<String> {
         }
         Ok(key) => {
             // Use the specified key
-            Some(format!("ssh -i {} -o IdentitiesOnly=yes", key))
+            Some(format!(
+                "ssh -i {} -o IdentitiesOnly=yes",
+                shell_single_quote(&key)
+            ))
         }
         Err(_) => {
             // Not set - use default git behavior (respects ~/.ssh/config)
@@ -51,7 +76,7 @@ pub async fn clone_if_needed(path: &Path, remote: &str) -> Result<bool> {
     }
 
     let mut cmd = Command::new("git");
-    cmd.args(["clone", remote, &path.to_string_lossy()]);
+    cmd.args(["clone", "--", remote, &path.to_string_lossy()]);
     apply_ssh_config(&mut cmd);
     let output = cmd.output().await.context("Failed to execute git clone")?;
 
@@ -402,7 +427,14 @@ pub async fn clone(path: &Path, remote: &str) -> Result<()> {
     }
 
     let mut cmd = Command::new("git");
-    cmd.args(["clone", "--depth", "1", remote, &path.to_string_lossy()]);
+    cmd.args([
+        "clone",
+        "--depth",
+        "1",
+        "--",
+        remote,
+        &path.to_string_lossy(),
+    ]);
     apply_ssh_config(&mut cmd);
     let output = cmd.output().await.context("Failed to execute git clone")?;
 
@@ -416,6 +448,8 @@ pub async fn clone(path: &Path, remote: &str) -> Result<()> {
 
 /// Clone a specific path from a git repository using sparse checkout.
 pub async fn sparse_clone(path: &Path, remote: &str, subpath: &str) -> Result<()> {
+    validate_sparse_subpath(subpath)?;
+
     tracing::info!(
         remote = %remote,
         path = %path.display(),
@@ -446,7 +480,7 @@ pub async fn sparse_clone(path: &Path, remote: &str, subpath: &str) -> Result<()
     // Add remote
     let output = Command::new("git")
         .current_dir(path)
-        .args(["remote", "add", "origin", remote])
+        .args(["remote", "add", "--", "origin", remote])
         .output()
         .await
         .context("Failed to add remote")?;
@@ -587,5 +621,28 @@ async fn get_ahead_behind(path: &Path) -> Result<(u32, u32)> {
         Ok((ahead, behind))
     } else {
         Ok((0, 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shell_single_quote, validate_sparse_subpath};
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        assert_eq!(shell_single_quote("/tmp/key"), "'/tmp/key'");
+        assert_eq!(
+            shell_single_quote("/tmp/key' -oProxyCommand=evil 'x"),
+            "'/tmp/key'\\'' -oProxyCommand=evil '\\''x'"
+        );
+    }
+
+    #[test]
+    fn validate_sparse_subpath_rejects_patterns_and_traversal() {
+        assert!(validate_sparse_subpath("skills/demo").is_ok());
+        assert!(validate_sparse_subpath("../secret").is_err());
+        assert!(validate_sparse_subpath("/etc/passwd").is_err());
+        assert!(validate_sparse_subpath("skills/demo\n*").is_err());
+        assert!(validate_sparse_subpath("").is_err());
     }
 }

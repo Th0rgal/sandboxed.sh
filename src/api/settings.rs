@@ -279,6 +279,14 @@ const BACKUP_FILES: &[&str] = &[
 /// Directories included in the backup (relative to .sandboxed-sh/)
 const BACKUP_DIRS: &[&str] = &["secrets"];
 
+fn restrict_restored_file_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
 /// Find Claude credentials file from various possible locations.
 /// Returns the path and archive name if found.
 fn find_claude_credentials() -> Option<(std::path::PathBuf, &'static str)> {
@@ -548,6 +556,7 @@ async fn restore_backup(
 
         match std::fs::write(&target_path, &contents) {
             Ok(()) => {
+                restrict_restored_file_permissions(&target_path);
                 restored_files.push(display_name);
                 tracing::info!("Restored: {} -> {}", name, target_path.display());
             }
@@ -608,4 +617,27 @@ async fn restore_backup(
         restored_files,
         errors,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn restored_files_are_restricted_to_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, b"{}").expect("write file");
+        restrict_restored_file_permissions(&path);
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

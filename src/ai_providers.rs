@@ -463,6 +463,11 @@ impl AIProviderStore {
         let tmp_path = self.storage_path.with_extension("tmp");
         std::fs::write(&tmp_path, contents)?;
         std::fs::rename(&tmp_path, &self.storage_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.storage_path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 

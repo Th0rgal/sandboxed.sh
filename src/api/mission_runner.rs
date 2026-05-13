@@ -4021,7 +4021,7 @@ pub fn run_claudecode_turn<'a>(
                         );
                     }
                 }
-                match std::fs::copy(&host_creds, &mission_creds_path) {
+                match copy_private_file(&host_creds, &mission_creds_path) {
                     Ok(_) => {
                         tracing::info!(
                             from = %host_creds.display(),
@@ -8106,13 +8106,32 @@ fn build_opencode_auth_from_ai_providers(
     }
 }
 
+fn restrict_private_file(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn copy_private_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<u64> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let copied = std::fs::copy(from, to)?;
+    restrict_private_file(to)?;
+    Ok(copied)
+}
+
 fn write_json_file(path: &std::path::Path, value: &serde_json::Value) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let contents = serde_json::to_string_pretty(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, contents)
+    std::fs::write(path, contents)?;
+    restrict_private_file(path)
 }
 
 fn sync_opencode_auth_to_workspace(
@@ -8139,7 +8158,7 @@ fn sync_opencode_auth_to_workspace(
                         );
                     }
                 }
-                if let Err(e) = std::fs::copy(&source_path, &dest_path) {
+                if let Err(e) = copy_private_file(&source_path, &dest_path) {
                     tracing::warn!(
                         "Failed to copy OpenCode auth.json to workspace {}: {}",
                         dest_path.display(),
@@ -8195,7 +8214,7 @@ fn sync_opencode_auth_to_workspace(
                 );
                 continue;
             }
-            if let Err(e) = std::fs::copy(&src, &dest) {
+            if let Err(e) = copy_private_file(&src, &dest) {
                 tracing::warn!(
                     "Failed to copy OpenCode provider auth file to workspace {}: {}",
                     dest.display(),
@@ -9355,10 +9374,14 @@ async fn ensure_claudecode_cli_available(
 }
 
 fn desired_claudecode_version() -> String {
+    // 2.1.140 ships the bug-fixed native `/goal` slash command (added in
+    // 2.1.139, hardened against `disableAllHooks` / `allowManagedHooksOnly`
+    // in 2.1.140). Bumping the pin so the per-workspace install matches
+    // what `run_claudecode_native_goal` relies on.
     std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "2.1.139".to_string())
+        .unwrap_or_else(|| "2.1.140".to_string())
 }
 
 async fn claude_cli_matches_desired_version(
@@ -14216,7 +14239,7 @@ pub async fn run_gemini_turn(
                     &[
                         "-c".to_string(),
                         format!(
-                            r#"echo '{}' > "${{HOME:-/root}}/.gemini/oauth_creds.json""#,
+                            r#"umask 077; printf '%s' '{}' > "${{HOME:-/root}}/.gemini/oauth_creds.json""#,
                             escaped
                         ),
                     ],
@@ -14830,21 +14853,21 @@ mod tests {
         codex_chatgpt_fallback_model, codex_error_message_to_surface,
         codex_final_message_looks_like_progress_update, codex_key_fingerprint,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
-        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
-        is_codex_node_wrapper, is_provider_payload_error, is_rate_limited_error,
-        is_session_corruption_error, is_success_path_auth_error,
+        copy_private_file, extract_model_from_message, extract_opencode_session_id,
+        extract_part_text, extract_str, extract_thought_line, is_capacity_limited_error,
+        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_provider_payload_error,
+        is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
         is_success_path_provider_payload_error, is_success_path_rate_limited_error,
         is_tool_call_only_output, opencode_idle_timeout_result_message,
         opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, record_codex_error_message, resolve_cost_cents_and_source,
-        running_health, sanitized_opencode_stdout, shell_quote, stall_severity, strip_ansi_codes,
-        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
-        sync_opencode_agent_config, use_thinking_only_fallback, ClaudeIncompleteTurnContext,
-        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
-        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
-        STALL_WARN_SECS,
+        restrict_private_file, running_health, sanitized_opencode_stdout, shell_quote,
+        stall_severity, strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
+        summarize_recent_opencode_stderr, sync_opencode_agent_config, use_thinking_only_fallback,
+        write_json_file, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
+        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
+        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, inject_telegram_identity_into_claude_md,
@@ -14857,6 +14880,27 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    #[cfg(unix)]
+    fn private_file_helpers_restrict_credential_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.json");
+        let copied = temp.path().join("nested").join("copy.json");
+        let written = temp.path().join("written.json");
+
+        fs::write(&source, b"{\"token\":\"secret\"}").expect("write source");
+        restrict_private_file(&source).expect("restrict source");
+        copy_private_file(&source, &copied).expect("copy private file");
+        write_json_file(&written, &json!({ "token": "secret" })).expect("write json");
+
+        for path in [&source, &copied, &written] {
+            let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
 
     #[test]
     fn codex_turn_requires_tool_activity_for_file_shell_prompt() {

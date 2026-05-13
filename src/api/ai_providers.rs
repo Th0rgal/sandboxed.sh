@@ -50,6 +50,28 @@ fn openai_redirect_uri() -> String {
     std::env::var("OPENAI_REDIRECT_URI").unwrap_or_else(|_| OPENAI_REDIRECT_URI.to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn write_private_file_restricts_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("credentials.json");
+        write_private_file(&path, b"secret").expect("write private file");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
+
 async fn exchange_openai_id_token_for_api_key(
     client: &reqwest::Client,
     id_token: &str,
@@ -257,6 +279,23 @@ fn google_client_id() -> &'static str {
 
 fn google_client_secret() -> &'static str {
     GOOGLE_CLIENT_SECRET
+}
+
+fn write_private_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), String> {
+    std::fs::write(path, contents)
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            format!(
+                "Failed to restrict permissions on {}: {}",
+                path.display(),
+                e
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn anthropic_client_id() -> String {
@@ -1013,7 +1052,7 @@ pub async fn refresh_workspace_anthropic_auth(
 
     let contents = serde_json::to_string_pretty(&new_auth)
         .map_err(|e| format!("Failed to serialize auth: {}", e))?;
-    std::fs::write(&auth_path, contents)
+    write_private_file(&auth_path, contents)
         .map_err(|e| format!("Failed to write workspace auth file: {}", e))?;
 
     // **Solution #3: Sync to all storage tiers atomically**
@@ -1554,7 +1593,7 @@ fn upsert_openai_api_key_in_ai_providers(working_dir: &Path, api_key: &str) -> R
 
     let contents = serde_json::to_string_pretty(&providers)
         .map_err(|e| format!("Failed to serialize ai_providers.json: {}", e))?;
-    std::fs::write(&path, contents)
+    write_private_file(&path, contents)
         .map_err(|e| format!("Failed to write ai_providers.json: {}", e))?;
 
     Ok(())
@@ -2652,7 +2691,7 @@ fn sync_to_opencode_auth(
     // Write back to file
     let contents = serde_json::to_string_pretty(&auth)
         .map_err(|e| format!("Failed to serialize OpenCode auth: {}", e))?;
-    std::fs::write(&auth_path, contents)
+    write_private_file(&auth_path, contents)
         .map_err(|e| format!("Failed to write OpenCode auth: {}", e))?;
 
     if matches!(
@@ -2710,7 +2749,7 @@ pub(crate) fn write_claudecode_credentials_from_entry(
     let contents = serde_json::to_string_pretty(&credentials)
         .map_err(|e| format!("Failed to serialize Claude credentials: {}", e))?;
 
-    std::fs::write(&credentials_path, contents)
+    write_private_file(&credentials_path, contents)
         .map_err(|e| format!("Failed to write Claude credentials: {}", e))?;
 
     tracing::info!(
@@ -2832,7 +2871,7 @@ fn write_sandboxed_credential(
 
     let contents = serde_json::to_string_pretty(&auth)
         .map_err(|e| format!("Failed to serialize Open Agent credentials: {}", e))?;
-    std::fs::write(&path, contents)
+    write_private_file(&path, contents)
         .map_err(|e| format!("Failed to write Open Agent credentials: {}", e))?;
 
     tracing::info!(
@@ -2868,7 +2907,7 @@ fn remove_sandboxed_credential(provider_type: ProviderType) -> Result<(), String
     if changed {
         let contents = serde_json::to_string_pretty(&auth)
             .map_err(|e| format!("Failed to serialize Open Agent credentials: {}", e))?;
-        std::fs::write(&path, contents)
+        write_private_file(&path, contents)
             .map_err(|e| format!("Failed to write Open Agent credentials: {}", e))?;
     }
 
@@ -3823,7 +3862,7 @@ pub fn write_claudecode_credentials_to_path(
     let contents = serde_json::to_string_pretty(&credentials)
         .map_err(|e| format!("Failed to serialize Claude credentials: {}", e))?;
 
-    std::fs::write(&credentials_path, contents)
+    write_private_file(&credentials_path, contents)
         .map_err(|e| format!("Failed to write Claude credentials: {}", e))?;
 
     tracing::info!(
@@ -3932,7 +3971,7 @@ fn sync_api_key_to_opencode_auth(provider_type: ProviderType, api_key: &str) -> 
 
     let contents = serde_json::to_string_pretty(&auth)
         .map_err(|e| format!("Failed to serialize OpenCode auth: {}", e))?;
-    std::fs::write(&auth_path, contents)
+    write_private_file(&auth_path, contents)
         .map_err(|e| format!("Failed to write OpenCode auth: {}", e))?;
 
     if matches!(
@@ -3997,7 +4036,7 @@ fn remove_opencode_auth_entry(provider_type: ProviderType) -> Result<(), String>
     if changed {
         let contents = serde_json::to_string_pretty(&auth)
             .map_err(|e| format!("Failed to serialize OpenCode auth: {}", e))?;
-        std::fs::write(&auth_path, contents)
+        write_private_file(&auth_path, contents)
             .map_err(|e| format!("Failed to write OpenCode auth: {}", e))?;
     }
 
@@ -4105,7 +4144,7 @@ fn write_opencode_provider_auth_file(
 
     let contents = serde_json::to_string_pretty(entry)
         .map_err(|e| format!("Failed to serialize OpenCode provider auth: {}", e))?;
-    std::fs::write(&auth_path, contents)
+    write_private_file(&auth_path, contents)
         .map_err(|e| format!("Failed to write OpenCode provider auth: {}", e))?;
 
     Ok(())
@@ -4694,7 +4733,7 @@ fn write_opencode_auth(auth: &serde_json::Value) -> Result<(), String> {
 
     let contents = serde_json::to_string_pretty(auth)
         .map_err(|e| format!("Failed to serialize OpenCode auth: {}", e))?;
-    std::fs::write(&auth_path, contents)
+    write_private_file(&auth_path, contents)
         .map_err(|e| format!("Failed to write OpenCode auth: {}", e))?;
 
     Ok(())

@@ -18,11 +18,29 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::time::{Duration as StdDuration, Instant};
+use tokio::sync::Mutex;
 
 use super::routes::AppState;
 use super::types::{LoginRequest, LoginResponse};
 use crate::config::{AuthMode, Config, UserAccount};
 use crate::util::internal_error;
+
+const PASSWORD_HASH_ITERATIONS: u32 = 100_000;
+const MAX_PASSWORD_HASH_ITERATIONS: u32 = 600_000;
+const LOGIN_FAILURE_THRESHOLD: u32 = 8;
+const LOGIN_BACKOFF_DURATION: StdDuration = StdDuration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct LoginThrottle {
+    failed_attempts: u32,
+    locked_until: Option<Instant>,
+}
+
+static LOGIN_THROTTLES: LazyLock<Mutex<HashMap<String, LoginThrottle>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Claims {
@@ -82,14 +100,14 @@ pub fn implicit_single_tenant_user(config: &Config) -> AuthUser {
 pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
-    if a_bytes.len() != b_bytes.len() {
-        return false;
-    }
     let mut diff: u8 = 0;
-    for i in 0..a_bytes.len() {
-        diff |= a_bytes[i] ^ b_bytes[i];
+    let max_len = a_bytes.len().max(b_bytes.len());
+    for i in 0..max_len {
+        let left = a_bytes.get(i).copied().unwrap_or(0);
+        let right = b_bytes.get(i).copied().unwrap_or(0);
+        diff |= left ^ right;
     }
-    diff == 0
+    diff == 0 && a_bytes.len() == b_bytes.len()
 }
 
 /// Hash a password using PBKDF2-SHA256.
@@ -100,7 +118,7 @@ pub fn hash_password(password: &str) -> String {
     use rand::RngCore;
     use sha2::Sha256;
 
-    let iterations = 100_000u32;
+    let iterations = PASSWORD_HASH_ITERATIONS;
     let mut salt = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut salt);
 
@@ -131,6 +149,9 @@ pub fn verify_password_hash(password: &str, stored: &str) -> bool {
         Ok(n) => n,
         Err(_) => return false,
     };
+    if !(1..=MAX_PASSWORD_HASH_ITERATIONS).contains(&iterations) {
+        return false;
+    }
     let salt = match hex::decode(parts[2]) {
         Ok(s) => s,
         Err(_) => return false,
@@ -146,6 +167,54 @@ pub fn verify_password_hash(password: &str, stored: &str) -> bool {
     }
 
     constant_time_eq(&hex::encode(&computed), &hex::encode(&expected_hash))
+}
+
+fn login_throttle_key(auth_mode: AuthMode, username: Option<&str>) -> String {
+    match auth_mode {
+        AuthMode::MultiUser => format!(
+            "multi:{}",
+            username.unwrap_or("").trim().to_ascii_lowercase()
+        ),
+        AuthMode::SingleTenant | AuthMode::Disabled => "single".to_string(),
+    }
+}
+
+async fn check_login_throttle(key: &str) -> Result<(), (StatusCode, String)> {
+    let throttles = LOGIN_THROTTLES.lock().await;
+    if let Some(throttle) = throttles.get(key) {
+        if let Some(locked_until) = throttle.locked_until {
+            if let Some(remaining) = locked_until.checked_duration_since(Instant::now()) {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Too many failed login attempts. Try again in {} seconds.",
+                        remaining.as_secs().max(1)
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn record_login_failure(key: &str) {
+    let mut throttles = LOGIN_THROTTLES.lock().await;
+    let throttle = throttles.entry(key.to_string()).or_default();
+    if throttle
+        .locked_until
+        .and_then(|until| until.checked_duration_since(Instant::now()))
+        .is_none()
+    {
+        throttle.locked_until = None;
+    }
+    throttle.failed_attempts = throttle.failed_attempts.saturating_add(1);
+    if throttle.failed_attempts >= LOGIN_FAILURE_THRESHOLD {
+        throttle.locked_until = Some(Instant::now() + LOGIN_BACKOFF_DURATION);
+    }
+}
+
+async fn record_login_success(key: &str) {
+    LOGIN_THROTTLES.lock().await.remove(key);
 }
 
 fn issue_jwt(secret: &str, ttl_days: i64, user: &AuthUser) -> anyhow::Result<(String, i64)> {
@@ -202,6 +271,9 @@ pub async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, String)> {
     let auth_mode = state.config.auth.auth_mode(state.config.dev_mode);
+    let throttle_key = login_throttle_key(auth_mode, req.username.as_deref());
+    check_login_throttle(&throttle_key).await?;
+
     let user = match auth_mode {
         AuthMode::MultiUser => {
             let username = req.username.as_deref().unwrap_or("").trim();
@@ -230,6 +302,7 @@ pub async fn login(
             };
 
             if !valid {
+                record_login_failure(&throttle_key).await;
                 return Err((
                     StatusCode::UNAUTHORIZED,
                     "Invalid username or password".to_string(),
@@ -275,6 +348,7 @@ pub async fn login(
             };
 
             if !valid {
+                record_login_failure(&throttle_key).await;
                 return Err((StatusCode::UNAUTHORIZED, "Invalid password".to_string()));
             }
 
@@ -291,6 +365,7 @@ pub async fn login(
 
     let (token, exp) =
         issue_jwt(secret, state.config.auth.jwt_ttl_days, &user).map_err(internal_error)?;
+    record_login_success(&throttle_key).await;
 
     Ok(Json(LoginResponse { token, exp }))
 }
@@ -557,6 +632,34 @@ mod tests {
         let user = implicit_single_tenant_user_from_id(&test_config(false), None);
         assert_eq!(user.id, "default");
         assert_eq!(user.username, "default");
+    }
+
+    #[test]
+    fn password_hash_verification_rejects_excessive_iterations() {
+        let stored = "pbkdf2:999999999:000102030405060708090a0b0c0d0e0f:000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f";
+        assert!(!verify_password_hash("password", stored));
+    }
+
+    #[test]
+    fn constant_time_eq_still_rejects_length_mismatch() {
+        assert!(constant_time_eq("same", "same"));
+        assert!(!constant_time_eq("same", "same-prefix"));
+        assert!(!constant_time_eq("same", "diff"));
+    }
+
+    #[tokio::test]
+    async fn login_throttle_locks_after_repeated_failures() {
+        let key = format!("test-{}", uuid::Uuid::new_v4());
+        for _ in 0..LOGIN_FAILURE_THRESHOLD {
+            assert!(check_login_throttle(&key).await.is_ok());
+            record_login_failure(&key).await;
+        }
+        assert!(matches!(
+            check_login_throttle(&key).await,
+            Err((StatusCode::TOO_MANY_REQUESTS, _))
+        ));
+        record_login_success(&key).await;
+        assert!(check_login_throttle(&key).await.is_ok());
     }
 
     #[test]

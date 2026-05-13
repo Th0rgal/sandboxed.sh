@@ -106,6 +106,29 @@ fn select_container_resolv_conf() -> Option<PathBuf> {
     Some(custom_path)
 }
 
+fn cmdline_matches_nspawn_workspace(cmdline: &[u8], workspace_path: &str) -> bool {
+    let args: Vec<&str> = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .filter_map(|arg| std::str::from_utf8(arg).ok())
+        .collect();
+
+    let is_nspawn = args
+        .first()
+        .and_then(|arg| Path::new(arg).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "systemd-nspawn");
+    if !is_nspawn {
+        return false;
+    }
+
+    args.windows(2)
+        .any(|pair| pair[0] == "-D" && pair[1] == workspace_path)
+        || args
+            .iter()
+            .any(|arg| arg.strip_prefix("--directory=") == Some(workspace_path))
+}
+
 fn bind_resolv_conf(cmd: &mut Command) {
     if let Some(path) = select_container_resolv_conf() {
         if path == Path::new("/etc/resolv.conf") {
@@ -122,7 +145,9 @@ fn bind_resolv_conf(cmd: &mut Command) {
 
 #[cfg(test)]
 mod tests {
-    use super::{environ_has_keepalive_marker, normalize_container_path};
+    use super::{
+        cmdline_matches_nspawn_workspace, environ_has_keepalive_marker, normalize_container_path,
+    };
 
     #[test]
     fn container_path_adds_system_dirs_when_missing() {
@@ -151,6 +176,18 @@ mod tests {
         ));
         assert!(!environ_has_keepalive_marker(
             b"PATH=/usr/bin\0SANDBOXED_SH_CONTAINER_KEEPALIVE=0\0HOME=/root\0"
+        ));
+    }
+
+    #[test]
+    fn nspawn_cmdline_match_uses_exact_workspace_arg() {
+        assert!(cmdline_matches_nspawn_workspace(
+            b"/usr/bin/systemd-nspawn\0-D\0/tmp/ws[1]\0--quiet\0",
+            "/tmp/ws[1]"
+        ));
+        assert!(!cmdline_matches_nspawn_workspace(
+            b"/usr/bin/systemd-nspawn\0-D\0/tmp/ws1\0--quiet\0",
+            "/tmp/ws[1]"
         ));
     }
 }
@@ -522,7 +559,7 @@ impl WorkspaceExec {
         // the leader by scanning for `systemd-nspawn -D <workspace path>`.
         let path = self.workspace.path.to_string_lossy().into_owned();
         let nspawn_pids = Command::new("pgrep")
-            .args(["-f", &format!("systemd-nspawn.*-D {}", path)])
+            .args(["-f", "systemd-nspawn"])
             .output()
             .await
             .ok()?;
@@ -531,8 +568,15 @@ impl WorkspaceExec {
         }
         let nspawn_pid = String::from_utf8_lossy(&nspawn_pids.stdout)
             .lines()
-            .next()
-            .map(|s| s.trim().to_string())?;
+            .filter_map(|s| {
+                let pid = s.trim();
+                if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+                cmdline_matches_nspawn_workspace(&cmdline, &path).then(|| pid.to_string())
+            })
+            .next()?;
         if nspawn_pid.is_empty() {
             return None;
         }

@@ -1711,6 +1711,12 @@ async fn enqueue_deferred_request(
             next_attempt_at,
         )
         .await;
+    let record = match record {
+        Ok(record) => record,
+        Err(err) => {
+            return error_response(StatusCode::PAYLOAD_TOO_LARGE, err, "invalid_request_error");
+        }
+    };
 
     (
         StatusCode::ACCEPTED,

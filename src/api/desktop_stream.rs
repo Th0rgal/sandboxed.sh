@@ -22,6 +22,10 @@ use tokio::sync::mpsc;
 use super::auth;
 use super::routes::AppState;
 
+const MAX_SCROLL_STEPS_PER_COMMAND: i32 = 20;
+const MAX_INPUT_DELAY_MS: u64 = 1_000;
+const MAX_TYPE_TEXT_CHARS: usize = 10_000;
+
 /// Query parameters for the desktop stream endpoint
 #[derive(Debug, Deserialize)]
 pub struct StreamParams {
@@ -31,6 +35,22 @@ pub struct StreamParams {
     pub fps: Option<u32>,
     /// JPEG quality 1-100 (default: 70)
     pub quality: Option<u32>,
+}
+
+fn valid_x11_display(display: &str) -> bool {
+    let rest = match display.strip_prefix(':') {
+        Some(rest) => rest,
+        None => return false,
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    let (display_num, screen_num) = rest.split_once('.').unwrap_or((rest, ""));
+    !display_num.is_empty()
+        && display_num.len() <= 5
+        && display_num.bytes().all(|byte| byte.is_ascii_digit())
+        && (screen_num.is_empty()
+            || (screen_num.len() <= 5 && screen_num.bytes().all(|byte| byte.is_ascii_digit())))
 }
 
 /// Extract JWT from WebSocket subprotocol header
@@ -68,7 +88,7 @@ pub async fn desktop_stream_ws(
     }
 
     // Validate display format
-    if !params.display.starts_with(':') {
+    if !valid_x11_display(&params.display) {
         return (StatusCode::BAD_REQUEST, "Invalid display format").into_response();
     }
 
@@ -478,11 +498,19 @@ async fn run_xdotool_scroll_steps(
         .await?;
     }
 
+    let steps_y = steps_y.clamp(-MAX_SCROLL_STEPS_PER_COMMAND, MAX_SCROLL_STEPS_PER_COMMAND);
+    let steps_x = steps_x.clamp(-MAX_SCROLL_STEPS_PER_COMMAND, MAX_SCROLL_STEPS_PER_COMMAND);
+
     if steps_y != 0 {
         let button = if steps_y > 0 { "5" } else { "4" };
         run_xdotool(
             display,
-            &["click", "--repeat", &steps_y.abs().to_string(), button],
+            &[
+                "click",
+                "--repeat",
+                &steps_y.unsigned_abs().to_string(),
+                button,
+            ],
         )
         .await?;
     }
@@ -491,7 +519,12 @@ async fn run_xdotool_scroll_steps(
         let button = if steps_x > 0 { "7" } else { "6" };
         run_xdotool(
             display,
-            &["click", "--repeat", &steps_x.abs().to_string(), button],
+            &[
+                "click",
+                "--repeat",
+                &steps_x.unsigned_abs().to_string(),
+                button,
+            ],
         )
         .await?;
     }
@@ -503,10 +536,11 @@ async fn run_xdotool_type(display: &str, text: &str, delay_ms: Option<u64>) -> a
     if text.is_empty() {
         return Ok(());
     }
-    let delay = delay_ms.unwrap_or(1).to_string();
+    let text: String = text.chars().take(MAX_TYPE_TEXT_CHARS).collect();
+    let delay = delay_ms.unwrap_or(1).min(MAX_INPUT_DELAY_MS).to_string();
     run_xdotool(
         display,
-        &["type", "--delay", &delay, "--clearmodifiers", text],
+        &["type", "--delay", &delay, "--clearmodifiers", &text],
     )
     .await
 }
@@ -515,7 +549,7 @@ async fn run_xdotool_key(display: &str, key: &str, delay_ms: Option<u64>) -> any
     if key.trim().is_empty() {
         return Ok(());
     }
-    let delay = delay_ms.unwrap_or(1).to_string();
+    let delay = delay_ms.unwrap_or(1).min(MAX_INPUT_DELAY_MS).to_string();
     run_xdotool(
         display,
         &["key", "--delay", &delay, "--clearmodifiers", key],
@@ -599,5 +633,16 @@ mod tests {
         assert_eq!(0_u32.clamp(1, 30), 1);
         assert_eq!(50_u32.clamp(1, 30), 30);
         assert_eq!(15_u32.clamp(1, 30), 15);
+    }
+
+    #[test]
+    fn x11_display_validation_rejects_non_numeric_values() {
+        assert!(valid_x11_display(":99"));
+        assert!(valid_x11_display(":99.0"));
+        assert!(!valid_x11_display(""));
+        assert!(!valid_x11_display(":"));
+        assert!(!valid_x11_display("localhost:99"));
+        assert!(!valid_x11_display(":../../tmp/x"));
+        assert!(!valid_x11_display(":999999"));
     }
 }

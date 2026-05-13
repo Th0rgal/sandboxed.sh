@@ -2111,6 +2111,75 @@ async fn validate_library_command(
     }
 }
 
+fn validate_local_automation_path(path: &str) -> Result<(), (StatusCode, String)> {
+    let candidate = std::path::Path::new(path);
+    if path.trim().is_empty() || candidate.is_absolute() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Local automation command path must be relative".to_string(),
+        ));
+    }
+
+    for component in candidate.components() {
+        match component {
+            std::path::Component::Normal(part) if !part.is_empty() => {}
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Local automation command path cannot traverse directories".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_local_automation_path(
+    workspace_path: &std::path::Path,
+    path: &str,
+) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    validate_local_automation_path(path)?;
+    let workspace_root = workspace_path.canonicalize().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to resolve workspace path: {e}"),
+        )
+    })?;
+    let canonical = workspace_path.join(path).canonicalize().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to resolve local automation command path: {e}"),
+        )
+    })?;
+    if !canonical.starts_with(&workspace_root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Local automation command path escapes workspace".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
+async fn validate_automation_command_source(
+    state: &AppState,
+    _control: &ControlState,
+    _mission_id: Uuid,
+    command_source: &mission_store::CommandSource,
+) -> Result<(), (StatusCode, String)> {
+    match command_source {
+        mission_store::CommandSource::Library { name } => {
+            validate_library_command(state, name).await
+        }
+        mission_store::CommandSource::LocalFile { path } => {
+            validate_local_automation_path(path)?;
+            Ok(())
+        }
+        mission_store::CommandSource::Inline { .. } => Ok(()),
+    }
+}
+
 async fn mission_has_active_automation(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
@@ -5917,7 +5986,17 @@ async fn automation_scheduler_loop(
                 CommandSource::LocalFile { path } => {
                     // Read file from mission workspace
                     let file_path = if let Some(ws) = workspace.as_ref() {
-                        ws.path.join(path)
+                        match resolve_local_automation_path(&ws.path, path) {
+                            Ok(path) => path,
+                            Err((_, error)) => {
+                                tracing::warn!(
+                                    "Invalid local file path for automation {}: {}",
+                                    automation.id,
+                                    error
+                                );
+                                continue;
+                            }
+                        }
                     } else {
                         tracing::warn!(
                             "Workspace {} not found for automation {}",
@@ -6181,7 +6260,8 @@ async fn resolve_automation_command(
         }
         CommandSource::LocalFile { path } => {
             let ws = workspace.as_ref()?;
-            tokio::fs::read_to_string(ws.path.join(path)).await.ok()?
+            let file_path = resolve_local_automation_path(&ws.path, path).ok()?;
+            tokio::fs::read_to_string(file_path).await.ok()?
         }
         CommandSource::Inline { content } => content.clone(),
     };
@@ -6688,7 +6768,17 @@ async fn agent_finished_automation_messages(
             }
             CommandSource::LocalFile { path } => {
                 let file_path = if let Some(ws) = workspace.as_ref() {
-                    ws.path.join(path)
+                    match resolve_local_automation_path(&ws.path, path) {
+                        Ok(path) => path,
+                        Err((_, error)) => {
+                            tracing::warn!(
+                                "Invalid local file path for automation {}: {}",
+                                automation.id,
+                                error
+                            );
+                            continue;
+                        }
+                    }
                 } else {
                     tracing::warn!(
                         "Workspace {} not found for automation {}",
@@ -10394,10 +10484,7 @@ pub async fn create_automation(
 ) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
-    // Validate the command exists in the library if CommandSource::Library
-    if let mission_store::CommandSource::Library { ref name } = req.command_source {
-        validate_library_command(&state, name).await?;
-    }
+    validate_automation_command_source(&state, &control, mission_id, &req.command_source).await?;
 
     // Generate webhook_id if trigger type is Webhook
     let trigger = match req.trigger {
@@ -10591,9 +10678,9 @@ pub async fn update_automation(
 
     let mut automation = require_automation(&control.mission_store, automation_id).await?;
 
-    // Validate the command exists in the library if CommandSource::Library is being updated
-    if let Some(mission_store::CommandSource::Library { name }) = req.command_source.as_ref() {
-        validate_library_command(&state, name).await?;
+    if let Some(command_source) = req.command_source.as_ref() {
+        validate_automation_command_source(&state, &control, automation.mission_id, command_source)
+            .await?;
     }
 
     // Update fields if provided
@@ -10990,6 +11077,38 @@ const MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// bundles must use the chunked route, which stages chunks on disk
 /// first.
 const MISSION_BUNDLE_SINGLE_SHOT_MAX_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+const MISSION_IMPORT_CHUNK_MAX_BYTES: usize = 128 * 1024 * 1024;
+const MISSION_IMPORT_MAX_CHUNKS: u32 =
+    (MISSION_BUNDLE_MAX_DECOMPRESSED_BYTES / MISSION_IMPORT_CHUNK_MAX_BYTES as u64) as u32;
+
+fn validate_mission_import_chunk_shape(
+    index: Option<u32>,
+    total_chunks: u32,
+) -> Result<(), (StatusCode, String)> {
+    if total_chunks == 0 || total_chunks > MISSION_IMPORT_MAX_CHUNKS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "total_chunks must be between 1 and {}",
+                MISSION_IMPORT_MAX_CHUNKS
+            ),
+        ));
+    }
+
+    if let Some(index) = index {
+        if index >= MISSION_IMPORT_MAX_CHUNKS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "chunk index must be less than {}",
+                    MISSION_IMPORT_MAX_CHUNKS
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
 
 /// Stream a mission bundle out of a staged chunk directory without ever
 /// holding the concatenated body in memory. Handles gzip transparently —
@@ -11009,6 +11128,7 @@ fn parse_mission_bundle_from_chunk_dir(
             "total_chunks must be > 0".to_string(),
         ));
     }
+    validate_mission_import_chunk_shape(None, total_chunks)?;
 
     // Peek at the first chunk to auto-detect gzip when the caller
     // forgot to pass the hint. A plain `[0x1f, 0x8b]` prefix is
@@ -11350,6 +11470,16 @@ pub async fn upload_mission_import_chunk(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let safe_id = sanitize_upload_id(&upload_id)
         .ok_or((StatusCode::BAD_REQUEST, "Invalid upload_id".to_string()))?;
+    validate_mission_import_chunk_shape(Some(index), MISSION_IMPORT_MAX_CHUNKS)?;
+    if body.len() > MISSION_IMPORT_CHUNK_MAX_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Chunk too large: limit is {} bytes",
+                MISSION_IMPORT_CHUNK_MAX_BYTES
+            ),
+        ));
+    }
     let dir = import_chunks_dir(&safe_id);
     if !dir.exists() {
         return Err((
@@ -11410,6 +11540,7 @@ pub async fn commit_mission_import(
     // daemon". The parser streams via `serde_json::from_reader` on a
     // chained `File` iterator (optionally gzip-decoded in flight).
     let total_chunks = query.total_chunks;
+    validate_mission_import_chunk_shape(None, total_chunks)?;
     let gzip_hint = query.gzip;
     let dir_for_parse = dir.clone();
     let bundle_result = tokio::task::spawn_blocking(move || {
@@ -11681,7 +11812,7 @@ pub async fn webhook_receiver(
         CommandSource::LocalFile { path } => {
             // Read file from mission workspace
             let file_path = if let Some(ws) = workspace.as_ref() {
-                ws.path.join(path)
+                resolve_local_automation_path(&ws.path, path)?
             } else {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -15545,6 +15676,28 @@ And the report:
             normalize_model_override_for_backend(Some("codex"), "   "),
             None
         );
+    }
+
+    #[test]
+    fn test_validate_mission_import_chunk_shape_bounds_counts() {
+        assert!(validate_mission_import_chunk_shape(None, 0).is_err());
+        assert!(validate_mission_import_chunk_shape(None, MISSION_IMPORT_MAX_CHUNKS + 1).is_err());
+        assert!(validate_mission_import_chunk_shape(Some(MISSION_IMPORT_MAX_CHUNKS), 1).is_err());
+        assert!(validate_mission_import_chunk_shape(Some(0), 1).is_ok());
+        assert!(validate_mission_import_chunk_shape(
+            Some(MISSION_IMPORT_MAX_CHUNKS - 1),
+            MISSION_IMPORT_MAX_CHUNKS
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_local_automation_path_rejects_escape() {
+        assert!(validate_local_automation_path("../secret.md").is_err());
+        assert!(validate_local_automation_path("commands/../../secret.md").is_err());
+        assert!(validate_local_automation_path("/etc/passwd").is_err());
+        assert!(validate_local_automation_path("").is_err());
+        assert!(validate_local_automation_path("commands/reminder.md").is_ok());
     }
 
     #[test]

@@ -1040,31 +1040,101 @@ async fn get_oh_my_opencode_version() -> Option<String> {
         }
     }
 
-    // Fallback: scan bun cache for platform-specific packages
-    // (e.g. oh-my-opencode-linux-x64@3.0.1@@@1)
-    let home = home_dir();
-    let output = Command::new("bash")
-        .args([
-            "-c",
-            &format!(
-                r#"find {}/.bun/install/cache -maxdepth 1 -type d -name 'oh-my-opencode*@*' 2>/dev/null | \
-                   grep -oP 'oh-my-opencode[^@]*@\K[0-9]+\.[0-9]+\.[0-9]+' | \
-                   sort -V | tail -1"#,
-                home
-            ),
-        ])
-        .output()
-        .await
-        .ok()?;
+    latest_oh_my_opencode_cache_version().await
+}
 
-    if output.status.success() {
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !version.is_empty() {
-            return Some(version);
+fn oh_my_opencode_cache_version_from_name(name: &str) -> Option<String> {
+    let (_, version_part) = name.split_once('@')?;
+    let version = version_part.split("@@@").next().unwrap_or(version_part);
+    extract_version_token(version)
+}
+
+async fn latest_oh_my_opencode_cache_version() -> Option<String> {
+    let cache_dir = std::path::Path::new(&home_dir())
+        .join(".bun")
+        .join("install")
+        .join("cache");
+    let mut entries = tokio::fs::read_dir(cache_dir).await.ok()?;
+    let mut versions = Vec::new();
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        if !name.starts_with("oh-my-opencode") || !name.contains('@') {
+            continue;
+        }
+        if let Some(version) = oh_my_opencode_cache_version_from_name(&name) {
+            versions.push(version);
         }
     }
 
-    None
+    versions.sort_by(|a, b| compare_semver(a, b));
+    versions.pop()
+}
+
+fn compare_semver(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse = |value: &str| {
+        let mut parts = value
+            .split('.')
+            .take(3)
+            .map(|part| part.parse::<u64>().unwrap_or(0));
+        [
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        ]
+    };
+    parse(a).cmp(&parse(b))
+}
+
+async fn remove_oh_my_opencode_cache_dirs(home: &str) {
+    for cache_dir in [
+        std::path::Path::new(home)
+            .join(".bun")
+            .join("install")
+            .join("cache"),
+        std::path::Path::new(home)
+            .join(".cache")
+            .join(".bun")
+            .join("install")
+            .join("cache"),
+    ] {
+        remove_matching_child_dirs(&cache_dir, "oh-my-opencode").await;
+    }
+
+    let npx_dir = std::path::Path::new(home).join(".npm").join("_npx");
+    let Ok(mut entries) = tokio::fs::read_dir(npx_dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let node_modules_dir = entry.path().join("node_modules");
+        remove_matching_child_dirs(&node_modules_dir, "oh-my-opencode").await;
+    }
+}
+
+async fn remove_matching_child_dirs(parent: &std::path::Path, prefix: &str) {
+    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|name| name.starts_with(prefix)) {
+            let _ = tokio::fs::remove_dir_all(entry.path()).await;
+        }
+    }
 }
 
 /// Check if there's a newer version of oh-my-opencode available.
@@ -1224,6 +1294,8 @@ fn container_install_command(component: &str) -> Option<String> {
 /// have an npm-installed binary at /usr/local/bin: bun installs to ~/.bun/bin which is later on
 /// PATH, leaving the stale npm copy in place.
 fn npm_install_shell(bin: &str, package: &str) -> String {
+    // npm fails with EEXIST when /usr/local/bin/<bin> is a regular file (e.g. a binary release
+    // already in place from a non-npm installer), so use --force on npm. bun overwrites by default.
     format!(
         r#"set -e
 PKG="{package}"
@@ -1233,7 +1305,10 @@ case "$CURRENT" in
   */node_modules/*|/usr/local/*|/usr/*) PM=npm ;;
   *) command -v bun >/dev/null 2>&1 && PM=bun || PM=npm ;;
 esac
-$PM install -g "$PKG""#
+case "$PM" in
+  npm) npm install -g --force "$PKG" ;;
+  bun) bun install -g "$PKG" ;;
+esac"#
     )
 }
 
@@ -1722,18 +1797,7 @@ fn stream_oh_my_opencode_update() -> impl Stream<Item = Result<Event, std::conve
 
         // Clear ALL oh-my-opencode caches (bun stores in multiple locations)
         yield sse("log", "Clearing oh-my-opencode caches...", Some(15));
-        let cache_clear_script = format!(
-            r#"
-            rm -rf {home}/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.cache/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.npm/_npx/*/node_modules/oh-my-opencode* 2>/dev/null
-            "#,
-            home = home
-        );
-        let _ = Command::new("bash")
-            .args(["-c", &cache_clear_script])
-            .output()
-            .await;
+        remove_oh_my_opencode_cache_dirs(&home).await;
 
         yield sse("log", "Running bunx oh-my-opencode@latest install...", Some(25));
 
@@ -1982,18 +2046,7 @@ fn stream_oh_my_opencode_uninstall() -> impl Stream<Item = Result<Event, std::co
 
         // Clear bun cache for oh-my-opencode
         yield sse("log", "Clearing oh-my-opencode caches...", Some(30));
-        let cache_clear_script = format!(
-            r#"
-            rm -rf {home}/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.cache/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.npm/_npx/*/node_modules/oh-my-opencode* 2>/dev/null
-            "#,
-            home = home
-        );
-        let _ = Command::new("bash")
-            .args(["-c", &cache_clear_script])
-            .output()
-            .await;
+        remove_oh_my_opencode_cache_dirs(&home).await;
 
         // Remove the oh-my-opencode config file
         yield sse("log", "Removing oh-my-opencode configuration...", Some(60));
@@ -2017,7 +2070,10 @@ fn stream_oh_my_opencode_uninstall() -> impl Stream<Item = Result<Event, std::co
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_repo_path, normalize_repo_path, select_repo_path};
+    use super::{
+        compare_semver, is_safe_repo_path, normalize_repo_path,
+        oh_my_opencode_cache_version_from_name, select_repo_path,
+    };
 
     #[test]
     fn select_repo_path_prefers_env() {
@@ -2068,5 +2124,25 @@ mod tests {
         assert!(is_safe_repo_path(std::path::Path::new(
             crate::settings::DEFAULT_SANDBOXED_REPO_PATH
         )));
+    }
+
+    #[test]
+    fn parses_oh_my_opencode_cache_versions() {
+        assert_eq!(
+            oh_my_opencode_cache_version_from_name("oh-my-opencode-linux-x64@3.0.1@@@1"),
+            Some("3.0.1".to_string())
+        );
+        assert_eq!(
+            oh_my_opencode_cache_version_from_name("other-package@9.9.9"),
+            Some("9.9.9".to_string())
+        );
+    }
+
+    #[test]
+    fn compares_semver_numerically() {
+        assert_eq!(
+            compare_semver("3.10.0", "3.9.9"),
+            std::cmp::Ordering::Greater
+        );
     }
 }

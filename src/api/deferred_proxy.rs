@@ -12,6 +12,8 @@ pub const DEFER_ON_RATE_LIMIT_HEADER: &str = "x-sandboxed-defer-on-rate-limit";
 const DEFAULT_TTL_HOURS: i64 = 24;
 const WORKER_POLL_INTERVAL_SECS: u64 = 2;
 const WORKER_FALLBACK_RETRY_SECS: i64 = 10;
+const MAX_DEFERRED_REQUESTS: usize = 256;
+const MAX_DEFERRED_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -97,7 +99,16 @@ impl DeferredRequestStore {
         request_payload: serde_json::Value,
         openai_organization: Option<String>,
         next_attempt_at: DateTime<Utc>,
-    ) -> DeferredRequestRecord {
+    ) -> Result<DeferredRequestRecord, String> {
+        let payload_bytes = serde_json::to_vec(&request_payload)
+            .map_err(|e| format!("Failed to serialize deferred request payload: {}", e))?;
+        if payload_bytes.len() > MAX_DEFERRED_PAYLOAD_BYTES {
+            return Err(format!(
+                "Deferred request payload is too large ({} bytes, max {})",
+                payload_bytes.len(),
+                MAX_DEFERRED_PAYLOAD_BYTES
+            ));
+        }
         let now = Utc::now();
         let rec = DeferredRequestRecord {
             id: Uuid::new_v4(),
@@ -114,7 +125,7 @@ impl DeferredRequestStore {
             response_payload: None,
         };
         self.upsert(rec.clone()).await;
-        rec
+        Ok(rec)
     }
 
     pub async fn get(&self, id: Uuid) -> Option<DeferredRequestRecord> {
@@ -223,6 +234,7 @@ impl DeferredRequestStore {
         {
             let mut guard = self.inner.write().await;
             guard.insert(rec.id, rec);
+            prune_deferred_records(&mut guard);
         }
         self.persist().await;
     }
@@ -244,6 +256,11 @@ impl DeferredRequestStore {
                     rec.updated_at = now;
                     changed = true;
                 }
+            }
+            let before = guard.len();
+            prune_deferred_records(&mut guard);
+            if guard.len() != before {
+                changed = true;
             }
         }
         if changed {
@@ -276,6 +293,36 @@ impl DeferredRequestStore {
                 tracing::warn!(path = %self.path.display(), error = %err, "Failed to serialize deferred request store");
             }
         }
+    }
+}
+
+fn terminal_status(status: &DeferredRequestStatus) -> bool {
+    matches!(
+        status,
+        DeferredRequestStatus::Succeeded
+            | DeferredRequestStatus::Failed
+            | DeferredRequestStatus::Canceled
+            | DeferredRequestStatus::Expired
+    )
+}
+
+fn prune_deferred_records(records: &mut HashMap<Uuid, DeferredRequestRecord>) {
+    let now = Utc::now();
+    records.retain(|_, rec| rec.expires_at > now || !terminal_status(&rec.status));
+
+    if records.len() <= MAX_DEFERRED_REQUESTS {
+        return;
+    }
+
+    let mut removable: Vec<(Uuid, bool, DateTime<Utc>)> = records
+        .values()
+        .map(|rec| (rec.id, terminal_status(&rec.status), rec.created_at))
+        .collect();
+    removable.sort_by_key(|(_, is_terminal, created_at)| (!*is_terminal, *created_at));
+
+    let remove_count = records.len().saturating_sub(MAX_DEFERRED_REQUESTS);
+    for (id, _, _) in removable.into_iter().take(remove_count) {
+        records.remove(&id);
     }
 }
 
@@ -446,7 +493,8 @@ mod tests {
                 Some("org-123".to_string()),
                 next_attempt_at,
             )
-            .await;
+            .await
+            .expect("enqueue");
         assert_eq!(queued.status, DeferredRequestStatus::Queued);
         assert_eq!(queued.attempt_count, 0);
 
@@ -493,7 +541,8 @@ mod tests {
                 None,
                 Utc::now(),
             )
-            .await;
+            .await
+            .expect("enqueue");
 
         let reloaded = DeferredRequestStore::new(path).await;
         let fetched = reloaded
@@ -502,5 +551,44 @@ mod tests {
             .expect("record should exist after reload");
         assert_eq!(fetched.id, created.id);
         assert_eq!(fetched.chain_id, "builtin/smart");
+    }
+
+    #[tokio::test]
+    async fn deferred_store_rejects_oversized_payloads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("deferred_requests.json");
+        let store = DeferredRequestStore::new(path).await;
+
+        let err = store
+            .enqueue(
+                "builtin/smart".to_string(),
+                serde_json::json!({ "model": "builtin/smart", "blob": "x".repeat(MAX_DEFERRED_PAYLOAD_BYTES) }),
+                None,
+                Utc::now(),
+            )
+            .await
+            .expect_err("oversized payload should be rejected");
+        assert!(err.contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn deferred_store_prunes_to_capacity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("deferred_requests.json");
+        let store = DeferredRequestStore::new(path).await;
+
+        for _ in 0..(MAX_DEFERRED_REQUESTS + 5) {
+            let _ = store
+                .enqueue(
+                    "builtin/smart".to_string(),
+                    serde_json::json!({ "model": "builtin/smart", "messages": [] }),
+                    None,
+                    Utc::now() + chrono::Duration::hours(1),
+                )
+                .await
+                .expect("enqueue");
+        }
+
+        assert!(store.inner.read().await.len() <= MAX_DEFERRED_REQUESTS);
     }
 }

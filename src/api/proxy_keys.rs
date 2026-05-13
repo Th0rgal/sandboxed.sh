@@ -22,6 +22,9 @@ use uuid::Uuid;
 
 use super::routes::AppState;
 
+const MAX_PROXY_API_KEYS: usize = 128;
+const MAX_PROXY_KEY_NAME_LEN: usize = 128;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,8 +101,10 @@ impl ProxyApiKeyStore {
             return Ok(Vec::new());
         }
         let contents = std::fs::read_to_string(&self.storage_path)?;
-        serde_json::from_str(&contents)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let mut keys: Vec<ProxyApiKey> = serde_json::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        sanitize_loaded_keys(&mut keys);
+        Ok(keys)
     }
 
     fn save_to_disk(&self, keys: &[ProxyApiKey]) -> Result<(), std::io::Error> {
@@ -116,6 +121,7 @@ impl ProxyApiKeyStore {
 
     /// Create a new API key. Returns the raw key value (only available once).
     pub async fn create(&self, name: String) -> Result<CreateKeyResponse, String> {
+        let name = validate_key_name(&name)?;
         let id = Uuid::new_v4();
         let raw_key = format!("sk-proxy-{}", Uuid::new_v4().as_simple());
         let key_hash = hex_sha256(&raw_key);
@@ -131,6 +137,12 @@ impl ProxyApiKeyStore {
         };
 
         let mut keys = self.keys.write().await;
+        if keys.len() >= MAX_PROXY_API_KEYS {
+            return Err(format!(
+                "Maximum number of proxy API keys reached ({})",
+                MAX_PROXY_API_KEYS
+            ));
+        }
         keys.push(record);
         self.save_to_disk(&keys)
             .map_err(|e| format!("Failed to persist proxy API key: {}", e))?;
@@ -193,6 +205,43 @@ fn hex_sha256(input: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn validate_key_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Name is required".to_string());
+    }
+    if trimmed.chars().count() > MAX_PROXY_KEY_NAME_LEN {
+        return Err(format!(
+            "Name is too long (max {} characters)",
+            MAX_PROXY_KEY_NAME_LEN
+        ));
+    }
+    if trimmed.contains('\0') {
+        return Err("Name cannot contain NUL bytes".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn valid_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn sanitize_loaded_keys(keys: &mut Vec<ProxyApiKey>) {
+    keys.retain(|key| {
+        key.name.chars().count() <= MAX_PROXY_KEY_NAME_LEN
+            && !key.name.trim().is_empty()
+            && !key.name.contains('\0')
+            && valid_hash(&key.key_hash)
+            && key.key_prefix.starts_with("sk-proxy-")
+            && key.key_prefix.len() <= 32
+    });
+    keys.sort_by_key(|key| key.created_at);
+    if keys.len() > MAX_PROXY_API_KEYS {
+        let drop_count = keys.len() - MAX_PROXY_API_KEYS;
+        keys.drain(0..drop_count);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // API Handlers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -214,12 +263,10 @@ async fn create_key(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateKeyRequest>,
 ) -> Result<(StatusCode, Json<CreateKeyResponse>), (StatusCode, String)> {
-    let name = req.name.trim().to_string();
-    if name.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Name is required".to_string()));
-    }
-    match state.proxy_api_keys.create(name).await {
+    match state.proxy_api_keys.create(req.name).await {
         Ok(resp) => Ok((StatusCode::CREATED, Json(resp))),
+        Err(e) if e.contains("Name") => Err((StatusCode::BAD_REQUEST, e)),
+        Err(e) if e.contains("Maximum number") => Err((StatusCode::CONFLICT, e)),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
     }
 }
@@ -232,5 +279,82 @@ async fn delete_key(
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn proxy_key_store_rejects_empty_and_long_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ProxyApiKeyStore::new(temp.path().join("proxy_keys.json")).await;
+
+        let err = store
+            .create("   ".to_string())
+            .await
+            .expect_err("empty names should be rejected");
+        assert!(err.contains("required"));
+
+        let err = store
+            .create("x".repeat(MAX_PROXY_KEY_NAME_LEN + 1))
+            .await
+            .expect_err("long names should be rejected");
+        assert!(err.contains("too long"));
+    }
+
+    #[tokio::test]
+    async fn proxy_key_store_enforces_capacity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ProxyApiKeyStore::new(temp.path().join("proxy_keys.json")).await;
+
+        for idx in 0..MAX_PROXY_API_KEYS {
+            store
+                .create(format!("key-{idx}"))
+                .await
+                .expect("key should be created below capacity");
+        }
+
+        let err = store
+            .create("overflow".to_string())
+            .await
+            .expect_err("capacity overflow should be rejected");
+        assert!(err.contains("Maximum number"));
+    }
+
+    #[tokio::test]
+    async fn proxy_key_store_sanitizes_loaded_records() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("proxy_keys.json");
+        let now = chrono::Utc::now();
+        let mut keys = Vec::new();
+        keys.push(ProxyApiKey {
+            id: Uuid::new_v4(),
+            name: "valid".to_string(),
+            key_hash: "a".repeat(64),
+            key_prefix: "sk-proxy-1234567".to_string(),
+            created_at: now,
+        });
+        keys.push(ProxyApiKey {
+            id: Uuid::new_v4(),
+            name: "\0bad".to_string(),
+            key_hash: "b".repeat(64),
+            key_prefix: "sk-proxy-1234567".to_string(),
+            created_at: now,
+        });
+        keys.push(ProxyApiKey {
+            id: Uuid::new_v4(),
+            name: "bad-hash".to_string(),
+            key_hash: "not-hex".to_string(),
+            key_prefix: "sk-proxy-1234567".to_string(),
+            created_at: now,
+        });
+        std::fs::write(&path, serde_json::to_string(&keys).expect("json")).expect("write");
+
+        let store = ProxyApiKeyStore::new(path).await;
+        let loaded = store.list().await;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "valid");
     }
 }
