@@ -191,7 +191,13 @@ export function ServerConnectionCard({
   };
 
   const handleSyncAll = (report: ComponentWorkspaceReport) => {
-    const outOfSync = report.workspaces.filter((w) => !w.in_sync);
+    // Bulk sync only touches workspaces that already have this component
+    // installed (version != null) — skipping bare containers avoids surprise
+    // installs into workspaces the user never asked to add this backend to.
+    // Per-workspace "Sync" buttons remain available for explicit installs.
+    const outOfSync = report.workspaces.filter(
+      (w) => !w.in_sync && w.version !== null
+    );
     if (outOfSync.length === 0) return;
     // Sequential to avoid concurrent installs racing the same package manager.
     void (async () => {
@@ -225,44 +231,62 @@ export function ServerConnectionCard({
 
   // ---- status helpers ----------------------------------------------------
 
+  type Tone = 'emerald' | 'amber' | 'red';
+
+  type SyncSummary = {
+    tone: Tone;
+    // Short label shown only on host-only components (no workspaces involved).
+    shortLabel?: string;
+    // Detailed message rendered under the component name when we have richer
+    // info (out-of-sync counts, upstream availability, etc.).
+    detail?: string;
+  };
+
   const componentSyncSummary = (
     component: ComponentInfo,
     report: ComponentWorkspaceReport | undefined
-  ) => {
+  ): SyncSummary => {
     if (!report || report.workspaces.length === 0) {
-      // No workspace-level data: surface host status only.
       if (component.status === 'update_available') {
-        return { label: 'Update available', tone: 'amber' as const };
+        return { tone: 'amber', shortLabel: 'Update available' };
       }
       if (component.status === 'not_installed' || component.status === 'error') {
-        return { label: 'Not installed', tone: 'red' as const };
+        return { tone: 'red', shortLabel: 'Not installed' };
       }
-      return { label: 'Synced', tone: 'emerald' as const };
+      return { tone: 'emerald', shortLabel: 'Synced' };
     }
     const total = report.workspaces.length;
     const synced = report.workspaces.filter((w) => w.in_sync).length;
+    const outOfSync = total - synced;
     const hostBehindUpstream = !!report.host_update_available;
+
     if (synced === total && !hostBehindUpstream) {
-      return { label: `All ${total} synced`, tone: 'emerald' as const };
+      return { tone: 'emerald', detail: `All ${total} workspaces in sync` };
     }
-    if (synced === total && hostBehindUpstream) {
-      return { label: `${total}/${total} on host, upstream newer`, tone: 'amber' as const };
-    }
+    // For drift cases we leave the detail empty — the "Sync N" action button
+    // already conveys the count. We only set a detail line when there's
+    // information the button can't carry (e.g. upstream version below).
     return {
-      label: `${synced}/${total} synced`,
-      tone: synced === 0 ? ('red' as const) : ('amber' as const),
+      tone: outOfSync === total ? 'red' : 'amber',
     };
   };
 
-  const toneBadgeClass = (tone: 'emerald' | 'amber' | 'red') =>
+  const toneBadgeClass = (tone: Tone) =>
     tone === 'emerald'
       ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
       : tone === 'amber'
       ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
       : 'border-red-500/30 bg-red-500/10 text-red-300';
 
-  const toneDotClass = (tone: 'emerald' | 'amber' | 'red') =>
+  const toneDotClass = (tone: Tone) =>
     tone === 'emerald' ? 'bg-emerald-400' : tone === 'amber' ? 'bg-amber-400' : 'bg-red-400';
+
+  const toneTextClass = (tone: Tone) =>
+    tone === 'emerald'
+      ? 'text-emerald-300/80'
+      : tone === 'amber'
+      ? 'text-amber-300/90'
+      : 'text-red-300/90';
 
   const isOpInProgress = (key: OpKey) => activeOp === key && activeOpKind === 'update';
 
@@ -387,12 +411,24 @@ export function ServerConnectionCard({
               components.map((component) => {
                 const report = wsByName.get(component.name);
                 const summary = componentSyncSummary(component, report);
-                const outOfSync = report ? report.workspaces.filter((w) => !w.in_sync) : [];
+                // "Sync N" bulk action only counts workspaces that already have the
+                // component installed — not-installed ones get a per-row Sync button
+                // instead, so users opt in explicitly per workspace.
+                const outOfSync = report
+                  ? report.workspaces.filter((w) => !w.in_sync && w.version !== null)
+                  : [];
                 const isExpanded = rowExpanded(component, report);
                 const hostOpInFlight = isOpInProgress(component.name);
-                const updateAvailableLine = component.update_available
-                  ? `v${component.update_available} available upstream`
+                const upstreamLine = component.update_available
+                  ? `v${component.update_available} upstream`
                   : null;
+                // One muted line summarises everything actionable about the row.
+                // Joining with a middle-dot keeps things compact instead of
+                // stacking two amber lines on top of each other.
+                const detailParts = [upstreamLine, summary.detail].filter(
+                  (v): v is string => !!v
+                );
+                const detailLine = detailParts.join(' · ');
 
                 return (
                   <div
@@ -418,41 +454,69 @@ export function ServerConnectionCard({
                         report ? 'cursor-pointer' : 'cursor-default'
                       )}
                     >
-                      <span className="text-base">{componentIcons[component.name] || '📦'}</span>
+                      <span
+                        className={cn(
+                          'h-2 w-2 rounded-full shrink-0',
+                          toneDotClass(summary.tone)
+                        )}
+                        aria-hidden
+                      />
+                      <span className="text-base shrink-0">
+                        {componentIcons[component.name] || '📦'}
+                      </span>
 
                       <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm text-white/80">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-sm text-white/80 truncate">
                             {componentNames[component.name] || component.name}
                           </span>
                           {component.version && (
-                            <span className="text-xs text-white/40">v{component.version}</span>
+                            <span className="text-xs text-white/40 shrink-0">
+                              v{component.version}
+                            </span>
                           )}
-                          <span
+                          {/* Compact status only for host-only components.
+                              Workspaced components surface state in the
+                              sub-line + the dot, avoiding a second amber pill
+                              right next to the amber action button. */}
+                          {summary.shortLabel && (
+                            <span
+                              className={cn(
+                                'inline-flex items-center rounded-md border px-1.5 py-0.5 text-[10px] font-medium shrink-0',
+                                toneBadgeClass(summary.tone)
+                              )}
+                            >
+                              {summary.shortLabel}
+                            </span>
+                          )}
+                        </div>
+                        {detailLine && (
+                          <div
                             className={cn(
-                              'inline-flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-[10px] font-medium',
-                              toneBadgeClass(summary.tone)
+                              'text-xs mt-0.5',
+                              toneTextClass(summary.tone)
                             )}
                           >
-                            <span className={cn('h-1.5 w-1.5 rounded-full', toneDotClass(summary.tone))} />
-                            {summary.label}
-                          </span>
-                        </div>
-                        {updateAvailableLine && (
-                          <div className="text-xs text-amber-400/80 mt-0.5">{updateAvailableLine}</div>
+                            {detailLine}
+                          </div>
                         )}
-                        {!component.installed && (
-                          <div className="text-xs text-red-400/80 mt-0.5">Not installed on host</div>
+                        {!component.installed && !summary.shortLabel && (
+                          <div className="text-xs text-red-300/80 mt-0.5">
+                            Not installed on host
+                          </div>
                         )}
                       </div>
 
-                      <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                      <div
+                        className="flex items-center gap-1.5 shrink-0"
+                        onClick={(e) => e.stopPropagation()}
+                      >
                         {/* Host-level Update/Install button stays available even when collapsed. */}
                         {component.status === 'update_available' && (
                           <button
                             onClick={() => handleHostUpdate(component)}
                             disabled={activeOp !== null}
-                            className="flex items-center gap-1.5 rounded-lg bg-indigo-500/20 border border-indigo-500/30 px-2.5 py-1 text-xs text-indigo-300 hover:bg-indigo-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="flex items-center gap-1.5 rounded-md bg-indigo-500/15 border border-indigo-500/25 px-2 py-1 text-[11px] font-medium text-indigo-300 hover:bg-indigo-500/25 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                             title="Update host installation"
                           >
                             {hostOpInFlight ? (
@@ -467,7 +531,7 @@ export function ServerConnectionCard({
                           <button
                             onClick={() => handleHostUpdate(component)}
                             disabled={activeOp !== null}
-                            className="flex items-center gap-1.5 rounded-lg bg-emerald-500/20 border border-emerald-500/30 px-2.5 py-1 text-xs text-emerald-300 hover:bg-emerald-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="flex items-center gap-1.5 rounded-md bg-emerald-500/15 border border-emerald-500/25 px-2 py-1 text-[11px] font-medium text-emerald-300 hover:bg-emerald-500/25 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             <ArrowUp className="h-3 w-3" />
                             Install
@@ -477,7 +541,7 @@ export function ServerConnectionCard({
                           <button
                             onClick={() => handleSyncAll(report)}
                             disabled={activeOp !== null}
-                            className="flex items-center gap-1.5 rounded-lg bg-amber-500/20 border border-amber-500/30 px-2.5 py-1 text-xs text-amber-300 hover:bg-amber-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="flex items-center gap-1.5 rounded-md bg-amber-500/15 border border-amber-500/25 px-2 py-1 text-[11px] font-medium text-amber-300 hover:bg-amber-500/25 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                             title="Sync all out-of-sync workspaces"
                           >
                             <ArrowUp className="h-3 w-3" />
@@ -488,7 +552,7 @@ export function ServerConnectionCard({
                           <button
                             onClick={() => handleHostUninstall(component)}
                             disabled={activeOp !== null}
-                            className="p-1.5 rounded-lg text-white/30 hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="p-1.5 rounded-md text-white/30 hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                             title={`Uninstall ${componentNames[component.name] || component.name}`}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
