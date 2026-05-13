@@ -1,0 +1,20 @@
+{
+  "name": "autonomous-transaction-safety-check",
+  "description": "Autonomous transaction safety check: an isolated Ubuntu workspace with the read-only OKX security skill for token, DApp, transaction, signature, and approval risk reports.",
+  "distro": "ubuntu-noble",
+  "skills": [
+    "okx-security"
+  ],
+  "env_vars": {},
+  "encrypted_keys": [],
+  "init_scripts": [
+    "base",
+    "bun-mcp",
+    "uv-python",
+    "network-helpers"
+  ],
+  "init_script": "",
+  "shared_network": null,
+  "mcps": [],
+  "mcps_replace_defaults": true
+}

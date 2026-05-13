@@ -1,3 +1,44 @@
+## Build X-Agent Hackathon: Safe Runtime for Autonomous On-chain AI Agents
+
+**sandboxed.sh is the safe runtime for autonomous on-chain AI agents.**
+
+Run OKX security skills unattended inside isolated Linux workspaces, without
+leaking wallet secrets to the model, the host, or unrelated missions. This is a
+real shipped product, not a hackathon toy: sandboxed.sh already has a web
+dashboard, iOS app, per-mission runtimes for Claude Code/OpenCode/Amp, a
+Git-backed Library, encrypted secrets, MCP integration, and production install
+docs for [Docker](docs/install-docker.md) and [native Ubuntu](docs/install-native.md).
+
+Why this matters for OKX:
+
+- **Read-only is the feature**: the bundled `okx-security` skill can inspect
+  token, DApp, transaction, signature, and approval risk without signing or
+  broadcasting anything.
+- **Isolation matches the threat model**: each autonomous run gets its own
+  workspace, so OKX risk checks can run unattended without exposing host files or
+  long-lived credentials.
+- **Skills become operational infrastructure**: the same Library item is synced
+  into Claude Code, OpenCode, and Amp mission environments instead of being a
+  one-off demo prompt.
+
+<p align="center">
+  <img src="screenshots/okx-security-report.webp" alt="OKX security risk report running inside sandboxed.sh Mission Control" width="100%" />
+</p>
+
+Try it in 60 seconds:
+
+```bash
+git clone https://github.com/Th0rgal/sandboxed.sh.git
+cd sandboxed.sh
+cp .env.example .env
+docker compose up -d
+npx --yes @xagt/agent-plugin@latest setup --target all
+# In the dashboard, create a workspace from:
+# "autonomous-transaction-safety-check"
+```
+
+---
+
 <p align="center">
   <img src="dashboard/public/favicon.svg" width="120" alt="sandboxed.sh" />
 </p>

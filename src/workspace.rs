@@ -5106,4 +5106,46 @@ mod tests {
         assert!(!result.contains("[otel]"));
         assert!(!result.contains("[mcp_servers"));
     }
+
+    #[tokio::test]
+    async fn writes_same_skill_content_to_supported_native_harnesses() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill = SkillContent {
+            name: "okx-security".to_string(),
+            description: Some("Read-only OKX security checks".to_string()),
+            content: "---\nname: okx-security\n---\n\n# OKX Security\n".to_string(),
+            files: vec![(
+                "references/read-only.md".to_string(),
+                "No signing, swaps, broadcasts, or approval changes.".to_string(),
+            )],
+        };
+        let skills = vec![skill];
+
+        write_skills_to_workspace(temp.path(), &skills)
+            .await
+            .unwrap();
+        write_claudecode_skills_to_workspace(temp.path(), &skills)
+            .await
+            .unwrap();
+        write_amp_skills_to_workspace(temp.path(), &skills)
+            .await
+            .unwrap();
+
+        assert!(temp
+            .path()
+            .join(".opencode/skill/okx-security/SKILL.md")
+            .exists());
+        assert!(temp
+            .path()
+            .join(".claude/skills/okx-security/SKILL.md")
+            .exists());
+        assert!(temp
+            .path()
+            .join(".agents/skills/okx-security/SKILL.md")
+            .exists());
+        assert!(temp
+            .path()
+            .join(".agents/skills/okx-security/references/read-only.md")
+            .exists());
+    }
 }

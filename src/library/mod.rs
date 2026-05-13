@@ -74,6 +74,14 @@ const PLUGINS_FILE: &str = "plugins.json";
 const WORKSPACE_TEMPLATE_DIR: &str = "workspace-template";
 const CONFIGS_DIR: &str = "configs";
 const DEFAULT_PROFILE: &str = "default";
+const OKX_SECURITY_SKILL_NAME: &str = "okx-security";
+const OKX_SECURITY_SKILL: &str = include_str!("../../bundled-library/skill/okx-security/SKILL.md");
+const OKX_SECURITY_SOURCE: &str =
+    include_str!("../../bundled-library/skill/okx-security/.skill-source.json");
+const AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE_NAME: &str = "autonomous-transaction-safety-check";
+const AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE: &str = include_str!(
+    "../../bundled-library/workspace-template/autonomous-transaction-safety-check.json"
+);
 
 /// Store for managing the configuration library.
 pub struct LibraryStore {
@@ -95,10 +103,13 @@ impl LibraryStore {
         git::clone_if_needed(&path, remote).await?;
         git::ensure_remote(&path, remote).await?;
 
-        Ok(Self {
+        let store = Self {
             path,
             remote: remote.to_string(),
-        })
+        };
+        store.seed_bundled_hackathon_items().await?;
+
+        Ok(store)
     }
 
     /// Get the library path.
@@ -109,6 +120,46 @@ impl LibraryStore {
     /// Get the remote URL.
     pub fn remote(&self) -> &str {
         &self.remote
+    }
+
+    /// Seed bundled showcase Library items without overwriting user-owned Library content.
+    async fn seed_bundled_hackathon_items(&self) -> Result<()> {
+        let skill_dir = self.skills_dir().join(OKX_SECURITY_SKILL_NAME);
+        let skill_md = skill_dir.join("SKILL.md");
+        if !skill_md.exists() {
+            fs::create_dir_all(&skill_dir)
+                .await
+                .context("Failed to create bundled OKX skill directory")?;
+            fs::write(&skill_md, OKX_SECURITY_SKILL)
+                .await
+                .context("Failed to write bundled OKX security skill")?;
+        }
+
+        let source_path = skill_dir.join(".skill-source.json");
+        if !source_path.exists() {
+            fs::write(&source_path, OKX_SECURITY_SOURCE)
+                .await
+                .context("Failed to write bundled OKX skill source metadata")?;
+        }
+
+        let templates_dir = self.path.join(WORKSPACE_TEMPLATE_DIR);
+        let template_path = templates_dir.join(format!(
+            "{}.json",
+            AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE_NAME
+        ));
+        if !template_path.exists() {
+            fs::create_dir_all(&templates_dir)
+                .await
+                .context("Failed to create bundled workspace-template directory")?;
+            let _: WorkspaceTemplateConfig =
+                serde_json::from_str(AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE)
+                    .context("Bundled OKX workspace template is invalid JSON")?;
+            fs::write(&template_path, AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE)
+                .await
+                .context("Failed to write bundled OKX workspace template")?;
+        }
+
+        Ok(())
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2575,6 +2626,35 @@ This is the body."#;
         assert!(LibraryStore::validate_name("skill/../etc").is_err());
         assert!(LibraryStore::validate_name("skill/subdir").is_err());
         assert!(LibraryStore::validate_name("skill\\subdir").is_err());
+    }
+
+    #[tokio::test]
+    async fn bundled_hackathon_items_seed_without_overwriting_user_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
+
+        store.seed_bundled_hackathon_items().await.unwrap();
+
+        let skill = store.get_skill("okx-security").await.unwrap();
+        assert_eq!(skill.name, "okx-security");
+        assert!(skill.content.contains("read-only by design"));
+        assert!(skill.content.contains("must never request private keys"));
+
+        let template = store
+            .get_workspace_template("autonomous-transaction-safety-check")
+            .await
+            .unwrap();
+        assert_eq!(template.skills, vec!["okx-security"]);
+        assert_eq!(template.distro.as_deref(), Some("ubuntu-noble"));
+
+        let custom = "---\nname: okx-security\n---\n\n# Custom local copy\n";
+        let skill_path = temp.path().join("skill/okx-security/SKILL.md");
+        tokio::fs::write(&skill_path, custom).await.unwrap();
+
+        store.seed_bundled_hackathon_items().await.unwrap();
+
+        let preserved = tokio::fs::read_to_string(&skill_path).await.unwrap();
+        assert_eq!(preserved, custom);
     }
 
     #[test]
