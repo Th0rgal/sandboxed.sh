@@ -22,7 +22,7 @@ Why this matters for OKX:
   one-off demo prompt.
 
 <p align="center">
-  <img src="screenshots/okx-security-report.webp" alt="OKX security risk report running inside sandboxed.sh Mission Control" width="100%" />
+  <img src="screenshots/okx-security-report.png" alt="OKX security risk report running inside sandboxed.sh Mission Control" width="100%" />
 </p>
 
 Try it in 60 seconds:

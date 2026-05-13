@@ -11,14 +11,15 @@
   <text x="1232" y="76" fill="#93c5fd" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700">OKX read-only skill</text>
 
   <rect x="68" y="134" width="366" height="690" rx="16" fill="#172033" stroke="#2f3a4f"/>
-  <text x="100" y="184" fill="#f9fafb" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="800">Autonomous transaction safety check</text>
-  <text x="100" y="224" fill="#a7b0c0" font-family="Inter, Arial, sans-serif" font-size="18">Workspace template</text>
-  <rect x="100" y="260" width="200" height="36" rx="18" fill="#ecfdf5"/>
-  <text x="120" y="284" fill="#047857" font-family="Inter, Arial, sans-serif" font-size="16" font-weight="800">sandbox isolated</text>
-  <rect x="100" y="314" width="172" height="36" rx="18" fill="#eff6ff"/>
-  <text x="120" y="338" fill="#1d4ed8" font-family="Inter, Arial, sans-serif" font-size="16" font-weight="800">no wallet keys</text>
-  <rect x="100" y="368" width="198" height="36" rx="18" fill="#fff7ed"/>
-  <text x="120" y="392" fill="#c2410c" font-family="Inter, Arial, sans-serif" font-size="16" font-weight="800">no broadcasts</text>
+  <text x="100" y="184" fill="#f9fafb" font-family="Inter, Arial, sans-serif" font-size="25" font-weight="800">Autonomous transaction</text>
+  <text x="100" y="216" fill="#f9fafb" font-family="Inter, Arial, sans-serif" font-size="25" font-weight="800">safety check</text>
+  <text x="100" y="248" fill="#a7b0c0" font-family="Inter, Arial, sans-serif" font-size="18">Workspace template</text>
+  <rect x="100" y="284" width="200" height="36" rx="18" fill="#ecfdf5"/>
+  <text x="120" y="308" fill="#047857" font-family="Inter, Arial, sans-serif" font-size="16" font-weight="800">sandbox isolated</text>
+  <rect x="100" y="338" width="172" height="36" rx="18" fill="#eff6ff"/>
+  <text x="120" y="362" fill="#1d4ed8" font-family="Inter, Arial, sans-serif" font-size="16" font-weight="800">no wallet keys</text>
+  <rect x="100" y="392" width="198" height="36" rx="18" fill="#fff7ed"/>
+  <text x="120" y="416" fill="#c2410c" font-family="Inter, Arial, sans-serif" font-size="16" font-weight="800">no broadcasts</text>
 
   <text x="100" y="465" fill="#e5e7eb" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="700">Native harness sync</text>
   <text x="100" y="508" fill="#a7b0c0" font-family="Inter, Arial, sans-serif" font-size="18">.claude/skills/okx-security</text>
