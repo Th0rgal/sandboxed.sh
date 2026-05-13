@@ -450,20 +450,18 @@ pub struct SandboxedConfig {
     /// Desktop session lifecycle configuration.
     #[serde(default)]
     pub desktop: DesktopConfig,
-    /// When true, use raw `opencode` CLI instead of oh-my-opencode wrapper.
-    /// This is useful for profiles that use builtin/* models directly.
+    /// When true, wrap the `opencode` CLI in oh-my-opencode for extra features
+    /// (todo enforcement, background tasks, opinionated agent profiles).
+    /// Default: false — vanilla `opencode` is used directly.
     #[serde(default)]
-    pub disable_oh_my_opencode: bool,
+    pub enable_oh_my_opencode: bool,
 }
 
 impl Default for SandboxedConfig {
     fn default() -> Self {
         Self {
             hidden_agents: vec![
-                "build".to_string(),
-                "plan".to_string(),
                 "general".to_string(),
-                "explore".to_string(),
                 "compaction".to_string(),
                 "title".to_string(),
                 "summary".to_string(),
@@ -471,9 +469,9 @@ impl Default for SandboxedConfig {
                 "Momus (Plan Reviewer)".to_string(),
                 "orchestrator-sisyphus".to_string(),
             ],
-            default_agent: Some("Sisyphus".to_string()),
+            default_agent: Some("build".to_string()),
             desktop: DesktopConfig::default(),
-            disable_oh_my_opencode: false,
+            enable_oh_my_opencode: false,
         }
     }
 }

@@ -1,6 +1,7 @@
 'use client';
 
 import { useMemo, useState, useEffect } from 'react';
+import Link from 'next/link';
 import {
   X,
   Loader2,
@@ -8,6 +9,7 @@ import {
   XCircle,
   Clock,
   Users,
+  ExternalLink,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -24,23 +26,88 @@ export interface SubagentEntry {
   endTime?: number;
 }
 
-function extractAgentName(args: unknown): string | null {
+/** Heading text for a sub-agent card.
+ *  Preference order:
+ *    1. `args.title` — set by orchestrator worker tools, human-curated per call.
+ *    2. `args.agent` / `subagent_type` / `name` — Claude Code Task fields.
+ *    3. friendly label derived from the tool name (strips MCP prefixes).
+ *    4. raw tool name as a last resort. */
+function extractAgentName(args: unknown, toolName: string): string {
+  if (args && typeof args === 'object') {
+    const obj = args as Record<string, unknown>;
+    for (const key of ['title', 'agent', 'subagent_type', 'name']) {
+      const v = obj[key];
+      if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+  }
+  return prettyToolName(toolName);
+}
+
+function prettyToolName(toolName: string): string {
+  // Strip "mcp__<server>__" prefix, then rewrite known orchestrator verbs
+  // into something readable in the card heading.
+  const stripped = toolName.replace(/^mcp__[^_]+__/, '');
+  switch (stripped) {
+    case 'create_worker_mission':
+      return 'Worker';
+    case 'batch_create_workers':
+      return 'Worker (batch)';
+    case 'retask_worker':
+      return 'Worker retask';
+    case 'background_task':
+    case 'task':
+      return 'Task';
+    default:
+      return stripped || toolName;
+  }
+}
+
+function isOrchestratorWorkerTool(toolName: string): boolean {
+  const n = toolName.toLowerCase();
+  return (
+    n.startsWith('mcp__orchestrator__create_worker') ||
+    n === 'mcp__orchestrator__batch_create_workers' ||
+    n === 'mcp__orchestrator__retask_worker'
+  );
+}
+
+function extractDescription(args: unknown, toolName: string): string | null {
   if (!args || typeof args !== 'object') return null;
   const obj = args as Record<string, unknown>;
-  for (const key of ['agent', 'subagent_type', 'name']) {
-    const v = obj[key];
-    if (typeof v === 'string' && v.trim()) return v;
-  }
+  // Skip the heading itself (already shown above) when looking for a description.
+  const heading = obj['title'];
+  const d = obj['description'];
+  if (typeof d === 'string' && d.trim() && d.trim() !== heading) return d.trim();
+  // Orchestrator worker prompts always start with the same boilerplate
+  // ("You are a senior X engineer...") so showing the first 140 chars is
+  // misleading — every card looks identical. Use the title only; the user
+  // can click into the child mission for the full prompt.
+  if (isOrchestratorWorkerTool(toolName)) return null;
+  const p = obj['prompt'];
+  if (typeof p === 'string' && p.trim()) return p.slice(0, 140);
   return null;
 }
 
-function extractDescription(args: unknown): string | null {
-  if (!args || typeof args !== 'object') return null;
-  const obj = args as Record<string, unknown>;
-  const d = obj['description'];
-  if (typeof d === 'string' && d.trim()) return d;
-  const p = obj['prompt'];
-  if (typeof p === 'string' && p.trim()) return p.slice(0, 140);
+/** UUID pattern used to harvest a spawned child mission id from tool results. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Pull the spawned child mission id out of a worker-tool result, if any.
+ *
+ *  `create_worker_mission` returns the mission record directly at the top
+ *  level (id, title, status, ...). `batch_create_workers` is already
+ *  fanned out per-worker by the caller, with the per-worker mission record
+ *  hoisted up to `result`. So in both cases the id is just `result.id`. */
+function extractChildMissionId(result: unknown): string | null {
+  if (!result || typeof result !== 'object') return null;
+  const r = result as Record<string, unknown>;
+  const id = r['id'];
+  if (typeof id === 'string' && UUID_RE.test(id)) return id;
+  // Some tool result shapes still wrap the mission. Try one level deeper.
+  const wrapped = r['mission'];
+  if (wrapped && typeof wrapped === 'object') {
+    const innerId = (wrapped as Record<string, unknown>)['id'];
+    if (typeof innerId === 'string' && UUID_RE.test(innerId)) return innerId;
+  }
   return null;
 }
 

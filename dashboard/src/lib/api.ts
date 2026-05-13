@@ -2370,20 +2370,52 @@ async function streamComponentOperation(
   }
 }
 
-// Update a system component (streams progress via SSE)
+// Update a system component (streams progress via SSE).
+// When `workspaceId` is provided, the install runs inside that workspace's container.
 export async function updateSystemComponent(
   name: string,
   onProgress: (event: UpdateProgressEvent) => void,
   onComplete: () => void,
-  onError: (error: string) => void
+  onError: (error: string) => void,
+  workspaceId?: string
 ): Promise<void> {
+  const qs = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : '';
   return streamComponentOperation(
-    `/api/system/components/${name}/update`,
+    `/api/system/components/${name}/update${qs}`,
     'update',
     onProgress,
     onComplete,
     onError
   );
+}
+
+// Per-workspace component report.
+export interface WorkspaceComponentInfo {
+  workspace_id: string;
+  workspace_name: string;
+  workspace_type: 'host' | 'container';
+  workspace_status: 'pending' | 'building' | 'ready' | 'error';
+  version: string | null;
+  in_sync: boolean;
+  note?: string;
+}
+
+export interface ComponentWorkspaceReport {
+  name: string;
+  host_version: string | null;
+  host_update_available: string | null;
+  host_status: ComponentStatus;
+  per_workspace: boolean;
+  workspaces: WorkspaceComponentInfo[];
+}
+
+export interface ComponentsByWorkspaceResponse {
+  components: ComponentWorkspaceReport[];
+}
+
+// Fetch per-workspace component info (host + each workspace's installed version).
+export async function getComponentsByWorkspace(): Promise<ComponentsByWorkspaceResponse> {
+  return apiGet('/api/system/components/by-workspace', 'Failed to get per-workspace components');
 }
 
 // Uninstall a system component (streams progress via SSE)

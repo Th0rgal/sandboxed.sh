@@ -342,6 +342,26 @@ pub struct InstallFromRegistryRequest {
     name: Option<String>,
 }
 
+fn normalize_skill_name(name: &str) -> Result<String, (StatusCode, String)> {
+    let skill_name = name.trim().to_lowercase();
+    if skill_name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Skill name is required".to_string(),
+        ));
+    }
+    if !skill_name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Skill name must contain only lowercase letters, numbers, and hyphens".to_string(),
+        ));
+    }
+    Ok(skill_name)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SaveWorkspaceTemplateRequest {
     pub description: Option<String>,
@@ -686,22 +706,7 @@ async fn import_skill(
     let library = ensure_library(&state, &headers).await?;
 
     // Validate skill name
-    let skill_name = req.name.trim().to_lowercase();
-    if skill_name.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Skill name is required".to_string(),
-        ));
-    }
-    if !skill_name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Skill name must contain only lowercase letters, numbers, and hyphens".to_string(),
-        ));
-    }
+    let skill_name = normalize_skill_name(&req.name)?;
 
     // Check if skill already exists
     let skill_dir = library.path().join("skill").join(&skill_name);
@@ -814,10 +819,13 @@ async fn import_skill_from_zip(skill_dir: &std::path::Path, data: &[u8]) -> Resu
             .by_index(i)
             .map_err(|e| format!("Failed to read ZIP entry: {}", e))?;
 
-        let name = file.name().to_string();
+        let Some(enclosed_name) = file.enclosed_name() else {
+            continue;
+        };
+        let name = enclosed_name.to_string_lossy().replace('\\', "/");
 
         // Skip directories and hidden files
-        if name.ends_with('/') || name.contains("/.") || name.starts_with('.') {
+        if file.is_dir() || name.contains("/.") || name.starts_with('.') {
             continue;
         }
 
@@ -832,7 +840,19 @@ async fn import_skill_from_zip(skill_dir: &std::path::Path, data: &[u8]) -> Resu
             continue;
         }
 
+        let relative_path = std::path::Path::new(relative_path);
+        if relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+
         let target_path = skill_dir.join(relative_path);
+        if !target_path.starts_with(skill_dir) {
+            continue;
+        }
 
         // Create parent directories
         if let Some(parent) = target_path.parent() {
@@ -2289,12 +2309,13 @@ async fn install_from_registry(
     })?;
 
     // Determine target name
-    let skill_name = request.name.unwrap_or_else(|| {
+    let raw_skill_name = request.name.unwrap_or_else(|| {
         source_dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "imported-skill".to_string())
     });
+    let skill_name = normalize_skill_name(&raw_skill_name)?;
 
     // Copy to library
     let target_dir = library.path().join("skill").join(&skill_name);
@@ -2401,6 +2422,17 @@ mod tests {
         assert_eq!(prefix, None);
     }
 
+    #[test]
+    fn test_normalize_skill_name_blocks_path_traversal() {
+        assert_eq!(
+            normalize_skill_name("Valid-Skill1").unwrap(),
+            "valid-skill1"
+        );
+        assert!(normalize_skill_name("../escape").is_err());
+        assert!(normalize_skill_name("nested/name").is_err());
+        assert!(normalize_skill_name(".hidden").is_err());
+    }
+
     #[tokio::test]
     async fn test_import_skill_from_zip_flat() {
         let zip_data = create_zip(&[
@@ -2468,5 +2500,24 @@ mod tests {
         // Hidden files should be skipped
         assert!(!skill_dir.join(".gitignore").exists());
         assert!(!skill_dir.join("refs/.hidden").exists());
+    }
+
+    #[tokio::test]
+    async fn test_import_skill_from_zip_rejects_path_traversal_entries() {
+        let zip_data = create_zip(&[
+            ("SKILL.md", "# Test"),
+            ("../outside.md", "outside"),
+            ("refs/../../outside2.md", "outside2"),
+        ]);
+
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("test-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        import_skill_from_zip(&skill_dir, &zip_data).await.unwrap();
+
+        assert!(skill_dir.join("SKILL.md").exists());
+        assert!(!dir.path().join("outside.md").exists());
+        assert!(!dir.path().join("outside2.md").exists());
     }
 }

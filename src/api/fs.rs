@@ -271,6 +271,130 @@ fn canonicalize_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn path_allowed_roots(state: &AppState) -> Vec<PathBuf> {
+    let mut roots = vec![state.config.working_dir.clone(), api_context_root(state)];
+
+    if let Some(runtime) = load_runtime_workspace() {
+        if let Some(root) = runtime
+            .workspace_root
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            roots.push(PathBuf::from(root));
+        }
+        if let Some(working_dir) = runtime
+            .working_dir
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            if is_container_workspace(&runtime) {
+                if let Some(mapped) =
+                    map_container_path_to_host(&PathBuf::from(working_dir), &runtime)
+                {
+                    roots.push(mapped);
+                }
+            } else {
+                roots.push(PathBuf::from(working_dir));
+            }
+        }
+        if let Some(context) = runtime
+            .mission_context
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            roots.push(PathBuf::from(context));
+        }
+    }
+
+    roots
+        .into_iter()
+        .map(|root| canonicalize_or_original(&root))
+        .collect()
+}
+
+fn canonical_path_for_write(path: &Path) -> Result<PathBuf, (StatusCode, String)> {
+    if path.exists() || std::fs::symlink_metadata(path).is_ok() {
+        return path.canonicalize().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to resolve path: {}", e),
+            )
+        });
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid path: no parent directory".to_string(),
+        )
+    })?;
+    let canonical_parent = parent.canonicalize().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to resolve parent path: {}", e),
+        )
+    })?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid path".to_string()))?;
+    Ok(canonical_parent.join(filename))
+}
+
+fn ensure_path_allowed(state: &AppState, path: &Path) -> Result<(), (StatusCode, String)> {
+    let canonical = canonicalize_or_original(path);
+    let roots = path_allowed_roots(state);
+    if path_is_under_allowed_roots(&canonical, &roots) {
+        return Ok(());
+    }
+
+    Err((
+        StatusCode::FORBIDDEN,
+        format!(
+            "Path traversal attempt: {} is outside allowed directories",
+            canonical.display()
+        ),
+    ))
+}
+
+fn path_is_under_allowed_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+fn resolve_legacy_fs_path_for_read(
+    state: &AppState,
+    path: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let resolved = resolve_download_path(path, Some(&state.config.working_dir))?;
+    let canonical = resolved.canonicalize().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to resolve path: {}", e),
+        )
+    })?;
+    ensure_path_allowed(state, &canonical)?;
+    Ok(canonical)
+}
+
+fn resolve_legacy_fs_path_for_write(
+    state: &AppState,
+    path: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let resolved = resolve_upload_base(path).or_else(|_| {
+        let input = Path::new(path);
+        if input.is_absolute() {
+            Ok(input.to_path_buf())
+        } else {
+            Ok(state.config.working_dir.join(input))
+        }
+    })?;
+    let canonical = canonical_path_for_write(&resolved)?;
+    ensure_path_allowed(state, &canonical)?;
+    Ok(canonical)
+}
+
 fn configured_context_root(config_working_dir: &Path) -> PathBuf {
     let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
         .ok()
@@ -749,10 +873,15 @@ pub struct FsEntry {
 }
 
 pub async fn list(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Query(q): Query<PathQuery>,
 ) -> Result<Json<Vec<FsEntry>>, (StatusCode, String)> {
-    let path = Path::new(&q.path);
+    let resolved_path = if let Some(workspace_id) = q.workspace_id {
+        resolve_path_for_workspace(&state, workspace_id, &q.path, q.mission_id).await?
+    } else {
+        resolve_legacy_fs_path_for_read(&state, &q.path)?
+    };
+    let path = resolved_path.as_path();
 
     // Check if path is a symlink loop (ELOOP) before trying to read it.
     // Only auto-clean on ELOOP — dangling symlinks or permission errors are left alone.
@@ -779,7 +908,7 @@ pub async fn list(
         }
     }
 
-    let entries = list_directory_local(&q.path)
+    let entries = list_directory_local(&resolved_path.to_string_lossy())
         .await
         .map_err(internal_error)?;
     Ok(Json(entries))
@@ -827,27 +956,29 @@ async fn list_directory_local(path: &str) -> anyhow::Result<Vec<FsEntry>> {
 }
 
 pub async fn mkdir(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<MkdirRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    tokio::fs::create_dir_all(&req.path)
+    let target = resolve_legacy_fs_path_for_write(&state, &req.path)?;
+    tokio::fs::create_dir_all(&target)
         .await
         .map_err(internal_error)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn rm(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<RmRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let recursive = req.recursive.unwrap_or(false);
+    let target = resolve_legacy_fs_path_for_write(&state, &req.path)?;
 
     if recursive {
-        tokio::fs::remove_dir_all(&req.path)
+        tokio::fs::remove_dir_all(&target)
             .await
             .map_err(internal_error)?;
     } else {
-        tokio::fs::remove_file(&req.path)
+        tokio::fs::remove_file(&target)
             .await
             .map_err(internal_error)?;
     }
@@ -872,7 +1003,7 @@ pub async fn validate(
     let resolved_path = if let Some(workspace_id) = q.workspace_id {
         resolve_path_for_workspace(&state, workspace_id, &q.path, q.mission_id).await?
     } else {
-        resolve_download_path(&q.path, Some(&state.config.working_dir))?
+        resolve_legacy_fs_path_for_read(&state, &q.path)?
     };
 
     if !resolved_path.exists() {
@@ -908,7 +1039,7 @@ pub async fn download(
     let resolved_path = if let Some(workspace_id) = q.workspace_id {
         resolve_path_for_workspace(&state, workspace_id, &q.path, q.mission_id).await?
     } else {
-        resolve_download_path(&q.path, Some(&state.config.working_dir))?
+        resolve_legacy_fs_path_for_read(&state, &q.path)?
     };
     let filename = q
         .path
@@ -956,7 +1087,7 @@ pub async fn upload(
         let base = resolve_path_for_workspace(&state, workspace_id, &q.path, q.mission_id).await?;
         (base, ws)
     } else {
-        (resolve_upload_base(&q.path)?, None)
+        (resolve_legacy_fs_path_for_write(&state, &q.path)?, None)
     };
 
     // Expect one file field.
@@ -965,10 +1096,18 @@ pub async fn upload(
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
     {
-        let file_name = field
+        let raw_file_name = field
             .file_name()
             .map(|s| s.to_string())
             .unwrap_or_else(|| "upload.bin".to_string());
+        let file_name = {
+            let sanitized = sanitize_path_component(&raw_file_name);
+            if sanitized.is_empty() {
+                "upload.bin".to_string()
+            } else {
+                sanitized
+            }
+        };
         // Stream to temp file first (avoid buffering large uploads in memory).
         let tmp = std::env::temp_dir().join(format!("sandboxed_sh_ul_{}", uuid::Uuid::new_v4()));
         let mut f = tokio::fs::File::create(&tmp)
@@ -1120,7 +1259,7 @@ pub async fn upload_finalize(
             resolve_path_for_workspace(&state, workspace_id, &req.path, req.mission_id).await?;
         (base, ws)
     } else {
-        (resolve_upload_base(&req.path)?, None)
+        (resolve_legacy_fs_path_for_write(&state, &req.path)?, None)
     };
 
     // Sanitize upload_id and file_name to prevent path traversal attacks
@@ -1236,8 +1375,9 @@ pub async fn download_from_url(
     // Download to temp file
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300)) // 5 min timeout
-        // Don't follow redirects automatically to prevent redirect-based SSRF
-        .redirect(reqwest::redirect::Policy::limited(5))
+        // Do not follow redirects automatically. A redirected request to an
+        // internal host would already be an SSRF before post-response validation.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| {
             (
@@ -1250,15 +1390,6 @@ pub async fn download_from_url(
         (
             StatusCode::BAD_REQUEST,
             format!("Failed to fetch URL: {}", e),
-        )
-    })?;
-
-    // Validate the final URL after redirects to prevent redirect-based SSRF
-    let final_url = response.url().to_string();
-    validate_url_for_ssrf(&final_url).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Redirect target blocked: {}", e),
         )
     })?;
 
@@ -1345,7 +1476,7 @@ pub async fn download_from_url(
             resolve_path_for_workspace(&state, workspace_id, &req.path, req.mission_id).await?;
         (base, ws)
     } else {
-        (resolve_upload_base(&req.path)?, None)
+        (resolve_legacy_fs_path_for_write(&state, &req.path)?, None)
     };
     let remote_path = base.join(&file_name);
     let target_dir = remote_path
@@ -1385,7 +1516,7 @@ pub async fn download_from_url(
 mod tests {
     use super::{
         api_context_root_for_config, context_mirror_suffix, context_upload_suffix_for_dir,
-        is_context_upload_path_for_dir,
+        is_context_upload_path_for_dir, path_is_under_allowed_roots, sanitize_path_component,
     };
     use crate::config::Config;
     use std::path::{Path, PathBuf};
@@ -1434,6 +1565,37 @@ mod tests {
             context_upload_suffix_for_dir("contextual/paper.pdf", "context"),
             None
         );
+    }
+
+    #[test]
+    fn path_boundary_requires_actual_root_prefix() {
+        let roots = vec![PathBuf::from("/tmp/workspace")];
+
+        assert!(path_is_under_allowed_roots(
+            Path::new("/tmp/workspace/file.txt"),
+            &roots
+        ));
+        assert!(!path_is_under_allowed_roots(
+            Path::new("/tmp/workspace-evil/file.txt"),
+            &roots
+        ));
+        assert!(!path_is_under_allowed_roots(
+            Path::new("/tmp/other/file.txt"),
+            &roots
+        ));
+    }
+
+    #[test]
+    fn sanitize_path_component_strips_upload_filename_traversal() {
+        assert_eq!(
+            sanitize_path_component("../outside/secret.txt"),
+            "secret.txt"
+        );
+        assert_eq!(
+            sanitize_path_component("..\\outside\\secret.txt"),
+            "secret.txt"
+        );
+        assert_eq!(sanitize_path_component("..hidden\0.txt"), "hidden.txt");
     }
 
     #[test]

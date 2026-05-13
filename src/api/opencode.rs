@@ -239,14 +239,44 @@ fn extract_agents_from_settings(settings: &Value) -> Option<Value> {
     None
 }
 
+/// Vanilla opencode ships with these primary agents.  They are surfaced in the
+/// dashboard's agent dropdown even when the Library defines no `.opencode/agents/`
+/// files, so that picking "build" or "plan" Just Works.
+const VANILLA_OPENCODE_AGENTS: &[&str] = &["build", "plan"];
+
 /// Fetch agents from Library configuration (no central server needed).
-/// Reads agents from Library's oh-my-opencode.json, falling back to defaults.
+///
+/// The returned list merges:
+///   1. vanilla opencode's built-in primary agents ("build", "plan"),
+///   2. native `.opencode/agents/*.md` files in the Library profile,
+///   3. oh-my-opencode agents from `oh-my-opencode.json` — only when the
+///      profile's `SandboxedConfig.enable_oh_my_opencode` is true.
 pub async fn fetch_opencode_agents(state: &super::routes::AppState) -> Result<Value, String> {
     fetch_opencode_agents_for_profile(state, None).await
 }
 
-/// Fetch agents from Library configuration for a specific config profile.
-/// Falls back to the default profile if the profile has no agent list.
+/// Read native opencode agent names from `<profile>/.opencode/agents/*.md`.
+/// Returns the filename stem of each `.md` file (e.g. "ana" from "ana.md").
+async fn read_native_agent_names(lib: &crate::library::LibraryStore, profile: &str) -> Vec<String> {
+    let agents_dir = lib
+        .config_profile_path(profile)
+        .join(".opencode")
+        .join("agents");
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&agents_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().map(|e| e == "md").unwrap_or(false) {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    names.push(stem.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Fetch agents for a specific config profile.  See [`fetch_opencode_agents`].
 pub async fn fetch_opencode_agents_for_profile(
     state: &super::routes::AppState,
     profile: Option<&str>,
@@ -254,45 +284,66 @@ pub async fn fetch_opencode_agents_for_profile(
     let library_guard = state.library.read().await;
     let Some(lib) = library_guard.as_ref() else {
         tracing::debug!("Library not configured, no agents available");
-        return Ok(Value::Array(vec![]));
+        return Ok(Value::Array(
+            VANILLA_OPENCODE_AGENTS
+                .iter()
+                .map(|s| Value::String(s.to_string()))
+                .collect(),
+        ));
     };
 
-    if let Some(profile_name) = profile {
-        match lib.get_opencode_settings_for_profile(profile_name).await {
-            Ok(settings) => {
-                if let Some(agents) = extract_agents_from_settings(&settings) {
-                    tracing::debug!(
-                        profile = %profile_name,
-                        "Loaded agents from Library profile"
-                    );
-                    return Ok(agents);
+    let profile_name = profile.unwrap_or("default");
+
+    // 1. Start with vanilla opencode's built-in primary agents.
+    let mut agents: Vec<String> = VANILLA_OPENCODE_AGENTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // 2. Merge native `.opencode/agents/*.md` files from the Library profile.
+    for name in read_native_agent_names(lib, profile_name).await {
+        if !agents.iter().any(|a| a.eq_ignore_ascii_case(&name)) {
+            agents.push(name);
+        }
+    }
+
+    // 3. Merge oh-my-opencode agents only when the profile opts into the wrapper.
+    let wrapper_enabled = lib
+        .get_sandboxed_config_for_profile(profile_name)
+        .await
+        .map(|c| c.enable_oh_my_opencode)
+        .unwrap_or(false);
+    if wrapper_enabled {
+        let omo_settings = if profile.is_some() {
+            lib.get_opencode_settings_for_profile(profile_name).await
+        } else {
+            lib.get_opencode_settings().await
+        };
+        if let Ok(settings) = omo_settings {
+            if let Some(omo_agents) = extract_agents_from_settings(&settings) {
+                if let Some(arr) = omo_agents.as_array() {
+                    for entry in arr {
+                        if let Some(name) = entry.as_str() {
+                            if !agents.iter().any(|a| a.eq_ignore_ascii_case(name)) {
+                                agents.push(name.to_string());
+                            }
+                        }
+                    }
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    profile = %profile_name,
-                    "Failed to read Library opencode settings: {}",
-                    e
-                );
-            }
         }
     }
 
-    match lib.get_opencode_settings().await {
-        Ok(settings) => {
-            if let Some(agents) = extract_agents_from_settings(&settings) {
-                tracing::debug!("Loaded agents from Library default profile");
-                return Ok(agents);
-            }
-            tracing::debug!("No agents in Library oh-my-opencode.json");
-        }
-        Err(e) => {
-            tracing::warn!("Failed to read Library opencode settings: {}", e);
-        }
-    }
+    tracing::debug!(
+        profile = %profile_name,
+        count = agents.len(),
+        wrapper_enabled = wrapper_enabled,
+        "Resolved opencode agents"
+    );
 
-    // No hardcoded fallback — Library is the source of truth
-    Ok(Value::Array(vec![]))
+    Ok(Value::Array(
+        agents.into_iter().map(Value::String).collect(),
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

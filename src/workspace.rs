@@ -3656,8 +3656,17 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     )
     .await?;
 
-    // Sync oh-my-opencode settings into the mission directory when using OpenCode.
-    if backend_id == "opencode" {
+    // Sync oh-my-opencode settings into the mission directory only when the
+    // workspace (or its profile) opts into the wrapper. Vanilla `opencode`
+    // doesn't read this file, so writing it on every mission would just leave
+    // stale config behind. Native `.opencode/agents/*.md` files are still
+    // synced below, regardless of the wrapper flag.
+    let oh_my_opencode_enabled = workspace
+        .config
+        .get("enable_oh_my_opencode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if backend_id == "opencode" && oh_my_opencode_enabled {
         if let Some(lib) = library {
             let profile = config_profile.unwrap_or("default");
             tracing::info!(
@@ -3734,41 +3743,46 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                     );
                 }
             }
+        }
+    }
 
-            // Sync agents directory from profile (e.g. .opencode/agents/*.md)
-            {
-                let profile_path = lib.config_profile_path(profile);
-                let agents_src = profile_path.join(".opencode").join("agents");
-                if agents_src.is_dir() {
-                    let agents_dest = dir.join(".opencode").join("agent");
-                    if let Err(e) = tokio::fs::create_dir_all(&agents_dest).await {
-                        tracing::warn!(
-                            mission = %mission_id,
-                            error = %e,
-                            "Failed to create .opencode/agent directory"
-                        );
-                    } else {
-                        let mut count = 0u32;
-                        if let Ok(mut entries) = tokio::fs::read_dir(&agents_src).await {
-                            while let Ok(Some(entry)) = entries.next_entry().await {
-                                let path = entry.path();
-                                if path.extension().map(|e| e == "md").unwrap_or(false) {
-                                    let dest = agents_dest.join(entry.file_name());
-                                    if let Ok(content) = tokio::fs::read(&path).await {
-                                        let _ = tokio::fs::write(&dest, &content).await;
-                                        count += 1;
-                                    }
+    // Sync native opencode agents directory from profile (e.g.
+    // .opencode/agents/*.md). These are read by vanilla `opencode` directly
+    // and apply whether or not the oh-my-opencode wrapper is enabled.
+    if backend_id == "opencode" {
+        if let Some(lib) = library {
+            let profile = config_profile.unwrap_or("default");
+            let profile_path = lib.config_profile_path(profile);
+            let agents_src = profile_path.join(".opencode").join("agents");
+            if agents_src.is_dir() {
+                let agents_dest = dir.join(".opencode").join("agent");
+                if let Err(e) = tokio::fs::create_dir_all(&agents_dest).await {
+                    tracing::warn!(
+                        mission = %mission_id,
+                        error = %e,
+                        "Failed to create .opencode/agent directory"
+                    );
+                } else {
+                    let mut count = 0u32;
+                    if let Ok(mut entries) = tokio::fs::read_dir(&agents_src).await {
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            let path = entry.path();
+                            if path.extension().map(|e| e == "md").unwrap_or(false) {
+                                let dest = agents_dest.join(entry.file_name());
+                                if let Ok(content) = tokio::fs::read(&path).await {
+                                    let _ = tokio::fs::write(&dest, &content).await;
+                                    count += 1;
                                 }
                             }
                         }
-                        if count > 0 {
-                            tracing::info!(
-                                mission = %mission_id,
-                                count = count,
-                                profile = %profile,
-                                "Synced agents from config profile to workspace"
-                            );
-                        }
+                    }
+                    if count > 0 {
+                        tracing::info!(
+                            mission = %mission_id,
+                            count = count,
+                            profile = %profile,
+                            "Synced agents from config profile to workspace"
+                        );
                     }
                 }
             }

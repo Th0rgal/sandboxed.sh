@@ -7988,21 +7988,64 @@ export default function ControlClient() {
   }, [activeMission, recentMissions]);
   const activeMissionRole = activeMission ? inferMissionRole(activeMission) : null;
 
-  // In-mission sub-agents (Claude Code `Task`, orchestrator MCP worker
-  // creators). These run inside the same harness process — not as
-  // separate missions with parent_mission_id — so the child-mission
-  // `WorkerPanel` can't represent them. We expose them through a
-  // lighter `SubagentsPanel` keyed off the current mission's own items.
+  // In-mission sub-agents — a mix of:
+  //   - Claude Code's in-process `Task` / `background_task` / `spawn_agent`,
+  //     which never produce a separate mission record.
+  //   - Orchestrator MCP worker creators, which DO produce real child
+  //     missions but still show up usefully here as "what did this boss
+  //     spawn and when" with a deeplink to the child mission.
+  //
+  // `mcp__orchestrator__batch_create_workers` is special: a single tool
+  // call spawns N workers and the panel is much clearer when each worker
+  // is its own row (with its own title and child-mission deeplink).
   const inMissionSubagents = useMemo<SubagentEntry[]>(() => {
     const out: SubagentEntry[] = [];
     for (const item of items) {
       if (item.kind !== "tool") continue;
       const name = item.name.toLowerCase();
+      const isBatch = name === "mcp__orchestrator__batch_create_workers";
       const isOrchestratorWorker =
         name.startsWith("mcp__orchestrator__create_worker") ||
-        name === "mcp__orchestrator__batch_create_workers" ||
+        isBatch ||
         name === "mcp__orchestrator__retask_worker";
       if (!isSubagentTool(item.name) && !isOrchestratorWorker) continue;
+
+      if (isBatch) {
+        // Fan a batch call out into one synthetic row per worker so the
+        // user sees N cards (with N titles) instead of one opaque
+        // "Workers (batch)" card. Result -> { results: [{ index, mission }] }
+        // is matched up to args.workers[i] by index.
+        const argsObj = (item.args ?? {}) as Record<string, unknown>;
+        const workers = Array.isArray(argsObj.workers)
+          ? (argsObj.workers as unknown[])
+          : [];
+        const resultObj = (item.result ?? null) as Record<string, unknown> | null;
+        const resultArray = Array.isArray(resultObj?.results)
+          ? (resultObj!.results as unknown[])
+          : [];
+
+        for (let i = 0; i < workers.length; i++) {
+          const workerArgs = workers[i] as Record<string, unknown> | null;
+          const perResult = resultArray[i] as Record<string, unknown> | undefined;
+          // Lift the spawned mission record up so the card can use it
+          // directly for deeplinks without re-walking the batch envelope.
+          const workerResult =
+            perResult && typeof perResult === "object"
+              ? (perResult.mission ?? perResult)
+              : item.result;
+          out.push({
+            id: `${item.id}#${i}`,
+            toolCallId: item.toolCallId,
+            name: item.name,
+            args: workerArgs,
+            result: workerResult,
+            startTime: item.startTime,
+            endTime: item.endTime,
+          });
+        }
+        continue;
+      }
+
       out.push({
         id: item.id,
         toolCallId: item.toolCallId,

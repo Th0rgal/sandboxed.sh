@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{
         sse::{Event, Sse},
@@ -17,11 +17,12 @@ use axum::{
     Router,
 };
 use futures::stream::Stream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use super::routes::AppState;
 use crate::util::home_dir;
+use crate::workspace::{Workspace, WorkspaceStatus, WorkspaceType};
 
 /// Git remote used for sandboxed.sh self-updates
 const SANDBOXED_REPO_REMOTE: &str = "https://github.com/Th0rgal/sandboxed.sh.git";
@@ -53,6 +54,41 @@ pub enum ComponentStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct SystemComponentsResponse {
     pub components: Vec<ComponentInfo>,
+}
+
+/// Per-workspace view of a single component's installed version.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceComponentInfo {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub workspace_type: &'static str,
+    pub workspace_status: &'static str,
+    /// Installed version of the component inside this workspace, if any.
+    pub version: Option<String>,
+    /// True iff this workspace's version equals the host's version.
+    pub in_sync: bool,
+    /// Optional reason this workspace couldn't be probed (e.g. "not ready",
+    /// "nspawn unavailable", "timed out").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Aggregated by-workspace info for a single component.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComponentWorkspaceReport {
+    pub name: String,
+    pub host_version: Option<String>,
+    pub host_update_available: Option<String>,
+    pub host_status: ComponentStatus,
+    /// True if this component supports per-workspace installs. Components like
+    /// `sandboxed_sh` are host-only and have an empty `workspaces` list.
+    pub per_workspace: bool,
+    pub workspaces: Vec<WorkspaceComponentInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComponentsByWorkspaceResponse {
+    pub components: Vec<ComponentWorkspaceReport>,
 }
 
 /// Response for update progress events.
@@ -121,7 +157,12 @@ fn is_safe_repo_path(path: &std::path::Path) -> bool {
     for component in path.components() {
         match component {
             Component::CurDir | Component::ParentDir => return false,
-            Component::Normal(_) => normal_count += 1,
+            Component::Normal(part) => {
+                if part.to_string_lossy().starts_with('.') {
+                    return false;
+                }
+                normal_count += 1;
+            }
             _ => {}
         }
     }
@@ -264,6 +305,7 @@ type UpdateStream = Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infall
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/components", get(get_components))
+        .route("/components/by-workspace", get(get_components_by_workspace))
         .route("/components/:name/update", post(update_component))
         .route("/components/:name/uninstall", post(uninstall_component))
 }
@@ -312,6 +354,197 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
     components.push(omo_info);
 
     Json(SystemComponentsResponse { components })
+}
+
+/// Components that support per-workspace installations. Order is preserved in the response.
+const PER_WORKSPACE_COMPONENTS: &[&str] = &["opencode", "claude_code", "codex", "amp"];
+
+/// Get per-workspace version info for each component. Container workspaces are probed via nspawn
+/// in parallel with a per-probe timeout to keep the page responsive.
+async fn get_components_by_workspace(
+    State(state): State<Arc<AppState>>,
+) -> Json<ComponentsByWorkspaceResponse> {
+    // Reuse the host-level report so the comparison target stays in lockstep with /components.
+    let host = get_components(State(state.clone())).await.0.components;
+    let host_by_name: std::collections::HashMap<String, ComponentInfo> =
+        host.into_iter().map(|c| (c.name.clone(), c)).collect();
+
+    let workspaces = state.workspaces.list().await;
+    let nspawn_ok = crate::nspawn::nspawn_available();
+
+    let mut reports = Vec::with_capacity(host_by_name.len());
+
+    for name in PER_WORKSPACE_COMPONENTS {
+        let Some(host_info) = host_by_name.get(*name).cloned() else {
+            continue;
+        };
+
+        // Spawn a parallel probe per workspace.
+        let host_version = host_info.version.clone();
+        let mut probes = futures::stream::FuturesUnordered::new();
+        for ws in &workspaces {
+            let ws = ws.clone();
+            let host_v = host_version.clone();
+            let component = (*name).to_string();
+            probes.push(tokio::spawn(async move {
+                probe_workspace_component(&ws, &component, host_v.as_deref(), nspawn_ok).await
+            }));
+        }
+
+        use futures::StreamExt;
+        let mut ws_infos = Vec::with_capacity(workspaces.len());
+        while let Some(joined) = probes.next().await {
+            if let Ok(info) = joined {
+                ws_infos.push(info);
+            }
+        }
+        ws_infos.sort_by(|a, b| a.workspace_name.cmp(&b.workspace_name));
+
+        reports.push(ComponentWorkspaceReport {
+            name: host_info.name,
+            host_version: host_info.version,
+            host_update_available: host_info.update_available,
+            host_status: host_info.status,
+            per_workspace: true,
+            workspaces: ws_infos,
+        });
+    }
+
+    Json(ComponentsByWorkspaceResponse {
+        components: reports,
+    })
+}
+
+/// Probe a single workspace for the installed version of a component.
+async fn probe_workspace_component(
+    workspace: &Workspace,
+    component: &str,
+    host_version: Option<&str>,
+    nspawn_ok: bool,
+) -> WorkspaceComponentInfo {
+    let workspace_type = match workspace.workspace_type {
+        WorkspaceType::Host => "host",
+        WorkspaceType::Container => "container",
+    };
+    let workspace_status = match workspace.status {
+        WorkspaceStatus::Pending => "pending",
+        WorkspaceStatus::Building => "building",
+        WorkspaceStatus::Ready => "ready",
+        WorkspaceStatus::Error => "error",
+    };
+
+    // Host workspaces share the host's binaries, so the version is whatever the host probe found.
+    if workspace.workspace_type == WorkspaceType::Host {
+        let version = host_version.map(|s| s.to_string());
+        let in_sync = version.is_some() && version.as_deref() == host_version;
+        return WorkspaceComponentInfo {
+            workspace_id: workspace.id.to_string(),
+            workspace_name: workspace.name.clone(),
+            workspace_type,
+            workspace_status,
+            version,
+            in_sync,
+            note: None,
+        };
+    }
+
+    if workspace.status != WorkspaceStatus::Ready {
+        return WorkspaceComponentInfo {
+            workspace_id: workspace.id.to_string(),
+            workspace_name: workspace.name.clone(),
+            workspace_type,
+            workspace_status,
+            version: None,
+            in_sync: false,
+            note: Some(format!("workspace is {}", workspace_status)),
+        };
+    }
+
+    if !nspawn_ok {
+        return WorkspaceComponentInfo {
+            workspace_id: workspace.id.to_string(),
+            workspace_name: workspace.name.clone(),
+            workspace_type,
+            workspace_status,
+            version: None,
+            in_sync: false,
+            note: Some("nspawn unavailable on host".to_string()),
+        };
+    }
+
+    let (version, note) = match probe_version_in_container(workspace, component).await {
+        Ok(v) => (v, None),
+        Err(e) => (None, Some(e)),
+    };
+    let in_sync = match (&version, host_version) {
+        (Some(v), Some(h)) => v == h,
+        _ => false,
+    };
+
+    WorkspaceComponentInfo {
+        workspace_id: workspace.id.to_string(),
+        workspace_name: workspace.name.clone(),
+        workspace_type,
+        workspace_status,
+        version,
+        in_sync,
+        note,
+    }
+}
+
+/// Exec `<tool> --version` inside a container with a strict timeout. Returns the parsed
+/// version (if any) or an error string describing why the probe failed.
+async fn probe_version_in_container(
+    workspace: &Workspace,
+    component: &str,
+) -> Result<Option<String>, String> {
+    let bin = component_binary_name(component)
+        .ok_or_else(|| format!("unsupported component: {component}"))?;
+    let config = crate::nspawn::NspawnConfig {
+        env: workspace.env_vars.clone(),
+        ..Default::default()
+    };
+    // Use sh -lc so PATH is configured the same way an interactive shell would see it.
+    let cmd = vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        format!(
+            "command -v {bin} >/dev/null 2>&1 && {bin} --version 2>&1 || echo __NOT_INSTALLED__"
+        ),
+    ];
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        crate::nspawn::execute_in_container(&workspace.path, &cmd, &config),
+    )
+    .await;
+
+    let output = match result {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("nspawn error: {e}")),
+        Err(_) => return Err("timed out".to_string()),
+    };
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if combined.contains("__NOT_INSTALLED__") {
+        return Ok(None);
+    }
+    Ok(extract_version_token(&combined))
+}
+
+/// CLI binary name used by each component inside a workspace.
+fn component_binary_name(component: &str) -> Option<&'static str> {
+    match component {
+        "opencode" => Some("opencode"),
+        "claude_code" => Some("claude"),
+        "codex" => Some("codex"),
+        "amp" => Some("amp"),
+        _ => None,
+    }
 }
 
 /// Get OpenCode version and status.
@@ -844,22 +1077,144 @@ async fn check_oh_my_opencode_update(current_version: Option<&str>) -> Option<St
     }
 }
 
-/// Update a system component.
+/// Optional query params accepted by /components/:name/update.
+#[derive(Debug, Deserialize)]
+pub struct UpdateComponentQuery {
+    /// When set, the update runs inside the named workspace's container instead of on the host.
+    pub workspace_id: Option<String>,
+}
+
+/// Update a system component, either on the host or inside a specific container workspace.
 async fn update_component(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    Query(query): Query<UpdateComponentQuery>,
 ) -> Result<Sse<UpdateStream>, (StatusCode, String)> {
-    match name.as_str() {
+    // If a workspace is targeted, dispatch to per-workspace update for the supported components.
+    if let Some(ws_id) = query.workspace_id.as_deref() {
+        if !PER_WORKSPACE_COMPONENTS.contains(&name.as_str()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Component '{name}' does not support per-workspace updates"),
+            ));
+        }
+        let uuid = uuid::Uuid::parse_str(ws_id).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid workspace_id: {ws_id}"),
+            )
+        })?;
+        let workspace = state.workspaces.get(uuid).await.ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Workspace not found: {ws_id}"),
+        ))?;
+
+        // Host workspaces share host binaries, so update the host instead.
+        if workspace.workspace_type == WorkspaceType::Host {
+            return host_update_stream(state, &name);
+        }
+
+        return Ok(Sse::new(Box::pin(stream_container_component_update(
+            workspace, name,
+        ))));
+    }
+
+    host_update_stream(state, &name)
+}
+
+/// Dispatch to the appropriate host-level update stream by component name.
+fn host_update_stream(
+    state: Arc<AppState>,
+    name: &str,
+) -> Result<Sse<UpdateStream>, (StatusCode, String)> {
+    match name {
         "sandboxed_sh" => Ok(Sse::new(Box::pin(stream_sandboxed_update(state)))),
         "opencode" => Ok(Sse::new(Box::pin(stream_opencode_update()))),
         "claude_code" => Ok(Sse::new(Box::pin(stream_claude_code_update()))),
         "codex" => Ok(Sse::new(Box::pin(stream_codex_update()))),
         "amp" => Ok(Sse::new(Box::pin(stream_amp_update()))),
         "oh_my_opencode" => Ok(Sse::new(Box::pin(stream_oh_my_opencode_update()))),
-        _ => Err((
+        other => Err((
             StatusCode::BAD_REQUEST,
-            format!("Unknown component: {}", name),
+            format!("Unknown component: {}", other),
         )),
+    }
+}
+
+/// Run the install command for `component` inside `workspace`'s container, streaming progress.
+fn stream_container_component_update(
+    workspace: Workspace,
+    component: String,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    async_stream::stream! {
+        yield sse("log", format!("Updating {} inside workspace '{}'...", component, workspace.name), Some(0));
+
+        if !crate::nspawn::nspawn_available() {
+            yield sse("error", "systemd-nspawn is not available on this host.", None);
+            return;
+        }
+        if workspace.status != WorkspaceStatus::Ready {
+            yield sse("error", format!("Workspace '{}' is not ready (status: {:?})", workspace.name, workspace.status), None);
+            return;
+        }
+
+        let install_cmd = match container_install_command(&component) {
+            Some(cmd) => cmd,
+            None => {
+                yield sse("error", format!("No container install command defined for {component}"), None);
+                return;
+            }
+        };
+
+        yield sse("log", format!("Running: {}", install_cmd), Some(10));
+
+        let config = crate::nspawn::NspawnConfig {
+            env: workspace.env_vars.clone(),
+            ..Default::default()
+        };
+        let cmd = vec!["sh".to_string(), "-lc".to_string(), install_cmd];
+
+        let result = crate::nspawn::execute_in_container(&workspace.path, &cmd, &config).await;
+        match result {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let summary: String = stdout.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                if !summary.trim().is_empty() {
+                    yield sse("log", format!("Output: {}", summary), Some(80));
+                }
+                yield sse("complete", format!("{} updated inside '{}'", component, workspace.name), Some(100));
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                yield sse("error", format!("Install failed: {} {}", stderr.trim(), stdout.trim()), None);
+            }
+            Err(e) => {
+                yield sse("error", format!("Failed to run install inside container: {}", e), None);
+            }
+        }
+    }
+}
+
+/// Shell command used to install/update a component inside a container, run via `sh -lc`.
+///
+/// We mirror the host-side installers so a "sync" produces the same version as on host.
+fn container_install_command(component: &str) -> Option<String> {
+    match component {
+        "claude_code" => Some(format!(
+            "command -v bun >/dev/null 2>&1 && PM=bun || PM=npm; $PM install -g @anthropic-ai/claude-code@{}",
+            desired_claude_code_version()
+        )),
+        "codex" => Some(
+            "command -v bun >/dev/null 2>&1 && PM=bun || PM=npm; $PM install -g @openai/codex@latest".to_string(),
+        ),
+        "amp" => Some(
+            "command -v bun >/dev/null 2>&1 && PM=bun || PM=npm; $PM install -g @sourcegraph/amp@latest".to_string(),
+        ),
+        "opencode" => Some(
+            "curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path".to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -1679,5 +2034,20 @@ mod tests {
     #[test]
     fn safe_repo_path_rejects_root() {
         assert!(!is_safe_repo_path(std::path::Path::new("/")));
+    }
+
+    #[test]
+    fn safe_repo_path_rejects_sensitive_hidden_subdirectories() {
+        assert!(!is_safe_repo_path(std::path::Path::new("/root/.ssh")));
+        assert!(!is_safe_repo_path(std::path::Path::new(
+            "/opt/.cache/sandboxed-sh"
+        )));
+    }
+
+    #[test]
+    fn safe_repo_path_accepts_default_repo_location() {
+        assert!(is_safe_repo_path(std::path::Path::new(
+            crate::settings::DEFAULT_SANDBOXED_REPO_PATH
+        )));
     }
 }

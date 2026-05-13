@@ -3098,15 +3098,15 @@ async fn run_mission_turn(
             result
         }
         "opencode" => {
-            // Check profile's sandboxed config for disable_oh_my_opencode flag
+            // Check profile's sandboxed config for the oh-my-opencode opt-in flag.
             if let Some(ref profile) = effective_config_profile {
                 let lib_guard = library.read().await;
                 if let Some(lib) = lib_guard.as_ref() {
                     if let Ok(profile_data) = lib.get_config_profile(profile).await {
-                        if profile_data.sandboxed_config.disable_oh_my_opencode {
+                        if profile_data.sandboxed_config.enable_oh_my_opencode {
                             let mut obj = workspace.config.as_object().cloned().unwrap_or_default();
                             obj.insert(
-                                "disable_oh_my_opencode".to_string(),
+                                "enable_oh_my_opencode".to_string(),
                                 serde_json::json!(true),
                             );
                             workspace.config = serde_json::Value::Object(obj);
@@ -10335,14 +10335,11 @@ pub async fn run_opencode_turn(
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    // oh-my-opencode's packaged implicit default can drift from the
-    // Library-synced agent names. Pass the Sandboxed default explicitly so
-    // API-created OpenCode missions don't fail before the first turn.
-    let default_agent = if agent.is_none() {
-        Some("sisyphus")
-    } else {
-        None
-    };
+    // When no agent is requested, default to vanilla opencode's primary
+    // "build" agent. Workspaces that opt into oh-my-opencode and want a
+    // different default should set their preferred agent on the mission
+    // (or via SandboxedConfig::default_agent).
+    let default_agent = if agent.is_none() { Some("build") } else { None };
     let agent = agent.or(default_agent);
 
     // Determine CLI runner: prefer backend config, then env var, then try bunx/npx
@@ -10648,24 +10645,26 @@ pub async fn run_opencode_turn(
         escaped
     };
 
-    // Use the workspace config flag to decide between oh-my-opencode and plain opencode.
-    // oh-my-opencode wraps opencode with extra features (todo enforcement, background tasks)
-    // but requires a compatible opencode version.  When the flag is set, or when the
-    // workspace agent names are incompatible, fall back to plain `opencode run`.
-    let configured_plain_opencode = workspace
+    // Vanilla `opencode` is the default. oh-my-opencode wraps opencode with extra
+    // features (todo enforcement, background tasks, opinionated agent profiles)
+    // and is opt-in per workspace/profile via `enable_oh_my_opencode`.
+    // The `sisyphus` agent name is an oh-my-opencode-only identifier; if it is
+    // selected explicitly, fall back to plain opencode (the wrapper is not
+    // available) rather than failing.
+    let oh_my_opencode_enabled = workspace
         .config
-        .get("disable_oh_my_opencode")
+        .get("enable_oh_my_opencode")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let agent_needs_plain_opencode = agent
         .map(|a| a.eq_ignore_ascii_case("sisyphus"))
         .unwrap_or(false);
-    let use_plain_opencode = configured_plain_opencode || agent_needs_plain_opencode;
+    let use_plain_opencode = !oh_my_opencode_enabled || agent_needs_plain_opencode;
 
     tracing::info!(
         mission_id = %mission_id,
         use_plain_opencode = use_plain_opencode,
-        configured_plain_opencode = configured_plain_opencode,
+        oh_my_opencode_enabled = oh_my_opencode_enabled,
         agent_needs_plain_opencode = agent_needs_plain_opencode,
         "OpenCode mode selection"
     );
