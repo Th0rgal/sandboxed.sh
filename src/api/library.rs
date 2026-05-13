@@ -1189,6 +1189,21 @@ async fn get_builtin_commands() -> Json<BuiltinCommandsResponse> {
             path: "builtin-claude".to_string(),
             params: vec![],
         },
+        // `/goal` shipped natively in claude-code 2.1.139 and was hardened in
+        // 2.1.140 (the version pinned by desired_claudecode_version). Without
+        // this entry the dashboard's slash autocomplete didn't suggest it.
+        CommandSummary {
+            name: "goal".to_string(),
+            description: Some(
+                "Loop until the objective is achieved (claude-code 2.1.139+)".to_string(),
+            ),
+            path: "builtin-claude".to_string(),
+            params: vec![CommandParam {
+                name: "objective".to_string(),
+                required: true,
+                description: Some("What the agent should keep iterating on until done".to_string()),
+            }],
+        },
     ];
 
     // Codex builtin commands. `/goal` lands in codex 0.128.0 behind the
