@@ -9823,9 +9823,7 @@ async fn run_single_control_turn(
             // would clobber the in-progress session. We just wrap the call
             // with a GoalStatus bracket so the dashboard pill and mission
             // store goal metadata stay in sync with the codex path.
-            if let Some(objective) =
-                crate::backend::goal::parse_goal_objective(&user_message)
-            {
+            if let Some(objective) = crate::backend::goal::parse_goal_objective(&user_message) {
                 return Box::pin(super::mission_runner::run_claudecode_native_goal(
                     exec_workspace,
                     &ctx.working_dir,

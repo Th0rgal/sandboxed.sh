@@ -1201,21 +1201,40 @@ fn stream_container_component_update(
 /// We mirror the host-side installers so a "sync" produces the same version as on host.
 fn container_install_command(component: &str) -> Option<String> {
     match component {
-        "claude_code" => Some(format!(
-            "command -v bun >/dev/null 2>&1 && PM=bun || PM=npm; $PM install -g @anthropic-ai/claude-code@{}",
-            desired_claude_code_version()
+        "claude_code" => Some(npm_install_shell(
+            "claude",
+            &format!(
+                "@anthropic-ai/claude-code@{}",
+                desired_claude_code_version()
+            ),
         )),
-        "codex" => Some(
-            "command -v bun >/dev/null 2>&1 && PM=bun || PM=npm; $PM install -g @openai/codex@latest".to_string(),
-        ),
-        "amp" => Some(
-            "command -v bun >/dev/null 2>&1 && PM=bun || PM=npm; $PM install -g @sourcegraph/amp@latest".to_string(),
-        ),
-        "opencode" => Some(
-            "curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path".to_string(),
-        ),
+        "codex" => Some(npm_install_shell("codex", "@openai/codex@latest")),
+        "amp" => Some(npm_install_shell("amp", "@sourcegraph/amp@latest")),
+        "opencode" => {
+            Some("curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path".to_string())
+        }
         _ => None,
     }
+}
+
+/// Build the shell snippet that installs `package` for `bin` inside a container.
+///
+/// Picks the package manager that owns the *currently installed* binary so the install actually
+/// shadows it on PATH. The naive "bun if available" picker mis-fires on containers that already
+/// have an npm-installed binary at /usr/local/bin: bun installs to ~/.bun/bin which is later on
+/// PATH, leaving the stale npm copy in place.
+fn npm_install_shell(bin: &str, package: &str) -> String {
+    format!(
+        r#"set -e
+PKG="{package}"
+CURRENT=$(readlink -f "$(command -v {bin} 2>/dev/null)" 2>/dev/null || true)
+case "$CURRENT" in
+  *.bun/*|*/bun/install/*) PM=bun ;;
+  */node_modules/*|/usr/local/*|/usr/*) PM=npm ;;
+  *) command -v bun >/dev/null 2>&1 && PM=bun || PM=npm ;;
+esac
+$PM install -g "$PKG""#
+    )
 }
 
 /// Uninstall a system component.

@@ -564,6 +564,23 @@ impl LibraryStore {
         Ok(())
     }
 
+    fn validate_relative_file_path(path: &str) -> Result<()> {
+        let candidate = Path::new(path);
+        if path.is_empty() || candidate.is_absolute() {
+            anyhow::bail!("Invalid file path");
+        }
+
+        for component in candidate.components() {
+            match component {
+                std::path::Component::Normal(part) if !part.is_empty() => {}
+                std::path::Component::CurDir => {}
+                _ => anyhow::bail!("Path traversal not allowed"),
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate that a path doesn't escape the base directory via traversal.
     fn validate_path_within(&self, base: &std::path::Path, target: &std::path::Path) -> Result<()> {
         // Canonicalize what we can, but for non-existent paths we need to check components
@@ -2238,9 +2255,11 @@ impl LibraryStore {
     /// Get a specific file from a config profile.
     pub async fn get_config_profile_file(&self, profile: &str, file_path: &str) -> Result<String> {
         Self::validate_name(profile)?;
+        Self::validate_relative_file_path(file_path)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
         let path = profile_dir.join(file_path);
+        self.validate_path_within(&profile_dir, &path)?;
 
         if !path.exists() {
             anyhow::bail!("File not found: {}", file_path);
@@ -2259,9 +2278,11 @@ impl LibraryStore {
         content: &str,
     ) -> Result<()> {
         Self::validate_name(profile)?;
+        Self::validate_relative_file_path(file_path)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
         let path = profile_dir.join(file_path);
+        self.validate_path_within(&profile_dir, &path)?;
 
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
@@ -2278,9 +2299,11 @@ impl LibraryStore {
     /// Delete a specific file from a config profile.
     pub async fn delete_config_profile_file(&self, profile: &str, file_path: &str) -> Result<()> {
         Self::validate_name(profile)?;
+        Self::validate_relative_file_path(file_path)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
         let path = profile_dir.join(file_path);
+        self.validate_path_within(&profile_dir, &path)?;
 
         if !path.exists() {
             anyhow::bail!("File not found: {}", file_path);
@@ -2361,8 +2384,11 @@ impl LibraryStore {
         if !valid_harnesses.contains(&harness) {
             anyhow::bail!("Invalid harness: {}", harness);
         }
+        Self::validate_relative_file_path(file_name)?;
 
-        let path = self.path.join(harness).join(file_name);
+        let harness_dir = self.path.join(harness);
+        let path = harness_dir.join(file_name);
+        self.validate_path_within(&harness_dir, &path)?;
 
         if !path.exists() {
             anyhow::bail!("Harness default file not found: {}/{}", harness, file_name);
@@ -2380,7 +2406,6 @@ impl LibraryStore {
         if !valid_harnesses.contains(&harness) {
             anyhow::bail!("Invalid harness: {}", harness);
         }
-
         let harness_dir = self.path.join(harness);
         if !harness_dir.exists() {
             return Ok(Vec::new());
@@ -2414,6 +2439,7 @@ impl LibraryStore {
         if !valid_harnesses.contains(&harness) {
             anyhow::bail!("Invalid harness: {}", harness);
         }
+        Self::validate_relative_file_path(file_name)?;
 
         let harness_dir = self.path.join(harness);
         if !harness_dir.exists() {
@@ -2421,6 +2447,7 @@ impl LibraryStore {
         }
 
         let path = harness_dir.join(file_name);
+        self.validate_path_within(&harness_dir, &path)?;
         fs::write(&path, content)
             .await
             .context("Failed to write harness default file")?;
@@ -2586,6 +2613,19 @@ This is the body."#;
     #[test]
     fn test_validate_name_rejects_empty() {
         assert!(LibraryStore::validate_name("").is_err());
+    }
+
+    #[test]
+    fn test_validate_relative_file_path_rejects_escape() {
+        assert!(LibraryStore::validate_relative_file_path("../config.json").is_err());
+        assert!(LibraryStore::validate_relative_file_path("/etc/passwd").is_err());
+        assert!(LibraryStore::validate_relative_file_path("nested/../../config.json").is_err());
+    }
+
+    #[test]
+    fn test_validate_relative_file_path_allows_profile_paths() {
+        assert!(LibraryStore::validate_relative_file_path(".opencode/settings.json").is_ok());
+        assert!(LibraryStore::validate_relative_file_path(".sandboxed-sh/config.json").is_ok());
     }
 }
 

@@ -14,6 +14,22 @@ use tokio::sync::RwLock;
 use super::crypto::SecretsCrypto;
 use super::types::*;
 
+fn validate_storage_name(kind: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.starts_with('.')
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        anyhow::bail!(
+            "Invalid {} name: use ASCII letters, numbers, '_' or '-'",
+            kind
+        );
+    }
+    Ok(())
+}
+
 /// Store for managing encrypted secrets.
 pub struct SecretsStore {
     /// Base directory (.sandboxed-sh/secrets)
@@ -82,6 +98,9 @@ impl SecretsStore {
             if path.extension().map(|e| e == "json").unwrap_or(false) {
                 if let Ok(content) = fs::read_to_string(&path).await {
                     if let Ok(registry) = serde_json::from_str::<SecretRegistry>(&content) {
+                        if validate_storage_name("registry", &registry.name).is_err() {
+                            continue;
+                        }
                         registries.insert(registry.name.clone(), registry);
                     }
                 }
@@ -109,6 +128,7 @@ impl SecretsStore {
 
     /// Save a registry to disk.
     async fn save_registry(&self, registry: &SecretRegistry) -> Result<()> {
+        validate_storage_name("registry", &registry.name)?;
         let registries_dir = self.base_dir.join("registries");
         fs::create_dir_all(&registries_dir).await?;
 
@@ -163,6 +183,7 @@ impl SecretsStore {
     /// This creates the key entry in config but doesn't store any passphrase.
     /// The user must provide the passphrase via environment variable or unlock endpoint.
     pub async fn initialize(&self, key_id: &str) -> Result<InitializeKeysResult> {
+        validate_storage_name("key", key_id)?;
         // Ensure directories exist
         let keys_dir = self.base_dir.join("keys");
         fs::create_dir_all(&keys_dir).await?;
@@ -243,6 +264,7 @@ impl SecretsStore {
 
     /// Get or create a registry.
     pub async fn get_or_create_registry(&self, name: &str) -> Result<()> {
+        validate_storage_name("registry", name)?;
         let mut registries = self.registries.write().await;
 
         if registries.contains_key(name) {
@@ -262,6 +284,7 @@ impl SecretsStore {
 
     /// List secrets in a registry.
     pub async fn list_secrets(&self, registry_name: &str) -> Result<Vec<SecretInfo>> {
+        validate_storage_name("registry", registry_name)?;
         let registries = self.registries.read().await;
         let registry = registries
             .get(registry_name)
@@ -293,6 +316,7 @@ impl SecretsStore {
 
     /// Get a decrypted secret value.
     pub async fn get_secret(&self, registry_name: &str, key: &str) -> Result<String> {
+        validate_storage_name("registry", registry_name)?;
         let crypto = self.crypto.read().await;
         if !crypto.has_passphrase() {
             anyhow::bail!("Secrets are locked. Provide passphrase to unlock.");
@@ -321,6 +345,7 @@ impl SecretsStore {
         value: &str,
         metadata: Option<SecretMetadata>,
     ) -> Result<()> {
+        validate_storage_name("registry", registry_name)?;
         // Ensure registry exists
         self.get_or_create_registry(registry_name).await?;
 
@@ -354,6 +379,7 @@ impl SecretsStore {
 
     /// Delete a secret.
     pub async fn delete_secret(&self, registry_name: &str, key: &str) -> Result<()> {
+        validate_storage_name("registry", registry_name)?;
         let mut registries = self.registries.write().await;
         let registry = registries
             .get_mut(registry_name)
@@ -373,6 +399,7 @@ impl SecretsStore {
 
     /// Delete a registry and all its secrets.
     pub async fn delete_registry(&self, registry_name: &str) -> Result<()> {
+        validate_storage_name("registry", registry_name)?;
         let mut registries = self.registries.write().await;
 
         if registries.remove(registry_name).is_none() {
@@ -401,6 +428,7 @@ impl SecretsStore {
         registry_name: &str,
         keys: Option<&[&str]>,
     ) -> Result<PathBuf> {
+        validate_storage_name("registry", registry_name)?;
         let crypto = self.crypto.read().await;
         if !crypto.has_passphrase() {
             anyhow::bail!("Secrets are locked. Provide passphrase to unlock.");
@@ -452,6 +480,7 @@ impl SecretsStore {
 
     /// Import secrets from a JSON file.
     pub async fn import_from_json(&self, registry_name: &str, json_content: &str) -> Result<usize> {
+        validate_storage_name("registry", registry_name)?;
         let secrets: HashMap<String, serde_json::Value> = serde_json::from_str(json_content)?;
 
         let mut count = 0;
@@ -546,5 +575,23 @@ mod tests {
         let store2 = SecretsStore::new(temp.path()).await.unwrap();
         let result = store2.unlock("wrong-passphrase").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_registry_names_that_escape_storage_dir() {
+        let temp = tempdir().unwrap();
+        let store = SecretsStore::new(temp.path()).await.unwrap();
+
+        assert!(store.get_or_create_registry("../outside").await.is_err());
+        assert!(store.delete_registry("../outside").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_key_ids_that_escape_storage_dir() {
+        let temp = tempdir().unwrap();
+        let store = SecretsStore::new(temp.path()).await.unwrap();
+
+        assert!(store.initialize("../outside").await.is_err());
+        assert!(store.initialize(".hidden").await.is_err());
     }
 }
