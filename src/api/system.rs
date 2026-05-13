@@ -956,6 +956,10 @@ fn version_is_newer(a: &str, b: &str) -> bool {
 }
 
 /// Extract the first semver-like token from a version string.
+///
+/// A token qualifies only if it has at least one `digit.digit` pair, so stray
+/// dots from paths (e.g. `~/.config`, `node_modules/.bin`) don't get picked up
+/// as a "version" of `.`.
 fn extract_version_token(input: &str) -> Option<String> {
     let mut best: Option<String> = None;
     let mut current = String::new();
@@ -965,17 +969,33 @@ fn extract_version_token(input: &str) -> Option<String> {
             current.push(ch);
             continue;
         }
-        if current.contains('.') {
-            best = Some(current.clone());
+        if let Some(token) = qualify_version_token(&current) {
+            best = Some(token);
         }
         current.clear();
     }
 
-    if current.contains('.') {
-        best = Some(current);
+    if let Some(token) = qualify_version_token(&current) {
+        best = Some(token);
     }
 
     best.map(|v| v.trim_start_matches('v').to_string())
+}
+
+fn qualify_version_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_matches('.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let has_digit_dot_digit = bytes
+        .windows(3)
+        .any(|w| w[0].is_ascii_digit() && w[1] == b'.' && w[2].is_ascii_digit());
+    if has_digit_dot_digit {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
 }
 
 /// Get oh-my-opencode version and status.
@@ -1998,7 +2018,38 @@ fn stream_oh_my_opencode_uninstall() -> impl Stream<Item = Result<Event, std::co
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_repo_path, normalize_repo_path, select_repo_path};
+    use super::{
+        extract_version_token, is_safe_repo_path, normalize_repo_path, select_repo_path,
+    };
+
+    #[test]
+    fn extract_version_token_basic_semver() {
+        assert_eq!(
+            extract_version_token("opencode v1.4.0"),
+            Some("1.4.0".to_string())
+        );
+        assert_eq!(
+            extract_version_token("v0.128.0\n"),
+            Some("0.128.0".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_version_token_ignores_lone_dot_from_paths() {
+        // Was returning Some(".") before — paths in CLI output should never
+        // qualify as a version.
+        assert_eq!(extract_version_token("/root/.config/opencode"), None);
+        assert_eq!(extract_version_token("node_modules/.bin/foo"), None);
+        assert_eq!(extract_version_token("Could not find ~/.opencode/"), None);
+    }
+
+    #[test]
+    fn extract_version_token_prefers_last_semver_in_input() {
+        assert_eq!(
+            extract_version_token("warning at line 1.2 — installed v3.4.5"),
+            Some("3.4.5".to_string())
+        );
+    }
 
     #[test]
     fn select_repo_path_prefers_env() {
