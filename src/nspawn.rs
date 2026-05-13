@@ -477,7 +477,8 @@ pub(crate) fn build_log_path_for(container_path: &Path) -> std::path::PathBuf {
 }
 
 async fn create_arch_container(path: &Path) -> NspawnResult<()> {
-    let pacman_conf = std::env::temp_dir().join("sandboxed_sh_pacman.conf");
+    let pacman_conf =
+        std::env::temp_dir().join(format!("sandboxed_sh_pacman_{}.conf", uuid::Uuid::new_v4()));
     let pacman_conf_contents = r#"[options]
 Architecture = auto
 SigLevel = Never
@@ -488,28 +489,39 @@ Include = /etc/pacman.d/mirrorlist
 [extra]
 Include = /etc/pacman.d/mirrorlist
 "#;
-    tokio::fs::write(&pacman_conf, pacman_conf_contents).await?;
+    let mut pacman_conf_file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pacman_conf)
+        .await?;
+    use tokio::io::AsyncWriteExt;
+    pacman_conf_file
+        .write_all(pacman_conf_contents.as_bytes())
+        .await?;
+    pacman_conf_file.flush().await?;
+    drop(pacman_conf_file);
 
-    let output = tokio::process::Command::new("pacstrap")
+    let output_result = tokio::process::Command::new("pacstrap")
         .arg("-C")
         .arg(&pacman_conf)
         .arg("-c")
         .arg(path)
         .arg("base")
         .output()
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                NspawnError::Pacstrap(
-                    "pacstrap not found. Install arch-install-scripts (and pacman) on the host."
-                        .to_string(),
-                )
-            } else {
-                NspawnError::Pacstrap(e.to_string())
-            }
-        })?;
+        .await;
 
     let _ = tokio::fs::remove_file(&pacman_conf).await;
+
+    let output = output_result.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            NspawnError::Pacstrap(
+                "pacstrap not found. Install arch-install-scripts (and pacman) on the host."
+                    .to_string(),
+            )
+        } else {
+            NspawnError::Pacstrap(e.to_string())
+        }
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

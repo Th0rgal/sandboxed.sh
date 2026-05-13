@@ -79,7 +79,7 @@ idna_adapter = "=1.1.0"
 
 # File locking for OAuth token refresh synchronization
 fs2 = "0.4"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "2", default-features = false, features = ["gzip", "json", "native-tls"] }
 
 # Gzip compression for mission export/import transport. flate2 already
 # lands transitively via zip/tokio-util; naming it explicitly keeps the

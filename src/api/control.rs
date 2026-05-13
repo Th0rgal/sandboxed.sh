@@ -2662,17 +2662,20 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         resumable: bool,
     },
-    /// Goal-mode iteration marker — fired once per turn while a codex
-    /// `/goal` continuation loop is active. UI renders as "iter N" pill.
+    /// Goal-mode iteration marker — fired once per turn while a `/goal`
+    /// continuation loop is active. Today only codex's native goal engine
+    /// emits these (Claude Code's native `/goal` runs internally to the CLI
+    /// and surfaces a single completion). UI renders as "iter N" pill.
     GoalIteration {
         iteration: u32,
         objective: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
     },
-    /// Goal status transitioned. Carries the canonical status string from
-    /// codex's `thread/goal/updated`: `active`, `paused`, `budgetLimited`,
-    /// `complete`, or `cleared` when the goal was explicitly aborted.
+    /// Goal status transitioned. Canonical values: `active`, `paused`,
+    /// `budgetLimited`, `complete`, `aborted`, or `cleared`. Codex emits these
+    /// from `thread/goal/updated`; Claude Code's continuation loop emits them
+    /// at iteration boundaries.
     GoalStatus {
         status: String,
         objective: String,
@@ -9595,7 +9598,15 @@ async fn control_actor_loop(
                         mission_id: Some(mid),
                     } = &event
                     {
-                        let goal_mode = status != "cleared";
+                        // Any terminal status closes the goal loop — keep
+                        // history (mission still shows the objective) but
+                        // clear `goal_mode` so subsequent turns aren't
+                        // dispatched through the continuation driver.
+                        let is_terminal = matches!(
+                            status.as_str(),
+                            "cleared" | "complete" | "budgetLimited" | "aborted"
+                        );
+                        let goal_mode = !is_terminal;
                         let objective = goal_mode.then_some(objective.as_str());
                         if let Err(err) = mission_store
                             .update_mission_goal(*mid, goal_mode, objective)
@@ -9804,6 +9815,39 @@ async fn run_single_control_turn(
             // where the session exists but history may not have assistant messages yet).
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
+
+            // `/goal <objective>` is driven by Claude Code 2.1.139+ native
+            // continuation engine. Skip this dispatcher's per-turn transport
+            // recovery loop — the native CLI may legitimately run for many
+            // turns inside one `--print` invocation, and a transport retry
+            // would clobber the in-progress session. We just wrap the call
+            // with a GoalStatus bracket so the dashboard pill and mission
+            // store goal metadata stay in sync with the codex path.
+            if let Some(objective) =
+                crate::backend::goal::parse_goal_objective(&user_message)
+            {
+                return Box::pin(super::mission_runner::run_claudecode_native_goal(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &user_message,
+                    &objective,
+                    config.default_model.as_deref(),
+                    requested_model_effort.as_deref(),
+                    config.opencode_agent.as_deref(),
+                    mid,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    None,
+                    &config.working_dir,
+                    session_id.as_deref(),
+                    is_continuation,
+                    Some(tool_hub.clone()),
+                    Some(status.clone()),
+                    None,
+                ))
+                .await;
+            }
+
             let mut effective_message = user_message.clone();
             let mut effective_session_id = session_id.clone();
             let mut attempted_same_session_resume = false;
@@ -12895,7 +12939,7 @@ pub async fn telegram_webhook_receiver(
             .get("x-telegram-bot-api-secret-token")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if header_secret != expected_secret {
+        if !super::auth::constant_time_eq(header_secret, expected_secret) {
             tracing::warn!(
                 "Telegram webhook secret mismatch for channel {}",
                 channel_id

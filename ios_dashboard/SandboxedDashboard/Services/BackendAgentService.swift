@@ -48,8 +48,15 @@ enum BackendAgentService {
     }
 
     /// Actual network fetch (extracted from the previous loadBackendsAndAgents).
+    ///
+    /// Fans out the per-backend config and agent requests with `withTaskGroup`
+    /// instead of the previous sequential `for` loops. Previously: N backends →
+    /// N config round-trips + M agent round-trips, all serialised. On a slow
+    /// cellular link with 3 backends that was ~6 sequential RTTs before the
+    /// user saw an agent picker. Now all per-backend calls run concurrently,
+    /// gated only by the first (`listBackends`) and capped by the URLSession's
+    /// per-host connection limit.
     private static func fetchBackendsAndAgents() async -> BackendAgentData {
-        // Load backends
         let backends: [Backend]
         do {
             backends = try await api.listBackends()
@@ -57,35 +64,53 @@ enum BackendAgentService {
             backends = Backend.defaults
         }
 
-        // Load backend configs to check enabled status
-        var enabled = Set<String>()
-        for backend in backends {
-            do {
-                let config = try await api.getBackendConfig(backendId: backend.id)
-                if config.isEnabled {
-                    enabled.insert(backend.id)
+        // Fan out config probes in parallel. Default-to-enabled on error
+        // mirrors the previous behaviour so a flaky `/config` endpoint
+        // doesn't strand the user with an empty backend list.
+        let enabled: Set<String> = await withTaskGroup(of: (String, Bool).self) { group in
+            for backend in backends {
+                group.addTask {
+                    do {
+                        let config = try await api.getBackendConfig(backendId: backend.id)
+                        return (backend.id, config.isEnabled)
+                    } catch {
+                        return (backend.id, true)
+                    }
                 }
-            } catch {
-                // Default to enabled if we can't fetch config
-                enabled.insert(backend.id)
             }
+            var result = Set<String>()
+            for await (id, isEnabled) in group where isEnabled {
+                result.insert(id)
+            }
+            return result
         }
 
-        // Load agents for each enabled backend
-        var backendAgents: [String: [BackendAgent]] = [:]
-        for backendId in enabled {
-            do {
-                let agents = try await api.listBackendAgents(backendId: backendId)
-                backendAgents[backendId] = agents
-            } catch {
-                // Use defaults for Amp if API fails
-                if backendId == "amp" {
-                    backendAgents[backendId] = [
+        // Fan out agent probes in parallel.
+        let backendAgents: [String: [BackendAgent]] = await withTaskGroup(of: (String, [BackendAgent]?).self) { group in
+            for backendId in enabled {
+                group.addTask {
+                    do {
+                        let agents = try await api.listBackendAgents(backendId: backendId)
+                        return (backendId, agents)
+                    } catch {
+                        return (backendId, nil)
+                    }
+                }
+            }
+            var result: [String: [BackendAgent]] = [:]
+            for await (id, agents) in group {
+                if let agents {
+                    result[id] = agents
+                } else if id == "amp" {
+                    // Amp ships hardcoded fallbacks when its agent list 404s
+                    // mid-rollout; preserved from the original behaviour.
+                    result[id] = [
                         BackendAgent(id: "smart", name: "Smart Mode"),
                         BackendAgent(id: "rush", name: "Rush Mode")
                     ]
                 }
             }
+            return result
         }
 
         return BackendAgentData(

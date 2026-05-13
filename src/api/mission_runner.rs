@@ -2775,6 +2775,36 @@ async fn run_mission_turn(
     let is_continuation = history.iter().any(|(role, _)| role == "assistant");
     let result = match backend_id.as_str() {
         "claudecode" => {
+            // `/goal <objective>` runs through Claude Code's native
+            // continuation engine (added in 2.1.139). The CLI handles the
+            // multi-turn loop internally, so we just pass the prefix-bearing
+            // message through and synthesize start/end GoalStatus events so
+            // the dashboard pill and mission store's `goal_mode` flag stay
+            // in sync with the codex path.
+            if let Some(objective) = crate::backend::goal::parse_goal_objective(&user_message) {
+                let goal_result = run_claudecode_native_goal(
+                    &workspace,
+                    &mission_work_dir,
+                    &user_message,
+                    &objective,
+                    config.default_model.as_deref(),
+                    model_effort.as_deref(),
+                    effective_agent.as_deref(),
+                    mission_id,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    secrets.clone(),
+                    &config.working_dir,
+                    session_id.as_deref(),
+                    is_continuation,
+                    Some(Arc::clone(&tool_hub)),
+                    Some(Arc::clone(&status)),
+                    None,
+                )
+                .await;
+                return goal_result;
+            }
+
             // Track the effective message and session used for the most recent
             // attempt, so account rotation uses the right context (e.g. after
             // session corruption recovery rebuilds the message).
@@ -3632,6 +3662,105 @@ fn get_amp_url_from_settings() -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+/// Bracket a Claude Code `/goal <objective>` turn with the
+/// `GoalStatus { status: "active" }` event up front and a terminal
+/// `GoalStatus { status: "complete" }` (or `"cleared"` on cancel) after
+/// the underlying [`run_claudecode_turn`] returns.
+///
+/// Claude Code 2.1.139 added a native `/goal` command that drives the
+/// completion-condition loop **inside the CLI**, across however many turns
+/// it takes; `--print` returns a single terminal `result` event when the
+/// goal is satisfied (or fails). So unlike codex's `thread/goal/set` there
+/// are no per-iteration RPCs to translate — the `/goal ` prefix is passed
+/// through verbatim and Claude Code does the rest.
+///
+/// We still synthesize an `active` / `complete` GoalStatus bracket because
+/// the dashboard's goal pill and the mission store's `goal_mode` flag rely
+/// on those events (set by control.rs from `parse_goal_objective` for the
+/// active side, and by this wrapper for the terminal side).
+///
+/// Note: the `message` argument MUST retain its `/goal ` prefix — Claude
+/// Code's CLI dispatches on it. The `objective` argument is the parsed
+/// payload, used only for the GoalStatus event metadata.
+#[allow(clippy::too_many_arguments)]
+pub fn run_claudecode_native_goal<'a>(
+    workspace: &'a Workspace,
+    work_dir: &'a std::path::Path,
+    message: &'a str,
+    objective: &'a str,
+    model: Option<&'a str>,
+    model_effort: Option<&'a str>,
+    agent: Option<&'a str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    secrets: Option<Arc<SecretsStore>>,
+    app_working_dir: &'a std::path::Path,
+    session_id: Option<&'a str>,
+    is_continuation: bool,
+    tool_hub: Option<Arc<FrontendToolHub>>,
+    status: Option<Arc<RwLock<ControlStatus>>>,
+    override_auth: Option<super::ai_providers::ClaudeCodeAuth>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
+    Box::pin(async move {
+        let objective_owned = objective.to_string();
+
+        // Light the pill before the turn so the dashboard renders goal mode
+        // immediately. Mirrors the `active` notification codex emits.
+        let _ = events_tx.send(AgentEvent::GoalStatus {
+            status: "active".to_string(),
+            objective: objective_owned.clone(),
+            mission_id: Some(mission_id),
+        });
+
+        let result = run_claudecode_turn(
+            workspace,
+            work_dir,
+            message,
+            model,
+            model_effort,
+            agent,
+            mission_id,
+            events_tx.clone(),
+            cancel.clone(),
+            secrets,
+            app_working_dir,
+            session_id,
+            is_continuation,
+            tool_hub,
+            status,
+            override_auth,
+        )
+        .await;
+
+        // Close out the goal pill. Cancellation → `cleared`; clean success →
+        // `complete`; everything else (transport failure, auth error, etc.)
+        // leaves the goal in `active` so the next turn / user prompt can
+        // pick up where we left off.
+        let terminal_status = if cancel.is_cancelled()
+            || matches!(
+                result.terminal_reason,
+                Some(TerminalReason::Cancelled) | Some(TerminalReason::ServerShutdown)
+            ) {
+            Some("cleared")
+        } else if result.success {
+            Some("complete")
+        } else {
+            None
+        };
+
+        if let Some(status_str) = terminal_status {
+            let _ = events_tx.send(AgentEvent::GoalStatus {
+                status: status_str.to_string(),
+                objective: objective_owned,
+                mission_id: Some(mission_id),
+            });
+        }
+
+        result
+    })
 }
 
 /// Execute a turn using Claude Code CLI backend.
@@ -7130,13 +7259,13 @@ async fn ensure_opencode_plugin_installed(
     let install_cmd = match installer {
         "bun" => format!(
             "cd {} && bun add {}",
-            opencode_config_dir_env.to_string_lossy(),
-            plugin_spec
+            shell_quote(&opencode_config_dir_env.to_string_lossy()),
+            shell_quote(plugin_spec)
         ),
         _ => format!(
             "cd {} && npm install {}",
-            opencode_config_dir_env.to_string_lossy(),
-            plugin_spec
+            shell_quote(&opencode_config_dir_env.to_string_lossy()),
+            shell_quote(plugin_spec)
         ),
     };
 
@@ -8448,9 +8577,9 @@ async fn command_available(
         let mut args = Vec::new();
         args.push("-lc".to_string());
         if program.contains('/') {
-            args.push(format!("test -x {}", program));
+            args.push(format!("test -x {}", shell_quote(program)));
         } else {
-            args.push(format!("command -v {} 2>/dev/null", program));
+            args.push(format!("command -v {} 2>/dev/null", shell_quote(program)));
         }
         let output = workspace_exec
             .output(cwd, "/bin/sh", &args, HashMap::new())
@@ -8556,7 +8685,7 @@ async fn resolve_command_path_in_workspace(
 
     let mut args = Vec::new();
     args.push("-lc".to_string());
-    args.push(format!("command -v {} 2>/dev/null", program));
+    args.push(format!("command -v {} 2>/dev/null", shell_quote(program)));
     let output = workspace_exec
         .output(cwd, "/bin/sh", &args, HashMap::new())
         .await
@@ -14710,7 +14839,7 @@ mod tests {
         opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, record_codex_error_message, resolve_cost_cents_and_source,
-        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
+        running_health, sanitized_opencode_stdout, shell_quote, stall_severity, strip_ansi_codes,
         strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
         sync_opencode_agent_config, use_thinking_only_fallback, ClaudeIncompleteTurnContext,
         ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
@@ -17004,6 +17133,16 @@ mod tests {
         assert_eq!(
             localhost_api_base_url(Some(" 3000 ")).as_deref(),
             Some("http://127.0.0.1:3000")
+        );
+    }
+
+    #[test]
+    fn shell_quote_single_quotes_shell_metacharacters() {
+        assert_eq!(shell_quote("bun"), "'bun'");
+        assert_eq!(shell_quote("/tmp/a path/tool"), "'/tmp/a path/tool'");
+        assert_eq!(
+            shell_quote("x'; touch /tmp/pwn; 'y"),
+            "'x'\\''; touch /tmp/pwn; '\\''y'"
         );
     }
 }

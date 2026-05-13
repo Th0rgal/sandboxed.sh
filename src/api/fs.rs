@@ -751,6 +751,23 @@ fn sanitize_path_component(s: &str) -> String {
         .to_string()
 }
 
+fn content_disposition_filename(path: &str) -> String {
+    let filename = path
+        .split('/')
+        .next_back()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download");
+    let sanitized = sanitize_path_component(filename)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "download".to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Validate a URL to prevent SSRF attacks.
 /// Blocks requests to:
 /// - localhost and loopback addresses (127.0.0.0/8, ::1)
@@ -1041,12 +1058,7 @@ pub async fn download(
     } else {
         resolve_legacy_fs_path_for_read(&state, &q.path)?
     };
-    let filename = q
-        .path
-        .split('/')
-        .next_back()
-        .filter(|name| !name.is_empty())
-        .unwrap_or("download");
+    let filename = content_disposition_filename(&q.path);
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_DISPOSITION,
@@ -1515,8 +1527,9 @@ pub async fn download_from_url(
 #[cfg(test)]
 mod tests {
     use super::{
-        api_context_root_for_config, context_mirror_suffix, context_upload_suffix_for_dir,
-        is_context_upload_path_for_dir, path_is_under_allowed_roots, sanitize_path_component,
+        api_context_root_for_config, content_disposition_filename, context_mirror_suffix,
+        context_upload_suffix_for_dir, is_context_upload_path_for_dir, path_is_under_allowed_roots,
+        sanitize_path_component,
     };
     use crate::config::Config;
     use std::path::{Path, PathBuf};
@@ -1596,6 +1609,15 @@ mod tests {
             "secret.txt"
         );
         assert_eq!(sanitize_path_component("..hidden\0.txt"), "hidden.txt");
+    }
+
+    #[test]
+    fn content_disposition_filename_strips_header_metacharacters() {
+        assert_eq!(
+            content_disposition_filename(r#"../report"; filename*=utf-8''evil.txt"#),
+            "reportfilenameutf-8evil.txt"
+        );
+        assert_eq!(content_disposition_filename("???"), "download");
     }
 
     #[test]
