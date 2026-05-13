@@ -4,6 +4,7 @@ pub mod codex;
 pub mod events;
 pub mod gemini;
 pub mod goal;
+pub mod native_loops;
 pub mod opencode;
 pub mod registry;
 pub mod shared;

@@ -397,6 +397,16 @@ export function MissionAutomationsDialog({
       const content = automation.command_source.content;
       return content.length > 60 ? content.slice(0, 57) + '...' : content;
     }
+    if (automation.command_source?.type === 'native_loop') {
+      const objective =
+        typeof automation.command_source.args === 'object' &&
+        automation.command_source.args !== null
+          ? ((automation.command_source.args as Record<string, unknown>)
+              .objective as string | undefined)
+          : undefined;
+      const label = `/${automation.command_source.command} ${objective ?? ''}`.trim();
+      return label.length > 60 ? label.slice(0, 57) + '...' : label;
+    }
     return 'Command';
   }, []);
 
@@ -404,10 +414,22 @@ export function MissionAutomationsDialog({
     if (automation.command_source?.type === 'library') return 'Library';
     if (automation.command_source?.type === 'inline') return 'Prompt';
     if (automation.command_source?.type === 'local_file') return 'File';
+    if (automation.command_source?.type === 'native_loop') {
+      // Compact harness tag: "Claude /goal", "Codex /goal", …
+      const h = automation.command_source.harness;
+      const harnessLabel =
+        h === 'claudecode' ? 'Claude' : h === 'codex' ? 'Codex' : h;
+      return `${harnessLabel} /${automation.command_source.command}`;
+    }
     return '';
   }, []);
 
   const getAutomationScheduleLabel = useCallback((automation: Automation) => {
+    // Harness-loop rows aren't driven by OA's scheduler — the harness CLI
+    // controls cadence. Show that explicitly instead of "After agent finishes".
+    if (automation.driver === 'harness_loop') {
+      return 'Harness loop';
+    }
     if (automation.trigger?.type === 'interval') {
       return `Every ${formatInterval(automation.trigger.seconds)}`;
     }

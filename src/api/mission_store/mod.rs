@@ -143,6 +143,19 @@ pub enum CommandSource {
     LocalFile { path: String },
     /// Inline command content
     Inline { content: String },
+    /// Harness-native loop (e.g. claudecode `/goal`, codex `/goal`). OA does
+    /// not drive iteration here — the harness CLI runs its own continuation
+    /// loop and we record each iteration as an `AutomationExecution`. See
+    /// `crate::backend::native_loops` for the per-harness adapters.
+    NativeLoop {
+        /// Backend id: `"claudecode"`, `"codex"`, `"opencode"`, …
+        harness: String,
+        /// Slash command, without the leading `/`. Today: `"goal"`.
+        command: String,
+        /// Free-form per-command args. For `goal`: `{ "objective": "..." }`.
+        #[serde(default)]
+        args: serde_json::Value,
+    },
 }
 
 /// Webhook configuration for webhook-triggered automations.
@@ -265,6 +278,20 @@ impl Default for RetryConfig {
     }
 }
 
+/// Who actually drives iteration for an automation.
+///
+/// `Scheduler` is the historical behavior — OA fires the command on a
+/// `TriggerType`. `HarnessLoop` means the harness CLI runs its own
+/// continuation loop (claudecode/codex `/goal`); OA records iterations
+/// but doesn't decide when they fire.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationDriver {
+    #[default]
+    Scheduler,
+    HarnessLoop,
+}
+
 /// An automation that triggers commands based on various triggers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Automation {
@@ -298,6 +325,10 @@ pub struct Automation {
     /// This is tracked internally and not persisted directly.
     #[serde(default, skip_serializing)]
     pub consecutive_failures: u32,
+    /// What drives iteration for this automation. Existing rows default to
+    /// `Scheduler` (OA-driven) so the field is back-compatible.
+    #[serde(default)]
+    pub driver: AutomationDriver,
 }
 
 /// Execution status for automation runs.
@@ -1695,6 +1726,37 @@ pub async fn create_mission_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telegram_channel_serialization_omits_secret_material() {
+        let channel = TelegramChannel {
+            id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            bot_token: "123:secret-token".to_string(),
+            bot_username: Some("test_bot".to_string()),
+            allowed_chat_ids: vec![123],
+            trigger_mode: TelegramTriggerMode::default(),
+            active: true,
+            webhook_secret: Some("webhook-secret".to_string()),
+            instructions: None,
+            auto_create_missions: false,
+            default_backend: None,
+            default_model_override: None,
+            default_model_effort: None,
+            default_workspace_id: None,
+            default_config_profile: None,
+            default_agent: None,
+            created_at: now_string(),
+            updated_at: now_string(),
+        };
+
+        let value = serde_json::to_value(channel).expect("serialize telegram channel");
+        assert!(value.get("bot_token").is_none());
+        assert!(value.get("webhook_secret").is_none());
+        let text = serde_json::to_string(&value).expect("serialize json");
+        assert!(!text.contains("secret-token"));
+        assert!(!text.contains("webhook-secret"));
+    }
 
     /// Test that missions are created with Pending status (not Active).
     /// This is critical to prevent the race condition where startup recovery

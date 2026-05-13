@@ -2325,6 +2325,19 @@ async fn validate_automation_command_source(
         mission_store::CommandSource::Inline { content } => {
             validate_automation_command_content(content)
         }
+        mission_store::CommandSource::NativeLoop {
+            harness,
+            command,
+            args: _,
+        } => {
+            if harness.trim().is_empty() || command.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "native loop automations require harness and command".to_string(),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -5370,6 +5383,17 @@ fn spawn_control_session(
         });
     }
 
+    // Spawn native-loop observer: turns harness goal events into
+    // Automation rows + AutomationExecution iterations so the
+    // automations panel shows /goal alongside scheduled automations.
+    if state.mission_store.is_persistent() && config.automations_enabled {
+        let store = Arc::clone(&state.mission_store);
+        let tx = events_tx.clone();
+        tokio::spawn(async move {
+            super::native_loop_observer::run(store, tx).await;
+        });
+    }
+
     // Spawn automation scheduler task
     if state.mission_store.is_persistent() && config.automations_enabled {
         tokio::spawn(automation_scheduler_loop(
@@ -6182,6 +6206,13 @@ async fn automation_scheduler_loop(
                     }
                 }
                 CommandSource::Inline { content } => content.clone(),
+                CommandSource::NativeLoop { .. } => {
+                    tracing::debug!(
+                        "Skipping scheduler execution for native-loop automation {}",
+                        automation.id
+                    );
+                    continue;
+                }
             };
 
             // Build substitution context for variable replacement
@@ -6437,6 +6468,7 @@ async fn resolve_automation_command(
             read_local_automation_command_file(&file_path).await.ok()?
         }
         CommandSource::Inline { content } => content.clone(),
+        CommandSource::NativeLoop { .. } => return None,
     };
 
     let mut context = SubstitutionContext::new(mission.id);
@@ -6989,6 +7021,13 @@ async fn agent_finished_automation_messages(
                 }
             }
             CommandSource::Inline { content } => content.clone(),
+            CommandSource::NativeLoop { .. } => {
+                tracing::debug!(
+                    "Skipping agent_finished execution for native-loop automation {}",
+                    automation.id
+                );
+                continue;
+            }
         };
 
         // Build substitution context for variable replacement
@@ -10754,6 +10793,7 @@ pub async fn create_automation(
         last_triggered_at,
         retry_config: req.retry_config.unwrap_or_default(),
         consecutive_failures: 0,
+        driver: mission_store::AutomationDriver::Scheduler,
     };
 
     let mut automation = control
@@ -12098,6 +12138,12 @@ pub async fn webhook_receiver(
             read_local_automation_command_file(&file_path).await?
         }
         CommandSource::Inline { content } => content.clone(),
+        CommandSource::NativeLoop { .. } => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "native loop automations cannot be executed by the webhook scheduler".to_string(),
+            ));
+        }
     };
 
     // Apply webhook variable mappings
@@ -13454,6 +13500,7 @@ mod tests {
             stop_policy: mission_store::StopPolicy::Never,
             fresh_session,
             consecutive_failures: 0,
+            driver: mission_store::AutomationDriver::Scheduler,
         }
     }
 
