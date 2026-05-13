@@ -1674,10 +1674,9 @@ pub async fn process_webhook_message(
         // Context-only: store the message in mission history without triggering
         // the agent. This lets the agent see full chat context when it IS triggered.
         tracing::debug!(
-            "Storing Telegram context message for mission {} from {}: {}",
+            "Storing Telegram context message for mission {} from {}",
             target_mission_id,
-            sender_name,
-            &clean_text[..clean_text.floor_char_boundary(100)]
+            sender_name
         );
         let _ = ctx
             .mission_store
@@ -1695,10 +1694,9 @@ pub async fn process_webhook_message(
     }
 
     tracing::info!(
-        "Telegram webhook message for mission {} from {}: {}",
+        "Telegram webhook message for mission {} from {}",
         target_mission_id,
-        sender_name,
-        &clean_text[..clean_text.floor_char_boundary(100)]
+        sender_name
     );
 
     // Subscribe to events BEFORE sending the command to avoid race conditions

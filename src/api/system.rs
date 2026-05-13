@@ -253,19 +253,10 @@ async fn ensure_repo_present(repo_path: &std::path::Path) -> Result<(), String> 
     }
 
     if repo_path.exists() && !is_git_repo(repo_path).await {
-        if repo_path.is_file() {
-            tokio::fs::remove_file(repo_path)
-                .await
-                .map_err(|e| format!("Failed to remove file at {}: {}", repo_path.display(), e))?;
-        } else {
-            tokio::fs::remove_dir_all(repo_path).await.map_err(|e| {
-                format!(
-                    "Failed to remove non-git directory at {}: {}",
-                    repo_path.display(),
-                    e
-                )
-            })?;
-        }
+        return Err(format!(
+            "Refusing to overwrite existing non-git path {}. Choose an empty path or a sandboxed.sh git checkout.",
+            repo_path.display()
+        ));
     }
 
     if !repo_path.exists() {
@@ -2074,7 +2065,7 @@ fn stream_oh_my_opencode_uninstall() -> impl Stream<Item = Result<Event, std::co
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_semver, is_safe_repo_path, normalize_repo_path,
+        compare_semver, ensure_repo_present, is_safe_repo_path, normalize_repo_path,
         oh_my_opencode_cache_version_from_name, select_repo_path,
     };
 
@@ -2127,6 +2118,25 @@ mod tests {
         assert!(is_safe_repo_path(std::path::Path::new(
             crate::settings::DEFAULT_SANDBOXED_REPO_PATH
         )));
+    }
+
+    #[tokio::test]
+    async fn ensure_repo_present_refuses_existing_non_git_directory_without_deleting() {
+        let temp = tempfile::Builder::new()
+            .prefix("open-agent-system-test-")
+            .tempdir_in("/tmp")
+            .expect("tempdir");
+        let repo_path = temp.path().join("repo").join("target");
+        std::fs::create_dir_all(&repo_path).expect("create non-git dir");
+        let marker = repo_path.join("keep.txt");
+        std::fs::write(&marker, b"keep").expect("write marker");
+
+        let err = ensure_repo_present(&repo_path)
+            .await
+            .expect_err("existing non-git path should be rejected");
+
+        assert!(err.contains("Refusing to overwrite existing non-git path"));
+        assert!(marker.exists(), "non-git directory contents must remain");
     }
 
     #[test]

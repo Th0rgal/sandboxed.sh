@@ -92,6 +92,55 @@ mod tests {
 
         assert!(validate_oauth_callback_input(&req).is_err());
     }
+
+    #[test]
+    fn backend_auth_status_reports_presence_without_secret_material() {
+        let api = serde_json::json!({
+            "type": "api_key",
+            "key": "sk-secret"
+        });
+        let oauth = serde_json::json!({
+            "type": "oauth",
+            "access": "access-secret",
+            "refresh": "refresh-secret",
+            "expires": 123
+        });
+
+        assert_eq!(
+            backend_auth_status_from_entry(Some(&api)),
+            (Some("api_key".to_string()), true)
+        );
+        assert_eq!(
+            backend_auth_status_from_entry(Some(&oauth)),
+            (Some("oauth".to_string()), true)
+        );
+        assert_eq!(backend_auth_status_from_entry(None), (None, false));
+    }
+
+    #[test]
+    fn redacted_opencode_auth_removes_secret_fields() {
+        let auth = serde_json::json!({
+            "anthropic": {
+                "type": "oauth",
+                "access": "access-secret",
+                "refresh": "refresh-secret",
+                "expires": 123
+            },
+            "openai": {
+                "type": "api_key",
+                "key": "sk-secret"
+            }
+        });
+
+        let redacted = redacted_opencode_auth(&auth);
+        let text = serde_json::to_string(&redacted).expect("serialize redacted auth");
+        assert!(!text.contains("access-secret"));
+        assert!(!text.contains("refresh-secret"));
+        assert!(!text.contains("sk-secret"));
+        assert_eq!(redacted["anthropic"]["type"], "oauth");
+        assert_eq!(redacted["openai"]["type"], "api_key");
+        assert_eq!(redacted["anthropic"]["has_credentials"], true);
+    }
 }
 
 async fn exchange_openai_id_token_for_api_key(
@@ -2576,7 +2625,7 @@ pub struct AuthResponse {
     pub auth_url: Option<String>,
 }
 
-/// Response for provider credentials for a specific backend.
+/// Response for provider status for a specific backend.
 #[derive(Debug, Serialize)]
 pub struct BackendProviderResponse {
     /// Whether a provider is configured for this backend
@@ -2585,12 +2634,15 @@ pub struct BackendProviderResponse {
     pub provider_type: Option<String>,
     /// The provider name
     pub provider_name: Option<String>,
-    /// API key (if using API key auth)
+    /// Deprecated: raw API keys are no longer returned by this status endpoint.
     pub api_key: Option<String>,
-    /// OAuth credentials (if using OAuth)
+    /// Deprecated: raw OAuth tokens are no longer returned by this status endpoint.
     pub oauth: Option<BackendOAuthCredentials>,
     /// Whether the provider has valid credentials
     pub has_credentials: bool,
+    /// Credential type configured for this backend, without secret material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
 }
 
 /// OAuth credentials for backend provider.
@@ -2599,6 +2651,50 @@ pub struct BackendOAuthCredentials {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: i64,
+}
+
+fn backend_auth_status_from_entry(
+    auth_entry: Option<&serde_json::Value>,
+) -> (Option<String>, bool) {
+    let Some(auth_entry) = auth_entry else {
+        return (None, false);
+    };
+
+    let auth_type = auth_entry.get("type").and_then(|v| v.as_str());
+    match auth_type {
+        Some("api_key") | Some("api") => (Some("api_key".to_string()), true),
+        Some("oauth") => (Some("oauth".to_string()), true),
+        _ => {
+            if auth_entry.get("refresh").is_some() {
+                (Some("oauth".to_string()), true)
+            } else if auth_entry.get("key").is_some() || auth_entry.get("api_key").is_some() {
+                (Some("api_key".to_string()), true)
+            } else {
+                (None, false)
+            }
+        }
+    }
+}
+
+fn redacted_opencode_auth(auth: &serde_json::Value) -> serde_json::Value {
+    let Some(map) = auth.as_object() else {
+        return serde_json::json!({});
+    };
+
+    let mut redacted = serde_json::Map::new();
+    for (provider, entry) in map {
+        let (auth_method, has_credentials) = backend_auth_status_from_entry(Some(entry));
+        let expires = entry.get("expires").and_then(|v| v.as_i64());
+        redacted.insert(
+            provider.clone(),
+            serde_json::json!({
+                "type": auth_method,
+                "has_credentials": has_credentials,
+                "expires": expires,
+            }),
+        );
+    }
+    serde_json::Value::Object(redacted)
 }
 
 /// Request to initiate OAuth authorization.
@@ -3079,19 +3175,12 @@ pub fn read_oauth_token_entry(provider_type: ProviderType) -> Option<OAuthTokenE
 
     let (selected, source, path) = candidates.remove(best_idx);
 
-    let refresh_prefix = if selected.refresh_token.len() > 4 {
-        &selected.refresh_token[..4]
-    } else {
-        &selected.refresh_token
-    };
-
     tracing::debug!(
         provider = ?provider_type,
         source = ?source,
         expires_at = selected.expires_at,
         now_ms = now_ms,
-        refresh_prefix = %refresh_prefix,
-        "Selected OAuth token source (token prefix for correlation only)"
+        "Selected OAuth token source"
     );
 
     // If we selected a non-canonical source, sync it back to the canonical store.
@@ -3334,15 +3423,9 @@ async fn refresh_anthropic_oauth_token_inner(force: bool) -> Result<(), String> 
     }
 
     let refresh_token = entry.refresh_token.clone();
-    let refresh_token_prefix = if refresh_token.len() > 12 {
-        &refresh_token[..12]
-    } else {
-        &refresh_token
-    };
 
     tracing::info!(
-        "Refreshing Anthropic OAuth token (refresh_token prefix: {}..., expires_at: {})",
-        refresh_token_prefix,
+        "Refreshing Anthropic OAuth token (expires_at: {})",
         chrono::DateTime::from_timestamp_millis(entry.expires_at)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| "invalid".to_string())
@@ -3432,17 +3515,7 @@ async fn refresh_anthropic_oauth_token_inner(force: bool) -> Result<(), String> 
     let expires_in = token_data["expires_in"].as_i64().unwrap_or(3600);
     let expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
 
-    let new_refresh_prefix = if new_refresh_token.len() > 4 {
-        &new_refresh_token[..4]
-    } else {
-        new_refresh_token
-    };
-
-    tracing::debug!(
-        "Received new tokens from Anthropic (new refresh_token prefix: {}..., expires_in: {}s)",
-        new_refresh_prefix,
-        expires_in
-    );
+    tracing::debug!(expires_in, "Received new tokens from Anthropic");
 
     // **Solution #3: Sync to all storage tiers atomically**
     sync_oauth_to_all_tiers(
@@ -4771,7 +4844,7 @@ async fn get_opencode_auth() -> Result<Json<OpenCodeAuthResponse>, (StatusCode, 
         Ok(auth) => Ok(Json(OpenCodeAuthResponse {
             success: true,
             message: "OpenCode auth retrieved".to_string(),
-            auth: Some(auth),
+            auth: Some(redacted_opencode_auth(&auth)),
         })),
         Err(e) => Err(internal_error(e)),
     }
@@ -4853,7 +4926,7 @@ async fn set_opencode_auth(
             "OpenCode auth credentials set for provider: {}",
             req.provider
         ),
-        auth: Some(auth),
+        auth: Some(redacted_opencode_auth(&auth)),
     }))
 }
 
@@ -5006,6 +5079,7 @@ async fn get_provider_for_backend(
             api_key: None,
             oauth: None,
             has_credentials: false,
+            auth_method: None,
         }));
     }
 
@@ -5024,77 +5098,15 @@ async fn get_provider_for_backend(
             api_key: None,
             oauth: None,
             has_credentials: false,
+            auth_method: None,
         }));
     }
 
-    // Get the Anthropic provider credentials from auth.json
+    // Check whether Anthropic credentials exist without returning secret material.
     let auth = read_opencode_auth().map_err(internal_error)?;
     let anthropic_auth = auth.get("anthropic");
 
-    let (api_key, oauth, has_credentials) = if let Some(auth_entry) = anthropic_auth {
-        let auth_type = auth_entry.get("type").and_then(|v| v.as_str());
-        match auth_type {
-            Some("api_key") | Some("api") => {
-                let key = auth_entry
-                    .get("key")
-                    .or_else(|| auth_entry.get("api_key"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                (key, None, true)
-            }
-            Some("oauth") => {
-                let oauth_creds = BackendOAuthCredentials {
-                    access_token: auth_entry
-                        .get("access")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    refresh_token: auth_entry
-                        .get("refresh")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    expires_at: auth_entry
-                        .get("expires")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                };
-                (None, Some(oauth_creds), true)
-            }
-            _ => {
-                // Check for OAuth credentials without type field
-                if auth_entry.get("refresh").is_some() {
-                    let oauth_creds = BackendOAuthCredentials {
-                        access_token: auth_entry
-                            .get("access")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        refresh_token: auth_entry
-                            .get("refresh")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        expires_at: auth_entry
-                            .get("expires")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0),
-                    };
-                    (None, Some(oauth_creds), true)
-                } else if auth_entry.get("key").is_some() {
-                    let key = auth_entry
-                        .get("key")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    (key, None, true)
-                } else {
-                    (None, None, false)
-                }
-            }
-        }
-    } else {
-        (None, None, false)
-    };
+    let (auth_method, has_credentials) = backend_auth_status_from_entry(anthropic_auth);
 
     // Get provider name from OpenCode config if available
     let config_path = get_opencode_config_path(&state.config.working_dir);
@@ -5108,9 +5120,10 @@ async fn get_provider_for_backend(
         configured: true,
         provider_type: Some("anthropic".to_string()),
         provider_name: Some(provider_name),
-        api_key,
-        oauth,
+        api_key: None,
+        oauth: None,
         has_credentials,
+        auth_method,
     }))
 }
 
@@ -7763,14 +7776,8 @@ pub async fn refresh_oauth_token_with_lock(
         return Ok((entry.access_token, entry.refresh_token, entry.expires_at));
     }
 
-    let refresh_token_prefix = if entry.refresh_token.len() > 12 {
-        &entry.refresh_token[..12]
-    } else {
-        &entry.refresh_token
-    };
     tracing::info!(
         provider = ?provider_type,
-        refresh_token_prefix = %refresh_token_prefix,
         expires_at = entry.expires_at,
         "Background refresher: refreshing token (holding lock)"
     );

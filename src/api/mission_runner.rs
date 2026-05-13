@@ -13980,12 +13980,11 @@ pub async fn run_codex_turn(
                             );
                             if recorded {
                                 if pending_tools.is_empty() {
-                                    tracing::error!("Codex error: {}", surfaced_message);
+                                    tracing::error!("Codex error encountered");
                                 } else {
                                     tracing::warn!(
                                         pending_tool_count = pending_tools.len(),
-                                        "Treating post-response Codex error as fatal because tool calls are still pending: {}",
-                                        surfaced_message
+                                        "Treating post-response Codex error as fatal because tool calls are still pending"
                                     );
                                 }
                             } else {
@@ -14411,7 +14410,7 @@ pub async fn run_gemini_turn(
                     }
                     ExecutionEvent::TurnSummary { content } => {
                         if !content.trim().is_empty() {
-                            tracing::debug!("Gemini turn summary: {}", content);
+                            tracing::debug!("Gemini turn summary received");
                         }
                     }
                     ExecutionEvent::Usage { input_tokens, output_tokens } => {
@@ -14438,7 +14437,7 @@ pub async fn run_gemini_turn(
                     }
                     ExecutionEvent::Error { message } => {
                         error_message = Some(message.clone());
-                        tracing::error!("Gemini CLI error: {}", message);
+                        tracing::error!("Gemini CLI error encountered");
                     }
                     ExecutionEvent::MessageComplete { session_id: _ } => {
                         success = error_message.is_none();
