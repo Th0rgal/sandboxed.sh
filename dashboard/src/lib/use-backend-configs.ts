@@ -4,17 +4,23 @@ import { type BackendConfig, getBackendConfig } from './api';
 
 const DEDUPING_MS = 30000;
 
+export interface BackendConfigsHandle {
+  /** Latest config keyed by backend id. Missing key = not yet loaded. */
+  configs: Record<string, BackendConfig | undefined>;
+  /** Force a refetch of all backend configs (e.g. after a save). */
+  refresh: () => Promise<void>;
+}
+
 /**
- * Fetch persisted config for each backend id, keyed by id.
+ * Fetch persisted config for every backend id in one SWR entry.
  *
- * Replaces N hand-written `useSWR('backend-X-config', ...)` calls with a
- * single SWR entry whose fetcher fans out in parallel.
+ * Replaces N hand-written `useSWR('backend-X-config', ...)` calls. The
+ * fetcher fans out in parallel; the cache key is derived from the id list
+ * so different callers can share results.
  */
-export function useBackendConfigs(
-  ids: readonly string[]
-): Record<string, BackendConfig | undefined> {
+export function useBackendConfigs(ids: readonly string[]): BackendConfigsHandle {
   const key = ids.length > 0 ? `backends-configs|${[...ids].sort().join(',')}` : null;
-  const { data } = useSWR<Record<string, BackendConfig>>(
+  const { data, mutate } = useSWR<Record<string, BackendConfig>>(
     key,
     async () => {
       const entries = await Promise.all(
@@ -24,7 +30,12 @@ export function useBackendConfigs(
     },
     { revalidateOnFocus: false, dedupingInterval: DEDUPING_MS }
   );
-  return data ?? {};
+  return {
+    configs: data ?? {},
+    refresh: async () => {
+      await mutate();
+    },
+  };
 }
 
 /**

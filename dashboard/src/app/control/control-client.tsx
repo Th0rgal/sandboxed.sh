@@ -5029,7 +5029,7 @@ export default function ControlClient() {
           }
           // Skip terminal statuses — those clear the pill, matching the live handler.
           const isTerminalStatus = latestStatus
-            ? ["complete", "cleared", "budgetLimited"].includes(latestStatus)
+            ? ["complete", "cleared", "budgetLimited", "aborted"].includes(latestStatus)
             : false;
           if ((latestIteration !== undefined || latestStatus !== undefined) && !isTerminalStatus) {
             setGoalInfoByMission((prev) => ({
@@ -7092,7 +7092,8 @@ export default function ControlClient() {
           if (
             status === "complete" ||
             status === "cleared" ||
-            status === "budgetLimited"
+            status === "budgetLimited" ||
+            status === "aborted"
           ) {
             setGoalInfoByMission((prev) => {
               if (!(missionId in prev)) return prev;
@@ -7988,64 +7989,20 @@ export default function ControlClient() {
   }, [activeMission, recentMissions]);
   const activeMissionRole = activeMission ? inferMissionRole(activeMission) : null;
 
-  // In-mission sub-agents — a mix of:
-  //   - Claude Code's in-process `Task` / `background_task` / `spawn_agent`,
-  //     which never produce a separate mission record.
-  //   - Orchestrator MCP worker creators, which DO produce real child
-  //     missions but still show up usefully here as "what did this boss
-  //     spawn and when" with a deeplink to the child mission.
+  // In-mission sub-agents: Claude Code's in-process `Task` /
+  // `background_task` / `spawn_agent`. These run inside the harness
+  // process and never produce a separate mission record, so the
+  // child-mission `WorkerPanel` can't represent them — this panel does.
   //
-  // `mcp__orchestrator__batch_create_workers` is special: a single tool
-  // call spawns N workers and the panel is much clearer when each worker
-  // is its own row (with its own title and child-mission deeplink).
+  // Orchestrator MCP worker tools (`mcp__orchestrator__create_worker_mission`,
+  // `batch_create_workers`, `retask_worker`) DO produce real child missions
+  // with `parent_mission_id`; they are rendered by `WorkerPanel` instead so
+  // the same delegation isn't shown twice.
   const inMissionSubagents = useMemo<SubagentEntry[]>(() => {
     const out: SubagentEntry[] = [];
     for (const item of items) {
       if (item.kind !== "tool") continue;
-      const name = item.name.toLowerCase();
-      const isBatch = name === "mcp__orchestrator__batch_create_workers";
-      const isOrchestratorWorker =
-        name.startsWith("mcp__orchestrator__create_worker") ||
-        isBatch ||
-        name === "mcp__orchestrator__retask_worker";
-      if (!isSubagentTool(item.name) && !isOrchestratorWorker) continue;
-
-      if (isBatch) {
-        // Fan a batch call out into one synthetic row per worker so the
-        // user sees N cards (with N titles) instead of one opaque
-        // "Workers (batch)" card. Result -> { results: [{ index, mission }] }
-        // is matched up to args.workers[i] by index.
-        const argsObj = (item.args ?? {}) as Record<string, unknown>;
-        const workers = Array.isArray(argsObj.workers)
-          ? (argsObj.workers as unknown[])
-          : [];
-        const resultObj = (item.result ?? null) as Record<string, unknown> | null;
-        const resultArray = Array.isArray(resultObj?.results)
-          ? (resultObj!.results as unknown[])
-          : [];
-
-        for (let i = 0; i < workers.length; i++) {
-          const workerArgs = workers[i] as Record<string, unknown> | null;
-          const perResult = resultArray[i] as Record<string, unknown> | undefined;
-          // Lift the spawned mission record up so the card can use it
-          // directly for deeplinks without re-walking the batch envelope.
-          const workerResult =
-            perResult && typeof perResult === "object"
-              ? (perResult.mission ?? perResult)
-              : item.result;
-          out.push({
-            id: `${item.id}#${i}`,
-            toolCallId: item.toolCallId,
-            name: item.name,
-            args: workerArgs,
-            result: workerResult,
-            startTime: item.startTime,
-            endTime: item.endTime,
-          });
-        }
-        continue;
-      }
-
+      if (!isSubagentTool(item.name)) continue;
       out.push({
         id: item.id,
         toolCallId: item.toolCallId,

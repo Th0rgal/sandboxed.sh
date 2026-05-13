@@ -144,7 +144,7 @@ export function NewMissionDialog({
 
   // SWR: fetch backend configs to check enabled / cli / auth status for every
   // known backend in one request.
-  const backendConfigs = useBackendConfigs(KNOWN_BACKEND_IDS);
+  const { configs: backendConfigs } = useBackendConfigs(KNOWN_BACKEND_IDS);
 
   const { data: providersResponse } = useSWR(
     'model-providers',

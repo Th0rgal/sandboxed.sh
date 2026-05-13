@@ -5,7 +5,6 @@ import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import {
   listBackends,
-  getBackendConfig,
   updateBackendConfig,
   getProviderForBackend,
   getHealth,
@@ -17,6 +16,9 @@ import { Server, Save, Loader, Key, Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getRuntimeApiBase, writeSavedSettings } from '@/lib/settings';
 import { ServerConnectionCard } from '@/components/server-connection-card';
+import { useBackendConfigs } from '@/lib/use-backend-configs';
+
+const SETTINGS_BACKEND_IDS = ['opencode', 'claudecode', 'amp'] as const;
 
 export default function BackendsPage() {
   const [activeBackendTab, setActiveBackendTab] = useState<'opencode' | 'claudecode' | 'amp'>('opencode');
@@ -93,21 +95,15 @@ export default function BackendsPage() {
     ],
   });
 
-  const { data: opencodeBackendConfig, mutate: mutateOpenCodeBackend } = useSWR(
-    'backend-opencode-config',
-    () => getBackendConfig('opencode'),
-    { revalidateOnFocus: false }
+  // One SWR entry covers all backends; share the same refresher so saves
+  // refetch every config in lockstep without the page having to track
+  // per-backend mutators.
+  const { configs: backendConfigs, refresh: refreshBackendConfigs } = useBackendConfigs(
+    SETTINGS_BACKEND_IDS
   );
-  const { data: claudecodeBackendConfig, mutate: mutateClaudeBackend } = useSWR(
-    'backend-claudecode-config',
-    () => getBackendConfig('claudecode'),
-    { revalidateOnFocus: false }
-  );
-  const { data: ampBackendConfig, mutate: mutateAmpBackend } = useSWR(
-    'backend-amp-config',
-    () => getBackendConfig('amp'),
-    { revalidateOnFocus: false }
-  );
+  const opencodeBackendConfig = backendConfigs.opencode;
+  const claudecodeBackendConfig = backendConfigs.claudecode;
+  const ampBackendConfig = backendConfigs.amp;
 
   // Fetch Claude Code provider status (Anthropic provider configured for claudecode)
   const { data: claudecodeProvider } = useSWR<BackendProviderResponse>(
@@ -220,7 +216,7 @@ export default function BackendsPage() {
         { enabled: opencodeForm.enabled }
       );
       toast.success(result.message || 'OpenCode settings updated');
-      mutateOpenCodeBackend();
+      refreshBackendConfigs();
     } catch (err) {
       toast.error(
         `Failed to update OpenCode settings: ${
@@ -243,7 +239,7 @@ export default function BackendsPage() {
         enabled: claudeForm.enabled,
       });
       toast.success(result.message || 'Claude Code settings updated');
-      mutateClaudeBackend();
+      refreshBackendConfigs();
     } catch (err) {
       toast.error(
         `Failed to update Claude Code settings: ${
@@ -269,7 +265,7 @@ export default function BackendsPage() {
         enabled: ampForm.enabled,
       });
       toast.success(result.message || 'Amp settings updated');
-      mutateAmpBackend();
+      refreshBackendConfigs();
     } catch (err) {
       toast.error(
         `Failed to update Amp settings: ${

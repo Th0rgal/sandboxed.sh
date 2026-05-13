@@ -249,58 +249,58 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     });
 
     // Initialize backend config store (persisted settings).
-    // Probe each CLI binary so backends whose CLI is missing default to disabled.
-    // Persisted configs are preserved — this only affects fresh installs or new backends.
-    let opencode_detected = cli_available("opencode");
-    let claude_detected = cli_available("claude");
-    let amp_detected = cli_available("amp");
-    let codex_detected = cli_available("codex");
-    let gemini_detected = cli_available("gemini");
+    // Probe each backend's declared CLI names so backends whose CLI is missing
+    // default to disabled. CLI binary names live on the `Backend` trait
+    // (`cli_names()`); this loop reads them via short-lived instances so the
+    // names aren't duplicated here.
+    // Persisted configs are preserved — this only affects fresh installs or
+    // new backends.
+    let probe_candidates: Vec<Box<dyn crate::backend::Backend>> = vec![
+        Box::new(crate::backend::opencode::OpenCodeBackend::new(
+            config.opencode_base_url.clone(),
+            config.opencode_agent.clone(),
+            config.opencode_permissive,
+        )),
+        Box::new(crate::backend::claudecode::ClaudeCodeBackend::new()),
+        Box::new(crate::backend::amp::AmpBackend::new()),
+        Box::new(crate::backend::codex::CodexBackend::new()),
+        Box::new(crate::backend::gemini::GeminiBackend::new()),
+    ];
+    struct BackendProbe {
+        id: String,
+        name: String,
+        detected: bool,
+    }
+    let probes: Vec<BackendProbe> = probe_candidates
+        .iter()
+        .map(|b| BackendProbe {
+            id: b.id().to_string(),
+            name: b.name().to_string(),
+            detected: b.cli_names().iter().any(|n| cli_available(n)),
+        })
+        .collect();
+    drop(probe_candidates);
     tracing::info!(
-        opencode = opencode_detected,
-        claude = claude_detected,
-        amp = amp_detected,
-        codex = codex_detected,
-        gemini = gemini_detected,
+        detections = ?probes.iter().map(|p| (p.id.as_str(), p.detected)).collect::<Vec<_>>(),
         "CLI detection for backend defaults"
     );
 
-    let backend_defaults = vec![
-        {
-            let mut entry = BackendConfigEntry::new(
-                "opencode",
-                "OpenCode",
-                serde_json::json!({
+    let backend_defaults: Vec<BackendConfigEntry> = probes
+        .iter()
+        .map(|p| {
+            let settings = match p.id.as_str() {
+                "opencode" => serde_json::json!({
                     "base_url": config.opencode_base_url,
                     "default_agent": config.opencode_agent,
                     "permissive": config.opencode_permissive,
                 }),
-            );
-            entry.enabled = opencode_detected;
+                _ => serde_json::json!({}),
+            };
+            let mut entry = BackendConfigEntry::new(&p.id, &p.name, settings);
+            entry.enabled = p.detected;
             entry
-        },
-        {
-            let mut entry =
-                BackendConfigEntry::new("claudecode", "Claude Code", serde_json::json!({}));
-            entry.enabled = claude_detected;
-            entry
-        },
-        {
-            let mut entry = BackendConfigEntry::new("amp", "Amp", serde_json::json!({}));
-            entry.enabled = amp_detected;
-            entry
-        },
-        {
-            let mut entry = BackendConfigEntry::new("codex", "Codex", serde_json::json!({}));
-            entry.enabled = codex_detected;
-            entry
-        },
-        {
-            let mut entry = BackendConfigEntry::new("gemini", "Gemini CLI", serde_json::json!({}));
-            entry.enabled = gemini_detected;
-            entry
-        },
-    ];
+        })
+        .collect();
     let backend_configs = Arc::new(
         crate::backend_config::BackendConfigStore::new(
             config.working_dir.join(".sandboxed-sh/backend_config.json"),
@@ -336,35 +336,35 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let opencode_default_agent = config.opencode_agent.clone();
     let opencode_permissive = config.opencode_permissive;
 
-    // Determine default backend: env var, or first available with priority claudecode → opencode → amp → gemini → codex
+    // Determine default backend: env var, or the first available backend by
+    // a fixed preference order. The preference list lives here (operational
+    // policy) but the "is it available" answer comes from the probe map so
+    // we don't restate CLI names.
+    const DEFAULT_BACKEND_PRIORITY: &[&str] = &["claudecode", "opencode", "amp", "gemini", "codex"];
     let default_backend = config.default_backend.clone().unwrap_or_else(|| {
-        if claude_detected {
-            "claudecode".to_string()
-        } else if opencode_detected {
-            "opencode".to_string()
-        } else if amp_detected {
-            "amp".to_string()
-        } else if gemini_detected {
-            "gemini".to_string()
-        } else if codex_detected {
-            "codex".to_string()
-        } else {
-            // Fallback to claudecode even if not detected (will show warning in UI)
-            tracing::warn!(
-                "No backend CLIs detected. Defaulting to claudecode. Please install at least one backend."
-            );
-            "claudecode".to_string()
-        }
+        let detected = |id: &str| {
+            probes
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.detected)
+                .unwrap_or(false)
+        };
+        DEFAULT_BACKEND_PRIORITY
+            .iter()
+            .find(|id| detected(id))
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "No backend CLIs detected. Defaulting to claudecode. Please install at least one backend."
+                );
+                "claudecode".to_string()
+            })
     });
 
     tracing::info!(
-        "Default backend: {} (claudecode={}, opencode={}, amp={}, codex={}, gemini={})",
-        default_backend,
-        claude_detected,
-        opencode_detected,
-        amp_detected,
-        codex_detected,
-        gemini_detected
+        default_backend = %default_backend,
+        detections = ?probes.iter().map(|p| (p.id.as_str(), p.detected)).collect::<Vec<_>>(),
+        "Default backend selected",
     );
 
     let mut backend_registry = BackendRegistry::new(default_backend);
