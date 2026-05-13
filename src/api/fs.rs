@@ -1379,7 +1379,10 @@ pub async fn download_from_url(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300)) // 5 min timeout
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 {
+            // `previous()` lists hops already followed, so the Nth attempt has
+            // N-1 entries. Using `> 5` allows the 5 hops promised by the
+            // comment above; `>= 5` would cap at 4.
+            if attempt.previous().len() > 5 {
                 return attempt.error("too many redirects");
             }
             if let Err(e) = validate_url_for_ssrf(attempt.url().as_str()) {
