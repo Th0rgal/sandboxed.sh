@@ -9305,8 +9305,11 @@ async fn ensure_claudecode_cli_available(
         //    stub that prints "claude native binary not installed" and exits 1.
         //    Run install.cjs ourselves so the platform-specific native binary is
         //    copied into place.
+        // Bun picks ~/.bun/install/global *or* ~/.cache/.bun/install/global depending
+        // on XDG_CACHE_HOME — workspace containers usually set XDG_CACHE_HOME=/root/.cache
+        // so the global lands in the cache path, not ~/.bun. Cover both.
         format!(
-            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && rm -rf /root/.bun/install/global/node_modules/@anthropic-ai/claude-code* && {bun} install -g @anthropic-ai/claude-code@{ver} && PKG_DIR=/root/.bun/install/global/node_modules/@anthropic-ai/claude-code && if [ -f "$PKG_DIR/install.cjs" ]; then (cd "$PKG_DIR" && (command -v node >/dev/null 2>&1 && node install.cjs || {bun} run install.cjs) 2>&1 | tail -20) || true; fi"#,
+            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && rm -rf /root/.bun/install/global/node_modules/@anthropic-ai/claude-code* /root/.cache/.bun/install/global/node_modules/@anthropic-ai/claude-code* && {bun} install -g @anthropic-ai/claude-code@{ver} && for PKG_DIR in /root/.bun/install/global/node_modules/@anthropic-ai/claude-code /root/.cache/.bun/install/global/node_modules/@anthropic-ai/claude-code; do if [ -f "$PKG_DIR/install.cjs" ]; then (cd "$PKG_DIR" && (command -v node >/dev/null 2>&1 && node install.cjs || {bun} run install.cjs) 2>&1 | tail -20) || true; fi; done"#,
             bun = shell_quote(bun),
             ver = shell_quote(&desired_version)
         )
