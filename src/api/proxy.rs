@@ -4411,4 +4411,75 @@ mod tests {
         assert!(value.get("top_k").is_none());
         assert_eq!(value["thinking"], serde_json::json!({ "type": "disabled" }));
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn track_stream_health_times_out_when_upstream_stalls() {
+        let tracker = std::sync::Arc::new(crate::provider_health::ProviderHealthTracker::new());
+        let account_id = uuid::Uuid::new_v4();
+
+        // Stream that emits one chunk then sleeps far longer than the
+        // idle timeout. With the paused tokio clock the sleep only
+        // advances when the test advances time, so the idle watchdog
+        // inside `track_stream_health` should win the race.
+        let inner = async_stream::stream! {
+            yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from("data: {}\n\n"));
+            tokio::time::sleep(STREAM_IDLE_TIMEOUT * 10).await;
+            yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from("never sent"));
+        };
+
+        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None);
+        let mut tracked = std::pin::pin!(tracked);
+
+        // First chunk should pass through immediately.
+        let first = tracked.next().await.expect("first chunk").expect("ok");
+        assert_eq!(first.as_ref(), b"data: {}\n\n");
+
+        // Advance virtual time past the idle timeout. The watchdog
+        // inside the stream should fire and yield a TimedOut error.
+        tokio::time::advance(STREAM_IDLE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+
+        let second = tracked.next().await.expect("error item");
+        let err = second.expect_err("idle timeout should produce error");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        // Stream is closed after the error.
+        assert!(tracked.next().await.is_none());
+
+        // Health tracker should have recorded a Timeout-cause failure.
+        let h = tracker.get_health(account_id).await;
+        assert_eq!(h.last_failure_reason.as_deref(), Some("timeout"));
+        assert!(!h.is_healthy, "account should be in cooldown after timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn track_stream_health_passes_through_when_upstream_streams_normally() {
+        let tracker = std::sync::Arc::new(crate::provider_health::ProviderHealthTracker::new());
+        let account_id = uuid::Uuid::new_v4();
+
+        let inner = async_stream::stream! {
+            for i in 0..3 {
+                yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(format!(
+                    "data: {{\"chunk\":{}}}\n\n",
+                    i
+                )));
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+
+        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None);
+        let mut tracked = std::pin::pin!(tracked);
+        let mut count = 0;
+        while let Some(item) = tracked.next().await {
+            let bytes = item.expect("chunk should be ok");
+            assert!(bytes.starts_with(b"data:"));
+            count += 1;
+            tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(count, 3);
+
+        // Healthy account should not be cooled down.
+        let h = tracker.get_health(account_id).await;
+        assert_eq!(h.last_failure_reason, None);
+        assert!(h.is_healthy);
+    }
 }
