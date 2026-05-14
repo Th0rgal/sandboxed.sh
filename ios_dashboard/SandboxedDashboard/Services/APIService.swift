@@ -857,9 +857,6 @@ struct MissionEventsResult {
     let maxSequence: Int64?
 }
 
-private struct StreamInactivityError: Error {}
-private struct StreamOversizeError: Error {}
-
 enum APIError: LocalizedError {
     case invalidURL
     case invalidResponse

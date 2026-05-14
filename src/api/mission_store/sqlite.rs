@@ -3869,7 +3869,7 @@ impl MissionStore for SqliteMissionStore {
             let mut stmt = conn
                 .prepare("SELECT id, mission_id, command_source_type, command_source_data,
                                 trigger_type, trigger_data, variables, active, stop_policy, fresh_session, created_at, last_triggered_at,
-                                retry_max_retries, retry_delay_seconds, retry_backoff_multiplier, driver, driver
+                                retry_max_retries, retry_delay_seconds, retry_backoff_multiplier, driver
                          FROM automations WHERE mission_id = ? ORDER BY created_at DESC")
                 .map_err(|e| e.to_string())?;
 

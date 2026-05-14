@@ -3546,6 +3546,10 @@ private struct SharedFileCardView: View {
 
         do {
             var request = URLRequest(url: url)
+            // Bound the per-image fetch to the same window as JSON requests so
+            // a stalled image host can't leave the cell spinning behind the
+            // 60s URLSession default.
+            request.timeoutInterval = APIService.requestTimeout
 
             // Add authentication token if available
             if let token = APIService.shared.authToken {

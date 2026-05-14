@@ -107,6 +107,10 @@ async fn handle_event(
                         "Failed to deactivate completed native-loop automation"
                     );
                 }
+                // Evict from cache so a subsequent `/goal` on the same mission
+                // creates a fresh automation row instead of appending iterations
+                // to the deactivated one.
+                cache.remove(&mission_id);
             }
         }
         LoopObservation::None => {}
