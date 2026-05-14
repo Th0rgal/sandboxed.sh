@@ -8095,6 +8095,7 @@ export default function ControlClient() {
               : activeMission.title?.trim() || getMissionShortName(activeMission.id)
             : null
         }
+        missionBackend={activeMission?.backend ?? null}
         onClose={() => setShowAutomationsDialog(false)}
       />
 

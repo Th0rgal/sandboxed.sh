@@ -35,6 +35,8 @@ import {
   getAutomationExecutions,
   getMissionAutomationExecutions,
   getLibraryCommand,
+  postControlMessage,
+  cancelMission,
 } from '@/lib/api';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { toast } from '@/components/toast';
@@ -84,11 +86,14 @@ export interface MissionAutomationsDialogProps {
   open: boolean;
   missionId: string | null;
   missionLabel?: string | null;
+  /** Backend id of the active mission, used to auto-pick the harness when the
+   *  user chooses "Native harness loop". Empty string when not yet known. */
+  missionBackend?: string | null;
   onClose: () => void;
 }
 
 type IntervalUnit = 'seconds' | 'minutes' | 'hours' | 'days';
-type CommandSourceType = 'library' | 'inline';
+type CommandSourceType = 'library' | 'inline' | 'native_loop';
 type TriggerKind = 'interval' | 'agent_finished' | 'webhook';
 
 const UNIT_TO_SECONDS: Record<IntervalUnit, number> = {
@@ -120,6 +125,28 @@ function getLatestRunByAutomation(executions: AutomationExecution[]): Map<string
     }
   }
   return latestByAutomation;
+}
+
+/**
+ * For native-loop automations only: count `harness_loop:iteration:N` execution
+ * rows per automation and remember the largest N seen. Used to render an
+ * "iter N" badge alongside the row label.
+ */
+function getIterationProgressByAutomation(
+  executions: AutomationExecution[]
+): Map<string, { count: number; latest: number }> {
+  const progress = new Map<string, { count: number; latest: number }>();
+  for (const execution of executions) {
+    const src = execution.trigger_source ?? '';
+    if (!src.startsWith('harness_loop:iteration:')) continue;
+    const parsed = Number.parseInt(src.slice('harness_loop:iteration:'.length), 10);
+    if (!Number.isFinite(parsed)) continue;
+    const existing = progress.get(execution.automation_id) ?? { count: 0, latest: 0 };
+    existing.count += 1;
+    if (parsed > existing.latest) existing.latest = parsed;
+    progress.set(execution.automation_id, existing);
+  }
+  return progress;
 }
 
 function mergeLastRunFromExecutions(
@@ -175,6 +202,7 @@ export function MissionAutomationsDialog({
   open,
   missionId,
   missionLabel,
+  missionBackend,
   onClose,
 }: MissionAutomationsDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -202,6 +230,8 @@ export function MissionAutomationsDialog({
   const [inlinePrompt, setInlinePrompt] = useState('');
   const commandSourceTypeRef = useRef<CommandSourceType>('library');
   const inlinePromptRef = useRef('');
+  /** Objective text when commandSourceType === 'native_loop'. */
+  const [nativeLoopObjective, setNativeLoopObjective] = useState('');
   const [triggerKind, setTriggerKind] = useState<TriggerKind>('interval');
   const [intervalValue, setIntervalValue] = useState('5');
   const [intervalUnit, setIntervalUnit] = useState<IntervalUnit>('minutes');
@@ -217,6 +247,9 @@ export function MissionAutomationsDialog({
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Automation | null>(null);
   const [deleting, setDeleting] = useState(false);
+  /** Native-loop row queued for stop. The confirm dialog reads this. */
+  const [pendingStop, setPendingStop] = useState<Automation | null>(null);
+  const [stopping, setStopping] = useState(false);
   const [editingAutomationId, setEditingAutomationId] = useState<string | null>(null);
   const [editingPrompt, setEditingPrompt] = useState('');
   const [savingEditId, setSavingEditId] = useState<string | null>(null);
@@ -397,6 +430,16 @@ export function MissionAutomationsDialog({
       const content = automation.command_source.content;
       return content.length > 60 ? content.slice(0, 57) + '...' : content;
     }
+    if (automation.command_source?.type === 'native_loop') {
+      const objective =
+        typeof automation.command_source.args === 'object' &&
+        automation.command_source.args !== null
+          ? ((automation.command_source.args as Record<string, unknown>)
+              .objective as string | undefined)
+          : undefined;
+      const label = `/${automation.command_source.command} ${objective ?? ''}`.trim();
+      return label.length > 60 ? label.slice(0, 57) + '...' : label;
+    }
     return 'Command';
   }, []);
 
@@ -404,10 +447,22 @@ export function MissionAutomationsDialog({
     if (automation.command_source?.type === 'library') return 'Library';
     if (automation.command_source?.type === 'inline') return 'Prompt';
     if (automation.command_source?.type === 'local_file') return 'File';
+    if (automation.command_source?.type === 'native_loop') {
+      // Compact harness tag: "Claude /goal", "Codex /goal", …
+      const h = automation.command_source.harness;
+      const harnessLabel =
+        h === 'claudecode' ? 'Claude' : h === 'codex' ? 'Codex' : h;
+      return `${harnessLabel} /${automation.command_source.command}`;
+    }
     return '';
   }, []);
 
   const getAutomationScheduleLabel = useCallback((automation: Automation) => {
+    // Harness-loop rows aren't driven by OA's scheduler — the harness CLI
+    // controls cadence. Show that explicitly instead of "After agent finishes".
+    if (automation.driver === 'harness_loop') {
+      return 'Harness loop';
+    }
     if (automation.trigger?.type === 'interval') {
       return `Every ${formatInterval(automation.trigger.seconds)}`;
     }
@@ -544,6 +599,34 @@ export function MissionAutomationsDialog({
   const handleCreate = async () => {
     if (!missionId) return;
 
+    // Native harness loop: submit `/goal <objective>` as a control message.
+    // The native_loop_observer materializes the Automation row asynchronously
+    // from the resulting GoalIteration/GoalStatus events.
+    if (commandSourceType === 'native_loop') {
+      const objective = nativeLoopObjective.trim();
+      if (!objective) {
+        toast.error('Enter an objective for the harness loop');
+        return;
+      }
+      setCreating(true);
+      try {
+        await postControlMessage(`/goal ${objective}`, { mission_id: missionId });
+        toast.success('Goal loop started — row will appear once the harness reports progress');
+        setNativeLoopObjective('');
+        // Re-fetch automations shortly so the new row shows up without a
+        // manual refresh. The observer runs asynchronously, so wait a beat.
+        setTimeout(() => {
+          void loadAutomations(true);
+        }, 800);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to submit /goal';
+        toast.error(message);
+      } finally {
+        setCreating(false);
+      }
+      return;
+    }
+
     // Build command source
     let command_source: CommandSource;
     if (commandSourceType === 'library') {
@@ -674,6 +757,36 @@ export function MissionAutomationsDialog({
     }
   };
 
+  /** Stop a native harness loop: cancel the mission's current turn (coarse —
+   *  Phase 3 will use harness-native cancel like codex `thread/goal/clear`)
+   *  and mark the automation inactive so the panel reflects the new state. */
+  const handleStopNativeLoop = async () => {
+    if (!pendingStop) return;
+    setStopping(true);
+    try {
+      await cancelMission(pendingStop.mission_id);
+      try {
+        await updateAutomation(pendingStop.id, { active: false });
+      } catch {
+        // Falling back to local state — the observer will flip it inactive
+        // anyway when the harness emits the aborted GoalStatus.
+      }
+      if (missionId) {
+        const next = automationsRef.current.map((item) =>
+          item.id === pendingStop.id ? { ...item, active: false } : item
+        );
+        setAutomationsForMission(missionId, next);
+      }
+      toast.success('Goal loop stop requested');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to stop goal loop';
+      toast.error(message);
+    } finally {
+      setStopping(false);
+      setPendingStop(null);
+    }
+  };
+
   const handleStartEdit = (automation: Automation) => {
     if (automation.command_source?.type !== 'inline') return;
     setEditingAutomationId(automation.id);
@@ -751,15 +864,26 @@ export function MissionAutomationsDialog({
 
   // -- Validation --
   const isCommandValid =
-    commandSourceType === 'library' ? commandName.trim().length > 0 : inlinePrompt.trim().length > 0;
+    commandSourceType === 'library'
+      ? commandName.trim().length > 0
+      : commandSourceType === 'native_loop'
+      ? nativeLoopObjective.trim().length > 0
+      : inlinePrompt.trim().length > 0;
   const isTriggerValid =
-    triggerKind === 'webhook' || triggerKind === 'agent_finished' || intervalSeconds > 0;
+    commandSourceType === 'native_loop' ||
+    triggerKind === 'webhook' ||
+    triggerKind === 'agent_finished' ||
+    intervalSeconds > 0;
   const allowCreate = !!missionId && !creating && isCommandValid && isTriggerValid;
 
   const isMissionDataReady = !!missionId && loadedMissionId === missionId;
   const showLoadingPlaceholder = !!missionId && (!isMissionDataReady || (loading && !hasLoaded));
   const visibleAutomations = isMissionDataReady ? automations : [];
   const visibleError = isMissionDataReady ? error : null;
+  const iterationProgress = useMemo(
+    () => getIterationProgressByAutomation(executions),
+    [executions]
+  );
 
   const selectClass =
     'rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer';
@@ -837,46 +961,97 @@ export function MissionAutomationsDialog({
                 )}
 
                 {/* Row 1: Command source type + Trigger type */}
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs text-white/50 mb-1.5">Source</label>
-                    <select
-                      value={commandSourceType}
-                      onChange={(e) => handleSourceTypeChange(e.target.value as CommandSourceType)}
-                      className={cn(selectClass, 'w-full')}
-                      style={selectStyle}
-                    >
-                      <option value="library" className="bg-[#1a1a1a]">
-                        Library command
-                      </option>
-                      <option value="inline" className="bg-[#1a1a1a]">
-                        Inline prompt
-                      </option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-xs text-white/50 mb-1.5">Trigger</label>
-                    <select
-                      value={triggerKind}
-                      onChange={(e) => setTriggerKind(e.target.value as TriggerKind)}
-                      className={cn(selectClass, 'w-full')}
-                      style={selectStyle}
-                    >
-                      <option value="interval" className="bg-[#1a1a1a]">
-                        Interval (time-based)
-                      </option>
-                      <option value="agent_finished" className="bg-[#1a1a1a]">
-                        After agent finishes (restart)
-                      </option>
-                      <option value="webhook" className="bg-[#1a1a1a]">
-                        Webhook (API call)
-                      </option>
-                    </select>
-                  </div>
-                </div>
+                {(() => {
+                  const harnessForBackend =
+                    missionBackend === 'claudecode' || missionBackend === 'codex'
+                      ? missionBackend
+                      : null;
+                  const harnessLabel =
+                    harnessForBackend === 'claudecode' ? 'Claude Code' : harnessForBackend === 'codex' ? 'Codex' : null;
+                  const nativeLoopDisabled = !harnessForBackend;
+                  return (
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs text-white/50 mb-1.5">Source</label>
+                        <select
+                          value={commandSourceType}
+                          onChange={(e) =>
+                            handleSourceTypeChange(e.target.value as CommandSourceType)
+                          }
+                          className={cn(selectClass, 'w-full')}
+                          style={selectStyle}
+                        >
+                          <option value="library" className="bg-[#1a1a1a]">
+                            Library command
+                          </option>
+                          <option value="inline" className="bg-[#1a1a1a]">
+                            Inline prompt
+                          </option>
+                          <option
+                            value="native_loop"
+                            className="bg-[#1a1a1a]"
+                            disabled={nativeLoopDisabled}
+                          >
+                            {nativeLoopDisabled
+                              ? 'Native harness loop (Claude/Codex only)'
+                              : `Native harness loop (${harnessLabel} /goal)`}
+                          </option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-xs text-white/50 mb-1.5">Trigger</label>
+                        {commandSourceType === 'native_loop' ? (
+                          <div
+                            className={cn(
+                              selectClass,
+                              'w-full text-white/40 cursor-not-allowed pointer-events-none'
+                            )}
+                            aria-disabled
+                            title="The harness CLI drives iteration; OA only observes."
+                          >
+                            Harness loop
+                          </div>
+                        ) : (
+                          <select
+                            value={triggerKind}
+                            onChange={(e) => setTriggerKind(e.target.value as TriggerKind)}
+                            className={cn(selectClass, 'w-full')}
+                            style={selectStyle}
+                          >
+                            <option value="interval" className="bg-[#1a1a1a]">
+                              Interval (time-based)
+                            </option>
+                            <option value="agent_finished" className="bg-[#1a1a1a]">
+                              After agent finishes (restart)
+                            </option>
+                            <option value="webhook" className="bg-[#1a1a1a]">
+                              Webhook (API call)
+                            </option>
+                          </select>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* Row 2: Command details */}
-                {commandSourceType === 'library' ? (
+                {commandSourceType === 'native_loop' ? (
+                  <div>
+                    <label className="block text-xs text-white/50 mb-1.5">Objective</label>
+                    <textarea
+                      value={nativeLoopObjective}
+                      onChange={(e) => setNativeLoopObjective(e.target.value)}
+                      placeholder="What should the harness keep iterating on until done?"
+                      rows={3}
+                      className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50 resize-y"
+                    />
+                    <div className="mt-1 text-[11px] text-white/30">
+                      Submits <code className="text-indigo-400/70">/goal &lt;objective&gt;</code>{' '}
+                      to this mission. The harness CLI runs its own continuation loop; each
+                      iteration is recorded here.
+                    </div>
+                  </div>
+                ) : commandSourceType === 'library' ? (
                   <div>
                     <label className="block text-xs text-white/50 mb-1.5">Command</label>
                     <select
@@ -1259,6 +1434,19 @@ export function MissionAutomationsDialog({
                                   {sourceTag}
                                 </span>
                               ) : null}
+                              {automation.command_source?.type === 'native_loop' &&
+                                (() => {
+                                  const progress = iterationProgress.get(automation.id);
+                                  if (!progress || progress.latest === 0) return null;
+                                  return (
+                                    <span
+                                      className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium bg-indigo-500/10 text-indigo-300"
+                                      title={`${progress.count} recorded iteration${progress.count === 1 ? '' : 's'}`}
+                                    >
+                                      iter {progress.latest}
+                                    </span>
+                                  );
+                                })()}
                               {automation.command_source?.type === 'library' && !command && (
                                 <span className="flex items-center gap-1 text-[11px] text-amber-300">
                                   <AlertTriangle className="h-3 w-3" />
@@ -1348,6 +1536,16 @@ export function MissionAutomationsDialog({
                                 <Pencil className="h-3.5 w-3.5" />
                               </button>
                             )}
+                            {automation.command_source?.type === 'native_loop' &&
+                              automation.active && (
+                                <button
+                                  onClick={() => setPendingStop(automation)}
+                                  className="flex items-center gap-1 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-200 hover:bg-amber-500/20 transition-colors"
+                                  title="Stop the harness goal loop"
+                                >
+                                  Stop
+                                </button>
+                              )}
                             <button
                               onClick={() => setPendingDelete(automation)}
                               className="flex items-center gap-1 rounded-lg border border-white/[0.08] px-2.5 py-1.5 text-xs text-white/60 hover:text-red-300 hover:border-red-500/40 hover:bg-red-500/10 transition-colors"
@@ -1483,6 +1681,20 @@ export function MissionAutomationsDialog({
         onCancel={() => {
           if (deleting) return;
           setPendingDelete(null);
+        }}
+      />
+
+      <ConfirmDialog
+        open={!!pendingStop}
+        title="Stop harness goal loop?"
+        description="This cancels the mission's current turn so the harness CLI stops iterating. Any in-flight tool calls will be aborted."
+        confirmLabel="Stop loop"
+        variant="danger"
+        busy={stopping}
+        onConfirm={handleStopNativeLoop}
+        onCancel={() => {
+          if (stopping) return;
+          setPendingStop(null);
         }}
       />
     </div>
