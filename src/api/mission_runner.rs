@@ -251,6 +251,129 @@ pub(super) fn localhost_api_base_url_from_env() -> Option<String> {
     localhost_api_base_url(std::env::var("PORT").ok().as_deref())
 }
 
+/// Claude Code's built-in `ScheduleWakeup` tool ends the agent's turn with a
+/// promise that "the harness re-invokes you when the wakeup fires" — but in
+/// `--print` mode, open_agent is the harness and would otherwise have no way
+/// to know about the request. These helpers translate the built-in tool call
+/// into an open_agent interval automation that fires the prompt back into the
+/// mission after the requested delay (mirroring `automation_manager_mcp`'s
+/// `schedule_wakeup`). The delay is clamped to the same [60, 3600] range
+/// open_agent's own wakeup tool advertises.
+const CLAUDE_BUILTIN_WAKEUP_MIN_SECONDS: u64 = 60;
+const CLAUDE_BUILTIN_WAKEUP_MAX_SECONDS: u64 = 3600;
+
+fn mint_internal_service_jwt() -> Option<String> {
+    use jsonwebtoken::{EncodingKey, Header};
+
+    let secret = std::env::var("JWT_SECRET").ok()?;
+    if secret.trim().is_empty() {
+        return None;
+    }
+    let identity = std::env::var("SANDBOXED_SINGLE_TENANT_USER_ID")
+        .or_else(|_| std::env::var("SINGLE_TENANT_USER_ID"))
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+
+    let now = chrono::Utc::now();
+    let exp = now + chrono::Duration::hours(24);
+
+    #[derive(serde::Serialize)]
+    struct ServiceJwtClaims {
+        sub: String,
+        usr: String,
+        iat: i64,
+        exp: i64,
+    }
+    let claims = ServiceJwtClaims {
+        sub: identity.clone(),
+        usr: identity,
+        iat: now.timestamp(),
+        exp: exp.timestamp(),
+    };
+    jsonwebtoken::encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .ok()
+}
+
+fn spawn_claude_builtin_wakeup_automation(
+    mission_id: Uuid,
+    delay_seconds: u64,
+    prompt: String,
+    reason: String,
+) {
+    let Some(api_base) = localhost_api_base_url_from_env() else {
+        tracing::warn!(
+            mission_id = %mission_id,
+            "Observed Claude built-in ScheduleWakeup but PORT env is unset; cannot create wakeup automation"
+        );
+        return;
+    };
+
+    let delay = delay_seconds.clamp(
+        CLAUDE_BUILTIN_WAKEUP_MIN_SECONDS,
+        CLAUDE_BUILTIN_WAKEUP_MAX_SECONDS,
+    );
+
+    tokio::spawn(async move {
+        let url = format!(
+            "{}/api/control/missions/{}/automations",
+            api_base, mission_id
+        );
+
+        let mut variables: HashMap<String, String> = HashMap::new();
+        variables.insert("__wakeup_reason".to_string(), reason.clone());
+        variables.insert("__wakeup_source".to_string(), "claude-builtin".to_string());
+
+        let body = serde_json::json!({
+            "command_source": { "type": "inline", "content": prompt },
+            "trigger": { "type": "interval", "seconds": delay },
+            "stop_policy": { "type": "after_first_fire" },
+            "fresh_session": "keep",
+            "variables": variables,
+            "start_immediately": false,
+        });
+
+        let client = reqwest::Client::new();
+        let mut request = client.post(&url).json(&body);
+        if let Some(token) = mint_internal_service_jwt() {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        match request.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    delay_seconds = delay,
+                    reason = %reason,
+                    "Created interval automation for Claude built-in ScheduleWakeup"
+                );
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                tracing::error!(
+                    mission_id = %mission_id,
+                    status = %status,
+                    body = %body,
+                    "Failed to create wakeup automation for Claude built-in ScheduleWakeup"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    mission_id = %mission_id,
+                    error = %e,
+                    "HTTP error creating wakeup automation for Claude built-in ScheduleWakeup"
+                );
+            }
+        }
+    });
+}
+
 fn write_telegram_action_cli_helpers(work_dir: &Path) {
     let path = work_dir.join(".sandboxed-sh-telegram-action.py");
     let wrapper_path = work_dir.join("telegram-action");
@@ -4827,6 +4950,10 @@ pub fn run_claudecode_turn<'a>(
 
         // Track tool calls for result mapping
         let mut pending_tools: HashMap<String, String> = HashMap::new();
+        // Track Claude Code's built-in ScheduleWakeup calls so we can convert
+        // a successful tool result into an open_agent wakeup automation.
+        // Maps tool_use_id -> (delay_seconds, prompt, reason).
+        let mut pending_wakeups: HashMap<String, (u64, String, String)> = HashMap::new();
         let mut total_cost_usd: Option<f64> = None;
         let mut total_input_tokens: u64 = 0;
         let mut total_output_tokens: u64 = 0;
@@ -4876,6 +5003,21 @@ pub fn run_claudecode_turn<'a>(
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(30),
         );
+        // Heartbeat interval used to signal liveness to the actor-level
+        // stuck-mission watchdog. During extended thinking (notably with
+        // model_effort=max), Claude CLI can emit only scaffolding stream
+        // events (message_start, content_block_start, signature_delta…)
+        // for many minutes without any thinking_delta. Those reset the
+        // per-turn PTY idle timer but never become broadcast events, so
+        // the actor's main_runner_last_activity never updates and the
+        // 900s stuck-mission watchdog cancels the mission mid-turn.
+        let heartbeat_interval = Duration::from_secs(
+            std::env::var("SANDBOXED_SH_CLAUDECODE_HEARTBEAT_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300),
+        );
+        let mut last_heartbeat_at = Instant::now();
         let startup_deadline = Instant::now() + startup_timeout;
         let mut turn_wait_state = ClaudeTurnWaitState::Startup;
         let mut tool_timeout_override: Option<tokio::time::Instant> = None;
@@ -5222,6 +5364,38 @@ pub fn run_claudecode_turn<'a>(
                                                     mission_id: Some(mission_id),
                                                 });
 
+                                                // Capture args from Claude Code's built-in
+                                                // ScheduleWakeup so the matching ToolResult
+                                                // can turn it into a real wakeup automation.
+                                                if name == "ScheduleWakeup" {
+                                                    let delay = input
+                                                        .get("delaySeconds")
+                                                        .or_else(|| input.get("delay_seconds"))
+                                                        .and_then(|v| v.as_u64());
+                                                    let prompt = input
+                                                        .get("prompt")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(|s| s.to_string());
+                                                    let reason = input
+                                                        .get("reason")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(|s| s.to_string())
+                                                        .unwrap_or_default();
+                                                    match (delay, prompt) {
+                                                        (Some(d), Some(p)) => {
+                                                            pending_wakeups
+                                                                .insert(id.clone(), (d, p, reason));
+                                                        }
+                                                        _ => {
+                                                            tracing::warn!(
+                                                                mission_id = %mission_id,
+                                                                tool_use_id = %id,
+                                                                "Claude built-in ScheduleWakeup tool call missing delaySeconds or prompt; skipping wakeup automation"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+
                                                 // Extend idle timeout when tool has its own timeout.
                                                 // Long-running commands (e.g. `lake build` with timeout: 600000ms)
                                                 // produce no PTY output while waiting, so our default idle
@@ -5413,6 +5587,28 @@ pub fn run_claudecode_turn<'a>(
                                                 );
                                             }
 
+                                            // Convert a successful Claude built-in
+                                            // ScheduleWakeup into an open_agent wakeup
+                                            // automation. Claude Code's CLI handles the
+                                            // tool locally and emits a confirmation result
+                                            // but no further re-invocation happens in
+                                            // --print mode — we have to schedule it.
+                                            if let Some((delay, prompt, reason)) =
+                                                pending_wakeups.remove(&tool_use_id)
+                                            {
+                                                if !is_error {
+                                                    spawn_claude_builtin_wakeup_automation(
+                                                        mission_id, delay, prompt, reason,
+                                                    );
+                                                } else {
+                                                    tracing::warn!(
+                                                        mission_id = %mission_id,
+                                                        tool_use_id = %tool_use_id,
+                                                        "Claude built-in ScheduleWakeup result was an error; skipping wakeup automation"
+                                                    );
+                                                }
+                                            }
+
                                             // Convert content to string representation (handles both text and image results)
                                             let content_str = content.to_string_lossy();
 
@@ -5486,6 +5682,25 @@ pub fn run_claudecode_turn<'a>(
                         post_tool_result_idle_timeout,
                         tool_timeout_override,
                     );
+                    // Emit a throttled liveness heartbeat so the stuck-mission
+                    // watchdog (control.rs:stuck_mission_watchdog_loop) does not
+                    // cancel us while Claude is producing CLI scaffolding events
+                    // that don't translate to broadcast events (e.g. extended
+                    // thinking without thinking_delta).
+                    if last_heartbeat_at.elapsed() >= heartbeat_interval {
+                        let label = match turn_wait_state {
+                            ClaudeTurnWaitState::Startup => "Claude Code starting…",
+                            ClaudeTurnWaitState::AwaitingClaude => "Claude is responding…",
+                            ClaudeTurnWaitState::AwaitingToolResults => "Awaiting tool results…",
+                            ClaudeTurnWaitState::AwaitingTerminalResult => "Claude is thinking…",
+                        };
+                        let _ = events_tx.send(AgentEvent::MissionActivity {
+                            label: label.to_string(),
+                            tool_name: "claudecode_heartbeat".to_string(),
+                            mission_id: Some(mission_id),
+                        });
+                        last_heartbeat_at = Instant::now();
+                    }
                 }
             }
         }
