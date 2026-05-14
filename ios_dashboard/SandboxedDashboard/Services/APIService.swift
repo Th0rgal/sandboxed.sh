@@ -13,7 +13,58 @@ import Observation
 final class APIService {
     static let shared = APIService()
     nonisolated init() {}
-    
+
+    /// Per-request timeout for ordinary JSON calls. Anything that hasn't started
+    /// returning data within this window is treated as failed. Default
+    /// `URLSession.shared` ships with 60s, which is far too long for a chat
+    /// app's cold-start path — the user sits at "Connecting…" with no feedback.
+    nonisolated static let requestTimeout: TimeInterval = 15
+
+    /// Full-transfer cap for ordinary JSON calls. Default is 7 days; a stalled
+    /// large download (e.g. a multi-MB event tail over a flaky cellular link)
+    /// would block the call until the user kills the app.
+    nonisolated static let resourceTimeout: TimeInterval = 60
+
+    /// SSE inactivity threshold. If no bytes arrive for this long the stream is
+    /// considered dead and the caller's reconnect logic re-runs. Covers the
+    /// silent-half-open-socket case (cell→wifi handoff, NAT idle reset).
+    nonisolated static let streamInactivityTimeout: TimeInterval = 30
+
+    /// Hard cap on the SSE line-buffer (1 MiB). A pathological server that
+    /// never emits a newline must not be allowed to balloon memory.
+    nonisolated static let streamMaxBufferBytes: Int = 1 << 20
+
+    /// Dedicated session for JSON calls. `URLSession.shared`'s defaults
+    /// (60s request, 7d resource, infinite cache) are wrong for a chat app on
+    /// bad networks — short timeouts surface failures fast and let the UI
+    /// retry instead of holding a spinner indefinitely.
+    nonisolated private static let jsonSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = requestTimeout
+        config.timeoutIntervalForResource = resourceTimeout
+        config.waitsForConnectivity = false
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpAdditionalHeaders = ["Accept": "application/json"]
+        return URLSession(configuration: config)
+    }()
+
+    /// Session used for SSE. `timeoutIntervalForRequest` here doubles as the
+    /// stream inactivity timeout: per URLSession semantics it's the maximum
+    /// gap between bytes received, so a healthy stream emitting events
+    /// regularly resets the clock and stays alive indefinitely, while a
+    /// silent half-open socket (cell→wifi handoff, NAT idle reset) fails
+    /// within `streamInactivityTimeout` and triggers the caller's reconnect
+    /// loop. `timeoutIntervalForResource` stays effectively unbounded so
+    /// long-running missions aren't capped.
+    nonisolated private static let streamSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = streamInactivityTimeout
+        config.timeoutIntervalForResource = TimeInterval.greatestFiniteMagnitude
+        config.waitsForConnectivity = false
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: config)
+    }()
+
     // Configuration
     var baseURL: String {
         get { UserDefaults.standard.string(forKey: "api_base_url") ?? "" }
@@ -417,25 +468,25 @@ final class APIService {
         
         request.httpBody = body
         
-        let (responseData, response) = try await URLSession.shared.data(for: request)
-        
+        let (responseData, response) = try await Self.jsonSession.data(for: request)
+
         guard let httpResponse = response as? HTTPURLResponse else {
             throw APIError.invalidResponse
         }
-        
+
         if httpResponse.statusCode == 401 {
             logout()
             throw APIError.unauthorized
         }
-        
+
         guard httpResponse.statusCode >= 200 && httpResponse.statusCode < 300 else {
             throw APIError.httpError(httpResponse.statusCode, String(data: responseData, encoding: .utf8))
         }
-        
+
         struct UploadResponse: Decodable {
             let path: String
         }
-        
+
         let uploadResponse = try JSONDecoder().decode(UploadResponse.self, from: responseData)
         return uploadResponse.path
     }
@@ -526,35 +577,105 @@ final class APIService {
     // MARK: - SSE Streaming
 
     func streamControl(onEvent: @escaping (String, [String: Any]) -> Void) -> Task<Void, Never> {
-        Task {
-            guard let url = URL(string: "\(baseURL)/api/control/stream") else { return }
-            
+        let base = baseURL
+        let token = jwtToken
+        let maxBuffer = Self.streamMaxBufferBytes
+        let inactivity = Self.streamInactivityTimeout
+        let session = Self.streamSession
+
+        return Task { [weak self] in
+            guard let url = URL(string: "\(base)/api/control/stream") else { return }
+
             var request = URLRequest(url: url)
             request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-            
-            if let token = jwtToken {
+            request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+            if let token {
                 request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             }
-            
+
             do {
-                let (stream, _) = try await URLSession.shared.bytes(for: request)
-                
-                var buffer = ""
-                for try await byte in stream {
-                    guard !Task.isCancelled else { break }
-                    
-                    if let char = String(bytes: [byte], encoding: .utf8) {
-                        buffer.append(char)
-                        
-                        // Look for double newline (end of SSE event)
-                        while let range = buffer.range(of: "\n\n") {
-                            let eventString = String(buffer[..<range.lowerBound])
-                            buffer = String(buffer[range.upperBound...])
-                            
-                            parseSSEEvent(eventString, onEvent: onEvent)
+                let (rawStream, response) = try await session.bytes(for: request)
+
+                // Reject HTTP errors up front. The previous code happily fed
+                // a 401 HTML body through the SSE parser, which silently
+                // dropped events and left the user staring at "Reconnecting…".
+                if let http = response as? HTTPURLResponse {
+                    guard (200..<300).contains(http.statusCode) else {
+                        if http.statusCode == 401 {
+                            await MainActor.run { self?.logout() }
                         }
+                        onEvent("error", [
+                            "message": "Stream rejected by server (HTTP \(http.statusCode))",
+                            "status": http.statusCode
+                        ])
+                        return
                     }
                 }
+
+                // `rawStream.lines` decodes chunks as UTF-8 and yields per
+                // line. Replaces the previous byte-by-byte
+                // `String(bytes: [byte], encoding: .utf8)` loop which silently
+                // dropped any byte belonging to a multi-byte UTF-8 codepoint —
+                // every emoji or non-ASCII character in the agent stream was
+                // being corrupted.
+                //
+                // Inactivity is enforced by `streamSession`'s
+                // `timeoutIntervalForRequest`: per URLSession semantics that
+                // is the max gap between received bytes, so a healthy stream
+                // resets it on every event and a silent half-open socket
+                // errors out within `streamInactivityTimeout`. No manual
+                // watchdog needed.
+                var eventType = "message"
+                var dataLines: [String] = []
+                var bufferedBytes = 0
+
+                for try await line in rawStream.lines {
+                    if Task.isCancelled { return }
+
+                    // Hard cap on per-event payload — a server that never
+                    // emits a blank line must not balloon this buffer.
+                    bufferedBytes += line.utf8.count + 1
+                    if bufferedBytes > maxBuffer {
+                        onEvent("error", ["message": "Stream event exceeded \(maxBuffer) bytes — dropping connection"])
+                        return
+                    }
+
+                    if line.isEmpty {
+                        Self.dispatchSSEEvent(
+                            eventType: eventType,
+                            dataLines: dataLines,
+                            onEvent: onEvent
+                        )
+                        eventType = "message"
+                        dataLines.removeAll(keepingCapacity: true)
+                        bufferedBytes = 0
+                        continue
+                    }
+
+                    if line.hasPrefix(":") { continue }  // comment
+
+                    guard let colonIdx = line.firstIndex(of: ":") else { continue }
+                    let field = line[..<colonIdx]
+                    var value = line[line.index(after: colonIdx)...]
+                    // SSE spec: strip exactly one leading space.
+                    if value.first == " " { value = value.dropFirst() }
+
+                    switch field {
+                    case "event":
+                        eventType = String(value)
+                    case "data":
+                        dataLines.append(String(value))
+                    default:
+                        break  // ignore id/retry/unknown
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch let urlError as URLError where urlError.code == .timedOut {
+                onEvent("error", [
+                    "message": "Stream idle (no data for \(Int(inactivity))s) — reconnecting",
+                    "reason": "inactivity"
+                ])
             } catch {
                 if !Task.isCancelled {
                     onEvent("error", ["message": "Stream connection failed: \(error.localizedDescription)"])
@@ -562,29 +683,35 @@ final class APIService {
             }
         }
     }
-    
-    private func parseSSEEvent(_ eventString: String, onEvent: @escaping (String, [String: Any]) -> Void) {
-        var eventType = "message"
-        var dataString = ""
-        
-        for line in eventString.split(separator: "\n", omittingEmptySubsequences: false) {
-            let lineStr = String(line)
-            if lineStr.hasPrefix("event:") {
-                eventType = String(lineStr.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-            } else if lineStr.hasPrefix("data:") {
-                dataString += String(lineStr.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            }
+
+    /// Flush a complete SSE event. `dataLines` are joined with `\n` per spec —
+    /// the previous code joined with empty string, mangling multi-line JSON
+    /// payloads. Only object-shaped JSON is forwarded; scalars/arrays/garbage
+    /// surface as a structured `parseError` so the caller can log them
+    /// instead of silently dropping data.
+    @MainActor
+    private static func dispatchSSEEvent(
+        eventType: String,
+        dataLines: [String],
+        onEvent: (String, [String: Any]) -> Void
+    ) {
+        guard !dataLines.isEmpty else { return }
+        let payload = dataLines.joined(separator: "\n")
+        guard !payload.isEmpty else { return }
+
+        guard let data = payload.data(using: .utf8) else {
+            onEvent("parseError", ["raw": payload, "reason": "non-utf8 payload"])
+            return
         }
-        
-        guard !dataString.isEmpty else { return }
-        
         do {
-            if let data = dataString.data(using: .utf8),
-               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                onEvent(eventType, json)
+            let parsed = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+            if let obj = parsed as? [String: Any] {
+                onEvent(eventType, obj)
+            } else {
+                onEvent("parseError", ["raw": payload, "reason": "non-object payload"])
             }
         } catch {
-            // Ignore parse errors
+            onEvent("parseError", ["raw": payload, "reason": error.localizedDescription])
         }
     }
     
@@ -673,7 +800,7 @@ final class APIService {
     }
 
     private func executeWithResponse<T: Decodable>(_ request: URLRequest) async throws -> (T, HTTPURLResponse) {
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await Self.jsonSession.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw APIError.invalidResponse
@@ -695,10 +822,31 @@ final class APIService {
             }
         }
 
-        let decoder = JSONDecoder()
-        let value = try decoder.decode(T.self, from: data)
-        return (value, httpResponse)
+        // Decode off the main actor. APIService is `@MainActor`, so without
+        // this hop a multi-MB events payload would block the UI thread for
+        // hundreds of ms during decode. We use a `nonisolated` global-actor-free
+        // helper wrapped in `Task.detached` so the decode runs on a cooperative
+        // thread; `DecodedBox` is `@unchecked Sendable` because the decoded
+        // value is treated as immutable from the moment we ship it back.
+        let box: DecodedBox<T>
+        do {
+            box = try await Task.detached(priority: .userInitiated) {
+                try DecodedBox(value: JSONDecoder().decode(T.self, from: data))
+            }.value
+        } catch {
+            throw APIError.decodingError(error)
+        }
+        return (box.value, httpResponse)
     }
+}
+
+/// Sendable transport for decoded values across the detached-decode boundary.
+/// Marked `@unchecked` because `T: Decodable` makes no Sendable promise and we
+/// can't constrain every existing Decodable type in the codebase. Safe in
+/// practice: the producer (decode task) has the only reference until `.value`
+/// crosses back to the consumer actor, after which the producer is gone.
+private struct DecodedBox<T>: @unchecked Sendable {
+    let value: T
 }
 
 /// Result of a `/missions/:id/events` fetch. `maxSequence` is the response's
@@ -708,6 +856,9 @@ struct MissionEventsResult {
     let events: [StoredEvent]
     let maxSequence: Int64?
 }
+
+private struct StreamInactivityError: Error {}
+private struct StreamOversizeError: Error {}
 
 enum APIError: LocalizedError {
     case invalidURL

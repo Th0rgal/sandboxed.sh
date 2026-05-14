@@ -393,31 +393,34 @@ struct ControlView: View {
             }
         }
         .task {
-            // Load workspaces for the workspace picker
-            await workspaceState.loadWorkspaces()
+            // Cold-start sequencing. Previously every step here was awaited
+            // serially — workspaces → loadMission → loadCurrentMission →
+            // refreshRunningMissions — which on a slow cellular link stacked
+            // up to a dozen sequential RTTs before the user could read or
+            // type anything. We now:
+            //   1. Kick off the SSE stream first so any live events for the
+            //      restored mission start arriving immediately (the stream
+            //      doesn't depend on which mission we end up viewing — it
+            //      receives all events and the view filters by id).
+            //   2. Fan out the three independent "context" fetches —
+            //      workspaces, mission history, running missions — using
+            //      `async let`. They share zero state at this stage; the
+            //      previous serial chain was incidental, not required.
+            //   3. Start the running-missions poller last; it's a 3s tick
+            //      and starting it before the first refresh is fine.
+            startStreaming()
 
-            // Check if we're being opened with a specific mission from History
-            if let pendingId = nav.consumePendingMission() {
-                await loadMission(id: pendingId)
-                // Also load the current mission in the background for main-session context
-                await loadCurrentMission(updateViewing: false)
-            } else if let savedId = UserDefaults.standard.string(forKey: Self.lastMissionIdKey) {
-                // Restore last viewed mission from previous session
-                await loadMission(id: savedId)
-                await loadCurrentMission(updateViewing: false)
-            } else {
-                await loadCurrentMission(updateViewing: true)
-            }
+            async let workspacesTask: Void = workspaceState.loadWorkspaces()
+            async let runningTask: Void = refreshRunningMissions()
+            async let missionTask: Void = loadInitialMission()
 
-            // Fetch initial running missions
-            await refreshRunningMissions()
+            _ = await (workspacesTask, runningTask, missionTask)
 
             // Auto-show bar if there are multiple running missions
             if runningMissions.count > 1 {
                 showRunningMissions = true
             }
 
-            startStreaming()
             startPollingRunningMissions()
         }
         .onChange(of: nav.pendingMissionId) { _, newId in
@@ -1278,44 +1281,88 @@ struct ControlView: View {
     }
 
     private static let maxCachedMissions = 10  // Limit cache size
+    /// Legacy key prefix used when mission blobs lived in UserDefaults. Kept
+    /// only so the one-time migration below can purge them on first launch
+    /// after upgrade — every payload bloats cfprefsd's in-memory plist.
     private static let cachePrefix = "cached_mission_"
     private static let cacheKeysKey = "cached_mission_keys"
+    private static let didMigrateCacheKey = "did_migrate_mission_cache_v1"
 
-    // Cache mission with events for faster loading and consistent display
-    private func cacheMissionWithEvents(_ mission: Mission, events: [StoredEvent]) {
-        let key = Self.cachePrefix + mission.id
-        let cacheData = CachedMissionData(mission: mission, events: events, cachedAt: Date())
-
-        guard let encoded = try? JSONEncoder().encode(cacheData) else { return }
-
-        // Implement LRU eviction
-        var cachedKeys = UserDefaults.standard.stringArray(forKey: Self.cacheKeysKey) ?? []
-
-        // Remove this key if it exists (we'll re-add it at the end as most recent)
-        cachedKeys.removeAll { $0 == mission.id }
-
-        // If we've hit the limit, remove the oldest cached mission
-        if cachedKeys.count >= Self.maxCachedMissions {
-            if let oldestKey = cachedKeys.first {
-                UserDefaults.standard.removeObject(forKey: Self.cachePrefix + oldestKey)
-                cachedKeys.removeFirst()
+    /// One-shot migration: previous versions stored mission events as raw
+    /// JSON blobs in UserDefaults. Those blobs are loaded into memory by
+    /// cfprefsd at process start, costing RAM forever. Read each blob,
+    /// rewrite it to disk, then erase the UserDefaults key. Idempotent —
+    /// guarded by a separate flag so a clean install doesn't run the loop.
+    static func migrateMissionCacheIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: didMigrateCacheKey) else { return }
+        let keys = defaults.stringArray(forKey: cacheKeysKey) ?? []
+        for missionId in keys {
+            let legacyKey = cachePrefix + missionId
+            if let data = defaults.data(forKey: legacyKey) {
+                try? writeCachedMissionFile(missionId: missionId, data: data)
+                defaults.removeObject(forKey: legacyKey)
             }
         }
+        defaults.set(true, forKey: didMigrateCacheKey)
+    }
 
-        // Add new entry
-        cachedKeys.append(mission.id)
+    // Cache mission with events for faster loading and consistent display.
+    //
+    // Storage moved off `UserDefaults` (which loads its entire backing plist
+    // into the cfprefsd daemon and the app process at launch, then writes
+    // synchronously on the main thread) to per-mission JSON files in
+    // `Caches/`. Writes are dispatched to a background queue so a multi-MB
+    // event payload no longer freezes the chat thread while it serialises.
+    private func cacheMissionWithEvents(_ mission: Mission, events: [StoredEvent]) {
+        let missionId = mission.id
+        let cacheData = CachedMissionData(mission: mission, events: events, cachedAt: Date())
+
+        // LRU key list still lives in UserDefaults — it's a tiny string array
+        // so it's free, and keeping it there means the LRU survives Caches
+        // eviction by iOS (we'll just miss on the orphaned files).
+        var cachedKeys = UserDefaults.standard.stringArray(forKey: Self.cacheKeysKey) ?? []
+        cachedKeys.removeAll { $0 == missionId }
+
+        var evicted: String?
+        if cachedKeys.count >= Self.maxCachedMissions {
+            evicted = cachedKeys.first
+            cachedKeys.removeFirst()
+        }
+        cachedKeys.append(missionId)
         UserDefaults.standard.set(cachedKeys, forKey: Self.cacheKeysKey)
-        UserDefaults.standard.set(encoded, forKey: key)
+
+        // Encode on @MainActor (CachedMissionData transitively contains
+        // `AnyCodable.value: Any`, which isn't Sendable, so we can't ship
+        // the struct to a detached task), then hand the raw bytes off for
+        // the actual filesystem write. `Data` is Sendable, so the write
+        // dispatch is clean. The disk write is the bigger UI-thread hazard
+        // on large missions anyway — encoding is bounded CPU; writing is
+        // unbounded I/O blocked on the filesystem coordinator.
+        let encoded = try? JSONEncoder().encode(cacheData)
+        let evictedId = evicted
+        Task.detached(priority: .utility) {
+            if let evictedId {
+                Self.deleteCachedMissionFile(missionId: evictedId)
+            }
+            if let encoded {
+                try? Self.writeCachedMissionFile(missionId: missionId, data: encoded)
+            }
+        }
     }
 
     private func loadCachedMissionData(_ missionId: String) -> CachedMissionData? {
-        let key = Self.cachePrefix + missionId
-        guard let data = UserDefaults.standard.data(forKey: key),
+        // Synchronous read on the call site (cold start) — the file is
+        // bounded by `loadEarlierPageLimit` * StoredEvent size (~few MB
+        // worst case) and decoding it on @MainActor is unavoidable here
+        // because the caller needs the result immediately to render the
+        // first frame. Subsequent caches written in the background.
+        guard let url = Self.cacheFileURL(missionId: missionId),
+              let data = try? Data(contentsOf: url),
               let cached = try? JSONDecoder().decode(CachedMissionData.self, from: data) else {
             return nil
         }
 
-        // Update LRU order - move to end as most recently accessed
         if var cachedKeys = UserDefaults.standard.stringArray(forKey: Self.cacheKeysKey) {
             cachedKeys.removeAll { $0 == missionId }
             cachedKeys.append(missionId)
@@ -1326,14 +1373,48 @@ struct ControlView: View {
     }
 
     private func removeMissionFromCache(_ missionId: String) {
-        let key = Self.cachePrefix + missionId
-        UserDefaults.standard.removeObject(forKey: key)
+        Self.deleteCachedMissionFile(missionId: missionId)
 
         // Remove from LRU tracking
         if var cachedKeys = UserDefaults.standard.stringArray(forKey: Self.cacheKeysKey) {
             cachedKeys.removeAll { $0 == missionId }
             UserDefaults.standard.set(cachedKeys, forKey: Self.cacheKeysKey)
         }
+    }
+
+    /// Cache directory for mission JSON. `.cachesDirectory` is appropriate
+    /// here: iOS may evict files under memory pressure, but losing them only
+    /// means a cache miss on next open, which costs one network round-trip.
+    /// (Compared to `.documentDirectory` which would be backed-up to iCloud
+    /// and counted toward the app's storage quota.)
+    nonisolated private static func cacheFileURL(missionId: String) -> URL? {
+        guard let caches = try? FileManager.default.url(
+            for: .cachesDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) else { return nil }
+        let dir = caches.appendingPathComponent("missions", isDirectory: true)
+        // mkdir on first use. Best-effort — if it fails, the write below
+        // will fail too and the caller falls through to network.
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // mission IDs are server-generated UUIDs in practice; sanitise
+        // anyway so we never write `../etc/passwd`-style paths.
+        let safeId = missionId.replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "..", with: "_")
+        return dir.appendingPathComponent("\(safeId).json", isDirectory: false)
+    }
+
+    nonisolated private static func writeCachedMissionFile(missionId: String, data: Data) throws {
+        guard let url = cacheFileURL(missionId: missionId) else { return }
+        // Atomic write — partial files left after a crash would fail to
+        // decode on next open and trigger an unnecessary network fetch.
+        try data.write(to: url, options: [.atomic])
+    }
+
+    nonisolated private static func deleteCachedMissionFile(missionId: String) {
+        guard let url = cacheFileURL(missionId: missionId) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     private func applyViewingMission(_ mission: Mission, scrollToBottom: Bool = true) {
@@ -1468,6 +1549,25 @@ struct ControlView: View {
 
         loadedEventCount += orderedEvents.count
         recomputeGroupedItems()
+    }
+
+    /// Decide what to load on cold start. The previous code did
+    /// `loadMission(savedId)` then *also* awaited `loadCurrentMission` as
+    /// "background context" — but the await was serial, so the user paid
+    /// for both round-trips before the UI became interactive. The
+    /// "background" fetch is now genuinely backgrounded: kick off the
+    /// secondary `loadCurrentMission` in a detached Task so the primary
+    /// mission's events render as soon as they arrive.
+    private func loadInitialMission() async {
+        if let pendingId = nav.consumePendingMission() {
+            await loadMission(id: pendingId)
+            Task { await self.loadCurrentMission(updateViewing: false) }
+        } else if let savedId = UserDefaults.standard.string(forKey: Self.lastMissionIdKey) {
+            await loadMission(id: savedId)
+            Task { await self.loadCurrentMission(updateViewing: false) }
+        } else {
+            await loadCurrentMission(updateViewing: true)
+        }
     }
 
     private func loadCurrentMission(updateViewing: Bool) async {
@@ -1639,6 +1739,14 @@ struct ControlView: View {
         }
     }
 
+    /// Hard cap on the "Load earlier" payload. The previous implementation
+    /// passed `types:` only with no `limit`, asking the server for the entire
+    /// mission history — on a 50k-event mission that's a multi-MB JSON
+    /// download blocking the chat behind a spinner. Pull a single large page
+    /// instead; if the user truly needs to scroll past that, they can tap
+    /// again. Keeps cold-load worst-case bounded.
+    private static let loadEarlierPageLimit = 1000
+
     // Load earlier messages when user taps "Load earlier" button
     private func loadEarlierMessages() async {
         guard let missionId = viewingMissionId, !isLoadingEarlier else { return }
@@ -1646,12 +1754,18 @@ struct ControlView: View {
         defer { isLoadingEarlier = false }
 
         do {
-            // Fetch all events (no limit) to get the full history
-            let allEvents = try await api.getMissionEvents(id: missionId, types: historyEventTypes)
+            let allEvents = try await api.getMissionEvents(
+                id: missionId,
+                types: historyEventTypes,
+                limit: Self.loadEarlierPageLimit
+            )
             guard viewingMissionId == missionId else { return }
 
             if !allEvents.isEmpty, let mission = viewingMission {
-                hasMoreHistory = false
+                // Only mark history exhausted if we got fewer rows than the
+                // page cap. If the server returned a full page, more may
+                // remain — keep the button visible.
+                hasMoreHistory = allEvents.count >= Self.loadEarlierPageLimit
                 applyViewingMissionWithEvents(mission, events: allEvents, scrollToBottom: false)
                 cacheMissionWithEvents(mission, events: allEvents)
             }
@@ -2823,6 +2937,8 @@ struct ControlView: View {
                 let isSseReconnectError = lower.contains("stream connection failed") ||
                                           lower.contains("sse connection") ||
                                           lower.contains("event stream") ||
+                                          lower.contains("stream idle") ||
+                                          lower.contains("stream rejected by server") ||
                                           lower == "timed out" ||
                                           lower == "connection reset" ||
                                           lower == "connection closed"
@@ -3435,13 +3551,6 @@ private struct SharedFileCardView: View {
             if let token = APIService.shared.authToken {
                 request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             }
-
-            // Per-request timeout for image downloads — `URLSession.shared`'s
-            // 60s default leaves the spinner running for a full minute on a
-            // stalled image fetch. 15s matches the JSON path; if the user
-            // ever scrolls past this in a slow gallery the failed-image
-            // placeholder still surfaces fast enough to feel responsive.
-            request.timeoutInterval = 15
 
             let (data, response) = try await URLSession.shared.data(for: request)
 
