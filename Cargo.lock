@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "sandboxed_sh"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "aes-gcm",
  "anyhow",
