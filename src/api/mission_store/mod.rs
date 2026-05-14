@@ -143,6 +143,19 @@ pub enum CommandSource {
     LocalFile { path: String },
     /// Inline command content
     Inline { content: String },
+    /// Harness-native loop (e.g. claudecode `/goal`, codex `/goal`). OA does
+    /// not drive iteration here — the harness CLI runs its own continuation
+    /// loop and we record each iteration as an `AutomationExecution`. See
+    /// `crate::backend::native_loops` for the per-harness adapters.
+    NativeLoop {
+        /// Backend id: `"claudecode"`, `"codex"`, `"opencode"`, …
+        harness: String,
+        /// Slash command, without the leading `/`. Today: `"goal"`.
+        command: String,
+        /// Free-form per-command args. For `goal`: `{ "objective": "..." }`.
+        #[serde(default)]
+        args: serde_json::Value,
+    },
 }
 
 /// Webhook configuration for webhook-triggered automations.
@@ -265,6 +278,20 @@ impl Default for RetryConfig {
     }
 }
 
+/// Who actually drives iteration for an automation.
+///
+/// `Scheduler` is the historical behavior — OA fires the command on a
+/// `TriggerType`. `HarnessLoop` means the harness CLI runs its own
+/// continuation loop (claudecode/codex `/goal`); OA records iterations
+/// but doesn't decide when they fire.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationDriver {
+    #[default]
+    Scheduler,
+    HarnessLoop,
+}
+
 /// An automation that triggers commands based on various triggers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Automation {
@@ -298,6 +325,10 @@ pub struct Automation {
     /// This is tracked internally and not persisted directly.
     #[serde(default, skip_serializing)]
     pub consecutive_failures: u32,
+    /// What drives iteration for this automation. Existing rows default to
+    /// `Scheduler` (OA-driven) so the field is back-compatible.
+    #[serde(default)]
+    pub driver: AutomationDriver,
 }
 
 /// Execution status for automation runs.

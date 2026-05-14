@@ -3,6 +3,7 @@ pub mod claudecode;
 pub mod codex;
 pub mod events;
 pub mod gemini;
+pub mod native_loops;
 pub mod opencode;
 pub mod registry;
 pub mod shared;

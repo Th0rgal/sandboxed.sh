@@ -486,6 +486,7 @@ CREATE TABLE IF NOT EXISTS automations (
     active INTEGER NOT NULL DEFAULT 1,
     stop_policy TEXT NOT NULL DEFAULT 'consecutive_failures:2',
     fresh_session TEXT NOT NULL DEFAULT 'keep',
+    driver TEXT NOT NULL DEFAULT 'scheduler',
     created_at TEXT NOT NULL,
     last_triggered_at TEXT,
     retry_max_retries INTEGER NOT NULL DEFAULT 3,
@@ -571,6 +572,11 @@ impl SqliteMissionStore {
         let retry_max_retries: i64 = row.get(12)?;
         let retry_delay_seconds: i64 = row.get(13)?;
         let retry_backoff_multiplier: f64 = row.get(14)?;
+        // `driver` is appended to the SELECT list by all callers below. If a
+        // legacy SELECT doesn't include it, default to `scheduler`.
+        let driver_str: String = row
+            .get::<_, String>(15)
+            .unwrap_or_else(|_| "scheduler".to_string());
 
         // Parse command source
         let command_source: CommandSource = match command_source_type.as_str() {
@@ -593,6 +599,15 @@ impl SqliteMissionStore {
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 CommandSource::Inline {
                     content: data["content"].as_str().unwrap_or("").to_string(),
+                }
+            }
+            "native_loop" => {
+                let data: serde_json::Value = serde_json::from_str(&command_source_data)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                CommandSource::NativeLoop {
+                    harness: data["harness"].as_str().unwrap_or("").to_string(),
+                    command: data["command"].as_str().unwrap_or("").to_string(),
+                    args: data.get("args").cloned().unwrap_or(serde_json::Value::Null),
                 }
             }
             _ => {
@@ -669,6 +684,11 @@ impl SqliteMissionStore {
             _ => FreshSession::Keep,
         };
 
+        let driver = match driver_str.as_str() {
+            "harness_loop" => super::AutomationDriver::HarnessLoop,
+            _ => super::AutomationDriver::Scheduler,
+        };
+
         Ok(Automation {
             id: Uuid::parse_str(&id)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
@@ -688,6 +708,7 @@ impl SqliteMissionStore {
                 backoff_multiplier: retry_backoff_multiplier,
             },
             consecutive_failures: 0,
+            driver,
         })
     }
 
@@ -1913,6 +1934,24 @@ impl SqliteMissionStore {
                 [],
             )
             .map_err(|e| format!("Failed to add fresh_session column: {}", e))?;
+        }
+
+        // Migration: add driver column distinguishing OA-scheduled automations
+        // from harness-driven native loops (claudecode/codex `/goal`, etc).
+        let has_driver: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('automations') WHERE name = 'driver'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_driver {
+            tracing::info!("Running migration: adding 'driver' column to automations table");
+            conn.execute(
+                "ALTER TABLE automations ADD COLUMN driver TEXT NOT NULL DEFAULT 'scheduler'",
+                [],
+            )
+            .map_err(|e| format!("Failed to add driver column: {}", e))?;
         }
 
         Ok(())
@@ -3726,6 +3765,19 @@ impl MissionStore for SqliteMissionStore {
                 "inline",
                 serde_json::json!({ "content": content }).to_string(),
             ),
+            CommandSource::NativeLoop {
+                harness,
+                command,
+                args,
+            } => (
+                "native_loop",
+                serde_json::json!({
+                    "harness": harness,
+                    "command": command,
+                    "args": args,
+                })
+                .to_string(),
+            ),
         };
 
         // Serialize trigger
@@ -3770,12 +3822,16 @@ impl MissionStore for SqliteMissionStore {
                 FreshSession::Switch => "switch",
                 FreshSession::Keep => "keep",
             };
+            let driver_str = match a.driver {
+                super::AutomationDriver::Scheduler => "scheduler",
+                super::AutomationDriver::HarnessLoop => "harness_loop",
+            };
             conn.execute(
                 "INSERT INTO automations (id, mission_id, command_source_type, command_source_data,
                                          trigger_type, trigger_data, variables, active, stop_policy,
-                                         fresh_session, created_at, last_triggered_at, retry_max_retries,
+                                         fresh_session, driver, created_at, last_triggered_at, retry_max_retries,
                                          retry_delay_seconds, retry_backoff_multiplier)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     a.id.to_string(),
                     a.mission_id.to_string(),
@@ -3787,6 +3843,7 @@ impl MissionStore for SqliteMissionStore {
                     if a.active { 1 } else { 0 },
                     stop_policy_str,
                     fresh_session_str,
+                    driver_str,
                     a.created_at,
                     a.last_triggered_at,
                     a.retry_config.max_retries as i64,
@@ -3812,7 +3869,7 @@ impl MissionStore for SqliteMissionStore {
             let mut stmt = conn
                 .prepare("SELECT id, mission_id, command_source_type, command_source_data,
                                 trigger_type, trigger_data, variables, active, stop_policy, fresh_session, created_at, last_triggered_at,
-                                retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
+                                retry_max_retries, retry_delay_seconds, retry_backoff_multiplier, driver, driver
                          FROM automations WHERE mission_id = ? ORDER BY created_at DESC")
                 .map_err(|e| e.to_string())?;
 
@@ -3839,7 +3896,7 @@ impl MissionStore for SqliteMissionStore {
                 .prepare(
                     "SELECT id, mission_id, command_source_type, command_source_data,
                             trigger_type, trigger_data, variables, active, stop_policy, fresh_session, created_at, last_triggered_at,
-                            retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
+                            retry_max_retries, retry_delay_seconds, retry_backoff_multiplier, driver
                      FROM automations WHERE active = 1 ORDER BY created_at DESC",
                 )
                 .map_err(|e| e.to_string())?;
@@ -3868,7 +3925,7 @@ impl MissionStore for SqliteMissionStore {
                 .query_row(
                     "SELECT id, mission_id, command_source_type, command_source_data,
                             trigger_type, trigger_data, variables, active, stop_policy, fresh_session, created_at, last_triggered_at,
-                            retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
+                            retry_max_retries, retry_delay_seconds, retry_backoff_multiplier, driver
                      FROM automations WHERE id = ?",
                     [id_str],
                     Self::parse_automation_row,
@@ -3947,6 +4004,19 @@ impl MissionStore for SqliteMissionStore {
             CommandSource::Inline { content } => (
                 "inline",
                 serde_json::json!({ "content": content }).to_string(),
+            ),
+            CommandSource::NativeLoop {
+                harness,
+                command,
+                args,
+            } => (
+                "native_loop",
+                serde_json::json!({
+                    "harness": harness,
+                    "command": command,
+                    "args": args,
+                })
+                .to_string(),
             ),
         };
 
@@ -4033,7 +4103,7 @@ impl MissionStore for SqliteMissionStore {
                 .query_row(
                     "SELECT id, mission_id, command_source_type, command_source_data,
                             trigger_type, trigger_data, variables, active, stop_policy, fresh_session, created_at, last_triggered_at,
-                            retry_max_retries, retry_delay_seconds, retry_backoff_multiplier
+                            retry_max_retries, retry_delay_seconds, retry_backoff_multiplier, driver
                      FROM automations
                      WHERE trigger_type = 'webhook' AND json_extract(trigger_data, '$.webhook_id') = ?",
                     [webhook_id],
@@ -6336,6 +6406,19 @@ impl MissionStore for SqliteMissionStore {
                         "inline",
                         serde_json::json!({ "content": content }).to_string(),
                     ),
+                    CommandSource::NativeLoop {
+                        harness,
+                        command,
+                        args,
+                    } => (
+                        "native_loop",
+                        serde_json::json!({
+                            "harness": harness,
+                            "command": command,
+                            "args": args,
+                        })
+                        .to_string(),
+                    ),
                 };
                 let (trigger_type, trigger_data) = match &auto.trigger {
                     TriggerType::Interval { seconds } => (
@@ -6380,12 +6463,16 @@ impl MissionStore for SqliteMissionStore {
                     FreshSession::Switch => "switch",
                     FreshSession::Keep => "keep",
                 };
+                let driver_str = match auto.driver {
+                    super::AutomationDriver::Scheduler => "scheduler",
+                    super::AutomationDriver::HarnessLoop => "harness_loop",
+                };
                 tx.execute(
                     "INSERT INTO automations (id, mission_id, command_source_type, command_source_data,
                                              trigger_type, trigger_data, variables, active, stop_policy,
-                                             fresh_session, created_at, last_triggered_at, retry_max_retries,
+                                             fresh_session, driver, created_at, last_triggered_at, retry_max_retries,
                                              retry_delay_seconds, retry_backoff_multiplier)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     rusqlite::params![
                         new_auto_id.to_string(),
                         new_mission_id.to_string(),
@@ -6397,6 +6484,7 @@ impl MissionStore for SqliteMissionStore {
                         if keep_active && auto.active { 1 } else { 0 },
                         stop_policy_str,
                         fresh_session_str,
+                        driver_str,
                         auto.created_at,
                         // Clear last_triggered_at so interval-based automations
                         // get a full interval on the target before firing.

@@ -35,6 +35,7 @@ pub mod mission_runner;
 pub mod mission_store;
 mod model_routing;
 mod monitoring;
+mod native_loop_observer;
 pub mod opencode;
 mod providers;
 pub(crate) mod proxy;

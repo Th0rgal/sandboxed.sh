@@ -5150,6 +5150,17 @@ fn spawn_control_session(
         });
     }
 
+    // Spawn native-loop observer: turns harness goal events into
+    // Automation rows + AutomationExecution iterations so the
+    // automations panel shows /goal alongside scheduled automations.
+    if state.mission_store.is_persistent() && config.automations_enabled {
+        let store = Arc::clone(&state.mission_store);
+        let tx = state.events_tx.clone();
+        tokio::spawn(async move {
+            super::native_loop_observer::run(store, tx).await;
+        });
+    }
+
     // Spawn automation scheduler task
     if state.mission_store.is_persistent() && config.automations_enabled {
         tokio::spawn(automation_scheduler_loop(
@@ -5938,6 +5949,12 @@ async fn automation_scheduler_loop(
                     }
                 }
                 CommandSource::Inline { content } => content.clone(),
+                CommandSource::NativeLoop { .. } => {
+                    // Harness-driven loops iterate via the harness CLI itself,
+                    // not the OA scheduler. Skip — the native_loop_observer
+                    // records executions when the harness emits goal events.
+                    continue;
+                }
             };
 
             // Build substitution context for variable replacement
@@ -6181,6 +6198,7 @@ async fn resolve_automation_command(
             tokio::fs::read_to_string(ws.path.join(path)).await.ok()?
         }
         CommandSource::Inline { content } => content.clone(),
+        CommandSource::NativeLoop { .. } => return None,
     };
 
     let mut context = SubstitutionContext::new(mission.id);
@@ -6717,6 +6735,12 @@ async fn agent_finished_automation_messages(
                 }
             }
             CommandSource::Inline { content } => content.clone(),
+            CommandSource::NativeLoop { .. } => {
+                // Harness-driven loops iterate via the harness CLI itself.
+                // Skip — the native_loop_observer records executions when
+                // the harness emits goal events.
+                continue;
+            }
         };
 
         // Build substitution context for variable replacement
@@ -10436,6 +10460,7 @@ pub async fn create_automation(
         last_triggered_at,
         retry_config: req.retry_config.unwrap_or_default(),
         consecutive_failures: 0,
+        driver: mission_store::AutomationDriver::Scheduler,
     };
 
     let mut automation = control
@@ -11667,6 +11692,12 @@ pub async fn webhook_receiver(
             }
         }
         CommandSource::Inline { content } => content.clone(),
+        CommandSource::NativeLoop { .. } => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Webhook triggers are not supported for native-loop automations".to_string(),
+            ));
+        }
     };
 
     // Apply webhook variable mappings
@@ -13010,6 +13041,7 @@ mod tests {
             stop_policy: mission_store::StopPolicy::Never,
             fresh_session,
             consecutive_failures: 0,
+            driver: mission_store::AutomationDriver::Scheduler,
         }
     }
 
