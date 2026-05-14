@@ -132,18 +132,21 @@ async fn ensure_automation(
     if let Some(&id) = cache.get(&mission_id) {
         return Ok(id);
     }
+    // Only consider *active* native-loop rows: a prior `/goal` on this
+    // mission may have completed and been deactivated, in which case
+    // reusing it would append iterations to a row the panel hides.
     let existing = store
         .get_mission_automations(mission_id)
         .await
         .unwrap_or_default()
         .into_iter()
-        .find(|a| match &a.command_source {
-            CommandSource::NativeLoop {
-                harness: h,
-                command: c,
-                ..
-            } => h == harness && c == command,
-            _ => false,
+        .find(|a| {
+            a.active
+                && matches!(
+                    &a.command_source,
+                    CommandSource::NativeLoop { harness: h, command: c, .. }
+                        if h == harness && c == command
+                )
         });
     let id = if let Some(a) = existing {
         a.id
