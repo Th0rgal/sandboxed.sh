@@ -1700,7 +1700,19 @@ struct ControlView: View {
                            !trace.events.isEmpty {
                             await MainActor.run {
                                 guard fetchingMissionId == id || viewingMissionId == id else { return }
-                                let merged = (events + trace.events).sorted { $0.sequence < $1.sequence }
+                                // Deduplicate by sequence — transcript and
+                                // trace endpoints can overlap on shared
+                                // sequence numbers (the web client does the
+                                // same via a Map keyed by sequence in its
+                                // `renderDeferredTraceRef`). Without dedup
+                                // any overlapping event would render twice
+                                // after the deferred trace fetch lands.
+                                var bySequence: [Int64: StoredEvent] = [:]
+                                bySequence.reserveCapacity(events.count + trace.events.count)
+                                for e in events { bySequence[e.sequence] = e }
+                                for e in trace.events { bySequence[e.sequence] = e }
+                                let merged = bySequence.values
+                                    .sorted { $0.sequence < $1.sequence }
                                 applyViewingMissionWithEvents(mission, events: merged)
                                 if let maxSeq = trace.maxSequence, maxSeq > 0 {
                                     missionMaxSeq[id] = maxSeq

@@ -209,7 +209,11 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
         setSelectedBackends(['opencode', 'gemini']);
       }
       if (selectedProvider === 'xai') {
-        setSelectedBackends(['grok']);
+        // Match the server's `default_backends_for_provider(ProviderType::Xai)`
+        // (`src/api/ai_providers.rs`) and the provider-level preselect at
+        // line ~181 — both return `["opencode", "grok"]`. Without this the
+        // OAuth-method path silently drops opencode targeting only for xAI.
+        setSelectedBackends(['opencode', 'grok']);
       }
       setStep('select-backends');
       return;

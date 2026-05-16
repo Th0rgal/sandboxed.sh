@@ -297,8 +297,11 @@ export async function getMissionTraceWithMeta(
   }
 ): Promise<{ events: StoredEvent[]; meta: MissionEventsMeta }> {
   const params = new URLSearchParams();
-  if (options?.limit) params.set("limit", String(options.limit));
-  if (options?.offset) params.set("offset", String(options.offset));
+  // `!== undefined` matches the sinceSeq/beforeSeq pattern below — a
+  // truthiness check drops `0`, but `offset: 0` is a valid value meaning
+  // "start from the beginning."
+  if (options?.limit !== undefined) params.set("limit", String(options.limit));
+  if (options?.offset !== undefined) params.set("offset", String(options.offset));
   if (options?.latest) params.set("latest", "true");
   if (options?.sinceSeq !== undefined) params.set("since_seq", String(options.sinceSeq));
   if (options?.beforeSeq !== undefined) params.set("before_seq", String(options.beforeSeq));

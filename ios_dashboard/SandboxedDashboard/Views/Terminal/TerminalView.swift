@@ -283,16 +283,33 @@ struct TerminalView: View {
         state.webSocketTask?.resume()
 
         // Start receiving messages. The connection-status transition to
-        // `.connected` and the "Connected." line are now driven by the first
-        // successful message receive (see `receiveMessages`) — the previous
-        // 500 ms fixed timer added unnecessary latency on fast networks and
-        // masked failure on slow ones. (UX audit item #18.)
+        // `.connected` and the "Connected." line are driven by the first
+        // successful message receive (see `receiveMessages`) — typical
+        // shells print a prompt on open, so the fast path is "promote as
+        // soon as bytes flow". The previous fixed 500 ms timer added
+        // unnecessary latency on fast networks and masked failure on slow
+        // ones. (UX audit item #18.)
         receiveMessages()
 
         // Send initial resize immediately so the shell sizes correctly on
         // open; this is just a control message and doesn't depend on the
         // status transition.
         sendResize(cols: 80, rows: 24)
+
+        // Fallback: a silent shell (waiting on input, slow init script,
+        // workspaces/<id>/shell endpoints that don't echo a banner) would
+        // otherwise leave us in "Connecting" forever because no inbound
+        // message ever triggers the promotion above. Promote after 3 s as
+        // long as the websocket is still attached and hasn't errored or
+        // been deliberately disconnected.
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            guard state.webSocketTask != nil,
+                  state.connectionStatus == .connecting else { return }
+            state.connectionStatus = .connected
+            state.isConnecting = false
+            state.appendLine(TerminalLine(text: "Connected.", type: .system))
+        }
     }
     
     private func disconnect() {

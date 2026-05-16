@@ -3662,8 +3662,13 @@ export default function ControlClient() {
   const expectingDesktopSessionRef = useRef(false);
   const desktopRapidPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Thinking panel state
-  const [showThinkingPanel, setShowThinkingPanel] = useState(true);
+  // Thinking panel state. Defaults to closed; the auto-show effect below
+  // (`hasActiveThinking && !thinkingPanelManuallyHidden → setShowThinkingPanel(true)`)
+  // is the canonical path that opens the panel when thinking content
+  // actually starts streaming. Defaulting to open made every cold-load of
+  // an old mission (often with no thinking content at all) render the
+  // panel by default.
+  const [showThinkingPanel, setShowThinkingPanel] = useState(false);
   // Deferred mirror used by the heavy chat-list regrouping memo so the toggle
   // click stays interactive even on long missions.
   const deferredShowThinkingPanel = useDeferredValue(showThinkingPanel);
@@ -3864,7 +3869,19 @@ export default function ControlClient() {
             .map(({ trace_count: _traceCount, trace_summary: _traceSummary, ...event }) => event)
             .sort((a, b) => a.sequence - b.sequence);
           metaMaxSeq = transcript.latest_sequence;
-          metaTotal = Object.values(transcript.event_counts).reduce((sum, count) => sum + count, 0);
+          // Only count types the client actually loads. The transcript's
+          // `event_counts` includes debug/status events outside
+          // `HISTORY_EVENT_TYPES`; summing them all inflates the total and
+          // makes `computeHasMoreOlder(id)` (which compares against the
+          // count of *loaded* events) return true forever, leaving the
+          // "Load older messages" button permanently visible. The fallback
+          // branch below already does this correctly via the meta returned
+          // by the typed `getMissionEventsWithMeta` call.
+          metaTotal = Object.entries(transcript.event_counts).reduce(
+            (sum, [type, count]) =>
+              HISTORY_EVENT_TYPES.includes(type) ? sum + count : sum,
+            0,
+          );
 
           // Fetch hidden thoughts/tools after first paint. The renderer ref is
           // populated below `eventsToItems`; this avoids blocking transcript
