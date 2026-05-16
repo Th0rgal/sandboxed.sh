@@ -5248,26 +5248,41 @@ pub async fn stream(
                                 }
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            // This receiver's cursor slipped behind the
+                            // broadcast buffer's tail by `dropped` events.
+                            // The stream itself is still alive — `recv()`
+                            // will keep yielding fresh events on the next
+                            // tick — so we deliberately don't emit an
+                            // `error` event here. The dashboard treats
+                            // `error` as fatal (red toast + system-error
+                            // row in the chat) and it caused a confusing
+                            // user-facing alert every time a chatty
+                            // mission (text_delta burst, big tool result)
+                            // outpaced the browser tab's event handler.
+                            //
+                            // Instead, emit a distinct `stream_lagged`
+                            // event with the dropped count. The dashboard
+                            // reacts by silently refetching the viewing
+                            // mission via the existing `since_seq` path
+                            // so any dropped events are recovered from
+                            // the database. No user toast, no chat
+                            // pollution.
                             tracing::warn!(
                                 stream_id = %stream_id,
-                                "Control SSE stream lagged; events dropped"
+                                dropped = dropped,
+                                "Control SSE stream lagged; signalling client refetch"
                             );
                             match Event::default()
-                                .event("error")
-                                .json_data(AgentEvent::Error {
-                                    message:
-                                        "event stream lagged; some events were dropped"
-                                            .to_string(),
-                                    mission_id: None,
-                                    resumable: false,
-                                }) {
+                                .event("stream_lagged")
+                                .json_data(serde_json::json!({ "dropped": dropped }))
+                            {
                                 Ok(sse) => yield Ok(sse),
                                 Err(e) => {
                                     tracing::error!(
                                         stream_id = %stream_id,
                                         error = %e,
-                                        "Failed to serialize SSE lag error event"
+                                        "Failed to serialize SSE stream_lagged event"
                                     );
                                 }
                             }
@@ -5304,7 +5319,13 @@ fn spawn_control_session(
     telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
-    let (events_tx, events_rx) = broadcast::channel::<AgentEvent>(1024);
+    // 8 192 slots ≈ ~8 s of headroom even for chatty missions (text_delta
+    // bursts during long completions push ~1 k events / sec). The previous
+    // 1 024 cap regularly overflowed for any tab whose JS event handler
+    // momentarily slowed (large React reducer work, tab backgrounded by
+    // Chrome). Per-receiver cursor + Arc<AgentEvent> internal layout keeps
+    // the memory cost bounded.
+    let (events_tx, events_rx) = broadcast::channel::<AgentEvent>(8192);
     let tool_hub = Arc::new(FrontendToolHub::new());
     let status = Arc::new(RwLock::new(ControlStatus {
         state: ControlRunState::Idle,

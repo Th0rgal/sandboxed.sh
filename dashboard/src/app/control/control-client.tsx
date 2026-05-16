@@ -7427,6 +7427,28 @@ export default function ControlClient() {
         }
       }
 
+      // `stream_lagged` is emitted by the server when this SSE
+      // subscriber's broadcast cursor falls behind the channel buffer
+      // (chatty mission outpaces the browser tab's event handler). The
+      // stream itself stays alive — we just missed a window of events.
+      // Silently catch up via the existing delta-resume path
+      // (`reloadMissionHistory` → `loadHistoryEvents(sinceSeq)`) so the
+      // user never sees a scary error toast for what is a transient
+      // back-pressure event.
+      if (event.type === "stream_lagged") {
+        const dropped = isRecord(data) && typeof data["dropped"] === "number"
+          ? (data["dropped"] as number)
+          : undefined;
+        streamLog("warn", "stream_lagged — refetching", { dropped });
+        const viewingId = viewingMissionIdRef.current;
+        if (viewingId) {
+          void reloadMissionHistory(viewingId).catch((err) => {
+            streamLog("warn", "stream_lagged refetch failed", { err: String(err) });
+          });
+        }
+        return;
+      }
+
       // Handle mission status changes
       if (event.type === "mission_status_changed" && isRecord(data)) {
         const newStatus = String(data["status"] ?? "");

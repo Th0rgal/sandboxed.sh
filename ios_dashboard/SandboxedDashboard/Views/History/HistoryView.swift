@@ -418,12 +418,22 @@ private struct MissionRow: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            // Icon based on backend
-            Image(systemName: mission.canResume ? "play.circle" : backendIcon)
+            // Leading tile always identifies the backend (codex / claudecode
+            // / opencode / gemini / grok). Previously this slot painted a
+            // yellow `play.circle` when `mission.canResume == true` to flag
+            // resumability — but `canResume` now also covers `awaiting_user`
+            // and `acknowledged` (added with the Needs You refactor), so
+            // *every* Needs You row went yellow regardless of backend while
+            // sibling rows in other columns kept their cyan/indigo/green
+            // backend tile. The StatusBadge directly below the title
+            // already conveys the "Needs You" / "Interrupted" / "Blocked"
+            // state in the right color, so the leading-tile override was
+            // redundant and visually inconsistent across buckets.
+            Image(systemName: backendIcon)
                 .font(.title3)
-                .foregroundStyle(mission.canResume ? Theme.warning : backendColor)
+                .foregroundStyle(backendColor)
                 .frame(width: 40, height: 40)
-                .background((mission.canResume ? Theme.warning : backendColor).opacity(0.15))
+                .background(backendColor.opacity(0.15))
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
             // Content

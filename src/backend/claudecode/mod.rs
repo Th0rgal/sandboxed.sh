@@ -96,16 +96,49 @@ impl Backend for ClaudeCodeBackend {
     }
 
     async fn check_auth_configured(&self, ctx: &crate::backend::AuthContext<'_>) -> Option<bool> {
-        // Claude Code keeps its api_key in the secrets store under the
-        // "claudecode" namespace. A non-expired entry means we have auth.
-        let Some(store) = ctx.secrets else {
-            return Some(false);
-        };
-        let has_key = match store.list_secrets("claudecode").await {
-            Ok(secrets) => secrets.iter().any(|s| s.key == "api_key" && !s.is_expired),
-            Err(_) => false,
-        };
-        Some(has_key)
+        // Two valid auth modes:
+        //   1. An API key stored in the secrets store under the
+        //      "claudecode" namespace (set via the providers UI).
+        //   2. OAuth credentials at `~/.claude/.credentials.json` (the
+        //      common case — written by `claude login` and used by every
+        //      mission via the workspace bootstrap). We previously only
+        //      checked (1), so any user authed via OAuth saw Claude Code
+        //      filtered out of the new-mission picker even though every
+        //      mission run worked correctly.
+        if let Some(store) = ctx.secrets {
+            if let Ok(secrets) = store.list_secrets("claudecode").await {
+                if secrets.iter().any(|s| s.key == "api_key" && !s.is_expired) {
+                    return Some(true);
+                }
+            }
+        }
+        // Probe the same on-disk locations the Claude CLI uses. See
+        // `crate::api::ai_providers::get_anthropic_auth_from_claude_cli_credentials`
+        // — duplicated here as a lightweight path-existence check so the
+        // backend module stays self-contained (no JSON parse needed, the
+        // file's mere presence is the install-completed signal).
+        let candidate_paths = [
+            std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
+            std::path::PathBuf::from("/root/.claude/.credentials.json"),
+        ];
+        for path in &candidate_paths {
+            if path.exists() {
+                return Some(true);
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let p = std::path::PathBuf::from(home).join(".claude/.credentials.json");
+            if p.exists() {
+                return Some(true);
+            }
+        }
+        // No secrets-store entry, no OAuth file on disk. Mirror Grok's
+        // "don't hide on uncertainty" by returning `None` rather than
+        // `Some(false)` — the CLI may still be authed via env vars
+        // (`ANTHROPIC_API_KEY`) we don't enumerate here, and worst case
+        // the user clicks the backend and gets a clear auth error
+        // instead of a hidden picker entry.
+        None
     }
 
     async fn list_agents(&self) -> Result<Vec<AgentInfo>, Error> {
