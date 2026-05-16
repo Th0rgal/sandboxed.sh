@@ -63,7 +63,7 @@ const defaultProviderTypes: AIProviderTypeInfo[] = [
   { id: 'open-router', name: 'OpenRouter', uses_oauth: false, env_var: 'OPENROUTER_API_KEY' },
   { id: 'groq', name: 'Groq', uses_oauth: false, env_var: 'GROQ_API_KEY' },
   { id: 'mistral', name: 'Mistral AI', uses_oauth: false, env_var: 'MISTRAL_API_KEY' },
-  { id: 'xai', name: 'xAI', uses_oauth: false, env_var: 'XAI_API_KEY' },
+  { id: 'xai', name: 'xAI', uses_oauth: true, env_var: 'XAI_API_KEY' },
   { id: 'zai', name: 'Z.AI', uses_oauth: false, env_var: 'ZHIPU_API_KEY' },
   { id: 'minimax', name: 'Minimax', uses_oauth: false, env_var: 'MINIMAX_API_KEY' },
   { id: 'github-copilot', name: 'GitHub Copilot', uses_oauth: true, env_var: null },

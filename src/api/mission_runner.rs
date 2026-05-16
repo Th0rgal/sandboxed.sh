@@ -10024,6 +10024,61 @@ async fn ensure_grok_cli_available(
     }
 }
 
+async fn sync_grok_oauth_auth_file(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Result<bool, String> {
+    let auth_path = std::path::PathBuf::from(crate::util::home_dir())
+        .join(".grok")
+        .join("auth.json");
+    if !auth_path.is_file() {
+        return Ok(false);
+    }
+
+    let auth_json = tokio::fs::read_to_string(&auth_path)
+        .await
+        .map_err(|e| format!("Failed to read Grok auth file: {}", e))?;
+    if auth_json.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let encoded = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(auth_json.as_bytes())
+    };
+    let output = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &[
+                "-lc".to_string(),
+                format!(
+                    "mkdir -p \"${{HOME:-/root}}/.grok\" && printf %s '{}' | base64 -d > \"${{HOME:-/root}}/.grok/auth.json\" && chmod 600 \"${{HOME:-/root}}/.grok/auth.json\"",
+                    encoded
+                ),
+            ],
+            HashMap::new(),
+        )
+        .await
+        .map_err(|e| format!("Failed to sync Grok auth file: {}", e))?;
+    if output.status.success() {
+        Ok(true)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Err(format!(
+            "Failed to sync Grok auth file into workspace: {}{}{}",
+            stderr.trim(),
+            if stderr.trim().is_empty() || stdout.trim().is_empty() {
+                ""
+            } else {
+                " | "
+            },
+            stdout.trim()
+        ))
+    }
+}
+
 /// Result of a backend preflight check
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BackendPreflightResult {
@@ -12641,6 +12696,16 @@ fn grok_event_text(value: &serde_json::Value) -> Option<String> {
         return Some(text.to_string());
     }
 
+    if value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("text"))
+    {
+        if let Some(text) = value.get("data").and_then(|v| v.as_str()) {
+            return Some(text.to_string());
+        }
+    }
+
     if let Some(content) = value.get("content") {
         if let Some(text) = content.as_str() {
             return Some(text.to_string());
@@ -12650,21 +12715,21 @@ fn grok_event_text(value: &serde_json::Value) -> Option<String> {
         }
     }
 
-    if let Some(text) = value
-        .get("message")
-        .and_then(|message| message.get("content"))
-        .and_then(|content| {
-            content.as_str().map(str::to_string).or_else(|| {
-                content.as_array().map(|blocks| {
-                    blocks
-                        .iter()
-                        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-                        .collect::<Vec<_>>()
-                        .join("")
+    if let Some(text) = value.get("message").and_then(|message| {
+        message.as_str().map(str::to_string).or_else(|| {
+            message.get("content").and_then(|content| {
+                content.as_str().map(str::to_string).or_else(|| {
+                    content.as_array().map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
                 })
             })
         })
-    {
+    }) {
         if !text.is_empty() {
             return Some(text);
         }
@@ -12754,10 +12819,14 @@ pub async fn run_grok_turn(
     args.push("streaming-json".to_string());
     args.push("--always-approve".to_string());
     args.push("--cwd".to_string());
-    args.push(work_dir.display().to_string());
+    args.push(workspace_exec.translate_path_for_container(work_dir));
     if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
         args.push("--model".to_string());
         args.push(model.to_string());
+    }
+
+    if let Err(err) = sync_grok_oauth_auth_file(&workspace_exec, work_dir).await {
+        tracing::warn!(mission_id = %mission_id, error = %err, "Failed to sync Grok OAuth auth file");
     }
 
     let mut env = HashMap::new();
@@ -12872,7 +12941,7 @@ pub async fn run_grok_turn(
                                     .get("delta")
                                     .is_some()
                                     || value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
-                                        t.contains("delta") || t.contains("chunk")
+                                        t.contains("delta") || t.contains("chunk") || t == "text"
                                     })
                                 {
                                     final_result.push_str(&text);
@@ -12929,9 +12998,7 @@ pub async fn run_grok_turn(
     } else {
         AgentResult::failure(final_result, 0).with_terminal_reason(TerminalReason::LlmError)
     };
-    if let Some(model) = model_used {
-        result = result.with_model(model);
-    }
+    result = result.with_model(model_used.unwrap_or_else(|| "grok-build".to_string()));
     result
 }
 

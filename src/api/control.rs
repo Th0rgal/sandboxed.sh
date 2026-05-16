@@ -9716,6 +9716,7 @@ async fn run_single_control_turn(
         && effective_config_profile.is_some()
         && requested_model.is_none())
         || (backend_id.as_deref() == Some("codex") && requested_model.is_none())
+        || (backend_id.as_deref() == Some("grok") && requested_model.is_none())
     {
         config.default_model = None;
     } else if backend_id.as_deref() == Some("gemini") && requested_model.is_none() {

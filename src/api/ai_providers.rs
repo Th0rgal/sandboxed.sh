@@ -25,6 +25,10 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::Command as TokioCommand;
+use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
 
 use crate::ai_providers::{AuthMethod, PendingOAuth, ProviderType};
 use crate::util::{
@@ -250,6 +254,7 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_REDIRECT_URI: &str = "http://localhost:8085/oauth2callback";
 const GOOGLE_SCOPES: &str =
     "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
+const GROK_OAUTH_CLIENT_KEY: &str = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828";
 
 fn google_client_id() -> &'static str {
     GOOGLE_CLIENT_ID
@@ -257,6 +262,326 @@ fn google_client_id() -> &'static str {
 
 fn google_client_secret() -> &'static str {
     GOOGLE_CLIENT_SECRET
+}
+
+fn grok_auth_path() -> PathBuf {
+    PathBuf::from(home_dir()).join(".grok").join("auth.json")
+}
+
+fn read_grok_auth_entry() -> Option<serde_json::Value> {
+    let contents = std::fs::read_to_string(grok_auth_path()).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    auth.get(GROK_OAUTH_CLIENT_KEY).cloned()
+}
+
+fn grok_auth_email(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("email")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
+fn grok_auth_expires_at_millis(entry: &serde_json::Value) -> i64 {
+    entry
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() + 6 * 60 * 60 * 1000)
+}
+
+fn parse_grok_device_auth_line(line: &str) -> (Option<String>, Option<String>) {
+    let trimmed = line
+        .trim()
+        .trim_matches(|c: char| c.is_ascii_control() || c.is_whitespace());
+
+    let auth_url = trimmed
+        .split_whitespace()
+        .find(|part| part.starts_with("https://"))
+        .map(|part| {
+            part.trim_end_matches(|c: char| c == '.' || c == ',')
+                .to_string()
+        });
+
+    let user_code = if let Some(ref url) = auth_url {
+        url::Url::parse(url).ok().and_then(|url| {
+            url.query_pairs()
+                .find(|(key, _)| key == "user_code")
+                .map(|(_, value)| value.to_string())
+        })
+    } else if trimmed.contains('-')
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    };
+
+    (auth_url, user_code)
+}
+
+#[cfg(test)]
+mod grok_oauth_tests {
+    use super::{get_xai_api_key_for_grok, parse_grok_device_auth_line};
+    use crate::ai_providers::{AIProvider, OAuthCredentials, ProviderType};
+
+    #[test]
+    fn parses_device_auth_url_and_user_code_from_stderr_line() {
+        let line = "  https://accounts.x.ai/oauth2/device?user_code=YKRD-M9AF";
+
+        let (url, code) = parse_grok_device_auth_line(line);
+
+        assert_eq!(
+            url.as_deref(),
+            Some("https://accounts.x.ai/oauth2/device?user_code=YKRD-M9AF")
+        );
+        assert_eq!(code.as_deref(), Some("YKRD-M9AF"));
+    }
+
+    #[test]
+    fn parses_standalone_device_code_line() {
+        let (_, code) = parse_grok_device_auth_line("  YKRD-M9AF");
+
+        assert_eq!(code.as_deref(), Some("YKRD-M9AF"));
+    }
+
+    #[test]
+    fn grok_credential_lookup_uses_xai_api_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store_dir = temp.path().join(".sandboxed-sh");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+
+        let mut provider = AIProvider::new(ProviderType::Xai, "xAI API".to_string());
+        provider.api_key = Some("xai-api-key".to_string());
+        std::fs::write(
+            store_dir.join("ai_providers.json"),
+            serde_json::to_string(&vec![provider]).expect("serialize providers"),
+        )
+        .expect("write providers");
+
+        assert_eq!(
+            get_xai_api_key_for_grok(temp.path()).as_deref(),
+            Some("xai-api-key")
+        );
+    }
+
+    #[test]
+    fn grok_credential_lookup_does_not_treat_oauth_token_as_api_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store_dir = temp.path().join(".sandboxed-sh");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+
+        let mut provider = AIProvider::new(ProviderType::Xai, "xAI OAuth".to_string());
+        provider.oauth = Some(OAuthCredentials {
+            access_token: "oauth-access-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000,
+        });
+        std::fs::write(
+            store_dir.join("ai_providers.json"),
+            serde_json::to_string(&vec![provider]).expect("serialize providers"),
+        )
+        .expect("write providers");
+
+        assert_eq!(get_xai_api_key_for_grok(temp.path()), None);
+    }
+}
+
+async fn forward_grok_login_lines<R>(stream: R, sender: mpsc::UnboundedSender<String>)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(stream).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let _ = sender.send(line);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed reading Grok login output");
+                break;
+            }
+        }
+    }
+}
+
+async fn start_grok_device_auth() -> Result<(String, String), String> {
+    let mut child = TokioCommand::new("grok")
+        .args(["login", "--device-auth"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start `grok login --device-auth`: {}", e))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture Grok login stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture Grok login stderr".to_string())?;
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    tokio::spawn(forward_grok_login_lines(stdout, sender.clone()));
+    tokio::spawn(forward_grok_login_lines(stderr, sender));
+
+    let mut auth_url: Option<String> = None;
+    let mut user_code: Option<String> = None;
+
+    let auth_result = timeout(Duration::from_secs(15), async {
+        while let Some(line) = receiver.recv().await {
+            let (line_url, line_code) = parse_grok_device_auth_line(&line);
+            if auth_url.is_none() {
+                auth_url = line_url;
+            }
+            if user_code.is_none() {
+                user_code = line_code;
+            }
+            if auth_url.is_some() && user_code.is_some() {
+                break;
+            }
+        }
+        Ok::<(), String>(())
+    })
+    .await;
+
+    if auth_result.is_err() {
+        let _ = child.kill().await;
+        return Err("Timed out waiting for Grok device authorization URL".to_string());
+    }
+    auth_result.map_err(|e| e.to_string())??;
+
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) if status.success() => {
+                tracing::info!("Grok device authorization completed successfully");
+            }
+            Ok(status) => {
+                tracing::warn!(
+                    ?status,
+                    "Grok device authorization process exited unsuccessfully"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed waiting for Grok device authorization process");
+            }
+        }
+    });
+
+    Ok((
+        auth_url.ok_or_else(|| "Grok did not print a device authorization URL".to_string())?,
+        user_code.ok_or_else(|| "Grok did not print a device authorization code".to_string())?,
+    ))
+}
+
+async fn upsert_grok_oauth_provider(
+    state: &super::routes::AppState,
+    entry: &serde_json::Value,
+    use_for_backends: Option<Vec<String>>,
+) -> Result<ProviderResponse, (StatusCode, String)> {
+    let access_token = entry
+        .get("key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Grok auth file did not include an access token".to_string(),
+            )
+        })?;
+    let refresh_token = entry
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Grok auth file did not include a refresh token".to_string(),
+            )
+        })?;
+    let account_email = grok_auth_email(entry);
+    let backends = use_for_backends.unwrap_or_else(|| vec!["grok".to_string()]);
+
+    let mut provider = state
+        .ai_providers
+        .get_all_by_type(ProviderType::Xai)
+        .await
+        .into_iter()
+        .find(|p| p.has_oauth())
+        .unwrap_or_else(|| {
+            crate::ai_providers::AIProvider::new(
+                ProviderType::Xai,
+                "xAI (Grok Build OAuth)".to_string(),
+            )
+        });
+
+    provider.name = account_email
+        .as_ref()
+        .map(|email| format!("xAI ({email})"))
+        .unwrap_or_else(|| "xAI (Grok Build OAuth)".to_string());
+    provider.account_email = account_email;
+    provider.api_key = None;
+    provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+        refresh_token: refresh_token.to_string(),
+        access_token: access_token.to_string(),
+        expires_at: grok_auth_expires_at_millis(entry),
+    });
+    provider.use_for_backends = Some(backends.clone());
+    provider.enabled = true;
+
+    let stored = if state.ai_providers.get(provider.id).await.is_some() {
+        state.ai_providers.update(provider.id, provider).await
+    } else {
+        let id = state.ai_providers.add(provider).await;
+        state.ai_providers.get(id).await
+    }
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to save Grok OAuth provider".to_string(),
+        )
+    })?;
+
+    if let Err(e) =
+        update_provider_backends(&state.config.working_dir, ProviderType::Xai.id(), backends)
+    {
+        tracing::error!("Failed to save xAI provider backends: {}", e);
+    }
+    if provider_targets_grok(&stored) {
+        if let Err(e) = state.backend_configs.set_enabled("grok", true).await {
+            tracing::error!(
+                "Failed to enable Grok backend after xAI OAuth connect: {}",
+                e
+            );
+        }
+    }
+    if let Some(ref email) = stored.account_email {
+        if let Err(e) = update_provider_account(
+            &state.config.working_dir,
+            ProviderType::Xai.id(),
+            email.clone(),
+        ) {
+            tracing::error!("Failed to save xAI account email: {}", e);
+        }
+    }
+
+    Ok(build_response_from_store(&stored))
+}
+
+fn provider_targets_grok(provider: &crate::ai_providers::AIProvider) -> bool {
+    provider
+        .use_for_backends
+        .as_ref()
+        .map(|backends| backends.iter().any(|backend| backend == "grok"))
+        .unwrap_or_else(|| {
+            default_backends_for_provider(provider.provider_type)
+                .iter()
+                .any(|backend| backend == "grok")
+        })
 }
 
 fn anthropic_client_id() -> String {
@@ -689,6 +1014,7 @@ pub fn get_xai_api_key_for_grok(working_dir: &Path) -> Option<String> {
         if provider.provider_type != ProviderType::Xai || !provider.enabled {
             return None;
         }
+
         provider
             .api_key
             .filter(|key| !key.trim().is_empty())
@@ -5028,7 +5354,7 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
         ProviderTypeInfo {
             id: "xai".to_string(),
             name: "xAI".to_string(),
-            uses_oauth: false,
+            uses_oauth: true,
             env_var: Some("XAI_API_KEY".to_string()),
         },
         ProviderTypeInfo {
@@ -6224,6 +6550,15 @@ async fn create_provider(
         .await;
     }
 
+    if provider_type == ProviderType::Xai && provider.enabled && provider_targets_grok(&provider) {
+        if let Err(e) = state.backend_configs.set_enabled("grok", true).await {
+            tracing::error!(
+                "Failed to enable Grok backend after xAI provider creation: {}",
+                e
+            );
+        }
+    }
+
     // Refresh metadata LLM config so new API keys are picked up for title generation
     super::metadata_llm::refresh_metadata_llm_config(&state.ai_providers).await;
 
@@ -6340,6 +6675,15 @@ async fn update_provider(
     let pt = result.provider_type;
     if pt != ProviderType::Custom {
         sync_store_to_opencode(&state.ai_providers, &state.config.working_dir, pt).await;
+    }
+
+    if pt == ProviderType::Xai && result.enabled && provider_targets_grok(&result) {
+        if let Err(e) = state.backend_configs.set_enabled("grok", true).await {
+            tracing::error!(
+                "Failed to enable Grok backend after xAI provider update: {}",
+                e
+            );
+        }
     }
 
     let response = build_response_from_store(&result);
@@ -6733,6 +7077,16 @@ async fn oauth_authorize(
                 method: "code".to_string(),
             }))
         }
+        ProviderType::Xai => {
+            let (url, code) = start_grok_device_auth().await.map_err(internal_error)?;
+            Ok(Json(OAuthAuthorizeResponse {
+                url,
+                instructions: format!(
+                    "1. Open the xAI authorization page.\n2. Confirm code: {code}\n3. After the page says connection successful, return here and click Connect."
+                ),
+                method: "auto".to_string(),
+            }))
+        }
         _ => Err((
             StatusCode::BAD_REQUEST,
             "OAuth not supported for this provider".to_string(),
@@ -6750,6 +7104,10 @@ async fn oauth_callback(
     let provider_type_id = id.clone();
     match oauth_callback_inner(State(state.clone()), AxumPath(id), Json(req)).await {
         Ok(json) => {
+            if ProviderType::from_id(&provider_type_id) == Some(ProviderType::Xai) {
+                return json.into_response();
+            }
+
             // After successful OAuth, upsert the provider in AIProviderStore.
             // The OAuth callback already synced creds to auth.json; now mirror that
             // into the store so multiple accounts of the same type are tracked.
@@ -6848,6 +7206,19 @@ async fn oauth_callback_inner(
             )
         })?
     };
+
+    if provider_type == ProviderType::Xai {
+        let entry = read_grok_auth_entry().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Grok is not connected yet. Complete the xAI browser authorization first, then click Connect."
+                    .to_string(),
+            )
+        })?;
+        let response =
+            upsert_grok_oauth_provider(&state, &entry, req.use_for_backends.clone()).await?;
+        return Ok(Json(response));
+    }
 
     // Get pending OAuth state
     let pending = {

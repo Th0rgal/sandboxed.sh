@@ -218,8 +218,45 @@ async fn list_workspaces(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<Vec<WorkspaceResponse>>, (StatusCode, String)> {
     let workspaces = state.workspaces.list().await;
-    let responses: Vec<WorkspaceResponse> = workspaces.into_iter().map(Into::into).collect();
+    let responses: Vec<WorkspaceResponse> =
+        dedupe_workspace_list(workspaces, &state.config.working_dir)
+            .into_iter()
+            .map(Into::into)
+            .collect();
     Ok(Json(responses))
+}
+
+fn dedupe_workspace_list(workspaces: Vec<Workspace>, working_dir: &Path) -> Vec<Workspace> {
+    let canonical_container_root = working_dir.join(".sandboxed-sh").join("containers");
+    let mut by_identity: HashMap<(String, String), Workspace> = HashMap::new();
+
+    for workspace in workspaces {
+        let key = (
+            workspace.workspace_type.as_str().to_string(),
+            workspace.name.clone(),
+        );
+        match by_identity.get_mut(&key) {
+            Some(existing) => {
+                let existing_current = existing.path.starts_with(&canonical_container_root);
+                let candidate_current = workspace.path.starts_with(&canonical_container_root);
+                if candidate_current && !existing_current {
+                    *existing = workspace;
+                }
+            }
+            None => {
+                by_identity.insert(key, workspace);
+            }
+        }
+    }
+
+    let mut list: Vec<_> = by_identity.into_values().collect();
+    list.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.workspace_type.as_str().cmp(b.workspace_type.as_str()))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    list
 }
 
 /// Validate workspace name to prevent path traversal.

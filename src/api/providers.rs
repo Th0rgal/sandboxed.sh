@@ -1234,8 +1234,16 @@ pub async fn list_backend_model_options(
         &|id: &str| id.contains("codex") || id == "gpt-5.5" || id == "gpt-5.4";
     push_options("codex", Some(&["openai"]), false, Some(codex_filter));
     push_options("gemini", Some(&["google"]), false, None);
-    push_options("grok", Some(&["xai"]), false, None);
     push_options("opencode", None, true, None);
+    backends.insert(
+        "grok".to_string(),
+        vec![BackendModelOption {
+            value: "grok-build".to_string(),
+            label: "Grok Build".to_string(),
+            provider_id: Some("xai".to_string()),
+            description: Some("Default Grok Build CLI coding model".to_string()),
+        }],
+    );
 
     let codex_candidates: Vec<String> = backends
         .get("codex")

@@ -67,6 +67,16 @@ const getProviderAuthMethods = (providerType: AIProviderType): AIProviderAuthMet
       { label: 'Enter API Key', type: 'api', description: 'Use an existing Google AI API key' },
     ];
   }
+  if (providerType === 'xai') {
+    return [
+      {
+        label: 'Grok Build OAuth',
+        type: 'oauth',
+        description: 'Use your grok.com account through Grok Build',
+      },
+      { label: 'Enter API Key', type: 'api', description: 'Use an existing xAI API key' },
+    ];
+  }
   return [];
 };
 
@@ -190,13 +200,16 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     setSelectedMethodIndex(methodIndex);
 
     // Providers that support multiple backends should select targeting first.
-    if (selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google') {
+    if (selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google' || selectedProvider === 'xai') {
       // For OpenAI, default backends depend on auth method.
       if (selectedProvider === 'openai') {
         setSelectedBackends(['opencode', 'codex']);
       }
       if (selectedProvider === 'google') {
         setSelectedBackends(['opencode', 'gemini']);
+      }
+      if (selectedProvider === 'xai') {
+        setSelectedBackends(['grok']);
       }
       setStep('select-backends');
       return;
@@ -285,7 +298,8 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
   };
 
   const handleSubmitOAuthCode = async () => {
-    if (!oauthCode.trim() || !selectedProvider || selectedMethodIndex === null) return;
+    if (!selectedProvider || selectedMethodIndex === null) return;
+    if (!oauthCode.trim() && oauthResponse?.method !== 'auto') return;
 
     setLoading(true);
     try {
@@ -294,7 +308,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
         selectedMethodIndex,
         oauthCode,
         // Include backend targeting for supported providers
-        selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google'
+        selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google' || selectedProvider === 'xai'
           ? selectedBackends
           : undefined
       );
@@ -716,9 +730,10 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                 type="text"
                 value={oauthCode}
                 onChange={(e) => setOauthCode(e.target.value)}
-                placeholder="sk-ant-oc01-...#..."
+                placeholder={oauthResponse.method === 'auto' ? 'No code required' : 'sk-ant-oc01-...#...'}
+                disabled={oauthResponse.method === 'auto'}
                 autoFocus
-                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:outline-none focus:border-indigo-500/50 font-mono"
+                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:outline-none focus:border-indigo-500/50 font-mono disabled:opacity-60"
               />
               <div className="flex gap-2">
                 <button
@@ -729,7 +744,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                 </button>
                 <button
                   onClick={handleSubmitOAuthCode}
-                  disabled={loading || !oauthCode.trim()}
+                  disabled={loading || (!oauthCode.trim() && oauthResponse.method !== 'auto')}
                   className="flex-1 rounded-xl bg-indigo-500 px-4 py-3 text-sm font-medium text-white hover:bg-indigo-600 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {loading ? <Loader className="h-4 w-4 animate-spin mx-auto" /> : 'Connect'}

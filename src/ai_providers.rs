@@ -206,7 +206,7 @@ impl ProviderType {
     pub fn uses_oauth(&self) -> bool {
         matches!(
             self,
-            Self::Anthropic | Self::GithubCopilot | Self::OpenAI | Self::Google
+            Self::Anthropic | Self::GithubCopilot | Self::OpenAI | Self::Google | Self::Xai
         )
     }
 
@@ -266,6 +266,21 @@ impl ProviderType {
                     label: "Manually enter API Key".to_string(),
                     method_type: AuthMethodType::Api,
                     description: Some("Enter an existing Google AI API key".to_string()),
+                },
+            ],
+            Self::Xai => vec![
+                AuthMethod {
+                    label: "Grok Build OAuth".to_string(),
+                    method_type: AuthMethodType::Oauth,
+                    description: Some(
+                        "Use your grok.com account through Grok Build device authorization"
+                            .to_string(),
+                    ),
+                },
+                AuthMethod {
+                    label: "Manually enter API Key".to_string(),
+                    method_type: AuthMethodType::Api,
+                    description: Some("Enter an existing xAI API key".to_string()),
                 },
             ],
             _ => vec![AuthMethod {

@@ -3105,31 +3105,33 @@ const ChatItemRow = memo(function ChatItemRow({
                 </span>
               </>
             )}
-            <>
-              <span>•</span>
-              <span
-                className={
-                  item.costSource === "actual"
-                    ? "text-emerald-400"
+            {(item.costSource !== "unknown" || item.costCents > 0) && (
+              <>
+                <span>•</span>
+                <span
+                  className={
+                    item.costSource === "actual"
+                      ? "text-emerald-400"
+                      : item.costSource === "estimated"
+                        ? "text-amber-300"
+                        : "text-white/50"
+                  }
+                >
+                  {item.costSource === "unknown"
+                    ? item.costCents > 0
+                      ? `$${(item.costCents / 100).toFixed(4)}`
+                      : "N/A"
+                    : `$${(item.costCents / 100).toFixed(4)}`}
+                </span>
+                <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/60">
+                  {item.costSource === "actual"
+                    ? "Actual"
                     : item.costSource === "estimated"
-                      ? "text-amber-300"
-                      : "text-white/50"
-                }
-              >
-                {item.costSource === "unknown"
-                  ? item.costCents > 0
-                    ? `$${(item.costCents / 100).toFixed(4)}`
-                    : "N/A"
-                  : `$${(item.costCents / 100).toFixed(4)}`}
-              </span>
-              <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/60">
-                {item.costSource === "actual"
-                  ? "Actual"
-                  : item.costSource === "estimated"
-                    ? "Estimated"
-                    : "Unknown"}
-              </span>
-            </>
+                      ? "Estimated"
+                      : "Unknown"}
+                </span>
+              </>
+            )}
             <span>•</span>
             <span className="text-white/30">{formatTime(item.timestamp)}</span>
           </div>

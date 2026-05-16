@@ -146,6 +146,24 @@ impl BackendConfigStore {
         self.save_to_disk().await?;
         Ok(Some(updated))
     }
+
+    pub async fn set_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<Option<BackendConfigEntry>, std::io::Error> {
+        let mut configs = self.configs.write().await;
+        let entry = configs.get_mut(id);
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+
+        entry.enabled = enabled;
+        let updated = entry.clone();
+        drop(configs);
+        self.save_to_disk().await?;
+        Ok(Some(updated))
+    }
 }
 
 pub type SharedBackendConfigStore = Arc<BackendConfigStore>;
