@@ -142,9 +142,13 @@ struct BuiltinCommandsResponse: Codable {
     let opencode: [SlashCommand]
     let claudecode: [SlashCommand]
     let codex: [SlashCommand]?
+    /// Grok Build builtin commands (just `/goal` today — sandboxed.sh-driven,
+    /// not a native grok feature). Optional so older backends without the
+    /// field decode fine.
+    let grok: [SlashCommand]?
 
     private enum CodingKeys: String, CodingKey {
-        case opencode, claudecode, codex
+        case opencode, claudecode, codex, grok
     }
 
     init(from decoder: Decoder) throws {
@@ -152,12 +156,19 @@ struct BuiltinCommandsResponse: Codable {
         opencode = try c.decodeIfPresent([SlashCommand].self, forKey: .opencode) ?? []
         claudecode = try c.decodeIfPresent([SlashCommand].self, forKey: .claudecode) ?? []
         codex = try c.decodeIfPresent([SlashCommand].self, forKey: .codex)
+        grok = try c.decodeIfPresent([SlashCommand].self, forKey: .grok)
     }
 
-    init(opencode: [SlashCommand] = [], claudecode: [SlashCommand] = [], codex: [SlashCommand]? = nil) {
+    init(
+        opencode: [SlashCommand] = [],
+        claudecode: [SlashCommand] = [],
+        codex: [SlashCommand]? = nil,
+        grok: [SlashCommand]? = nil
+    ) {
         self.opencode = opencode
         self.claudecode = claudecode
         self.codex = codex
+        self.grok = grok
     }
 }
 

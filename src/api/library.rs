@@ -957,6 +957,11 @@ struct BuiltinCommandsResponse {
     /// Empty when the workspace's codex binary predates the goals feature flag.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     codex: Vec<CommandSummary>,
+    /// Commands for Grok Build. Today this carries the sandboxed.sh-driven
+    /// `/goal` loop (Grok has no native goal mode — see
+    /// `src/api/grok_goal.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    grok: Vec<CommandSummary>,
 }
 
 /// GET /api/library/builtin-commands - Get builtin slash commands for each backend.
@@ -1126,10 +1131,28 @@ fn build_builtin_commands() -> BuiltinCommandsResponse {
         }],
     }];
 
+    // Grok builtin commands. Grok has no native goal mode; sandboxed.sh
+    // drives the loop via an AgentFinished automation that parses sentinel
+    // markers from each turn's output. See `src/api/grok_goal.rs`.
+    let grok_commands = vec![CommandSummary {
+        name: "goal".to_string(),
+        description: Some(
+            "Loop until the objective is achieved (sandboxed.sh-driven; works with any grok model)"
+                .to_string(),
+        ),
+        path: "builtin-grok".to_string(),
+        params: vec![CommandParam {
+            name: "objective".to_string(),
+            required: true,
+            description: Some("What the agent should keep iterating on until done".to_string()),
+        }],
+    }];
+
     BuiltinCommandsResponse {
         opencode: opencode_commands,
         claudecode: claudecode_commands,
         codex: codex_commands,
+        grok: grok_commands,
     }
 }
 
