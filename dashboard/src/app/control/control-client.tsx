@@ -5074,6 +5074,21 @@ export default function ControlClient() {
       const liveTail = prev.slice(oldHistoricCount);
       return [...newHistoricItems, ...liveTail];
     });
+
+    // Re-derive `hasMore` now that the deferred trace has merged in.
+    // `seedPaginationStateAfterInitialLoad` ran with only transcript
+    // messages in `missionHistoricEventsRef`, so its comparison against
+    // the all-event-types `totalEvents` was always under-counted and
+    // pinned `hasMore` to true. With the trace merged the counts match,
+    // and short missions correctly hide the "Load older messages" button.
+    // We don't touch state if the user is already paginating (loading=true)
+    // or has switched missions — both are handled by the existing
+    // missionId-tagged read selector elsewhere.
+    setOlderLoadState((prev) =>
+      prev.missionId === id && !prev.loading
+        ? { ...prev, hasMore: computeHasMoreOlder(id) }
+        : prev
+    );
   };
 
   /**
