@@ -278,10 +278,12 @@ fn is_terminal_mission_status(status: &MissionStatus) -> bool {
     matches!(
         status,
         MissionStatus::Completed
+            | MissionStatus::Acknowledged
             | MissionStatus::Failed
             | MissionStatus::Interrupted
             | MissionStatus::Blocked
             | MissionStatus::NotFeasible
+            | MissionStatus::AwaitingUser
     )
 }
 
@@ -3018,6 +3020,12 @@ pub enum MissionStatus {
     /// Mission created but hasn't received any messages yet
     Pending,
     Active,
+    /// Agent's turn / automation cycle finished cleanly with no follow-up
+    /// queued; mission is parked waiting for the user to read it.
+    AwaitingUser,
+    /// User opened the mission while it was AwaitingUser and the ack grace
+    /// period elapsed without a new message — mission is auto-archived.
+    Acknowledged,
     Completed,
     Failed,
     /// Mission was interrupted (server shutdown, cancellation, etc.)
@@ -3033,6 +3041,8 @@ impl std::fmt::Display for MissionStatus {
         match self {
             Self::Pending => write!(f, "pending"),
             Self::Active => write!(f, "active"),
+            Self::AwaitingUser => write!(f, "awaiting_user"),
+            Self::Acknowledged => write!(f, "acknowledged"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
             Self::Blocked => write!(f, "blocked"),
@@ -4624,6 +4634,227 @@ pub async fn get_mission_events(
         }
     }
     // CORS exposure so browsers can read these headers from JS.
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        header::HeaderValue::from_static("X-Total-Events, X-Max-Sequence"),
+    );
+
+    Ok(response)
+}
+
+const TRANSCRIPT_EVENT_TYPES: &[&str] = &["user_message", "assistant_message"];
+const TRACE_EVENT_TYPES: &[&str] = &[
+    "thinking",
+    "tool_call",
+    "tool_result",
+    "text_delta",
+    "error",
+    "phase",
+    "status",
+];
+
+fn event_visibility(event_type: &str) -> &'static str {
+    match event_type {
+        "user_message" | "assistant_message" => "transcript",
+        "thinking" | "tool_call" | "tool_result" | "text_delta" | "phase" | "status" => "trace",
+        _ => "debug",
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TranscriptMessage {
+    #[serde(flatten)]
+    pub event: mission_store::StoredEvent,
+    /// Count of non-transcript events after the previous transcript row and
+    /// before this row. Lets clients reserve a Thinking/Activity affordance
+    /// without downloading the trace on the first mission paint.
+    pub trace_count: usize,
+    pub trace_summary: HashMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MissionTranscriptResponse {
+    pub mission: Mission,
+    pub messages: Vec<TranscriptMessage>,
+    pub event_counts: HashMap<String, usize>,
+    pub visibility_counts: HashMap<String, usize>,
+    pub latest_sequence: i64,
+}
+
+async fn event_count_map(
+    store: &(dyn MissionStore + Send + Sync),
+    mission_id: Uuid,
+    event_types: &[&str],
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for event_type in event_types {
+        if let Ok(count) = store.count_events(mission_id, Some(&[*event_type])).await {
+            counts.insert((*event_type).to_string(), count);
+        }
+    }
+    counts
+}
+
+fn trace_summary_between(
+    trace_events: &[mission_store::StoredEvent],
+    after_sequence: i64,
+    before_sequence: i64,
+) -> HashMap<String, usize> {
+    let mut summary = HashMap::new();
+    for event in trace_events {
+        if event.sequence > after_sequence && event.sequence < before_sequence {
+            *summary.entry(event.event_type.clone()).or_insert(0) += 1;
+        }
+    }
+    summary
+}
+
+/// Lightweight initial mission payload: final chat transcript only, plus event
+/// counts/cursors so clients can fetch the hidden activity trace afterward.
+pub async fn get_mission_transcript(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+) -> Result<Json<MissionTranscriptResponse>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mut mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "Mission not found".to_string()))?;
+
+    if let Some(workspace) = state.workspaces.get(mission.workspace_id).await {
+        mission.workspace_name = Some(workspace.name);
+    }
+
+    let transcript_events = control
+        .mission_store
+        .get_events(mission_id, Some(TRANSCRIPT_EVENT_TYPES), None, None)
+        .await
+        .map_err(internal_error)?;
+    let trace_events = control
+        .mission_store
+        .get_events(mission_id, Some(TRACE_EVENT_TYPES), None, None)
+        .await
+        .map_err(internal_error)?;
+    let latest_sequence = control
+        .mission_store
+        .max_event_sequence(mission_id)
+        .await
+        .map_err(internal_error)?;
+
+    let mut previous_transcript_sequence = 0;
+    let mut messages = Vec::with_capacity(transcript_events.len());
+    for event in transcript_events {
+        let trace_summary =
+            trace_summary_between(&trace_events, previous_transcript_sequence, event.sequence);
+        let trace_count = trace_summary.values().sum();
+        previous_transcript_sequence = event.sequence;
+        messages.push(TranscriptMessage {
+            event,
+            trace_count,
+            trace_summary,
+        });
+    }
+
+    let mut known_types = Vec::new();
+    known_types.extend_from_slice(TRANSCRIPT_EVENT_TYPES);
+    known_types.extend_from_slice(TRACE_EVENT_TYPES);
+    let event_counts = event_count_map(&*control.mission_store, mission_id, &known_types).await;
+
+    let mut visibility_counts: HashMap<String, usize> = HashMap::new();
+    for (event_type, count) in &event_counts {
+        *visibility_counts
+            .entry(event_visibility(event_type).to_string())
+            .or_insert(0) += *count;
+    }
+
+    Ok(Json(MissionTranscriptResponse {
+        mission,
+        messages,
+        event_counts,
+        visibility_counts,
+        latest_sequence,
+    }))
+}
+
+/// Deferred intermediate activity for a mission. This returns thoughts, tool
+/// calls/results, text deltas, and runtime/status events while keeping the
+/// first transcript request small.
+pub async fn get_mission_trace(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<GetEventsQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?;
+    if mission.is_none() {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    }
+
+    let events = if let Some(before_seq) = query.before_seq {
+        control
+            .mission_store
+            .get_events_before(mission_id, before_seq, Some(TRACE_EVENT_TYPES), query.limit)
+            .await
+            .map_err(internal_error)?
+    } else if let Some(since_seq) = query.since_seq {
+        control
+            .mission_store
+            .get_events_since(mission_id, since_seq, Some(TRACE_EVENT_TYPES), query.limit)
+            .await
+            .map_err(internal_error)?
+    } else {
+        let offset = if query.latest.unwrap_or(false) {
+            if let Some(limit) = query.limit {
+                let total = control
+                    .mission_store
+                    .count_events(mission_id, Some(TRACE_EVENT_TYPES))
+                    .await
+                    .map_err(internal_error)?;
+                Some(total.saturating_sub(limit))
+            } else {
+                query.offset
+            }
+        } else {
+            query.offset
+        };
+        control
+            .mission_store
+            .get_events(mission_id, Some(TRACE_EVENT_TYPES), query.limit, offset)
+            .await
+            .map_err(internal_error)?
+    };
+
+    let total = control
+        .mission_store
+        .count_events(mission_id, Some(TRACE_EVENT_TYPES))
+        .await
+        .ok();
+    let max_seq = control
+        .mission_store
+        .max_event_sequence(mission_id)
+        .await
+        .ok();
+
+    let mut response = Json(events).into_response();
+    let headers = response.headers_mut();
+    if let Some(total) = total {
+        if let Ok(v) = header::HeaderValue::from_str(&total.to_string()) {
+            headers.insert("X-Total-Events", v);
+        }
+    }
+    if let Some(max_seq) = max_seq {
+        if let Ok(v) = header::HeaderValue::from_str(&max_seq.to_string()) {
+            headers.insert("X-Max-Sequence", v);
+        }
+    }
     headers.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         header::HeaderValue::from_static("X-Total-Events, X-Max-Sequence"),
@@ -6256,7 +6487,13 @@ fn mission_status_for_terminal_reason(
 ) -> Option<(MissionStatus, &'static str)> {
     match reason {
         TerminalReason::TurnComplete if complete_turn_without_follow_up => {
-            Some((MissionStatus::Completed, "completed"))
+            // Agent finished its turn cleanly and there is no queued follow-up
+            // message or scheduled wakeup — the mission is parked waiting for
+            // the user to read it. The dashboard / iOS clients surface this in
+            // the "Needs You" column. An explicit `TerminalReason::Completed`
+            // (the path below) is used when the agent declares the work fully
+            // done, not just a turn boundary.
+            Some((MissionStatus::AwaitingUser, "turn_complete"))
         }
         TerminalReason::TurnComplete => None,
         TerminalReason::Completed => Some((MissionStatus::Completed, "completed")),
@@ -7183,6 +7420,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating parallel mission {} (was {})",
@@ -7292,6 +7531,8 @@ async fn control_actor_loop(
                                                 | MissionStatus::Blocked
                                                 | MissionStatus::Completed
                                                 | MissionStatus::Failed
+                                                | MissionStatus::AwaitingUser
+                                                | MissionStatus::Acknowledged
                                         ) {
                                             tracing::info!(
                                                 "Activating main mission {} (was {})",
@@ -7338,6 +7579,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating switched mission {} (was {})",
@@ -7379,6 +7622,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating reloaded mission {} (was {})",
@@ -7477,6 +7722,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating mission {} (was {})",
@@ -15600,6 +15847,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -15630,6 +15878,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let strong_score = mission_search_relevance_score(
@@ -15675,6 +15924,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15717,6 +15967,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15759,6 +16010,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15801,6 +16053,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15927,6 +16180,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {

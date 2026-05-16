@@ -97,6 +97,12 @@ pub struct Mission {
     /// stays current.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal_objective: Option<String>,
+    /// When the user first opened this mission *since it last entered
+    /// AwaitingUser*. Drives the 1-hour ack grace timer and the "opened"
+    /// dot on Finished missions. Cleared when the mission goes back to
+    /// Active via a new user message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_viewed_at: Option<String>,
 }
 
 fn default_backend() -> String {

@@ -425,7 +425,8 @@ CREATE TABLE IF NOT EXISTS missions (
     interrupted_at TEXT,
     resumable INTEGER NOT NULL DEFAULT 0,
     desktop_sessions TEXT,
-    terminal_reason TEXT
+    terminal_reason TEXT,
+    first_viewed_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
@@ -1728,6 +1729,20 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add goal_objective column: {}", e))?;
         }
 
+        // first_viewed_at: timestamp of the user's first open of the mission
+        // since it last entered AwaitingUser. Drives the ack grace timer and
+        // the "opened" dot on Finished missions.
+        let has_first_viewed_at_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'first_viewed_at'")
+            .map_err(|e| format!("Failed to check for first_viewed_at column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_first_viewed_at_column {
+            tracing::info!("Running migration: adding 'first_viewed_at' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN first_viewed_at TEXT", [])
+                .map_err(|e| format!("Failed to add first_viewed_at column: {}", e))?;
+        }
+
         Ok(())
     }
 
@@ -1962,6 +1977,8 @@ fn parse_status(s: &str) -> MissionStatus {
     match s {
         "pending" => MissionStatus::Pending,
         "active" => MissionStatus::Active,
+        "awaiting_user" => MissionStatus::AwaitingUser,
+        "acknowledged" => MissionStatus::Acknowledged,
         "completed" => MissionStatus::Completed,
         "failed" => MissionStatus::Failed,
         "interrupted" => MissionStatus::Interrupted,
@@ -1975,6 +1992,8 @@ fn status_to_string(status: MissionStatus) -> &'static str {
     match status {
         MissionStatus::Pending => "pending",
         MissionStatus::Active => "active",
+        MissionStatus::AwaitingUser => "awaiting_user",
+        MissionStatus::Acknowledged => "acknowledged",
         MissionStatus::Completed => "completed",
         MissionStatus::Failed => "failed",
         MissionStatus::Interrupted => "interrupted",
@@ -2001,7 +2020,7 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode,
-                            COALESCE(goal_mode, 0) as goal_mode, goal_objective
+                            COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2053,6 +2072,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
+                            first_viewed_at: row.get(27).ok().flatten(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2080,7 +2100,7 @@ impl MissionStore for SqliteMissionStore {
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
-                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective FROM missions WHERE id = ?1",
+                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -2129,6 +2149,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
+                            first_viewed_at: row.get(27).ok().flatten(),
                     })
                 })
                 .optional()
@@ -2247,6 +2268,7 @@ impl MissionStore for SqliteMissionStore {
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let m = mission.clone();
@@ -2335,6 +2357,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                             goal_mode: row.get::<_, i32>(23).unwrap_or(0) != 0,
                             goal_objective: row.get(24).ok().flatten(),
+                            first_viewed_at: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2839,6 +2862,7 @@ impl MissionStore for SqliteMissionStore {
                         mission_mode: MissionMode::default(),
                         goal_mode: false,
                         goal_objective: None,
+                        first_viewed_at: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2912,6 +2936,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         goal_mode: row.get::<_, i32>(14).unwrap_or(0) != 0,
                         goal_objective: row.get(15).ok().flatten(),
+                        first_viewed_at: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -4384,6 +4409,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         goal_mode: false,
                         goal_objective: None,
+                        first_viewed_at: None,
                     })
                 })
                 .map_err(|e| e.to_string())?

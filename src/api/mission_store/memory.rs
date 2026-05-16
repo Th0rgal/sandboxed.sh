@@ -100,6 +100,7 @@ impl MissionStore for InMemoryMissionStore {
             mission_mode: super::MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
         self.missions
             .write()
