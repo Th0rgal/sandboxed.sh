@@ -1689,7 +1689,19 @@ struct ControlView: View {
                     removeMissionFromCache(mission.id)
                     applyViewingMission(mission)
                 } else {
-                    hasMoreHistory = transcript.eventCounts.values.reduce(0, +) > events.count
+                    // Mirror the web client's transcript-meta fix: only
+                    // count event types the iOS app actually loads. The
+                    // backend's `event_counts` includes debug/status
+                    // events outside `historyEventTypes`; summing them
+                    // all inflates the total and keeps the "Load earlier
+                    // messages" affordance visible on missions that have
+                    // already shown every loadable event.
+                    let loadable = Set(historyEventTypes)
+                    let loadableTotal = transcript.eventCounts
+                        .filter { loadable.contains($0.key) }
+                        .values
+                        .reduce(0, +)
+                    hasMoreHistory = loadableTotal > events.count
                     applyViewingMissionWithEvents(mission, events: events)
                     if transcript.latestSequence > 0 {
                         missionMaxSeq[id] = transcript.latestSequence
