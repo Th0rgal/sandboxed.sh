@@ -4585,6 +4585,25 @@ private enum MissionQuickAction: Hashable {
 
 /// Sheet for switching between missions (like dashboard's Cmd+K)
 private struct MissionSwitcherSheet: View {
+    private enum MissionSwitcherItemType: Equatable {
+        case current
+        case running
+        case recent
+    }
+
+    private struct MissionSwitcherItem: Identifiable {
+        let type: MissionSwitcherItemType
+        let mission: Mission?
+        let runningInfo: RunningMissionInfo?
+        let id: String
+        let isWorkerOf: String?
+        let isBoss: Bool
+
+        var isRunning: Bool {
+            type == .running || runningInfo != nil
+        }
+    }
+
     let runningMissions: [RunningMissionInfo]
     let recentMissions: [Mission]
     let currentMissionId: String?
@@ -4626,121 +4645,183 @@ private struct MissionSwitcherSheet: View {
         )
     }
 
-    private var filteredRunning: [RunningMissionInfo] {
-        if normalizedSearchQuery.isEmpty {
-            return runningMissions
+    private var bossMissionWorkerIds: [String: [String]] {
+        var map: [String: [String]] = [:]
+        for mission in recentMissions {
+            guard let parentId = mission.parentMissionId, !parentId.isEmpty else { continue }
+            map[parentId, default: []].append(mission.id)
         }
-        return runningMissions
-            .compactMap { info -> (RunningMissionInfo, Double)? in
-                let score = runningMissionSearchScore(
-                    info,
-                    query: normalizedSearchQuery,
-                    linkedMission: missionById[info.missionId]
-                )
-                return score > 0 ? (info, score) : nil
-            }
-            .sorted { lhs, rhs in
-                if lhs.1 == rhs.1 {
-                    let lhsUpdated = missionById[lhs.0.missionId]?.updatedDate ?? .distantPast
-                    let rhsUpdated = missionById[rhs.0.missionId]?.updatedDate ?? .distantPast
-                    if lhsUpdated != rhsUpdated {
-                        return lhsUpdated > rhsUpdated
-                    }
-                    return lhs.0.missionId < rhs.0.missionId
+        return map.mapValues { workerIds in
+            workerIds.sorted { lhs, rhs in
+                let lhsUpdated = missionById[lhs]?.updatedDate ?? .distantPast
+                let rhsUpdated = missionById[rhs]?.updatedDate ?? .distantPast
+                if lhsUpdated != rhsUpdated {
+                    return lhsUpdated > rhsUpdated
                 }
-                return lhs.1 > rhs.1
+                return lhs < rhs
             }
-            .map(\.0)
+        }
     }
 
-    private var filteredRecent: [Mission] {
-        let nonRunning = recentMissions.filter { !runningMissionIds.contains($0.id) }
-        if normalizedSearchQuery.isEmpty {
-            return nonRunning
+    private var allItems: [MissionSwitcherItem] {
+        var items: [MissionSwitcherItem] = []
+        var addedIds = Set<String>()
+
+        func addRunningWithWorkers(_ runningInfo: RunningMissionInfo) {
+            guard !addedIds.contains(runningInfo.missionId) else { return }
+            addedIds.insert(runningInfo.missionId)
+
+            let mission = missionById[runningInfo.missionId]
+            let workerIds = bossMissionWorkerIds[runningInfo.missionId] ?? []
+            items.append(MissionSwitcherItem(
+                type: .running,
+                mission: mission,
+                runningInfo: runningInfo,
+                id: runningInfo.missionId,
+                isWorkerOf: nil,
+                isBoss: !workerIds.isEmpty
+            ))
+
+            for workerId in workerIds where !addedIds.contains(workerId) {
+                addedIds.insert(workerId)
+                let workerMission = missionById[workerId]
+                let workerRunningInfo = runningMissions.first { $0.missionId == workerId }
+                items.append(MissionSwitcherItem(
+                    type: workerRunningInfo == nil ? .recent : .running,
+                    mission: workerMission,
+                    runningInfo: workerRunningInfo,
+                    id: workerId,
+                    isWorkerOf: runningInfo.missionId,
+                    isBoss: false
+                ))
+            }
         }
 
-        let localMatches: [Mission] = nonRunning
-            .compactMap { mission -> (Mission, Double)? in
-                let score = missionSearchRelevanceScore(mission, query: normalizedSearchQuery)
-                return score > 0 ? (mission, score) : nil
-            }
-            .sorted { lhs, rhs in
-                if lhs.1 == rhs.1 {
-                    return (lhs.0.updatedDate ?? .distantPast) > (rhs.0.updatedDate ?? .distantPast)
-                }
-                return lhs.1 > rhs.1
-            }
-            .map(\.0)
+        if let currentMissionId,
+           !runningMissionIds.contains(currentMissionId),
+           let currentMission = missionById[currentMissionId] {
+            addedIds.insert(currentMissionId)
+            let workerIds = bossMissionWorkerIds[currentMissionId] ?? []
+            items.append(MissionSwitcherItem(
+                type: .current,
+                mission: currentMission,
+                runningInfo: nil,
+                id: currentMissionId,
+                isWorkerOf: nil,
+                isBoss: !workerIds.isEmpty
+            ))
+        }
 
+        let runningBosses = runningMissions.filter { bossMissionWorkerIds[$0.missionId] != nil }
+        let standaloneRunning = runningMissions.filter { info in
+            bossMissionWorkerIds[info.missionId] == nil
+                && missionById[info.missionId]?.parentMissionId == nil
+        }
+        let workerOnlyRunning = runningMissions.filter { info in
+            let mission = missionById[info.missionId]
+            return mission?.parentMissionId != nil && bossMissionWorkerIds[info.missionId] == nil
+        }
+
+        for runningInfo in runningBosses {
+            addRunningWithWorkers(runningInfo)
+        }
+        for runningInfo in standaloneRunning {
+            addRunningWithWorkers(runningInfo)
+        }
+        for runningInfo in workerOnlyRunning where !addedIds.contains(runningInfo.missionId) {
+            addedIds.insert(runningInfo.missionId)
+            let mission = missionById[runningInfo.missionId]
+            items.append(MissionSwitcherItem(
+                type: .running,
+                mission: mission,
+                runningInfo: runningInfo,
+                id: runningInfo.missionId,
+                isWorkerOf: mission?.parentMissionId,
+                isBoss: false
+            ))
+        }
+
+        for mission in recentMissions where !addedIds.contains(mission.id) {
+            addedIds.insert(mission.id)
+            items.append(MissionSwitcherItem(
+                type: .recent,
+                mission: mission,
+                runningInfo: nil,
+                id: mission.id,
+                isWorkerOf: nil,
+                isBoss: false
+            ))
+        }
+
+        return items
+    }
+
+    private var filteredItems: [MissionSwitcherItem] {
+        if normalizedSearchQuery.isEmpty {
+            return allItems
+        }
+
+        var backendResultById: [String: Mission] = [:]
         if backendSearchQuery == normalizedSearchQuery {
-            let byId = Dictionary(
-                nonRunning.map { ($0.id, $0) },
+            backendResultById = Dictionary(
+                backendSearchResults.map { ($0.mission.id, $0.mission) },
                 uniquingKeysWith: preferredMissionForDuplicateId
             )
-            var merged: [Mission] = []
-            var seen = Set<String>()
-
-            for result in backendSearchResults {
-                let mission = byId[result.mission.id] ?? result.mission
-                guard !runningMissionIds.contains(mission.id) else { continue }
-                if seen.insert(mission.id).inserted {
-                    merged.append(mission)
-                }
-            }
-
-            for mission in localMatches {
-                if seen.insert(mission.id).inserted {
-                    merged.append(mission)
-                }
-            }
-
-            return merged
         }
 
-        return localMatches
-    }
+        var scoredItems = allItems.compactMap { item -> (MissionSwitcherItem, Double)? in
+            if let mission = item.mission {
+                let backendMission = backendResultById[mission.id]
+                let score = max(
+                    missionSearchRelevanceScore(mission, query: normalizedSearchQuery),
+                    backendMission.map { missionSearchRelevanceScore($0, query: normalizedSearchQuery) } ?? 0
+                )
+                return score > 0 ? (item, score) : nil
+            }
+            if let runningInfo = item.runningInfo {
+                let score = runningMissionSearchScore(
+                    runningInfo,
+                    query: normalizedSearchQuery,
+                    linkedMission: missionById[runningInfo.missionId]
+                )
+                return (item, max(score, 0.01))
+            }
+            return nil
+        }
 
-    private var activeOrPendingMissions: [Mission] {
-        filteredRecent.filter { $0.status == .active || $0.status == .pending }
-    }
-
-    private var completedMissions: [Mission] {
-        filteredRecent.filter { $0.status == .completed }
-    }
-
-    private var failedMissions: [Mission] {
-        filteredRecent.filter { $0.status == .failed || $0.status == .notFeasible }
-    }
-
-    private var interruptedMissions: [Mission] {
-        filteredRecent.filter { $0.status == .interrupted || $0.status == .blocked || $0.status == .unknown }
-    }
-
-    @ViewBuilder
-    private func missionSection(_ title: String, missions: [Mission]) -> some View {
-        if !missions.isEmpty {
-            Section(title) {
-                ForEach(missions) { mission in
-                    MissionRow(
-                        missionId: mission.id,
-                        displayName: missionDisplayName(for: mission),
-                        title: mission.displayTitle,
-                        shortDescription: missionCardDescription(for: mission),
-                        backend: mission.backend,
-                        status: mission.status,
-                        isRunning: false,
-                        runningState: nil,
-                        isViewing: viewingMissionId == mission.id,
-                        quickActions: missionQuickActions(for: mission),
-                        onSelect: { onSelectMission(mission.id) },
-                        onQuickAction: { action in
-                            handleQuickAction(action, for: mission)
-                        },
-                        onCancel: nil
-                    )
-                }
+        if backendSearchQuery == normalizedSearchQuery {
+            let existingIds = Set(allItems.map(\.id))
+            for result in backendSearchResults where !existingIds.contains(result.mission.id) {
+                let mission = result.mission
+                let score = missionSearchRelevanceScore(mission, query: normalizedSearchQuery)
+                guard score > 0 else { continue }
+                scoredItems.append((
+                    MissionSwitcherItem(
+                        type: .recent,
+                        mission: mission,
+                        runningInfo: nil,
+                        id: mission.id,
+                        isWorkerOf: mission.parentMissionId,
+                        isBoss: bossMissionWorkerIds[mission.id]?.isEmpty == false
+                    ),
+                    score
+                ))
             }
         }
+
+        return scoredItems
+            .sorted { lhs, rhs in
+                if lhs.1 != rhs.1 {
+                    return lhs.1 > rhs.1
+                }
+                let lhsUpdated = lhs.0.mission?.updatedDate ?? .distantPast
+                let rhsUpdated = rhs.0.mission?.updatedDate ?? .distantPast
+                if lhsUpdated != rhsUpdated {
+                    return lhsUpdated > rhsUpdated
+                }
+                return lhs.0.id < rhs.0.id
+            }
+            .map(\.0)
     }
 
     var body: some View {
@@ -4756,40 +4837,35 @@ private struct MissionSwitcherSheet: View {
                     }
                 }
 
-                // Running missions
-                if !filteredRunning.isEmpty {
-                    Section("Running") {
-                        ForEach(filteredRunning, id: \.missionId) { info in
-                            let mission = missionById[info.missionId]
-                            MissionRow(
-                                missionId: info.missionId,
-                                displayName: mission.map { missionDisplayName(for: $0) },
-                                title: mission?.displayTitle ?? info.title,
-                                shortDescription: mission.flatMap { missionCardDescription(for: $0) },
-                                backend: mission?.backend,
-                                status: .active,
-                                isRunning: true,
-                                runningState: info.state,
-                                isViewing: viewingMissionId == info.missionId,
-                                quickActions: [.followUp],
-                                onSelect: { onSelectMission(info.missionId) },
-                                onQuickAction: { action in
-                                    handleRunningQuickAction(
-                                        action,
-                                        missionId: info.missionId,
-                                        mission: mission
-                                    )
-                                },
-                                onCancel: { onCancelMission(info.missionId) }
-                            )
+                ForEach(Array(filteredItems.enumerated()), id: \.element.id) { index, item in
+                    let isSearching = !normalizedSearchQuery.isEmpty
+                    let previousItem = index > 0 ? filteredItems[index - 1] : nil
+                    let showCurrentHeader = !isSearching && item.type == .current && item.isWorkerOf == nil
+                    let showRunningHeader = !isSearching
+                        && item.type == .running
+                        && item.isWorkerOf == nil
+                        && previousItem?.type != .running
+                    let showRecentHeader = !isSearching
+                        && item.type == .recent
+                        && item.isWorkerOf == nil
+                        && previousItem?.type != .recent
+
+                    if showCurrentHeader {
+                        Section("Current") {
+                            missionRow(for: item)
                         }
+                    } else if showRunningHeader {
+                        Section("Running") {
+                            missionRow(for: item)
+                        }
+                    } else if showRecentHeader {
+                        Section("Recent") {
+                            missionRow(for: item)
+                        }
+                    } else {
+                        missionRow(for: item)
                     }
                 }
-
-                missionSection("Active & Pending", missions: activeOrPendingMissions)
-                missionSection("Completed", missions: completedMissions)
-                missionSection("Failed", missions: failedMissions)
-                missionSection("Interrupted", missions: interruptedMissions)
 
                 if isBackendSearchLoading && !normalizedSearchQuery.isEmpty {
                     Section {
@@ -4803,7 +4879,7 @@ private struct MissionSwitcherSheet: View {
                     }
                 }
 
-                if filteredRunning.isEmpty && filteredRecent.isEmpty && !normalizedSearchQuery.isEmpty {
+                if filteredItems.isEmpty && !normalizedSearchQuery.isEmpty {
                     ContentUnavailableView(
                         "No Missions Found",
                         systemImage: "magnifyingglass",
@@ -4830,6 +4906,43 @@ private struct MissionSwitcherSheet: View {
                 }
             }
         }
+    }
+
+    private func missionRow(for item: MissionSwitcherItem) -> some View {
+        let mission = item.mission
+        let runningInfo = item.runningInfo
+        let isRunning = item.isRunning
+        let cardTitle = mission.flatMap { missionCardTitle(for: $0) }
+        let cardDescription = mission.flatMap { missionCardDescription(for: $0, cardTitle: cardTitle) }
+
+        return MissionRow(
+            missionId: item.id,
+            displayName: mission.flatMap { missionWorkspaceLabel(for: $0) },
+            title: mission.map { missionDisplayName(for: $0) } ?? runningInfo?.title ?? missionShortName(for: item.id),
+            shortDescription: cardTitle ?? cardDescription,
+            backend: mission?.backend,
+            status: mission?.status ?? .active,
+            isRunning: isRunning,
+            runningState: runningInfo?.state,
+            currentActivity: runningInfo?.currentActivity,
+            isViewing: viewingMissionId == item.id,
+            isBoss: item.isBoss,
+            isWorker: item.isWorkerOf != nil || (!item.isBoss && mission?.parentMissionId != nil),
+            quickActions: mission.map { missionQuickActions(for: $0, isRunning: isRunning) } ?? (isRunning ? [.followUp] : []),
+            onSelect: { onSelectMission(item.id) },
+            onQuickAction: { action in
+                if isRunning {
+                    handleRunningQuickAction(
+                        action,
+                        missionId: item.id,
+                        mission: mission
+                    )
+                } else if let mission {
+                    handleQuickAction(action, for: mission)
+                }
+            },
+            onCancel: isRunning ? { onCancelMission(item.id) } : nil
+        )
     }
 
     private func scheduleBackendSearch(for rawQuery: String) {
@@ -4946,12 +5059,55 @@ private struct MissionSwitcherSheet: View {
         return workspaceName
     }
 
-    private func missionDisplayName(for mission: Mission) -> String {
-        let shortId = String(mission.id.prefix(8)).uppercased()
-        if let workspaceLabel = missionWorkspaceLabel(for: mission) {
-            return "\(workspaceLabel) · \(shortId)"
+    private let missionShortNameWords: [String] = [
+        "Ape", "Bat", "Bear", "Bee", "Boar", "Bison", "Bull", "Cat",
+        "Cod", "Crab", "Crow", "Deer", "Dodo", "Dove", "Duck", "Eel",
+        "Elk", "Emu", "Fawn", "Finch", "Foal", "Fox", "Frog", "Goat",
+        "Gull", "Hare", "Hawk", "Heron", "Ibis", "Jackal", "Koala", "Lark",
+        "Lynx", "Manta", "Mink", "Mole", "Moose", "Moth", "Mule", "Newt",
+        "Orca", "Otter", "Owl", "Panda", "Pika", "Pony", "Puma", "Raven",
+        "Seal", "Shark", "Shrew", "Skunk", "Snail", "Snake", "Stag", "Swan",
+        "Tern", "Tiger", "Toad", "Trout", "Viper", "Wren", "Yak", "Zebra",
+    ]
+
+    private func missionShortName(for missionId: String) -> String {
+        var hash: UInt32 = 2_166_136_261
+        for byte in missionId.utf8 {
+            hash ^= UInt32(byte)
+            hash = hash &* 16_777_619
         }
-        return shortId
+        return missionShortNameWords[Int(hash % UInt32(missionShortNameWords.count))]
+    }
+
+    private func missionDisplayName(for mission: Mission) -> String {
+        if let title = mission.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !title.isEmpty {
+            return title.count > 70 ? String(title.prefix(70)) + "..." : title
+        }
+        return missionShortName(for: mission.id)
+    }
+
+    private func firstUserMissionTitle(for mission: Mission, maxLength: Int = 80) -> String? {
+        guard let content = mission.history.first(where: { $0.role == "user" })?.content
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !content.isEmpty else {
+            return nil
+        }
+        return content.count > maxLength ? String(content.prefix(maxLength)) + "..." : content
+    }
+
+    private func missionCardTitle(for mission: Mission) -> String? {
+        if let title = mission.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !title.isEmpty {
+            guard let shortDescription = mission.shortDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !shortDescription.isEmpty else {
+                return nil
+            }
+            return hasMeaningfulExtraTokens(baseText: title, candidateText: shortDescription)
+                ? shortDescription
+                : nil
+        }
+        return firstUserMissionTitle(for: mission)
     }
 
     private func hasMeaningfulExtraTokens(baseText: String, candidateText: String) -> Bool {
@@ -4965,13 +5121,18 @@ private struct MissionSwitcherSheet: View {
         return candidateTokens.contains(where: { !baseTokens.contains($0) })
     }
 
-    private func missionCardDescription(for mission: Mission) -> String? {
+    private func missionCardDescription(for mission: Mission, cardTitle: String?) -> String? {
+        if let title = mission.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !title.isEmpty {
+            return nil
+        }
         guard let shortDescription = mission.shortDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
               !shortDescription.isEmpty else {
             return nil
         }
-        let title = mission.displayTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !title.isEmpty && !hasMeaningfulExtraTokens(baseText: title, candidateText: shortDescription) {
+        if let cardTitle = cardTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !cardTitle.isEmpty,
+           !hasMeaningfulExtraTokens(baseText: cardTitle, candidateText: shortDescription) {
             return nil
         }
         return shortDescription.count > 100 ? String(shortDescription.prefix(100)) + "..." : shortDescription
@@ -5071,11 +5232,12 @@ private struct MissionSwitcherSheet: View {
             : queryTerms.phraseQueries
 
         let displayName = missionDisplayName(for: mission)
-        let title = mission.displayTitle
+        let title = missionCardTitle(for: mission) ?? ""
         let shortDescription = mission.shortDescription ?? ""
         let backend = mission.backend ?? ""
         let status = mission.status.displayLabel
-        let combined = "\(displayName) \(mission.id) \(title) \(shortDescription) \(backend) \(status)"
+        let shortName = missionShortName(for: mission.id)
+        let combined = "\(displayName) \(shortName) \(mission.id) \(title) \(shortDescription) \(backend) \(status)"
         let normalizedCombined = normalizeMetadataText(combined)
         if normalizedCombined.isEmpty { return 0 }
 
@@ -5129,7 +5291,8 @@ private struct MissionSwitcherSheet: View {
             : queryTerms.phraseQueries
 
         let title = mission.title ?? ""
-        let combined = "\(mission.missionId) \(title) \(mission.state)"
+        let shortName = missionShortName(for: mission.missionId)
+        let combined = "\(mission.missionId) \(shortName) \(title) \(mission.state)"
         let candidateTokens = tokenSet(from: combined)
         if candidateTokens.isEmpty { return 0 }
 
@@ -5223,7 +5386,10 @@ private struct MissionRow: View {
     let status: MissionStatus
     let isRunning: Bool
     let runningState: String?
+    let currentActivity: String?
     let isViewing: Bool
+    let isBoss: Bool
+    let isWorker: Bool
     let quickActions: [MissionQuickAction]
     let onSelect: () -> Void
     let onQuickAction: ((MissionQuickAction) -> Void)?
@@ -5268,12 +5434,9 @@ private struct MissionRow: View {
         }
     }
 
-    /// Whether the supplied `displayName` is just the uppercased short id.
-    /// `missionDisplayName(for:)` always returns at least the uppercased
-    /// 8-char short id (with an optional `"<workspace> · "` prefix), so we
-    /// can't detect the bare-id case by checking for nil/empty — we have to
-    /// compare against the actual short id. When it matches we suppress the
-    /// secondary line: the title above already carries the meaning.
+    /// Whether the supplied `displayName` is just the raw short id. Mission
+    /// rows pass workspace labels here when available, and suppress this line
+    /// when there is no meaningful secondary label.
     private var displayLabelIsShortId: Bool {
         guard let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmed.isEmpty
@@ -5329,6 +5492,7 @@ private struct MissionRow: View {
                     .foregroundStyle(statusColor)
                     .symbolEffect(.pulse, options: (isRunning && runningState == "running") ? .repeating : .nonRepeating)
                     .frame(width: 24, height: 24)
+                    .padding(.leading, isWorker ? 14 : 0)
 
                 VStack(alignment: .leading, spacing: 2) {
                     // Title (or short id when there is no title) is the primary
@@ -5343,6 +5507,24 @@ private struct MissionRow: View {
                             Image(systemName: "checkmark.circle.fill")
                                 .font(.caption)
                                 .foregroundStyle(Theme.accent)
+                        }
+
+                        if isBoss {
+                            Text("Boss")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(Color.purple)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(Color.purple.opacity(0.12))
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                        } else if isWorker {
+                            Text("Worker")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(Color.cyan)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(Color.cyan.opacity(0.12))
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
                     }
 
@@ -5361,6 +5543,16 @@ private struct MissionRow: View {
                     if let secondaryMetadataLine {
                         Text(secondaryMetadataLine)
                             .font(.caption2)
+                            .foregroundStyle(Theme.textMuted)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+
+                    if isRunning,
+                       let currentActivity = currentActivity?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !currentActivity.isEmpty {
+                        Text(currentActivity)
+                            .font(.caption2.italic())
                             .foregroundStyle(Theme.textMuted)
                             .lineLimit(1)
                             .truncationMode(.tail)
