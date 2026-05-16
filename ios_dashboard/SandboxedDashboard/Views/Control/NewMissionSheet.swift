@@ -15,7 +15,7 @@ struct NewMissionSheet: View {
     
     // Backend and agent selection
     @State private var backends: [Backend] = Backend.defaults
-    @State private var enabledBackendIds: Set<String> = ["opencode", "claudecode", "amp"]
+    @State private var enabledBackendIds: Set<String> = ["opencode", "claudecode", "amp", "codex", "gemini", "grok"]
     @State private var backendAgents: [String: [BackendAgent]] = [:]
     @State private var selectedAgentValue: String = ""
     
@@ -435,6 +435,10 @@ struct NewMissionSheet: View {
             // Only show Google models for Gemini
             return providers.filter { $0.id == "google" }
         }
+        if backend == "grok" {
+            // Only show xAI models for Grok Build
+            return providers.filter { $0.id == "xai" }
+        }
         return providers
     }
     
@@ -444,7 +448,14 @@ struct NewMissionSheet: View {
         isLoading = true
         defer { isLoading = false }
 
-        let data = await BackendAgentService.loadBackendsAndAgents()
+        // Fetch backends/agents and providers concurrently. Previously these
+        // ran serially even though they share no state — the providers fetch
+        // is what's gating the model picker, so users on a slow link saw the
+        // form half-populated. (UX audit item #15.)
+        async let backendDataTask = BackendAgentService.loadBackendsAndAgents()
+        async let providersTask: ProvidersResponse? = try? api.listProviders()
+
+        let data = await backendDataTask
         backends = data.backends
         enabledBackendIds = data.enabledBackendIds
         backendAgents = data.backendAgents
@@ -461,7 +472,7 @@ struct NewMissionSheet: View {
                     selectedAgentValue = savedDefault
                 }
             }
-            
+
             // Fall back to Sisyphus or first available
             if selectedAgentValue.isEmpty {
                 if let sisyphus = backendAgents["opencode"]?.first(where: { $0.name == "Sisyphus" }) {
@@ -472,14 +483,8 @@ struct NewMissionSheet: View {
                 }
             }
         }
-        
-        // Load providers
-        do {
-            let response = try await api.listProviders()
-            providers = response.providers
-        } catch {
-            providers = []
-        }
+
+        providers = (await providersTask)?.providers ?? []
     }
 }
 

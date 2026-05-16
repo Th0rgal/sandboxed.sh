@@ -129,7 +129,17 @@ struct HistoryView: View {
                 // Content with floating cleanup button
                 ZStack(alignment: .bottomTrailing) {
                     if isLoading {
-                        LoadingView(message: "Loading history...")
+                        // Skeleton card scaffold — keeps the screen sized
+                        // while the list loads so we don't flash a centered
+                        // spinner. (UX audit item #29.)
+                        ScrollView {
+                            LazyVStack(spacing: 12) {
+                                ForEach(0..<6, id: \.self) { _ in
+                                    ShimmerCard()
+                                }
+                            }
+                            .padding()
+                        }
                     } else if let error = errorMessage {
                         EmptyStateView(
                             icon: "exclamationmark.triangle",
@@ -375,21 +385,11 @@ private struct MissionRow: View {
     let mission: Mission
     
     private var backendColor: Color {
-        switch mission.backend {
-        case "opencode": return Theme.success
-        case "claudecode": return Theme.accent
-        case "amp": return .orange
-        default: return Theme.accent
-        }
+        BackendAgentService.color(for: mission.backend)
     }
-    
+
     private var backendIcon: String {
-        switch mission.backend {
-        case "opencode": return "terminal"
-        case "claudecode": return "brain"
-        case "amp": return "bolt.fill"
-        default: return "target"
-        }
+        BackendAgentService.icon(for: mission.backend)
     }
     
     var body: some View {

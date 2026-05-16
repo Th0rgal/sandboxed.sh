@@ -1659,8 +1659,20 @@ struct ControlView: View {
         }
 
         do {
-            // Fetch mission metadata first (required)
-            let mission = try await api.getMission(id: id)
+            // Fan out metadata + events in parallel — they share only `id`,
+            // and the events fetch can be the bigger payload. Previously the
+            // events fetch waited for getMission to return, adding one
+            // mandatory RTT for nothing. (UX audit item #2.)
+            async let metadataTask = api.getMission(id: id)
+            async let eventsTask: MissionEventsResult? =
+                try? await api.getMissionEventsWithMeta(
+                    id: id,
+                    types: historyEventTypes,
+                    limit: Self.initialEventLimit,
+                    latest: true
+                )
+            let mission = try await metadataTask
+            let eventResult = await eventsTask
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -1671,17 +1683,8 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            // Try to fetch full event history (optional - fall back to basic history if it fails)
-            do {
-                // Fetch all relevant event types including thinking events (matching web dashboard behavior)
-                let result = try await api.getMissionEventsWithMeta(id: id, types: historyEventTypes, limit: Self.initialEventLimit, latest: true)
+            if let result = eventResult {
                 let events = result.events
-
-                // Race condition guard after the second await
-                guard fetchingMissionId == id else {
-                    return
-                }
-
                 if events.isEmpty {
                     // Clear stale cache when events are empty to prevent visual flashing
                     removeMissionFromCache(mission.id)
@@ -1695,18 +1698,13 @@ struct ControlView: View {
                     // Cache the mission with events for next time
                     cacheMissionWithEvents(mission, events: events)
                 }
-            } catch {
-                print("Failed to load mission events (falling back to basic history): \(error)")
-                guard fetchingMissionId == id else {
-                    return
-                }
-                // If we already displayed cached data, keep it and don't flash to basic view
-                // Only clear cache and fall back if we didn't have cached data to begin with
+            } else {
+                // Events fetch failed. If we already displayed cached data,
+                // keep it; otherwise fall back to the basic history view.
                 if !hasCache {
                     removeMissionFromCache(mission.id)
                     applyViewingMission(mission)
                 }
-                // Otherwise: keep the cached view displayed, don't cause a flash
             }
 
             isLoading = false
@@ -2251,9 +2249,11 @@ struct ControlView: View {
         HapticService.lightTap()
 
         // Generate temp ID and add message optimistically BEFORE the API call
-        // This ensures messages appear in send order, not response order
+        // This ensures messages appear in send order, not response order.
+        // The `isPending` flag dims the bubble and shows a tiny spinner so
+        // users on a slow network don't re-tap. (UX audit item #11.)
         let tempId = "temp-\(UUID().uuidString)"
-        let tempMessage = ChatMessage(id: tempId, type: .user, content: content)
+        let tempMessage = ChatMessage(id: tempId, type: .user, content: content, isPending: true)
         messages.append(tempMessage)
         recomputeGroupedItems()
         scrollToBottomTick += 1
@@ -2263,10 +2263,17 @@ struct ControlView: View {
                 let (messageId, queued) = try await api.sendMessage(content: content)
 
                 // Replace temp ID with server-assigned ID, preserving timestamp
-                // This allows SSE handler to correctly deduplicate
+                // This allows SSE handler to correctly deduplicate. Pending
+                // state is cleared so the bubble snaps back to full opacity.
                 if let index = messages.firstIndex(where: { $0.id == tempId }) {
                     let originalTimestamp = messages[index].timestamp
-                    messages[index] = ChatMessage(id: messageId, type: .user, content: content, timestamp: originalTimestamp)
+                    messages[index] = ChatMessage(
+                        id: messageId,
+                        type: .user,
+                        content: content,
+                        timestamp: originalTimestamp,
+                        isPending: false
+                    )
                 }
 
                 // Update queue count when message was queued
@@ -2486,7 +2493,21 @@ struct ControlView: View {
         // Clear stale workers from previous mission immediately
         childMissions = []
 
-        isLoading = true
+        // Cache-first render so mission switches don't blank the chat.
+        // `loadMission` has done this for a while; `switchToMission` (used by
+        // the mission switcher, running-mission chip, worker peek) used to
+        // skip the cache and show `LoadingView("Loading conversation…")`
+        // until both the metadata and the events round-trips returned —
+        // multi-second blank on a slow link even when the data was already
+        // on disk. (UX audit item #1.)
+        let hasCache: Bool
+        if let cached = loadCachedMissionData(id) {
+            applyViewingMissionWithEvents(cached.mission, events: cached.events)
+            hasCache = true
+        } else {
+            hasCache = false
+            isLoading = true
+        }
 
         // Determine the run state for this mission from runningMissions
         if let runningInfo = runningMissions.first(where: { $0.missionId == id }) {
@@ -2508,8 +2529,14 @@ struct ControlView: View {
         progress = nil
 
         do {
-            // Load the mission from API
-            let mission = try await api.getMission(id: id)
+            // Fan out metadata + events in parallel. They share only `id`, so
+            // the previous serial chain (getMission then
+            // getMissionEventsWithMeta) added one mandatory RTT for nothing.
+            // (UX audit item #2.)
+            async let metadataTask = api.getMission(id: id)
+            async let eventsTask: MissionEventsResult? = try? await api.getMissionEventsWithMeta(id: id, types: historyEventTypes)
+            let mission = try await metadataTask
+            let eventResult = await eventsTask
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -2521,19 +2548,16 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            // Fetch full event history to avoid partial history rendering.
-            // Use the meta variant so the `X-Max-Sequence` header seeds the
-            // delta-resume cursor — otherwise missions loaded via the switcher
-            // would always fall back to a full tail reload on reconnect.
-            if let result = try? await api.getMissionEventsWithMeta(id: id, types: historyEventTypes), !result.events.isEmpty {
-                guard fetchingMissionId == id else { return }
+            if let result = eventResult, !result.events.isEmpty {
                 applyViewingMissionWithEvents(mission, events: result.events)
                 if let maxSeq = result.maxSequence, maxSeq > 0 {
                     missionMaxSeq[id] = maxSeq
                 }
                 cacheMissionWithEvents(mission, events: result.events)
-            } else {
-                guard fetchingMissionId == id else { return }
+            } else if !hasCache {
+                // Only fall through to "no events" if we never rendered the
+                // cached transcript — otherwise an intermittent events
+                // failure would blow away a perfectly good cached view.
                 removeMissionFromCache(mission.id)
                 applyViewingMission(mission)
             }
@@ -3274,6 +3298,19 @@ private struct MessageBubble: View {
                             topTrailingRadius: 20
                         )
                     )
+                    // While the message is awaiting server ack, dim the bubble
+                    // and overlay a small spinner so the user has unambiguous
+                    // feedback that the send is in flight. (UX audit item #11.)
+                    .opacity(message.isPending ? 0.55 : 1)
+                    .overlay(alignment: .bottomTrailing) {
+                        if message.isPending {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(.white)
+                                .padding(6)
+                        }
+                    }
+                    .animation(.easeOut(duration: 0.15), value: message.isPending)
                     .contextMenu {
                         Button {
                             onCopy?()

@@ -322,7 +322,7 @@ struct ParallelConfig: Codable {
 
 // MARK: - Events
 
-struct StoredEvent: Codable, Identifiable {
+struct StoredEvent: Codable, Identifiable, Sendable {
     let id: Int64
     let missionId: String
     let sequence: Int64

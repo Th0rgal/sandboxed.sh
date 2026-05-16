@@ -48,6 +48,11 @@ enum BackendAgentService {
     }
 
     /// Actual network fetch (extracted from the previous loadBackendsAndAgents).
+    ///
+    /// Fans out the per-backend config and agent lookups via `withTaskGroup`
+    /// so a 5-backend install is one RTT-batch instead of five serial calls.
+    /// On a 200 ms RTT cellular link this shaved ~1.6 s off every "New
+    /// Mission" tap and every Settings open (UX audit item #3).
     private static func fetchBackendsAndAgents() async -> BackendAgentData {
         // Load backends
         let backends: [Backend]
@@ -57,34 +62,49 @@ enum BackendAgentService {
             backends = Backend.defaults
         }
 
-        // Load backend configs to check enabled status
-        var enabled = Set<String>()
-        for backend in backends {
-            do {
-                let config = try await api.getBackendConfig(backendId: backend.id)
-                if config.isEnabled {
-                    enabled.insert(backend.id)
+        // Parallel config fetch — one task per backend.
+        let configResults = await withTaskGroup(of: (String, Bool).self) { group in
+            for backend in backends {
+                group.addTask {
+                    if let config = try? await api.getBackendConfig(backendId: backend.id) {
+                        return (backend.id, config.isEnabled)
+                    }
+                    // Default to enabled if we can't fetch config (parity with
+                    // the previous serial implementation).
+                    return (backend.id, true)
                 }
-            } catch {
-                // Default to enabled if we can't fetch config
-                enabled.insert(backend.id)
             }
+            var out: [(String, Bool)] = []
+            for await pair in group { out.append(pair) }
+            return out
         }
+        let enabled = Set(configResults.filter(\.1).map(\.0))
 
-        // Load agents for each enabled backend
-        var backendAgents: [String: [BackendAgent]] = [:]
-        for backendId in enabled {
-            do {
-                let agents = try await api.listBackendAgents(backendId: backendId)
-                backendAgents[backendId] = agents
-            } catch {
-                // Use defaults for Amp if API fails
-                if backendId == "amp" {
-                    backendAgents[backendId] = [
-                        BackendAgent(id: "smart", name: "Smart Mode"),
-                        BackendAgent(id: "rush", name: "Rush Mode")
-                    ]
+        // Parallel agent fetch for each enabled backend.
+        let agentResults = await withTaskGroup(of: (String, [BackendAgent]?).self) { group in
+            for backendId in enabled {
+                group.addTask {
+                    if let agents = try? await api.listBackendAgents(backendId: backendId) {
+                        return (backendId, agents)
+                    }
+                    return (backendId, nil)
                 }
+            }
+            var out: [(String, [BackendAgent]?)] = []
+            for await pair in group { out.append(pair) }
+            return out
+        }
+        var backendAgents: [String: [BackendAgent]] = [:]
+        for (backendId, agents) in agentResults {
+            if let agents {
+                backendAgents[backendId] = agents
+            } else if backendId == "amp" {
+                // Preserve the legacy Amp fallback so the picker isn't empty
+                // when the agents endpoint flakes.
+                backendAgents[backendId] = [
+                    BackendAgent(id: "smart", name: "Smart Mode"),
+                    BackendAgent(id: "rush", name: "Rush Mode")
+                ]
             }
         }
 
@@ -101,6 +121,9 @@ enum BackendAgentService {
         case "opencode": return "terminal"
         case "claudecode": return "brain"
         case "amp": return "bolt.fill"
+        case "codex": return "chevron.left.forwardslash.chevron.right"
+        case "gemini": return "sparkles"
+        case "grok": return "xmark.circle"
         default: return "cpu"
         }
     }
@@ -111,6 +134,9 @@ enum BackendAgentService {
         case "opencode": return Theme.success
         case "claudecode": return Theme.accent
         case "amp": return .orange
+        case "codex": return .cyan
+        case "gemini": return .blue
+        case "grok": return Color(white: 0.85)
         default: return Theme.textSecondary
         }
     }

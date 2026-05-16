@@ -19,8 +19,16 @@ struct WorkspacesView: View {
             Theme.backgroundPrimary.ignoresSafeArea()
 
             if isLoading {
-                ProgressView()
-                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                // Skeleton cards instead of a bare ProgressView so the screen
+                // has structure while the API call completes. (UX audit #29.)
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        ForEach(0..<5, id: \.self) { _ in
+                            ShimmerCard()
+                        }
+                    }
+                    .padding()
+                }
             } else if let error = errorMessage {
                 VStack(spacing: 16) {
                     Image(systemName: "exclamationmark.triangle")

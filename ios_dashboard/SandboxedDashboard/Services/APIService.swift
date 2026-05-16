@@ -852,7 +852,10 @@ private struct DecodedBox<T>: @unchecked Sendable {
 /// Result of a `/missions/:id/events` fetch. `maxSequence` is the response's
 /// `X-Max-Sequence` header — `nil` if the backend doesn't advertise it (older
 /// versions). Callers must treat `nil` as "delta resume unsupported".
-struct MissionEventsResult {
+///
+/// `Sendable` so it can cross `async let` boundaries from the main actor —
+/// `StoredEvent` and `AnyCodable` are Sendable above.
+struct MissionEventsResult: Sendable {
     let events: [StoredEvent]
     let maxSequence: Int64?
 }

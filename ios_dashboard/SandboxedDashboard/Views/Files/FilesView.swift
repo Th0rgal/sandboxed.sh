@@ -29,6 +29,17 @@ struct FilesView: View {
     // Track workspace changes
     @State private var lastWorkspaceId: String?
 
+    /// In-memory cache of directory listings keyed by path. Used to render
+    /// the previous contents immediately on navigation (stale-while-revalidate)
+    /// so the file browser stops flashing to a full-screen spinner every time
+    /// the user taps into or out of a folder. The cache is per-workspace
+    /// (cleared when `selectedWorkspace` changes) and bounded — at ~50
+    /// entries it covers any realistic navigation pattern without bloating
+    /// memory. (UX audit item #5.)
+    @State private var pathCache: [String: [FileEntry]] = [:]
+    @State private var pathCacheOrder: [String] = []
+    private let pathCacheLimit = 50
+
     private let api = APIService.shared
     
     private var sortedEntries: [FileEntry] {
@@ -57,7 +68,18 @@ struct FilesView: View {
                 
                 // File list
                 if isLoading {
-                    LoadingView(message: "Loading files...")
+                    // Skeleton placeholders instead of a centered spinner so
+                    // the screen has shape while the listing is in flight.
+                    // (UX audit item #29.)
+                    ScrollView {
+                        LazyVStack(spacing: 8) {
+                            ForEach(0..<8, id: \.self) { _ in
+                                ShimmerCard()
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+                    }
                 } else if let error = errorMessage {
                     EmptyStateView(
                         icon: "exclamationmark.triangle",
@@ -224,9 +246,12 @@ struct FilesView: View {
             await loadDirectory()
         }
         .onChange(of: workspaceState.selectedWorkspace?.id) { _, newId in
-            // Handle workspace change from other tabs
+            // Handle workspace change from other tabs. Paths are
+            // workspace-scoped (host vs container), so wipe the cache to
+            // avoid showing a container directory while browsing the host.
             if newId != lastWorkspaceId {
                 lastWorkspaceId = newId
+                invalidatePathCache()
                 navigateTo(workspaceState.filesBasePath)
             }
         }
@@ -418,30 +443,70 @@ struct FilesView: View {
     private func loadDirectory() async {
         let pathToLoad = currentPath
         fetchingPath = pathToLoad
-        
-        isLoading = true
         errorMessage = nil
-        
+
+        // Stale-while-revalidate: if we have a cached listing for this path,
+        // render it instantly and only show the full-screen spinner when we
+        // have nothing to show. Refresh happens in the background regardless.
+        if let cached = pathCache[pathToLoad] {
+            entries = cached
+            isLoading = false
+            touchCacheKey(pathToLoad)
+        } else {
+            entries = []
+            isLoading = true
+        }
+
         do {
             let result = try await api.listDirectory(path: pathToLoad)
-            
+
             // Race condition guard: only update if this is still the path we want
             guard fetchingPath == pathToLoad else {
                 return // Navigation changed, discard this response
             }
-            
+
             entries = result
+            cachePath(pathToLoad, entries: result)
         } catch {
             // Race condition guard
             guard fetchingPath == pathToLoad else { return }
-            
-            errorMessage = error.localizedDescription
+
+            // Only surface the error when we have no cached fallback to show;
+            // otherwise the stale listing is better than an error screen.
+            if pathCache[pathToLoad] == nil {
+                errorMessage = error.localizedDescription
+            }
         }
-        
+
         // Only clear loading if this is still the current fetch
         if fetchingPath == pathToLoad {
             isLoading = false
         }
+    }
+
+    /// Insert/refresh a directory in the LRU cache.
+    private func cachePath(_ path: String, entries: [FileEntry]) {
+        pathCache[path] = entries
+        pathCacheOrder.removeAll { $0 == path }
+        pathCacheOrder.append(path)
+        while pathCacheOrder.count > pathCacheLimit {
+            let oldest = pathCacheOrder.removeFirst()
+            pathCache.removeValue(forKey: oldest)
+        }
+    }
+
+    /// Move a path to the back of the LRU order without re-inserting entries.
+    private func touchCacheKey(_ path: String) {
+        guard pathCache[path] != nil else { return }
+        pathCacheOrder.removeAll { $0 == path }
+        pathCacheOrder.append(path)
+    }
+
+    /// Clear the cache (e.g. when the workspace changes — paths between
+    /// workspaces are not interchangeable).
+    private func invalidatePathCache() {
+        pathCache.removeAll()
+        pathCacheOrder.removeAll()
     }
     
     private func navigateTo(_ path: String) {
@@ -461,14 +526,17 @@ struct FilesView: View {
     
     private func createFolder() async {
         guard !newFolderName.isEmpty else { return }
-        
-        let folderPath = currentPath.hasSuffix("/") 
-            ? currentPath + newFolderName 
+
+        let folderPath = currentPath.hasSuffix("/")
+            ? currentPath + newFolderName
             : currentPath + "/" + newFolderName
-        
+
         do {
             try await api.createDirectory(path: folderPath)
             newFolderName = ""
+            // Invalidate the current path so we refetch from the server
+            // rather than showing the stale cached listing.
+            pathCache.removeValue(forKey: currentPath)
             await loadDirectory()
             HapticService.success()
         } catch {
@@ -476,13 +544,20 @@ struct FilesView: View {
             HapticService.error()
         }
     }
-    
+
     private func deleteSelected() async {
         guard let entry = selectedEntry else { return }
-        
+
         do {
             try await api.deleteFile(path: entry.path, recursive: entry.isDirectory)
             selectedEntry = nil
+            pathCache.removeValue(forKey: currentPath)
+            // If we deleted a directory, drop its cached listing too —
+            // otherwise re-entering the same path name later would render
+            // ghost contents from before the delete.
+            if entry.isDirectory {
+                pathCache.removeValue(forKey: entry.path)
+            }
             await loadDirectory()
             HapticService.success()
         } catch {
@@ -516,9 +591,10 @@ struct FilesView: View {
                     return
                 }
             }
+            pathCache.removeValue(forKey: currentPath)
             await loadDirectory()
             HapticService.success()
-            
+
         case .failure(let error):
             errorMessage = error.localizedDescription
             HapticService.error()
