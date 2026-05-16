@@ -2283,6 +2283,16 @@ pub(crate) fn resolve_gemini_default_model() -> String {
     "gemini-3.1-pro-preview".to_string()
 }
 
+/// Return the default model for Grok Build when no override is specified.
+///
+/// Mirrors the dashboard's `KNOWN_BACKEND_DEFAULT_MODELS` entry for grok and
+/// the value advertised by `/api/providers` for xAI. Pinning here prevents
+/// grok missions from inheriting the global `DEFAULT_MODEL`
+/// (e.g. `anthropic/claude-opus-4-6`) which grok rejects as "unknown model id".
+pub(crate) fn resolve_grok_default_model() -> String {
+    "grok-build".to_string()
+}
+
 async fn close_mission_desktop_sessions(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,

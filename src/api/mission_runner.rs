@@ -36,8 +36,9 @@ use crate::workspace_exec::WorkspaceExec;
 
 use super::automation_variables::substitute_custom_variables;
 use super::control::{
-    resolve_claudecode_default_model, resolve_gemini_default_model, safe_truncate_index,
-    AgentEvent, AgentTreeNode, ControlRunState, ControlStatus, ExecutionProgress, FrontendToolHub,
+    resolve_claudecode_default_model, resolve_gemini_default_model, resolve_grok_default_model,
+    safe_truncate_index, AgentEvent, AgentTreeNode, ControlRunState, ControlStatus,
+    ExecutionProgress, FrontendToolHub,
 };
 use super::library::SharedLibrary;
 
@@ -2672,6 +2673,14 @@ async fn run_mission_turn(
         // Pin Gemini to a stable backend default instead of inheriting the
         // global model or relying on the CLI's own default.
         config.default_model = Some(resolve_gemini_default_model());
+    } else if backend_id == "grok" && model_override.is_none() {
+        // Pin Grok Build to its own default model. Without this the global
+        // DEFAULT_MODEL (typically `anthropic/claude-opus-4-6`) flows
+        // through to `--model` and the grok CLI rejects it as "unknown
+        // model id" — the mission then fails on the first turn with a
+        // confusing chdir error from the rejected-CLI path. See prod
+        // mission 1aef657a (2026-05-16).
+        config.default_model = Some(resolve_grok_default_model());
     }
     tracing::info!(
         mission_id = %mission_id,
@@ -12802,16 +12811,19 @@ pub async fn run_grok_turn(
     };
 
     let mut args = Vec::new();
-    if is_continuation {
-        if let Some(sid) = session_id {
-            args.push("--resume".to_string());
-            args.push(sid.to_string());
-        } else {
-            args.push("--continue".to_string());
-        }
-    } else if let Some(sid) = session_id {
+    // Use `-s/--session-id` for both first-turn and continuation when we
+    // already have a session id from the mission store. Per grok headless
+    // docs, `--session-id` has upsert semantics — loads the session if it
+    // exists, creates one with that id otherwise — so it self-heals the
+    // "orphan session" case where the first turn failed before grok could
+    // persist the session and `--resume <sid>` would error with "Session
+    // does not exist". `--resume` is strict-existence-only; we only fall
+    // through to `--continue` when we have no session id at all.
+    if let Some(sid) = session_id {
         args.push("--session-id".to_string());
         args.push(sid.to_string());
+    } else if is_continuation {
+        args.push("--continue".to_string());
     }
     args.push("-p".to_string());
     args.push(message.to_string());
