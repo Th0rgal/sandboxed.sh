@@ -192,6 +192,15 @@ final class APIService {
     func loadMission(id: String) async throws -> Mission {
         try await post("/api/control/missions/\(id)/load", body: EmptyBody())
     }
+
+    /// Tell the backend the user has opened this mission. The first call
+    /// (when `first_viewed_at` is still null on the row) starts the 1h ack
+    /// grace timer for `awaiting_user` missions; later calls are no-ops on
+    /// the server. Returns the updated mission so callers can rerender the
+    /// "opened" dot immediately.
+    func markMissionOpened(id: String) async throws -> Mission {
+        try await post("/api/control/missions/\(id)/opened", body: EmptyBody())
+    }
     
     func setMissionStatus(id: String, status: MissionStatus) async throws {
         struct StatusRequest: Encodable {
@@ -261,6 +270,38 @@ final class APIService {
         }
 
         var urlString = "/api/control/missions/\(id)/events"
+        if !queryItems.isEmpty {
+            var components = URLComponents(string: urlString)
+            components?.queryItems = queryItems
+            if let fullPath = components?.string {
+                urlString = fullPath
+            }
+        }
+
+        let (events, response): ([StoredEvent], HTTPURLResponse) = try await getWithResponse(urlString)
+        let maxSequence = (response.value(forHTTPHeaderField: "X-Max-Sequence") ?? response.value(forHTTPHeaderField: "x-max-sequence"))
+            .flatMap { Int64($0) }
+        return MissionEventsResult(events: events, maxSequence: maxSequence)
+    }
+
+    func getMissionTranscript(id: String) async throws -> MissionTranscriptResult {
+        try await get("/api/control/missions/\(id)/transcript")
+    }
+
+    func getMissionTraceWithMeta(
+        id: String,
+        limit: Int? = nil,
+        sinceSeq: Int64? = nil
+    ) async throws -> MissionEventsResult {
+        var queryItems: [URLQueryItem] = []
+        if let limit = limit {
+            queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        if let sinceSeq = sinceSeq {
+            queryItems.append(URLQueryItem(name: "since_seq", value: String(sinceSeq)))
+        }
+
+        var urlString = "/api/control/missions/\(id)/trace"
         if !queryItems.isEmpty {
             var components = URLComponents(string: urlString)
             components?.queryItems = queryItems
@@ -858,6 +899,67 @@ private struct DecodedBox<T>: @unchecked Sendable {
 struct MissionEventsResult: Sendable {
     let events: [StoredEvent]
     let maxSequence: Int64?
+}
+
+struct TranscriptMessage: Codable, Sendable {
+    let traceCount: Int
+    let traceSummary: [String: Int]
+    let id: Int64
+    let missionId: String
+    let sequence: Int64
+    let eventType: String
+    let timestamp: String
+    let eventId: String?
+    let toolCallId: String?
+    let toolName: String?
+    let content: String
+    let metadata: [String: AnyCodable]
+
+    enum CodingKeys: String, CodingKey {
+        case traceCount = "trace_count"
+        case traceSummary = "trace_summary"
+        case id
+        case missionId = "mission_id"
+        case sequence
+        case eventType = "event_type"
+        case timestamp
+        case eventId = "event_id"
+        case toolCallId = "tool_call_id"
+        case toolName = "tool_name"
+        case content
+        case metadata
+    }
+
+    var storedEvent: StoredEvent {
+        StoredEvent(
+            id: id,
+            missionId: missionId,
+            sequence: sequence,
+            eventType: eventType,
+            timestamp: timestamp,
+            eventId: eventId,
+            toolCallId: toolCallId,
+            toolName: toolName,
+            content: content,
+            metadata: metadata
+        )
+    }
+}
+
+struct MissionTranscriptResult: Codable, Sendable {
+    let mission: Mission
+    let messages: [TranscriptMessage]
+    let eventCounts: [String: Int]
+    let visibilityCounts: [String: Int]
+    let latestSequence: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case mission
+        case messages
+        case eventCounts = "event_counts"
+        case visibilityCounts = "visibility_counts"
+        case latestSequence = "latest_sequence"
+    }
 }
 
 enum APIError: LocalizedError {

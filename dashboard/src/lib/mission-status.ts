@@ -6,9 +6,23 @@
 import type { MissionStatus } from './api/missions';
 
 export type MissionCategory = 'running' | 'needs-you' | 'finished' | 'other';
+export type FinishedTone = 'green' | 'red';
 
-export const FINISHED_STATUSES: MissionStatus[] = ['completed', 'failed', 'not_feasible'];
-export const NEEDS_ATTENTION_STATUSES: MissionStatus[] = ['interrupted', 'blocked'];
+// "Needs You" is reserved for missions where the agent finished its turn
+// cleanly (`awaiting_user`) and is waiting on the user. Failure paths
+// (interrupted, blocked, not_feasible, failed) live in Finished with a red
+// tone instead.
+export const NEEDS_ATTENTION_STATUSES: MissionStatus[] = ['awaiting_user'];
+export const FINISHED_STATUSES: MissionStatus[] = [
+  'completed',
+  'acknowledged',
+  'failed',
+  'interrupted',
+  'blocked',
+  'not_feasible',
+];
+
+const FINISHED_GREEN_STATUSES: MissionStatus[] = ['completed', 'acknowledged'];
 
 /**
  * Check if a mission is in a finished state based on its stored status.
@@ -25,13 +39,21 @@ export function needsAttentionStatus(status: MissionStatus): boolean {
 }
 
 /**
+ * Within the Finished column, "green" tone = agent-declared completion or
+ * user acknowledgement, "red" tone = anything that ended badly.
+ */
+export function finishedTone(status: MissionStatus): FinishedTone {
+  return FINISHED_GREEN_STATUSES.includes(status) ? 'green' : 'red';
+}
+
+/**
  * Categorize a mission based on runtime state and stored status.
- * 
+ *
  * Priority order:
  * 1. Running - mission is actually running (runtime state takes precedence)
- * 2. Needs You - interrupted/blocked AND not running
- * 3. Finished - completed/failed/not_feasible AND not running
- * 4. Other - anything else (e.g., active but not in runtime running set)
+ * 2. Needs You - awaiting_user AND not running
+ * 3. Finished - completed/acknowledged/failed/interrupted/blocked/not_feasible AND not running
+ * 4. Other - anything else (active-but-not-running, pending)
  */
 export function categorizeMission(
   status: MissionStatus,
@@ -40,15 +62,15 @@ export function categorizeMission(
   if (isActuallyRunning) {
     return 'running';
   }
-  
+
   if (needsAttentionStatus(status)) {
     return 'needs-you';
   }
-  
+
   if (isFinishedStatus(status)) {
     return 'finished';
   }
-  
+
   return 'other';
 }
 
@@ -81,24 +103,30 @@ export function categorizeMissions<T extends { id: string; status: MissionStatus
  */
 export const STATUS_DOT_COLORS: Record<MissionStatus, string> = {
   active: 'bg-indigo-400',
+  awaiting_user: 'bg-sky-400',
+  acknowledged: 'bg-emerald-400',
   completed: 'bg-emerald-400',
   failed: 'bg-red-400',
-  interrupted: 'bg-amber-400',
-  blocked: 'bg-orange-400',
-  not_feasible: 'bg-rose-400',
+  interrupted: 'bg-red-400',
+  blocked: 'bg-red-400',
+  not_feasible: 'bg-red-400',
 };
 
 export const STATUS_TEXT_COLORS: Record<MissionStatus, string> = {
   active: 'text-indigo-400',
+  awaiting_user: 'text-sky-400',
+  acknowledged: 'text-emerald-400',
   completed: 'text-emerald-400',
   failed: 'text-red-400',
-  interrupted: 'text-amber-400',
-  blocked: 'text-orange-400',
-  not_feasible: 'text-rose-400',
+  interrupted: 'text-red-400',
+  blocked: 'text-red-400',
+  not_feasible: 'text-red-400',
 };
 
 export const STATUS_LABELS: Record<MissionStatus, string> = {
   active: 'Active',
+  awaiting_user: 'Needs You',
+  acknowledged: 'Acknowledged',
   completed: 'Completed',
   failed: 'Failed',
   interrupted: 'Interrupted',
@@ -136,6 +164,8 @@ export const STATUS_ICONS = {
   pending: 'Clock',
   active: 'Loader',
   running: 'Loader',
+  awaiting_user: 'Bell',
+  acknowledged: 'CheckCircle',
   completed: 'CheckCircle',
   failed: 'XCircle',
   cancelled: 'Ban',

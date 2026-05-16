@@ -187,19 +187,75 @@ impl MissionStore for FileMissionStore {
         let now = now_string();
         mission.updated_at = now.clone();
         mission.terminal_reason = terminal_reason.map(|s| s.to_string());
-        // Failed missions with LlmError are also resumable (transient API errors)
-        if matches!(
+        // AwaitingUser is resumable too (any user message wakes the agent).
+        // Failed missions with LlmError are also resumable (transient API errors).
+        mission.resumable = matches!(
             status,
-            MissionStatus::Interrupted | MissionStatus::Blocked | MissionStatus::Failed
-        ) {
-            mission.interrupted_at = Some(now);
-            mission.resumable = true;
-        } else {
-            mission.interrupted_at = None;
-            mission.resumable = false;
+            MissionStatus::Interrupted
+                | MissionStatus::Blocked
+                | MissionStatus::Failed
+                | MissionStatus::AwaitingUser
+                | MissionStatus::Acknowledged
+        );
+        mission.interrupted_at =
+            if matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked) {
+                Some(now)
+            } else {
+                None
+            };
+        if matches!(status, MissionStatus::Active) {
+            mission.first_viewed_at = None;
         }
         drop(missions);
         self.persist().await
+    }
+
+    async fn set_mission_first_viewed_at_if_unset(
+        &self,
+        id: Uuid,
+        timestamp: &str,
+    ) -> Result<Option<String>, String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+        if mission.first_viewed_at.is_some() {
+            return Ok(None);
+        }
+        mission.first_viewed_at = Some(timestamp.to_string());
+        drop(missions);
+        self.persist().await?;
+        Ok(Some(timestamp.to_string()))
+    }
+
+    async fn acknowledge_stale_awaiting_user_missions(
+        &self,
+        grace_seconds: u64,
+    ) -> Result<Vec<Uuid>, String> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(grace_seconds as i64);
+        let mut missions = self.missions.write().await;
+        let mut promoted = Vec::new();
+        for mission in missions.values_mut() {
+            if mission.status != MissionStatus::AwaitingUser {
+                continue;
+            }
+            let Some(ref viewed_at) = mission.first_viewed_at else {
+                continue;
+            };
+            let Ok(viewed_dt) = chrono::DateTime::parse_from_rfc3339(viewed_at) else {
+                continue;
+            };
+            if viewed_dt <= cutoff {
+                mission.status = MissionStatus::Acknowledged;
+                mission.updated_at = now_string();
+                promoted.push(mission.id);
+            }
+        }
+        drop(missions);
+        if !promoted.is_empty() {
+            self.persist().await?;
+        }
+        Ok(promoted)
     }
 
     async fn update_mission_history(

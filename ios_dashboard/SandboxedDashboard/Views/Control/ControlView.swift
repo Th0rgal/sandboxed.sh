@@ -1640,6 +1640,13 @@ struct ControlView: View {
         let previousViewingId = viewingMissionId
         viewingMissionId = id
 
+        // Fire-and-forget: tell the backend the user opened this mission.
+        // First call (per AwaitingUser round) starts the 1h ack grace timer
+        // and paints the "opened" dot in Finished; later calls are no-ops.
+        Task { [api] in
+            _ = try? await api.markMissionOpened(id: id)
+        }
+
         // Clear stale workers from previous mission immediately
         childMissions = []
 
@@ -1659,20 +1666,10 @@ struct ControlView: View {
         }
 
         do {
-            // Fan out metadata + events in parallel — they share only `id`,
-            // and the events fetch can be the bigger payload. Previously the
-            // events fetch waited for getMission to return, adding one
-            // mandatory RTT for nothing. (UX audit item #2.)
             async let metadataTask = api.getMission(id: id)
-            async let eventsTask: MissionEventsResult? =
-                try? await api.getMissionEventsWithMeta(
-                    id: id,
-                    types: historyEventTypes,
-                    limit: Self.initialEventLimit,
-                    latest: true
-                )
+            async let transcriptTask: MissionTranscriptResult? = try? await api.getMissionTranscript(id: id)
             let mission = try await metadataTask
-            let eventResult = await eventsTask
+            let transcriptResult = await transcriptTask
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -1683,25 +1680,49 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            if let result = eventResult {
-                let events = result.events
+            if let transcript = transcriptResult {
+                let events = transcript.messages.map(\.storedEvent)
                 if events.isEmpty {
                     // Clear stale cache when events are empty to prevent visual flashing
                     removeMissionFromCache(mission.id)
                     applyViewingMission(mission)
                 } else {
-                    hasMoreHistory = events.count >= Self.initialEventLimit
+                    hasMoreHistory = transcript.eventCounts.values.reduce(0, +) > events.count
                     applyViewingMissionWithEvents(mission, events: events)
+                    if transcript.latestSequence > 0 {
+                        missionMaxSeq[id] = transcript.latestSequence
+                    }
+                    cacheMissionWithEvents(mission, events: events)
+                    Task { [api] in
+                        if let trace = try? await api.getMissionTraceWithMeta(id: id, limit: Self.initialEventLimit, sinceSeq: 0),
+                           !trace.events.isEmpty {
+                            await MainActor.run {
+                                guard fetchingMissionId == id || viewingMissionId == id else { return }
+                                let merged = (events + trace.events).sorted { $0.sequence < $1.sequence }
+                                applyViewingMissionWithEvents(mission, events: merged)
+                                if let maxSeq = trace.maxSequence, maxSeq > 0 {
+                                    missionMaxSeq[id] = maxSeq
+                                }
+                                cacheMissionWithEvents(mission, events: merged)
+                            }
+                        }
+                    }
+                }
+            } else {
+                let fallback = try? await api.getMissionEventsWithMeta(
+                    id: id,
+                    types: historyEventTypes,
+                    limit: Self.initialEventLimit,
+                    latest: true
+                )
+                if let result = fallback, !result.events.isEmpty {
+                    hasMoreHistory = result.events.count >= Self.initialEventLimit
+                    applyViewingMissionWithEvents(mission, events: result.events)
                     if let maxSeq = result.maxSequence, maxSeq > 0 {
                         missionMaxSeq[id] = maxSeq
                     }
-                    // Cache the mission with events for next time
-                    cacheMissionWithEvents(mission, events: events)
-                }
-            } else {
-                // Events fetch failed. If we already displayed cached data,
-                // keep it; otherwise fall back to the basic history view.
-                if !hasCache {
+                    cacheMissionWithEvents(mission, events: result.events)
+                } else if !hasCache {
                     removeMissionFromCache(mission.id)
                     applyViewingMission(mission)
                 }
@@ -5148,9 +5169,11 @@ private struct MissionRow: View {
         switch status {
         case .pending: return Theme.warning
         case .active: return Theme.success
+        case .awaitingUser: return Theme.warning
+        case .acknowledged: return Theme.success
         case .completed: return Theme.textMuted
         case .failed: return Theme.error
-        case .interrupted, .blocked: return Theme.warning
+        case .interrupted, .blocked: return Theme.error
         case .notFeasible: return Theme.error
         case .unknown: return Theme.textMuted
         }
@@ -5163,6 +5186,8 @@ private struct MissionRow: View {
         switch status {
         case .pending: return "clock.fill"
         case .active: return "play.circle.fill"
+        case .awaitingUser: return "hand.wave.fill"
+        case .acknowledged: return "checkmark.circle.fill"
         case .completed: return "checkmark.circle.fill"
         case .failed: return "xmark.circle.fill"
         case .interrupted: return "pause.circle.fill"

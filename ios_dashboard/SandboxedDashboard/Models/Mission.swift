@@ -10,30 +10,38 @@ import Foundation
 enum MissionStatus: String, Codable, CaseIterable {
     case pending
     case active
+    /// Agent's turn / automation cycle finished cleanly with no follow-up
+    /// queued; the mission is parked waiting for the user. This is the
+    /// "Needs You" bucket.
+    case awaitingUser = "awaiting_user"
+    /// User opened the mission while it was AwaitingUser and the 1h grace
+    /// elapsed without a new message — auto-archived under Finished.
+    case acknowledged
     case completed
     case failed
     case interrupted
     case blocked
     case notFeasible = "not_feasible"
     case unknown
-    
+
     var statusType: StatusType {
         switch self {
         case .pending: return .pending
         case .active: return .active
+        case .awaitingUser: return .awaitingUser
+        case .acknowledged: return .completed
         case .completed: return .completed
         case .failed: return .failed
-        case .interrupted: return .interrupted
-        case .blocked: return .blocked
-        case .notFeasible: return .failed
-        case .unknown: return .failed
+        case .interrupted, .blocked, .notFeasible, .unknown: return .failed
         }
     }
-    
+
     var displayLabel: String {
         switch self {
         case .pending: return "Pending"
         case .active: return "Active"
+        case .awaitingUser: return "Needs You"
+        case .acknowledged: return "Acknowledged"
         case .completed: return "Completed"
         case .failed: return "Failed"
         case .interrupted: return "Interrupted"
@@ -42,9 +50,17 @@ enum MissionStatus: String, Codable, CaseIterable {
         case .unknown: return "Unknown"
         }
     }
-    
+
+    /// Stored statuses that the user can wake back into Active by sending a
+    /// new message. AwaitingUser/Acknowledged count too — the agent is idle
+    /// and ready to resume.
     var canResume: Bool {
-        self == .interrupted || self == .blocked
+        switch self {
+        case .interrupted, .blocked, .awaitingUser, .acknowledged:
+            return true
+        default:
+            return false
+        }
     }
 
     init(from decoder: Decoder) throws {
@@ -87,6 +103,10 @@ struct Mission: Codable, Identifiable, Hashable {
     let createdAt: String
     var updatedAt: String
     let interruptedAt: String?
+    /// Timestamp of the user's first open since this mission last entered
+    /// AwaitingUser. Drives the "opened" dot rendered next to Finished
+    /// missions, and the backend's 1h ack grace timer.
+    let firstViewedAt: String?
     let resumable: Bool
     let parentMissionId: String?
 
@@ -111,6 +131,7 @@ struct Mission: Codable, Identifiable, Hashable {
         case createdAt = "created_at"
         case updatedAt = "updated_at"
         case interruptedAt = "interrupted_at"
+        case firstViewedAt = "first_viewed_at"
         case parentMissionId = "parent_mission_id"
     }
 
@@ -133,6 +154,7 @@ struct Mission: Codable, Identifiable, Hashable {
         createdAt = try container.decode(String.self, forKey: .createdAt)
         updatedAt = try container.decode(String.self, forKey: .updatedAt)
         interruptedAt = try container.decodeIfPresent(String.self, forKey: .interruptedAt)
+        firstViewedAt = try container.decodeIfPresent(String.self, forKey: .firstViewedAt)
         resumable = try container.decodeIfPresent(Bool.self, forKey: .resumable) ?? false
         parentMissionId = try container.decodeIfPresent(String.self, forKey: .parentMissionId)
     }
@@ -345,6 +367,30 @@ struct StoredEvent: Codable, Identifiable, Sendable {
         case toolName = "tool_name"
         case content
         case metadata
+    }
+
+    init(
+        id: Int64,
+        missionId: String,
+        sequence: Int64,
+        eventType: String,
+        timestamp: String,
+        eventId: String?,
+        toolCallId: String?,
+        toolName: String?,
+        content: String,
+        metadata: [String: AnyCodable]
+    ) {
+        self.id = id
+        self.missionId = missionId
+        self.sequence = sequence
+        self.eventType = eventType
+        self.timestamp = timestamp
+        self.eventId = eventId
+        self.toolCallId = toolCallId
+        self.toolName = toolName
+        self.content = content
+        self.metadata = metadata
     }
 
     init(from decoder: Decoder) throws {

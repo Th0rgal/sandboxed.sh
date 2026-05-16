@@ -67,18 +67,117 @@ struct ShimmerCard: View {
                     .frame(width: 40, height: 40)
                     .overlay(ShimmerView())
                     .clipShape(RoundedRectangle(cornerRadius: 8))
-                
+
                 VStack(alignment: .leading, spacing: 6) {
                     ShimmerRow(height: 14, width: 120)
                     ShimmerRow(height: 12, width: 80)
                 }
             }
-            
+
             ShimmerRow(height: 12)
             ShimmerRow(height: 12, width: 200)
         }
         .padding(16)
         .background(Color.white.opacity(0.03))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+}
+
+// Skeleton mirroring WorkspaceCard (WorkspacesView.swift:128-174):
+// two-row VStack — top HStack(small symbol + name + spacer + status badge);
+// bottom HStack(type pill + spacer + chevron). Padding 16, corner 12, 1pt
+// border at white 0.06.
+struct ShimmerWorkspaceCard: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                ShimmerRow(height: 16, width: 16)
+                ShimmerRow(height: 16, width: 140)
+                Spacer(minLength: 8)
+                ShimmerRow(height: 18, width: 64)
+            }
+            HStack {
+                ShimmerRow(height: 18, width: 70)
+                Spacer()
+                ShimmerRow(height: 12, width: 8)
+            }
+        }
+        .padding()
+        .background(Color.white.opacity(0.02))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+}
+
+// Skeleton mirroring MissionRow (HistoryView.swift:384-456): single HStack
+// with 40x40 icon (corner 10) + VStack(title + badge row) + Spacer +
+// VStack(timestamp + chevron). Padding 14, corner 14, ultraThinMaterial.
+struct ShimmerMissionRow: View {
+    var body: some View {
+        HStack(spacing: 14) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+                .frame(width: 40, height: 40)
+                .overlay(ShimmerView())
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 4) {
+                ShimmerRow(height: 14, width: 180)
+                HStack(spacing: 6) {
+                    ShimmerRow(height: 16, width: 56)
+                    ShimmerRow(height: 14, width: 48)
+                    ShimmerRow(height: 12, width: 40)
+                }
+            }
+
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 4) {
+                ShimmerRow(height: 12, width: 48)
+                ShimmerRow(height: 12, width: 8)
+            }
+        }
+        .padding(14)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Theme.border, lineWidth: 0.5)
+        )
+    }
+}
+
+// Skeleton mirroring FileRow (FilesView.swift:607-687): single HStack with
+// 48x48 icon (corner 12) + VStack(name + meta row) + Spacer + chevron.
+// Padding 12v/16h, corner 14, Theme.backgroundSecondary.
+struct ShimmerFileRow: View {
+    var body: some View {
+        HStack(spacing: 16) {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+                .frame(width: 48, height: 48)
+                .overlay(ShimmerView())
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 4) {
+                ShimmerRow(height: 16, width: 160)
+                HStack(spacing: 6) {
+                    ShimmerRow(height: 12, width: 48)
+                    ShimmerRow(height: 12, width: 60)
+                    ShimmerRow(height: 12, width: 40)
+                }
+            }
+
+            Spacer()
+
+            ShimmerRow(height: 14, width: 8)
+        }
+        .padding(.vertical, 12)
+        .padding(.horizontal, 16)
+        .background(Theme.backgroundSecondary)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
@@ -125,20 +224,24 @@ struct EmptyStateView: View {
 }
 
 #Preview {
-    VStack(spacing: 24) {
-        LoadingView()
-            .frame(height: 150)
-        
-        ShimmerCard()
-            .padding()
-        
-        EmptyStateView(
-            icon: "message.badge.filled.fill",
-            title: "No Messages",
-            message: "Start a conversation with the agent",
-            action: { print("Tapped") }
-        )
-        .frame(height: 250)
+    ScrollView {
+        VStack(spacing: 16) {
+            LoadingView()
+                .frame(height: 120)
+
+            ShimmerWorkspaceCard()
+            ShimmerMissionRow()
+            ShimmerFileRow()
+
+            EmptyStateView(
+                icon: "message.badge.filled.fill",
+                title: "No Messages",
+                message: "Start a conversation with the agent",
+                action: { print("Tapped") }
+            )
+            .frame(height: 200)
+        }
+        .padding()
     }
     .background(Theme.backgroundPrimary)
 }

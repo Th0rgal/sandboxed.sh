@@ -24,7 +24,7 @@ struct WorkspacesView: View {
                 ScrollView {
                     LazyVStack(spacing: 12) {
                         ForEach(0..<5, id: \.self) { _ in
-                            ShimmerCard()
+                            ShimmerWorkspaceCard()
                         }
                     }
                     .padding()

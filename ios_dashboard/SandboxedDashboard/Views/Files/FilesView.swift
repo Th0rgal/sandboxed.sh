@@ -74,7 +74,7 @@ struct FilesView: View {
                     ScrollView {
                         LazyVStack(spacing: 8) {
                             ForEach(0..<8, id: \.self) { _ in
-                                ShimmerCard()
+                                ShimmerFileRow()
                             }
                         }
                         .padding(.horizontal, 16)

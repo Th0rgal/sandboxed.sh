@@ -10,7 +10,15 @@ import { generateMissionTitle } from "../llm";
 // Types
 // ---------------------------------------------------------------------------
 
-export type MissionStatus = "active" | "completed" | "failed" | "interrupted" | "blocked" | "not_feasible";
+export type MissionStatus =
+  | "active"
+  | "awaiting_user"
+  | "acknowledged"
+  | "completed"
+  | "failed"
+  | "interrupted"
+  | "blocked"
+  | "not_feasible";
 
 export type ModelEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -50,6 +58,12 @@ export interface Mission {
   created_at: string;
   updated_at: string;
   interrupted_at?: string;
+  /**
+   * Timestamp of the user's first open since this mission last entered
+   * `awaiting_user`. Drives the 1h ack grace timer (backend) and the
+   * "opened" dot rendered next to Finished missions (web + iOS).
+   */
+  first_viewed_at?: string | null;
   resumable?: boolean;
   session_id?: string | null;
   parent_mission_id?: string;
@@ -68,6 +82,29 @@ export interface StoredEvent {
   tool_name?: string;
   content: string;
   metadata: Record<string, unknown>;
+}
+
+export interface TranscriptMessage {
+  trace_count: number;
+  trace_summary: Record<string, number>;
+  id: number;
+  mission_id: string;
+  sequence: number;
+  event_type: string;
+  timestamp: string;
+  event_id?: string;
+  tool_call_id?: string;
+  tool_name?: string;
+  content: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface MissionTranscript {
+  mission: Mission;
+  messages: TranscriptMessage[];
+  event_counts: Record<string, number>;
+  visibility_counts: Record<string, number>;
+  latest_sequence: number;
 }
 
 export interface CreateMissionOptions {
@@ -242,6 +279,48 @@ export async function getMissionEventsWithMeta(
   return { events, meta: { totalEvents, maxSequence } };
 }
 
+export async function getMissionTranscript(id: string): Promise<MissionTranscript> {
+  return apiGet(
+    `/api/control/missions/${id}/transcript`,
+    "Failed to fetch mission transcript"
+  );
+}
+
+export async function getMissionTraceWithMeta(
+  id: string,
+  options?: {
+    limit?: number;
+    offset?: number;
+    latest?: boolean;
+    sinceSeq?: number;
+    beforeSeq?: number;
+  }
+): Promise<{ events: StoredEvent[]; meta: MissionEventsMeta }> {
+  const params = new URLSearchParams();
+  if (options?.limit) params.set("limit", String(options.limit));
+  if (options?.offset) params.set("offset", String(options.offset));
+  if (options?.latest) params.set("latest", "true");
+  if (options?.sinceSeq !== undefined) params.set("since_seq", String(options.sinceSeq));
+  if (options?.beforeSeq !== undefined) params.set("before_seq", String(options.beforeSeq));
+  const query = params.toString();
+  const res = await apiFetch(
+    `/api/control/missions/${id}/trace${query ? `?${query}` : ""}`
+  );
+  if (!res.ok) throw new Error("Failed to fetch mission trace");
+  const events = (await res.json()) as StoredEvent[];
+  const totalHeader = res.headers.get("x-total-events");
+  const maxSeqHeader = res.headers.get("x-max-sequence");
+  const totalEvents =
+    totalHeader !== null && totalHeader !== "" && !Number.isNaN(Number(totalHeader))
+      ? Number(totalHeader)
+      : undefined;
+  const maxSequence =
+    maxSeqHeader !== null && maxSeqHeader !== "" && !Number.isNaN(Number(maxSeqHeader))
+      ? Number(maxSeqHeader)
+      : undefined;
+  return { events, meta: { totalEvents, maxSequence } };
+}
+
 export async function getCurrentMission(): Promise<Mission | null> {
   return apiGet("/api/control/missions/current", "Failed to fetch current mission");
 }
@@ -283,6 +362,19 @@ export async function loadMission(id: string): Promise<Mission | null> {
   const res = await apiFetch(`/api/control/missions/${id}/load`, { method: "POST" });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("Failed to load mission");
+  return res.json();
+}
+
+/**
+ * Tell the backend the user has opened this mission. The first call (when
+ * `first_viewed_at` is still null on the mission row) starts the 1h ack
+ * grace timer; subsequent calls are no-ops on the server. Returns the
+ * updated mission so the caller can rerender the dot immediately.
+ */
+export async function markMissionOpened(id: string): Promise<Mission | null> {
+  const res = await apiFetch(`/api/control/missions/${id}/opened`, { method: "POST" });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error("Failed to mark mission opened");
   return res.json();
 }
 

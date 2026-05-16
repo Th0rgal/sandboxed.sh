@@ -24,17 +24,17 @@ struct HistoryView: View {
     enum StatusFilter: String, CaseIterable {
         case all = "All"
         case active = "Active"
-        case interrupted = "Interrupted"
+        case needsYou = "Needs You"
         case completed = "Completed"
         case failed = "Failed"
-        
+
         var missionStatuses: [MissionStatus]? {
             switch self {
             case .all: return nil
             case .active: return [.pending, .active]
-            case .interrupted: return [.interrupted, .blocked, .unknown]
-            case .completed: return [.completed]
-            case .failed: return [.failed, .notFeasible]
+            case .needsYou: return [.awaitingUser]
+            case .completed: return [.completed, .acknowledged]
+            case .failed: return [.failed, .notFeasible, .interrupted, .blocked, .unknown]
             }
         }
     }
@@ -135,7 +135,7 @@ struct HistoryView: View {
                         ScrollView {
                             LazyVStack(spacing: 12) {
                                 ForEach(0..<6, id: \.self) { _ in
-                                    ShimmerCard()
+                                    ShimmerMissionRow()
                                 }
                             }
                             .padding()
@@ -383,7 +383,7 @@ private struct FilterPill: View {
 
 private struct MissionRow: View {
     let mission: Mission
-    
+
     private var backendColor: Color {
         BackendAgentService.color(for: mission.backend)
     }
@@ -391,7 +391,21 @@ private struct MissionRow: View {
     private var backendIcon: String {
         BackendAgentService.icon(for: mission.backend)
     }
-    
+
+    /// True when the mission lives under "Finished" (any terminal status)
+    /// AND the user has already opened it at least once. Drives the small
+    /// notification dot rendered next to the title, mirroring the web
+    /// dashboard's behaviour.
+    private var showOpenedDot: Bool {
+        guard mission.firstViewedAt != nil else { return false }
+        switch mission.status {
+        case .completed, .acknowledged, .failed, .interrupted, .blocked, .notFeasible:
+            return true
+        default:
+            return false
+        }
+    }
+
     var body: some View {
         HStack(spacing: 14) {
             // Icon based on backend
@@ -401,13 +415,22 @@ private struct MissionRow: View {
                 .frame(width: 40, height: 40)
                 .background((mission.canResume ? Theme.warning : backendColor).opacity(0.15))
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            
+
             // Content
             VStack(alignment: .leading, spacing: 4) {
-                Text(mission.displayTitle)
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(Theme.textPrimary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(mission.displayTitle)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(Theme.textPrimary)
+                        .lineLimit(1)
+
+                    if showOpenedDot {
+                        Circle()
+                            .fill(Theme.textMuted)
+                            .frame(width: 6, height: 6)
+                            .accessibilityLabel("Opened")
+                    }
+                }
                 
                 HStack(spacing: 6) {
                     StatusBadge(status: mission.status.statusType, compact: true)

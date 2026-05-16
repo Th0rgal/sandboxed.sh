@@ -2388,27 +2388,52 @@ impl MissionStore for SqliteMissionStore {
             } else {
                 None
             };
-        // Failed missions with LlmError are also resumable (transient API errors)
+        // Failed missions with LlmError are also resumable (transient API errors).
+        // AwaitingUser missions are also resumable (the user can send another
+        // message at any time to wake the agent back up).
         let resumable = matches!(
             status,
-            MissionStatus::Interrupted | MissionStatus::Blocked | MissionStatus::Failed
+            MissionStatus::Interrupted
+                | MissionStatus::Blocked
+                | MissionStatus::Failed
+                | MissionStatus::AwaitingUser
+                | MissionStatus::Acknowledged
         );
         let terminal_reason = terminal_reason.map(|s| s.to_string());
+        // Transitioning back to Active means the user just sent a new message —
+        // clear `first_viewed_at` so the next AwaitingUser round starts fresh
+        // (and so the "opened" dot disappears once the agent picks up again).
+        let clear_first_viewed_at = matches!(status, MissionStatus::Active);
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            conn.execute(
-                "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5 WHERE id = ?6",
-                params![
-                    status_to_string(status),
-                    now,
-                    interrupted_at,
-                    if resumable { 1 } else { 0 },
-                    terminal_reason,
-                    id.to_string(),
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+            if clear_first_viewed_at {
+                conn.execute(
+                    "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5, first_viewed_at = NULL WHERE id = ?6",
+                    params![
+                        status_to_string(status),
+                        now,
+                        interrupted_at,
+                        if resumable { 1 } else { 0 },
+                        terminal_reason,
+                        id.to_string(),
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                conn.execute(
+                    "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5 WHERE id = ?6",
+                    params![
+                        status_to_string(status),
+                        now,
+                        interrupted_at,
+                        if resumable { 1 } else { 0 },
+                        terminal_reason,
+                        id.to_string(),
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
             Ok(())
         })
         .await
@@ -2437,6 +2462,74 @@ impl MissionStore for SqliteMissionStore {
             .map_err(|e| e.to_string())?;
 
             Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn set_mission_first_viewed_at_if_unset(
+        &self,
+        id: Uuid,
+        timestamp: &str,
+    ) -> Result<Option<String>, String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let ts = timestamp.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let updated = conn
+                .execute(
+                    "UPDATE missions SET first_viewed_at = ?1 WHERE id = ?2 AND first_viewed_at IS NULL",
+                    params![&ts, &id_str],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(if updated > 0 { Some(ts) } else { None })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn acknowledge_stale_awaiting_user_missions(
+        &self,
+        grace_seconds: u64,
+    ) -> Result<Vec<Uuid>, String> {
+        let conn = self.conn.clone();
+        let cutoff = (Utc::now() - chrono::Duration::seconds(grace_seconds as i64)).to_rfc3339();
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let ids: Vec<Uuid> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id FROM missions
+                         WHERE status = 'awaiting_user'
+                           AND first_viewed_at IS NOT NULL
+                           AND first_viewed_at <= ?1",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![&cutoff], |row| {
+                        let id_str: String = row.get(0)?;
+                        Ok(parse_uuid_or_nil(&id_str))
+                    })
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                rows
+            };
+            if !ids.is_empty() {
+                tx.execute(
+                    "UPDATE missions SET status = 'acknowledged', updated_at = ?1
+                     WHERE status = 'awaiting_user'
+                       AND first_viewed_at IS NOT NULL
+                       AND first_viewed_at <= ?2",
+                    params![&now, &cutoff],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(ids)
         })
         .await
         .map_err(|e| e.to_string())?

@@ -672,6 +672,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::load_mission),
         )
         .route(
+            "/api/control/missions/:id/opened",
+            post(control::mark_mission_opened),
+        )
+        .route(
             "/api/control/missions/:id/status",
             post(control::set_mission_status),
         )
