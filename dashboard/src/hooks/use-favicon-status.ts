@@ -11,9 +11,12 @@ const STATUS_COLORS: Record<MissionStatus, string> = {
   awaiting_user: "#38bdf8", // sky-400
   acknowledged: "#34d399", // emerald-400
   completed: "#34d399", // emerald-400
+  // Failure statuses all share `bg-red-400` in `STATUS_DOT_COLORS`
+  // (`lib/mission-status.ts`); the favicon dot now matches so the
+  // status indicator is consistent across the UI.
   failed: "#f87171", // red-400
-  interrupted: "#fbbf24", // amber-400
-  blocked: "#fb923c", // orange-400
+  interrupted: "#f87171", // red-400
+  blocked: "#f87171", // red-400
   not_feasible: "#f87171", // red-400
 };
 
