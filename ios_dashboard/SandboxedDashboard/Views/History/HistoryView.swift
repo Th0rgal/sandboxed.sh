@@ -289,15 +289,25 @@ struct HistoryView: View {
     }
 
     private func deleteMission(_ mission: Mission) async {
+        // Optimistic remove BEFORE the network call so the row slides out
+        // on the same frame as the swipe-to-delete gesture even on a slow
+        // connection. On failure we re-insert the mission so the UI
+        // reflects the server's actual state.
+        let removalIndex = missions.firstIndex(where: { $0.id == mission.id })
+        withAnimation {
+            missions.removeAll { $0.id == mission.id }
+        }
         do {
             _ = try await api.deleteMission(id: mission.id)
-            withAnimation {
-                missions.removeAll { $0.id == mission.id }
-            }
             HapticService.success()
         } catch {
             HapticService.error()
             errorMessage = "Failed to delete mission: \(error.localizedDescription)"
+            if let idx = removalIndex {
+                withAnimation {
+                    missions.insert(mission, at: min(idx, missions.count))
+                }
+            }
         }
     }
 

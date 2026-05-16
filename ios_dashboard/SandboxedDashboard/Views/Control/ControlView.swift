@@ -1997,16 +1997,22 @@ struct ControlView: View {
 
     private func setMissionStatus(_ status: MissionStatus) async {
         guard let mission = viewingMission else { return }
-        
+        let previousStatus = mission.status
+        // Flip the status pill instantly on the menu tap; roll back on
+        // failure so the badge tracks the server's true state.
+        viewingMission?.status = status
+        if currentMission?.id == mission.id {
+            currentMission?.status = status
+        }
         do {
             try await api.setMissionStatus(id: mission.id, status: status)
-            viewingMission?.status = status
-            if currentMission?.id == mission.id {
-                currentMission?.status = status
-            }
             HapticService.success()
         } catch {
             print("Failed to set status: \(error)")
+            viewingMission?.status = previousStatus
+            if currentMission?.id == mission.id {
+                currentMission?.status = previousStatus
+            }
             HapticService.error()
         }
     }
@@ -2663,22 +2669,38 @@ struct ControlView: View {
     }
     
     private func cancelMission(id: String) async {
+        // Drop the chip from the running-missions bar immediately so the
+        // tap-to-cancel feels instant on slow networks. The
+        // `refreshRunningMissions` below reconciles with the server.
+        let removedRunning = runningMissions.first { $0.missionId == id }
+        if removedRunning != nil {
+            withAnimation(.easeOut(duration: 0.2)) {
+                runningMissions.removeAll { $0.missionId == id }
+            }
+        }
         do {
             try await api.cancelMission(id: id)
-            
+
             // Refresh running missions
             await refreshRunningMissions()
-            
+
             // If we were viewing this mission, switch to current
             if viewingMissionId == id {
                 if let currentId = currentMission?.id {
                     await switchToMission(id: currentId)
                 }
             }
-            
+
             HapticService.success()
         } catch {
             print("Failed to cancel mission: \(error)")
+            // Restore the chip on failure.
+            if let restored = removedRunning,
+               !runningMissions.contains(where: { $0.missionId == id }) {
+                withAnimation {
+                    runningMissions.append(restored)
+                }
+            }
             HapticService.error()
         }
     }
