@@ -569,19 +569,11 @@ struct ControlView: View {
         .sheet(isPresented: $showQueueSheet) {
             QueueSheet(
                 items: queuedItems,
-                // Synchronous removes so swipe-to-delete shrinks the row in
-                // the same render frame as the gesture, even on a slow
-                // network (the API call is fire-and-forget; the optimistic
-                // update is rolled back on failure). The previous Task
-                // wrapper deferred the mutation by one runloop tick, which
-                // SwiftUI's `List.onDelete` interprets as "data source
-                // didn't shrink" — the row snapped back before
-                // disappearing.
                 onRemove: { messageId in
-                    removeFromQueueOptimistic(messageId: messageId)
+                    Task { await removeFromQueue(messageId: messageId) }
                 },
                 onClearAll: {
-                    clearQueueOptimistic()
+                    Task { await clearQueue() }
                 },
                 onDismiss: {
                     showQueueSheet = false
@@ -1092,14 +1084,12 @@ struct ControlView: View {
         case "codex": pool = catalog.codex ?? []
         case "claudecode": pool = catalog.claudecode
         case "opencode": pool = catalog.opencode
-        case "grok": pool = catalog.grok ?? []
         default:
             // No mission yet → show every backend's commands so the user
             // can preview what's available.
             pool = catalog.opencode
                 + catalog.claudecode
                 + (catalog.codex ?? [])
-                + (catalog.grok ?? [])
         }
         return pool.filter { $0.matchesPrefix(nameFragment) }
     }
@@ -1650,13 +1640,6 @@ struct ControlView: View {
         let previousViewingId = viewingMissionId
         viewingMissionId = id
 
-        // Fire-and-forget: tell the backend the user opened this mission.
-        // First call (per AwaitingUser round) starts the 1h ack grace timer
-        // and paints the "opened" dot in Finished; later calls are no-ops.
-        Task { [api] in
-            _ = try? await api.markMissionOpened(id: id)
-        }
-
         // Clear stale workers from previous mission immediately
         childMissions = []
 
@@ -1676,10 +1659,8 @@ struct ControlView: View {
         }
 
         do {
-            async let metadataTask = api.getMission(id: id)
-            async let transcriptTask: MissionTranscriptResult? = try? await api.getMissionTranscript(id: id)
-            let mission = try await metadataTask
-            let transcriptResult = await transcriptTask
+            // Fetch mission metadata first (required)
+            let mission = try await api.getMission(id: id)
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -1690,76 +1671,42 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            if let transcript = transcriptResult {
-                let events = transcript.messages.map(\.storedEvent)
+            // Try to fetch full event history (optional - fall back to basic history if it fails)
+            do {
+                // Fetch all relevant event types including thinking events (matching web dashboard behavior)
+                let result = try await api.getMissionEventsWithMeta(id: id, types: historyEventTypes, limit: Self.initialEventLimit, latest: true)
+                let events = result.events
+
+                // Race condition guard after the second await
+                guard fetchingMissionId == id else {
+                    return
+                }
+
                 if events.isEmpty {
                     // Clear stale cache when events are empty to prevent visual flashing
                     removeMissionFromCache(mission.id)
                     applyViewingMission(mission)
                 } else {
-                    // Mirror the web client's transcript-meta fix: only
-                    // count event types the iOS app actually loads. The
-                    // backend's `event_counts` includes debug/status
-                    // events outside `historyEventTypes`; summing them
-                    // all inflates the total and keeps the "Load earlier
-                    // messages" affordance visible on missions that have
-                    // already shown every loadable event.
-                    let loadable = Set(historyEventTypes)
-                    let loadableTotal = transcript.eventCounts
-                        .filter { loadable.contains($0.key) }
-                        .values
-                        .reduce(0, +)
-                    hasMoreHistory = loadableTotal > events.count
+                    hasMoreHistory = events.count >= Self.initialEventLimit
                     applyViewingMissionWithEvents(mission, events: events)
-                    if transcript.latestSequence > 0 {
-                        missionMaxSeq[id] = transcript.latestSequence
-                    }
-                    cacheMissionWithEvents(mission, events: events)
-                    Task { [api] in
-                        if let trace = try? await api.getMissionTraceWithMeta(id: id, limit: Self.initialEventLimit, sinceSeq: 0),
-                           !trace.events.isEmpty {
-                            await MainActor.run {
-                                guard fetchingMissionId == id || viewingMissionId == id else { return }
-                                // Deduplicate by sequence — transcript and
-                                // trace endpoints can overlap on shared
-                                // sequence numbers (the web client does the
-                                // same via a Map keyed by sequence in its
-                                // `renderDeferredTraceRef`). Without dedup
-                                // any overlapping event would render twice
-                                // after the deferred trace fetch lands.
-                                var bySequence: [Int64: StoredEvent] = [:]
-                                bySequence.reserveCapacity(events.count + trace.events.count)
-                                for e in events { bySequence[e.sequence] = e }
-                                for e in trace.events { bySequence[e.sequence] = e }
-                                let merged = bySequence.values
-                                    .sorted { $0.sequence < $1.sequence }
-                                applyViewingMissionWithEvents(mission, events: merged)
-                                if let maxSeq = trace.maxSequence, maxSeq > 0 {
-                                    missionMaxSeq[id] = maxSeq
-                                }
-                                cacheMissionWithEvents(mission, events: merged)
-                            }
-                        }
-                    }
-                }
-            } else {
-                let fallback = try? await api.getMissionEventsWithMeta(
-                    id: id,
-                    types: historyEventTypes,
-                    limit: Self.initialEventLimit,
-                    latest: true
-                )
-                if let result = fallback, !result.events.isEmpty {
-                    hasMoreHistory = result.events.count >= Self.initialEventLimit
-                    applyViewingMissionWithEvents(mission, events: result.events)
                     if let maxSeq = result.maxSequence, maxSeq > 0 {
                         missionMaxSeq[id] = maxSeq
                     }
-                    cacheMissionWithEvents(mission, events: result.events)
-                } else if !hasCache {
+                    // Cache the mission with events for next time
+                    cacheMissionWithEvents(mission, events: events)
+                }
+            } catch {
+                print("Failed to load mission events (falling back to basic history): \(error)")
+                guard fetchingMissionId == id else {
+                    return
+                }
+                // If we already displayed cached data, keep it and don't flash to basic view
+                // Only clear cache and fall back if we didn't have cached data to begin with
+                if !hasCache {
                     removeMissionFromCache(mission.id)
                     applyViewingMission(mission)
                 }
+                // Otherwise: keep the cached view displayed, don't cause a flash
             }
 
             isLoading = false
@@ -1997,22 +1944,16 @@ struct ControlView: View {
 
     private func setMissionStatus(_ status: MissionStatus) async {
         guard let mission = viewingMission else { return }
-        let previousStatus = mission.status
-        // Flip the status pill instantly on the menu tap; roll back on
-        // failure so the badge tracks the server's true state.
-        viewingMission?.status = status
-        if currentMission?.id == mission.id {
-            currentMission?.status = status
-        }
+        
         do {
             try await api.setMissionStatus(id: mission.id, status: status)
+            viewingMission?.status = status
+            if currentMission?.id == mission.id {
+                currentMission?.status = status
+            }
             HapticService.success()
         } catch {
             print("Failed to set status: \(error)")
-            viewingMission?.status = previousStatus
-            if currentMission?.id == mission.id {
-                currentMission?.status = previousStatus
-            }
             HapticService.error()
         }
     }
@@ -2310,11 +2251,9 @@ struct ControlView: View {
         HapticService.lightTap()
 
         // Generate temp ID and add message optimistically BEFORE the API call
-        // This ensures messages appear in send order, not response order.
-        // The `isPending` flag dims the bubble and shows a tiny spinner so
-        // users on a slow network don't re-tap. (UX audit item #11.)
+        // This ensures messages appear in send order, not response order
         let tempId = "temp-\(UUID().uuidString)"
-        let tempMessage = ChatMessage(id: tempId, type: .user, content: content, isPending: true)
+        let tempMessage = ChatMessage(id: tempId, type: .user, content: content)
         messages.append(tempMessage)
         recomputeGroupedItems()
         scrollToBottomTick += 1
@@ -2324,17 +2263,10 @@ struct ControlView: View {
                 let (messageId, queued) = try await api.sendMessage(content: content)
 
                 // Replace temp ID with server-assigned ID, preserving timestamp
-                // This allows SSE handler to correctly deduplicate. Pending
-                // state is cleared so the bubble snaps back to full opacity.
+                // This allows SSE handler to correctly deduplicate
                 if let index = messages.firstIndex(where: { $0.id == tempId }) {
                     let originalTimestamp = messages[index].timestamp
-                    messages[index] = ChatMessage(
-                        id: messageId,
-                        type: .user,
-                        content: content,
-                        timestamp: originalTimestamp,
-                        isPending: false
-                    )
+                    messages[index] = ChatMessage(id: messageId, type: .user, content: content, timestamp: originalTimestamp)
                 }
 
                 // Update queue count when message was queued
@@ -2377,55 +2309,40 @@ struct ControlView: View {
         }
     }
 
-    /// Synchronous optimistic remove — runs *during* the swipe gesture so
-    /// SwiftUI's `List.onDelete` animation has the new (smaller) data
-    /// source on the same render frame. Network call is fire-and-forget
-    /// in a detached `Task`. The previous implementation wrapped the whole
-    /// thing in `Task { await … }`, which deferred the array mutation by
-    /// one runloop tick — on a slow connection the row visibly snapped
-    /// back to its original position before re-disappearing.
-    private func removeFromQueueOptimistic(messageId: String) {
-        withAnimation(.easeOut(duration: 0.2)) {
-            queuedItems.removeAll { $0.id == messageId }
-            queueLength = max(0, queueLength - 1)
-        }
-        Task {
-            do {
-                try await api.removeFromQueue(messageId: messageId)
-            } catch {
-                print("Failed to remove from queue: \(error)")
-                // Reconcile with the server on error so the row reappears
-                // if the delete actually didn't take effect.
-                await loadQueueItems()
-                queueLength = queuedItems.count
-                HapticService.error()
-            }
+    private func removeFromQueue(messageId: String) async {
+        // Optimistic update
+        queuedItems.removeAll { $0.id == messageId }
+        queueLength = max(0, queueLength - 1)
+
+        do {
+            try await api.removeFromQueue(messageId: messageId)
+        } catch {
+            print("Failed to remove from queue: \(error)")
+            // Refresh from server on error to get actual state
+            await loadQueueItems()
+            queueLength = queuedItems.count
+            HapticService.error()
         }
     }
 
-    /// Synchronous optimistic clear — same rationale as
-    /// `removeFromQueueOptimistic`.
-    private func clearQueueOptimistic() {
-        withAnimation(.easeOut(duration: 0.2)) {
-            queuedItems = []
-            queueLength = 0
-        }
+    private func clearQueue() async {
+        // Optimistic update
+        queuedItems = []
+        queueLength = 0
         showQueueSheet = false
-        Task {
-            do {
-                _ = try await api.clearQueue()
-                HapticService.success()
-            } catch {
-                print("Failed to clear queue: \(error)")
-                // Reconcile with the server on error so any items that
-                // did not actually clear reappear.
-                await loadQueueItems()
-                queueLength = queuedItems.count
-                HapticService.error()
-            }
+
+        do {
+            _ = try await api.clearQueue()
+            HapticService.success()
+        } catch {
+            print("Failed to clear queue: \(error)")
+            // Refresh from server on error to get actual state
+            await loadQueueItems()
+            queueLength = queuedItems.count
+            HapticService.error()
         }
     }
-
+    
     private func startStreaming() {
         streamTask = Task {
             // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
@@ -2569,21 +2486,7 @@ struct ControlView: View {
         // Clear stale workers from previous mission immediately
         childMissions = []
 
-        // Cache-first render so mission switches don't blank the chat.
-        // `loadMission` has done this for a while; `switchToMission` (used by
-        // the mission switcher, running-mission chip, worker peek) used to
-        // skip the cache and show `LoadingView("Loading conversation…")`
-        // until both the metadata and the events round-trips returned —
-        // multi-second blank on a slow link even when the data was already
-        // on disk. (UX audit item #1.)
-        let hasCache: Bool
-        if let cached = loadCachedMissionData(id) {
-            applyViewingMissionWithEvents(cached.mission, events: cached.events)
-            hasCache = true
-        } else {
-            hasCache = false
-            isLoading = true
-        }
+        isLoading = true
 
         // Determine the run state for this mission from runningMissions
         if let runningInfo = runningMissions.first(where: { $0.missionId == id }) {
@@ -2605,14 +2508,8 @@ struct ControlView: View {
         progress = nil
 
         do {
-            // Fan out metadata + events in parallel. They share only `id`, so
-            // the previous serial chain (getMission then
-            // getMissionEventsWithMeta) added one mandatory RTT for nothing.
-            // (UX audit item #2.)
-            async let metadataTask = api.getMission(id: id)
-            async let eventsTask: MissionEventsResult? = try? await api.getMissionEventsWithMeta(id: id, types: historyEventTypes)
-            let mission = try await metadataTask
-            let eventResult = await eventsTask
+            // Load the mission from API
+            let mission = try await api.getMission(id: id)
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -2624,16 +2521,19 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            if let result = eventResult, !result.events.isEmpty {
+            // Fetch full event history to avoid partial history rendering.
+            // Use the meta variant so the `X-Max-Sequence` header seeds the
+            // delta-resume cursor — otherwise missions loaded via the switcher
+            // would always fall back to a full tail reload on reconnect.
+            if let result = try? await api.getMissionEventsWithMeta(id: id, types: historyEventTypes), !result.events.isEmpty {
+                guard fetchingMissionId == id else { return }
                 applyViewingMissionWithEvents(mission, events: result.events)
                 if let maxSeq = result.maxSequence, maxSeq > 0 {
                     missionMaxSeq[id] = maxSeq
                 }
                 cacheMissionWithEvents(mission, events: result.events)
-            } else if !hasCache {
-                // Only fall through to "no events" if we never rendered the
-                // cached transcript — otherwise an intermittent events
-                // failure would blow away a perfectly good cached view.
+            } else {
+                guard fetchingMissionId == id else { return }
                 removeMissionFromCache(mission.id)
                 applyViewingMission(mission)
             }
@@ -2669,38 +2569,22 @@ struct ControlView: View {
     }
     
     private func cancelMission(id: String) async {
-        // Drop the chip from the running-missions bar immediately so the
-        // tap-to-cancel feels instant on slow networks. The
-        // `refreshRunningMissions` below reconciles with the server.
-        let removedRunning = runningMissions.first { $0.missionId == id }
-        if removedRunning != nil {
-            withAnimation(.easeOut(duration: 0.2)) {
-                runningMissions.removeAll { $0.missionId == id }
-            }
-        }
         do {
             try await api.cancelMission(id: id)
-
+            
             // Refresh running missions
             await refreshRunningMissions()
-
+            
             // If we were viewing this mission, switch to current
             if viewingMissionId == id {
                 if let currentId = currentMission?.id {
                     await switchToMission(id: currentId)
                 }
             }
-
+            
             HapticService.success()
         } catch {
             print("Failed to cancel mission: \(error)")
-            // Restore the chip on failure.
-            if let restored = removedRunning,
-               !runningMissions.contains(where: { $0.missionId == id }) {
-                withAnimation {
-                    runningMissions.append(restored)
-                }
-            }
             HapticService.error()
         }
     }
@@ -3390,19 +3274,6 @@ private struct MessageBubble: View {
                             topTrailingRadius: 20
                         )
                     )
-                    // While the message is awaiting server ack, dim the bubble
-                    // and overlay a small spinner so the user has unambiguous
-                    // feedback that the send is in flight. (UX audit item #11.)
-                    .opacity(message.isPending ? 0.55 : 1)
-                    .overlay(alignment: .bottomTrailing) {
-                        if message.isPending {
-                            ProgressView()
-                                .controlSize(.mini)
-                                .tint(.white)
-                                .padding(6)
-                        }
-                    }
-                    .animation(.easeOut(duration: 0.15), value: message.isPending)
                     .contextMenu {
                         Button {
                             onCopy?()
@@ -5240,11 +5111,9 @@ private struct MissionRow: View {
         switch status {
         case .pending: return Theme.warning
         case .active: return Theme.success
-        case .awaitingUser: return Theme.warning
-        case .acknowledged: return Theme.success
         case .completed: return Theme.textMuted
         case .failed: return Theme.error
-        case .interrupted, .blocked: return Theme.error
+        case .interrupted, .blocked: return Theme.warning
         case .notFeasible: return Theme.error
         case .unknown: return Theme.textMuted
         }
@@ -5257,8 +5126,6 @@ private struct MissionRow: View {
         switch status {
         case .pending: return "clock.fill"
         case .active: return "play.circle.fill"
-        case .awaitingUser: return "hand.wave.fill"
-        case .acknowledged: return "checkmark.circle.fill"
         case .completed: return "checkmark.circle.fill"
         case .failed: return "xmark.circle.fill"
         case .interrupted: return "pause.circle.fill"

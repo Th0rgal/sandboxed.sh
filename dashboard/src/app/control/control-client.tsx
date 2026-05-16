@@ -2942,6 +2942,7 @@ function CollapsedToolGroup({
 }) {
   const hiddenCount = tools.length - 1;
   const lastTool = tools[tools.length - 1];
+  const previousTools = tools.slice(0, -1);
 
   // Helper to render appropriate tool component
   const renderTool = (tool: Extract<ChatItem, { kind: "tool" }>) => {
@@ -2959,9 +2960,11 @@ function CollapsedToolGroup({
   };
 
   if (isExpanded) {
-    // Show all tools with a collapse button at the top
+    // Older tools expand upward, keeping the collapse control near the latest tool.
     return (
       <div className="space-y-2">
+        {previousTools.map((tool) => renderTool(tool))}
+        {renderTool(lastTool)}
         <button
           onClick={onToggleExpand}
           className={cn(
@@ -2971,17 +2974,17 @@ function CollapsedToolGroup({
             "transition-all duration-200 text-xs"
           )}
         >
-          <ChevronUp className="h-3 w-3" />
+          <ChevronRight className="h-3 w-3" />
           <span>Hide {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}</span>
         </button>
-        {tools.map((tool) => renderTool(tool))}
       </div>
     );
   }
 
-  // Collapsed state - show expand button + last tool
+  // Collapsed state - show latest tool, then the upward expand control.
   return (
     <div className="space-y-2">
+      {renderTool(lastTool)}
       <button
         onClick={onToggleExpand}
         className={cn(
@@ -2991,10 +2994,9 @@ function CollapsedToolGroup({
           "transition-all duration-200 text-xs"
         )}
       >
-        <ChevronDown className="h-3 w-3" />
+        <ChevronUp className="h-3 w-3" />
         <span>Show {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}</span>
       </button>
-      {renderTool(lastTool)}
     </div>
   );
 }
@@ -7425,6 +7427,28 @@ export default function ControlClient() {
           ]);
           toast.error(msg);
         }
+      }
+
+      // `stream_lagged` is emitted by the server when this SSE
+      // subscriber's broadcast cursor falls behind the channel buffer
+      // (chatty mission outpaces the browser tab's JS event handler).
+      // The stream itself stays alive — we just missed a window of
+      // events. Silently catch up via the existing delta-resume path
+      // (`reloadMissionHistory` → `loadHistoryEvents(sinceSeq)`) so the
+      // user never sees a scary error toast for what is a transient
+      // back-pressure event.
+      if (event.type === "stream_lagged") {
+        const dropped = isRecord(data) && typeof data["dropped"] === "number"
+          ? (data["dropped"] as number)
+          : undefined;
+        streamLog("warn", "stream_lagged — refetching", { dropped });
+        const viewingId = viewingMissionIdRef.current;
+        if (viewingId) {
+          void reloadMissionHistory(viewingId).catch((err) => {
+            streamLog("warn", "stream_lagged refetch failed", { err: String(err) });
+          });
+        }
+        return;
       }
 
       // Handle mission status changes
