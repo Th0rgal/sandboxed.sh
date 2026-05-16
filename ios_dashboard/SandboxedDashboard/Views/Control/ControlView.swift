@@ -569,11 +569,19 @@ struct ControlView: View {
         .sheet(isPresented: $showQueueSheet) {
             QueueSheet(
                 items: queuedItems,
+                // Synchronous removes so swipe-to-delete shrinks the row in
+                // the same render frame as the gesture, even on a slow
+                // network (the API call is fire-and-forget; the optimistic
+                // update is rolled back on failure). The previous Task
+                // wrapper deferred the mutation by one runloop tick, which
+                // SwiftUI's `List.onDelete` interprets as "data source
+                // didn't shrink" — the row snapped back before
+                // disappearing.
                 onRemove: { messageId in
-                    Task { await removeFromQueue(messageId: messageId) }
+                    removeFromQueueOptimistic(messageId: messageId)
                 },
                 onClearAll: {
-                    Task { await clearQueue() }
+                    clearQueueOptimistic()
                 },
                 onDismiss: {
                     showQueueSheet = false
@@ -2363,40 +2371,55 @@ struct ControlView: View {
         }
     }
 
-    private func removeFromQueue(messageId: String) async {
-        // Optimistic update
-        queuedItems.removeAll { $0.id == messageId }
-        queueLength = max(0, queueLength - 1)
-
-        do {
-            try await api.removeFromQueue(messageId: messageId)
-        } catch {
-            print("Failed to remove from queue: \(error)")
-            // Refresh from server on error to get actual state
-            await loadQueueItems()
-            queueLength = queuedItems.count
-            HapticService.error()
+    /// Synchronous optimistic remove — runs *during* the swipe gesture so
+    /// SwiftUI's `List.onDelete` animation has the new (smaller) data
+    /// source on the same render frame. Network call is fire-and-forget
+    /// in a detached `Task`. The previous implementation wrapped the whole
+    /// thing in `Task { await … }`, which deferred the array mutation by
+    /// one runloop tick — on a slow connection the row visibly snapped
+    /// back to its original position before re-disappearing.
+    private func removeFromQueueOptimistic(messageId: String) {
+        withAnimation(.easeOut(duration: 0.2)) {
+            queuedItems.removeAll { $0.id == messageId }
+            queueLength = max(0, queueLength - 1)
+        }
+        Task {
+            do {
+                try await api.removeFromQueue(messageId: messageId)
+            } catch {
+                print("Failed to remove from queue: \(error)")
+                // Reconcile with the server on error so the row reappears
+                // if the delete actually didn't take effect.
+                await loadQueueItems()
+                queueLength = queuedItems.count
+                HapticService.error()
+            }
         }
     }
 
-    private func clearQueue() async {
-        // Optimistic update
-        queuedItems = []
-        queueLength = 0
+    /// Synchronous optimistic clear — same rationale as
+    /// `removeFromQueueOptimistic`.
+    private func clearQueueOptimistic() {
+        withAnimation(.easeOut(duration: 0.2)) {
+            queuedItems = []
+            queueLength = 0
+        }
         showQueueSheet = false
-
-        do {
-            _ = try await api.clearQueue()
-            HapticService.success()
-        } catch {
-            print("Failed to clear queue: \(error)")
-            // Refresh from server on error to get actual state
-            await loadQueueItems()
-            queueLength = queuedItems.count
-            HapticService.error()
+        Task {
+            do {
+                _ = try await api.clearQueue()
+                HapticService.success()
+            } catch {
+                print("Failed to clear queue: \(error)")
+                // Reconcile with the server on error so any items that
+                // did not actually clear reappear.
+                await loadQueueItems()
+                queueLength = queuedItems.count
+                HapticService.error()
+            }
         }
     }
-    
+
     private func startStreaming() {
         streamTask = Task {
             // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
