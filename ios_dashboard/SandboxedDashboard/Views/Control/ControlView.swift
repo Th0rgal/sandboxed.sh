@@ -1084,12 +1084,14 @@ struct ControlView: View {
         case "codex": pool = catalog.codex ?? []
         case "claudecode": pool = catalog.claudecode
         case "opencode": pool = catalog.opencode
+        case "grok": pool = catalog.grok ?? []
         default:
             // No mission yet → show every backend's commands so the user
             // can preview what's available.
             pool = catalog.opencode
                 + catalog.claudecode
                 + (catalog.codex ?? [])
+                + (catalog.grok ?? [])
         }
         return pool.filter { $0.matchesPrefix(nameFragment) }
     }

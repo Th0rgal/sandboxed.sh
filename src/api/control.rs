@@ -6626,8 +6626,7 @@ async fn maybe_begin_grok_goal(
             reason: "this mission already has an active /goal loop — wait for it to finish or cancel before starting a new one".to_string(),
         };
     }
-    if let Err(e) = super::grok_goal::create_goal_automation(mission_store, mid, &objective).await
-    {
+    if let Err(e) = super::grok_goal::create_goal_automation(mission_store, mid, &objective).await {
         tracing::warn!(
             "grok_goal: failed to create automation for mission {}: {}",
             mid,

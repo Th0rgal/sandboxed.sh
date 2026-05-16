@@ -63,7 +63,9 @@ pub const VAR_MISSING_COUNT: &str = "goal_missing_count";
 pub enum GoalSentinel {
     Complete,
     Continue,
-    Aborted { reason: String },
+    Aborted {
+        reason: String,
+    },
     /// No sentinel present in the assistant text. Treated leniently — see
     /// [`MAX_MISSING_SENTINELS`].
     Missing,
@@ -179,15 +181,17 @@ pub async fn active_goal_for_mission(
     automations.into_iter().find(|a| {
         a.active
             && matches!(a.trigger, TriggerType::AgentFinished)
-            && a.variables.get(GROK_GOAL_TAG_KEY).map(String::as_str)
-                == Some(GROK_GOAL_TAG_VALUE)
+            && a.variables.get(GROK_GOAL_TAG_KEY).map(String::as_str) == Some(GROK_GOAL_TAG_VALUE)
     })
 }
 
 /// Build the variables map for a fresh grok-goal automation.
 fn initial_variables(objective: &str, iteration: u32) -> HashMap<String, String> {
     let mut v = HashMap::new();
-    v.insert(GROK_GOAL_TAG_KEY.to_string(), GROK_GOAL_TAG_VALUE.to_string());
+    v.insert(
+        GROK_GOAL_TAG_KEY.to_string(),
+        GROK_GOAL_TAG_VALUE.to_string(),
+    );
     v.insert(VAR_OBJECTIVE.to_string(), objective.to_string());
     v.insert(VAR_ITERATION.to_string(), iteration.to_string());
     v.insert(VAR_MISSING_COUNT.to_string(), "0".to_string());
