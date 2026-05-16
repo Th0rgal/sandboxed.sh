@@ -299,10 +299,7 @@ fn parse_grok_device_auth_line(line: &str) -> (Option<String>, Option<String>) {
     let auth_url = trimmed
         .split_whitespace()
         .find(|part| part.starts_with("https://"))
-        .map(|part| {
-            part.trim_end_matches(|c: char| c == '.' || c == ',')
-                .to_string()
-        });
+        .map(|part| part.trim_end_matches(['.', ',']).to_string());
 
     let user_code = if let Some(ref url) = auth_url {
         url::Url::parse(url).ok().and_then(|url| {
