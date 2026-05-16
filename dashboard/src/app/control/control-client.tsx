@@ -33,9 +33,12 @@ import {
   postControlToolResult,
   streamControl,
   loadMission,
+  markMissionOpened,
   getMission,
   getMissionEvents,
   getMissionEventsWithMeta,
+  getMissionTranscript,
+  getMissionTraceWithMeta,
   searchMissionMoments,
   createMission,
   updateMissionSettings,
@@ -908,6 +911,7 @@ function statusLabel(state: ControlRunState): {
     case "waiting_for_tool":
       return { label: "Waiting", Icon: Loader, className: "text-amber-400" };
   }
+  return { label: "Idle", Icon: Clock, className: "text-white/40" };
 }
 
 function missionStatusLabel(status: MissionStatus, isRunning = false): {
@@ -921,6 +925,13 @@ function missionStatusLabel(status: MissionStatus, isRunning = false): {
   switch (status) {
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
+    case "awaiting_user":
+      return { label: "Needs You", className: "bg-sky-500/20 text-sky-400" };
+    case "acknowledged":
+      return {
+        label: "Acknowledged",
+        className: "bg-emerald-500/20 text-emerald-400",
+      };
     case "completed":
       return {
         label: "Completed",
@@ -989,31 +1000,56 @@ function Shimmer({ className }: { className?: string }) {
 }
 
 function ChatLoadingSkeleton() {
+  // Mirrors ChatItemRow: assistant rows are left-aligned with a Bot avatar
+  // (h-8 w-8 bg-indigo-500/20), user rows are right-aligned with a User
+  // avatar (bg-white/[0.08]) and a solid indigo bubble. Both bubbles use
+  // max-w-[80%].
+  const rows: Array<"assistant" | "user"> = ["assistant", "user", "assistant"];
   return (
     <div className="mx-auto max-w-3xl space-y-6 animate-pulse">
-      {[0, 1, 2].map((idx) => (
-        <div
-          key={idx}
-          className={cn(
-            "flex gap-3",
-            idx % 2 === 0 ? "justify-start" : "justify-end"
-          )}
-        >
-          {idx % 2 === 0 && (
-            <div className="h-8 w-8 shrink-0 rounded-full bg-white/[0.06]" />
-          )}
+      {rows.map((role, idx) => {
+        const isAssistant = role === "assistant";
+        return (
           <div
+            key={idx}
             className={cn(
-              "rounded-2xl border border-white/[0.06] bg-white/[0.03] px-4 py-3",
-              idx % 2 === 0 ? "w-[70%] rounded-tl-md" : "w-[58%] rounded-tr-md"
+              "flex gap-3",
+              isAssistant ? "justify-start" : "justify-end"
             )}
           >
-            <div className="h-3 rounded bg-white/[0.08]" />
-            <div className="mt-2 h-3 w-4/5 rounded bg-white/[0.06]" />
-            {idx === 0 && <div className="mt-2 h-3 w-2/3 rounded bg-white/[0.06]" />}
+            {isAssistant && (
+              <div className="h-8 w-8 shrink-0 rounded-full bg-indigo-500/20" />
+            )}
+            <div
+              className={cn(
+                "max-w-[80%] rounded-2xl px-4 py-3",
+                isAssistant
+                  ? "rounded-tl-md border border-white/[0.06] bg-white/[0.03]"
+                  : "rounded-tr-md bg-indigo-500/70"
+              )}
+            >
+              <div
+                className={cn(
+                  "h-3 w-48 rounded",
+                  isAssistant ? "bg-white/[0.08]" : "bg-white/30"
+                )}
+              />
+              <div
+                className={cn(
+                  "mt-2 h-3 w-40 rounded",
+                  isAssistant ? "bg-white/[0.06]" : "bg-white/20"
+                )}
+              />
+              {isAssistant && (
+                <div className="mt-2 h-3 w-32 rounded bg-white/[0.06]" />
+              )}
+            </div>
+            {!isAssistant && (
+              <div className="h-8 w-8 shrink-0 rounded-full bg-white/[0.08]" />
+            )}
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -3627,7 +3663,7 @@ export default function ControlClient() {
   const desktopRapidPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Thinking panel state
-  const [showThinkingPanel, setShowThinkingPanel] = useState(false);
+  const [showThinkingPanel, setShowThinkingPanel] = useState(true);
   // Deferred mirror used by the heavy chat-list regrouping memo so the toggle
   // click stays interactive even on long missions.
   const deferredShowThinkingPanel = useDeferredValue(showThinkingPanel);
@@ -3687,6 +3723,9 @@ export default function ControlClient() {
     ],
     []
   );
+  const renderDeferredTraceRef = useRef<
+    ((id: string, traceEvents: StoredEvent[], maxSequence?: number) => void) | null
+  >(null);
   /**
    * Per-mission high-water mark for `sequence`. When non-zero, reload
    * paths pass it as `since_seq` to `/events` so the server returns
@@ -3819,21 +3858,36 @@ export default function ControlClient() {
       }
 
       if (!sorted) {
-        // Cache miss (or delta path bailed). Request the most recent
-        // INITIAL_HISTORY_PAGE_SIZE events; `latest=true` lets the server
-        // compute the tail offset in one shot. The page size is
-        // intentionally small so first paint isn't gated on the full
-        // mission history; `streamOlderHistory` runs after to fill in the
-        // rest in the background.
-        const { events, meta } = await getMissionEventsWithMeta(id, {
-          types: HISTORY_EVENT_TYPES,
-          latest: true,
-          limit: INITIAL_HISTORY_PAGE_SIZE,
-        });
-        // Defensive: sort by sequence ASC in case upstream contract changes.
-        sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
-        metaMaxSeq = meta.maxSequence;
-        metaTotal = meta.totalEvents;
+        try {
+          const transcript = await getMissionTranscript(id);
+          sorted = transcript.messages
+            .map(({ trace_count: _traceCount, trace_summary: _traceSummary, ...event }) => event)
+            .sort((a, b) => a.sequence - b.sequence);
+          metaMaxSeq = transcript.latest_sequence;
+          metaTotal = Object.values(transcript.event_counts).reduce((sum, count) => sum + count, 0);
+
+          // Fetch hidden thoughts/tools after first paint. The renderer ref is
+          // populated below `eventsToItems`; this avoids blocking transcript
+          // display on the heavier activity trace.
+          setTimeout(() => {
+            void getMissionTraceWithMeta(id, { sinceSeq: 0, limit: HISTORY_PAGE_SIZE })
+              .then(({ events, meta }) => {
+                renderDeferredTraceRef.current?.(id, events, meta.maxSequence);
+              })
+              .catch(() => undefined);
+          }, 0);
+        } catch {
+          // Older backends do not expose `/transcript`; keep the existing full
+          // tail fetch as a compatibility fallback.
+          const { events, meta } = await getMissionEventsWithMeta(id, {
+            types: HISTORY_EVENT_TYPES,
+            latest: true,
+            limit: INITIAL_HISTORY_PAGE_SIZE,
+          });
+          sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
+          metaMaxSeq = meta.maxSequence;
+          metaTotal = meta.totalEvents;
+        }
       }
 
       // Only seed `missionMaxSeqRef` when the server has confirmed it
@@ -4001,6 +4055,18 @@ export default function ControlClient() {
 
   useEffect(() => {
     setThinkingPanelManuallyHidden(false);
+  }, [viewingMissionId]);
+
+  // Tell the backend the user opened this mission. The server records
+  // `first_viewed_at` on the first call (starting the 1h ack grace timer
+  // for `awaiting_user` missions and painting the "opened" dot for
+  // Finished missions); later calls are no-ops on the server. Fire-and-
+  // forget — failure to record opening is not user-visible.
+  useEffect(() => {
+    if (!viewingMissionId) return;
+    markMissionOpened(viewingMissionId).catch((err) => {
+      console.warn("markMissionOpened failed", err);
+    });
   }, [viewingMissionId]);
 
   // `groupedItems`, `thinkingItems`, etc. are all produced in the single
@@ -4979,6 +5045,36 @@ export default function ControlClient() {
 
     return items;
   }, []);
+
+  renderDeferredTraceRef.current = (id, traceEvents, maxSequence) => {
+    if (traceEvents.length === 0) return;
+    const liveCurrent = currentMissionRef.current;
+    const liveViewing = viewingMissionRef.current;
+    const mission =
+      liveCurrent?.id === id ? liveCurrent : liveViewing?.id === id ? liveViewing : null;
+    if (!mission) return;
+
+    const existing = missionHistoricEventsRef.current.get(id) ?? [];
+    const bySequence = new Map<number, StoredEvent>();
+    for (const event of existing) bySequence.set(event.sequence, event);
+    for (const event of traceEvents) bySequence.set(event.sequence, event);
+    const merged = [...bySequence.values()].sort((a, b) => a.sequence - b.sequence);
+    missionHistoricEventsRef.current.set(id, merged);
+    if (merged.length > 0) {
+      missionMinSeqRef.current.set(id, merged[0].sequence);
+    }
+    if (maxSequence !== undefined && maxSequence > 0) {
+      missionMaxSeqRef.current.set(id, maxSequence);
+    }
+
+    const newHistoricItems = eventsToItems(merged, mission);
+    const oldHistoricCount = historicItemsCountRef.current.get(id) ?? 0;
+    historicItemsCountRef.current.set(id, newHistoricItems.length);
+    setItems((prev) => {
+      const liveTail = prev.slice(oldHistoricCount);
+      return [...newHistoricItems, ...liveTail];
+    });
+  };
 
   /**
    * Fetch the next page of older history events (events with `sequence`

@@ -55,6 +55,15 @@ const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.
 /// CancelMission re-check to keep the two views of "stalled" consistent.
 const STUCK_SECONDS: u64 = 900;
 
+/// Grace period after the user first opens an `AwaitingUser` mission before
+/// the ack-promotion tick auto-archives it to `Acknowledged` (Finished).
+/// Resets whenever the user sends a new message (status returns to Active and
+/// `first_viewed_at` is cleared).
+const ACK_GRACE_SECONDS: u64 = 3600;
+
+/// How often the ack-promotion tick scans for stale `AwaitingUser` missions.
+const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
 pub(super) fn safe_truncate_index(s: &str, max: usize) -> usize {
     if s.len() <= max {
@@ -278,10 +287,12 @@ fn is_terminal_mission_status(status: &MissionStatus) -> bool {
     matches!(
         status,
         MissionStatus::Completed
+            | MissionStatus::Acknowledged
             | MissionStatus::Failed
             | MissionStatus::Interrupted
             | MissionStatus::Blocked
             | MissionStatus::NotFeasible
+            | MissionStatus::AwaitingUser
     )
 }
 
@@ -3018,6 +3029,12 @@ pub enum MissionStatus {
     /// Mission created but hasn't received any messages yet
     Pending,
     Active,
+    /// Agent's turn / automation cycle finished cleanly with no follow-up
+    /// queued; mission is parked waiting for the user to read it.
+    AwaitingUser,
+    /// User opened the mission while it was AwaitingUser and the ack grace
+    /// period elapsed without a new message — mission is auto-archived.
+    Acknowledged,
     Completed,
     Failed,
     /// Mission was interrupted (server shutdown, cancellation, etc.)
@@ -3033,6 +3050,8 @@ impl std::fmt::Display for MissionStatus {
         match self {
             Self::Pending => write!(f, "pending"),
             Self::Active => write!(f, "active"),
+            Self::AwaitingUser => write!(f, "awaiting_user"),
+            Self::Acknowledged => write!(f, "acknowledged"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
             Self::Blocked => write!(f, "blocked"),
@@ -4369,6 +4388,40 @@ pub async fn load_mission(
     })
 }
 
+/// Record that the user opened this mission for the first time since it last
+/// entered `AwaitingUser`. Sets `first_viewed_at` to now (no-op if already set)
+/// and broadcasts a `MissionStatusChanged` event so other clients can render
+/// the "opened" dot. The dashboard and iOS clients call this from their
+/// mission-detail entry points; the periodic ack-promotion tick uses the
+/// timestamp to decide when to move the mission to `Acknowledged`.
+pub async fn mark_mission_opened(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let now = chrono::Utc::now().to_rfc3339();
+    let newly_set = control
+        .mission_store
+        .set_mission_first_viewed_at_if_unset(id, &now)
+        .await
+        .map_err(internal_error)?;
+    let mission = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
+    if newly_set.is_some() {
+        let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+            mission_id: id,
+            status: mission.status,
+            summary: None,
+        });
+    }
+    Ok(Json(mission))
+}
+
 /// Set mission status (completed/failed).
 pub async fn set_mission_status(
     State(state): State<Arc<AppState>>,
@@ -4624,6 +4677,230 @@ pub async fn get_mission_events(
         }
     }
     // CORS exposure so browsers can read these headers from JS.
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        header::HeaderValue::from_static("X-Total-Events, X-Max-Sequence"),
+    );
+
+    Ok(response)
+}
+
+const TRANSCRIPT_EVENT_TYPES: &[&str] = &["user_message", "assistant_message"];
+const TRACE_EVENT_TYPES: &[&str] = &[
+    "thinking",
+    "tool_call",
+    "tool_result",
+    "text_delta",
+    "error",
+    "phase",
+    "status",
+];
+
+fn event_visibility(event_type: &str) -> &'static str {
+    match event_type {
+        "user_message" | "assistant_message" | "mission_status_changed" => "transcript",
+        "thinking" | "tool_call" | "tool_result" | "text_delta" | "phase" | "status" | "error" => {
+            "trace"
+        }
+        _ => "debug",
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TranscriptMessage {
+    #[serde(flatten)]
+    pub event: mission_store::StoredEvent,
+    /// Count of non-transcript events after the previous transcript row and
+    /// before this row. Lets clients reserve a Thinking/Activity affordance
+    /// without downloading the trace on the first mission paint.
+    pub trace_count: usize,
+    pub trace_summary: HashMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MissionTranscriptResponse {
+    pub mission: Mission,
+    pub messages: Vec<TranscriptMessage>,
+    pub event_counts: HashMap<String, usize>,
+    pub visibility_counts: HashMap<String, usize>,
+    pub latest_sequence: i64,
+}
+
+async fn event_count_map(
+    store: &(dyn MissionStore + Send + Sync),
+    mission_id: Uuid,
+    event_types: &[&str],
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for event_type in event_types {
+        if let Ok(count) = store.count_events(mission_id, Some(&[*event_type])).await {
+            counts.insert((*event_type).to_string(), count);
+        }
+    }
+    counts
+}
+
+fn trace_summary_between(
+    trace_events: &[mission_store::StoredEvent],
+    after_sequence: i64,
+    before_sequence: i64,
+) -> HashMap<String, usize> {
+    let mut summary = HashMap::new();
+    for event in trace_events {
+        if event.sequence > after_sequence && event.sequence < before_sequence {
+            *summary.entry(event.event_type.clone()).or_insert(0) += 1;
+        }
+    }
+    summary
+}
+
+/// Lightweight initial mission payload: final chat transcript only, plus event
+/// counts/cursors so clients can fetch the hidden activity trace afterward.
+pub async fn get_mission_transcript(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+) -> Result<Json<MissionTranscriptResponse>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mut mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "Mission not found".to_string()))?;
+
+    if let Some(workspace) = state.workspaces.get(mission.workspace_id).await {
+        mission.workspace_name = Some(workspace.name);
+    }
+
+    let transcript_events = control
+        .mission_store
+        .get_events(mission_id, Some(TRANSCRIPT_EVENT_TYPES), None, None)
+        .await
+        .map_err(internal_error)?;
+    let trace_events = control
+        .mission_store
+        .get_events(mission_id, Some(TRACE_EVENT_TYPES), None, None)
+        .await
+        .map_err(internal_error)?;
+    let latest_sequence = control
+        .mission_store
+        .max_event_sequence(mission_id)
+        .await
+        .map_err(internal_error)?;
+
+    let mut previous_transcript_sequence = 0;
+    let mut messages = Vec::with_capacity(transcript_events.len());
+    for event in transcript_events {
+        let trace_summary =
+            trace_summary_between(&trace_events, previous_transcript_sequence, event.sequence);
+        let trace_count = trace_summary.values().sum();
+        previous_transcript_sequence = event.sequence;
+        messages.push(TranscriptMessage {
+            event,
+            trace_count,
+            trace_summary,
+        });
+    }
+
+    let mut known_types = Vec::new();
+    known_types.extend_from_slice(TRANSCRIPT_EVENT_TYPES);
+    known_types.extend_from_slice(TRACE_EVENT_TYPES);
+    known_types.push("mission_status_changed");
+    let event_counts = event_count_map(&*control.mission_store, mission_id, &known_types).await;
+
+    let mut visibility_counts: HashMap<String, usize> = HashMap::new();
+    for (event_type, count) in &event_counts {
+        *visibility_counts
+            .entry(event_visibility(event_type).to_string())
+            .or_insert(0) += *count;
+    }
+
+    Ok(Json(MissionTranscriptResponse {
+        mission,
+        messages,
+        event_counts,
+        visibility_counts,
+        latest_sequence,
+    }))
+}
+
+/// Deferred intermediate activity for a mission. This returns thoughts, tool
+/// calls/results, text deltas, and runtime/status events while keeping the
+/// first transcript request small.
+pub async fn get_mission_trace(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<GetEventsQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?;
+    if mission.is_none() {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    }
+
+    let events = if let Some(before_seq) = query.before_seq {
+        control
+            .mission_store
+            .get_events_before(mission_id, before_seq, Some(TRACE_EVENT_TYPES), query.limit)
+            .await
+            .map_err(internal_error)?
+    } else if let Some(since_seq) = query.since_seq {
+        control
+            .mission_store
+            .get_events_since(mission_id, since_seq, Some(TRACE_EVENT_TYPES), query.limit)
+            .await
+            .map_err(internal_error)?
+    } else {
+        let offset = if query.latest.unwrap_or(false) {
+            if let Some(limit) = query.limit {
+                let total = control
+                    .mission_store
+                    .count_events(mission_id, Some(TRACE_EVENT_TYPES))
+                    .await
+                    .map_err(internal_error)?;
+                Some(total.saturating_sub(limit))
+            } else {
+                query.offset
+            }
+        } else {
+            query.offset
+        };
+        control
+            .mission_store
+            .get_events(mission_id, Some(TRACE_EVENT_TYPES), query.limit, offset)
+            .await
+            .map_err(internal_error)?
+    };
+
+    let total = control
+        .mission_store
+        .count_events(mission_id, Some(TRACE_EVENT_TYPES))
+        .await
+        .ok();
+    let max_seq = control
+        .mission_store
+        .max_event_sequence(mission_id)
+        .await
+        .ok();
+
+    let mut response = Json(events).into_response();
+    let headers = response.headers_mut();
+    if let Some(total) = total {
+        if let Ok(v) = header::HeaderValue::from_str(&total.to_string()) {
+            headers.insert("X-Total-Events", v);
+        }
+    }
+    if let Some(max_seq) = max_seq {
+        if let Ok(v) = header::HeaderValue::from_str(&max_seq.to_string()) {
+            headers.insert("X-Max-Sequence", v);
+        }
+    }
     headers.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         header::HeaderValue::from_static("X-Total-Events, X-Max-Sequence"),
@@ -5112,6 +5389,10 @@ fn spawn_control_session(
             state.cmd_tx.clone(),
             events_tx.clone(),
         ));
+        tokio::spawn(ack_promotion_loop(
+            Arc::clone(&state.mission_store),
+            events_tx.clone(),
+        ));
     }
 
     // Spawn event logger task (logs all events to SQLite for debugging/replay)
@@ -5415,6 +5696,41 @@ async fn cleanup_stale_active_missions_once(
 ///
 /// Threshold is intentionally generous (15 min) so a model in the
 /// middle of a slow API turn or a long shell command isn't false-killed.
+/// Periodic ack-promotion: scans `AwaitingUser` missions whose
+/// `first_viewed_at` is older than `ACK_GRACE_SECONDS` and flips them to
+/// `Acknowledged`. Broadcasts `MissionStatusChanged` so dashboard/iOS clients
+/// move the row from "Needs You" to "Finished" without a refresh.
+async fn ack_promotion_loop(
+    mission_store: Arc<dyn MissionStore>,
+    events_tx: broadcast::Sender<AgentEvent>,
+) {
+    tracing::info!(
+        "Ack-promotion loop started: grace {}s, tick {}s",
+        ACK_GRACE_SECONDS,
+        ACK_PROMOTION_TICK_INTERVAL.as_secs()
+    );
+    loop {
+        tokio::time::sleep(ACK_PROMOTION_TICK_INTERVAL).await;
+        match mission_store
+            .acknowledge_stale_awaiting_user_missions(ACK_GRACE_SECONDS)
+            .await
+        {
+            Ok(promoted) => {
+                for mission_id in promoted {
+                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                        mission_id,
+                        status: MissionStatus::Acknowledged,
+                        summary: None,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Ack-promotion tick failed: {}", e);
+            }
+        }
+    }
+}
+
 async fn stuck_mission_watchdog_loop(
     mission_store: Arc<dyn MissionStore>,
     cmd_tx: mpsc::Sender<ControlCommand>,
@@ -6237,6 +6553,197 @@ fn enqueue_agent_finished_messages(
     }
 }
 
+/// Backend id for a mission, or `None` if the mission isn't found.
+///
+/// Used by [`maybe_begin_grok_goal`] / [`post_turn_handle_grok_goal`] to
+/// gate the `/goal` loop behavior on backend identity without having to
+/// thread the backend id through every queue-dispatch path.
+async fn lookup_mission_backend(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+) -> Option<String> {
+    match mission_store.get_mission(mission_id).await {
+        Ok(Some(m)) => Some(m.backend),
+        _ => None,
+    }
+}
+
+/// Outcome of [`maybe_begin_grok_goal`]: either a rewritten first-turn
+/// prompt (the message should now carry this content) or a user-facing
+/// error to surface in the message ack.
+pub(crate) enum GrokGoalKickoff {
+    /// Not a grok-goal request; queue the original content unchanged.
+    Passthrough,
+    /// `/goal X` accepted; queue `prompt` (the wrapped first-turn prompt)
+    /// in place of the original message content.
+    Rewritten { prompt: String },
+    /// `/goal X` rejected — surface this string to the user.
+    Rejected { reason: String },
+}
+
+/// Detect `/goal <objective>` for a grok mission and, if recognised,
+/// create the AgentFinished-driven automation row that will iterate the
+/// loop. Returns the wrapped first-turn prompt to use in place of the
+/// raw `/goal X` message.
+///
+/// Non-grok backends fall through unchanged — claudecode and codex have
+/// their own `/goal` handling (CLI-native and `thread/goal/set`
+/// respectively); only grok needs sandboxed.sh to drive iteration.
+async fn maybe_begin_grok_goal(
+    mission_store: &Arc<dyn MissionStore>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    mission_id: Option<Uuid>,
+    content: &str,
+) -> GrokGoalKickoff {
+    let (is_goal, objective) = super::grok_goal::parse_goal_prefix(content);
+    if !is_goal {
+        return GrokGoalKickoff::Passthrough;
+    }
+    let Some(mid) = mission_id else {
+        // No target mission resolved yet (auto-create path) — let the
+        // normal flow create a mission, then we'll catch the next turn.
+        // For now treat as passthrough; the user can re-send `/goal X`
+        // once the mission exists. This avoids a chicken/egg with
+        // mission creation happening *after* this hook.
+        return GrokGoalKickoff::Passthrough;
+    };
+    if !matches!(
+        lookup_mission_backend(mission_store, mid).await.as_deref(),
+        Some("grok")
+    ) {
+        return GrokGoalKickoff::Passthrough;
+    }
+    if objective.is_empty() {
+        return GrokGoalKickoff::Rejected {
+            reason: "/goal requires an objective (e.g. `/goal write the docs`)".to_string(),
+        };
+    }
+    if super::grok_goal::active_goal_for_mission(mission_store, mid)
+        .await
+        .is_some()
+    {
+        return GrokGoalKickoff::Rejected {
+            reason: "this mission already has an active /goal loop — wait for it to finish or cancel before starting a new one".to_string(),
+        };
+    }
+    if let Err(e) = super::grok_goal::create_goal_automation(mission_store, mid, &objective).await
+    {
+        tracing::warn!(
+            "grok_goal: failed to create automation for mission {}: {}",
+            mid,
+            e
+        );
+        return GrokGoalKickoff::Rejected {
+            reason: format!("failed to set up /goal loop: {}", e),
+        };
+    }
+    tracing::info!(
+        mission_id = %mid,
+        objective_len = objective.len(),
+        "grok_goal: started loop"
+    );
+    let _ = events_tx.send(AgentEvent::GoalIteration {
+        iteration: 1,
+        objective: objective.clone(),
+        mission_id: Some(mid),
+    });
+    GrokGoalKickoff::Rewritten {
+        prompt: super::grok_goal::first_turn_prompt(&objective),
+    }
+}
+
+/// Post-turn hook for grok-goal missions. Parses the sentinel from the
+/// assistant's final text and either ends the loop (terminal sentinel,
+/// budget exhausted, sentinel-missing streak) or bumps the iteration
+/// counter so the existing AgentFinished hook re-fires the continuation
+/// prompt.
+async fn post_turn_handle_grok_goal(
+    mission_store: &Arc<dyn MissionStore>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    mission_id: Uuid,
+    assistant_text: &str,
+) {
+    let Some(mut row) = super::grok_goal::active_goal_for_mission(mission_store, mission_id).await
+    else {
+        return;
+    };
+    let objective = super::grok_goal::objective_of(&row);
+    let iteration = super::grok_goal::iteration_of(&row);
+    let prev_missing = super::grok_goal::missing_count_of(&row);
+    let sentinel = super::grok_goal::parse_goal_sentinel(assistant_text);
+    tracing::info!(
+        mission_id = %mission_id,
+        iteration,
+        prev_missing,
+        ?sentinel,
+        "grok_goal: post-turn sentinel"
+    );
+    match sentinel {
+        super::grok_goal::GoalSentinel::Complete => {
+            if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
+                tracing::warn!("grok_goal: disable_goal failed: {}", e);
+            }
+            let _ = events_tx.send(AgentEvent::GoalStatus {
+                status: "complete".to_string(),
+                objective,
+                mission_id: Some(mission_id),
+            });
+        }
+        super::grok_goal::GoalSentinel::Aborted { reason } => {
+            if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
+                tracing::warn!("grok_goal: disable_goal failed: {}", e);
+            }
+            let _ = events_tx.send(AgentEvent::GoalStatus {
+                status: format!("aborted:{}", reason),
+                objective,
+                mission_id: Some(mission_id),
+            });
+        }
+        super::grok_goal::GoalSentinel::Continue | super::grok_goal::GoalSentinel::Missing => {
+            let was_missing = matches!(sentinel, super::grok_goal::GoalSentinel::Missing);
+            let new_missing = if was_missing {
+                prev_missing.saturating_add(1)
+            } else {
+                0
+            };
+            if new_missing >= super::grok_goal::MAX_MISSING_SENTINELS {
+                if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
+                    tracing::warn!("grok_goal: disable_goal failed: {}", e);
+                }
+                let _ = events_tx.send(AgentEvent::GoalStatus {
+                    status: "aborted:no_goal_sentinel".to_string(),
+                    objective,
+                    mission_id: Some(mission_id),
+                });
+                return;
+            }
+            let next_iter = iteration.saturating_add(1);
+            if next_iter > super::grok_goal::MAX_ITERATIONS {
+                if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
+                    tracing::warn!("grok_goal: disable_goal failed: {}", e);
+                }
+                let _ = events_tx.send(AgentEvent::GoalStatus {
+                    status: "budget_limited".to_string(),
+                    objective,
+                    mission_id: Some(mission_id),
+                });
+                return;
+            }
+            if let Err(e) =
+                super::grok_goal::update_counters(mission_store, &mut row, next_iter, new_missing)
+                    .await
+            {
+                tracing::warn!("grok_goal: update_counters failed: {}", e);
+            }
+            let _ = events_tx.send(AgentEvent::GoalIteration {
+                iteration: next_iter,
+                objective,
+                mission_id: Some(mission_id),
+            });
+        }
+    }
+}
+
 fn queue_has_pending_target_mission(
     queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
     mission_id: Uuid,
@@ -6256,7 +6763,13 @@ fn mission_status_for_terminal_reason(
 ) -> Option<(MissionStatus, &'static str)> {
     match reason {
         TerminalReason::TurnComplete if complete_turn_without_follow_up => {
-            Some((MissionStatus::Completed, "completed"))
+            // Agent finished its turn cleanly and there is no queued follow-up
+            // message or scheduled wakeup — the mission is parked waiting for
+            // the user to read it. The dashboard / iOS clients surface this in
+            // the "Needs You" column. An explicit `TerminalReason::Completed`
+            // (the path below) is used when the agent declares the work fully
+            // done, not just a turn boundary.
+            Some((MissionStatus::AwaitingUser, "turn_complete"))
         }
         TerminalReason::TurnComplete => None,
         TerminalReason::Completed => Some((MissionStatus::Completed, "completed")),
@@ -7108,6 +7621,36 @@ async fn control_actor_loop(
                             .map(|tid| main_mission_id == Some(tid))
                             .unwrap_or(true); // No target = use main
 
+                        // Grok `/goal <objective>` kickoff: rewrite the message
+                        // to the wrapped first-turn prompt and create the
+                        // AgentFinished automation row that will drive the
+                        // loop. Non-grok backends and non-/goal messages fall
+                        // through unchanged. See `api/grok_goal.rs`.
+                        let goal_target_mission = effective_target.or(main_mission_id);
+                        let mut content = content;
+                        match maybe_begin_grok_goal(
+                            &mission_store,
+                            &events_tx,
+                            goal_target_mission,
+                            &content,
+                        )
+                        .await
+                        {
+                            GrokGoalKickoff::Passthrough => {}
+                            GrokGoalKickoff::Rewritten { prompt } => {
+                                content = prompt;
+                            }
+                            GrokGoalKickoff::Rejected { reason } => {
+                                let _ = events_tx.send(AgentEvent::Error {
+                                    message: reason,
+                                    mission_id: goal_target_mission,
+                                    resumable: true,
+                                });
+                                let _ = respond.send(false);
+                                continue;
+                            }
+                        }
+
                         // Case 1: Target is already running in parallel_runners - queue to it
                         if let Some(tid) = effective_target {
                             if target_in_parallel {
@@ -7183,6 +7726,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating parallel mission {} (was {})",
@@ -7292,6 +7837,8 @@ async fn control_actor_loop(
                                                 | MissionStatus::Blocked
                                                 | MissionStatus::Completed
                                                 | MissionStatus::Failed
+                                                | MissionStatus::AwaitingUser
+                                                | MissionStatus::Acknowledged
                                         ) {
                                             tracing::info!(
                                                 "Activating main mission {} (was {})",
@@ -7338,6 +7885,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating switched mission {} (was {})",
@@ -7379,6 +7928,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating reloaded mission {} (was {})",
@@ -7477,6 +8028,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating mission {} (was {})",
@@ -8605,10 +9158,16 @@ async fn control_actor_loop(
                     // Runner cleared itself; cancel the force-clear watchdog.
                     runner_force_clear_deadline = None;
                     let mut completed_terminal_reason = None;
+                    // Captured for the post-turn `grok_goal` sentinel hook (see
+                    // `post_turn_handle_grok_goal`), which runs after this
+                    // `match` closes — `agent_result` itself is out of scope
+                    // by then. Empty string when the join errored.
+                    let mut completed_agent_output = String::new();
                     match res {
                         Ok((_mid, _user_msg, mut agent_result)) => {
                             maybe_recover_soft_llm_error(&mut agent_result);
                             completed_terminal_reason = agent_result.terminal_reason;
+                            completed_agent_output = agent_result.output.clone();
                             // Only append assistant to local history if this mission is still the current mission.
                             // Note: User message was already added before execution started.
                             // If the user created a new mission mid-execution, history was cleared for that new mission,
@@ -8840,6 +9399,26 @@ async fn control_actor_loop(
                         let already_queued_for_mission = queue
                             .iter()
                             .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id));
+
+                        // Grok `/goal` post-turn: parse the sentinel from the
+                        // assistant's last text and either disable the goal
+                        // automation (terminal sentinel / budget exhausted /
+                        // sentinel-missing streak) or bump the iteration
+                        // counter. Must run BEFORE
+                        // `agent_finished_automation_messages` so a Complete /
+                        // Aborted disable takes effect on this very turn —
+                        // otherwise the existing hook would still fire the
+                        // continuation. Skipped on transient infra failures
+                        // for the same reason regular automations are.
+                        if !is_transient_infra_failure {
+                            post_turn_handle_grok_goal(
+                                &mission_store,
+                                &events_tx,
+                                mission_id,
+                                &completed_agent_output,
+                            )
+                            .await;
+                        }
                         if !already_queued_for_mission && !is_transient_infra_failure {
                             // Small delay so the UI can display the completion before restarting.
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -9097,6 +9676,21 @@ async fn control_actor_loop(
                                     | Some(TerminalReason::CapacityLimited)
                             );
                             let was_queue_empty = runner.queue.is_empty();
+                            // Grok /goal sentinel hook for the parallel-runner
+                            // path. Same contract as the main-session hook
+                            // above: runs before the AgentFinished automations
+                            // so a terminal sentinel disables the loop on this
+                            // turn rather than after one extra continuation
+                            // fire. (See `post_turn_handle_grok_goal`.)
+                            if !is_transient_infra_failure {
+                                post_turn_handle_grok_goal(
+                                    &mission_store,
+                                    &events_tx,
+                                    *mission_id,
+                                    &result.output,
+                                )
+                                .await;
+                            }
                             if was_queue_empty && !is_transient_infra_failure {
                                 // Small delay so the UI can display the completion before restarting.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -15601,6 +16195,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -15631,6 +16226,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let strong_score = mission_search_relevance_score(
@@ -15676,6 +16272,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15718,6 +16315,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15760,6 +16358,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15802,6 +16401,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15928,6 +16528,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {
@@ -16139,12 +16740,23 @@ Investigate <service/> failures.
 
     #[test]
     fn test_mission_status_for_terminal_reason_defers_turn_complete_until_idle_finalization() {
+        // With a follow-up still queued/scheduled the mission stays whatever
+        // it was — the next turn will resolve its status.
         assert_eq!(
             mission_status_for_terminal_reason(TerminalReason::TurnComplete, false),
             None
         );
+        // No follow-up: the agent's turn ended cleanly and the mission is
+        // parked waiting for the user. The Needs-You bucket is keyed on
+        // exactly this state.
         assert_eq!(
             mission_status_for_terminal_reason(TerminalReason::TurnComplete, true),
+            Some((MissionStatus::AwaitingUser, "turn_complete"))
+        );
+        // Explicit agent-declared completion still maps to Completed (green
+        // in Finished), distinct from the auto AwaitingUser path above.
+        assert_eq!(
+            mission_status_for_terminal_reason(TerminalReason::Completed, true),
             Some((MissionStatus::Completed, "completed"))
         );
     }
@@ -16463,5 +17075,50 @@ Investigate <service/> failures.
         ));
         let files = validate_rich_tags(&tags, root, None, None).await;
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn transcript_visibility_categorizes_known_event_types() {
+        assert_eq!(event_visibility("user_message"), "transcript");
+        assert_eq!(event_visibility("assistant_message"), "transcript");
+        assert_eq!(event_visibility("mission_status_changed"), "transcript");
+        assert_eq!(event_visibility("thinking"), "trace");
+        assert_eq!(event_visibility("tool_call"), "trace");
+        assert_eq!(event_visibility("tool_result"), "trace");
+        assert_eq!(event_visibility("text_delta"), "trace");
+        assert_eq!(event_visibility("error"), "trace");
+        assert_eq!(event_visibility("raw_backend_packet"), "debug");
+    }
+
+    #[test]
+    fn transcript_trace_summary_counts_only_events_between_transcript_rows() {
+        let mission_id = Uuid::new_v4();
+        let event = |sequence, event_type: &str| mission_store::StoredEvent {
+            id: sequence,
+            mission_id,
+            sequence,
+            event_type: event_type.to_string(),
+            timestamp: "2026-05-16T00:00:00Z".to_string(),
+            event_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            content: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        let trace_events = vec![
+            event(2, "thinking"),
+            event(3, "thinking"),
+            event(4, "tool_call"),
+            event(7, "tool_result"),
+        ];
+
+        let first = trace_summary_between(&trace_events, 1, 5);
+        assert_eq!(first.get("thinking"), Some(&2));
+        assert_eq!(first.get("tool_call"), Some(&1));
+        assert_eq!(first.get("tool_result"), None);
+
+        let second = trace_summary_between(&trace_events, 5, 8);
+        assert_eq!(second.get("tool_result"), Some(&1));
+        assert_eq!(second.get("thinking"), None);
     }
 }

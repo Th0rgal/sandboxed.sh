@@ -20,7 +20,7 @@ import {
 } from 'lucide-react';
 import { cn, formatRelativeTime } from '@/lib/utils';
 import { useLibrary } from '@/contexts/library-context';
-import { ShimmerCard } from '@/components/ui/shimmer';
+import { ShimmerAutomationRow } from '@/components/ui/shimmer';
 import {
   type Automation,
   type AutomationExecution,
@@ -1374,9 +1374,9 @@ export function MissionAutomationsDialog({
                 )}
 
                 {showLoadingPlaceholder && (
-                  <div className="space-y-3">
-                    <ShimmerCard />
-                    <ShimmerCard />
+                  <div className="space-y-2">
+                    <ShimmerAutomationRow />
+                    <ShimmerAutomationRow />
                   </div>
                 )}
 

@@ -86,8 +86,33 @@ impl NativeLoopAdapter for CodexGoal {
     }
 }
 
-/// Shared observer for `/goal` — both harnesses emit `GoalIteration` and
-/// `GoalStatus` events with the same shape, so the classification is identical.
+// ─── Adapter: Grok `/goal` (sandboxed.sh-driven) ─────────────────────────────
+//
+// Grok has no native goal-mode primitive — see `crate::api::grok_goal` for
+// the full design. Sandboxed.sh drives iteration via an AgentFinished
+// automation, parses sentinel markers from the assistant text, and emits
+// the same `AgentEvent::GoalIteration` / `AgentEvent::GoalStatus` shape as
+// codex so the UI surface is identical. Registering the adapter here lets
+// `native_loop_observer` materialise Automation + AutomationExecution rows
+// for grok-goal missions in the Automations panel alongside codex/claudecode
+// entries.
+pub struct GrokGoal;
+
+impl NativeLoopAdapter for GrokGoal {
+    fn harness(&self) -> &'static str {
+        "grok"
+    }
+    fn command(&self) -> &'static str {
+        "goal"
+    }
+    fn observe(&self, event: &AgentEvent) -> LoopObservation {
+        observe_goal_event(event)
+    }
+}
+
+/// Shared observer for `/goal` — all three harnesses emit `GoalIteration`
+/// and `GoalStatus` events with the same shape, so the classification is
+/// identical.
 fn observe_goal_event(event: &AgentEvent) -> LoopObservation {
     match event {
         AgentEvent::GoalIteration {
@@ -111,7 +136,7 @@ fn observe_goal_event(event: &AgentEvent) -> LoopObservation {
 /// Returns the registered adapters in iteration order. Add a new harness here
 /// (and only here) to expose it as a native loop.
 pub fn registry() -> &'static [&'static dyn NativeLoopAdapter] {
-    &[&ClaudeCodeGoal, &CodexGoal]
+    &[&ClaudeCodeGoal, &CodexGoal, &GrokGoal]
 }
 
 /// Find the adapter for a given (harness, command) pair, if any.
@@ -166,6 +191,7 @@ mod tests {
     fn registry_finds_known_adapters() {
         assert!(find_adapter("claudecode", "goal").is_some());
         assert!(find_adapter("codex", "goal").is_some());
+        assert!(find_adapter("grok", "goal").is_some());
         assert!(find_adapter("opencode", "goal").is_none());
         assert!(find_adapter("claudecode", "audit").is_none());
     }

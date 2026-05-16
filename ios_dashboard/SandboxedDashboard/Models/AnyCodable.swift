@@ -7,7 +7,13 @@
 
 import Foundation
 
-struct AnyCodable: Codable, Hashable {
+/// `@unchecked Sendable` because `value: Any` defeats the Sendable check, but
+/// in practice the `init(from:)` path only ever stores Foundation primitives
+/// (Bool/Int/Double/String, NSNull, or recursive `[AnyCodable]` / `[String: AnyCodable]`).
+/// Once decoded, the value is treated as immutable. Required so structures
+/// that transitively contain `AnyCodable` (StoredEvent, MissionEventsResult)
+/// can flow across `async let` boundaries.
+struct AnyCodable: Codable, Hashable, @unchecked Sendable {
     let value: Any
 
     init(_ value: Any) {

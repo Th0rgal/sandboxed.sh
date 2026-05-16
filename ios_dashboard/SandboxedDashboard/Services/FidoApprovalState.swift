@@ -16,6 +16,12 @@ final class FidoApprovalState {
 
     var pendingRequests: [FidoSignRequest] = []
 
+    /// Set of request IDs for which an approve/deny request is currently in
+    /// flight to the server. The overlay disables both buttons and shows a
+    /// spinner while the ID is present so users don't double-fire
+    /// `fidoRespond` on a slow link. (UX audit item #23a.)
+    var inFlightRequestIds: Set<String> = []
+
     var autoApprovalRules: [AutoApprovalRule] = [] {
         didSet { persistRules() }
     }
@@ -81,6 +87,11 @@ final class FidoApprovalState {
     // MARK: - Approve / Deny
 
     func approve(_ requestId: String) async {
+        // Idempotent — bail out if the user double-taps Approve before the
+        // first call comes back, otherwise we'd fire two `fidoRespond` calls.
+        guard !inFlightRequestIds.contains(requestId) else { return }
+        inFlightRequestIds.insert(requestId)
+        defer { inFlightRequestIds.remove(requestId) }
         do {
             try await api.fidoRespond(requestId: requestId, approved: true)
             HapticService.success()
@@ -91,6 +102,9 @@ final class FidoApprovalState {
     }
 
     func deny(_ requestId: String) async {
+        guard !inFlightRequestIds.contains(requestId) else { return }
+        inFlightRequestIds.insert(requestId)
+        defer { inFlightRequestIds.remove(requestId) }
         do {
             try await api.fidoRespond(requestId: requestId, approved: false)
         } catch {

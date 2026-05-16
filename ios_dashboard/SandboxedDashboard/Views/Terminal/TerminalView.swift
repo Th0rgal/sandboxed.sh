@@ -47,11 +47,14 @@ struct TerminalView: View {
                     ForEach(workspaceState.workspaces) { workspace in
                         Button {
                             workspaceState.selectWorkspace(id: workspace.id)
-                            // Reconnect to the new workspace
+                            // Reconnect to the new workspace. The previous
+                            // 0.3 s delay between disconnect and connect was
+                            // a guess at "let URLSession clean up"; in
+                            // practice cancelling and re-resuming a
+                            // webSocketTask is synchronous enough that the
+                            // delay was just visible latency. (UX audit #18.)
                             disconnect()
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                connect()
-                            }
+                            connect()
                             HapticService.selectionChanged()
                         } label: {
                             HStack {
@@ -278,19 +281,18 @@ struct TerminalView: View {
         
         state.webSocketTask = URLSession.shared.webSocketTask(with: request)
         state.webSocketTask?.resume()
-        
-        // Start receiving messages
+
+        // Start receiving messages. The connection-status transition to
+        // `.connected` and the "Connected." line are now driven by the first
+        // successful message receive (see `receiveMessages`) — the previous
+        // 500 ms fixed timer added unnecessary latency on fast networks and
+        // masked failure on slow ones. (UX audit item #18.)
         receiveMessages()
-        
-        // Send initial resize message after a brief delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            if state.connectionStatus == .connecting {
-                state.connectionStatus = .connected
-                state.appendLine(TerminalLine(text: "Connected.", type: .system))
-            }
-            state.isConnecting = false
-            sendResize(cols: 80, rows: 24)
-        }
+
+        // Send initial resize immediately so the shell sizes correctly on
+        // open; this is just a control message and doesn't depend on the
+        // status transition.
+        sendResize(cols: 80, rows: 24)
     }
     
     private func disconnect() {
@@ -318,6 +320,15 @@ struct TerminalView: View {
         state.webSocketTask?.receive { [self] result in
             switch result {
             case .success(let message):
+                // Promote to `.connected` on the first successful message
+                // rather than after a hardcoded 0.5 s timer.
+                Task { @MainActor in
+                    if state.connectionStatus != .connected {
+                        state.connectionStatus = .connected
+                        state.isConnecting = false
+                        state.appendLine(TerminalLine(text: "Connected.", type: .system))
+                    }
+                }
                 switch message {
                 case .string(let text):
                     Task { @MainActor in
@@ -336,9 +347,10 @@ struct TerminalView: View {
                 Task { @MainActor in
                     receiveMessages()
                 }
-                
+
             case .failure(let error):
                 Task { @MainActor in
+                    state.isConnecting = false
                     if state.connectionStatus != .disconnected {
                         state.connectionStatus = .error
                         state.appendLine(TerminalLine(text: "Connection error: \(error.localizedDescription)", type: .error))

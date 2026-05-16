@@ -425,7 +425,8 @@ CREATE TABLE IF NOT EXISTS missions (
     interrupted_at TEXT,
     resumable INTEGER NOT NULL DEFAULT 0,
     desktop_sessions TEXT,
-    terminal_reason TEXT
+    terminal_reason TEXT,
+    first_viewed_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
@@ -1728,6 +1729,20 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add goal_objective column: {}", e))?;
         }
 
+        // first_viewed_at: timestamp of the user's first open of the mission
+        // since it last entered AwaitingUser. Drives the ack grace timer and
+        // the "opened" dot on Finished missions.
+        let has_first_viewed_at_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'first_viewed_at'")
+            .map_err(|e| format!("Failed to check for first_viewed_at column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_first_viewed_at_column {
+            tracing::info!("Running migration: adding 'first_viewed_at' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN first_viewed_at TEXT", [])
+                .map_err(|e| format!("Failed to add first_viewed_at column: {}", e))?;
+        }
+
         Ok(())
     }
 
@@ -1962,6 +1977,8 @@ fn parse_status(s: &str) -> MissionStatus {
     match s {
         "pending" => MissionStatus::Pending,
         "active" => MissionStatus::Active,
+        "awaiting_user" => MissionStatus::AwaitingUser,
+        "acknowledged" => MissionStatus::Acknowledged,
         "completed" => MissionStatus::Completed,
         "failed" => MissionStatus::Failed,
         "interrupted" => MissionStatus::Interrupted,
@@ -1975,6 +1992,8 @@ fn status_to_string(status: MissionStatus) -> &'static str {
     match status {
         MissionStatus::Pending => "pending",
         MissionStatus::Active => "active",
+        MissionStatus::AwaitingUser => "awaiting_user",
+        MissionStatus::Acknowledged => "acknowledged",
         MissionStatus::Completed => "completed",
         MissionStatus::Failed => "failed",
         MissionStatus::Interrupted => "interrupted",
@@ -2001,7 +2020,7 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode,
-                            COALESCE(goal_mode, 0) as goal_mode, goal_objective
+                            COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2053,6 +2072,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
+                            first_viewed_at: row.get(27).ok().flatten(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2080,7 +2100,7 @@ impl MissionStore for SqliteMissionStore {
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
-                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective FROM missions WHERE id = ?1",
+                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -2129,6 +2149,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
+                            first_viewed_at: row.get(27).ok().flatten(),
                     })
                 })
                 .optional()
@@ -2247,6 +2268,7 @@ impl MissionStore for SqliteMissionStore {
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let m = mission.clone();
@@ -2335,6 +2357,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                             goal_mode: row.get::<_, i32>(23).unwrap_or(0) != 0,
                             goal_objective: row.get(24).ok().flatten(),
+                            first_viewed_at: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2365,27 +2388,52 @@ impl MissionStore for SqliteMissionStore {
             } else {
                 None
             };
-        // Failed missions with LlmError are also resumable (transient API errors)
+        // Failed missions with LlmError are also resumable (transient API errors).
+        // AwaitingUser missions are also resumable (the user can send another
+        // message at any time to wake the agent back up).
         let resumable = matches!(
             status,
-            MissionStatus::Interrupted | MissionStatus::Blocked | MissionStatus::Failed
+            MissionStatus::Interrupted
+                | MissionStatus::Blocked
+                | MissionStatus::Failed
+                | MissionStatus::AwaitingUser
+                | MissionStatus::Acknowledged
         );
         let terminal_reason = terminal_reason.map(|s| s.to_string());
+        // Transitioning back to Active means the user just sent a new message —
+        // clear `first_viewed_at` so the next AwaitingUser round starts fresh
+        // (and so the "opened" dot disappears once the agent picks up again).
+        let clear_first_viewed_at = matches!(status, MissionStatus::Active);
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            conn.execute(
-                "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5 WHERE id = ?6",
-                params![
-                    status_to_string(status),
-                    now,
-                    interrupted_at,
-                    if resumable { 1 } else { 0 },
-                    terminal_reason,
-                    id.to_string(),
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+            if clear_first_viewed_at {
+                conn.execute(
+                    "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5, first_viewed_at = NULL WHERE id = ?6",
+                    params![
+                        status_to_string(status),
+                        now,
+                        interrupted_at,
+                        if resumable { 1 } else { 0 },
+                        terminal_reason,
+                        id.to_string(),
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                conn.execute(
+                    "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5 WHERE id = ?6",
+                    params![
+                        status_to_string(status),
+                        now,
+                        interrupted_at,
+                        if resumable { 1 } else { 0 },
+                        terminal_reason,
+                        id.to_string(),
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
             Ok(())
         })
         .await
@@ -2414,6 +2462,74 @@ impl MissionStore for SqliteMissionStore {
             .map_err(|e| e.to_string())?;
 
             Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn set_mission_first_viewed_at_if_unset(
+        &self,
+        id: Uuid,
+        timestamp: &str,
+    ) -> Result<Option<String>, String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let ts = timestamp.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let updated = conn
+                .execute(
+                    "UPDATE missions SET first_viewed_at = ?1 WHERE id = ?2 AND first_viewed_at IS NULL",
+                    params![&ts, &id_str],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(if updated > 0 { Some(ts) } else { None })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn acknowledge_stale_awaiting_user_missions(
+        &self,
+        grace_seconds: u64,
+    ) -> Result<Vec<Uuid>, String> {
+        let conn = self.conn.clone();
+        let cutoff = (Utc::now() - chrono::Duration::seconds(grace_seconds as i64)).to_rfc3339();
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let ids: Vec<Uuid> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id FROM missions
+                         WHERE status = 'awaiting_user'
+                           AND first_viewed_at IS NOT NULL
+                           AND first_viewed_at <= ?1",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![&cutoff], |row| {
+                        let id_str: String = row.get(0)?;
+                        Ok(parse_uuid_or_nil(&id_str))
+                    })
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                rows
+            };
+            if !ids.is_empty() {
+                tx.execute(
+                    "UPDATE missions SET status = 'acknowledged', updated_at = ?1
+                     WHERE status = 'awaiting_user'
+                       AND first_viewed_at IS NOT NULL
+                       AND first_viewed_at <= ?2",
+                    params![&now, &cutoff],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(ids)
         })
         .await
         .map_err(|e| e.to_string())?
@@ -2839,6 +2955,7 @@ impl MissionStore for SqliteMissionStore {
                         mission_mode: MissionMode::default(),
                         goal_mode: false,
                         goal_objective: None,
+                        first_viewed_at: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2912,6 +3029,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         goal_mode: row.get::<_, i32>(14).unwrap_or(0) != 0,
                         goal_objective: row.get(15).ok().flatten(),
+                        first_viewed_at: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -4384,6 +4502,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         goal_mode: false,
                         goal_objective: None,
+                        first_viewed_at: None,
                     })
                 })
                 .map_err(|e| e.to_string())?

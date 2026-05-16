@@ -8,6 +8,8 @@ import type { MissionStatus } from "@/lib/api/missions";
  */
 const STATUS_COLORS: Record<MissionStatus, string> = {
   active: "#818cf8", // indigo-400
+  awaiting_user: "#38bdf8", // sky-400
+  acknowledged: "#34d399", // emerald-400
   completed: "#34d399", // emerald-400
   failed: "#f87171", // red-400
   interrupted: "#fbbf24", // amber-400

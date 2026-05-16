@@ -654,12 +654,24 @@ function InlineImagePreview({
   workspaceId?: string;
   missionId?: string;
 }) {
-  const resolvedPath = resolvePath(path, basePath);
+  const isAbsolute = path.startsWith("/") || /^[a-zA-Z]:/.test(path);
+  // A relative path can't be resolved until `basePath` is known. Returning a
+  // stable sentinel (null) keeps us in the loading state instead of firing
+  // a 404 fetch against `./artifacts/...` and then leaving a stale error
+  // pill when basePath later arrives and the effect re-runs.
+  const resolvedPath = isAbsolute || basePath ? resolvePath(path, basePath) : null;
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    // Reset between effect runs so a previous error/blob doesn't leak when
+    // `resolvedPath` changes (e.g. `basePath` resolves after first paint).
+    setImageUrl(null);
+    setError(null);
+    setLoading(true);
+    if (!resolvedPath) return;
+
     let cancelled = false;
     let acquired = false;
 
@@ -710,31 +722,44 @@ function InlineImagePreview({
     };
   }, [resolvedPath, workspaceId, missionId]);
 
+  // Shared placeholder box: same shape for loading and error so the layout
+  // doesn't jump and the error state reads as part of the same chrome as
+  // the skeleton. `<span>` (not `<div>`) keeps this valid inside the `<p>`
+  // that react-markdown wraps around `![alt](url)` so hydration doesn't
+  // tear the subtree.
+  const placeholderClass =
+    "my-2 block rounded-xl overflow-hidden border border-white/[0.06] bg-white/[0.03]";
+  const placeholderStyle = { maxWidth: 400, height: 200 } as const;
+
   if (error) {
     return (
-      <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-red-500/10 text-red-400 text-xs">
-        <Image className="h-3.5 w-3.5" />
-        {error}
+      <span
+        className={cn(placeholderClass, "flex items-center justify-center gap-2 text-xs text-white/40")}
+        style={placeholderStyle}
+        title={error}
+      >
+        <Image className="h-4 w-4" />
+        <span className="truncate max-w-[260px]">{error}</span>
       </span>
     );
   }
 
-  if (loading) {
+  if (loading || !imageUrl) {
     return (
-      <div className="my-2 rounded-xl overflow-hidden bg-white/[0.03] animate-pulse" style={{ maxWidth: 400, height: 200 }} />
+      <span className={cn(placeholderClass, "animate-pulse")} style={placeholderStyle} />
     );
   }
 
   return (
-    <div className="my-2">
+    <span className="my-2 block">
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
-        src={imageUrl!}
+        src={imageUrl}
         alt={alt}
         className="max-h-[300px] rounded-xl border border-white/[0.06] cursor-pointer hover:border-white/[0.12] transition-colors"
-        onClick={() => showFilePreviewModal(path, resolvedPath, workspaceId, missionId)}
+        onClick={() => showFilePreviewModal(path, resolvedPath ?? path, workspaceId, missionId)}
       />
-    </div>
+    </span>
   );
 }
 

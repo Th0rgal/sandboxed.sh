@@ -54,6 +54,7 @@ struct FidoApprovalOverlay: View {
                             .padding(.vertical, 8)
 
                             // Quick auto-approve chip
+                            let isInFlight = fidoState.inFlightRequestIds.contains(request.id)
                             Button {
                                 fidoState.addAutoApprovalRule(
                                     type: .allSSH,
@@ -74,24 +75,48 @@ struct FidoApprovalOverlay: View {
                                 .background(.ultraThinMaterial)
                                 .clipShape(Capsule())
                             }
+                            .disabled(isInFlight)
+                            .opacity(isInFlight ? 0.5 : 1)
 
-                            // Action buttons
+                            // Action buttons — show a spinner inside whichever
+                            // button is in flight so the user can't double-fire
+                            // approve/deny on a slow link. (UX audit item #23a.)
                             HStack(spacing: 16) {
                                 Button {
                                     Task { await fidoState.deny(request.id) }
                                 } label: {
-                                    Label("Deny", systemImage: "xmark")
-                                        .frame(maxWidth: .infinity)
+                                    HStack(spacing: 6) {
+                                        if isInFlight {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                                .tint(Theme.error)
+                                        } else {
+                                            Image(systemName: "xmark")
+                                        }
+                                        Text("Deny")
+                                    }
+                                    .frame(maxWidth: .infinity)
                                 }
                                 .buttonStyle(GlassDenyButtonStyle())
+                                .disabled(isInFlight)
 
                                 Button {
                                     Task { await fidoState.approve(request.id) }
                                 } label: {
-                                    Label("Approve", systemImage: "checkmark")
-                                        .frame(maxWidth: .infinity)
+                                    HStack(spacing: 6) {
+                                        if isInFlight {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                                .tint(.white)
+                                        } else {
+                                            Image(systemName: "checkmark")
+                                        }
+                                        Text("Approve")
+                                    }
+                                    .frame(maxWidth: .infinity)
                                 }
                                 .buttonStyle(GlassApproveButtonStyle())
+                                .disabled(isInFlight)
                             }
                         }
                     }

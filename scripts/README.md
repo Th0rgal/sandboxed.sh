@@ -30,6 +30,12 @@ Validates:
 - queued-message behavior
 - assistant model metadata (with optional per-backend expectations)
 
+For transcript-first loading changes, run this against the dev deployment and
+then inspect the created mission with `/api/control/missions/:id/transcript`,
+`/trace`, and `/events`: transcript should contain only user/final assistant
+messages, trace should contain hidden thinking/tool activity, and `/events`
+should remain backward-compatible.
+
 ### install_desktop.sh
 Installs desktop automation dependencies on the host (used by the desktop MCP).
 

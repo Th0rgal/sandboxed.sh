@@ -660,8 +660,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(control::get_mission_events),
         )
         .route(
+            "/api/control/missions/:id/transcript",
+            get(control::get_mission_transcript),
+        )
+        .route(
+            "/api/control/missions/:id/trace",
+            get(control::get_mission_trace),
+        )
+        .route(
             "/api/control/missions/:id/load",
             post(control::load_mission),
+        )
+        .route(
+            "/api/control/missions/:id/opened",
+            post(control::mark_mission_opened),
         )
         .route(
             "/api/control/missions/:id/status",
