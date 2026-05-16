@@ -6653,14 +6653,21 @@ async fn maybe_begin_grok_goal(
 
 /// Post-turn hook for grok-goal missions. Parses the sentinel from the
 /// assistant's final text and either ends the loop (terminal sentinel,
-/// budget exhausted, sentinel-missing streak) or bumps the iteration
-/// counter so the existing AgentFinished hook re-fires the continuation
-/// prompt.
+/// budget exhausted, sentinel-missing streak, or explicit cancellation)
+/// or bumps the iteration counter so the existing AgentFinished hook
+/// re-fires the continuation prompt.
+///
+/// `terminal_reason` is the runner's structured exit reason. A `Cancelled`
+/// turn ends the loop immediately with status `aborted:cancelled` —
+/// otherwise the cancelled output (typically the literal string
+/// `"Cancelled"`) would look like a sentinel-missing turn and burn through
+/// the missing-count budget before the loop tore down.
 async fn post_turn_handle_grok_goal(
     mission_store: &Arc<dyn MissionStore>,
     events_tx: &broadcast::Sender<AgentEvent>,
     mission_id: Uuid,
     assistant_text: &str,
+    terminal_reason: Option<TerminalReason>,
 ) {
     let Some(mut row) = super::grok_goal::active_goal_for_mission(mission_store, mission_id).await
     else {
@@ -6669,6 +6676,22 @@ async fn post_turn_handle_grok_goal(
     let objective = super::grok_goal::objective_of(&row);
     let iteration = super::grok_goal::iteration_of(&row);
     let prev_missing = super::grok_goal::missing_count_of(&row);
+
+    // Cancellation short-circuits sentinel parsing — there's no agent
+    // output to interpret and continuing the loop would re-fire prompts
+    // after the user explicitly stopped the mission.
+    if matches!(terminal_reason, Some(TerminalReason::Cancelled)) {
+        if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
+            tracing::warn!("grok_goal: disable_goal failed: {}", e);
+        }
+        let _ = events_tx.send(AgentEvent::GoalStatus {
+            status: "aborted:cancelled".to_string(),
+            objective,
+            mission_id: Some(mission_id),
+        });
+        return;
+    }
+
     let sentinel = super::grok_goal::parse_goal_sentinel(assistant_text);
     tracing::info!(
         mission_id = %mission_id,
@@ -9415,6 +9438,7 @@ async fn control_actor_loop(
                                 &events_tx,
                                 mission_id,
                                 &completed_agent_output,
+                                completed_terminal_reason,
                             )
                             .await;
                         }
@@ -9687,6 +9711,7 @@ async fn control_actor_loop(
                                     &events_tx,
                                     *mission_id,
                                     &result.output,
+                                    result.terminal_reason,
                                 )
                                 .await;
                             }
