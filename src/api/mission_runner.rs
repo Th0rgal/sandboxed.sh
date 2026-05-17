@@ -12784,6 +12784,22 @@ fn grok_event_is_error(value: &serde_json::Value) -> bool {
         || value.get("error").is_some()
 }
 
+/// Detect the headless `grok` CLI's interactive sign-in prompt. When the CLI
+/// has no valid OAuth token and no `XAI_API_KEY`, it writes the OAuth URL to
+/// stdout (not stderr) and blocks waiting for a 127.0.0.1 OAuth callback that
+/// the headless server will never deliver. Without this check we'd append
+/// those lines to `final_result` and surface them as a "successful" assistant
+/// message.
+fn grok_output_looks_like_oauth_prompt(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("signing in with grok")
+        || lower.contains("open this url to sign in")
+        || lower.contains("auth.x.ai/oauth2/authorize")
+        || lower.contains("grok-cli:access")
+}
+
+const GROK_AUTH_REQUIRED_MESSAGE: &str = "Grok Build needs authentication: no usable OAuth token or XAI API key found. Run `grok login` on the server (or set XAI_API_KEY) before resuming.";
+
 /// Execute a turn using the Grok Build CLI backend.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_grok_turn(
@@ -12896,6 +12912,7 @@ pub async fn run_grok_turn(
 
     let mut final_result = String::new();
     let mut had_error = false;
+    let mut auth_required = false;
     let mut model_used = model.map(str::to_string);
     let mut last_streamed_len = 0usize;
     let reader = BufReader::new(stdout);
@@ -12920,6 +12937,30 @@ pub async fn run_grok_turn(
                         let value: serde_json::Value = match serde_json::from_str(&line) {
                             Ok(value) => value,
                             Err(_) => {
+                                // Grok CLI prints its OAuth sign-in URL to stdout
+                                // when no credentials are available, then blocks
+                                // forever on the OAuth callback. Detect it and
+                                // bail out with AuthError instead of letting the
+                                // URL leak as a "successful" assistant message.
+                                if grok_output_looks_like_oauth_prompt(&line) {
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        "Grok CLI emitted OAuth sign-in prompt; aborting turn with AuthError"
+                                    );
+                                    let _ = child.kill().await;
+                                    if let Some(handle) = stderr_handle {
+                                        handle.abort();
+                                    }
+                                    let mut result = AgentResult::failure(
+                                        GROK_AUTH_REQUIRED_MESSAGE.to_string(),
+                                        0,
+                                    )
+                                    .with_terminal_reason(TerminalReason::AuthError);
+                                    result = result.with_model(
+                                        model_used.unwrap_or_else(|| "grok-build".to_string()),
+                                    );
+                                    return result;
+                                }
                                 if final_result.is_empty() {
                                     final_result.push_str(&line);
                                 } else {
@@ -12986,21 +13027,29 @@ pub async fn run_grok_turn(
         let _ = handle.await;
     }
 
-    if final_result.trim().is_empty() {
+    {
         let stderr_content = stderr_capture.lock().await;
-        if !stderr_content.trim().is_empty() {
-            final_result = format!(
-                "Grok Build error: {}",
-                stderr_content
-                    .lines()
-                    .take(5)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            );
+        let stderr_str = stderr_content.as_str();
+        // Same OAuth-prompt fingerprint as the stdout branch above, applied
+        // to whatever the CLI wrote to stderr before exiting. Some grok
+        // versions split the sign-in banner across both streams.
+        if grok_output_looks_like_oauth_prompt(stderr_str)
+            || grok_output_looks_like_oauth_prompt(&final_result)
+        {
+            auth_required = true;
             had_error = true;
-        } else {
-            final_result = "Grok Build produced no output. Run `grok login` or configure an xAI provider for Grok Build.".to_string();
-            had_error = true;
+            final_result = GROK_AUTH_REQUIRED_MESSAGE.to_string();
+        } else if final_result.trim().is_empty() {
+            if !stderr_str.trim().is_empty() {
+                final_result = format!(
+                    "Grok Build error: {}",
+                    stderr_str.lines().take(5).collect::<Vec<_>>().join(" | ")
+                );
+                had_error = true;
+            } else {
+                final_result = "Grok Build produced no output. Run `grok login` or configure an xAI provider for Grok Build.".to_string();
+                had_error = true;
+            }
         }
     }
 
@@ -13008,7 +13057,12 @@ pub async fn run_grok_turn(
     let mut result = if success {
         AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::TurnComplete)
     } else {
-        AgentResult::failure(final_result, 0).with_terminal_reason(TerminalReason::LlmError)
+        let reason = if auth_required {
+            TerminalReason::AuthError
+        } else {
+            TerminalReason::LlmError
+        };
+        AgentResult::failure(final_result, 0).with_terminal_reason(reason)
     };
     result = result.with_model(model_used.unwrap_or_else(|| "grok-build".to_string()));
     result
@@ -14548,9 +14602,9 @@ mod tests {
         codex_final_message_looks_like_progress_update, codex_key_fingerprint,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
         extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
-        is_codex_node_wrapper, is_provider_payload_error, is_rate_limited_error,
-        is_session_corruption_error, is_success_path_auth_error,
+        extract_thought_line, grok_output_looks_like_oauth_prompt, is_capacity_limited_error,
+        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_provider_payload_error,
+        is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
         is_success_path_provider_payload_error, is_success_path_rate_limited_error,
         is_tool_call_only_output, opencode_idle_timeout_result_message,
         opencode_output_needs_fallback, opencode_session_token_from_line,
@@ -14921,6 +14975,25 @@ mod tests {
         assert!(!is_provider_payload_error(
             "I resized the screenshots to fit the image request limits"
         ));
+    }
+
+    #[test]
+    fn grok_output_looks_like_oauth_prompt_detects_sign_in_banner() {
+        // Real captured payload from mission d446dbfd (interrupted Grok turn
+        // that emitted its OAuth prompt to stdout instead of stderr).
+        assert!(grok_output_looks_like_oauth_prompt(
+            "Signing in with Grok..."
+        ));
+        assert!(grok_output_looks_like_oauth_prompt(
+            "Open this URL to sign in:"
+        ));
+        assert!(grok_output_looks_like_oauth_prompt(
+            "https://auth.x.ai/oauth2/authorize?response_type=code&client_id=b1a00492&scope=grok-cli%3Aaccess"
+        ));
+        assert!(!grok_output_looks_like_oauth_prompt(
+            "Here is a summary of the audit findings."
+        ));
+        assert!(!grok_output_looks_like_oauth_prompt(""));
     }
 
     #[test]
