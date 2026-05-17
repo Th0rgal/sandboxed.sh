@@ -587,18 +587,18 @@ final class APIService: @unchecked Sendable {
         try await get("/api/workspaces")
     }
 
-    func listWorkspaces(completion: @escaping (Result<[Workspace], Error>) -> Void) {
+    func listWorkspaces(completion: @escaping @MainActor @Sendable (Result<[Workspace], Error>) -> Void) {
         Task {
             do {
                 let workspaces: [Workspace] = try await get("/api/workspaces")
-                completion(.success(workspaces))
+                await MainActor.run { completion(.success(workspaces)) }
             } catch {
-                completion(.failure(error))
+                await MainActor.run { completion(.failure(error)) }
             }
         }
     }
 
-    func createWorkspace(name: String, type: WorkspaceType, completion: @escaping (Result<Workspace, Error>) -> Void) {
+    func createWorkspace(name: String, type: WorkspaceType, completion: @escaping @MainActor @Sendable (Result<Workspace, Error>) -> Void) {
         Task {
             do {
                 struct CreateWorkspaceRequest: Encodable {
@@ -606,9 +606,9 @@ final class APIService: @unchecked Sendable {
                     let workspace_type: String
                 }
                 let workspace: Workspace = try await post("/api/workspaces", body: CreateWorkspaceRequest(name: name, workspace_type: type.rawValue))
-                completion(.success(workspace))
+                await MainActor.run { completion(.success(workspace)) }
             } catch {
-                completion(.failure(error))
+                await MainActor.run { completion(.failure(error)) }
             }
         }
     }
@@ -632,7 +632,7 @@ final class APIService: @unchecked Sendable {
 
     // MARK: - SSE Streaming
 
-    func streamControl(onEvent: @escaping (String, [String: Any]) -> Void) -> Task<Void, Never> {
+    func streamControl(onEvent: @escaping @MainActor @Sendable (String, [String: Any]) -> Void) -> Task<Void, Never> {
         let base = baseURL
         let token = jwtToken
         let maxBuffer = Self.streamMaxBufferBytes
@@ -660,10 +660,10 @@ final class APIService: @unchecked Sendable {
                         if http.statusCode == 401 {
                             await MainActor.run { self?.logout() }
                         }
-                        onEvent("error", [
+                        await MainActor.run { onEvent("error", [
                             "message": "Stream rejected by server (HTTP \(http.statusCode))",
                             "status": http.statusCode
-                        ])
+                        ]) }
                         return
                     }
                 }
@@ -692,12 +692,12 @@ final class APIService: @unchecked Sendable {
                     // emits a blank line must not balloon this buffer.
                     bufferedBytes += line.utf8.count + 1
                     if bufferedBytes > maxBuffer {
-                        onEvent("error", ["message": "Stream event exceeded \(maxBuffer) bytes — dropping connection"])
+                        await MainActor.run { onEvent("error", ["message": "Stream event exceeded \(maxBuffer) bytes — dropping connection"]) }
                         return
                     }
 
                     if line.isEmpty {
-                        Self.dispatchSSEEvent(
+                        await Self.dispatchSSEEvent(
                             eventType: eventType,
                             dataLines: dataLines,
                             onEvent: onEvent
@@ -728,13 +728,13 @@ final class APIService: @unchecked Sendable {
             } catch is CancellationError {
                 return
             } catch let urlError as URLError where urlError.code == .timedOut {
-                onEvent("error", [
+                await MainActor.run { onEvent("error", [
                     "message": "Stream idle (no data for \(Int(inactivity))s) — reconnecting",
                     "reason": "inactivity"
-                ])
+                ]) }
             } catch {
                 if !Task.isCancelled {
-                    onEvent("error", ["message": "Stream connection failed: \(error.localizedDescription)"])
+                    await MainActor.run { onEvent("error", ["message": "Stream connection failed: \(error.localizedDescription)"]) }
                 }
             }
         }
@@ -748,25 +748,25 @@ final class APIService: @unchecked Sendable {
     private static func dispatchSSEEvent(
         eventType: String,
         dataLines: [String],
-        onEvent: (String, [String: Any]) -> Void
-    ) {
+        onEvent: @escaping @MainActor @Sendable (String, [String: Any]) -> Void
+    ) async {
         guard !dataLines.isEmpty else { return }
         let payload = dataLines.joined(separator: "\n")
         guard !payload.isEmpty else { return }
 
         guard let data = payload.data(using: .utf8) else {
-            onEvent("parseError", ["raw": payload, "reason": "non-utf8 payload"])
+            await MainActor.run { onEvent("parseError", ["raw": payload, "reason": "non-utf8 payload"]) }
             return
         }
         do {
             let parsed = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
             if let obj = parsed as? [String: Any] {
-                onEvent(eventType, obj)
+                await MainActor.run { onEvent(eventType, obj) }
             } else {
-                onEvent("parseError", ["raw": payload, "reason": "non-object payload"])
+                await MainActor.run { onEvent("parseError", ["raw": payload, "reason": "non-object payload"]) }
             }
         } catch {
-            onEvent("parseError", ["raw": payload, "reason": error.localizedDescription])
+            await MainActor.run { onEvent("parseError", ["raw": payload, "reason": error.localizedDescription]) }
         }
     }
     

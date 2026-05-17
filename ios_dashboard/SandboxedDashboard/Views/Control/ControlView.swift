@@ -506,7 +506,7 @@ struct ControlView: View {
             // Save draft immediately on disappear
             UserDefaults.standard.set(inputText, forKey: Self.draftTextKey)
             draftSaveTask?.cancel()
-            groupedItemsRecomputeTask?.cancel()
+            flushPendingGroupedItemsRecompute()
         }
         .sheet(isPresented: $showDesktopStream) {
             DesktopStreamView(displayId: desktopDisplayId)
@@ -877,7 +877,7 @@ struct ControlView: View {
     /// Groups consecutive tool calls together for collapsed display (like dashboard).
     /// Thinking messages are always elided here — they live in the thoughts sheet
     /// only. Showing them inline duplicated the same content twice on screen.
-    private static func buildGroupedItems(from messages: [ChatMessage]) -> [GroupedChatItem] {
+    nonisolated private static func buildGroupedItems(from messages: [ChatMessage]) -> [GroupedChatItem] {
         var result: [GroupedChatItem] = []
         var currentToolGroup: [ChatMessage] = []
 
@@ -1430,7 +1430,7 @@ struct ControlView: View {
         os_signpost(.begin, log: Self.performanceLog, name: "cacheDecode", signpostID: signpostID)
         defer { os_signpost(.end, log: Self.performanceLog, name: "cacheDecode", signpostID: signpostID) }
 
-        let cached = await Task.detached(priority: .userInitiated) {
+        let cached: CachedMissionData? = await Task.detached(priority: .userInitiated) {
             guard let url = Self.cacheFileURL(missionId: missionId),
                   let data = try? Data(contentsOf: url) else {
                 return nil
@@ -1524,14 +1524,22 @@ struct ControlView: View {
         defer { os_signpost(.end, log: Self.performanceLog, name: "applyViewingMissionWithEvents", signpostID: signpostID) }
 
         isLoadingHistory = true  // Suppress animated auto-scroll during history load
+        let shouldPreserveLiveMessages = viewingMissionId == mission.id
 
         let snapshot = await Self.buildHistoricalTranscriptSnapshot(events: events)
+        let snapshotMessageIds = Set(snapshot.messages.map(\.id))
+        let liveMessages = shouldPreserveLiveMessages
+            ? messages.filter { !snapshotMessageIds.contains($0.id) }
+            : []
+        let mergedMessages = snapshot.messages + liveMessages
 
         viewingMission = mission
         viewingMissionId = mission.id
         loadedEventCount = snapshot.loadedEventCount
-        messages = snapshot.messages
-        groupedItems = snapshot.groupedItems
+        messages = mergedMessages
+        groupedItems = liveMessages.isEmpty
+            ? snapshot.groupedItems
+            : Self.buildGroupedItems(from: mergedMessages)
 
         if scrollToBottom {
             shouldScrollImmediately = true
@@ -3360,10 +3368,16 @@ struct ControlView: View {
     private func scheduleGroupedItemsRecompute() {
         groupedItemsRecomputeTask?.cancel()
         groupedItemsRecomputeTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(50))
+            try? await Task.sleep(for: .milliseconds(16))
             guard !Task.isCancelled else { return }
             recomputeGroupedItems()
         }
+    }
+
+    private func flushPendingGroupedItemsRecompute() {
+        groupedItemsRecomputeTask?.cancel()
+        groupedItemsRecomputeTask = nil
+        recomputeGroupedItems()
     }
 
     /// Marks all active tool calls as completed with the given state.
