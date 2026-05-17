@@ -12,6 +12,7 @@ use super::{
     WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo};
+use crate::backend::native_loops::GoalOutputRole;
 use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -135,6 +136,7 @@ struct AssistantMessageMetadataInput<'a> {
     model_normalized: &'a Option<String>,
     shared_files: &'a Option<Vec<crate::api::control::SharedFile>>,
     resumable: bool,
+    goal_role: Option<GoalOutputRole>,
 }
 
 fn assistant_message_metadata(input: AssistantMessageMetadataInput<'_>) -> serde_json::Value {
@@ -152,7 +154,14 @@ fn assistant_message_metadata(input: AssistantMessageMetadataInput<'_>) -> serde
         shared_files: input.shared_files.clone(),
         resumable: input.resumable,
     };
-    serde_json::to_value(metadata).expect("assistant metadata should serialize")
+    let mut value = serde_json::to_value(metadata).expect("assistant metadata should serialize");
+    if let (Some(role), Some(obj)) = (input.goal_role, value.as_object_mut()) {
+        obj.insert(
+            "goal_role".to_string(),
+            serde_json::Value::String(role.as_str().to_string()),
+        );
+    }
+    value
 }
 
 fn fold_search_char(ch: char) -> char {
@@ -3152,6 +3161,7 @@ impl MissionStore for SqliteMissionStore {
                 model_normalized,
                 shared_files,
                 resumable,
+                goal_role,
                 ..
             } => (
                 "assistant_message",
@@ -3168,15 +3178,24 @@ impl MissionStore for SqliteMissionStore {
                     model_normalized,
                     shared_files,
                     resumable: *resumable,
+                    goal_role: *goal_role,
                 }),
             ),
-            AgentEvent::Thinking { content, done, .. } => (
+            AgentEvent::Thinking {
+                content,
+                done,
+                goal_role,
+                ..
+            } => (
                 "thinking",
                 None,
                 None,
                 None,
                 content.clone(),
-                serde_json::json!({ "done": done }),
+                match goal_role {
+                    Some(role) => serde_json::json!({ "done": done, "goal_role": role.as_str() }),
+                    None => serde_json::json!({ "done": done }),
+                },
             ),
             AgentEvent::ToolCall {
                 tool_call_id,
@@ -7359,6 +7378,7 @@ mod tests {
             model_normalized: &Some("gpt-4o".to_string()),
             shared_files: &None,
             resumable: false,
+            goal_role: None,
         });
 
         assert_eq!(
@@ -7394,6 +7414,7 @@ mod tests {
             model_normalized: &None,
             shared_files: &None,
             resumable: false,
+            goal_role: None,
         });
 
         assert_eq!(
@@ -7982,6 +8003,7 @@ mod tests {
                     mission_id: Some(mission.id),
                     shared_files: None,
                     resumable: false,
+                    goal_role: None,
                 },
             )
             .await
@@ -8013,6 +8035,7 @@ mod tests {
                     mission_id: Some(mission.id),
                     shared_files: None,
                     resumable: false,
+                    goal_role: None,
                 },
             )
             .await
@@ -8363,6 +8386,7 @@ mod tests {
                         mission_id: Some(mission.id),
                         shared_files: None,
                         resumable: false,
+                        goal_role: None,
                     },
                 )
                 .await
@@ -8461,6 +8485,7 @@ mod tests {
                         mission_id: Some(mission.id),
                         shared_files: None,
                         resumable: false,
+                        goal_role: None,
                     },
                 )
                 .await

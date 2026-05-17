@@ -23,6 +23,9 @@ use uuid::Uuid;
 
 use crate::agents::{AgentRef, AgentResult, TerminalReason};
 use crate::backend::claudecode::client::{ClaudeEvent, ContentBlock, StreamEvent};
+use crate::backend::native_loops::{
+    classify_goal_output, is_goal_command, GoalOutputRole, GoalOutputSource,
+};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
 use crate::opencode::{extract_reasoning, extract_text};
@@ -41,6 +44,12 @@ use super::control::{
     ExecutionProgress, FrontendToolHub,
 };
 use super::library::SharedLibrary;
+
+fn goal_thinking_role(message: &str, content: &str) -> Option<GoalOutputRole> {
+    is_goal_command(message)
+        .then(|| classify_goal_output(content, GoalOutputSource::Thinking))
+        .flatten()
+}
 
 /// Build the synthetic `AgentResult::failure` produced when a turn is
 /// cancelled. If the process has begun a graceful shutdown, return a
@@ -321,6 +330,23 @@ fn spawn_claude_builtin_wakeup_automation(
     );
 
     tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let auth_token = mint_internal_service_jwt();
+
+        // Replace-by-default: cancel any previous Claude built-in wakeups still
+        // pending on this mission so the agent ends up with exactly one queued
+        // wakeup at a time. Without this, every call to ScheduleWakeup stacks a
+        // new automation (especially after server restarts, where the resumed
+        // turn re-issues the same ScheduleWakeup) and the user sees a cascade
+        // of redundant turns when they fire in succession.
+        cancel_existing_claude_builtin_wakeups(
+            &client,
+            &api_base,
+            mission_id,
+            auth_token.as_deref(),
+        )
+        .await;
+
         let url = format!(
             "{}/api/control/missions/{}/automations",
             api_base, mission_id
@@ -339,9 +365,8 @@ fn spawn_claude_builtin_wakeup_automation(
             "start_immediately": false,
         });
 
-        let client = reqwest::Client::new();
         let mut request = client.post(&url).json(&body);
-        if let Some(token) = mint_internal_service_jwt() {
+        if let Some(ref token) = auth_token {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
 
@@ -373,6 +398,114 @@ fn spawn_claude_builtin_wakeup_automation(
             }
         }
     });
+}
+
+/// Delete any active `after_first_fire` automations for this mission that were
+/// created by Claude's built-in ScheduleWakeup tool (identified by the
+/// `__wakeup_source = claude-builtin` variable). Best-effort: failures are
+/// logged but don't block creating the replacement.
+async fn cancel_existing_claude_builtin_wakeups(
+    client: &reqwest::Client,
+    api_base: &str,
+    mission_id: Uuid,
+    auth_token: Option<&str>,
+) {
+    let list_url = format!(
+        "{}/api/control/missions/{}/automations",
+        api_base, mission_id
+    );
+    let mut request = client.get(&list_url);
+    if let Some(token) = auth_token {
+        request = request.header("Authorization", format!("Bearer {}", token));
+    }
+    let existing: Vec<serde_json::Value> = match request.send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    error = %e,
+                    "Failed to parse existing automations list while deduping Claude built-in wakeups"
+                );
+                return;
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(
+                mission_id = %mission_id,
+                status = %resp.status(),
+                "Failed to list automations while deduping Claude built-in wakeups"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                mission_id = %mission_id,
+                error = %e,
+                "HTTP error listing automations while deduping Claude built-in wakeups"
+            );
+            return;
+        }
+    };
+
+    for automation in existing {
+        if !automation
+            .get("active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let is_after_first_fire = automation
+            .get("stop_policy")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("after_first_fire");
+        if !is_after_first_fire {
+            continue;
+        }
+        let is_claude_builtin = automation
+            .get("variables")
+            .and_then(|v| v.get("__wakeup_source"))
+            .and_then(|v| v.as_str())
+            == Some("claude-builtin");
+        if !is_claude_builtin {
+            continue;
+        }
+        let Some(id) = automation.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let delete_url = format!("{}/api/control/automations/{}", api_base, id);
+        let mut req = client.delete(&delete_url);
+        if let Some(token) = auth_token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    automation_id = %id,
+                    "Replaced previous Claude built-in wakeup automation"
+                );
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    automation_id = %id,
+                    status = %resp.status(),
+                    "Failed to delete previous Claude built-in wakeup automation"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    automation_id = %id,
+                    error = %e,
+                    "HTTP error deleting previous Claude built-in wakeup automation"
+                );
+            }
+        }
+    }
 }
 
 fn write_telegram_action_cli_helpers(work_dir: &Path) {
@@ -1418,6 +1551,7 @@ fn handle_part_update(
             content,
             done: false,
             mission_id: Some(mission_id),
+            goal_role: None,
         });
     }
 
@@ -5174,6 +5308,7 @@ pub fn run_claudecode_turn<'a>(
                                                                     content: String::new(),
                                                                     done: true,
                                                                     mission_id: Some(mission_id),
+                                                                    goal_role: None,
                                                                 });
                                                                 finalized_thinking_indices.insert(prev_idx);
                                                             }
@@ -5189,6 +5324,7 @@ pub fn run_claudecode_turn<'a>(
                                                             content: buffer.clone(),
                                                             done: false,
                                                             mission_id: Some(mission_id),
+                                                            goal_role: goal_thinking_role(message, buffer),
                                                         });
                                                         thinking_emitted = true;
                                                     }
@@ -5263,6 +5399,7 @@ pub fn run_claudecode_turn<'a>(
                                                     {
                                                         let _ =
                                                             events_tx.send(AgentEvent::Thinking {
+                                                                goal_role: goal_thinking_role(message, &thought),
                                                                 content: thought,
                                                                 done: true,
                                                                 mission_id: Some(mission_id),
@@ -5438,6 +5575,7 @@ pub fn run_claudecode_turn<'a>(
                                                 // (via the block-transition mechanism) and re-sending them
                                                 // causes duplicate items in the frontend thinking panel.
                                                 let _ = events_tx.send(AgentEvent::Thinking {
+                                                    goal_role: goal_thinking_role(message, &thinking),
                                                     content: thinking,
                                                     done: true,
                                                     mission_id: Some(mission_id),
@@ -10088,6 +10226,85 @@ async fn sync_grok_oauth_auth_file(
     }
 }
 
+/// Pull the workspace's `~/.grok/auth.json` back to the host after a grok
+/// turn. xAI rotates the OIDC refresh token on every refresh, so the file the
+/// CLI just rewrote inside the container is the only place the new refresh
+/// token lives. Without this flush, the next pre-turn sync clobbers the fresh
+/// token with the host's stale copy and the CLI falls back to an interactive
+/// OAuth flow that always times out in headless mode.
+async fn flush_grok_oauth_auth_file(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Result<bool, String> {
+    // `tr -d '\n'` so we work with both GNU (`base64`) and BSD (`base64`) which
+    // emit newline-wrapped output by default. `base64::STANDARD` rejects
+    // whitespace, so we strip it before decoding.
+    let output = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &[
+                "-lc".to_string(),
+                "f=\"${HOME:-/root}/.grok/auth.json\"; [ -s \"$f\" ] && base64 < \"$f\" | tr -d '\\n' || true".to_string(),
+            ],
+            HashMap::new(),
+        )
+        .await
+        .map_err(|e| format!("Failed to read Grok auth file from workspace: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Failed to read Grok auth file from workspace: {}",
+            stderr.trim()
+        ));
+    }
+
+    let encoded = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if encoded.is_empty() {
+        return Ok(false);
+    }
+
+    let decoded = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(|e| format!("Failed to decode Grok auth file from workspace: {}", e))?
+    };
+    if decoded.is_empty() {
+        return Ok(false);
+    }
+
+    let auth_path = std::path::PathBuf::from(crate::util::home_dir())
+        .join(".grok")
+        .join("auth.json");
+
+    if let Some(parent) = auth_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Failed to create host Grok dir: {}", e))?;
+    }
+
+    if let Ok(existing) = tokio::fs::read(&auth_path).await {
+        if existing == decoded {
+            return Ok(false);
+        }
+    }
+
+    tokio::fs::write(&auth_path, &decoded)
+        .await
+        .map_err(|e| format!("Failed to write Grok auth file to host: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ =
+            tokio::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600)).await;
+    }
+
+    Ok(true)
+}
+
 /// Result of a backend preflight check
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BackendPreflightResult {
@@ -11488,6 +11705,7 @@ pub async fn run_opencode_turn(
                                                     content: String::new(),
                                                     done: true,
                                                     mission_id: Some(mission_id),
+                                                    goal_role: None,
                                                 });
                                                 sse_done_sent.store(
                                                     true,
@@ -12273,6 +12491,7 @@ pub async fn run_opencode_turn(
                                             content: String::new(),
                                             done: true,
                                             mission_id: Some(mission_id),
+            goal_role: None,
                                         });
                                         sse_done_sent.store(true, std::sync::atomic::Ordering::SeqCst);
                                     }
@@ -12553,6 +12772,7 @@ pub async fn run_opencode_turn(
                     content: reasoning,
                     done: false,
                     mission_id: Some(mission_id),
+                    goal_role: None,
                 });
                 emitted_thinking = true;
             }
@@ -12565,6 +12785,7 @@ pub async fn run_opencode_turn(
                 content: thought,
                 done: false,
                 mission_id: Some(mission_id),
+                goal_role: None,
             });
             emitted_thinking = true;
             final_result = cleaned;
@@ -12577,6 +12798,7 @@ pub async fn run_opencode_turn(
             content: String::new(),
             done: true,
             mission_id: Some(mission_id),
+            goal_role: None,
         });
     }
 
@@ -12784,6 +13006,40 @@ fn grok_event_is_error(value: &serde_json::Value) -> bool {
         || value.get("error").is_some()
 }
 
+/// Pull thinking text out of a grok streaming event, if any.
+///
+/// The headless grok CLI emits one event per token while reasoning:
+/// `{"type":"thought","data":"..."}`. Without this hook we route the
+/// payload through `grok_event_text` (which checks generic `text/answer/
+/// result/output` keys but not `data`), so thoughts get silently dropped
+/// and the dashboard never shows the thinking stream.
+fn grok_event_thought_text(value: &serde_json::Value) -> Option<String> {
+    let type_str = value.get("type").and_then(|v| v.as_str())?;
+    if !type_str.eq_ignore_ascii_case("thought")
+        && !type_str.eq_ignore_ascii_case("thinking")
+        && !type_str.eq_ignore_ascii_case("reasoning")
+    {
+        return None;
+    }
+    value
+        .get("data")
+        .or_else(|| value.get("delta"))
+        .or_else(|| value.get("text"))
+        .or_else(|| value.get("content"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// True when the grok CLI emits its end-of-turn sentinel
+/// (`{"type":"end",...}`). Used to flip the thinking stream to `done=true`
+/// once the model stops reasoning.
+fn grok_event_is_end(value: &serde_json::Value) -> bool {
+    value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("end"))
+}
+
 /// Detect the headless `grok` CLI's interactive sign-in prompt. When the CLI
 /// has no valid OAuth token and no `XAI_API_KEY`, it writes the OAuth URL to
 /// stdout (not stderr) and blocks waiting for a 127.0.0.1 OAuth callback that
@@ -12796,6 +13052,13 @@ fn grok_output_looks_like_oauth_prompt(text: &str) -> bool {
         || lower.contains("open this url to sign in")
         || lower.contains("auth.x.ai/oauth2/authorize")
         || lower.contains("grok-cli:access")
+        // The CLI prints these *after* the interactive OAuth flow expires —
+        // either because no browser ever opened the URL or because the
+        // redirect to 127.0.0.1 was never reachable from the workspace. They
+        // come through as plain text assistant messages, so without this
+        // check we'd record the timeout as a `success:true` turn.
+        || lower.contains("login timed out")
+        || lower.contains("authentication timed out")
 }
 
 const GROK_AUTH_REQUIRED_MESSAGE: &str = "Grok Build needs authentication: no usable OAuth token or XAI API key found. Run `grok login` on the server (or set XAI_API_KEY) before resuming.";
@@ -12915,6 +13178,8 @@ pub async fn run_grok_turn(
     let mut auth_required = false;
     let mut model_used = model.map(str::to_string);
     let mut last_streamed_len = 0usize;
+    let mut thinking_buffer = String::new();
+    let mut emitted_thinking = false;
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
 
@@ -12988,6 +13253,32 @@ pub async fn run_grok_turn(
                             }
                             continue;
                         }
+                        if let Some(thought) = grok_event_thought_text(&value) {
+                            if !thought.is_empty() {
+                                thinking_buffer.push_str(&thought);
+                                let _ = events_tx.send(AgentEvent::Thinking {
+                                    content: thinking_buffer.clone(),
+                                    done: false,
+                                    mission_id: Some(mission_id),
+                                    goal_role: None,
+                                });
+                                emitted_thinking = true;
+                            }
+                            continue;
+                        }
+                        if grok_event_is_end(&value) {
+                            if emitted_thinking {
+                                let _ = events_tx.send(AgentEvent::Thinking {
+                                    content: String::new(),
+                                    done: true,
+                                    mission_id: Some(mission_id),
+                                    goal_role: None,
+                                });
+                                emitted_thinking = false;
+                                thinking_buffer.clear();
+                            }
+                            continue;
+                        }
                         if let Some(text) = grok_event_text(&value) {
                             if !text.is_empty() {
                                 if value
@@ -13032,10 +13323,16 @@ pub async fn run_grok_turn(
         let stderr_str = stderr_content.as_str();
         // Same OAuth-prompt fingerprint as the stdout branch above, applied
         // to whatever the CLI wrote to stderr before exiting. Some grok
-        // versions split the sign-in banner across both streams.
-        if grok_output_looks_like_oauth_prompt(stderr_str)
-            || grok_output_looks_like_oauth_prompt(&final_result)
-        {
+        // versions split the sign-in banner across both streams. The
+        // `final_result` check is length-gated so a substantive assistant
+        // reply that happens to mention "login timed out" or "signing in
+        // with grok" (e.g. answering a question *about* auth) isn't
+        // misclassified as an auth failure — real CLI banners and the
+        // "Login timed out after 10 minutes. Please try again." message
+        // are both well under this threshold.
+        let final_looks_like_banner =
+            final_result.trim().len() <= 300 && grok_output_looks_like_oauth_prompt(&final_result);
+        if grok_output_looks_like_oauth_prompt(stderr_str) || final_looks_like_banner {
             auth_required = true;
             had_error = true;
             final_result = GROK_AUTH_REQUIRED_MESSAGE.to_string();
@@ -13051,6 +13348,30 @@ pub async fn run_grok_turn(
                 had_error = true;
             }
         }
+    }
+
+    // If the CLI exited without an explicit `end` event but we already
+    // streamed thoughts, close the thinking stream so the dashboard can flip
+    // the "thinking…" indicator off.
+    if emitted_thinking {
+        let _ = events_tx.send(AgentEvent::Thinking {
+            content: String::new(),
+            done: true,
+            mission_id: Some(mission_id),
+            goal_role: None,
+        });
+    }
+
+    // Pull any rotated OAuth token the CLI just wrote back to the host so the
+    // next run isn't clobbered with a stale refresh token. Best-effort: if the
+    // workspace exited mid-write or we can't reach it, log and move on rather
+    // than masking the actual turn result.
+    if let Err(err) = flush_grok_oauth_auth_file(&workspace_exec, work_dir).await {
+        tracing::warn!(
+            mission_id = %mission_id,
+            error = %err,
+            "Failed to flush Grok OAuth auth file back to host"
+        );
     }
 
     let success = exit_status.map(|status| status.success()).unwrap_or(false) && !had_error;
@@ -13590,6 +13911,7 @@ pub async fn run_codex_turn(
                             content: content.clone(),
                             done: false,
                             mission_id: Some(mission_id),
+                            goal_role: goal_thinking_role(user_message, &content),
                         });
                         // Accumulate for persistence: Codex sends snapshot-style
                         // thinking updates (each one replaces the previous), so
@@ -13604,10 +13926,13 @@ pub async fn run_codex_turn(
                         // Flush accumulated thinking as done before tool call,
                         // so the event logger persists the full thought block.
                         if !thinking_accumulated.is_empty() {
+                            let goal_role =
+                                goal_thinking_role(user_message, &thinking_accumulated);
                             let _ = events_tx.send(AgentEvent::Thinking {
                                 content: std::mem::take(&mut thinking_accumulated),
                                 done: true,
                                 mission_id: Some(mission_id),
+                                goal_role,
                             });
                             thinking_done_emitted = true;
                         }
@@ -13736,6 +14061,7 @@ pub async fn run_codex_turn(
     if !thinking_emitted {
         if let Some((thought, cleaned)) = extract_thought_line(&assistant_message) {
             let _ = events_tx.send(AgentEvent::Thinking {
+                goal_role: goal_thinking_role(user_message, &thought),
                 content: thought,
                 done: true,
                 mission_id: Some(mission_id),
@@ -13749,10 +14075,12 @@ pub async fn run_codex_turn(
     // Flush any remaining accumulated thinking with full content so
     // the event logger persists it for replay/history.
     if thinking_emitted && !thinking_done_emitted {
+        let goal_role = goal_thinking_role(user_message, &thinking_accumulated);
         let _ = events_tx.send(AgentEvent::Thinking {
             content: thinking_accumulated,
             done: true,
             mission_id: Some(mission_id),
+            goal_role,
         });
     }
 
@@ -14097,6 +14425,7 @@ pub async fn run_gemini_turn(
                             content: content.clone(),
                             done: false,
                             mission_id: Some(mission_id),
+                            goal_role: goal_thinking_role(user_message, &content),
                         });
                         // Accumulate for persistence (keep longest snapshot)
                         if content.len() >= thinking_accumulated.len() {
@@ -14107,10 +14436,13 @@ pub async fn run_gemini_turn(
                     ExecutionEvent::ToolCall { id, name, args } => {
                         // Flush accumulated thinking before tool call
                         if !thinking_accumulated.is_empty() {
+                            let goal_role =
+                                goal_thinking_role(user_message, &thinking_accumulated);
                             let _ = events_tx.send(AgentEvent::Thinking {
                                 content: std::mem::take(&mut thinking_accumulated),
                                 done: true,
                                 mission_id: Some(mission_id),
+                                goal_role,
                             });
                             thinking_done_emitted = true;
                         }
@@ -14177,6 +14509,7 @@ pub async fn run_gemini_turn(
     if !thinking_emitted {
         if let Some((thought, cleaned)) = extract_thought_line(&assistant_message) {
             let _ = events_tx.send(AgentEvent::Thinking {
+                goal_role: goal_thinking_role(user_message, &thought),
                 content: thought,
                 done: true,
                 mission_id: Some(mission_id),
@@ -14189,10 +14522,12 @@ pub async fn run_gemini_turn(
 
     // Flush any remaining accumulated thinking with full content
     if thinking_emitted && !thinking_done_emitted {
+        let goal_role = goal_thinking_role(user_message, &thinking_accumulated);
         let _ = events_tx.send(AgentEvent::Thinking {
             content: thinking_accumulated,
             done: true,
             mission_id: Some(mission_id),
+            goal_role,
         });
     }
 
@@ -14611,7 +14946,8 @@ mod tests {
         codex_final_message_looks_like_progress_update, codex_key_fingerprint,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
         extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, grok_output_looks_like_oauth_prompt, is_capacity_limited_error,
+        extract_thought_line, grok_event_is_end, grok_event_thought_text,
+        grok_output_looks_like_oauth_prompt, is_capacity_limited_error,
         is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_provider_payload_error,
         is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
         is_success_path_provider_payload_error, is_success_path_rate_limited_error,
@@ -14987,6 +15323,32 @@ mod tests {
     }
 
     #[test]
+    fn grok_event_thought_text_extracts_thought_data() {
+        // Real payload from `grok -p ... --output-format streaming-json`:
+        // each token in the reasoning stream arrives as one of these. Ours
+        // is the only path that pulls them out — `grok_event_text` only
+        // recognises `data` when `type=="text"`, so without this hook the
+        // thought stream is silently dropped.
+        let ev = serde_json::json!({"type":"thought","data":" two"});
+        assert_eq!(grok_event_thought_text(&ev).as_deref(), Some(" two"));
+
+        // Case-insensitive aliases used by older grok builds.
+        let ev = serde_json::json!({"type":"Thinking","data":"foo"});
+        assert_eq!(grok_event_thought_text(&ev).as_deref(), Some("foo"));
+        let ev = serde_json::json!({"type":"reasoning","text":"bar"});
+        assert_eq!(grok_event_thought_text(&ev).as_deref(), Some("bar"));
+
+        // Non-thought events return None so the regular text path keeps
+        // ownership of them.
+        let ev = serde_json::json!({"type":"text","data":"hello"});
+        assert_eq!(grok_event_thought_text(&ev), None);
+        let ev = serde_json::json!({"type":"end","stopReason":"EndTurn"});
+        assert_eq!(grok_event_thought_text(&ev), None);
+        assert!(grok_event_is_end(&serde_json::json!({"type":"end"})));
+        assert!(!grok_event_is_end(&serde_json::json!({"type":"text"})));
+    }
+
+    #[test]
     fn grok_output_looks_like_oauth_prompt_detects_sign_in_banner() {
         // Real captured payload from mission d446dbfd (interrupted Grok turn
         // that emitted its OAuth prompt to stdout instead of stderr).
@@ -14998,6 +15360,17 @@ mod tests {
         ));
         assert!(grok_output_looks_like_oauth_prompt(
             "https://auth.x.ai/oauth2/authorize?response_type=code&client_id=b1a00492&scope=grok-cli%3Aaccess"
+        ));
+        // Captured from mission 0fa616bb: when the OAuth callback never
+        // arrives (headless server, browser closed, etc.) the CLI emits a
+        // plain "Login timed out" message as a streaming-json text event, so
+        // we have to treat that as an auth failure too instead of recording
+        // it as a `success:true` turn.
+        assert!(grok_output_looks_like_oauth_prompt(
+            "Login timed out after 10 minutes. Please try again."
+        ));
+        assert!(grok_output_looks_like_oauth_prompt(
+            "Authentication timed out"
         ));
         assert!(!grok_output_looks_like_oauth_prompt(
             "Here is a summary of the audit findings."

@@ -77,6 +77,7 @@ impl OpenCodeAgent {
                     content: content.clone(),
                     done: false,
                     mission_id: ctx.mission_id,
+                    goal_role: None,
                 }
             }
             OpenCodeEvent::TextDelta { content } => {
@@ -89,6 +90,7 @@ impl OpenCodeAgent {
                     content: content.clone(),
                     done: false,
                     mission_id: ctx.mission_id,
+                    goal_role: None,
                 }
             }
             OpenCodeEvent::ToolCall { id, name, args } => {
@@ -635,6 +637,7 @@ impl Agent for OpenCodeAgent {
                     content: reasoning_content,
                     done: false,
                     mission_id: ctx.mission_id,
+                    goal_role: None,
                 });
             }
             // Emit final thinking done marker
@@ -642,6 +645,7 @@ impl Agent for OpenCodeAgent {
                 content: String::new(),
                 done: true,
                 mission_id: ctx.mission_id,
+                goal_role: None,
             });
         }
 

@@ -190,6 +190,12 @@ enum CostSource: String, Sendable {
     case unknown
 }
 
+enum GoalOutputRole: String, Sendable {
+    case deliverable
+    case progress
+    case terminalNotice = "terminal_notice"
+}
+
 // MARK: - Chat Message Type
 
 enum ChatMessageType: @unchecked Sendable {
@@ -210,6 +216,7 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
     var toolUI: ToolUIContent?
     var toolData: ToolCallData?
     let timestamp: Date
+    var goalRole: GoalOutputRole?
     /// True while the optimistic user bubble is awaiting server acknowledgement.
     /// Cleared as soon as `sendMessage` returns or the SSE roundtrip arrives.
     /// The bubble renders dimmed with a small spinner while pending so users
@@ -223,6 +230,7 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
         toolUI: ToolUIContent? = nil,
         toolData: ToolCallData? = nil,
         timestamp: Date = Date(),
+        goalRole: GoalOutputRole? = nil,
         isPending: Bool = false
     ) {
         self.id = id
@@ -231,6 +239,7 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
         self.toolUI = toolUI
         self.toolData = toolData
         self.timestamp = timestamp
+        self.goalRole = goalRole
         self.isPending = isPending
     }
     

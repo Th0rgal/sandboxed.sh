@@ -17,7 +17,92 @@
 //! handled inside the existing harness paths in `mission_runner.rs`. The
 //! adapter is only used for *observation* and *event classification*.
 
+use serde::Serialize;
+
 use crate::api::control::AgentEvent;
+
+/// Semantic role for text emitted while a native `/goal` loop is active.
+///
+/// Harnesses often emit their real deliverable as reasoning/thinking and then
+/// finish with a short loop-control notice. Persisting this role lets the UI
+/// show the user's expected final answer without treating terminal bookkeeping
+/// as the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalOutputRole {
+    Deliverable,
+    Progress,
+    TerminalNotice,
+}
+
+impl GoalOutputRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deliverable => "deliverable",
+            Self::Progress => "progress",
+            Self::TerminalNotice => "terminal_notice",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalOutputSource {
+    Assistant,
+    Thinking,
+}
+
+pub fn is_goal_command(message: &str) -> bool {
+    message.trim_start().starts_with("/goal")
+}
+
+pub fn classify_goal_output(content: &str, source: GoalOutputSource) -> Option<GoalOutputRole> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_lowercase();
+    let terminal_phrases = [
+        "goal complete",
+        "goal window",
+        "window has elapsed",
+        "waiting for the window",
+        "continue if the goal hook",
+        "hook is still active",
+        "nothing more to do this turn",
+    ];
+    if terminal_phrases.iter().any(|phrase| lower.contains(phrase)) {
+        return Some(GoalOutputRole::TerminalNotice);
+    }
+
+    let deliverable_markers = [
+        "# summary",
+        "summary:",
+        "critical:",
+        "findings",
+        "recommendation",
+        "status\n",
+        "status\r\n",
+        "1. ",
+        "## ",
+    ];
+    if trimmed.len() >= 800 && source == GoalOutputSource::Thinking {
+        return Some(GoalOutputRole::Deliverable);
+    }
+    if trimmed.len() >= 1200 && source == GoalOutputSource::Assistant {
+        return Some(GoalOutputRole::Deliverable);
+    }
+    if deliverable_markers
+        .iter()
+        .filter(|marker| lower.contains(**marker))
+        .count()
+        >= 2
+    {
+        return Some(GoalOutputRole::Deliverable);
+    }
+
+    Some(GoalOutputRole::Progress)
+}
 
 /// What a single SSE event tells us about the loop's progress.
 #[derive(Debug, Clone, PartialEq)]
@@ -194,5 +279,34 @@ mod tests {
         assert!(find_adapter("grok", "goal").is_some());
         assert!(find_adapter("opencode", "goal").is_none());
         assert!(find_adapter("claudecode", "audit").is_none());
+    }
+
+    #[test]
+    fn goal_output_classifier_marks_long_thinking_as_deliverable() {
+        let report = format!(
+            "# Summary\n{}\n1. Critical: proof target changed\n## Recommendation\nship it",
+            "analysis ".repeat(120)
+        );
+        assert_eq!(
+            classify_goal_output(&report, GoalOutputSource::Thinking),
+            Some(GoalOutputRole::Deliverable)
+        );
+    }
+
+    #[test]
+    fn goal_output_classifier_marks_goal_control_notice_as_terminal() {
+        let notice = "The original goal window has elapsed. Goal complete.";
+        assert_eq!(
+            classify_goal_output(notice, GoalOutputSource::Assistant),
+            Some(GoalOutputRole::TerminalNotice)
+        );
+    }
+
+    #[test]
+    fn goal_output_classifier_marks_short_status_as_progress() {
+        assert_eq!(
+            classify_goal_output("The analysis is in good shape.", GoalOutputSource::Thinking),
+            Some(GoalOutputRole::Progress)
+        );
     }
 }

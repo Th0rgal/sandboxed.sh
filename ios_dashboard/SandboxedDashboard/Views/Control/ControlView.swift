@@ -893,9 +893,26 @@ struct ControlView: View {
         }
 
         for message in messages {
+            if message.isAssistant && message.goalRole == .terminalNotice {
+                continue
+            }
+
             // Thinking renders only in the thoughts sheet, never in the main pane.
             if message.isThinking {
                 flushToolGroup()
+                if message.goalRole == .deliverable,
+                   !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    var promoted = ChatMessage(
+                        id: "\(message.id)-goal-deliverable",
+                        type: .assistant(success: true, costCents: 0, costSource: .unknown, model: nil, sharedFiles: nil),
+                        content: message.content,
+                        timestamp: message.timestamp,
+                        goalRole: .deliverable
+                    )
+                    promoted.toolUI = message.toolUI
+                    promoted.toolData = message.toolData
+                    result.append(.single(promoted))
+                }
                 continue
             }
 
@@ -2787,6 +2804,42 @@ struct ControlView: View {
         message.id.hasPrefix(streamingThoughtPrefix)
     }
 
+    private func parseGoalOutputRole(_ value: Any?) -> GoalOutputRole? {
+        guard let raw = value as? String else { return nil }
+        return GoalOutputRole(rawValue: raw)
+    }
+
+    private func inferGoalOutputRole(content: String, kind: String) -> GoalOutputRole? {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let lower = trimmed.lowercased()
+        if lower.contains("goal complete")
+            || lower.contains("goal window")
+            || lower.contains("window has elapsed")
+            || lower.contains("waiting for the window")
+            || lower.contains("continue if the goal hook")
+            || lower.contains("hook is still active")
+        {
+            return .terminalNotice
+        }
+
+        let markers = ["# summary", "summary:", "critical:", "findings", "recommendation", "## ", "1. "]
+        let markerCount = markers.reduce(0) { count, marker in
+            count + (lower.contains(marker) ? 1 : 0)
+        }
+        if (kind == "thinking" && trimmed.count >= 800) || markerCount >= 2 {
+            return .deliverable
+        }
+        return nil
+    }
+
+    private func goalOutputRole(from data: [String: Any], content: String, kind: String) -> GoalOutputRole? {
+        parseGoalOutputRole(data["goal_role"])
+            ?? ((currentMission?.goalMode == true || viewingMission?.goalMode == true)
+                ? inferGoalOutputRole(content: content, kind: kind)
+                : nil)
+    }
+
     private func finalizeActiveThinkingMessages() {
         for index in messages.indices {
             guard messages[index].isThinking, !messages[index].thinkingDone else {
@@ -2801,7 +2854,8 @@ struct ControlView: View {
                 content: existing.content,
                 toolUI: existing.toolUI,
                 toolData: existing.toolData,
-                timestamp: existing.timestamp
+                timestamp: existing.timestamp,
+                goalRole: existing.goalRole
             )
         }
     }
@@ -2965,6 +3019,7 @@ struct ControlView: View {
                 let costSource = (data["cost_source"] as? String ?? costObj?["source"] as? String)
                     .flatMap(CostSource.init(rawValue:)) ?? .unknown
                 let model = data["model"] as? String
+                let goalRole = goalOutputRole(from: data, content: content, kind: "assistant")
 
                 // Parse shared_files if present
                 var sharedFiles: [SharedFile]? = nil
@@ -2991,7 +3046,8 @@ struct ControlView: View {
                 let message = ChatMessage(
                     id: id,
                     type: .assistant(success: success, costCents: costCents, costSource: costSource, model: model, sharedFiles: sharedFiles),
-                    content: content
+                    content: content,
+                    goalRole: goalRole
                 )
                 messages.append(message)
             }
@@ -3033,6 +3089,7 @@ struct ControlView: View {
             let content = data["content"] as? String ?? ""
             let done = data["done"] as? Bool ?? false
             let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            let goalRole = goalOutputRole(from: data, content: content, kind: "thinking")
 
             if trimmed.isEmpty {
                 if done {
@@ -3066,7 +3123,8 @@ struct ControlView: View {
                     content: content,
                     toolUI: existing.toolUI,
                     toolData: existing.toolData,
-                    timestamp: existing.timestamp
+                    timestamp: existing.timestamp,
+                    goalRole: existing.goalRole ?? goalRole
                 )
             } else {
                 // Create new thinking message - whether done or not.
@@ -3081,7 +3139,8 @@ struct ControlView: View {
                 let message = ChatMessage(
                     id: messageId,
                     type: .thinking(done: done, startTime: Date()),
-                    content: content
+                    content: content,
+                    goalRole: goalRole
                 )
                 messages.append(message)
             }
@@ -3447,6 +3506,7 @@ private struct HistoricalTranscriptBuilder {
                 .flatMap(CostSource.init(rawValue:)) ?? .unknown
             let model = data["model"] as? String
             let sharedFiles = parseSharedFiles(data["shared_files"])
+            let goalRole = goalOutputRole(from: data, content: content, kind: "assistant")
 
             finalizeActiveThinkingMessages()
             messages.removeAll { $0.isPhase }
@@ -3462,7 +3522,8 @@ private struct HistoricalTranscriptBuilder {
                         model: model,
                         sharedFiles: sharedFiles
                     ),
-                    content: content
+                    content: content,
+                    goalRole: goalRole
                 )
             )
 
@@ -3474,6 +3535,7 @@ private struct HistoricalTranscriptBuilder {
         case "thinking":
             let content = data["content"] as? String ?? ""
             let done = data["done"] as? Bool ?? false
+            let goalRole = goalOutputRole(from: data, content: content, kind: "thinking")
             let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
                 if done {
@@ -3497,14 +3559,16 @@ private struct HistoricalTranscriptBuilder {
                     content: content,
                     toolUI: existing.toolUI,
                     toolData: existing.toolData,
-                    timestamp: existing.timestamp
+                    timestamp: existing.timestamp,
+                    goalRole: existing.goalRole ?? goalRole
                 )
             } else {
                 messages.append(
                     ChatMessage(
                         id: eventId ?? "thinking-\(UUID().uuidString)",
                         type: .thinking(done: done, startTime: Date()),
-                        content: content
+                        content: content,
+                        goalRole: goalRole
                     )
                 )
             }
@@ -3606,7 +3670,8 @@ private struct HistoricalTranscriptBuilder {
                 content: mergedContent,
                 toolUI: existing.toolUI,
                 toolData: existing.toolData,
-                timestamp: existing.timestamp
+                timestamp: existing.timestamp,
+                goalRole: existing.goalRole
             )
         } else {
             messages.append(
@@ -3619,7 +3684,8 @@ private struct HistoricalTranscriptBuilder {
                         model: nil,
                         sharedFiles: nil
                     ),
-                    content: content
+                    content: content,
+                    goalRole: goalOutputRole(from: [:], content: content, kind: "assistant")
                 )
             )
         }
@@ -3665,6 +3731,38 @@ private struct HistoricalTranscriptBuilder {
             )
         }
         return files.isEmpty ? nil : files
+    }
+
+    private func parseGoalOutputRole(_ value: Any?) -> GoalOutputRole? {
+        guard let raw = value as? String else { return nil }
+        return GoalOutputRole(rawValue: raw)
+    }
+
+    private func inferGoalOutputRole(content: String, kind: String) -> GoalOutputRole? {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let lower = trimmed.lowercased()
+        if lower.contains("goal complete")
+            || lower.contains("goal window")
+            || lower.contains("window has elapsed")
+            || lower.contains("waiting for the window")
+            || lower.contains("continue if the goal hook")
+            || lower.contains("hook is still active")
+        {
+            return .terminalNotice
+        }
+        let markers = ["# summary", "summary:", "critical:", "findings", "recommendation", "## ", "1. "]
+        let markerCount = markers.reduce(0) { count, marker in
+            count + (lower.contains(marker) ? 1 : 0)
+        }
+        if (kind == "thinking" && trimmed.count >= 800) || markerCount >= 2 {
+            return .deliverable
+        }
+        return nil
+    }
+
+    private func goalOutputRole(from data: [String: Any], content: String, kind: String) -> GoalOutputRole? {
+        parseGoalOutputRole(data["goal_role"]) ?? inferGoalOutputRole(content: content, kind: kind)
     }
 
     private mutating func applyToolResult(_ data: [String: Any]) {

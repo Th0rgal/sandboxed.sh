@@ -45,6 +45,7 @@ use super::mission_store::{
     MissionStoreType,
 };
 use super::routes::AppState;
+use crate::backend::native_loops::{classify_goal_output, GoalOutputRole, GoalOutputSource};
 
 const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
 const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
@@ -2645,6 +2646,8 @@ pub enum AgentEvent {
         /// Whether the mission can be resumed after this failure (only relevant when success=false)
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         resumable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        goal_role: Option<GoalOutputRole>,
     },
     /// Agent thinking/reasoning (streaming)
     Thinking {
@@ -2655,6 +2658,8 @@ pub enum AgentEvent {
         /// Mission this thinking belongs to (for parallel execution)
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        goal_role: Option<GoalOutputRole>,
     },
     /// Text content delta (streaming assistant response)
     TextDelta {
@@ -5497,6 +5502,7 @@ fn spawn_control_session(
                                     content,
                                     done: true,
                                     mission_id: Some(mid),
+                                    goal_role: None,
                                 };
                                 if let Err(e) = store.log_event(mid, &synthetic).await {
                                     tracing::warn!("Failed to log synthetic thinking event: {}", e);
@@ -9391,6 +9397,17 @@ async fn control_actor_loop(
                             // Mark failures as resumable so UI can show a resume button
                             let resumable = !agent_result.success && completed_mission_id.is_some();
                             let model_used = agent_result.model_used.clone();
+                            let goal_role = if let Some(mid) = completed_mission_id {
+                                match mission_store.get_mission(mid).await {
+                                    Ok(Some(mission)) if mission.goal_mode => classify_goal_output(
+                                        &agent_result.output,
+                                        GoalOutputSource::Assistant,
+                                    ),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
                             let _ = events_tx.send(AgentEvent::AssistantMessage {
                                 id: Uuid::new_v4(),
                                 content: agent_result.output.clone(),
@@ -9405,6 +9422,7 @@ async fn control_actor_loop(
                                 mission_id: completed_mission_id,
                                 shared_files,
                                 resumable,
+                                goal_role,
                             });
                             if let Some(mission_id) = completed_mission_id {
                                 // Update automation executions based on agent outcome
@@ -9713,6 +9731,13 @@ async fn control_actor_loop(
                             // Emit completion event with mission_id
                             // Mark failures as resumable
                             let resumable = !result.success;
+                            let goal_role = match mission_store.get_mission(*mission_id).await {
+                                Ok(Some(mission)) if mission.goal_mode => classify_goal_output(
+                                    &result.output,
+                                    GoalOutputSource::Assistant,
+                                ),
+                                _ => None,
+                            };
                             let _ = events_tx.send(AgentEvent::AssistantMessage {
                                 // Use a unique id so we don't overwrite the user_message event
                                 // (event_id is used for de-dupe in the SQLite event logger).
@@ -9730,6 +9755,7 @@ async fn control_actor_loop(
                                 mission_id: Some(*mission_id),
                                 shared_files,
                                 resumable,
+                                goal_role,
                             });
 
                             // Update automation executions based on agent outcome
@@ -13907,6 +13933,7 @@ mod tests {
             mission_id: Some(mission_id),
             shared_files: None,
             resumable: false,
+            goal_role: None,
         };
 
         let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);
@@ -13937,6 +13964,7 @@ mod tests {
             mission_id: Some(mission_id),
             shared_files: None,
             resumable: false,
+            goal_role: None,
         };
 
         let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);
