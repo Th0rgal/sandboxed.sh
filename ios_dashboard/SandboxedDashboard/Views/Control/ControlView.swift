@@ -22,7 +22,9 @@ struct ControlView: View {
     private static let lastMissionIdKey = "control_last_mission_id"
     private static let performanceLog = OSLog(subsystem: "sh.sandboxed.dashboard", category: "ControlPerformance")
 
-    @State private var messages: [ChatMessage] = []
+    @State private var chatStore = ChatTranscriptStore()
+    @State private var missionListStore = MissionListStore()
+    @State private var runningMissionsStore = RunningMissionsStore()
     @State private var inputText = UserDefaults.standard.string(forKey: ControlView.draftTextKey) ?? ""
     @State private var runState: ControlRunState = .idle
     @State private var queueLength = 0
@@ -73,10 +75,6 @@ struct ControlView: View {
     /// header leave this `nil` and callers fall back to full reload.
     @State private var missionMaxSeq: [String: Int64] = [:]
 
-    // Cached grouped items (recomputed only when messages change)
-    @State private var groupedItems: [GroupedChatItem] = []
-    @State private var groupedItemsRecomputeTask: Task<Void, Never>?
-
     // Draft save debounce
     @State private var draftSaveTask: Task<Void, Never>?
 
@@ -84,11 +82,7 @@ struct ControlView: View {
     @State private var connectionState: ConnectionState = .disconnected
     @State private var reconnectAttempt = 0
 
-    // Parallel missions state
-    @State private var runningMissions: [RunningMissionInfo] = []
     @State private var viewingMissionId: String?
-    @State private var showRunningMissions = false
-    @State private var runningRefreshTask: Task<Void, Never>?
 
     // Track pending fetch to prevent race conditions
     @State private var fetchingMissionId: String?
@@ -99,17 +93,13 @@ struct ControlView: View {
     // Tool grouping state - track which groups are expanded
     @State private var expandedToolGroups: Set<String> = []
 
-    // Mission switcher state
     @State private var showMissionSwitcher = false
-    @State private var recentMissions: [Mission] = []
 
     // Desktop stream state
     @State private var showDesktopStream = false
     @State private var desktopDisplayId = ":101"
     private let availableDisplays = [":99", ":100", ":101", ":102"]
 
-    // Worker (child mission) state
-    @State private var childMissions: [Mission] = []
     @State private var showWorkerSheet = false
 
     // Workspace selection state (global)
@@ -124,6 +114,46 @@ struct ControlView: View {
     private let api = APIService.shared
     private let nav = NavigationState.shared
     private let bottomAnchorId = "bottom-anchor"
+
+    private var messages: [ChatMessage] {
+        get { chatStore.messages }
+        nonmutating set { chatStore.messages = newValue }
+    }
+
+    private var groupedItems: [GroupedChatItem] {
+        get { chatStore.groupedItems }
+        nonmutating set { chatStore.groupedItems = newValue }
+    }
+
+    private var groupedItemsRecomputeTask: Task<Void, Never>? {
+        get { chatStore.groupedItemsRecomputeTask }
+        nonmutating set { chatStore.groupedItemsRecomputeTask = newValue }
+    }
+
+    private var runningMissions: [RunningMissionInfo] {
+        get { runningMissionsStore.runningMissions }
+        nonmutating set { runningMissionsStore.runningMissions = newValue }
+    }
+
+    private var showRunningMissions: Bool {
+        get { runningMissionsStore.showRunningMissions }
+        nonmutating set { runningMissionsStore.showRunningMissions = newValue }
+    }
+
+    private var runningRefreshTask: Task<Void, Never>? {
+        get { runningMissionsStore.refreshTask }
+        nonmutating set { runningMissionsStore.refreshTask = newValue }
+    }
+
+    private var recentMissions: [Mission] {
+        get { missionListStore.recentMissions }
+        nonmutating set { missionListStore.recentMissions = newValue }
+    }
+
+    private var childMissions: [Mission] {
+        get { missionListStore.childMissions }
+        nonmutating set { missionListStore.childMissions = newValue }
+    }
     
     var body: some View {
         ZStack {

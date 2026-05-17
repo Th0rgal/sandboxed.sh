@@ -24,6 +24,7 @@
 		51E9D9F51934DFC8EAD58CDC /* QueueSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8EAAE29E81F160F8E8409B7D /* QueueSheet.swift */; };
 		58D2BEEDF2B4B34B3B98487C /* ToolUIOptionListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCD083A671640B2F286D7C06 /* ToolUIOptionListView.swift */; };
 		5D1FB1BE4D58CC95A500B684 /* ControlView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2E4AC8C92D9F496B8152B8F /* ControlView.swift */; };
+		61C4EFC39EDE42C2942147B5 /* ControlStores.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F3C17FD3C6E4CA98E877B38 /* ControlStores.swift */; };
 		66E208F9D4759B79ED653374 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B74AB5DF6829813AE79229D /* ContentView.swift */; };
 		6846AB79778CDF4CC216B7D1 /* SandboxedDashboardApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8080D5ADF84794AFE484FE17 /* SandboxedDashboardApp.swift */; };
 		692C694570F45D74CCBAC75B /* TerminalState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6922E2F0E17EDB3A8400D473 /* TerminalState.swift */; };
@@ -90,6 +91,7 @@
 		4802677F01F1504267EC2BE2 /* SandboxedDashboardTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = SandboxedDashboardTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		492E8CF2E0A3AEF64A472C85 /* FileEntry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileEntry.swift; sourceTree = "<group>"; };
 		4CC2B6E9848FF220F103DED2 /* LoadingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadingView.swift; sourceTree = "<group>"; };
+		4F3C17FD3C6E4CA98E877B38 /* ControlStores.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlStores.swift; sourceTree = "<group>"; };
 		55F4658A2D65748FC7AC5DE3 /* APIService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIService.swift; sourceTree = "<group>"; };
 		62B73495CB5FE8A01851005A /* FidoApprovalOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FidoApprovalOverlay.swift; sourceTree = "<group>"; };
 		6922E2F0E17EDB3A8400D473 /* TerminalState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalState.swift; sourceTree = "<group>"; };
@@ -253,6 +255,7 @@
 			isa = PBXGroup;
 			children = (
 				2A33016C6075CC02E61C315A /* AutomationsView.swift */,
+				4F3C17FD3C6E4CA98E877B38 /* ControlStores.swift */,
 				D2E4AC8C92D9F496B8152B8F /* ControlView.swift */,
 				1834CB7B575220FDE7679F7B /* NewMissionSheet.swift */,
 				8EAAE29E81F160F8E8409B7D /* QueueSheet.swift */,
@@ -422,6 +425,7 @@
 				BFD7D29C1F46E9F130A05F34 /* BackendAgentService.swift in Sources */,
 				B6263AC356BE51962E2D0145 /* ChatMessage.swift in Sources */,
 				66E208F9D4759B79ED653374 /* ContentView.swift in Sources */,
+				61C4EFC39EDE42C2942147B5 /* ControlStores.swift in Sources */,
 				5D1FB1BE4D58CC95A500B684 /* ControlView.swift in Sources */,
 				B3680EB29951C459A8C8A35A /* DesktopStreamService.swift in Sources */,
 				8573A897FBBC1697AE1AA7BA /* DesktopStreamView.swift in Sources */,
