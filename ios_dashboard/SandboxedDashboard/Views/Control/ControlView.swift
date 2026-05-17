@@ -1705,6 +1705,9 @@ struct ControlView: View {
         // Try to load cached version first for immediate display with consistent event-based rendering
         let hasCache: Bool
         if let cachedData = await loadCachedMissionData(id) {
+            guard fetchingMissionId == id, viewingMissionId == id else {
+                return
+            }
             // Use cached events for consistent display (avoids flash when fresh data arrives)
             await applyViewingMissionWithEvents(cachedData.mission, events: cachedData.events)
             hasCache = true
@@ -2642,6 +2645,9 @@ struct ControlView: View {
         // on disk. (UX audit item #1.)
         let hasCache: Bool
         if let cached = await loadCachedMissionData(id) {
+            guard fetchingMissionId == id, viewingMissionId == id else {
+                return
+            }
             await applyViewingMissionWithEvents(cached.mission, events: cached.events)
             hasCache = true
         } else {
