@@ -315,9 +315,40 @@ fn merge_pending_text_delta(existing: &mut String, content: &str) {
     if content.starts_with(existing.as_str()) {
         existing.clear();
         existing.push_str(content);
+    } else if existing.starts_with(content) {
+        // Snapshot-style streams can briefly resend a shorter prefix after
+        // reconnects or out-of-order delivery. Keep the fuller pending text.
+    } else if looks_like_new_text_snapshot(existing, content) {
+        existing.clear();
+        existing.push_str(content);
     } else {
         existing.push_str(content);
     }
+}
+
+fn looks_like_new_text_snapshot(existing: &str, content: &str) -> bool {
+    let existing = existing.trim();
+    let content = content.trim();
+    if existing.is_empty() || content.is_empty() {
+        return false;
+    }
+
+    // Plain token deltas are commonly short fragments ("the build.") or
+    // lower-case continuations. Snapshot-style updates are usually complete
+    // clauses/sentences. When a new, sentence-like snapshot does not share the
+    // previous snapshot as a prefix, replace it instead of gluing repeated
+    // prefixes together ("The...The focused...The focused build...").
+    let first = content.chars().next().unwrap_or_default();
+    let starts_like_sentence =
+        first.is_uppercase() || first == '"' || first == '\'' || first == '`';
+    let substantial = content.chars().count() >= 24;
+    let existing_sentence_complete = existing
+        .chars()
+        .rev()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | ':' | ';'));
+
+    starts_like_sentence && (substantial || existing_sentence_complete)
 }
 
 fn synthetic_thought_from_text_delta(
@@ -13909,6 +13940,42 @@ mod tests {
         assert_eq!(
             synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
             Some("Now let me run the build".to_string())
+        );
+    }
+
+    #[test]
+    fn synthetic_thought_from_text_delta_replaces_distinct_full_snapshots() {
+        let mission_id = Uuid::new_v4();
+        let mut pending = HashMap::new();
+
+        let first = AgentEvent::TextDelta {
+            content: "The focused build is still running through the large feature-test file. So far the changed modules and contract smokes compiled; I’m waiting for the regression assertions to complete.".to_string(),
+            mission_id: Some(mission_id),
+        };
+        let second = AgentEvent::TextDelta {
+            content: "The focused feature build passed with the new assertions.".to_string(),
+            mission_id: Some(mission_id),
+        };
+        let third = AgentEvent::TextDelta {
+            content: "The focused feature build passed with the new assertions. I’m running the broader lake test suite now.".to_string(),
+            mission_id: Some(mission_id),
+        };
+        let tool_call = AgentEvent::ToolCall {
+            tool_call_id: "tool-1".to_string(),
+            name: "Bash".to_string(),
+            args: serde_json::json!({ "command": "lake test" }),
+            mission_id: Some(mission_id),
+        };
+
+        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &first);
+        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &second);
+        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &third);
+        assert_eq!(
+            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
+            Some(
+                "The focused feature build passed with the new assertions. I’m running the broader lake test suite now."
+                    .to_string()
+            )
         );
     }
 

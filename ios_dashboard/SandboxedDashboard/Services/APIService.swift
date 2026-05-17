@@ -308,14 +308,22 @@ final class APIService: @unchecked Sendable {
     func getMissionTraceWithMeta(
         id: String,
         limit: Int? = nil,
-        sinceSeq: Int64? = nil
+        latest: Bool = false,
+        sinceSeq: Int64? = nil,
+        beforeSeq: Int64? = nil
     ) async throws -> MissionEventsResult {
         var queryItems: [URLQueryItem] = []
         if let limit = limit {
             queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
         }
+        if latest {
+            queryItems.append(URLQueryItem(name: "latest", value: "true"))
+        }
         if let sinceSeq = sinceSeq {
             queryItems.append(URLQueryItem(name: "since_seq", value: String(sinceSeq)))
+        }
+        if let beforeSeq = beforeSeq {
+            queryItems.append(URLQueryItem(name: "before_seq", value: String(beforeSeq)))
         }
 
         var urlString = "/api/control/missions/\(id)/trace"

@@ -67,6 +67,9 @@ struct ControlView: View {
     @State private var hasMoreHistory = false
     @State private var isLoadingEarlier = false
     @State private var loadedEventCount = 0  // How many events we've loaded so far
+    @State private var loadedViewingEvents: [StoredEvent] = []
+    @State private var hasMoreOlderThoughts = false
+    @State private var isLoadingOlderThoughts = false
 
     /// Per-mission high-water mark for `sequence`. When non-nil, reload paths
     /// pass it as `since_seq` to `/events` so the server returns only the tail
@@ -515,7 +518,11 @@ struct ControlView: View {
                 .presentationBackgroundInteraction(.enabled(upThrough: .medium))
         }
         .sheet(isPresented: $showThoughts) {
-            ThoughtsSheet(messages: messages)
+            ThoughtsSheet(
+                messages: messages,
+                hasMoreOlderThoughts: hasMoreOlderThoughts,
+                loadOlderThoughts: loadOlderThoughts
+            )
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .presentationBackgroundInteraction(.enabled(upThrough: .medium))
@@ -1576,6 +1583,11 @@ struct ControlView: View {
         viewingMission = mission
         viewingMissionId = mission.id
         loadedEventCount = snapshot.loadedEventCount
+        loadedViewingEvents = events.sorted { lhs, rhs in
+            if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+            if lhs.timestamp != rhs.timestamp { return lhs.timestamp < rhs.timestamp }
+            return lhs.id < rhs.id
+        }
         messages = mergedMessages
         groupedItems = liveMessages.isEmpty
             ? snapshot.groupedItems
@@ -1636,7 +1648,25 @@ struct ControlView: View {
         }
 
         loadedEventCount += orderedEvents.count
+        mergeLoadedViewingEvents(orderedEvents)
         recomputeGroupedItems()
+    }
+
+    private func mergeLoadedViewingEvents(_ newEvents: [StoredEvent]) {
+        guard !newEvents.isEmpty else { return }
+        var bySequence: [Int64: StoredEvent] = [:]
+        bySequence.reserveCapacity(loadedViewingEvents.count + newEvents.count)
+        for event in loadedViewingEvents {
+            bySequence[event.sequence] = event
+        }
+        for event in newEvents {
+            bySequence[event.sequence] = event
+        }
+        loadedViewingEvents = bySequence.values.sorted { lhs, rhs in
+            if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+            if lhs.timestamp != rhs.timestamp { return lhs.timestamp < rhs.timestamp }
+            return lhs.id < rhs.id
+        }
     }
 
     /// Decide what to load on cold start. The previous code did
@@ -1801,7 +1831,7 @@ struct ControlView: View {
                     }
                     cacheMissionWithEvents(mission, events: events)
                     Task { @MainActor [api] in
-                        if let trace = try? await api.getMissionTraceWithMeta(id: id, limit: Self.initialEventLimit, sinceSeq: 0),
+                        if let trace = try? await api.getMissionTraceWithMeta(id: id, limit: Self.initialEventLimit, latest: true),
                            !trace.events.isEmpty {
                             guard fetchingMissionId == id || viewingMissionId == id else { return }
                             // Deduplicate by sequence — transcript and trace
@@ -1820,6 +1850,7 @@ struct ControlView: View {
                                 missionMaxSeq[id] = maxSeq
                             }
                             cacheMissionWithEvents(mission, events: merged)
+                            hasMoreOlderThoughts = trace.events.count >= Self.initialEventLimit
                         }
                     }
                 }
@@ -1880,6 +1911,7 @@ struct ControlView: View {
     /// instead; if the user truly needs to scroll past that, they can tap
     /// again. Keeps cold-load worst-case bounded.
     private static let loadEarlierPageLimit = 1000
+    private static let loadOlderThoughtsPageLimit = 50
 
     // Load earlier messages when user taps "Load earlier" button
     private func loadEarlierMessages() async {
@@ -1905,6 +1937,59 @@ struct ControlView: View {
             }
         } catch {
             print("Failed to load earlier messages: \(error)")
+            HapticService.error()
+        }
+    }
+
+    private func loadOlderThoughts() async {
+        guard let missionId = viewingMissionId,
+              let mission = viewingMission,
+              !isLoadingOlderThoughts else {
+            return
+        }
+
+        let oldestTraceSequence = loadedViewingEvents
+            .filter { $0.eventType == "thinking" || $0.eventType == "tool_call" || $0.eventType == "tool_result" || $0.eventType == "text_delta" }
+            .map(\.sequence)
+            .min()
+
+        guard let beforeSeq = oldestTraceSequence else {
+            hasMoreOlderThoughts = false
+            return
+        }
+
+        isLoadingOlderThoughts = true
+        defer { isLoadingOlderThoughts = false }
+
+        do {
+            let result = try await api.getMissionTraceWithMeta(
+                id: missionId,
+                limit: Self.loadOlderThoughtsPageLimit,
+                beforeSeq: beforeSeq
+            )
+            guard viewingMissionId == missionId else { return }
+
+            hasMoreOlderThoughts = result.events.count >= Self.loadOlderThoughtsPageLimit
+            guard !result.events.isEmpty else { return }
+
+            var bySequence: [Int64: StoredEvent] = [:]
+            bySequence.reserveCapacity(loadedViewingEvents.count + result.events.count)
+            for event in loadedViewingEvents {
+                bySequence[event.sequence] = event
+            }
+            for event in result.events {
+                bySequence[event.sequence] = event
+            }
+
+            let merged = bySequence.values.sorted { lhs, rhs in
+                if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+                if lhs.timestamp != rhs.timestamp { return lhs.timestamp < rhs.timestamp }
+                return lhs.id < rhs.id
+            }
+            await applyViewingMissionWithEvents(mission, events: merged, scrollToBottom: false)
+            cacheMissionWithEvents(mission, events: merged)
+        } catch {
+            print("Failed to load older thoughts: \(error)")
             HapticService.error()
         }
     }
@@ -4772,7 +4857,13 @@ private struct ThinkingBubble: View {
 
 private struct ThoughtsSheet: View {
     let messages: [ChatMessage]
+    let hasMoreOlderThoughts: Bool
+    let loadOlderThoughts: () async -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var visibleCompletedLimit = 10
+    @State private var isLoadingOlderThoughts = false
+
+    private static let visibleThoughtIncrement = 10
 
     /// All thinking messages
     private var thinkingMessages: [ChatMessage] {
@@ -4787,7 +4878,7 @@ private struct ThoughtsSheet: View {
     /// Completed thoughts, deduplicated by content
     private var completedThoughts: [ChatMessage] {
         var seen = Set<String>()
-        return thinkingMessages.filter { msg in
+        return thinkingMessages.reversed().filter { msg in
             guard msg.thinkingDone else { return false }
             let trimmed = msg.content.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return false }
@@ -4797,13 +4888,21 @@ private struct ThoughtsSheet: View {
         }
     }
 
+    private var visibleCompletedThoughts: [ChatMessage] {
+        Array(completedThoughts.prefix(visibleCompletedLimit))
+    }
+
+    private var hasHiddenLoadedThoughts: Bool {
+        completedThoughts.count > visibleCompletedLimit
+    }
+
     private var hasActiveThinking: Bool {
         !activeThoughts.isEmpty
     }
 
     /// Count aligned with what is actually rendered in the sheet.
     private var visibleThoughtCount: Int {
-        activeThoughts.count + completedThoughts.count
+        activeThoughts.count + visibleCompletedThoughts.count
     }
 
     private var hasVisibleThoughts: Bool {
@@ -4832,10 +4931,45 @@ private struct ThoughtsSheet: View {
 
                             if !completedThoughts.isEmpty {
                                 ThoughtSection(title: "Recent Thoughts", icon: "clock.arrow.circlepath") {
-                                    ForEach(completedThoughts.reversed()) { msg in
+                                    ForEach(visibleCompletedThoughts) { msg in
                                         ThoughtTimelineRow(message: msg, emphasize: false)
                                     }
                                 }
+                            }
+
+                            if hasHiddenLoadedThoughts || hasMoreOlderThoughts {
+                                Button {
+                                    Task {
+                                        if hasHiddenLoadedThoughts {
+                                            visibleCompletedLimit += Self.visibleThoughtIncrement
+                                            return
+                                        }
+
+                                        isLoadingOlderThoughts = true
+                                        await loadOlderThoughts()
+                                        visibleCompletedLimit += Self.visibleThoughtIncrement
+                                        isLoadingOlderThoughts = false
+                                    }
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        if isLoadingOlderThoughts {
+                                            ProgressView()
+                                                .controlSize(.mini)
+                                        } else {
+                                            Image(systemName: "chevron.down")
+                                                .font(.caption2.weight(.semibold))
+                                        }
+                                        Text(isLoadingOlderThoughts ? "Loading Older Thoughts..." : "Load Older Thoughts")
+                                            .font(.caption.weight(.semibold))
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                                    .foregroundStyle(Theme.textSecondary)
+                                    .background(Theme.backgroundSecondary.opacity(0.8))
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isLoadingOlderThoughts)
                             }
                         }
                         .padding()
