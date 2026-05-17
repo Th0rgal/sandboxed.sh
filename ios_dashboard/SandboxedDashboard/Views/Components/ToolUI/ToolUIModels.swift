@@ -9,13 +9,13 @@ import Foundation
 
 // MARK: - Data Table
 
-struct ToolUIDataTable: Codable {
+struct ToolUIDataTable: Codable, @unchecked Sendable {
     let id: String?
     let title: String?
     let columns: [Column]
     let rows: [[String: AnyCodable]]
     
-    struct Column: Codable {
+    struct Column: Codable, Sendable {
         let id: String
         let label: String?
         let width: String?
@@ -48,14 +48,14 @@ struct ToolUIDataTable: Codable {
 
 // MARK: - Option List
 
-struct ToolUIOptionList: Codable {
+struct ToolUIOptionList: Codable, @unchecked Sendable {
     let id: String?
     let options: [Option]
     let selectionMode: String?
     let defaultValue: AnyCodable?
     let confirmed: AnyCodable?
     
-    struct Option: Codable, Identifiable {
+    struct Option: Codable, Identifiable, Sendable {
         let id: String
         let label: String
         let description: String?
@@ -80,7 +80,7 @@ struct ToolUIOptionList: Codable {
 
 // MARK: - Progress Bar
 
-struct ToolUIProgress: Codable {
+struct ToolUIProgress: Codable, Sendable {
     let id: String?
     let title: String?
     let current: Int
@@ -99,7 +99,7 @@ struct ToolUIProgress: Codable {
 
 // MARK: - Alert/Notification
 
-struct ToolUIAlert: Codable {
+struct ToolUIAlert: Codable, Sendable {
     let id: String?
     let title: String
     let message: String?
@@ -109,14 +109,14 @@ struct ToolUIAlert: Codable {
         AlertType(rawValue: type ?? "info") ?? .info
     }
 
-    enum AlertType: String {
+    enum AlertType: String, Sendable {
         case info, success, warning, error
     }
 }
 
 // MARK: - Code Block
 
-struct ToolUICodeBlock: Codable {
+struct ToolUICodeBlock: Codable, Sendable {
     let id: String?
     let title: String?
     let language: String?
@@ -126,7 +126,7 @@ struct ToolUICodeBlock: Codable {
 
 // MARK: - Tool Call Wrapper
 
-enum ToolUIContent: Identifiable {
+enum ToolUIContent: Identifiable, @unchecked Sendable {
     case dataTable(ToolUIDataTable)
     case optionList(ToolUIOptionList)
     case progress(ToolUIProgress)

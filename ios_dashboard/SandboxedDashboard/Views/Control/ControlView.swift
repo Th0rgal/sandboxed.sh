@@ -888,6 +888,37 @@ struct ControlView: View {
         groupedItems = Self.buildGroupedItems(from: messages)
     }
 
+    private struct HistoricalTranscriptSnapshot: Sendable {
+        let messages: [ChatMessage]
+        let groupedItems: [GroupedChatItem]
+        let loadedEventCount: Int
+    }
+
+    private static func buildHistoricalTranscriptSnapshot(events: [StoredEvent]) async -> HistoricalTranscriptSnapshot {
+        await Task.detached(priority: .userInitiated) {
+            let orderedEvents = events.sorted { lhs, rhs in
+                if lhs.sequence != rhs.sequence {
+                    return lhs.sequence < rhs.sequence
+                }
+                if lhs.timestamp != rhs.timestamp {
+                    return lhs.timestamp < rhs.timestamp
+                }
+                return lhs.id < rhs.id
+            }
+
+            var builder = HistoricalTranscriptBuilder()
+            for event in orderedEvents {
+                builder.apply(event)
+            }
+            let messages = builder.messages
+            return HistoricalTranscriptSnapshot(
+                messages: messages,
+                groupedItems: buildGroupedItems(from: messages),
+                loadedEventCount: orderedEvents.count
+            )
+        }.value
+    }
+
     /// Check if the currently viewed mission is running (not just any mission)
     private var viewingMissionIsRunning: Bool {
         guard let viewingId = viewingMissionId else {
@@ -1457,60 +1488,20 @@ struct ControlView: View {
 
     private static let initialEventLimit = 50
 
-    private func applyViewingMissionWithEvents(_ mission: Mission, events: [StoredEvent], scrollToBottom: Bool = true) {
+    private func applyViewingMissionWithEvents(_ mission: Mission, events: [StoredEvent], scrollToBottom: Bool = true) async {
         let signpostID = OSSignpostID(log: Self.performanceLog)
         os_signpost(.begin, log: Self.performanceLog, name: "applyViewingMissionWithEvents", signpostID: signpostID)
         defer { os_signpost(.end, log: Self.performanceLog, name: "applyViewingMissionWithEvents", signpostID: signpostID) }
 
         isLoadingHistory = true  // Suppress animated auto-scroll during history load
 
+        let snapshot = await Self.buildHistoricalTranscriptSnapshot(events: events)
+
         viewingMission = mission
         viewingMissionId = mission.id
-
-        // Ensure deterministic replay order in case the backend returns unsorted results
-        let orderedEvents = events.sorted { lhs, rhs in
-            if lhs.sequence != rhs.sequence {
-                return lhs.sequence < rhs.sequence
-            }
-            if lhs.timestamp != rhs.timestamp {
-                return lhs.timestamp < rhs.timestamp
-            }
-            return lhs.id < rhs.id
-        }
-
-        // Track total event count for pagination
-        loadedEventCount = orderedEvents.count
-
-        // Clear and replay all events to rebuild message history
-        messages.removeAll()
-
-        for event in orderedEvents {
-            var data: [String: Any] = [:]
-
-            // Add metadata first (lower priority)
-            for (key, value) in event.metadata {
-                data[key] = value.value
-            }
-
-            // Add core fields last (higher priority - these should never be overwritten)
-            data["mission_id"] = event.missionId
-            data["content"] = event.content
-
-            if let eventId = event.eventId {
-                data["id"] = eventId
-            }
-            if let toolCallId = event.toolCallId {
-                data["tool_call_id"] = toolCallId
-            }
-            if let toolName = event.toolName {
-                data["name"] = toolName
-            }
-
-            handleStreamEvent(type: event.eventType, data: data, isHistoricalReplay: true)
-        }
-
-        // Recompute grouped items once after all events are processed
-        recomputeGroupedItems()
+        loadedEventCount = snapshot.loadedEventCount
+        messages = snapshot.messages
+        groupedItems = snapshot.groupedItems
 
         if scrollToBottom {
             shouldScrollImmediately = true
@@ -1596,7 +1587,7 @@ struct ControlView: View {
            let cachedData = await loadCachedMissionData(currentId) {
             // Use cached events for consistent display (avoids flash when fresh data arrives)
             currentMission = cachedData.mission
-            applyViewingMissionWithEvents(cachedData.mission, events: cachedData.events)
+            await applyViewingMissionWithEvents(cachedData.mission, events: cachedData.events)
             hasCache = true
         } else {
             hasCache = false
@@ -1625,7 +1616,7 @@ struct ControlView: View {
                             applyViewingMission(mission)
                         } else {
                             hasMoreHistory = events.count >= Self.initialEventLimit
-                            applyViewingMissionWithEvents(mission, events: events)
+                            await applyViewingMissionWithEvents(mission, events: events)
                             // Seed delta cursor only when the backend advertises support
                             // via X-Max-Sequence — otherwise a delta call would be
                             // ignored and return offset=0 rows.
@@ -1666,6 +1657,10 @@ struct ControlView: View {
             _ = try? await api.markMissionOpened(id: id)
         }
 
+        if let summary = inMemoryMissionSummary(id: id) {
+            viewingMission = summary
+        }
+
         // Clear stale workers from previous mission immediately
         childMissions = []
 
@@ -1673,7 +1668,7 @@ struct ControlView: View {
         let hasCache: Bool
         if let cachedData = await loadCachedMissionData(id) {
             // Use cached events for consistent display (avoids flash when fresh data arrives)
-            applyViewingMissionWithEvents(cachedData.mission, events: cachedData.events)
+            await applyViewingMissionWithEvents(cachedData.mission, events: cachedData.events)
             hasCache = true
         } else {
             hasCache = false
@@ -1719,35 +1714,31 @@ struct ControlView: View {
                         .values
                         .reduce(0, +)
                     hasMoreHistory = loadableTotal > events.count
-                    applyViewingMissionWithEvents(mission, events: events)
+                    await applyViewingMissionWithEvents(mission, events: events)
                     if transcript.latestSequence > 0 {
                         missionMaxSeq[id] = transcript.latestSequence
                     }
                     cacheMissionWithEvents(mission, events: events)
-                    Task { [api] in
+                    Task { @MainActor [api] in
                         if let trace = try? await api.getMissionTraceWithMeta(id: id, limit: Self.initialEventLimit, sinceSeq: 0),
                            !trace.events.isEmpty {
-                            await MainActor.run {
-                                guard fetchingMissionId == id || viewingMissionId == id else { return }
-                                // Deduplicate by sequence — transcript and
-                                // trace endpoints can overlap on shared
-                                // sequence numbers (the web client does the
-                                // same via a Map keyed by sequence in its
-                                // `renderDeferredTraceRef`). Without dedup
-                                // any overlapping event would render twice
-                                // after the deferred trace fetch lands.
-                                var bySequence: [Int64: StoredEvent] = [:]
-                                bySequence.reserveCapacity(events.count + trace.events.count)
-                                for e in events { bySequence[e.sequence] = e }
-                                for e in trace.events { bySequence[e.sequence] = e }
-                                let merged = bySequence.values
-                                    .sorted { $0.sequence < $1.sequence }
-                                applyViewingMissionWithEvents(mission, events: merged)
-                                if let maxSeq = trace.maxSequence, maxSeq > 0 {
-                                    missionMaxSeq[id] = maxSeq
-                                }
-                                cacheMissionWithEvents(mission, events: merged)
+                            guard fetchingMissionId == id || viewingMissionId == id else { return }
+                            // Deduplicate by sequence — transcript and trace
+                            // endpoints can overlap on shared sequence
+                            // numbers. Without dedup any overlapping event
+                            // would render twice after the deferred trace
+                            // fetch lands.
+                            var bySequence: [Int64: StoredEvent] = [:]
+                            bySequence.reserveCapacity(events.count + trace.events.count)
+                            for e in events { bySequence[e.sequence] = e }
+                            for e in trace.events { bySequence[e.sequence] = e }
+                            let merged = bySequence.values
+                                .sorted { $0.sequence < $1.sequence }
+                            await applyViewingMissionWithEvents(mission, events: merged)
+                            if let maxSeq = trace.maxSequence, maxSeq > 0 {
+                                missionMaxSeq[id] = maxSeq
                             }
+                            cacheMissionWithEvents(mission, events: merged)
                         }
                     }
                 }
@@ -1760,7 +1751,7 @@ struct ControlView: View {
                 )
                 if let result = fallback, !result.events.isEmpty {
                     hasMoreHistory = result.events.count >= Self.initialEventLimit
-                    applyViewingMissionWithEvents(mission, events: result.events)
+                    await applyViewingMissionWithEvents(mission, events: result.events)
                     if let maxSeq = result.maxSequence, maxSeq > 0 {
                         missionMaxSeq[id] = maxSeq
                     }
@@ -1828,7 +1819,7 @@ struct ControlView: View {
                 // page cap. If the server returned a full page, more may
                 // remain — keep the button visible.
                 hasMoreHistory = allEvents.count >= Self.loadEarlierPageLimit
-                applyViewingMissionWithEvents(mission, events: allEvents, scrollToBottom: false)
+                await applyViewingMissionWithEvents(mission, events: allEvents, scrollToBottom: false)
                 cacheMissionWithEvents(mission, events: allEvents)
             }
         } catch {
@@ -1932,7 +1923,7 @@ struct ControlView: View {
                     removeMissionFromCache(mission.id)
                     applyViewingMission(mission, scrollToBottom: false)
                 } else {
-                    applyViewingMissionWithEvents(mission, events: result.events, scrollToBottom: false)
+                    await applyViewingMissionWithEvents(mission, events: result.events, scrollToBottom: false)
                     if let maxSeq = result.maxSequence, maxSeq > 0 {
                         missionMaxSeq[id] = maxSeq
                     }
@@ -2559,6 +2550,22 @@ struct ControlView: View {
         recentMissions.sort { $0.updatedAt > $1.updatedAt }
     }
 
+    private func inMemoryMissionSummary(id missionId: String) -> Mission? {
+        if viewingMission?.id == missionId {
+            return viewingMission
+        }
+        if currentMission?.id == missionId {
+            return currentMission
+        }
+        if let recent = recentMissions.first(where: { $0.id == missionId }) {
+            return recent
+        }
+        if let child = childMissions.first(where: { $0.id == missionId }) {
+            return child
+        }
+        return nil
+    }
+
     private func scheduleRunningMissionsRefresh(delay: Duration = .milliseconds(750)) {
         runningRefreshTask?.cancel()
         runningRefreshTask = Task { @MainActor in
@@ -2580,6 +2587,10 @@ struct ControlView: View {
         viewingMissionId = id
         fetchingMissionId = id
 
+        if let summary = inMemoryMissionSummary(id: id) {
+            viewingMission = summary
+        }
+
         // Clear stale workers from previous mission immediately
         childMissions = []
 
@@ -2592,7 +2603,7 @@ struct ControlView: View {
         // on disk. (UX audit item #1.)
         let hasCache: Bool
         if let cached = await loadCachedMissionData(id) {
-            applyViewingMissionWithEvents(cached.mission, events: cached.events)
+            await applyViewingMissionWithEvents(cached.mission, events: cached.events)
             hasCache = true
         } else {
             hasCache = false
@@ -2639,7 +2650,7 @@ struct ControlView: View {
             }
 
             if let result = eventResult, !result.events.isEmpty {
-                applyViewingMissionWithEvents(mission, events: result.events)
+                await applyViewingMissionWithEvents(mission, events: result.events)
                 if let maxSeq = result.maxSequence, maxSeq > 0 {
                     missionMaxSeq[id] = maxSeq
                 }
@@ -3348,6 +3359,299 @@ struct ControlView: View {
                 }
             }
         }
+    }
+}
+
+private struct HistoricalTranscriptBuilder {
+    private(set) var messages: [ChatMessage] = []
+
+    mutating func apply(_ event: StoredEvent) {
+        var data = eventData(event)
+
+        switch event.eventType {
+        case "user_message":
+            guard let content = data["content"] as? String,
+                  let id = data["id"] as? String,
+                  !messages.contains(where: { $0.id == id }) else {
+                return
+            }
+            finalizeActiveThinkingMessages()
+            messages.append(ChatMessage(id: id, type: .user, content: content))
+
+        case "assistant_message":
+            guard let content = data["content"] as? String,
+                  let id = data["id"] as? String,
+                  !messages.contains(where: { $0.id == id }) else {
+                return
+            }
+
+            let success = data["success"] as? Bool ?? true
+            let costObj = data["cost"] as? [String: Any]
+            let costCents = data["cost_cents"] as? Int
+                ?? costObj?["amount_cents"] as? Int
+                ?? 0
+            let costSource = (data["cost_source"] as? String ?? costObj?["source"] as? String)
+                .flatMap(CostSource.init(rawValue:)) ?? .unknown
+            let model = data["model"] as? String
+            let sharedFiles = parseSharedFiles(data["shared_files"])
+
+            finalizeActiveThinkingMessages()
+            messages.removeAll { $0.isPhase }
+            markActiveToolCallsAsCompleted(withState: .success)
+            messages.append(
+                ChatMessage(
+                    id: id,
+                    type: .assistant(
+                        success: success,
+                        costCents: costCents,
+                        costSource: costSource,
+                        model: model,
+                        sharedFiles: sharedFiles
+                    ),
+                    content: content
+                )
+            )
+
+        case "thinking":
+            let content = data["content"] as? String ?? ""
+            let done = data["done"] as? Bool ?? false
+            let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                if done {
+                    finalizeActiveThinkingMessages()
+                }
+                return
+            }
+
+            let eventId = data["id"] as? String
+            if let eventId, messages.contains(where: { $0.id == eventId }) {
+                return
+            }
+
+            messages.removeAll { $0.isPhase }
+            if let index = messages.lastIndex(where: { $0.isThinking && !$0.thinkingDone }) {
+                let existing = messages[index]
+                let existingStartTime = existing.thinkingStartTime ?? existing.timestamp
+                messages[index] = ChatMessage(
+                    id: existing.id,
+                    type: .thinking(done: done, startTime: existingStartTime),
+                    content: content,
+                    toolUI: existing.toolUI,
+                    toolData: existing.toolData,
+                    timestamp: existing.timestamp
+                )
+            } else {
+                messages.append(
+                    ChatMessage(
+                        id: eventId ?? "thinking-\(UUID().uuidString)",
+                        type: .thinking(done: done, startTime: Date()),
+                        content: content
+                    )
+                )
+            }
+
+        case "agent_phase":
+            let phase = data["phase"] as? String ?? ""
+            let detail = data["detail"] as? String
+            let agent = data["agent"] as? String
+            messages.removeAll { $0.isPhase }
+            messages.append(
+                ChatMessage(
+                    id: "phase-\(UUID().uuidString)",
+                    type: .phase(phase: phase, detail: detail, agent: agent),
+                    content: ""
+                )
+            )
+
+        case "error":
+            guard let errorMessage = data["message"] as? String,
+                  !isSSEReconnectError(errorMessage) else {
+                return
+            }
+            finalizeActiveThinkingMessages()
+            messages.append(
+                ChatMessage(
+                    id: "error-\(event.id)",
+                    type: .error,
+                    content: errorMessage
+                )
+            )
+
+        case "tool_call":
+            guard let toolCallId = data["tool_call_id"] as? String,
+                  let name = data["name"] as? String,
+                  let args = data["args"] as? [String: Any],
+                  !messages.contains(where: { $0.id == toolCallId || $0.id == "tool-\(toolCallId)" }) else {
+                return
+            }
+
+            finalizeActiveThinkingMessages()
+            if let toolUI = ToolUIContent.parse(name: name, args: args) {
+                messages.append(
+                    ChatMessage(
+                        id: toolCallId,
+                        type: .toolUI(name: name),
+                        content: "",
+                        toolUI: toolUI
+                    )
+                )
+            } else {
+                markActiveToolCallsAsCompleted(withState: .success)
+                let toolData = ToolCallData(
+                    toolCallId: toolCallId,
+                    name: name,
+                    args: args,
+                    startTime: Date(),
+                    endTime: nil,
+                    result: nil,
+                    state: .running
+                )
+                messages.append(
+                    ChatMessage(
+                        id: "tool-\(toolCallId)",
+                        type: .toolCall(name: name, isActive: true),
+                        content: "",
+                        toolData: toolData
+                    )
+                )
+            }
+
+        case "tool_result":
+            applyToolResult(data)
+
+        default:
+            break
+        }
+
+        data.removeAll(keepingCapacity: true)
+    }
+
+    private func eventData(_ event: StoredEvent) -> [String: Any] {
+        var data: [String: Any] = [:]
+        data.reserveCapacity(event.metadata.count + 5)
+        for (key, value) in event.metadata {
+            data[key] = value.value
+        }
+        data["mission_id"] = event.missionId
+        data["content"] = event.content
+        if let eventId = event.eventId {
+            data["id"] = eventId
+        }
+        if let toolCallId = event.toolCallId {
+            data["tool_call_id"] = toolCallId
+        }
+        if let toolName = event.toolName {
+            data["name"] = toolName
+        }
+        return data
+    }
+
+    private func parseSharedFiles(_ raw: Any?) -> [SharedFile]? {
+        guard let filesArray = raw as? [[String: Any]] else { return nil }
+        let files = filesArray.compactMap { fileData -> SharedFile? in
+            guard let name = fileData["name"] as? String,
+                  let url = fileData["url"] as? String,
+                  let contentType = fileData["content_type"] as? String,
+                  let kindString = fileData["kind"] as? String,
+                  let kind = SharedFileKind(rawValue: kindString) else {
+                return nil
+            }
+            let sizeBytes = fileData["size_bytes"] as? Int
+            return SharedFile(
+                name: name,
+                url: url,
+                contentType: contentType,
+                sizeBytes: sizeBytes,
+                kind: kind
+            )
+        }
+        return files.isEmpty ? nil : files
+    }
+
+    private mutating func applyToolResult(_ data: [String: Any]) {
+        guard let toolCallId = data["tool_call_id"] as? String,
+              let index = messages.firstIndex(where: { $0.id == "tool-\(toolCallId)" }),
+              var toolData = messages[index].toolData else {
+            return
+        }
+
+        let result = data["result"]
+        toolData.endTime = Date()
+        toolData.result = result
+
+        if let resultDict = result as? [String: Any] {
+            if resultDict["status"] as? String == "cancelled" {
+                toolData.state = .cancelled
+            } else if toolData.isErrorResult {
+                toolData.state = .error
+            } else {
+                toolData.state = .success
+            }
+        } else if toolData.isErrorResult {
+            toolData.state = .error
+        } else {
+            toolData.state = .success
+        }
+
+        messages[index] = ChatMessage(
+            id: messages[index].id,
+            type: .toolCall(name: toolData.name, isActive: false),
+            content: messages[index].content,
+            toolData: toolData,
+            timestamp: messages[index].timestamp
+        )
+    }
+
+    private mutating func finalizeActiveThinkingMessages() {
+        for index in messages.indices {
+            guard messages[index].isThinking, !messages[index].thinkingDone else {
+                continue
+            }
+
+            let existing = messages[index]
+            let startTime = existing.thinkingStartTime ?? existing.timestamp
+            messages[index] = ChatMessage(
+                id: existing.id,
+                type: .thinking(done: true, startTime: startTime),
+                content: existing.content,
+                toolUI: existing.toolUI,
+                toolData: existing.toolData,
+                timestamp: existing.timestamp
+            )
+        }
+    }
+
+    private mutating func markActiveToolCallsAsCompleted(withState state: ToolCallState) {
+        for i in messages.indices where messages[i].isToolCall && messages[i].isActiveToolCall {
+            if var toolData = messages[i].toolData {
+                toolData.endTime = Date()
+                if toolData.result == nil || state == .cancelled {
+                    toolData.state = state
+                }
+                messages[i].toolData = toolData
+            }
+            if let name = messages[i].toolCallName {
+                messages[i] = ChatMessage(
+                    id: messages[i].id,
+                    type: .toolCall(name: name, isActive: false),
+                    content: messages[i].content,
+                    toolData: messages[i].toolData,
+                    timestamp: messages[i].timestamp
+                )
+            }
+        }
+    }
+
+    private func isSSEReconnectError(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("stream connection failed") ||
+            lower.contains("sse connection") ||
+            lower.contains("event stream") ||
+            lower.contains("stream idle") ||
+            lower.contains("stream rejected by server") ||
+            lower == "timed out" ||
+            lower == "connection reset" ||
+            lower == "connection closed"
     }
 }
 
@@ -4507,7 +4811,7 @@ private struct FlowLayout: Layout {
 // MARK: - Grouped Chat Item
 
 /// Represents either a single message or a group of consecutive tool calls
-enum GroupedChatItem: Identifiable {
+enum GroupedChatItem: Identifiable, Sendable {
     case single(ChatMessage)
     case toolGroup(groupId: String, tools: [ChatMessage])
 

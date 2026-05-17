@@ -87,7 +87,7 @@ enum SharedFileKind: String, Codable {
 // MARK: - Tool Call State
 
 /// State of a tool call (tracks lifecycle from start to completion)
-enum ToolCallState {
+enum ToolCallState: Sendable {
     case running
     case success
     case error
@@ -104,7 +104,7 @@ enum ToolCallState {
 // MARK: - Tool Call Data
 
 /// Data associated with a tool call, including arguments, result, and timing
-struct ToolCallData {
+struct ToolCallData: @unchecked Sendable {
     let toolCallId: String
     let name: String
     let args: [String: Any]
@@ -184,7 +184,7 @@ struct ToolCallData {
 
 /// Provenance of the cost value attached to an assistant message.
 /// Matches the backend's `CostSource` enum serialized as snake_case strings.
-enum CostSource: String {
+enum CostSource: String, Sendable {
     case actual
     case estimated
     case unknown
@@ -192,7 +192,7 @@ enum CostSource: String {
 
 // MARK: - Chat Message Type
 
-enum ChatMessageType {
+enum ChatMessageType: @unchecked Sendable {
     case user
     case assistant(success: Bool, costCents: Int, costSource: CostSource, model: String?, sharedFiles: [SharedFile]?)
     case thinking(done: Bool, startTime: Date)
@@ -203,7 +203,7 @@ enum ChatMessageType {
     case error
 }
 
-struct ChatMessage: Identifiable {
+struct ChatMessage: Identifiable, @unchecked Sendable {
     let id: String
     let type: ChatMessageType
     var content: String
