@@ -2572,6 +2572,7 @@ struct ControlView: View {
 
         do {
             recentMissions = try await api.listMissionSummaries(limit: 50)
+                .sorted { $0.updatedAt > $1.updatedAt }
         } catch {
             print("Failed to load recent missions: \(error)")
         }
