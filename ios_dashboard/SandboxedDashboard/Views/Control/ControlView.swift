@@ -3414,6 +3414,8 @@ struct ControlView: View {
 }
 
 private struct HistoricalTranscriptBuilder {
+    private static let deltaAssistantPrefix = "historical-delta-assistant-"
+
     private(set) var messages: [ChatMessage] = []
 
     mutating func apply(_ event: StoredEvent) {
@@ -3448,6 +3450,7 @@ private struct HistoricalTranscriptBuilder {
 
             finalizeActiveThinkingMessages()
             messages.removeAll { $0.isPhase }
+            messages.removeAll { $0.id.hasPrefix(Self.deltaAssistantPrefix) }
             markActiveToolCallsAsCompleted(withState: .success)
             messages.append(
                 ChatMessage(
@@ -3462,6 +3465,11 @@ private struct HistoricalTranscriptBuilder {
                     content: content
                 )
             )
+
+        case "text_delta":
+            if let content = data["content"] as? String {
+                upsertDeltaAssistant(content: content)
+            }
 
         case "thinking":
             let content = data["content"] as? String ?? ""
@@ -3575,6 +3583,46 @@ private struct HistoricalTranscriptBuilder {
         }
 
         data.removeAll(keepingCapacity: true)
+    }
+
+    private func isHistoricalDeltaAssistant(_ message: ChatMessage) -> Bool {
+        message.id.hasPrefix(Self.deltaAssistantPrefix)
+    }
+
+    private mutating func upsertDeltaAssistant(content: String) {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        messages.removeAll { $0.isPhase }
+
+        if let index = messages.lastIndex(where: isHistoricalDeltaAssistant) {
+            let existing = messages[index]
+            let mergedContent = content.hasPrefix(existing.content)
+                ? content
+                : existing.content + content
+            messages[index] = ChatMessage(
+                id: existing.id,
+                type: existing.type,
+                content: mergedContent,
+                toolUI: existing.toolUI,
+                toolData: existing.toolData,
+                timestamp: existing.timestamp
+            )
+        } else {
+            messages.append(
+                ChatMessage(
+                    id: "\(Self.deltaAssistantPrefix)\(UUID().uuidString)",
+                    type: .assistant(
+                        success: true,
+                        costCents: 0,
+                        costSource: .unknown,
+                        model: nil,
+                        sharedFiles: nil
+                    ),
+                    content: content
+                )
+            )
+        }
     }
 
     private func eventData(_ event: StoredEvent) -> [String: Any] {
