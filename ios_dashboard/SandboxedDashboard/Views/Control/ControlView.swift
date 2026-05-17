@@ -941,7 +941,7 @@ struct ControlView: View {
         let loadedEventCount: Int
     }
 
-    private static func buildHistoricalTranscriptSnapshot(events: [StoredEvent]) async -> HistoricalTranscriptSnapshot {
+    private static func buildHistoricalTranscriptSnapshot(events: [StoredEvent], goalMode: Bool) async -> HistoricalTranscriptSnapshot {
         await Task.detached(priority: .userInitiated) {
             let orderedEvents = events.sorted { lhs, rhs in
                 if lhs.sequence != rhs.sequence {
@@ -953,7 +953,7 @@ struct ControlView: View {
                 return lhs.id < rhs.id
             }
 
-            var builder = HistoricalTranscriptBuilder()
+            var builder = HistoricalTranscriptBuilder(goalMode: goalMode)
             for event in orderedEvents {
                 builder.apply(event)
             }
@@ -1543,7 +1543,7 @@ struct ControlView: View {
         isLoadingHistory = true  // Suppress animated auto-scroll during history load
         let shouldPreserveLiveMessages = viewingMissionId == mission.id
 
-        let snapshot = await Self.buildHistoricalTranscriptSnapshot(events: events)
+        let snapshot = await Self.buildHistoricalTranscriptSnapshot(events: events, goalMode: mission.goalMode)
         let snapshotMessageIds = Set(snapshot.messages.map(\.id))
         let liveMessages = shouldPreserveLiveMessages
             ? messages.filter { !snapshotMessageIds.contains($0.id) }
@@ -3476,6 +3476,16 @@ private struct HistoricalTranscriptBuilder {
     private static let deltaAssistantPrefix = "historical-delta-assistant-"
 
     private(set) var messages: [ChatMessage] = []
+    /// Mirrors the live `ControlView` guard on goal-role inference: heuristic
+    /// classification (long thinking blocks, summary markers) is only safe to
+    /// apply to missions that are actually running in goal mode. Without this
+    /// gate, regular missions get false-positive `deliverable` /
+    /// `terminalNotice` tags and end up with promoted or hidden bubbles.
+    let goalMode: Bool
+
+    init(goalMode: Bool = false) {
+        self.goalMode = goalMode
+    }
 
     mutating func apply(_ event: StoredEvent) {
         var data = eventData(event)
@@ -3762,7 +3772,8 @@ private struct HistoricalTranscriptBuilder {
     }
 
     private func goalOutputRole(from data: [String: Any], content: String, kind: String) -> GoalOutputRole? {
-        parseGoalOutputRole(data["goal_role"]) ?? inferGoalOutputRole(content: content, kind: kind)
+        parseGoalOutputRole(data["goal_role"])
+            ?? (goalMode ? inferGoalOutputRole(content: content, kind: kind) : nil)
     }
 
     private mutating func applyToolResult(_ data: [String: Any]) {
@@ -3813,7 +3824,8 @@ private struct HistoricalTranscriptBuilder {
                 content: existing.content,
                 toolUI: existing.toolUI,
                 toolData: existing.toolData,
-                timestamp: existing.timestamp
+                timestamp: existing.timestamp,
+                goalRole: existing.goalRole
             )
         }
     }

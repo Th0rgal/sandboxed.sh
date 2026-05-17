@@ -243,10 +243,9 @@ import { WorkerPanel } from "@/components/worker-panel";
 import { SubagentsPanel, type SubagentEntry } from "@/components/subagents-panel";
 import { RelativeTime } from "@/components/ui/relative-time";
 
-import type { SharedFile } from "@/lib/api";
+import type { GoalOutputRole, SharedFile } from "@/lib/api";
 
 type CostSource = "actual" | "estimated" | "unknown";
-type GoalOutputRole = "deliverable" | "progress" | "terminal_notice";
 
 function parseGoalOutputRole(value: unknown): GoalOutputRole | undefined {
   return value === "deliverable" || value === "progress" || value === "terminal_notice"
