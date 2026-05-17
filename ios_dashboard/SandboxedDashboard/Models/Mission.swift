@@ -243,6 +243,8 @@ struct RunningMissionInfo: Codable, Identifiable {
     let expectedDeliverables: Int
     let currentActivity: String?
     let title: String?
+    let shortDescription: String?
+    let parentMissionId: String?
 
     var id: String { missionId }
 
@@ -255,6 +257,8 @@ struct RunningMissionInfo: Codable, Identifiable {
         case expectedDeliverables = "expected_deliverables"
         case currentActivity = "current_activity"
         case title
+        case shortDescription = "short_description"
+        case parentMissionId = "parent_mission_id"
     }
 
     // Custom decoder to handle optional fields
@@ -268,10 +272,12 @@ struct RunningMissionInfo: Codable, Identifiable {
         expectedDeliverables = try container.decode(Int.self, forKey: .expectedDeliverables)
         currentActivity = try container.decodeIfPresent(String.self, forKey: .currentActivity)
         title = try container.decodeIfPresent(String.self, forKey: .title)
+        shortDescription = try container.decodeIfPresent(String.self, forKey: .shortDescription)
+        parentMissionId = try container.decodeIfPresent(String.self, forKey: .parentMissionId)
     }
 
     // Memberwise initializer for previews and testing
-    init(missionId: String, state: String, queueLen: Int, historyLen: Int, secondsSinceActivity: Int, expectedDeliverables: Int, currentActivity: String? = nil, title: String? = nil) {
+    init(missionId: String, state: String, queueLen: Int, historyLen: Int, secondsSinceActivity: Int, expectedDeliverables: Int, currentActivity: String? = nil, title: String? = nil, shortDescription: String? = nil, parentMissionId: String? = nil) {
         self.missionId = missionId
         self.state = state
         self.queueLen = queueLen
@@ -280,6 +286,8 @@ struct RunningMissionInfo: Codable, Identifiable {
         self.expectedDeliverables = expectedDeliverables
         self.currentActivity = currentActivity
         self.title = title
+        self.shortDescription = shortDescription
+        self.parentMissionId = parentMissionId
     }
 
     var isRunning: Bool {

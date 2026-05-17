@@ -20,6 +20,7 @@ struct GoalPillInfo: Equatable {
 struct ControlView: View {
     private static let draftTextKey = "control_draft_text"
     private static let lastMissionIdKey = "control_last_mission_id"
+    private static let performanceLog = OSLog(subsystem: "sh.sandboxed.dashboard", category: "ControlPerformance")
 
     @State private var messages: [ChatMessage] = []
     @State private var inputText = UserDefaults.standard.string(forKey: ControlView.draftTextKey) ?? ""
@@ -74,6 +75,7 @@ struct ControlView: View {
 
     // Cached grouped items (recomputed only when messages change)
     @State private var groupedItems: [GroupedChatItem] = []
+    @State private var groupedItemsRecomputeTask: Task<Void, Never>?
 
     // Draft save debounce
     @State private var draftSaveTask: Task<Void, Never>?
@@ -86,7 +88,7 @@ struct ControlView: View {
     @State private var runningMissions: [RunningMissionInfo] = []
     @State private var viewingMissionId: String?
     @State private var showRunningMissions = false
-    @State private var pollingTask: Task<Void, Never>?
+    @State private var runningRefreshTask: Task<Void, Never>?
 
     // Track pending fetch to prevent race conditions
     @State private var fetchingMissionId: String?
@@ -406,8 +408,8 @@ struct ControlView: View {
             //      workspaces, mission history, running missions — using
             //      `async let`. They share zero state at this stage; the
             //      previous serial chain was incidental, not required.
-            //   3. Start the running-missions poller last; it's a 3s tick
-            //      and starting it before the first refresh is fine.
+            //   3. Let SSE-driven refresh scheduling keep the running list
+            //      current after the initial snapshot.
             startStreaming()
 
             async let workspacesTask: Void = workspaceState.loadWorkspaces()
@@ -421,7 +423,7 @@ struct ControlView: View {
                 showRunningMissions = true
             }
 
-            startPollingRunningMissions()
+            scheduleRunningMissionsRefresh(delay: .milliseconds(750))
         }
         .onChange(of: nav.pendingMissionId) { _, newId in
             // Handle navigation from History while Control is already visible
@@ -450,7 +452,7 @@ struct ControlView: View {
                     if let missionId = viewingMissionId {
                         await reloadMissionFromServer(id: missionId)
                     }
-                    await refreshRunningMissions()
+                    scheduleRunningMissionsRefresh(delay: .milliseconds(750))
                 }
             }
         }
@@ -470,10 +472,11 @@ struct ControlView: View {
             streamTask?.cancel()
             connectionState = .disconnected
             reconnectAttempt = 0
-            pollingTask?.cancel()
+            runningRefreshTask?.cancel()
             // Save draft immediately on disappear
             UserDefaults.standard.set(inputText, forKey: Self.draftTextKey)
             draftSaveTask?.cancel()
+            groupedItemsRecomputeTask?.cancel()
         }
         .sheet(isPresented: $showDesktopStream) {
             DesktopStreamView(displayId: desktopDisplayId)
@@ -1284,7 +1287,7 @@ struct ControlView: View {
     // MARK: - Mission Caching with LRU Eviction
 
     // Cache both mission metadata and events for consistent display
-    private struct CachedMissionData: Codable {
+    private struct CachedMissionData: Codable, @unchecked Sendable {
         let mission: Mission
         let events: [StoredEvent]
         let cachedAt: Date
@@ -1361,19 +1364,21 @@ struct ControlView: View {
         }
     }
 
-    private func loadCachedMissionData(_ missionId: String) -> CachedMissionData? {
-        // Synchronous read on the call site (cold start) — the file is
-        // bounded by `loadEarlierPageLimit` * StoredEvent size (~few MB
-        // worst case) and decoding it on @MainActor is unavoidable here
-        // because the caller needs the result immediately to render the
-        // first frame. Subsequent caches written in the background.
-        guard let url = Self.cacheFileURL(missionId: missionId),
-              let data = try? Data(contentsOf: url),
-              let cached = try? JSONDecoder().decode(CachedMissionData.self, from: data) else {
-            return nil
-        }
+    private func loadCachedMissionData(_ missionId: String) async -> CachedMissionData? {
+        let signpostID = OSSignpostID(log: Self.performanceLog)
+        os_signpost(.begin, log: Self.performanceLog, name: "cacheDecode", signpostID: signpostID)
+        defer { os_signpost(.end, log: Self.performanceLog, name: "cacheDecode", signpostID: signpostID) }
 
-        if var cachedKeys = UserDefaults.standard.stringArray(forKey: Self.cacheKeysKey) {
+        let cached = await Task.detached(priority: .userInitiated) {
+            guard let url = Self.cacheFileURL(missionId: missionId),
+                  let data = try? Data(contentsOf: url) else {
+                return nil
+            }
+            return try? JSONDecoder().decode(CachedMissionData.self, from: data)
+        }.value
+
+        if cached != nil,
+           var cachedKeys = UserDefaults.standard.stringArray(forKey: Self.cacheKeysKey) {
             cachedKeys.removeAll { $0 == missionId }
             cachedKeys.append(missionId)
             UserDefaults.standard.set(cachedKeys, forKey: Self.cacheKeysKey)
@@ -1453,6 +1458,10 @@ struct ControlView: View {
     private static let initialEventLimit = 50
 
     private func applyViewingMissionWithEvents(_ mission: Mission, events: [StoredEvent], scrollToBottom: Bool = true) {
+        let signpostID = OSSignpostID(log: Self.performanceLog)
+        os_signpost(.begin, log: Self.performanceLog, name: "applyViewingMissionWithEvents", signpostID: signpostID)
+        defer { os_signpost(.end, log: Self.performanceLog, name: "applyViewingMissionWithEvents", signpostID: signpostID) }
+
         isLoadingHistory = true  // Suppress animated auto-scroll during history load
 
         viewingMission = mission
@@ -1584,7 +1593,7 @@ struct ControlView: View {
         // Try to load cached version first for immediate display with consistent event-based rendering
         let hasCache: Bool
         if updateViewing, let currentId = currentMission?.id ?? viewingMissionId,
-           let cachedData = loadCachedMissionData(currentId) {
+           let cachedData = await loadCachedMissionData(currentId) {
             // Use cached events for consistent display (avoids flash when fresh data arrives)
             currentMission = cachedData.mission
             applyViewingMissionWithEvents(cachedData.mission, events: cachedData.events)
@@ -1662,7 +1671,7 @@ struct ControlView: View {
 
         // Try to load cached version first for immediate display with consistent event-based rendering
         let hasCache: Bool
-        if let cachedData = loadCachedMissionData(id) {
+        if let cachedData = await loadCachedMissionData(id) {
             // Use cached events for consistent display (avoids flash when fresh data arrives)
             applyViewingMissionWithEvents(cachedData.mission, events: cachedData.events)
             hasCache = true
@@ -2508,6 +2517,10 @@ struct ControlView: View {
     // MARK: - Parallel Missions
     
     private func refreshRunningMissions() async {
+        let signpostID = OSSignpostID(log: Self.performanceLog)
+        os_signpost(.begin, log: Self.performanceLog, name: "refreshRunningMissions", signpostID: signpostID)
+        defer { os_signpost(.end, log: Self.performanceLog, name: "refreshRunningMissions", signpostID: signpostID) }
+
         do {
             runningMissions = try await api.getRunningMissions()
         } catch {
@@ -2524,10 +2537,12 @@ struct ControlView: View {
     }
 
     private func loadRecentMissions() async {
+        let signpostID = OSSignpostID(log: Self.performanceLog)
+        os_signpost(.begin, log: Self.performanceLog, name: "loadRecentMissions", signpostID: signpostID)
+        defer { os_signpost(.end, log: Self.performanceLog, name: "loadRecentMissions", signpostID: signpostID) }
+
         do {
-            let allMissions = try await api.listMissions()
-            // Sort by most recent (updatedAt, ISO8601 strings sort correctly)
-            recentMissions = allMissions.sorted { $0.updatedAt > $1.updatedAt }
+            recentMissions = try await api.listMissionSummaries(limit: 50)
         } catch {
             print("Failed to load recent missions: \(error)")
         }
@@ -2544,13 +2559,12 @@ struct ControlView: View {
         recentMissions.sort { $0.updatedAt > $1.updatedAt }
     }
 
-    private func startPollingRunningMissions() {
-        pollingTask = Task {
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3))
-                guard !Task.isCancelled else { break }
-                await refreshRunningMissions()
-            }
+    private func scheduleRunningMissionsRefresh(delay: Duration = .milliseconds(750)) {
+        runningRefreshTask?.cancel()
+        runningRefreshTask = Task { @MainActor in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await refreshRunningMissions()
         }
     }
     
@@ -2577,7 +2591,7 @@ struct ControlView: View {
         // multi-second blank on a slow link even when the data was already
         // on disk. (UX audit item #1.)
         let hasCache: Bool
-        if let cached = loadCachedMissionData(id) {
+        if let cached = await loadCachedMissionData(id) {
             applyViewingMissionWithEvents(cached.mission, events: cached.events)
             hasCache = true
         } else {
@@ -2782,6 +2796,10 @@ struct ControlView: View {
     }
     
     private func handleStreamEvent(type: String, data: [String: Any], isHistoricalReplay: Bool = false) {
+        let signpostID = OSSignpostID(log: Self.performanceLog)
+        os_signpost(.begin, log: Self.performanceLog, name: "handleStreamEvent", signpostID: signpostID, "%{public}@", type)
+        defer { os_signpost(.end, log: Self.performanceLog, name: "handleStreamEvent", signpostID: signpostID) }
+
         // Filter events by mission_id - only show events for the mission we're viewing
         // This prevents cross-mission contamination when parallel missions are running
         let eventMissionId = data["mission_id"] as? String
@@ -3202,7 +3220,7 @@ struct ControlView: View {
 
                 // Refresh running missions list (live only)
                 if !isHistoricalReplay {
-                    Task { await refreshRunningMissions() }
+                    scheduleRunningMissionsRefresh()
                 }
             }
 
@@ -3226,7 +3244,7 @@ struct ControlView: View {
 
                 // Refresh running missions list so the bar picks up the new title
                 if !isHistoricalReplay {
-                    Task { await refreshRunningMissions() }
+                    scheduleRunningMissionsRefresh()
                 }
             }
 
@@ -3278,7 +3296,7 @@ struct ControlView: View {
                 }
 
                 if !isHistoricalReplay {
-                    Task { await refreshRunningMissions() }
+                    scheduleRunningMissionsRefresh()
                 }
             }
 
@@ -3289,8 +3307,20 @@ struct ControlView: View {
             break
         }
 
-        // Recompute grouped items for live events (history replay calls recomputeGroupedItems() once at the end)
+        // Recompute grouped items for live events on a short frame-sized
+        // debounce. Busy agent streams can produce many status/tool events in
+        // a single run-loop turn; grouping after each one invalidates the
+        // entire chat view repeatedly.
         if !isHistoricalReplay {
+            scheduleGroupedItemsRecompute()
+        }
+    }
+
+    private func scheduleGroupedItemsRecompute() {
+        groupedItemsRecomputeTask?.cancel()
+        groupedItemsRecomputeTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(50))
+            guard !Task.isCancelled else { return }
             recomputeGroupedItems()
         }
     }

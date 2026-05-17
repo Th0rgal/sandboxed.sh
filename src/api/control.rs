@@ -3567,14 +3567,53 @@ pub async fn clear_queue(
 // ==================== Mission Endpoints ====================
 
 /// List all missions.
+#[derive(Debug, Deserialize)]
+pub struct ListMissionsQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
 pub async fn list_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    axum::extract::Query(query): axum::extract::Query<ListMissionsQuery>,
+) -> Result<Json<Vec<Mission>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
+    let mut missions = control
+        .mission_store
+        .list_missions(limit, offset)
+        .await
+        .map_err(internal_error)?;
+    populate_workspace_names(&state, &mut missions).await;
+    Ok(Json(missions))
+}
+
+/// List paginated mission summaries for mobile switchers.
+///
+/// The mission store's list path already returns metadata with an empty
+/// history vector, so this endpoint is intentionally an alias with a distinct
+/// contract: clients should use it when they do not need transcript history.
+pub async fn list_mission_summaries(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    axum::extract::Query(query): axum::extract::Query<ListMissionsQuery>,
+) -> Result<Json<Vec<Mission>>, (StatusCode, String)> {
+    list_missions(State(state), Extension(user), axum::extract::Query(query)).await
+}
+
+/// Get child worker missions for a parent mission without scanning a broad
+/// recent-missions page on the client.
+pub async fn get_child_missions(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(parent_id): Path<Uuid>,
 ) -> Result<Json<Vec<Mission>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let mut missions = control
         .mission_store
-        .list_missions(50, 0)
+        .get_child_missions(parent_id)
         .await
         .map_err(internal_error)?;
     populate_workspace_names(&state, &mut missions).await;
@@ -4961,7 +5000,19 @@ pub async fn list_running_missions(
     Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<super::mission_runner::RunningMissionInfo>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
-    let running = get_running_missions(&control).await?;
+    let mut running = get_running_missions(&control).await?;
+    for item in &mut running {
+        if let Some(mission) = control
+            .mission_store
+            .get_mission(item.mission_id)
+            .await
+            .map_err(internal_error)?
+        {
+            item.title = mission.title;
+            item.short_description = mission.short_description;
+            item.parent_mission_id = mission.parent_mission_id;
+        }
+    }
     Ok(Json(running))
 }
 
@@ -8670,6 +8721,9 @@ async fn control_actor_loop(
                                     ),
                                     expected_deliverables: 0,
                                     current_activity: main_runner_activity.clone(),
+                                    title: None,
+                                    short_description: None,
+                                    parent_mission_id: None,
                                     subtask_total: main_runner_subtasks.len(),
                                     subtask_completed: main_runner_subtasks.iter().filter(|s| s.completed).count(),
                                 });

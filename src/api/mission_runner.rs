@@ -13027,6 +13027,12 @@ pub struct RunningMissionInfo {
     /// Current activity label (e.g., "Reading: main.rs")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_activity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_mission_id: Option<Uuid>,
     /// Total tracked subtasks
     pub subtask_total: usize,
     /// Completed subtasks
@@ -13057,6 +13063,9 @@ impl From<&MissionRunner> for RunningMissionInfo {
             ),
             expected_deliverables: runner.deliverables.deliverables.len(),
             current_activity: runner.current_activity.clone(),
+            title: None,
+            short_description: None,
+            parent_mission_id: None,
             subtask_total: runner.subtasks.len(),
             subtask_completed: runner.subtasks.iter().filter(|s| s.completed).count(),
         }
