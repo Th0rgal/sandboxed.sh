@@ -13,6 +13,8 @@ import {
   type FilePasteContext,
 } from "@/components/enhanced-input";
 import { MissionAutomationsDialog } from "@/components/mission-automations-dialog";
+import { PerfOverlay } from "@/components/perf-overlay";
+import { perfBus } from "@/lib/perf-bus";
 import { MissionDebugStats } from "./MissionDebugStats";
 import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
@@ -4044,7 +4046,10 @@ export default function ControlClient() {
     // block the main thread for several seconds, so feed it through
     // `useDeferredValue`: the toggle button + panel mount react instantly
     // while the chat-list regrouping is treated as a non-urgent transition.
-    () => deriveItemViews(items, deferredShowThinkingPanel),
+    () =>
+      perfBus.time("replay:group", () =>
+        deriveItemViews(items, deferredShowThinkingPanel)
+      ),
     [items, deferredShowThinkingPanel]
   );
 
@@ -4812,6 +4817,12 @@ export default function ControlClient() {
   // Convert stored events (from SQLite) to ChatItems for display
   // This enables full history replay including tool calls on page refresh
   const eventsToItems = useCallback((events: StoredEvent[], mission?: Mission | null): ChatItem[] => {
+    return perfBus.time("replay:apply", () => eventsToItemsImpl(events, mission));
+  }, []);
+
+  // Implementation extracted so the perf wrapper above stays one-liner; the
+  // function body is unchanged from the original eventsToItems.
+  function eventsToItemsImpl(events: StoredEvent[], mission?: Mission | null): ChatItem[] {
     const items: ChatItem[] = [];
     const toolCallMap = new Map<string, number>(); // tool_call_id -> index in items
     // Track seen event IDs to prevent duplicate items (backend may store duplicates)
@@ -5061,7 +5072,7 @@ export default function ControlClient() {
     }
 
     return items;
-  }, []);
+  }
 
   renderDeferredTraceRef.current = (id, traceEvents, maxSequence) => {
     if (traceEvents.length === 0) return;
@@ -5661,6 +5672,9 @@ export default function ControlClient() {
   }, []);
 
   const handleStreamDiagnostics = useCallback((update: StreamDiagnosticUpdate) => {
+    if (typeof update.bytes === "number") {
+      perfBus.recordSseBytes(update.bytes);
+    }
     switch (update.phase) {
       case "connecting":
         streamLog("info", "connecting", { url: update.url });
@@ -6670,6 +6684,7 @@ export default function ControlClient() {
           ? String(data["mission_id"])
           : null;
       const currentMissionId = currentMissionRef.current?.id;
+      perfBus.recordSseEvent("received");
       streamLog("debug", "received", {
         type: event.type,
         eventMissionId,
@@ -6700,6 +6715,7 @@ export default function ControlClient() {
           }
         }
         if (filterReason) {
+          perfBus.recordSseEvent("filtered");
           streamLog("debug", "filtered", {
             type: event.type,
             eventMissionId,
@@ -8529,6 +8545,10 @@ export default function ControlClient() {
           a polling tick every 2s that reads performance.memory and
           publishes a CustomEvent the parent listens to for shedding. */}
       <MissionDebugStats items={items} visibleItems={visibleItemsLimit} />
+
+      {/* Opt-in perf overlay — `?debug=perf` only. Mounts no work in normal
+          sessions; the bus and observer self-disable when the flag is off. */}
+      <PerfOverlay />
 
       {/* Hidden file input */}
       <input
