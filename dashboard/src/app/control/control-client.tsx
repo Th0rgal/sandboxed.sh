@@ -243,9 +243,51 @@ import { WorkerPanel } from "@/components/worker-panel";
 import { SubagentsPanel, type SubagentEntry } from "@/components/subagents-panel";
 import { RelativeTime } from "@/components/ui/relative-time";
 
-import type { SharedFile } from "@/lib/api";
+import type { GoalOutputRole, SharedFile } from "@/lib/api";
 
 type CostSource = "actual" | "estimated" | "unknown";
+
+function parseGoalOutputRole(value: unknown): GoalOutputRole | undefined {
+  return value === "deliverable" || value === "progress" || value === "terminal_notice"
+    ? value
+    : undefined;
+}
+
+function inferGoalOutputRole(content: string, kind: "assistant" | "thinking"): GoalOutputRole | undefined {
+  const trimmed = content.trim();
+  if (!trimmed) return undefined;
+  const lower = trimmed.toLowerCase();
+  if (
+    lower.includes("goal complete") ||
+    lower.includes("goal window") ||
+    lower.includes("window has elapsed") ||
+    lower.includes("waiting for the window") ||
+    lower.includes("continue if the goal hook") ||
+    lower.includes("hook is still active")
+  ) {
+    return "terminal_notice";
+  }
+  const markers = ["# summary", "summary:", "critical:", "findings", "recommendation", "## ", "1. "];
+  const markerCount = markers.reduce((count, marker) => count + (lower.includes(marker) ? 1 : 0), 0);
+  if ((kind === "thinking" && trimmed.length >= 800) || markerCount >= 2) {
+    return "deliverable";
+  }
+  return undefined;
+}
+
+function goalRoleFromMetadata(
+  metadata: Record<string, unknown>,
+  content: string,
+  kind: "assistant" | "thinking",
+  mission?: Mission | null
+): GoalOutputRole | undefined {
+  return (
+    parseGoalOutputRole(metadata.goal_role) ??
+    ((mission as (Mission & { goal_mode?: boolean }) | null | undefined)?.goal_mode
+      ? inferGoalOutputRole(content, kind)
+      : undefined)
+  );
+}
 
 export type ChatItem =
   | {
@@ -266,6 +308,7 @@ export type ChatItem =
       timestamp: number;
       sharedFiles?: SharedFile[];
       resumable?: boolean;
+      goalRole?: GoalOutputRole;
       /** Goal-mode iteration that this assistant message ended. Set when
        *  the mission is in goal mode and we've seen at least one
        *  goal_iteration event before this message. UI replaces "Turn
@@ -280,6 +323,7 @@ export type ChatItem =
       done: boolean;
       startTime: number;
       endTime?: number;
+      goalRole?: GoalOutputRole;
     }
   | {
       // Streaming text delta (draft assistant output).
@@ -412,9 +456,50 @@ function deriveItemViews(
   // `chatDisplayItems` is `displayItems` minus queued users. When there
   // are no queued users the two are identical; share the reference so
   // downstream memos see stable identity on the common path.
-  const chatDisplayItems = hasQueuedUser
+  let chatDisplayItems = hasQueuedUser
     ? displayItems.filter((it) => !(it.kind === "user" && it.queued === true))
     : displayItems;
+
+  const goalDeliverableThinking = chatDisplayItems.filter(
+    (it): it is Extract<ChatItem, { kind: "thinking" }> =>
+      it.kind === "thinking" && it.goalRole === "deliverable" && it.content.trim().length > 0
+  );
+  if (goalDeliverableThinking.length > 0) {
+    const deliverableContent = new Set(goalDeliverableThinking.map((it) => it.content.trim()));
+    const alreadyVisibleDeliverables = new Set(
+      chatDisplayItems
+        .filter(
+          (it): it is Extract<ChatItem, { kind: "assistant" }> =>
+            it.kind === "assistant" && deliverableContent.has(it.content.trim())
+        )
+        .map((it) => it.content.trim())
+    );
+    const goalAwareItems: ChatItem[] = [];
+    for (const item of chatDisplayItems) {
+      if (item.kind === "assistant" && item.goalRole === "terminal_notice") {
+        continue;
+      }
+      goalAwareItems.push(item);
+      if (
+        item.kind === "thinking" &&
+        item.goalRole === "deliverable" &&
+        !alreadyVisibleDeliverables.has(item.content.trim())
+      ) {
+        goalAwareItems.push({
+          kind: "assistant",
+          id: `${item.id}-goal-deliverable`,
+          content: item.content,
+          success: true,
+          costCents: 0,
+          costSource: "unknown",
+          model: null,
+          timestamp: item.endTime ?? item.startTime,
+          goalRole: "deliverable",
+        });
+      }
+    }
+    chatDisplayItems = goalAwareItems;
+  }
 
   let lastNonQueuedItem: ChatItem | undefined;
   for (let i = displayItems.length - 1; i >= 0; i--) {
@@ -4899,6 +4984,7 @@ export default function ControlClient() {
             costSource,
             model: typeof meta.model === "string" ? meta.model : null,
             timestamp,
+            goalRole: goalRoleFromMetadata(meta, event.content, "assistant", mission),
           });
           lastAssistantTimestamp = timestamp;
           break;
@@ -4945,6 +5031,7 @@ export default function ControlClient() {
                 done: isDone,
                 startTime: timestamp,
                 endTime: isDone ? timestamp : undefined,
+                goalRole: goalRoleFromMetadata(meta, content, "thinking", mission),
               });
               currentThinkingIdx = isDone ? null : newIdx;
             } else {
@@ -4955,6 +5042,8 @@ export default function ControlClient() {
                 content: newContent,
                 done: isDone,
                 endTime: isDone ? timestamp : existing.endTime,
+                goalRole:
+                  existing.goalRole ?? goalRoleFromMetadata(meta, newContent, "thinking", mission),
               };
               if (isDone) {
                 currentThinkingIdx = null; // Reset for next thinking session
@@ -4969,6 +5058,7 @@ export default function ControlClient() {
               done: isDone,
               startTime: timestamp,
               endTime: isDone ? timestamp : undefined,
+              goalRole: goalRoleFromMetadata(meta, content, "thinking", mission),
             });
             if (!isDone) {
               currentThinkingIdx = newIdx; // Track for consolidation
@@ -6621,6 +6711,7 @@ export default function ControlClient() {
     done: boolean;
     id: string;
     startTime: number;
+    goalRole?: GoalOutputRole;
   } | null>(null);
   const thinkingFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const thinkingIdCounterRef = useRef(0);
@@ -6902,6 +6993,12 @@ export default function ControlClient() {
         // undefined means no explicit status, only false means actual failure
         const isFailure = data["success"] === false;
         const incomingId = String(data["id"] ?? Date.now());
+        const incomingContent = String(data["content"] ?? "");
+        const incomingGoalRole =
+          parseGoalOutputRole(data["goal_role"]) ??
+          (viewingMissionRef.current?.goal_mode
+            ? inferGoalOutputRole(incomingContent, "assistant")
+            : undefined);
 
         // Finalize any pending thinking session when an assistant message arrives.
         if (thinkingFlushTimeoutRef.current) {
@@ -6952,7 +7049,7 @@ export default function ControlClient() {
             >;
             updated[existingIdx] = {
               ...existing,
-              content: String(data["content"] ?? existing.content),
+              content: incomingContent || existing.content,
               success: !isFailure,
               ...parseCostMetadata(data, {
                 costCents: existing.costCents,
@@ -6963,6 +7060,7 @@ export default function ControlClient() {
               sharedFiles: sharedFiles ?? existing.sharedFiles,
               resumable,
               goalIteration: goalIterationForEvent ?? existing.goalIteration,
+              goalRole: incomingGoalRole ?? existing.goalRole,
             };
             return updated;
           }
@@ -6970,7 +7068,7 @@ export default function ControlClient() {
           const newItem: ChatItem = {
             kind: "assistant",
             id: incomingId,
-            content: String(data["content"] ?? ""),
+            content: incomingContent,
             success: !isFailure,
             ...parseCostMetadata(data),
             model: data["model"] ? String(data["model"]) : null,
@@ -6981,6 +7079,7 @@ export default function ControlClient() {
             // goal mode so the chat badge can render "Iteration N"
             // instead of the noisy per-turn "Turn complete".
             goalIteration: goalIterationForEvent,
+            goalRole: incomingGoalRole,
           };
 
           const firstQueuedIdx = filtered.findIndex(
@@ -7042,6 +7141,11 @@ export default function ControlClient() {
         const content = String(data["content"] ?? "");
         const done = Boolean(data["done"]);
         const now = Date.now();
+        const incomingGoalRole =
+          parseGoalOutputRole(data["goal_role"]) ??
+          (viewingMissionRef.current?.goal_mode
+            ? inferGoalOutputRole(content, "thinking")
+            : undefined);
 
         // Debounced thinking updates to reduce re-renders during streaming
         const flushThinking = () => {
@@ -7068,6 +7172,7 @@ export default function ControlClient() {
                   content: pending.content || existing.content,
                   done: pending.done,
                   endTime: pending.done ? now : existing.endTime,
+                  goalRole: pending.goalRole ?? existing.goalRole,
                 };
                 if (pending.done) {
                   pendingThinkingRef.current = null;
@@ -7093,6 +7198,7 @@ export default function ControlClient() {
                   done: pending.done,
                   startTime: pending.startTime,
                   endTime: pending.done ? now : undefined,
+                  goalRole: pending.goalRole,
                 },
               ];
             } else {
@@ -7108,6 +7214,7 @@ export default function ControlClient() {
                   done: pending.done,
                   startTime: pending.startTime,
                   endTime: pending.done ? now : undefined,
+                  goalRole: pending.goalRole,
                 },
               ];
             }
@@ -7131,6 +7238,7 @@ export default function ControlClient() {
             done: true,
             id: existingPending?.id ?? `thinking-${thinkingIdCounterRef.current++}`,
             startTime: existingPending?.startTime ?? now,
+            goalRole: existingPending?.goalRole,
           };
           flushThinking();
         }
@@ -7146,6 +7254,7 @@ export default function ControlClient() {
           done,
           id: thinkingId,
           startTime,
+          goalRole: incomingGoalRole ?? existingPending?.goalRole,
         };
 
         // Clear any pending flush timeout

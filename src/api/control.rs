@@ -45,6 +45,7 @@ use super::mission_store::{
     MissionStoreType,
 };
 use super::routes::AppState;
+use crate::backend::native_loops::{classify_goal_output, GoalOutputRole, GoalOutputSource};
 
 const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
 const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
@@ -2645,6 +2646,8 @@ pub enum AgentEvent {
         /// Whether the mission can be resumed after this failure (only relevant when success=false)
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         resumable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        goal_role: Option<GoalOutputRole>,
     },
     /// Agent thinking/reasoning (streaming)
     Thinking {
@@ -2655,6 +2658,8 @@ pub enum AgentEvent {
         /// Mission this thinking belongs to (for parallel execution)
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        goal_role: Option<GoalOutputRole>,
     },
     /// Text content delta (streaming assistant response)
     TextDelta {
@@ -3567,14 +3572,53 @@ pub async fn clear_queue(
 // ==================== Mission Endpoints ====================
 
 /// List all missions.
+#[derive(Debug, Deserialize)]
+pub struct ListMissionsQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
 pub async fn list_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    axum::extract::Query(query): axum::extract::Query<ListMissionsQuery>,
+) -> Result<Json<Vec<Mission>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
+    let mut missions = control
+        .mission_store
+        .list_missions(limit, offset)
+        .await
+        .map_err(internal_error)?;
+    populate_workspace_names(&state, &mut missions).await;
+    Ok(Json(missions))
+}
+
+/// List paginated mission summaries for mobile switchers.
+///
+/// The mission store's list path already returns metadata with an empty
+/// history vector, so this endpoint is intentionally an alias with a distinct
+/// contract: clients should use it when they do not need transcript history.
+pub async fn list_mission_summaries(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    axum::extract::Query(query): axum::extract::Query<ListMissionsQuery>,
+) -> Result<Json<Vec<Mission>>, (StatusCode, String)> {
+    list_missions(State(state), Extension(user), axum::extract::Query(query)).await
+}
+
+/// Get child worker missions for a parent mission without scanning a broad
+/// recent-missions page on the client.
+pub async fn get_child_missions(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(parent_id): Path<Uuid>,
 ) -> Result<Json<Vec<Mission>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let mut missions = control
         .mission_store
-        .list_missions(50, 0)
+        .get_child_missions(parent_id)
         .await
         .map_err(internal_error)?;
     populate_workspace_names(&state, &mut missions).await;
@@ -4961,7 +5005,19 @@ pub async fn list_running_missions(
     Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<super::mission_runner::RunningMissionInfo>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
-    let running = get_running_missions(&control).await?;
+    let mut running = get_running_missions(&control).await?;
+    for item in &mut running {
+        if let Some(mission) = control
+            .mission_store
+            .get_mission(item.mission_id)
+            .await
+            .map_err(internal_error)?
+        {
+            item.title = mission.title;
+            item.short_description = mission.short_description;
+            item.parent_mission_id = mission.parent_mission_id;
+        }
+    }
     Ok(Json(running))
 }
 
@@ -5446,6 +5502,7 @@ fn spawn_control_session(
                                     content,
                                     done: true,
                                     mission_id: Some(mid),
+                                    goal_role: None,
                                 };
                                 if let Err(e) = store.log_event(mid, &synthetic).await {
                                     tracing::warn!("Failed to log synthetic thinking event: {}", e);
@@ -6907,6 +6964,8 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
         && !output.starts_with("Claude Code exited without")
         && !output.starts_with("Claude Code stopped producing output")
         && !output.starts_with("No Claude Code credentials detected")
+        && !output.starts_with("Grok Build needs authentication")
+        && !output.starts_with("Grok Build produced no output")
         && !is_bare_llm_error_output(output)
     {
         tracing::info!(
@@ -8670,6 +8729,9 @@ async fn control_actor_loop(
                                     ),
                                     expected_deliverables: 0,
                                     current_activity: main_runner_activity.clone(),
+                                    title: None,
+                                    short_description: None,
+                                    parent_mission_id: None,
                                     subtask_total: main_runner_subtasks.len(),
                                     subtask_completed: main_runner_subtasks.iter().filter(|s| s.completed).count(),
                                 });
@@ -9335,6 +9397,17 @@ async fn control_actor_loop(
                             // Mark failures as resumable so UI can show a resume button
                             let resumable = !agent_result.success && completed_mission_id.is_some();
                             let model_used = agent_result.model_used.clone();
+                            let goal_role = if let Some(mid) = completed_mission_id {
+                                match mission_store.get_mission(mid).await {
+                                    Ok(Some(mission)) if mission.goal_mode => classify_goal_output(
+                                        &agent_result.output,
+                                        GoalOutputSource::Assistant,
+                                    ),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
                             let _ = events_tx.send(AgentEvent::AssistantMessage {
                                 id: Uuid::new_v4(),
                                 content: agent_result.output.clone(),
@@ -9349,6 +9422,7 @@ async fn control_actor_loop(
                                 mission_id: completed_mission_id,
                                 shared_files,
                                 resumable,
+                                goal_role,
                             });
                             if let Some(mission_id) = completed_mission_id {
                                 // Update automation executions based on agent outcome
@@ -9657,6 +9731,13 @@ async fn control_actor_loop(
                             // Emit completion event with mission_id
                             // Mark failures as resumable
                             let resumable = !result.success;
+                            let goal_role = match mission_store.get_mission(*mission_id).await {
+                                Ok(Some(mission)) if mission.goal_mode => classify_goal_output(
+                                    &result.output,
+                                    GoalOutputSource::Assistant,
+                                ),
+                                _ => None,
+                            };
                             let _ = events_tx.send(AgentEvent::AssistantMessage {
                                 // Use a unique id so we don't overwrite the user_message event
                                 // (event_id is used for de-dupe in the SQLite event logger).
@@ -9674,6 +9755,7 @@ async fn control_actor_loop(
                                 mission_id: Some(*mission_id),
                                 shared_files,
                                 resumable,
+                                goal_role,
                             });
 
                             // Update automation executions based on agent outcome
@@ -13851,6 +13933,7 @@ mod tests {
             mission_id: Some(mission_id),
             shared_files: None,
             resumable: false,
+            goal_role: None,
         };
 
         let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);
@@ -13881,6 +13964,7 @@ mod tests {
             mission_id: Some(mission_id),
             shared_files: None,
             resumable: false,
+            goal_role: None,
         };
 
         let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);

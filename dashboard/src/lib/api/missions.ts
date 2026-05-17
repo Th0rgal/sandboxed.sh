@@ -69,6 +69,8 @@ export interface Mission {
   parent_mission_id?: string;
   working_directory?: string;
   mission_mode?: "task" | "assistant";
+  goal_mode?: boolean;
+  goal_objective?: string | null;
 }
 
 export interface StoredEvent {

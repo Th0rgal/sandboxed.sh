@@ -306,6 +306,7 @@ export async function getRunTasks(
 // ==================== Global Control Session ====================
 
 export type ControlRunState = "idle" | "running" | "waiting_for_tool";
+export type GoalOutputRole = "deliverable" | "progress" | "terminal_notice";
 
 /** File shared by the agent (images render inline, other files show as download links). */
 export interface SharedFile {
@@ -337,10 +338,11 @@ export type ControlAgentEvent =
       cost_cents: number;
       model: string | null;
       mission_id?: string;
+      goal_role?: GoalOutputRole;
       /** Files shared in this message (images, documents, etc.) */
       shared_files?: SharedFile[];
     }
-  | { type: "thinking"; content: string; done: boolean; mission_id?: string }
+  | { type: "thinking"; content: string; done: boolean; mission_id?: string; goal_role?: GoalOutputRole }
   | {
       // Codex `/goal` continuation loop — `iteration` is 1-based, monotonic
       // within a mission. Surfaced once per `turn/started` while the goal

@@ -258,6 +258,10 @@ export function MissionAutomationsDialog({
   const [expandedAutomationId, setExpandedAutomationId] = useState<string | null>(null);
   const [executions, setExecutions] = useState<AutomationExecution[]>([]);
   const [executionsLoading, setExecutionsLoading] = useState(false);
+  const iterationProgress = useMemo(
+    () => getIterationProgressByAutomation(executions),
+    [executions]
+  );
 
   // -- Clipboard --
   const [copiedWebhookId, setCopiedWebhookId] = useState<string | null>(null);
@@ -880,10 +884,6 @@ export function MissionAutomationsDialog({
   const showLoadingPlaceholder = !!missionId && (!isMissionDataReady || (loading && !hasLoaded));
   const visibleAutomations = isMissionDataReady ? automations : [];
   const visibleError = isMissionDataReady ? error : null;
-  const iterationProgress = useMemo(
-    () => getIterationProgressByAutomation(executions),
-    [executions]
-  );
 
   const selectClass =
     'rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer';

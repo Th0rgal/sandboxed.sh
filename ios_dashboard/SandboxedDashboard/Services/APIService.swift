@@ -8,37 +8,36 @@
 import Foundation
 import Observation
 
-@MainActor
 @Observable
-final class APIService {
+final class APIService: @unchecked Sendable {
     static let shared = APIService()
-    nonisolated init() {}
+    init() {}
 
     /// Per-request timeout for ordinary JSON calls. Anything that hasn't started
     /// returning data within this window is treated as failed. Default
     /// `URLSession.shared` ships with 60s, which is far too long for a chat
     /// app's cold-start path — the user sits at "Connecting…" with no feedback.
-    nonisolated static let requestTimeout: TimeInterval = 15
+    static let requestTimeout: TimeInterval = 15
 
     /// Full-transfer cap for ordinary JSON calls. Default is 7 days; a stalled
     /// large download (e.g. a multi-MB event tail over a flaky cellular link)
     /// would block the call until the user kills the app.
-    nonisolated static let resourceTimeout: TimeInterval = 60
+    static let resourceTimeout: TimeInterval = 60
 
     /// SSE inactivity threshold. If no bytes arrive for this long the stream is
     /// considered dead and the caller's reconnect logic re-runs. Covers the
     /// silent-half-open-socket case (cell→wifi handoff, NAT idle reset).
-    nonisolated static let streamInactivityTimeout: TimeInterval = 30
+    static let streamInactivityTimeout: TimeInterval = 30
 
     /// Hard cap on the SSE line-buffer (1 MiB). A pathological server that
     /// never emits a newline must not be allowed to balloon memory.
-    nonisolated static let streamMaxBufferBytes: Int = 1 << 20
+    static let streamMaxBufferBytes: Int = 1 << 20
 
     /// Dedicated session for JSON calls. `URLSession.shared`'s defaults
     /// (60s request, 7d resource, infinite cache) are wrong for a chat app on
     /// bad networks — short timeouts surface failures fast and let the UI
     /// retry instead of holding a spinner indefinitely.
-    nonisolated private static let jsonSession: URLSession = {
+    private static let jsonSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = requestTimeout
         config.timeoutIntervalForResource = resourceTimeout
@@ -56,7 +55,7 @@ final class APIService {
     /// within `streamInactivityTimeout` and triggers the caller's reconnect
     /// loop. `timeoutIntervalForResource` stays effectively unbounded so
     /// long-running missions aren't capped.
-    nonisolated private static let streamSession: URLSession = {
+    private static let streamSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = streamInactivityTimeout
         config.timeoutIntervalForResource = TimeInterval.greatestFiniteMagnitude
@@ -89,8 +88,8 @@ final class APIService {
         jwtToken != nil
     }
     
-    var authRequired: Bool = false
-    var authMode: AuthMode = .singleTenant
+    @MainActor var authRequired: Bool = false
+    @MainActor var authMode: AuthMode = .singleTenant
 
     enum AuthMode: String {
         case disabled = "disabled"
@@ -113,10 +112,13 @@ final class APIService {
         }
         
         let response: LoginResponse = try await post("/api/auth/login", body: LoginRequest(password: password, username: username), authenticated: false)
-        jwtToken = response.token
+        await MainActor.run {
+            jwtToken = response.token
+        }
         return true
     }
     
+    @MainActor
     func logout() {
         jwtToken = nil
     }
@@ -135,19 +137,34 @@ final class APIService {
         }
         
         let response: HealthResponse = try await get("/api/health", authenticated: false)
-        authRequired = response.authRequired
-        if let modeRaw = response.authMode, let mode = AuthMode(rawValue: modeRaw) {
-            authMode = mode
-        } else {
-            authMode = authRequired ? .singleTenant : .disabled
+        await MainActor.run {
+            authRequired = response.authRequired
+            if let modeRaw = response.authMode, let mode = AuthMode(rawValue: modeRaw) {
+                authMode = mode
+            } else {
+                authMode = response.authRequired ? .singleTenant : .disabled
+            }
         }
         return response.status == "ok"
     }
     
     // MARK: - Missions
     
-    func listMissions() async throws -> [Mission] {
-        try await get("/api/control/missions")
+    func listMissions(limit: Int? = nil, offset: Int? = nil) async throws -> [Mission] {
+        var components = URLComponents(string: "/api/control/missions")
+        var queryItems: [URLQueryItem] = []
+        if let limit {
+            queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        if let offset {
+            queryItems.append(URLQueryItem(name: "offset", value: String(offset)))
+        }
+        components?.queryItems = queryItems.isEmpty ? nil : queryItems
+        return try await get(components?.string ?? "/api/control/missions")
+    }
+
+    func listMissionSummaries(limit: Int = 50, offset: Int = 0) async throws -> [Mission] {
+        try await get("/api/control/missions/summary?limit=\(limit)&offset=\(offset)")
     }
     
     func getMission(id: String) async throws -> Mission {
@@ -316,12 +333,8 @@ final class APIService {
         return MissionEventsResult(events: events, maxSequence: maxSequence)
     }
 
-    /// Get child (worker) missions for a boss mission.
-    /// Filters the full mission list by parent_mission_id on the client side,
-    /// since the backend includes parent_mission_id in the mission response.
     func getChildMissions(parentId: String) async throws -> [Mission] {
-        let all: [Mission] = try await get("/api/control/missions?limit=200&offset=0")
-        return all.filter { $0.parentMissionId == parentId }
+        try await get("/api/control/missions/\(parentId)/children")
     }
 
     func searchMissions(query: String, limit: Int? = nil) async throws -> [MissionSearchResult] {
@@ -516,7 +529,9 @@ final class APIService {
         }
 
         if httpResponse.statusCode == 401 {
-            logout()
+            await MainActor.run {
+                logout()
+            }
             throw APIError.unauthorized
         }
 
@@ -572,18 +587,18 @@ final class APIService {
         try await get("/api/workspaces")
     }
 
-    func listWorkspaces(completion: @escaping (Result<[Workspace], Error>) -> Void) {
+    func listWorkspaces(completion: @escaping @MainActor @Sendable (Result<[Workspace], Error>) -> Void) {
         Task {
             do {
                 let workspaces: [Workspace] = try await get("/api/workspaces")
-                completion(.success(workspaces))
+                await MainActor.run { completion(.success(workspaces)) }
             } catch {
-                completion(.failure(error))
+                await MainActor.run { completion(.failure(error)) }
             }
         }
     }
 
-    func createWorkspace(name: String, type: WorkspaceType, completion: @escaping (Result<Workspace, Error>) -> Void) {
+    func createWorkspace(name: String, type: WorkspaceType, completion: @escaping @MainActor @Sendable (Result<Workspace, Error>) -> Void) {
         Task {
             do {
                 struct CreateWorkspaceRequest: Encodable {
@@ -591,9 +606,9 @@ final class APIService {
                     let workspace_type: String
                 }
                 let workspace: Workspace = try await post("/api/workspaces", body: CreateWorkspaceRequest(name: name, workspace_type: type.rawValue))
-                completion(.success(workspace))
+                await MainActor.run { completion(.success(workspace)) }
             } catch {
-                completion(.failure(error))
+                await MainActor.run { completion(.failure(error)) }
             }
         }
     }
@@ -617,7 +632,7 @@ final class APIService {
 
     // MARK: - SSE Streaming
 
-    func streamControl(onEvent: @escaping (String, [String: Any]) -> Void) -> Task<Void, Never> {
+    func streamControl(onEvent: @escaping @MainActor @Sendable (String, [String: Any]) -> Void) -> Task<Void, Never> {
         let base = baseURL
         let token = jwtToken
         let maxBuffer = Self.streamMaxBufferBytes
@@ -645,10 +660,10 @@ final class APIService {
                         if http.statusCode == 401 {
                             await MainActor.run { self?.logout() }
                         }
-                        onEvent("error", [
+                        await MainActor.run { onEvent("error", [
                             "message": "Stream rejected by server (HTTP \(http.statusCode))",
                             "status": http.statusCode
-                        ])
+                        ]) }
                         return
                     }
                 }
@@ -677,12 +692,12 @@ final class APIService {
                     // emits a blank line must not balloon this buffer.
                     bufferedBytes += line.utf8.count + 1
                     if bufferedBytes > maxBuffer {
-                        onEvent("error", ["message": "Stream event exceeded \(maxBuffer) bytes — dropping connection"])
+                        await MainActor.run { onEvent("error", ["message": "Stream event exceeded \(maxBuffer) bytes — dropping connection"]) }
                         return
                     }
 
                     if line.isEmpty {
-                        Self.dispatchSSEEvent(
+                        await Self.dispatchSSEEvent(
                             eventType: eventType,
                             dataLines: dataLines,
                             onEvent: onEvent
@@ -713,13 +728,13 @@ final class APIService {
             } catch is CancellationError {
                 return
             } catch let urlError as URLError where urlError.code == .timedOut {
-                onEvent("error", [
+                await MainActor.run { onEvent("error", [
                     "message": "Stream idle (no data for \(Int(inactivity))s) — reconnecting",
                     "reason": "inactivity"
-                ])
+                ]) }
             } catch {
                 if !Task.isCancelled {
-                    onEvent("error", ["message": "Stream connection failed: \(error.localizedDescription)"])
+                    await MainActor.run { onEvent("error", ["message": "Stream connection failed: \(error.localizedDescription)"]) }
                 }
             }
         }
@@ -730,29 +745,28 @@ final class APIService {
     /// payloads. Only object-shaped JSON is forwarded; scalars/arrays/garbage
     /// surface as a structured `parseError` so the caller can log them
     /// instead of silently dropping data.
-    @MainActor
     private static func dispatchSSEEvent(
         eventType: String,
         dataLines: [String],
-        onEvent: (String, [String: Any]) -> Void
-    ) {
+        onEvent: @escaping @MainActor @Sendable (String, [String: Any]) -> Void
+    ) async {
         guard !dataLines.isEmpty else { return }
         let payload = dataLines.joined(separator: "\n")
         guard !payload.isEmpty else { return }
 
         guard let data = payload.data(using: .utf8) else {
-            onEvent("parseError", ["raw": payload, "reason": "non-utf8 payload"])
+            await MainActor.run { onEvent("parseError", ["raw": payload, "reason": "non-utf8 payload"]) }
             return
         }
         do {
             let parsed = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
             if let obj = parsed as? [String: Any] {
-                onEvent(eventType, obj)
+                await MainActor.run { onEvent(eventType, obj) }
             } else {
-                onEvent("parseError", ["raw": payload, "reason": "non-object payload"])
+                await MainActor.run { onEvent("parseError", ["raw": payload, "reason": "non-object payload"]) }
             }
         } catch {
-            onEvent("parseError", ["raw": payload, "reason": error.localizedDescription])
+            await MainActor.run { onEvent("parseError", ["raw": payload, "reason": error.localizedDescription]) }
         }
     }
     
@@ -848,7 +862,9 @@ final class APIService {
         }
 
         if httpResponse.statusCode == 401 {
-            logout()
+            await MainActor.run {
+                logout()
+            }
             throw APIError.unauthorized
         }
 
@@ -863,12 +879,8 @@ final class APIService {
             }
         }
 
-        // Decode off the main actor. APIService is `@MainActor`, so without
-        // this hop a multi-MB events payload would block the UI thread for
-        // hundreds of ms during decode. We use a `nonisolated` global-actor-free
-        // helper wrapped in `Task.detached` so the decode runs on a cooperative
-        // thread; `DecodedBox` is `@unchecked Sendable` because the decoded
-        // value is treated as immutable from the moment we ship it back.
+        // Decode off the caller's actor. A multi-MB events payload should not
+        // block SwiftUI while decoding.
         let box: DecodedBox<T>
         do {
             box = try await Task.detached(priority: .userInitiated) {
