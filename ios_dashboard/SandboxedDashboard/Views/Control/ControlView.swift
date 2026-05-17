@@ -892,6 +892,27 @@ struct ControlView: View {
             currentToolGroup = []
         }
 
+        // Mirror the dashboard's `alreadyVisibleDeliverables` dedup: if a
+        // finalized `assistant_message` already carries the same content as a
+        // deliverable-tagged thinking block, we must not also promote the
+        // thinking block, or the bubble renders twice in the main pane.
+        let deliverableThinkingContents: Set<String> = Set(
+            messages.lazy.compactMap { msg -> String? in
+                guard msg.isThinking, msg.goalRole == .deliverable else { return nil }
+                let trimmed = msg.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+        )
+        let alreadyVisibleDeliverables: Set<String> = deliverableThinkingContents.isEmpty
+            ? []
+            : Set(
+                messages.lazy.compactMap { msg -> String? in
+                    guard msg.isAssistant else { return nil }
+                    let trimmed = msg.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return deliverableThinkingContents.contains(trimmed) ? trimmed : nil
+                }
+            )
+
         for message in messages {
             if message.isAssistant && message.goalRole == .terminalNotice {
                 continue
@@ -900,18 +921,20 @@ struct ControlView: View {
             // Thinking renders only in the thoughts sheet, never in the main pane.
             if message.isThinking {
                 flushToolGroup()
-                if message.goalRole == .deliverable,
-                   !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    var promoted = ChatMessage(
-                        id: "\(message.id)-goal-deliverable",
-                        type: .assistant(success: true, costCents: 0, costSource: .unknown, model: nil, sharedFiles: nil),
-                        content: message.content,
-                        timestamp: message.timestamp,
-                        goalRole: .deliverable
-                    )
-                    promoted.toolUI = message.toolUI
-                    promoted.toolData = message.toolData
-                    result.append(.single(promoted))
+                if message.goalRole == .deliverable {
+                    let trimmed = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty, !alreadyVisibleDeliverables.contains(trimmed) {
+                        var promoted = ChatMessage(
+                            id: "\(message.id)-goal-deliverable",
+                            type: .assistant(success: true, costCents: 0, costSource: .unknown, model: nil, sharedFiles: nil),
+                            content: message.content,
+                            timestamp: message.timestamp,
+                            goalRole: .deliverable
+                        )
+                        promoted.toolUI = message.toolUI
+                        promoted.toolData = message.toolData
+                        result.append(.single(promoted))
+                    }
                 }
                 continue
             }
