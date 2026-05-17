@@ -6958,6 +6958,8 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
         && !output.starts_with("Claude Code exited without")
         && !output.starts_with("Claude Code stopped producing output")
         && !output.starts_with("No Claude Code credentials detected")
+        && !output.starts_with("Grok Build needs authentication")
+        && !output.starts_with("Grok Build produced no output")
         && !is_bare_llm_error_output(output)
     {
         tracing::info!(
