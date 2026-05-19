@@ -126,6 +126,7 @@ impl LibraryStore {
         let mut seeded_paths = Vec::new();
         let skill_dir = self.skills_dir().join(OKX_SECURITY_SKILL_NAME);
         let skill_md = skill_dir.join("SKILL.md");
+        let source_path = skill_dir.join(".skill-source.json");
         if !skill_md.exists() {
             fs::create_dir_all(&skill_dir)
                 .await
@@ -134,12 +135,21 @@ impl LibraryStore {
                 .await
                 .context("Failed to write bundled OKX security skill")?;
 
-            let source_path = skill_dir.join(".skill-source.json");
             fs::write(&source_path, OKX_SECURITY_SOURCE)
                 .await
                 .context("Failed to write bundled OKX skill source metadata")?;
             seeded_paths.push(skill_md);
             seeded_paths.push(source_path);
+        } else if !source_path.exists() {
+            let existing_skill = fs::read_to_string(&skill_md)
+                .await
+                .context("Failed to read existing OKX security skill")?;
+            if existing_skill == OKX_SECURITY_SKILL {
+                fs::write(&source_path, OKX_SECURITY_SOURCE)
+                    .await
+                    .context("Failed to write bundled OKX skill source metadata")?;
+                seeded_paths.push(source_path);
+            }
         }
 
         let templates_dir = self.path.join(WORKSPACE_TEMPLATE_DIR);
@@ -2659,6 +2669,26 @@ This is the body."#;
             .unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    }
+
+    #[tokio::test]
+    async fn bundled_hackathon_items_seed_repairs_missing_source_for_bundled_skill() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
+
+        let skill_dir = temp.path().join("skill/okx-security");
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        let skill_path = skill_dir.join("SKILL.md");
+        let source_path = skill_dir.join(".skill-source.json");
+        tokio::fs::write(&skill_path, OKX_SECURITY_SKILL)
+            .await
+            .unwrap();
+
+        store.seed_bundled_hackathon_items().await.unwrap();
+
+        assert!(source_path.exists());
+        let source = tokio::fs::read_to_string(source_path).await.unwrap();
+        assert_eq!(source, OKX_SECURITY_SOURCE);
     }
 
     #[test]
