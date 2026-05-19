@@ -8668,11 +8668,12 @@ export default function ControlClient() {
     return null;
   }, [items]);
 
-  // Derive child (worker) missions for the active mission
+  // Derive child (worker) missions from the route's current mission, not the
+  // viewed worker, so the worker strip stays visible after selecting a chip.
   const childMissions = useMemo(() => {
-    if (!activeMission) return [];
-    return recentMissions.filter((m) => m.parent_mission_id === activeMission.id);
-  }, [activeMission, recentMissions]);
+    if (!currentMission) return [];
+    return recentMissions.filter((m) => m.parent_mission_id === currentMission.id);
+  }, [currentMission, recentMissions]);
   const activeMissionRole = activeMission ? inferMissionRole(activeMission) : null;
 
   // In-mission sub-agents: Claude Code's in-process `Task` /
