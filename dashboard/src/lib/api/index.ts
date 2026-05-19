@@ -118,6 +118,7 @@ export {
   type UsageWindow,
   type ModelUsageSummary,
   type DailyUsage,
+  type HourlyUsage,
   type UsageSummary,
   getUsageSummary,
   refreshProviderUsage,

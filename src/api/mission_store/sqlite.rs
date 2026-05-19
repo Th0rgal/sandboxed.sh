@@ -2,10 +2,10 @@
 
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, DailyUsageStats,
-    ExecutionStatus, FreshSession, Mission, MissionHistoryEntry, MissionMode, MissionStatus,
-    MissionStore, ModelUsageStats, RetryConfig, StopPolicy, StoredEvent, TelegramActionExecution,
-    TelegramActionExecutionKind, TelegramActionExecutionStatus, TelegramChannel,
-    TelegramChatMission, TelegramConversation, TelegramConversationMessage,
+    ExecutionStatus, FreshSession, HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode,
+    MissionStatus, MissionStore, ModelUsageStats, RetryConfig, StopPolicy, StoredEvent,
+    TelegramActionExecution, TelegramActionExecutionKind, TelegramActionExecutionStatus,
+    TelegramChannel, TelegramChatMission, TelegramConversation, TelegramConversationMessage,
     TelegramConversationMessageDirection, TelegramScheduledMessage, TelegramScheduledMessageStatus,
     TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
     TelegramStructuredMemorySearchHit, TelegramWorkflow, TelegramWorkflowEvent,
@@ -4030,6 +4030,79 @@ impl MissionStore for SqliteMissionStore {
         for r in rows {
             let row = r.map_err(|e| e.to_string())?;
             if row.day.is_empty() {
+                continue;
+            }
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    async fn get_usage_by_hour(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<HourlyUsageStats>, String> {
+        let conn = self.conn.lock().await;
+
+        // Bucket by `YYYY-MM-DDTHH` (the first 13 chars of an RFC3339 stamp).
+        // Same cost-source fallback as get_usage_by_day.
+        let base_query = r#"
+            SELECT
+                substr(timestamp, 1, 13) AS hour,
+                COUNT(*) AS requests,
+                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER)), 0) AS input_tokens,
+                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER)), 0) AS output_tokens,
+                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER)), 0) AS cache_read_tokens,
+                COALESCE(SUM(
+                    CASE WHEN CAST(
+                        COALESCE(
+                            json_extract(metadata, '$.cost.amount_cents'),
+                            json_extract(metadata, '$.cost_cents'),
+                            0
+                        ) AS INTEGER
+                    ) > 0
+                    THEN CAST(
+                        COALESCE(
+                            json_extract(metadata, '$.cost.amount_cents'),
+                            json_extract(metadata, '$.cost_cents'),
+                            0
+                        ) AS INTEGER
+                    ) ELSE 0 END
+                ), 0) AS cost_cents
+            FROM mission_events
+            WHERE event_type = 'assistant_message'
+        "#;
+        let sql = match since {
+            Some(_) => format!("{base_query} AND timestamp >= ?1 GROUP BY hour ORDER BY hour ASC"),
+            None => format!("{base_query} GROUP BY hour ORDER BY hour ASC"),
+        };
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let since_owned = since.map(|s| s.to_string());
+        let params: Vec<&dyn rusqlite::ToSql> = match since_owned.as_ref() {
+            Some(s) => vec![s],
+            None => vec![],
+        };
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                let hour: String = row.get(0)?;
+                let requests: i64 = row.get(1)?;
+                let input_tokens: i64 = row.get(2)?;
+                let output_tokens: i64 = row.get(3)?;
+                let cache_read_tokens: i64 = row.get(4)?;
+                let cost_cents: i64 = row.get(5)?;
+                Ok(HourlyUsageStats {
+                    hour,
+                    requests: requests.max(0) as u64,
+                    input_tokens: input_tokens.max(0) as u64,
+                    output_tokens: output_tokens.max(0) as u64,
+                    cache_read_tokens: cache_read_tokens.max(0) as u64,
+                    cost_cents: cost_cents.max(0) as u64,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out: Vec<HourlyUsageStats> = Vec::new();
+        for r in rows {
+            let row = r.map_err(|e| e.to_string())?;
+            if row.hour.is_empty() {
                 continue;
             }
             out.push(row);

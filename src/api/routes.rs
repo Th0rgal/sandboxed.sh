@@ -1365,12 +1365,26 @@ pub struct UsageSummaryResponse {
     pub totals: UsageSummaryTotals,
     pub by_model: Vec<ModelUsageResponse>,
     pub by_day: Vec<DailyUsageResponse>,
+    /// Only populated for windows where hourly granularity makes sense (24h, 7d).
+    pub by_hour: Vec<HourlyUsageResponse>,
 }
 
 /// One day's worth of aggregated usage — used to draw the sparkline.
 #[derive(Debug, Serialize)]
 pub struct DailyUsageResponse {
     pub day: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
+/// One hour's worth of aggregated usage — finer granularity for 24h/7d views.
+#[derive(Debug, Serialize)]
+pub struct HourlyUsageResponse {
+    /// `YYYY-MM-DDTHH` (UTC).
+    pub hour: String,
     pub requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -1439,6 +1453,17 @@ async fn get_ai_usage_summary(
         .get_usage_by_day(since.as_deref())
         .await
         .unwrap_or_default();
+    // Only fetch hourly buckets for short windows — at 30d / all the count
+    // explodes into the thousands and the line chart becomes unreadable.
+    let hourly = if matches!(window, "24h" | "7d") {
+        control_state
+            .mission_store
+            .get_usage_by_hour(since.as_deref())
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     let mut totals = UsageSummaryTotals {
         requests: 0,
@@ -1487,12 +1512,25 @@ async fn get_ai_usage_summary(
         })
         .collect();
 
+    let by_hour = hourly
+        .into_iter()
+        .map(|h| HourlyUsageResponse {
+            hour: h.hour,
+            requests: h.requests,
+            input_tokens: h.input_tokens,
+            output_tokens: h.output_tokens,
+            cache_read_tokens: h.cache_read_tokens,
+            cost_cents: h.cost_cents,
+        })
+        .collect();
+
     Json(UsageSummaryResponse {
         window: window.to_string(),
         since,
         totals,
         by_model,
         by_day,
+        by_hour,
     })
 }
 

@@ -161,6 +161,18 @@ pub struct DailyUsageStats {
     pub cost_cents: u64,
 }
 
+/// Aggregated AI usage for one UTC hour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HourlyUsageStats {
+    /// `YYYY-MM-DDTHH` (UTC), e.g. "2026-05-19T08".
+    pub hour: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Automation Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1122,6 +1134,15 @@ pub trait MissionStore: Send + Sync {
     /// Aggregate AI usage per UTC day. Days with no usage are omitted; the
     /// caller is responsible for filling gaps if a contiguous series is needed.
     async fn get_usage_by_day(&self, _since: Option<&str>) -> Result<Vec<DailyUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate AI usage per UTC hour. Buckets with no usage are omitted.
+    /// Returned timestamps are in `YYYY-MM-DDTHH` form (no minutes/seconds).
+    async fn get_usage_by_hour(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<HourlyUsageStats>, String> {
         Ok(Vec::new())
     }
 

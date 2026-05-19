@@ -20,11 +20,12 @@
  * the selected window so bars always fill the chart even on sparse data.
  */
 
-import { useMemo } from 'react';
+import { useMemo, useState, useRef, useCallback } from 'react';
 import useSWR from 'swr';
 import {
   getUsageSummary,
   type DailyUsage,
+  type HourlyUsage,
   type ModelUsageSummary,
   type UsageSummary,
   type UsageWindow,
@@ -74,49 +75,95 @@ function fmtCompact(n: number): string {
 
 /** Number of bars to draw for each window. The data may have fewer days; we
  * fill gaps with zero-height placeholders so the axis width is stable. */
-function daysForWindow(w: UsageWindow): number {
-  switch (w) {
-    case '24h':
-      return 7;
-    case '7d':
-      return 7;
-    case '30d':
-      return 30;
-    case 'all':
-    default:
-      return 30;
-  }
-}
+/** A single data point on the cost-over-time chart. `ts` is a UTC timestamp,
+ * `label` is what we render on the X axis. */
+type ChartPoint = {
+  ts: Date;
+  cost_cents: number;
+  requests: number;
+  bucket: string; // raw bucket key (day or hour)
+};
 
-function buildDailySeries(
+/** Build a continuous series at the granularity that best fits the window.
+ *  - 24h → 24 hourly buckets ending now
+ *  - 7d  → 168 hourly buckets (preferred) or 7 days fallback
+ *  - 30d → 30 daily buckets
+ *  - all → up to 60 daily buckets from the actual data tail
+ */
+function buildSeries(
   byDay: DailyUsage[],
+  byHour: HourlyUsage[],
   windowKey: UsageWindow
-): { day: string; cost_cents: number; requests: number }[] {
-  const map = new Map(byDay.map((d) => [d.day, d]));
-  // For "all" we prefer to span the actual data range (latest 30) so we don't
-  // show 30 empty bars when there's only 10 days of history.
-  if (windowKey === 'all' && byDay.length > 0) {
-    return byDay.slice(-30).map((d) => ({
-      day: d.day,
-      cost_cents: d.cost_cents,
-      requests: d.requests,
-    }));
-  }
-  const count = daysForWindow(windowKey);
-  const series: { day: string; cost_cents: number; requests: number }[] = [];
+): { points: ChartPoint[]; granularity: 'hour' | 'day' } {
+  const dayMap = new Map(byDay.map((d) => [d.day, d]));
+  const hourMap = new Map(byHour.map((h) => [h.hour, h]));
   const now = new Date();
+
+  if (windowKey === '24h') {
+    const out: ChartPoint[] = [];
+    for (let i = 23; i >= 0; i--) {
+      const d = new Date(now);
+      d.setUTCMinutes(0, 0, 0);
+      d.setUTCHours(d.getUTCHours() - i);
+      const key = `${d.toISOString().slice(0, 13)}`;
+      const found = hourMap.get(key);
+      out.push({
+        ts: d,
+        bucket: key,
+        cost_cents: found?.cost_cents ?? 0,
+        requests: found?.requests ?? 0,
+      });
+    }
+    return { points: out, granularity: 'hour' };
+  }
+
+  if (windowKey === '7d' && byHour.length > 0) {
+    const out: ChartPoint[] = [];
+    for (let i = 7 * 24 - 1; i >= 0; i--) {
+      const d = new Date(now);
+      d.setUTCMinutes(0, 0, 0);
+      d.setUTCHours(d.getUTCHours() - i);
+      const key = `${d.toISOString().slice(0, 13)}`;
+      const found = hourMap.get(key);
+      out.push({
+        ts: d,
+        bucket: key,
+        cost_cents: found?.cost_cents ?? 0,
+        requests: found?.requests ?? 0,
+      });
+    }
+    return { points: out, granularity: 'hour' };
+  }
+
+  // Daily granularity for 7d (fallback), 30d, all
+  const count = windowKey === '7d' ? 7 : windowKey === '30d' ? 30 : 60;
+  if (windowKey === 'all' && byDay.length > 0) {
+    const slice = byDay.slice(-count);
+    return {
+      points: slice.map((d) => ({
+        ts: new Date(d.day + 'T00:00:00Z'),
+        bucket: d.day,
+        cost_cents: d.cost_cents,
+        requests: d.requests,
+      })),
+      granularity: 'day',
+    };
+  }
+  const out: ChartPoint[] = [];
   for (let i = count - 1; i >= 0; i--) {
     const d = new Date(now);
-    d.setUTCDate(now.getUTCDate() - i);
+    d.setUTCHours(0, 0, 0, 0);
+    d.setUTCDate(d.getUTCDate() - i);
     const key = d.toISOString().slice(0, 10);
-    const found = map.get(key);
-    series.push({
-      day: key,
+    const found = dayMap.get(key);
+    out.push({
+      ts: d,
+      bucket: key,
       cost_cents: found?.cost_cents ?? 0,
       requests: found?.requests ?? 0,
     });
   }
-  return series;
+  return { points: out, granularity: 'day' };
 }
 
 // ─── Tiles ───────────────────────────────────────────────────────────────────
@@ -151,30 +198,149 @@ function MetricTile({
 
 // ─── Cost-over-time sparkline ────────────────────────────────────────────────
 
-function CostSparkline({
+/** Build a quadratic-bezier-smoothed SVG path string. */
+function buildSmoothPath(
+  points: { x: number; y: number }[],
+  baselineY: number,
+  close = false
+): string {
+  if (points.length === 0) return '';
+  if (points.length === 1) {
+    const p = points[0];
+    return close
+      ? `M ${p.x} ${baselineY} L ${p.x} ${p.y} L ${p.x} ${baselineY} Z`
+      : `M ${p.x} ${p.y}`;
+  }
+  let d = `M ${points[0].x} ${points[0].y}`;
+  for (let i = 0; i < points.length - 1; i++) {
+    const p = points[i];
+    const n = points[i + 1];
+    const mx = (p.x + n.x) / 2;
+    const my = (p.y + n.y) / 2;
+    d += ` Q ${p.x} ${p.y} ${mx} ${my}`;
+  }
+  const last = points[points.length - 1];
+  d += ` T ${last.x} ${last.y}`;
+  if (close) {
+    d += ` L ${last.x} ${baselineY} L ${points[0].x} ${baselineY} Z`;
+  }
+  return d;
+}
+
+function fmtAxisLabel(ts: Date, gran: 'hour' | 'day'): string {
+  if (gran === 'hour') {
+    return `${ts.getUTCHours().toString().padStart(2, '0')}:00`;
+  }
+  const m = ts.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' });
+  return `${m} ${ts.getUTCDate()}`;
+}
+
+function fmtPointLabel(ts: Date, gran: 'hour' | 'day'): string {
+  if (gran === 'hour') {
+    const day = ts.toLocaleString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    return `${day} · ${ts.getUTCHours().toString().padStart(2, '0')}:00 UTC`;
+  }
+  return ts.toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    timeZone: 'UTC',
+  });
+}
+
+function CostAreaChart({
   byDay,
+  byHour,
   windowKey,
 }: {
   byDay: DailyUsage[];
+  byHour: HourlyUsage[];
   windowKey: UsageWindow;
 }) {
-  const series = useMemo(() => buildDailySeries(byDay, windowKey), [byDay, windowKey]);
-  const maxCost = useMemo(
-    () => series.reduce((m, d) => Math.max(m, d.cost_cents), 0),
-    [series]
+  const { points, granularity } = useMemo(
+    () => buildSeries(byDay, byHour, windowKey),
+    [byDay, byHour, windowKey]
   );
   const totalCost = useMemo(
-    () => series.reduce((s, d) => s + d.cost_cents, 0),
-    [series]
+    () => points.reduce((s, p) => s + p.cost_cents, 0),
+    [points]
+  );
+  const maxCost = useMemo(
+    () => points.reduce((m, p) => Math.max(m, p.cost_cents), 0),
+    [points]
   );
 
-  // Show day labels every ~5 bars (plus first + last)
-  const labelStep = Math.max(1, Math.floor(series.length / 6));
+  // Internal SVG coordinates; preserveAspectRatio="none" stretches them.
+  const W = 600;
+  const H = 180;
+  const padX = 4;
+  const padTop = 6;
+  const padBottom = 4;
+  const chartW = W - padX * 2;
+  const chartH = H - padTop - padBottom;
+  const baselineY = padTop + chartH;
+
+  const linePoints = useMemo(
+    () =>
+      points.map((p, i) => {
+        const x =
+          points.length <= 1
+            ? W / 2
+            : padX + (i / (points.length - 1)) * chartW;
+        const y =
+          padTop + chartH - (maxCost > 0 ? p.cost_cents / maxCost : 0) * chartH;
+        return { x, y };
+      }),
+    [points, maxCost, chartW, chartH, padX, padTop, baselineY]
+  );
+  const linePath = useMemo(
+    () => buildSmoothPath(linePoints, baselineY, false),
+    [linePoints, baselineY]
+  );
+  const fillPath = useMemo(
+    () => buildSmoothPath(linePoints, baselineY, true),
+    [linePoints, baselineY]
+  );
+
+  const gridYs = [0.25, 0.5, 0.75, 1].map((f) => padTop + chartH - f * chartH);
+  const tickCount = granularity === 'hour' ? (windowKey === '24h' ? 6 : 7) : 6;
+  const tickIdxs: number[] = [];
+  if (points.length > 0) {
+    for (let i = 0; i < Math.min(tickCount, points.length); i++) {
+      const t = Math.max(1, tickCount - 1);
+      const idx = Math.round((i / t) * (points.length - 1));
+      tickIdxs.push(idx);
+    }
+  }
+
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+
+  const onMove = useCallback(
+    (e: React.MouseEvent<SVGSVGElement>) => {
+      if (!svgRef.current || points.length === 0) return;
+      const pt = svgRef.current.createSVGPoint();
+      pt.x = e.clientX;
+      pt.y = e.clientY;
+      const ctm = svgRef.current.getScreenCTM();
+      if (!ctm) return;
+      const local = pt.matrixTransform(ctm.inverse());
+      const x = Math.max(padX, Math.min(W - padX, local.x));
+      const ratio = (x - padX) / chartW;
+      const idx = Math.round(ratio * (points.length - 1));
+      setHoverIdx(idx);
+    },
+    [points.length, chartW, padX, W]
+  );
+  const onLeave = useCallback(() => setHoverIdx(null), []);
+
+  const hovered = hoverIdx != null ? points[hoverIdx] : null;
+  const hoveredPoint = hoverIdx != null ? linePoints[hoverIdx] : null;
 
   return (
     <div
       className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4 h-full flex flex-col"
-      data-testid="usage-sparkline"
+      data-testid="usage-chart"
     >
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2 text-sm font-medium text-white">
@@ -182,53 +348,119 @@ function CostSparkline({
           <span>Cost over time</span>
         </div>
         <div className="font-mono text-[11px] text-white/40 tabular-nums">
-          {formatCents(totalCost)} · {series.length}d
+          {formatCents(totalCost)} · {points.length}
+          {granularity === 'hour' ? 'h' : 'd'}
         </div>
       </div>
 
-      <div
-        className="flex-1 min-h-[7rem] flex items-end gap-[2px]"
-        data-testid="usage-sparkline-bars"
-      >
-        {series.map((d) => {
-          const height = maxCost > 0 ? (d.cost_cents / maxCost) * 100 : 0;
-          const date = new Date(d.day + 'T00:00:00Z');
-          const dow = date.getUTCDay();
-          const isWeekend = dow === 0 || dow === 6;
-          const isEmpty = d.cost_cents === 0;
-          return (
-            <div
-              key={d.day}
-              className="flex-1 flex flex-col items-center justify-end min-w-0 h-full"
-            >
-              <div
-                className={cn(
-                  'w-full rounded-sm transition-colors',
-                  isEmpty
-                    ? 'bg-white/[0.05]'
-                    : isWeekend
-                    ? 'bg-indigo-500/30 hover:bg-indigo-500/60'
-                    : 'bg-indigo-500/55 hover:bg-indigo-500/80'
-                )}
-                style={{ height: `${Math.max(height, isEmpty ? 4 : 6)}%` }}
-                title={`${d.day} · ${formatCents(d.cost_cents)} · ${d.requests} req`}
-                data-testid="usage-sparkline-bar"
-                data-empty={isEmpty ? '1' : '0'}
+      <div className="flex-1 min-h-[9rem] relative" data-testid="usage-chart-area">
+        <svg
+          ref={svgRef}
+          viewBox={`0 0 ${W} ${H}`}
+          preserveAspectRatio="none"
+          className="w-full h-full overflow-visible"
+          onMouseMove={onMove}
+          onMouseLeave={onLeave}
+        >
+          <defs>
+            <linearGradient id="usage-fill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="rgb(99,102,241)" stopOpacity="0.45" />
+              <stop offset="100%" stopColor="rgb(99,102,241)" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+
+          {gridYs.map((y, i) => (
+            <line
+              key={i}
+              x1={padX}
+              x2={W - padX}
+              y1={y}
+              y2={y}
+              stroke="rgba(255,255,255,0.045)"
+              strokeWidth={1}
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
+
+          {maxCost > 0 && (
+            <>
+              <path d={fillPath} fill="url(#usage-fill)" />
+              <path
+                d={linePath}
+                fill="none"
+                stroke="rgb(129,140,248)"
+                strokeWidth={1.5}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
               />
+            </>
+          )}
+
+          {hovered && hoveredPoint && (
+            <g pointerEvents="none">
+              <line
+                x1={hoveredPoint.x}
+                x2={hoveredPoint.x}
+                y1={padTop}
+                y2={padTop + chartH}
+                stroke="rgba(255,255,255,0.2)"
+                strokeWidth={1}
+                vectorEffect="non-scaling-stroke"
+              />
+              <circle
+                cx={hoveredPoint.x}
+                cy={hoveredPoint.y}
+                r={3.5}
+                fill="rgb(129,140,248)"
+                stroke="rgba(15,15,25,0.85)"
+                strokeWidth={2}
+                vectorEffect="non-scaling-stroke"
+              />
+            </g>
+          )}
+        </svg>
+
+        {hovered && hoveredPoint && (
+          <div
+            className="pointer-events-none absolute z-10 rounded-md border border-white/[0.08] bg-black/85 backdrop-blur px-2 py-1.5 text-[10px] shadow-lg"
+            style={{
+              left: `${(hoveredPoint.x / W) * 100}%`,
+              top: 0,
+              transform: 'translate(-50%, -10%)',
+            }}
+            data-testid="usage-chart-tooltip"
+          >
+            <div className="font-medium text-white/85 whitespace-nowrap">
+              {fmtPointLabel(hovered.ts, granularity)}
             </div>
-          );
-        })}
+            <div className="mt-0.5 flex gap-3 font-mono tabular-nums whitespace-nowrap">
+              <span className="text-indigo-300">{formatCents(hovered.cost_cents)}</span>
+              <span className="text-white/40">{fmtCompact(hovered.requests)} req</span>
+            </div>
+          </div>
+        )}
       </div>
-      {/* Axis labels under the bars */}
-      <div className="mt-1.5 flex gap-[2px] text-[9px] text-white/30 tabular-nums">
-        {series.map((d, idx) => {
-          const showLabel =
-            idx === 0 || idx === series.length - 1 || idx % labelStep === 0;
-          const date = new Date(d.day + 'T00:00:00Z');
+
+      <div className="relative mt-1 h-3 text-[9px] text-white/30 tabular-nums">
+        {tickIdxs.map((idx, i) => {
+          const p = points[idx];
+          if (!p) return null;
+          const ratio = points.length <= 1 ? 0.5 : idx / (points.length - 1);
+          const transform =
+            i === 0
+              ? 'translate(0, 0)'
+              : i === tickIdxs.length - 1
+              ? 'translate(-100%, 0)'
+              : 'translate(-50%, 0)';
           return (
-            <div key={d.day} className="flex-1 text-center">
-              {showLabel ? date.getUTCDate() : ' '}
-            </div>
+            <span
+              key={idx}
+              className="absolute top-0 whitespace-nowrap"
+              style={{ left: `${ratio * 100}%`, transform }}
+            >
+              {fmtAxisLabel(p.ts, granularity)}
+            </span>
           );
         })}
       </div>
@@ -639,10 +871,14 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
             />
           </div>
 
-          {/* Sparkline + provider distribution — equal-height row */}
+          {/* Chart + provider distribution — equal-height row */}
           <div className="grid gap-3 md:grid-cols-3 md:items-stretch">
             <div className="md:col-span-2">
-              <CostSparkline byDay={data.by_day} windowKey={window} />
+              <CostAreaChart
+                byDay={data.by_day}
+                byHour={data.by_hour ?? []}
+                windowKey={window}
+              />
             </div>
             <div className="md:col-span-1">
               <ProviderDistribution models={data.by_model} />

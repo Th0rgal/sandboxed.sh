@@ -363,6 +363,16 @@ export interface DailyUsage {
   cost_cents: number;
 }
 
+export interface HourlyUsage {
+  /** `YYYY-MM-DDTHH` (UTC). */
+  hour: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_cents: number;
+}
+
 export interface UsageSummary {
   window: UsageWindow;
   since: string | null;
@@ -376,6 +386,8 @@ export interface UsageSummary {
   };
   by_model: ModelUsageSummary[];
   by_day: DailyUsage[];
+  /** Only populated for windows where hourly granularity is useful (24h, 7d). */
+  by_hour: HourlyUsage[];
 }
 
 export async function getUsageSummary(window: UsageWindow = "all"): Promise<UsageSummary> {
