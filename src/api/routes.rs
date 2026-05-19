@@ -651,13 +651,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             axum::routing::delete(control::clear_queue),
         )
         // State snapshots (for refresh resilience)
-        .route("/api/control/tree", get(control::get_tree))
         .route("/api/control/progress", get(control::get_progress))
-        // Diagnostic endpoints
-        .route(
-            "/api/control/diagnostics/opencode",
-            get(control::get_opencode_diagnostics),
-        )
         // Mission management endpoints
         .route("/api/control/missions", get(control::list_missions))
         .route("/api/control/missions", post(control::create_mission))
@@ -884,10 +878,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))
-        .route(
-            "/api/control/parallel/config",
-            get(control::get_parallel_config),
-        )
         // P0-#3: in-process metrics for perf validation.
         .route("/api/control/metrics", get(control::get_control_metrics))
         // P5-#25: client health-budget telemetry sink.
@@ -907,7 +897,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/fs/validate", get(fs::validate))
         .merge(upload_route)
         .route("/api/fs/upload-finalize", post(fs::upload_finalize))
-        .route("/api/fs/download-url", post(fs::download_from_url))
         .route("/api/fs/mkdir", post(fs::mkdir))
         .route("/api/fs/rm", post(fs::rm))
         // MCP management endpoints

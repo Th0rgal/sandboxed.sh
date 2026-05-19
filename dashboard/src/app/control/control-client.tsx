@@ -4149,62 +4149,46 @@ export default function ControlClient() {
       }
 
       if (!sorted) {
-        try {
-          const transcript = await getMissionTranscript(id);
-          sorted = transcript.messages
-            .map(
-              ({
-                trace_count: _traceCount,
-                trace_summary: _traceSummary,
-                ...event
-              }) => event,
-            )
-            .sort((a, b) => a.sequence - b.sequence);
-          metaMaxSeq = transcript.latest_sequence;
-          // Only count types the client actually loads. The transcript's
-          // `event_counts` includes debug/status events outside
-          // `HISTORY_EVENT_TYPES`; summing them all inflates the total and
-          // makes `computeHasMoreOlder(id)` (which compares against the
-          // count of *loaded* events) return true forever, leaving the
-          // "Load older messages" button permanently visible. The fallback
-          // branch below already does this correctly via the meta returned
-          // by the typed `getMissionEventsWithMeta` call.
-          metaTotal = Object.entries(transcript.event_counts).reduce(
-            (sum, [type, count]) =>
-              HISTORY_EVENT_TYPES.includes(type) ? sum + count : sum,
-            0,
-          );
+        const transcript = await getMissionTranscript(id);
+        sorted = transcript.messages
+          .map(
+            ({
+              trace_count: _traceCount,
+              trace_summary: _traceSummary,
+              ...event
+            }) => event,
+          )
+          .sort((a, b) => a.sequence - b.sequence);
+        metaMaxSeq = transcript.latest_sequence;
+        // Only count types the client actually loads. The transcript's
+        // `event_counts` includes debug/status events outside
+        // `HISTORY_EVENT_TYPES`; summing them all inflates the total and
+        // makes `computeHasMoreOlder(id)` (which compares against the
+        // count of *loaded* events) return true forever.
+        metaTotal = Object.entries(transcript.event_counts).reduce(
+          (sum, [type, count]) =>
+            HISTORY_EVENT_TYPES.includes(type) ? sum + count : sum,
+          0,
+        );
 
-          // Fetch hidden thoughts/tools after first paint. The renderer ref is
-          // populated below `eventsToItems`; this avoids blocking transcript
-          // display on the heavier activity trace.
-          setTimeout(() => {
-            if (deferredTraceLoadsRef.current.has(id)) return;
-            deferredTraceLoadsRef.current.add(id);
-            void getMissionTraceWithMeta(id, {
-              sinceSeq: 0,
-              limit: HISTORY_PAGE_SIZE,
+        // Fetch hidden thoughts/tools after first paint. The renderer ref is
+        // populated below `eventsToItems`; this avoids blocking transcript
+        // display on the heavier activity trace.
+        setTimeout(() => {
+          if (deferredTraceLoadsRef.current.has(id)) return;
+          deferredTraceLoadsRef.current.add(id);
+          void getMissionTraceWithMeta(id, {
+            sinceSeq: 0,
+            limit: HISTORY_PAGE_SIZE,
+          })
+            .then(({ events, meta }) => {
+              renderDeferredTraceRef.current?.(id, events, meta.maxSequence);
             })
-              .then(({ events, meta }) => {
-                renderDeferredTraceRef.current?.(id, events, meta.maxSequence);
-              })
-              .catch(() => undefined)
-              .finally(() => {
-                deferredTraceLoadsRef.current.delete(id);
-              });
-          }, 0);
-        } catch {
-          // Older backends do not expose `/transcript`; keep the existing full
-          // tail fetch as a compatibility fallback.
-          const { events, meta } = await getMissionEventsWithMeta(id, {
-            types: HISTORY_EVENT_TYPES,
-            latest: true,
-            limit: INITIAL_HISTORY_PAGE_SIZE,
-          });
-          sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
-          metaMaxSeq = meta.maxSequence;
-          metaTotal = meta.totalEvents;
-        }
+            .catch(() => undefined)
+            .finally(() => {
+              deferredTraceLoadsRef.current.delete(id);
+            });
+        }, 0);
       }
 
       // Only seed `missionMaxSeqRef` when the server has confirmed it

@@ -4535,17 +4535,6 @@ pub async fn get_current_mission(
     }
 }
 
-/// Get current agent tree snapshot (for refresh resilience).
-/// Returns the last emitted tree state, or null if no tree is active.
-pub async fn get_tree(
-    State(state): State<Arc<AppState>>,
-    Extension(user): Extension<AuthUser>,
-) -> Json<Option<AgentTreeNode>> {
-    let control = control_for_user(&state, &user).await;
-    let tree = control.current_tree.read().await.clone();
-    Json(tree)
-}
-
 /// Get tree for a specific mission.
 /// For currently running mission, returns the live tree from memory.
 /// For completed missions, returns the saved final_tree from the database.
@@ -5079,40 +5068,6 @@ pub async fn get_mission_trace(
     Ok(response)
 }
 
-// ==================== Diagnostic Endpoints ====================
-
-/// Response for OpenCode diagnostic endpoint.
-#[derive(Debug, Clone, Serialize)]
-pub struct OpenCodeDiagnostics {
-    /// OpenCode base URL
-    pub base_url: String,
-    /// Current session ID (if active)
-    pub session_id: Option<String>,
-    /// Session status from OpenCode
-    pub session_status: Option<crate::opencode::OpenCodeSessionStatus>,
-    /// Error message if status check failed
-    pub error: Option<String>,
-}
-
-/// Get OpenCode diagnostics.
-/// Note: With per-mission CLI execution, there's no central server to diagnose.
-/// This endpoint now returns information about the execution mode.
-pub async fn get_opencode_diagnostics(
-    State(_state): State<Arc<AppState>>,
-    Extension(_user): Extension<AuthUser>,
-) -> Result<Json<OpenCodeDiagnostics>, (StatusCode, String)> {
-    // Per-mission CLI execution doesn't use a central server
-    Ok(Json(OpenCodeDiagnostics {
-        base_url: "per-mission-cli-mode".to_string(),
-        session_id: None,
-        session_status: None,
-        error: Some(
-            "Per-mission CLI mode: No central server. Each mission spawns its own CLI process."
-                .to_string(),
-        ),
-    }))
-}
-
 // ==================== Parallel Mission Endpoints ====================
 
 /// List currently running missions.
@@ -5244,21 +5199,6 @@ pub async fn resume_mission(
         .map_err(recv_failed)?
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))
-}
-
-/// Get parallel execution configuration.
-pub async fn get_parallel_config(
-    State(state): State<Arc<AppState>>,
-    Extension(user): Extension<AuthUser>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let control = control_for_user(&state, &user).await;
-    let running = get_running_missions(&control).await?;
-    let max_parallel = crate::settings::max_parallel_missions_cached_or(control.max_parallel);
-
-    Ok(Json(serde_json::json!({
-        "max_parallel_missions": max_parallel,
-        "running_count": running.len(),
-    })))
 }
 
 /// Delete a mission by ID.

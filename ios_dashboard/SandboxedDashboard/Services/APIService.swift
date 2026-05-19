@@ -381,10 +381,6 @@ final class APIService {
         let _: EmptyResponse = try await post("/api/control/missions/\(id)/parallel", body: ParallelRequest(content: content, model: model))
     }
     
-    func getParallelConfig() async throws -> ParallelConfig {
-        try await get("/api/control/parallel/config")
-    }
-
     // MARK: - Automations
 
     func listMissionAutomations(missionId: String) async throws -> [Automation] {

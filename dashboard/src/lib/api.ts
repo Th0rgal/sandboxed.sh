@@ -473,10 +473,6 @@ export interface AgentTreeNode {
   children: AgentTreeNode[];
 }
 
-export async function getAgentTree(): Promise<AgentTreeNode | null> {
-  return apiGet("/api/control/tree", "Failed to fetch agent tree");
-}
-
 // Get tree for a specific mission (either live from memory or saved from database)
 export async function getMissionTree(
   missionId: string
@@ -1101,40 +1097,6 @@ async function finalizeChunkedUpload(
   return res.json();
 }
 
-// Download file from URL to server filesystem
-export async function downloadFromUrl(
-  url: string,
-  remotePath: string = "./context/",
-  fileName?: string,
-  workspaceId?: string,
-  missionId?: string
-): Promise<UploadResult> {
-  const body: Record<string, unknown> = {
-    url,
-    path: remotePath,
-    file_name: fileName,
-  };
-  if (workspaceId) {
-    body.workspace_id = workspaceId;
-  }
-  if (missionId) {
-    body.mission_id = missionId;
-  }
-
-  const res = await apiFetch("/api/fs/download-url", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Failed to download from URL: ${await res.text()}`);
-  }
-
-  return res.json();
-}
-
-// Re-export from shared module for backwards compatibility
 export { formatBytes } from "./format";
 
 // ==================== Providers ====================

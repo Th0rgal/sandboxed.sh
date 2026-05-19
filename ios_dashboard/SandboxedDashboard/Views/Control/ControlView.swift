@@ -1792,7 +1792,7 @@ struct ControlView: View {
 
         do {
             let mission = try await api.getMission(id: id)
-            let transcriptResult: MissionTranscriptResult? = try? await api.getMissionTranscript(id: id)
+            let transcript = try await api.getMissionTranscript(id: id)
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -1803,78 +1803,58 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            if let transcript = transcriptResult {
-                let events = transcript.messages.map(\.storedEvent)
-                if events.isEmpty {
-                    // Clear stale cache when events are empty to prevent visual flashing
-                    removeMissionFromCache(mission.id)
-                    applyViewingMission(mission)
-                } else {
-                    // Mirror the web client's transcript-meta fix: only
-                    // count event types the iOS app actually loads. The
-                    // backend's `event_counts` includes debug/status
-                    // events outside `historyEventTypes`; summing them
-                    // all inflates the total and keeps the "Load earlier
-                    // messages" affordance visible on missions that have
-                    // already shown every loadable event.
-                    let loadable = Set(historyEventTypes)
-                    let loadableTotal = transcript.eventCounts
-                        .filter { loadable.contains($0.key) }
-                        .values
-                        .reduce(0, +)
-                    hasMoreHistory = loadableTotal > events.count
-                    applyViewingMissionWithEvents(mission, events: events)
-                    if transcript.latestSequence > 0 {
-                        missionMaxSeq[id] = transcript.latestSequence
-                    }
-                    cacheMissionWithEvents(mission, events: events)
-                    if !deferredTraceLoads.contains(id) {
-                        deferredTraceLoads.insert(id)
-                        Task { [api] in
-                            let trace = try? await api.getMissionTraceWithMeta(id: id, limit: Self.initialEventLimit, sinceSeq: 0)
-                            await MainActor.run {
-                                deferredTraceLoads.remove(id)
-                                guard fetchingMissionId == id || viewingMissionId == id else { return }
-                                guard let trace, !trace.events.isEmpty else { return }
-                                // Deduplicate by sequence — transcript and
-                                // trace endpoints can overlap on shared
-                                // sequence numbers (the web client does the
-                                // same via a Map keyed by sequence in its
-                                // `renderDeferredTraceRef`). Without dedup
-                                // any overlapping event would render twice
-                                // after the deferred trace fetch lands.
-                                var bySequence: [Int64: StoredEvent] = [:]
-                                bySequence.reserveCapacity(events.count + trace.events.count)
-                                for e in events { bySequence[e.sequence] = e }
-                                for e in trace.events { bySequence[e.sequence] = e }
-                                let merged = bySequence.values
-                                    .sorted { $0.sequence < $1.sequence }
-                                applyViewingMissionWithEvents(mission, events: merged)
-                                if let maxSeq = trace.maxSequence, maxSeq > 0 {
-                                    missionMaxSeq[id] = maxSeq
-                                }
-                                cacheMissionWithEvents(mission, events: merged)
+            let events = transcript.messages.map(\.storedEvent)
+            if events.isEmpty {
+                // Clear stale cache when events are empty to prevent visual flashing
+                removeMissionFromCache(mission.id)
+                applyViewingMission(mission)
+            } else {
+                // Mirror the web client's transcript-meta fix: only
+                // count event types the iOS app actually loads. The
+                // backend's `event_counts` includes debug/status
+                // events outside `historyEventTypes`; summing them
+                // all inflates the total and keeps the "Load earlier
+                // messages" affordance visible on missions that have
+                // already shown every loadable event.
+                let loadable = Set(historyEventTypes)
+                let loadableTotal = transcript.eventCounts
+                    .filter { loadable.contains($0.key) }
+                    .values
+                    .reduce(0, +)
+                hasMoreHistory = loadableTotal > events.count
+                applyViewingMissionWithEvents(mission, events: events)
+                if transcript.latestSequence > 0 {
+                    missionMaxSeq[id] = transcript.latestSequence
+                }
+                cacheMissionWithEvents(mission, events: events)
+                if !deferredTraceLoads.contains(id) {
+                    deferredTraceLoads.insert(id)
+                    Task { [api] in
+                        let trace = try? await api.getMissionTraceWithMeta(id: id, limit: Self.initialEventLimit, sinceSeq: 0)
+                        await MainActor.run {
+                            deferredTraceLoads.remove(id)
+                            guard fetchingMissionId == id || viewingMissionId == id else { return }
+                            guard let trace, !trace.events.isEmpty else { return }
+                            // Deduplicate by sequence — transcript and
+                            // trace endpoints can overlap on shared
+                            // sequence numbers (the web client does the
+                            // same via a Map keyed by sequence in its
+                            // `renderDeferredTraceRef`). Without dedup
+                            // any overlapping event would render twice
+                            // after the deferred trace fetch lands.
+                            var bySequence: [Int64: StoredEvent] = [:]
+                            bySequence.reserveCapacity(events.count + trace.events.count)
+                            for e in events { bySequence[e.sequence] = e }
+                            for e in trace.events { bySequence[e.sequence] = e }
+                            let merged = bySequence.values
+                                .sorted { $0.sequence < $1.sequence }
+                            applyViewingMissionWithEvents(mission, events: merged)
+                            if let maxSeq = trace.maxSequence, maxSeq > 0 {
+                                missionMaxSeq[id] = maxSeq
                             }
+                            cacheMissionWithEvents(mission, events: merged)
                         }
                     }
-                }
-            } else {
-                let fallback = try? await api.getMissionEventsWithMeta(
-                    id: id,
-                    types: historyEventTypes,
-                    limit: Self.initialEventLimit,
-                    latest: true
-                )
-                if let result = fallback, !result.events.isEmpty {
-                    hasMoreHistory = result.events.count >= Self.initialEventLimit
-                    applyViewingMissionWithEvents(mission, events: result.events)
-                    if let maxSeq = result.maxSequence, maxSeq > 0 {
-                        missionMaxSeq[id] = maxSeq
-                    }
-                    cacheMissionWithEvents(mission, events: result.events)
-                } else if !hasCache {
-                    removeMissionFromCache(mission.id)
-                    applyViewingMission(mission)
                 }
             }
 

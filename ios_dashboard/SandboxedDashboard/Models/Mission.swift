@@ -332,16 +332,6 @@ struct MissionSearchResult: Codable {
     }
 }
 
-struct ParallelConfig: Codable {
-    let maxParallelMissions: Int
-    let runningCount: Int
-    
-    enum CodingKeys: String, CodingKey {
-        case maxParallelMissions = "max_parallel_missions"
-        case runningCount = "running_count"
-    }
-}
-
 // MARK: - Events
 
 struct StoredEvent: Codable, Identifiable, Sendable {
