@@ -15,6 +15,7 @@ import {
 import { MissionAutomationsDialog } from "@/components/mission-automations-dialog";
 import { PerfOverlay } from "@/components/perf-overlay";
 import { perfBus } from "@/lib/perf-bus";
+import { isStreamContinuation } from "@/lib/stream-continuation";
 import { MissionDebugStats } from "./MissionDebugStats";
 import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
@@ -4231,6 +4232,15 @@ export default function ControlClient() {
   const streamCleanupRef = useRef<null | (() => void)>(null);
   const enhancedInputRef = useRef<EnhancedInputHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  /** Reconnect the SSE stream with the freshest mission filter. Set by the
+   * stream effect; called from the per-mission switcher effect. Ref-based so
+   * the SSE useEffect can keep its empty deps array. */
+  const reconnectStreamRef = useRef<(() => void) | null>(null);
+  /** Wall-clock timestamp (ms) of the last SSE event we received. The 15s
+   * "running mission" history reload (P1-#5) checks this and skips the
+   * refetch when the SSE stream is fresh — saves a 5000-row /events trip
+   * (and the longtask that comes with it) on every running mission. */
+  const lastSseEventAtRef = useRef<number>(0);
   const viewingMissionIdRef = useRef<string | null>(null);
   const runStateMissionIdRef = useRef<string | null>(null);
   const runningMissionsRef = useRef<RunningMissionInfo[]>([]);
@@ -4242,6 +4252,39 @@ export default function ControlClient() {
   // Keep refs in sync with state
   useEffect(() => {
     viewingMissionIdRef.current = viewingMissionId;
+    // Reconnect the SSE stream so the server-side ?mission=<uuid> filter
+    // (P1-#4) re-binds to the freshly-viewed mission. Skipped on the very
+    // first render — the stream effect makes the initial connection itself.
+    if (reconnectStreamRef.current) {
+      reconnectStreamRef.current();
+    }
+    // P1-#9 navigation leak guard. Every entry path eventually changes
+    // `viewingMissionId` — handleViewMission, the URL-driven effect, the
+    // mission switcher palette. Centralizing the cleanup here means a
+    // future path can't forget to clear refs. Bubble-buffer refs hold the
+    // *previous* mission's tail of streaming deltas; if we don't drop them
+    // here they get appended to the new mission's first bubble on the
+    // next flush, and the abandoned setTimeout keeps the previous closure
+    // alive (the main contributor to the ~150 MB-per-visit heap ratchet
+    // we measured).
+    if (thinkingFlushTimeoutRef.current) {
+      clearTimeout(thinkingFlushTimeoutRef.current);
+      thinkingFlushTimeoutRef.current = null;
+    }
+    if (thinkingFlushRafRef.current !== null) {
+      cancelAnimationFrame(thinkingFlushRafRef.current);
+      thinkingFlushRafRef.current = null;
+    }
+    if (streamFlushTimeoutRef.current) {
+      clearTimeout(streamFlushTimeoutRef.current);
+      streamFlushTimeoutRef.current = null;
+    }
+    if (streamFlushRafRef.current !== null) {
+      cancelAnimationFrame(streamFlushRafRef.current);
+      streamFlushRafRef.current = null;
+    }
+    pendingThinkingRef.current = null;
+    pendingStreamRef.current = null;
   }, [viewingMissionId]);
 
   useEffect(() => {
@@ -4935,11 +4978,10 @@ export default function ControlClient() {
           if (currentThinkingIdx !== null) {
             const existing = items[currentThinkingIdx] as Extract<ChatItem, { kind: "thinking" }>;
             const existingContent = existing.content || "";
-            const isContinuation =
-              !content ||
-              !existingContent ||
-              content.startsWith(existingContent) ||
-              existingContent.startsWith(content);
+            // P1-#8: tolerant continuation check — strips trailing
+            // whitespace/punct and allows a short tail wobble so the
+            // "NoNo newNo new CI…" double-emission pattern consolidates.
+            const isContinuation = isStreamContinuation(content, existingContent);
 
             if (!isContinuation) {
               // Treat as a new thought session: finalize previous and start a new item.
@@ -6637,6 +6679,7 @@ export default function ControlClient() {
     startTime: number;
   } | null>(null);
   const thinkingFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const thinkingFlushRafRef = useRef<number | null>(null);
   const thinkingIdCounterRef = useRef(0);
 
   const pendingStreamRef = useRef<{
@@ -6644,6 +6687,7 @@ export default function ControlClient() {
     startTime: number;
   } | null>(null);
   const streamFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamFlushRafRef = useRef<number | null>(null);
 
   // Auto-reconnecting stream with exponential backoff
   useEffect(() => {
@@ -6685,6 +6729,7 @@ export default function ControlClient() {
           : null;
       const currentMissionId = currentMissionRef.current?.id;
       perfBus.recordSseEvent("received");
+      lastSseEventAtRef.current = Date.now();
       streamLog("debug", "received", {
         type: event.type,
         eventMissionId,
@@ -6924,10 +6969,18 @@ export default function ControlClient() {
           clearTimeout(thinkingFlushTimeoutRef.current);
           thinkingFlushTimeoutRef.current = null;
         }
+        if (thinkingFlushRafRef.current !== null) {
+          cancelAnimationFrame(thinkingFlushRafRef.current);
+          thinkingFlushRafRef.current = null;
+        }
         pendingThinkingRef.current = null;
         if (streamFlushTimeoutRef.current) {
           clearTimeout(streamFlushTimeoutRef.current);
           streamFlushTimeoutRef.current = null;
+        }
+        if (streamFlushRafRef.current !== null) {
+          cancelAnimationFrame(streamFlushRafRef.current);
+          streamFlushRafRef.current = null;
         }
         pendingStreamRef.current = null;
 
@@ -7133,11 +7186,8 @@ export default function ControlClient() {
         // Get or create stable ID for current thinking session
         const existingPending = pendingThinkingRef.current;
         const existingContent = existingPending?.content ?? "";
-        const isContinuation =
-          !content ||
-          !existingContent ||
-          content.startsWith(existingContent) ||
-          existingContent.startsWith(content);
+        // P1-#8: tolerant continuation check (see stream-continuation.ts).
+        const isContinuation = isStreamContinuation(content, existingContent);
         const shouldStartNew = Boolean(existingPending && !isContinuation && existingContent.trim());
 
         if (shouldStartNew) {
@@ -7164,26 +7214,35 @@ export default function ControlClient() {
           startTime,
         };
 
-        // Clear any pending flush timeout
+        // Clear any pending flush handles
         if (thinkingFlushTimeoutRef.current) {
           clearTimeout(thinkingFlushTimeoutRef.current);
           thinkingFlushTimeoutRef.current = null;
+        }
+        if (thinkingFlushRafRef.current !== null) {
+          cancelAnimationFrame(thinkingFlushRafRef.current);
+          thinkingFlushRafRef.current = null;
         }
 
         // Flush immediately on:
         //  - `done: true` (finalization)
         //  - first delta of a brand-new thought (no pending content yet)
         //  - the existing thought session was just (re)started
-        // Otherwise debounce at 30 ms — codex's reasoning summary deltas
-        // arrive in tight ~10–20 ms bursts and the previous 100 ms
-        // debounce kept resetting until `done`, so the user only ever
-        // saw the final snapshot ("Thought for <1s") with no streaming.
+        // Otherwise coalesce on the next animation frame (P1-#6). The
+        // previous 30 ms setTimeout caused codex's tight 10-20 ms reasoning
+        // bursts to trigger a React commit per delta even though only one
+        // could ever be painted per frame. rAF guarantees ≤1 commit per
+        // frame regardless of arrival rate; pending content keeps
+        // accumulating in `pendingThinkingRef.current` so no delta is lost.
         const shouldFlushNow =
           done || shouldStartNew || !existingPending || !existingContent;
         if (shouldFlushNow) {
           flushThinking();
         } else {
-          thinkingFlushTimeoutRef.current = setTimeout(flushThinking, 30);
+          thinkingFlushRafRef.current = requestAnimationFrame(() => {
+            thinkingFlushRafRef.current = null;
+            flushThinking();
+          });
         }
         return;
       }
@@ -7212,11 +7271,8 @@ export default function ControlClient() {
                 { kind: "stream" }
               >;
               const existingContent = existing.content ?? "";
-              const isContinuation =
-                !pending.content ||
-                !existingContent ||
-                pending.content.startsWith(existingContent) ||
-                existingContent.startsWith(pending.content);
+              // P1-#8: tolerant continuation check (see stream-continuation.ts).
+              const isContinuation = isStreamContinuation(pending.content, existingContent);
               updated[existingIdx] = {
                 ...existing,
                 content: pending.content || existing.content,
@@ -7247,11 +7303,8 @@ export default function ControlClient() {
 
         const existingPending = pendingStreamRef.current;
         const existingContent = existingPending?.content ?? "";
-        const isContinuation =
-          !content ||
-          !existingContent ||
-          content.startsWith(existingContent) ||
-          existingContent.startsWith(content);
+        // P1-#8: tolerant continuation check (see stream-continuation.ts).
+        const isContinuation = isStreamContinuation(content, existingContent);
 
         pendingStreamRef.current = {
           content: content || existingPending?.content || "",
@@ -7262,7 +7315,18 @@ export default function ControlClient() {
           clearTimeout(streamFlushTimeoutRef.current);
           streamFlushTimeoutRef.current = null;
         }
-        streamFlushTimeoutRef.current = setTimeout(flushStream, 100);
+        if (streamFlushRafRef.current !== null) {
+          cancelAnimationFrame(streamFlushRafRef.current);
+          streamFlushRafRef.current = null;
+        }
+        // P1-#6: schedule the flush on the next animation frame. Multiple
+        // deltas arriving within the same frame collapse to a single React
+        // commit because pendingStreamRef accumulates content while the
+        // pending rAF callback hasn't fired yet.
+        streamFlushRafRef.current = requestAnimationFrame(() => {
+          streamFlushRafRef.current = null;
+          flushStream();
+        });
         return;
       }
 
@@ -7850,12 +7914,20 @@ export default function ControlClient() {
 
     const connect = () => {
       cleanup?.();
-      streamLog("info", "connecting stream");
-      cleanup = streamControl(handleEvent, handleStreamDiagnostics);
+      const missionFilter = viewingMissionIdRef.current ?? undefined;
+      streamLog("info", "connecting stream", { missionFilter });
+      cleanup = streamControl(handleEvent, handleStreamDiagnostics, {
+        missionId: missionFilter,
+      });
     };
 
     connect();
     streamCleanupRef.current = cleanup;
+    // Expose the reconnect hook so the per-mission switcher effect (below)
+    // can tear down the current SSE and open a new one filtered for the
+    // freshly-viewed mission. Reading from a ref keeps this effect's deps
+    // empty so we don't recycle the SSE on every unrelated render.
+    reconnectStreamRef.current = connect;
 
     return () => {
       mounted = false;
@@ -8388,13 +8460,23 @@ export default function ControlClient() {
     return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
   }, [viewingMissionId, reloadMissionHistory]);
 
-  // Periodically sync history for running missions to catch missed SSE events
+  // Periodically sync history for running missions to catch missed SSE
+  // events. P1-#5: skip the refetch when the SSE stream is fresh (<30s
+  // since the last received event). The old unconditional refetch was the
+  // main /events traffic driver — on busy long-running missions it fired
+  // a 5000-row trip every 15s for every open tab, costing a 1-5s longtask
+  // in the dashboard reducer each time.
   useEffect(() => {
     if (!viewingMissionId || !viewingMissionIsRunning) return;
+    const SSE_FRESH_WINDOW_MS = 30_000;
     const interval = setInterval(() => {
-      if (document.visibilityState === "visible") {
-        reloadMissionHistory(viewingMissionId);
+      if (document.visibilityState !== "visible") return;
+      const since = Date.now() - lastSseEventAtRef.current;
+      if (lastSseEventAtRef.current > 0 && since < SSE_FRESH_WINDOW_MS) {
+        // SSE is healthy; trust the live stream rather than refetching.
+        return;
       }
+      reloadMissionHistory(viewingMissionId);
     }, 15_000);
     return () => clearInterval(interval);
   }, [viewingMissionId, viewingMissionIsRunning, reloadMissionHistory]);

@@ -5142,17 +5142,31 @@ pub async fn cleanup_empty_missions(
 }
 
 /// Stream control session events via SSE.
+#[derive(Debug, Deserialize)]
+pub struct StreamQuery {
+    /// Optional mission filter. When set, the server only emits events whose
+    /// `mission_id` matches (plus the connection-scoped `status` /
+    /// `stream_lagged` events the dashboard relies on). Cuts cross-mission
+    /// noise to zero for a focused tab. Omit the param to receive every
+    /// event the user can see (used by the mission list / debug overlay).
+    #[serde(default)]
+    pub mission: Option<Uuid>,
+}
+
 pub async fn stream(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    axum::extract::Query(query): axum::extract::Query<StreamQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let mut rx = control.events_tx.subscribe();
     let stream_id = Uuid::new_v4();
+    let mission_filter = query.mission;
     tracing::info!(
         stream_id = %stream_id,
         user_id = %user.id,
         username = %user.username,
+        mission_filter = ?mission_filter,
         "Control SSE stream opened"
     );
 
@@ -5218,6 +5232,17 @@ pub async fn stream(
                     match result {
                         Ok(ev) => {
                             let mission_id = ev.mission_id();
+                            // Server-side mission filter (P1-#4). When the client
+                            // opened the stream with `?mission=<uuid>`, drop events
+                            // whose mission_id doesn't match. `Status` always passes
+                            // because it's the connection-keepalive and carries the
+                            // global running/queue state, not a per-mission update.
+                            if let Some(filter) = mission_filter {
+                                let is_status = matches!(&ev, AgentEvent::Status { .. });
+                                if !is_status && mission_id != Some(filter) {
+                                    continue;
+                                }
+                            }
                             match &ev {
                                 AgentEvent::Thinking { .. } => {
                                     tracing::trace!(

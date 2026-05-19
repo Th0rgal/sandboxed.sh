@@ -498,15 +498,26 @@ export type StreamDiagnosticUpdate = {
   timestamp: number;
 };
 
+export type StreamControlOptions = {
+  /** Server-side filter — receive only events for this mission (and
+   * connection-scoped status / stream_lagged). Omit to receive every event
+   * the user can see. */
+  missionId?: string;
+};
+
 export function streamControl(
   onEvent: (event: { type: string; data: unknown }) => void,
-  onDiagnostics?: (update: StreamDiagnosticUpdate) => void
+  onDiagnostics?: (update: StreamDiagnosticUpdate) => void,
+  options?: StreamControlOptions
 ): () => void {
   const controller = new AbortController();
   const decoder = new TextDecoder();
   let buffer = "";
   let bytesRead = 0;
-  const streamUrl = apiUrl("/api/control/stream");
+  const baseUrl = apiUrl("/api/control/stream");
+  const streamUrl = options?.missionId
+    ? `${baseUrl}?mission=${encodeURIComponent(options.missionId)}`
+    : baseUrl;
 
   onDiagnostics?.({
     phase: "connecting",

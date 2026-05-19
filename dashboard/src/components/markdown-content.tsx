@@ -874,6 +874,13 @@ function InlineFileCard({
   );
 }
 
+// P1-#10: messages larger than this render as plain <pre> with an opt-in
+// "Render markdown" button. The freeze trace on the verity missions
+// showed single assistant bubbles 200KB+ of repeated tokens that took
+// 5s+ to highlight + lay out. Past ~50KB the cost is no longer paying
+// for anything the user actually reads.
+const MARKDOWN_SIZE_CAP_BYTES = 50_000;
+
 // Memoized to prevent re-renders when parent re-renders with same props
 export const MarkdownContent = memo(function MarkdownContent({
   content,
@@ -882,8 +889,15 @@ export const MarkdownContent = memo(function MarkdownContent({
   workspaceId,
   missionId,
 }: MarkdownContentProps) {
+  const [forceMarkdown, setForceMarkdown] = useState(false);
+  const oversize = content.length > MARKDOWN_SIZE_CAP_BYTES;
+  const renderPlain = oversize && !forceMarkdown;
+
   // Pre-process content: transform <image> and <file> tags into markdown syntax
-  const processedContent = useMemo(() => transformRichTags(content), [content]);
+  const processedContent = useMemo(
+    () => (renderPlain ? "" : transformRichTags(content)),
+    [content, renderPlain]
+  );
 
   // Memoize components object to prevent react-markdown from re-creating DOM on every render
   const components: Components = useMemo(() => ({
@@ -1011,6 +1025,30 @@ export const MarkdownContent = memo(function MarkdownContent({
     }
     return defaultUrlTransform(url);
   }, []);
+
+  if (renderPlain) {
+    const sizeKb = (content.length / 1024).toFixed(0);
+    return (
+      <div className={cn("prose-glass text-sm [&_p]:my-2", className)}>
+        <div className="mb-2 flex items-center justify-between rounded border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          <span>
+            Large message ({sizeKb} KB). Markdown rendering skipped for
+            performance — code blocks, links, and images are not active.
+          </span>
+          <button
+            type="button"
+            onClick={() => setForceMarkdown(true)}
+            className="ml-3 shrink-0 rounded bg-amber-400/20 px-2 py-0.5 text-xs font-medium text-amber-100 hover:bg-amber-400/30"
+          >
+            Render markdown
+          </button>
+        </div>
+        <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words rounded bg-white/5 p-3 text-xs leading-relaxed">
+          {content}
+        </pre>
+      </div>
+    );
+  }
 
   return (
     <div className={cn("prose-glass text-sm [&_p]:my-2", className)}>
