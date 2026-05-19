@@ -1121,10 +1121,7 @@ pub trait MissionStore: Send + Sync {
 
     /// Aggregate AI usage per UTC day. Days with no usage are omitted; the
     /// caller is responsible for filling gaps if a contiguous series is needed.
-    async fn get_usage_by_day(
-        &self,
-        _since: Option<&str>,
-    ) -> Result<Vec<DailyUsageStats>, String> {
+    async fn get_usage_by_day(&self, _since: Option<&str>) -> Result<Vec<DailyUsageStats>, String> {
         Ok(Vec::new())
     }
 

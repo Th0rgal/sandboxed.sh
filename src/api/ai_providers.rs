@@ -6522,11 +6522,7 @@ async fn live_fetch_and_cache(
     state: Arc<super::routes::AppState>,
     id: String,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let result = get_provider_usage(
-        State(Arc::clone(&state)),
-        AxumPath(id.clone()),
-    )
-    .await?;
+    let result = get_provider_usage(State(Arc::clone(&state)), AxumPath(id.clone())).await?;
     let value = result.0;
     state.provider_usage_cache.insert(id, value.clone()).await;
     Ok(value)
@@ -6546,14 +6542,8 @@ async fn get_provider_usage_cached(
             if is_fresh || q.cached_only {
                 let mut value = cached.value;
                 if let Some(obj) = value.as_object_mut() {
-                    obj.insert(
-                        "cached".to_string(),
-                        serde_json::json!(true),
-                    );
-                    obj.insert(
-                        "fetched_at".to_string(),
-                        serde_json::json!(fetched_at_iso),
-                    );
+                    obj.insert("cached".to_string(), serde_json::json!(true));
+                    obj.insert("fetched_at".to_string(), serde_json::json!(fetched_at_iso));
                     if is_stale {
                         obj.insert("stale".to_string(), serde_json::json!(true));
                     }
@@ -6591,10 +6581,7 @@ async fn list_all_provider_usage(
     // Decide which provider ids to refresh in the background — every stored
     // provider whose entry is missing or older than REFRESH_AFTER.
     let candidate_ids: Vec<String> = providers.iter().map(|p| p.id.to_string()).collect();
-    let stale = state
-        .provider_usage_cache
-        .stale_keys(&candidate_ids)
-        .await;
+    let stale = state.provider_usage_cache.stale_keys(&candidate_ids).await;
     for id in stale {
         let bg_state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -6611,10 +6598,7 @@ async fn list_all_provider_usage(
         let mut value = cached.value;
         if let Some(obj) = value.as_object_mut() {
             obj.insert("cached".to_string(), serde_json::json!(true));
-            obj.insert(
-                "fetched_at".to_string(),
-                serde_json::json!(fetched_at_iso),
-            );
+            obj.insert("fetched_at".to_string(), serde_json::json!(fetched_at_iso));
             if is_stale {
                 obj.insert("stale".to_string(), serde_json::json!(true));
             }

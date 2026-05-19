@@ -1,9 +1,9 @@
 //! SQLite-based mission store with full event logging.
 
 use super::{
-    now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, ExecutionStatus,
-    FreshSession, Mission, MissionHistoryEntry, MissionMode, MissionStatus, MissionStore,
-    DailyUsageStats, ModelUsageStats, RetryConfig, StopPolicy, StoredEvent, TelegramActionExecution,
+    now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, DailyUsageStats,
+    ExecutionStatus, FreshSession, Mission, MissionHistoryEntry, MissionMode, MissionStatus,
+    MissionStore, ModelUsageStats, RetryConfig, StopPolicy, StoredEvent, TelegramActionExecution,
     TelegramActionExecutionKind, TelegramActionExecutionStatus, TelegramChannel,
     TelegramChatMission, TelegramConversation, TelegramConversationMessage,
     TelegramConversationMessageDirection, TelegramScheduledMessage, TelegramScheduledMessageStatus,
@@ -3963,10 +3963,7 @@ impl MissionStore for SqliteMissionStore {
         Ok(out)
     }
 
-    async fn get_usage_by_day(
-        &self,
-        since: Option<&str>,
-    ) -> Result<Vec<DailyUsageStats>, String> {
+    async fn get_usage_by_day(&self, since: Option<&str>) -> Result<Vec<DailyUsageStats>, String> {
         let conn = self.conn.lock().await;
 
         // Group by the UTC date prefix of the ISO-8601 timestamp.
