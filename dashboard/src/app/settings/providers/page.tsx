@@ -30,7 +30,7 @@ import {
 import { cn } from '@/lib/utils';
 import { AddProviderModal } from '@/components/ui/add-provider-modal';
 import { AsyncButton } from '@/components/ui/async-button';
-import { ProviderUsageHud } from '@/components/ui/provider-usage-hud';
+import { UsageOverview } from '@/components/ui/usage-overview';
 import type { UsageWindow } from '@/lib/api';
 
 const providerConfig: Record<string, { color: string; icon: string }> = {
@@ -315,7 +315,7 @@ export default function ProvidersPage() {
   const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
   const [usageData, setUsageData] = useState<Record<string, ProviderUsage>>({});
   const [usageLoading, setUsageLoading] = useState<Record<string, boolean>>({});
-  const [hudWindow, setHudWindow] = useState<UsageWindow>('7d');
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>('7d');
   const [editForm, setEditForm] = useState<{
     name?: string;
     label?: string;
@@ -478,7 +478,7 @@ export default function ProvidersPage() {
         </div>
 
         <div className="mb-4">
-          <ProviderUsageHud window={hudWindow} onWindowChange={setHudWindow} />
+          <UsageOverview window={usageWindow} onWindowChange={setUsageWindow} />
         </div>
 
         <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
