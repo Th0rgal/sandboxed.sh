@@ -12725,6 +12725,13 @@ pub async fn run_opencode_turn(
 }
 
 fn grok_event_text(value: &serde_json::Value) -> Option<String> {
+    if value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
+        let lower = t.to_ascii_lowercase();
+        lower == "reasoning" || lower == "thinking" || lower == "reasoning_delta"
+    }) {
+        return None;
+    }
+
     if let Some(text) = value
         .get("delta")
         .and_then(|delta| delta.get("text").or_else(|| delta.get("content")))
@@ -13156,6 +13163,12 @@ pub async fn run_grok_turn(
     }
     let _ = last_streamed_len; // silence "unused after final assignment"
 
+    let reasoning_for_fallback = if reasoning_buffer.trim().is_empty() {
+        None
+    } else {
+        Some(reasoning_buffer.clone())
+    };
+
     // Flush any remaining reasoning that never got followed by a text
     // delta (e.g., reasoning-only turns or the trailing coalescer window).
     // Emit done: true so the dashboard finalizes the thinking block in the
@@ -13171,7 +13184,9 @@ pub async fn run_grok_turn(
 
     if final_result.trim().is_empty() {
         let stderr_content = stderr_capture.lock().await;
-        if !stderr_content.trim().is_empty() {
+        if let Some(reasoning) = reasoning_for_fallback {
+            final_result = reasoning;
+        } else if !stderr_content.trim().is_empty() {
             final_result = format!(
                 "Grok Build error: {}",
                 stderr_content
@@ -14848,8 +14863,8 @@ mod tests {
         STALL_WARN_SECS,
     };
     use super::{
-        extract_telegram_instructions, inject_telegram_identity_into_claude_md,
-        localhost_api_base_url, public_api_base_url,
+        extract_telegram_instructions, grok_event_reasoning, grok_event_text,
+        inject_telegram_identity_into_claude_md, localhost_api_base_url, public_api_base_url,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
@@ -14858,6 +14873,45 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn grok_typed_reasoning_event_is_not_answer_text() {
+        let event = json!({
+            "type": "thinking",
+            "text": "private reasoning"
+        });
+
+        assert_eq!(
+            grok_event_reasoning(&event).as_deref(),
+            Some("private reasoning")
+        );
+        assert_eq!(grok_event_text(&event), None);
+    }
+
+    #[test]
+    fn grok_typed_reasoning_content_event_is_not_answer_text() {
+        let event = json!({
+            "type": "reasoning",
+            "content": "private reasoning"
+        });
+
+        assert_eq!(
+            grok_event_reasoning(&event).as_deref(),
+            Some("private reasoning")
+        );
+        assert_eq!(grok_event_text(&event), None);
+    }
+
+    #[test]
+    fn grok_text_event_still_extracts_answer_text() {
+        let event = json!({
+            "type": "text",
+            "data": "visible answer"
+        });
+
+        assert_eq!(grok_event_text(&event).as_deref(), Some("visible answer"));
+        assert_eq!(grok_event_reasoning(&event), None);
+    }
 
     #[test]
     fn codex_turn_requires_tool_activity_for_file_shell_prompt() {
