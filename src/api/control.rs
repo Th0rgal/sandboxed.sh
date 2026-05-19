@@ -4563,7 +4563,21 @@ pub async fn get_progress(
     Json(progress)
 }
 
-/// Query params for events endpoint.
+/// Query params for the unified mission events endpoint (P3-#18).
+///
+/// `GET /api/control/missions/:id/events` is the canonical cursor
+/// endpoint for fetching persisted events. With `since_seq=N` it
+/// returns events strictly after sequence N (forward delta — what
+/// SSE reconnect uses). With `before_seq=N` it pages backwards. With
+/// `types=tool_call,tool_result` it filters to a subset (replaces
+/// `/trace`). With `types=user_message,assistant_message,thinking,...`
+/// + a high `limit` it returns the full transcript shape.
+///
+/// `/trace` and `/transcript` remain as thin alias handlers for
+/// backward compatibility with iOS clients on older binaries — both
+/// forward to the same `mission_store.list_events` call. Document
+/// the migration: new clients should use `/events?since_seq=N`
+/// exclusively.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GetEventsQuery {
     /// Comma-separated event types to filter (e.g., "tool_call,tool_result")

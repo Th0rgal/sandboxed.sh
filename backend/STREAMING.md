@@ -84,13 +84,28 @@ The iOS app must mirror the same rule (the
 The persisted event log is a superset of the SSE stream — every
 broadcast event lands in the `mission_events` table (with a few
 exceptions noted below). Clients reading historical missions consume
-the log through three endpoints:
+the log through the unified cursor endpoint:
 
-- `GET /api/control/missions/:id/events?types=…&limit=N&before_seq=N`
-  — page through structured events.
+- `GET /api/control/missions/:id/events` (P3-#18) is the canonical
+  cursor endpoint. Query params:
+  - `since_seq=N` — return events strictly after sequence N (forward
+    delta). Use this for SSE reconnect — keep the highest sequence
+    seen and pass it on resume.
+  - `before_seq=N` — page backwards (oldest-first within the page).
+    For "load older messages" UI.
+  - `types=user_message,assistant_message,…` — filter to a subset.
+    With the default set (the constant `HISTORY_EVENT_TYPES` on the
+    client) this returns the same shape as the legacy `/transcript`.
+  - `limit=N` — page size; default 5000.
+
+Legacy endpoints kept as thin aliases for iOS clients on older
+binaries:
+
 - `GET /api/control/missions/:id/trace?since_seq=N&limit=N` — same
-  shape, ordered by `(sequence, timestamp, id)`.
-- `GET /api/control/missions/:id/transcript` — flattened message list.
+  shape as `/events` but defaults to the activity-trace type set.
+- `GET /api/control/missions/:id/transcript` — flattened message
+  list. New clients should use `/events?types=user_message,…` with
+  a high `limit` instead.
 
 The historical reducer (`eventsToItems` in dashboard, the Swift
 `HistoricalTranscriptBuilder`) walks events in `sequence` order and
