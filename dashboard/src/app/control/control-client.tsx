@@ -244,6 +244,7 @@ import { DesktopStream } from "@/components/desktop-stream";
 import { NewMissionDialog } from "@/components/new-mission-dialog";
 import { MissionSwitcher, normalizeMetadataText } from "@/components/mission-switcher";
 import { WorkerPanel } from "@/components/worker-panel";
+import { WorkersStrip } from "@/components/workers-strip";
 import { SubagentsPanel, type SubagentEntry } from "@/components/subagents-panel";
 import { RelativeTime } from "@/components/ui/relative-time";
 
@@ -4041,6 +4042,25 @@ export default function ControlClient() {
       ),
     [items, deferredShowThinkingPanel]
   );
+
+  // P2-#14: memoize the tail slice + "agent is working" predicate so
+  // they don't recompute on every parent render (e.g. each NowTick).
+  const visibleGroupedItems = useMemo(
+    () => groupedItems.slice(-visibleItemsLimit),
+    [groupedItems, visibleItemsLimit]
+  );
+
+  const showAgentWorkingIndicator = useMemo(() => {
+    if (items.length === 0) return false;
+    if (items[items.length - 1]?.kind === "assistant") return false;
+    return !items.some(
+      (it) =>
+        ((it.kind === "thinking" || it.kind === "stream") &&
+          !it.done &&
+          !showThinkingPanel) ||
+        it.kind === "phase"
+    );
+  }, [items, showThinkingPanel]);
 
   // Auto-show thinking panel when thinking starts (only on transition to active)
   const prevHasActiveThinking = useRef(false);
@@ -9243,6 +9263,15 @@ export default function ControlClient() {
           "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative transition-all duration-300",
           showDesktopStream && "flex-[2]"
         )}>
+        {/* Active workers strip — sticky above the scrolling messages so the
+            boss can see and hop into delegated workers without opening a side
+            panel. Self-hides when there are no child missions. */}
+        <WorkersStrip
+          childMissions={childMissions}
+          runningMissions={runningMissions}
+          viewingMissionId={viewingMissionId}
+          onSelectWorker={handleViewMission}
+        />
         {/* Messages */}
         <div ref={containerRef} className="flex-1 overflow-y-auto p-6">
           {/* Backwards pagination — only when there's actually more older
@@ -9371,7 +9400,7 @@ export default function ControlClient() {
                   </span>
                 </button>
               )}
-              {groupedItems.slice(-visibleItemsLimit).map((item) => {
+              {visibleGroupedItems.map((item) => {
                 const key =
                   item.kind === "tool_group" || item.kind === "thinking_group"
                     ? item.groupId
@@ -9415,20 +9444,12 @@ export default function ControlClient() {
                 );
               })}
 
-              {/* Show streaming indicator when running but no active thinking/phase visible inline */}
+              {/* Show streaming indicator when running but no active thinking/phase visible inline.
+                  P2-#14: the items.some + last-index lookup live in `showAgentWorkingIndicator`
+                  memo so each NowTick render doesn't re-walk the whole items array. */}
               {viewingMissionIsRunning &&
                 activeMission?.status === "active" &&
-                items.length > 0 &&
-                !items.some(
-                  (it) =>
-                    // Only block for undone thinking if it's visible inline (panel closed)
-                    ((it.kind === "thinking" || it.kind === "stream") &&
-                      !it.done &&
-                      !showThinkingPanel) ||
-                    it.kind === "phase"
-                ) &&
-                // Hide if the last item is an assistant message (response complete, waiting for state change)
-                items[items.length - 1]?.kind !== "assistant" && (
+                showAgentWorkingIndicator && (
                   <div className="flex justify-start gap-3 animate-fade-in">
                     <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
                       <Bot className="h-4 w-4 text-indigo-400 animate-pulse" />
