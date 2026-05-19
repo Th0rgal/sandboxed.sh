@@ -12781,6 +12781,52 @@ fn grok_event_text(value: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Extract Grok / xAI reasoning text from a streamed JSONL event.
+///
+/// The Grok Build CLI mostly mirrors the xAI Chat Completions stream, which
+/// puts chain-of-thought in `delta.reasoning_content` (some builds) or
+/// `delta.reasoning` (others), and sometimes wraps it as a typed event
+/// (`type: "reasoning" | "thinking"` with `data` or `text`). Field name
+/// discovery is conservative — return None if no known key is present so a
+/// CLI version bump doesn't accidentally show user-visible noise as
+/// reasoning.
+fn grok_event_reasoning(value: &serde_json::Value) -> Option<String> {
+    if let Some(delta) = value.get("delta") {
+        for key in ["reasoning_content", "reasoning", "thinking"] {
+            if let Some(text) = delta.get(key).and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+
+    if value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
+        let lower = t.to_ascii_lowercase();
+        lower == "reasoning" || lower == "thinking" || lower == "reasoning_delta"
+    }) {
+        for key in ["data", "text", "content", "reasoning"] {
+            if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(text) = value
+        .get("message")
+        .and_then(|m| m.get("reasoning_content").or_else(|| m.get("reasoning")))
+        .and_then(|v| v.as_str())
+    {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+
+    None
+}
+
 fn grok_event_session_id(value: &serde_json::Value) -> Option<String> {
     value
         .get("session_id")
@@ -12961,6 +13007,13 @@ pub async fn run_grok_turn(
     let mut model_used = model.map(str::to_string);
     let mut last_streamed_len = 0usize;
     let mut text_delta_coalescer = TextDeltaCoalescer::new();
+    // Accumulate Grok's reasoning deltas into a cumulative buffer and
+    // throttle Thinking emissions the same way text deltas are throttled.
+    // Grok's CLI delivers reasoning as incremental tokens, mirroring the
+    // text path.
+    let mut reasoning_buffer = String::new();
+    let mut last_reasoning_len = 0usize;
+    let mut reasoning_delta_coalescer = TextDeltaCoalescer::new();
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
 
@@ -13010,8 +13063,38 @@ pub async fn run_grok_turn(
                             }
                             continue;
                         }
+                        if let Some(reasoning) = grok_event_reasoning(&value) {
+                            if !reasoning.is_empty() {
+                                reasoning_buffer.push_str(&reasoning);
+                                // Mirror the TextDelta coalescing strategy:
+                                // emit cumulative snapshots throttled to ~50ms.
+                                if reasoning_buffer.len() > last_reasoning_len
+                                    && reasoning_delta_coalescer.should_emit()
+                                {
+                                    last_reasoning_len = reasoning_buffer.len();
+                                    let _ = events_tx.send(AgentEvent::Thinking {
+                                        content: reasoning_buffer.clone(),
+                                        done: false,
+                                        mission_id: Some(mission_id),
+                                    });
+                                }
+                            }
+                        }
                         if let Some(text) = grok_event_text(&value) {
                             if !text.is_empty() {
+                                // The first non-reasoning content marks the
+                                // boundary between thinking and answer; flush
+                                // a final Thinking { done: true } so the
+                                // dashboard collapses the reasoning panel
+                                // before streaming text deltas.
+                                if !reasoning_buffer.is_empty() {
+                                    let _ = events_tx.send(AgentEvent::Thinking {
+                                        content: std::mem::take(&mut reasoning_buffer),
+                                        done: true,
+                                        mission_id: Some(mission_id),
+                                    });
+                                    last_reasoning_len = 0;
+                                }
                                 if value
                                     .get("delta")
                                     .is_some()
@@ -13072,6 +13155,19 @@ pub async fn run_grok_turn(
         last_streamed_len = final_result.len();
     }
     let _ = last_streamed_len; // silence "unused after final assignment"
+
+    // Flush any remaining reasoning that never got followed by a text
+    // delta (e.g., reasoning-only turns or the trailing coalescer window).
+    // Emit done: true so the dashboard finalizes the thinking block in the
+    // event store.
+    if !reasoning_buffer.is_empty() {
+        let _ = events_tx.send(AgentEvent::Thinking {
+            content: std::mem::take(&mut reasoning_buffer),
+            done: true,
+            mission_id: Some(mission_id),
+        });
+    }
+    let _ = last_reasoning_len;
 
     if final_result.trim().is_empty() {
         let stderr_content = stderr_capture.lock().await;
