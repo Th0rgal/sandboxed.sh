@@ -15,7 +15,10 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{Extension, Path, Query, State},
+    extract::{
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+        Extension, Path, Query, State,
+    },
     http::{header, HeaderMap, StatusCode},
     response::{
         sse::{Event, Sse},
@@ -23,7 +26,7 @@ use axum::{
     },
     Json,
 };
-use futures::stream::Stream;
+use futures::{stream::Stream, SinkExt, StreamExt};
 use serde::Deserializer;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
@@ -2664,6 +2667,12 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
     },
+    /// Negotiated CRDT-style text operations for streaming assistant content.
+    TextOp {
+        mission_id: Uuid,
+        bubble_id: String,
+        ops: Vec<TextOp>,
+    },
     ToolCall {
         tool_call_id: String,
         name: String,
@@ -2801,6 +2810,14 @@ pub enum AgentEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TextOp {
+    Insert { pos: usize, text: String },
+    Replace { range: (usize, usize), text: String },
+    Finalize,
+}
+
 /// A node in the agent tree (for visualization)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTreeNode {
@@ -2870,6 +2887,7 @@ impl AgentEvent {
             AgentEvent::AssistantMessage { .. } => "assistant_message",
             AgentEvent::Thinking { .. } => "thinking",
             AgentEvent::TextDelta { .. } => "text_delta",
+            AgentEvent::TextOp { .. } => "text_op",
             AgentEvent::ToolCall { .. } => "tool_call",
             AgentEvent::ToolResult { .. } => "tool_result",
             AgentEvent::Error { .. } => "error",
@@ -2895,6 +2913,7 @@ impl AgentEvent {
             AgentEvent::AssistantMessage { mission_id, .. } => *mission_id,
             AgentEvent::Thinking { mission_id, .. } => *mission_id,
             AgentEvent::TextDelta { mission_id, .. } => *mission_id,
+            AgentEvent::TextOp { mission_id, .. } => Some(*mission_id),
             AgentEvent::ToolCall { mission_id, .. } => *mission_id,
             AgentEvent::ToolResult { mission_id, .. } => *mission_id,
             AgentEvent::Error { mission_id, .. } => *mission_id,
@@ -4618,6 +4637,83 @@ pub struct GetEventsQuery {
     pub before_seq: Option<i64>,
 }
 
+const INACTIVE_EVENT_SUMMARY_AFTER: chrono::Duration = chrono::Duration::minutes(5);
+
+#[derive(Debug, Clone)]
+struct EventSummary {
+    events: Vec<mission_store::StoredEvent>,
+    original_count: usize,
+    summarized_count: usize,
+}
+
+impl EventSummary {
+    fn unchanged(events: Vec<mission_store::StoredEvent>) -> Self {
+        let count = events.len();
+        Self {
+            events,
+            original_count: count,
+            summarized_count: count,
+        }
+    }
+}
+
+fn is_stream_summary_event(event_type: &str) -> bool {
+    matches!(event_type, "thinking" | "text_delta")
+}
+
+fn should_summarize_events(mission: &Mission) -> bool {
+    if mission.status == MissionStatus::Active {
+        return false;
+    }
+
+    let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&mission.updated_at) else {
+        return false;
+    };
+    chrono::Utc::now().signed_duration_since(updated_at.with_timezone(&chrono::Utc))
+        > INACTIVE_EVENT_SUMMARY_AFTER
+}
+
+fn summarize_inactive_stream_events(events: Vec<mission_store::StoredEvent>) -> EventSummary {
+    if events.len() < 2 {
+        return EventSummary::unchanged(events);
+    }
+
+    let original_count = events.len();
+    let mut summarized = Vec::with_capacity(events.len());
+    let mut pending: Option<mission_store::StoredEvent> = None;
+
+    for event in events {
+        if !is_stream_summary_event(&event.event_type) {
+            if let Some(pending) = pending.take() {
+                summarized.push(pending);
+            }
+            summarized.push(event);
+            continue;
+        }
+
+        match pending.as_mut() {
+            Some(existing) if existing.event_type == event.event_type => {
+                *existing = event;
+            }
+            Some(_) => {
+                summarized.push(pending.take().expect("pending checked above"));
+                pending = Some(event);
+            }
+            None => pending = Some(event),
+        }
+    }
+
+    if let Some(pending) = pending {
+        summarized.push(pending);
+    }
+
+    EventSummary {
+        original_count,
+        summarized_count: summarized.len(),
+        events: summarized,
+    }
+}
+
 /// Get events for a mission (for debugging/replay).
 ///
 /// Response includes `X-Total-Events` (total count matching the type
@@ -4638,11 +4734,8 @@ pub async fn get_mission_events(
         .mission_store
         .get_mission(mission_id)
         .await
-        .map_err(internal_error)?;
-
-    if mission.is_none() {
-        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
-    }
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "Mission not found".to_string()))?;
 
     // Parse event types filter
     let types: Option<Vec<&str>> = query
@@ -4685,6 +4778,11 @@ pub async fn get_mission_events(
             .await
             .map_err(internal_error)?
     };
+    let summary = if should_summarize_events(&mission) {
+        summarize_inactive_stream_events(events)
+    } else {
+        EventSummary::unchanged(events)
+    };
 
     // Metadata headers let the client decide whether it's caught up
     // without a second round-trip. Failures here are non-fatal — we just
@@ -4700,7 +4798,7 @@ pub async fn get_mission_events(
         .await
         .ok();
 
-    let mut response = Json(events).into_response();
+    let mut response = Json(summary.events).into_response();
     let headers = response.headers_mut();
     if let Some(total) = total {
         if let Ok(v) = header::HeaderValue::from_str(&total.to_string()) {
@@ -4712,21 +4810,36 @@ pub async fn get_mission_events(
             headers.insert("X-Max-Sequence", v);
         }
     }
+    if summary.summarized_count < summary.original_count {
+        if let Ok(v) = header::HeaderValue::from_str(&summary.original_count.to_string()) {
+            headers.insert("X-Original-Event-Count", v);
+        }
+        if let Ok(v) = header::HeaderValue::from_str(&summary.summarized_count.to_string()) {
+            headers.insert("X-Summarized-Event-Count", v);
+        }
+    }
     // CORS exposure so browsers can read these headers from JS.
     headers.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        header::HeaderValue::from_static("X-Total-Events, X-Max-Sequence"),
+        header::HeaderValue::from_static(
+            "X-Total-Events, X-Max-Sequence, X-Original-Event-Count, X-Summarized-Event-Count",
+        ),
     );
 
     Ok(response)
 }
 
-const TRANSCRIPT_EVENT_TYPES: &[&str] = &["user_message", "assistant_message"];
+const TRANSCRIPT_EVENT_TYPES: &[&str] = &[
+    "user_message",
+    "assistant_message",
+    "assistant_message_canonical",
+];
 const TRACE_EVENT_TYPES: &[&str] = &[
     "thinking",
     "tool_call",
     "tool_result",
     "text_delta",
+    "text_op",
     "error",
     "phase",
     "status",
@@ -4734,10 +4847,12 @@ const TRACE_EVENT_TYPES: &[&str] = &[
 
 fn event_visibility(event_type: &str) -> &'static str {
     match event_type {
-        "user_message" | "assistant_message" | "mission_status_changed" => "transcript",
-        "thinking" | "tool_call" | "tool_result" | "text_delta" | "phase" | "status" | "error" => {
-            "trace"
-        }
+        "user_message"
+        | "assistant_message"
+        | "assistant_message_canonical"
+        | "mission_status_changed" => "transcript",
+        "thinking" | "tool_call" | "tool_result" | "text_delta" | "text_op" | "phase"
+        | "status" | "error" => "trace",
         _ => "debug",
     }
 }
@@ -4819,6 +4934,11 @@ pub async fn get_mission_transcript(
         .get_events(mission_id, Some(TRACE_EVENT_TYPES), None, None)
         .await
         .map_err(internal_error)?;
+    let trace_events = if should_summarize_events(&mission) {
+        summarize_inactive_stream_events(trace_events).events
+    } else {
+        trace_events
+    };
     let latest_sequence = control
         .mission_store
         .max_event_sequence(mission_id)
@@ -4876,10 +4996,8 @@ pub async fn get_mission_trace(
         .mission_store
         .get_mission(mission_id)
         .await
-        .map_err(internal_error)?;
-    if mission.is_none() {
-        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
-    }
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "Mission not found".to_string()))?;
 
     let events = if let Some(before_seq) = query.before_seq {
         control
@@ -4914,6 +5032,11 @@ pub async fn get_mission_trace(
             .await
             .map_err(internal_error)?
     };
+    let summary = if should_summarize_events(&mission) {
+        summarize_inactive_stream_events(events)
+    } else {
+        EventSummary::unchanged(events)
+    };
 
     let total = control
         .mission_store
@@ -4926,7 +5049,7 @@ pub async fn get_mission_trace(
         .await
         .ok();
 
-    let mut response = Json(events).into_response();
+    let mut response = Json(summary.events).into_response();
     let headers = response.headers_mut();
     if let Some(total) = total {
         if let Ok(v) = header::HeaderValue::from_str(&total.to_string()) {
@@ -4938,9 +5061,19 @@ pub async fn get_mission_trace(
             headers.insert("X-Max-Sequence", v);
         }
     }
+    if summary.summarized_count < summary.original_count {
+        if let Ok(v) = header::HeaderValue::from_str(&summary.original_count.to_string()) {
+            headers.insert("X-Original-Event-Count", v);
+        }
+        if let Ok(v) = header::HeaderValue::from_str(&summary.summarized_count.to_string()) {
+            headers.insert("X-Summarized-Event-Count", v);
+        }
+    }
     headers.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        header::HeaderValue::from_static("X-Total-Events, X-Max-Sequence"),
+        header::HeaderValue::from_static(
+            "X-Total-Events, X-Max-Sequence, X-Original-Event-Count, X-Summarized-Event-Count",
+        ),
     );
 
     Ok(response)
@@ -5199,6 +5332,466 @@ pub struct StreamQuery {
     /// event the user can see (used by the mission list / debug overlay).
     #[serde(default)]
     pub mission: Option<Uuid>,
+    /// Optional comma-separated client capabilities. `text_op` asks the
+    /// stream transport to deliver cumulative text deltas as CRDT-style ops
+    /// while preserving the default cumulative fallback for older clients.
+    #[serde(default)]
+    pub cap: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ControlWsClientMessage {
+    Resume { since_seq: i64 },
+}
+
+#[derive(Debug, Serialize)]
+struct ControlWsHeartbeat {
+    seq: i64,
+}
+
+fn stream_supports_text_op(query: &StreamQuery) -> bool {
+    query
+        .cap
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .any(|cap| cap.trim().eq_ignore_ascii_case("text_op"))
+}
+
+fn text_op_events_for_stream(
+    ev: AgentEvent,
+    text_buffers: &mut HashMap<Uuid, String>,
+) -> Vec<AgentEvent> {
+    match ev {
+        AgentEvent::TextDelta {
+            content,
+            mission_id: Some(mission_id),
+        } => {
+            let previous = text_buffers.entry(mission_id).or_default();
+            let previous_len = previous.chars().count();
+            let ops = if previous.is_empty() {
+                vec![TextOp::Insert {
+                    pos: 0,
+                    text: content.clone(),
+                }]
+            } else {
+                vec![TextOp::Replace {
+                    range: (0, previous_len),
+                    text: content.clone(),
+                }]
+            };
+            *previous = content;
+            vec![AgentEvent::TextOp {
+                mission_id,
+                bubble_id: "text_delta_latest".to_string(),
+                ops,
+            }]
+        }
+        AgentEvent::AssistantMessage {
+            mission_id: Some(mission_id),
+            ..
+        } if text_buffers.remove(&mission_id).is_some() => {
+            vec![
+                AgentEvent::TextOp {
+                    mission_id,
+                    bubble_id: "text_delta_latest".to_string(),
+                    ops: vec![TextOp::Finalize],
+                },
+                ev,
+            ]
+        }
+        _ => vec![ev],
+    }
+}
+
+fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<AgentEvent> {
+    let mission_id = Some(event.mission_id);
+    match event.event_type.as_str() {
+        "user_message" => Some(AgentEvent::UserMessage {
+            id: event
+                .event_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .unwrap_or_else(Uuid::new_v4),
+            content: event.content.clone(),
+            queued: false,
+            mission_id,
+        }),
+        "assistant_message" => {
+            let meta = event.metadata.as_object();
+            Some(AgentEvent::AssistantMessage {
+                id: event
+                    .event_id
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .unwrap_or_else(Uuid::new_v4),
+                content: event.content.clone(),
+                success: meta
+                    .and_then(|m| m.get("success"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                cost_cents: meta
+                    .and_then(|m| m.get("cost_cents"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cost_source: crate::agents::CostSource::Unknown,
+                usage: None,
+                model: meta
+                    .and_then(|m| m.get("model"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                model_normalized: meta
+                    .and_then(|m| m.get("model_normalized"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                mission_id,
+                shared_files: None,
+                resumable: meta
+                    .and_then(|m| m.get("resumable"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            })
+        }
+        "thinking" => Some(AgentEvent::Thinking {
+            content: event.content.clone(),
+            done: event
+                .metadata
+                .as_object()
+                .and_then(|m| m.get("done"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            mission_id,
+        }),
+        "text_delta" => Some(AgentEvent::TextDelta {
+            content: event.content.clone(),
+            mission_id,
+        }),
+        "text_op" => Some(AgentEvent::TextOp {
+            mission_id: event.mission_id,
+            bubble_id: event
+                .metadata
+                .as_object()
+                .and_then(|m| m.get("bubble_id"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+                .or_else(|| event.event_id.clone())
+                .unwrap_or_else(|| format!("event-{}", event.id)),
+            ops: serde_json::from_str(&event.content).unwrap_or_default(),
+        }),
+        "assistant_message_canonical" => Some(AgentEvent::AssistantMessage {
+            id: event
+                .event_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .unwrap_or_else(Uuid::new_v4),
+            content: event.content.clone(),
+            success: true,
+            cost_cents: 0,
+            cost_source: crate::agents::CostSource::Unknown,
+            usage: None,
+            model: None,
+            model_normalized: None,
+            mission_id,
+            shared_files: None,
+            resumable: false,
+        }),
+        "tool_call" => Some(AgentEvent::ToolCall {
+            tool_call_id: event
+                .tool_call_id
+                .clone()
+                .unwrap_or_else(|| format!("event-{}", event.id)),
+            name: event
+                .tool_name
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            args: serde_json::from_str(&event.content).unwrap_or(serde_json::Value::Null),
+            mission_id,
+        }),
+        "tool_result" => Some(AgentEvent::ToolResult {
+            tool_call_id: event.tool_call_id.clone().unwrap_or_default(),
+            name: event
+                .tool_name
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            result: serde_json::from_str(&event.content)
+                .unwrap_or_else(|_| serde_json::Value::String(event.content.clone())),
+            mission_id,
+        }),
+        "error" => Some(AgentEvent::Error {
+            message: event.content.clone(),
+            mission_id,
+            resumable: event
+                .metadata
+                .as_object()
+                .and_then(|m| m.get("resumable"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        }),
+        "mission_status_changed" => {
+            let status = event
+                .metadata
+                .as_object()
+                .and_then(|m| m.get("status"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_value::<MissionStatus>(serde_json::json!(s)).ok())?;
+            Some(AgentEvent::MissionStatusChanged {
+                mission_id: event.mission_id,
+                status,
+                summary: None,
+            })
+        }
+        "agent_phase" | "phase" => Some(AgentEvent::AgentPhase {
+            phase: event.content.clone(),
+            detail: event
+                .metadata
+                .as_object()
+                .and_then(|m| m.get("detail"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            agent: event
+                .metadata
+                .as_object()
+                .and_then(|m| m.get("agent"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            mission_id,
+        }),
+        "goal_iteration" => Some(AgentEvent::GoalIteration {
+            iteration: event
+                .metadata
+                .as_object()
+                .and_then(|m| m.get("iteration"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            objective: event.content.clone(),
+            mission_id,
+        }),
+        "goal_status" => Some(AgentEvent::GoalStatus {
+            status: event
+                .metadata
+                .as_object()
+                .and_then(|m| m.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("active")
+                .to_string(),
+            objective: event.content.clone(),
+            mission_id,
+        }),
+        _ => None,
+    }
+}
+
+async fn send_ws_json<T: Serialize>(
+    sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
+    value: &T,
+) -> bool {
+    match serde_json::to_string(value) {
+        Ok(payload) => sender.send(WsMessage::Text(payload)).await.is_ok(),
+        Err(err) => {
+            tracing::warn!(error = %err, "Failed to serialize control WebSocket payload");
+            true
+        }
+    }
+}
+
+pub async fn control_ws(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    axum::extract::Query(query): axum::extract::Query<StreamQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let use_text_op = stream_supports_text_op(&query);
+    ws.on_upgrade(move |socket| control_ws_loop(state, user, query.mission, use_text_op, socket))
+}
+
+async fn control_ws_loop(
+    state: Arc<AppState>,
+    user: AuthUser,
+    mission_filter: Option<Uuid>,
+    use_text_op: bool,
+    socket: WebSocket,
+) {
+    let control = control_for_user(&state, &user).await;
+    let mut rx = control.events_tx.subscribe();
+    let mut mission_rx = if let Some(mid) = mission_filter {
+        let mut map = control.mission_channels.write().await;
+        let entry = map.entry(mid).or_insert_with(|| {
+            let (tx, _rx) = broadcast::channel::<AgentEvent>(8192);
+            tx
+        });
+        Some(entry.subscribe())
+    } else {
+        None
+    };
+    let ws_id = Uuid::new_v4();
+    tracing::info!(
+        ws_id = %ws_id,
+        user_id = %user.id,
+        username = %user.username,
+        mission_filter = ?mission_filter,
+        "Control WebSocket opened"
+    );
+
+    let initial = control.status.read().await.clone();
+    let (mut sender, mut receiver) = socket.split();
+    let mut latest_seq = match mission_filter {
+        Some(mid) => control
+            .mission_store
+            .max_event_sequence(mid)
+            .await
+            .unwrap_or(0),
+        None => 0,
+    };
+    let mut text_op_buffers: HashMap<Uuid, String> = HashMap::new();
+    let initial_status = AgentEvent::Status {
+        state: initial.state,
+        queue_len: initial.queue_len,
+        mission_id: initial.mission_id,
+    };
+    if !send_ws_json(&mut sender, &initial_status).await {
+        return;
+    }
+
+    let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut shutdown_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    shutdown_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_check_interval.tick() => {
+                if super::routes::is_shutdown_initiated() {
+                    break;
+                }
+            }
+            _ = heartbeat_interval.tick() => {
+                if let Some(mid) = mission_filter {
+                    latest_seq = control.mission_store.max_event_sequence(mid).await.unwrap_or(latest_seq);
+                }
+                if !send_ws_json(&mut sender, &ControlWsHeartbeat { seq: latest_seq }).await {
+                    break;
+                }
+            }
+            client_msg = receiver.next() => {
+                match client_msg {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        match serde_json::from_str::<ControlWsClientMessage>(&text) {
+                            Ok(ControlWsClientMessage::Resume { since_seq }) => {
+                                if let Some(mid) = mission_filter {
+                                    match control.mission_store.get_events_since(mid, since_seq, None, None).await {
+                                        Ok(events) => {
+                                            for event in events {
+                                                latest_seq = latest_seq.max(event.sequence);
+                                                if let Some(agent_event) = stored_event_to_agent_event(&event) {
+                                                    let outbound = if use_text_op {
+                                                        text_op_events_for_stream(agent_event, &mut text_op_buffers)
+                                                    } else {
+                                                        vec![agent_event]
+                                                    };
+                                                    for agent_event in outbound {
+                                                        if !send_ws_json(&mut sender, &agent_event).await {
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            let error = AgentEvent::Error {
+                                                message: format!("Failed to resume stream: {err}"),
+                                                mission_id: Some(mid),
+                                                resumable: true,
+                                            };
+                                            if !send_ws_json(&mut sender, &error).await {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!(ws_id = %ws_id, error = %err, "Ignoring malformed control WebSocket client message");
+                            }
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => {
+                        tracing::warn!(ws_id = %ws_id, error = %err, "Control WebSocket receive error");
+                        break;
+                    }
+                }
+            }
+            ev_result = async {
+                match mission_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if mission_rx.is_some() => {
+                match ev_result {
+                    Ok(ev) => {
+                        if let Some(mid) = ev.mission_id() {
+                            latest_seq = control.mission_store.max_event_sequence(mid).await.unwrap_or(latest_seq);
+                        }
+                        let outbound = if use_text_op {
+                            text_op_events_for_stream(ev, &mut text_op_buffers)
+                        } else {
+                            vec![ev]
+                        };
+                        for ev in outbound {
+                            if !send_ws_json(&mut sender, &ev).await {
+                                return;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            result = rx.recv() => {
+                match result {
+                    Ok(ev) => {
+                        let mission_id = ev.mission_id();
+                        if mission_rx.is_some() {
+                            let is_status = matches!(&ev, AgentEvent::Status { .. });
+                            let is_fido = matches!(&ev, AgentEvent::FidoSignRequest { .. });
+                            if !is_status && !is_fido {
+                                continue;
+                            }
+                        } else if let Some(filter) = mission_filter {
+                            let is_status = matches!(&ev, AgentEvent::Status { .. });
+                            if !is_status && mission_id != Some(filter) {
+                                continue;
+                            }
+                        }
+                        if let Some(mid) = mission_id {
+                            latest_seq = control.mission_store.max_event_sequence(mid).await.unwrap_or(latest_seq);
+                        }
+                        let outbound = if use_text_op {
+                            text_op_events_for_stream(ev, &mut text_op_buffers)
+                        } else {
+                            vec![ev]
+                        };
+                        for ev in outbound {
+                            if !send_ws_json(&mut sender, &ev).await {
+                                return;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        ws_id = %ws_id,
+        user_id = %user.id,
+        username = %user.username,
+        "Control WebSocket closed"
+    );
 }
 
 pub async fn stream(
@@ -5208,6 +5801,7 @@ pub async fn stream(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let mission_filter = query.mission;
+    let use_text_op = stream_supports_text_op(&query);
     // P3-#20: when a mission filter is set, subscribe to that mission's
     // dedicated channel — the fan-out task in spawn_control_session
     // mirrors events from the global tx into per-mission txs. Avoids
@@ -5283,6 +5877,7 @@ pub async fn stream(
         keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut shutdown_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         shutdown_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut text_op_buffers: HashMap<Uuid, String> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -5333,21 +5928,28 @@ pub async fn stream(
                                     );
                                 }
                             }
-                            match serde_json::to_string(&ev) {
-                                Ok(payload) => {
-                                    metrics.record_sse_chunk(payload.len());
-                                    metrics.record_broadcast(mission_id);
-                                    yield Ok(Event::default()
-                                        .event(ev.event_name())
-                                        .data(payload));
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        stream_id = %stream_id,
-                                        event = %ev.event_name(),
-                                        error = %e,
-                                        "Failed to serialize SSE event; dropping"
-                                    );
+                            let outbound = if use_text_op {
+                                text_op_events_for_stream(ev, &mut text_op_buffers)
+                            } else {
+                                vec![ev]
+                            };
+                            for ev in outbound {
+                                match serde_json::to_string(&ev) {
+                                    Ok(payload) => {
+                                        metrics.record_sse_chunk(payload.len());
+                                        metrics.record_broadcast(ev.mission_id());
+                                        yield Ok(Event::default()
+                                            .event(ev.event_name())
+                                            .data(payload));
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            stream_id = %stream_id,
+                                            event = %ev.event_name(),
+                                            error = %e,
+                                            "Failed to serialize SSE event; dropping"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -5411,21 +6013,28 @@ pub async fn stream(
                             // the metrics endpoint (P0-#3). The payload
                             // size approximates the on-the-wire chunk
                             // length closely enough for p50/p99 use.
-                            match serde_json::to_string(&ev) {
-                                Ok(payload) => {
-                                    metrics.record_sse_chunk(payload.len());
-                                    metrics.record_broadcast(mission_id);
-                                    yield Ok(Event::default()
-                                        .event(ev.event_name())
-                                        .data(payload));
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        stream_id = %stream_id,
-                                        event = %ev.event_name(),
-                                        error = %e,
-                                        "Failed to serialize SSE event; dropping"
-                                    );
+                            let outbound = if use_text_op {
+                                text_op_events_for_stream(ev, &mut text_op_buffers)
+                            } else {
+                                vec![ev]
+                            };
+                            for ev in outbound {
+                                match serde_json::to_string(&ev) {
+                                    Ok(payload) => {
+                                        metrics.record_sse_chunk(payload.len());
+                                        metrics.record_broadcast(ev.mission_id());
+                                        yield Ok(Event::default()
+                                            .event(ev.event_name())
+                                            .data(payload));
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            stream_id = %stream_id,
+                                            event = %ev.event_name(),
+                                            error = %e,
+                                            "Failed to serialize SSE event; dropping"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -13989,6 +14598,113 @@ mod tests {
     }
 
     #[test]
+    fn text_op_stream_transform_converts_cumulative_delta_to_insert_then_replace() {
+        let mission_id = Uuid::new_v4();
+        let mut buffers = HashMap::new();
+
+        let first = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "hello".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+        assert_eq!(first.len(), 1);
+        match &first[0] {
+            AgentEvent::TextOp {
+                mission_id: actual_mission,
+                bubble_id,
+                ops,
+            } => {
+                assert_eq!(*actual_mission, mission_id);
+                assert_eq!(bubble_id, "text_delta_latest");
+                assert_eq!(
+                    ops,
+                    &vec![TextOp::Insert {
+                        pos: 0,
+                        text: "hello".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected text_op, got {other:?}"),
+        }
+
+        let second = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "hello world".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+        assert_eq!(second.len(), 1);
+        match &second[0] {
+            AgentEvent::TextOp {
+                mission_id: actual_mission,
+                bubble_id,
+                ops,
+            } => {
+                assert_eq!(*actual_mission, mission_id);
+                assert_eq!(bubble_id, "text_delta_latest");
+                assert_eq!(
+                    ops,
+                    &vec![TextOp::Replace {
+                        range: (0, 5),
+                        text: "hello world".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected text_op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_op_stream_transform_finalizes_before_assistant_message() {
+        let mission_id = Uuid::new_v4();
+        let mut buffers = HashMap::new();
+
+        let _ = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "draft".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        let finalized = text_op_events_for_stream(
+            AgentEvent::AssistantMessage {
+                id: Uuid::new_v4(),
+                content: "final".to_string(),
+                success: true,
+                cost_cents: 0,
+                cost_source: crate::agents::CostSource::Unknown,
+                usage: None,
+                model: None,
+                model_normalized: None,
+                mission_id: Some(mission_id),
+                shared_files: None,
+                resumable: false,
+            },
+            &mut buffers,
+        );
+
+        assert_eq!(finalized.len(), 2);
+        match &finalized[0] {
+            AgentEvent::TextOp {
+                mission_id: actual_mission,
+                bubble_id,
+                ops,
+            } => {
+                assert_eq!(*actual_mission, mission_id);
+                assert_eq!(bubble_id, "text_delta_latest");
+                assert_eq!(ops, &vec![TextOp::Finalize]);
+            }
+            other => panic!("expected finalize text_op, got {other:?}"),
+        }
+        assert!(matches!(finalized[1], AgentEvent::AssistantMessage { .. }));
+        assert!(buffers.is_empty());
+    }
+
+    #[test]
     fn synthetic_thought_from_text_delta_accumulates_incremental_fragments() {
         let mission_id = Uuid::new_v4();
         let mut pending = HashMap::new();
@@ -17357,6 +18073,74 @@ Investigate <service/> failures.
         assert_eq!(event_visibility("text_delta"), "trace");
         assert_eq!(event_visibility("error"), "trace");
         assert_eq!(event_visibility("raw_backend_packet"), "debug");
+    }
+
+    #[test]
+    fn inactive_stream_summary_collapses_consecutive_cumulative_rows() {
+        let event = |sequence, event_type: &str, content: &str| mission_store::StoredEvent {
+            id: sequence,
+            mission_id: Uuid::nil(),
+            sequence,
+            event_type: event_type.to_string(),
+            timestamp: "2026-05-19T00:00:00Z".to_string(),
+            event_id: Some(format!("{event_type}-{sequence}")),
+            tool_call_id: None,
+            tool_name: None,
+            content: content.to_string(),
+            metadata: serde_json::json!({}),
+        };
+
+        let events = vec![
+            event(1, "user_message", "hello"),
+            event(2, "thinking", "a"),
+            event(3, "thinking", "ab"),
+            event(4, "thinking", "abc"),
+            event(5, "tool_call", "{}"),
+            event(6, "text_delta", "draft"),
+            event(7, "text_delta", "draft final"),
+            event(8, "assistant_message", "done"),
+        ];
+
+        let summary = summarize_inactive_stream_events(events);
+
+        assert_eq!(summary.original_count, 8);
+        assert_eq!(summary.summarized_count, 5);
+        assert_eq!(summary.events[1].event_type, "thinking");
+        assert_eq!(summary.events[1].sequence, 4);
+        assert_eq!(summary.events[1].content, "abc");
+        assert_eq!(summary.events[3].event_type, "text_delta");
+        assert_eq!(summary.events[3].sequence, 7);
+        assert_eq!(summary.events[3].content, "draft final");
+    }
+
+    #[test]
+    fn inactive_stream_summary_reduces_large_payload_by_ten_x() {
+        let mission_id = Uuid::nil();
+        let original: Vec<_> = (1..=100)
+            .map(|sequence| mission_store::StoredEvent {
+                id: sequence,
+                mission_id,
+                sequence,
+                event_type: "thinking".to_string(),
+                timestamp: "2026-05-19T00:00:00Z".to_string(),
+                event_id: Some(format!("thinking-{sequence}")),
+                tool_call_id: None,
+                tool_name: None,
+                content: "x".repeat(sequence as usize),
+                metadata: serde_json::json!({ "done": sequence == 100 }),
+            })
+            .collect();
+        let before_bytes = serde_json::to_vec(&original).unwrap().len();
+
+        let summary = summarize_inactive_stream_events(original);
+        let after_bytes = serde_json::to_vec(&summary.events).unwrap().len();
+
+        assert_eq!(summary.original_count, 100);
+        assert_eq!(summary.summarized_count, 1);
+        assert!(
+            before_bytes >= after_bytes * 10,
+            "expected >=10x payload drop, before={before_bytes}, after={after_bytes}"
+        );
     }
 
     #[test]

@@ -1,5 +1,8 @@
 import { defineConfig, devices } from '@playwright/test';
 
+const port = process.env.PLAYWRIGHT_PORT || '3099';
+const baseURL = process.env.PLAYWRIGHT_BASE_URL || `http://localhost:${port}`;
+
 export default defineConfig({
   testDir: './tests',
   fullyParallel: true,
@@ -9,7 +12,7 @@ export default defineConfig({
   reporter: 'html',
   timeout: 30000, // 30 seconds per test
   use: {
-    baseURL: 'http://localhost:3099',
+    baseURL,
     trace: 'on-first-retry',
   },
 
@@ -24,8 +27,8 @@ export default defineConfig({
   ],
 
   webServer: {
-    command: 'bun dev --port 3099',
-    url: 'http://localhost:3099',
+    command: `bunx next dev --port ${port}`,
+    url: baseURL,
     reuseExistingServer: !process.env.CI,
     timeout: 120000, // 2 minutes for server to start
     env: {

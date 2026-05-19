@@ -1,10 +1,24 @@
 "use client";
 
 import type React from "react";
-import { useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo, startTransition } from "react";
+import {
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useCallback,
+  memo,
+  startTransition,
+} from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
-import { MarkdownContent, LazyMarkdownContent } from "@/components/markdown-content";
+import {
+  MarkdownContent,
+  LazyMarkdownContent,
+} from "@/components/markdown-content";
 import { StreamingMarkdown } from "@/components/streaming-markdown";
 import {
   EnhancedInput,
@@ -16,6 +30,21 @@ import { MissionAutomationsDialog } from "@/components/mission-automations-dialo
 import { PerfOverlay } from "@/components/perf-overlay";
 import { perfBus } from "@/lib/perf-bus";
 import { isStreamContinuation } from "@/lib/stream-continuation";
+import {
+  eventsToItemsImpl,
+  isRecord,
+  parseCostMetadata,
+  type ChatItem,
+} from "./events-reducer";
+export type { ChatItem } from "./events-reducer";
+import {
+  useControlItemsStore,
+  useControlQueueStore,
+  useControlStreamingDiagnosticsStore,
+  useControlThinkingStore,
+  useControlViewingMissionStore,
+  type StreamDiagnosticsState,
+} from "./control-stores";
 import { NowTickProvider, useNow } from "@/lib/now-tick";
 import { startHealthBudgetWatcher } from "@/lib/health-budget";
 import { MissionDebugStats } from "./MissionDebugStats";
@@ -81,6 +110,7 @@ import {
   type DesktopSessionDetail,
   type DesktopSessionStatus,
   type StoredEvent,
+  type SharedFile,
 } from "@/lib/api";
 import { QueueStrip, type QueueItem } from "@/components/queue-strip";
 import { AsyncButton } from "@/components/ui/async-button";
@@ -139,28 +169,25 @@ import {
   Flag,
 } from "lucide-react";
 import { IMAGE_PATH_PATTERN } from "@/lib/file-extensions";
-import { insertTextAtSelection, type TextSelection } from "@/lib/text-selection";
+import {
+  insertTextAtSelection,
+  type TextSelection,
+} from "@/lib/text-selection";
 import { useFaviconStatus } from "@/hooks/use-favicon-status";
-
-type StreamDiagnosticsState = {
-  phase: "idle" | "connecting" | "open" | "streaming" | "closed" | "error";
-  url: string | null;
-  status?: number;
-  contentType?: string | null;
-  cacheControl?: string | null;
-  transferEncoding?: string | null;
-  contentEncoding?: string | null;
-  server?: string | null;
-  via?: string | null;
-  lastEventAt?: number;
-  lastChunkAt?: number;
-  bytes: number;
-  lastError?: string | null;
-};
 
 type InputInsertionState = TextSelection & {
   insertedCount: number;
 };
+
+type EventsWorkerRequest = {
+  id: number;
+  events: StoredEvent[];
+  mission?: Mission | null;
+};
+
+type EventsWorkerResponse =
+  | { id: number; ok: true; items: ChatItem[] }
+  | { id: number; ok: false; error: string };
 
 function formatDiagAge(ts?: number) {
   if (!ts) return "—";
@@ -191,7 +218,7 @@ function isRetriableSendError(error: unknown): boolean {
 
 async function postControlMessageWithRetry(
   content: string,
-  options: { agent?: string; mission_id?: string; client_message_id: string }
+  options: { agent?: string; mission_id?: string; client_message_id: string },
 ): Promise<{ id: string; queued: boolean }> {
   try {
     return await postControlMessage(content, options);
@@ -204,7 +231,11 @@ async function postControlMessageWithRetry(
 
 type StreamLogLevel = "debug" | "info" | "warn" | "error";
 
-function streamLog(level: StreamLogLevel, message: string, meta?: Record<string, unknown>) {
+function streamLog(
+  level: StreamLogLevel,
+  message: string,
+  meta?: Record<string, unknown>,
+) {
   const prefix = "[control:sse]";
   const args = meta ? [prefix, message, meta] : [prefix, message];
   switch (level) {
@@ -243,85 +274,17 @@ import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { useVisibilityPolling } from "@/hooks/use-visibility-polling";
 import { DesktopStream } from "@/components/desktop-stream";
 import { NewMissionDialog } from "@/components/new-mission-dialog";
-import { MissionSwitcher, normalizeMetadataText } from "@/components/mission-switcher";
+import {
+  MissionSwitcher,
+  normalizeMetadataText,
+} from "@/components/mission-switcher";
 import { WorkerPanel } from "@/components/worker-panel";
 import { WorkersStrip } from "@/components/workers-strip";
-import { SubagentsPanel, type SubagentEntry } from "@/components/subagents-panel";
+import {
+  SubagentsPanel,
+  type SubagentEntry,
+} from "@/components/subagents-panel";
 import { RelativeTime } from "@/components/ui/relative-time";
-
-import type { SharedFile } from "@/lib/api";
-
-type CostSource = "actual" | "estimated" | "unknown";
-
-export type ChatItem =
-  | {
-      kind: "user";
-      id: string;
-      content: string;
-      timestamp: number;
-      queued?: boolean;
-    }
-  | {
-      kind: "assistant";
-      id: string;
-      content: string;
-      success: boolean;
-      costCents: number;
-      costSource: CostSource;
-      model: string | null;
-      timestamp: number;
-      sharedFiles?: SharedFile[];
-      resumable?: boolean;
-      /** Goal-mode iteration that this assistant message ended. Set when
-       *  the mission is in goal mode and we've seen at least one
-       *  goal_iteration event before this message. UI replaces "Turn
-       *  complete" with "Iteration N" so the chat doesn't read as a
-       *  series of standalone turns. */
-      goalIteration?: number;
-    }
-  | {
-      kind: "thinking";
-      id: string;
-      content: string;
-      done: boolean;
-      startTime: number;
-      endTime?: number;
-    }
-  | {
-      // Streaming text delta (draft assistant output).
-      kind: "stream";
-      id: string;
-      content: string;
-      done: boolean;
-      startTime: number;
-      endTime?: number;
-    }
-  | {
-      kind: "tool";
-      id: string;
-      toolCallId: string;
-      name: string;
-      args: unknown;
-      result?: unknown;
-      isUiTool: boolean;
-      startTime: number;
-      endTime?: number;
-    }
-  | {
-      kind: "system";
-      id: string;
-      content: string;
-      timestamp: number;
-      resumable?: boolean;
-      missionId?: string;
-    }
-  | {
-      kind: "phase";
-      id: string;
-      phase: string;
-      detail: string | null;
-      agent: string | null;
-    };
 
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
@@ -337,6 +300,13 @@ type ThinkingGroup = {
   thoughts: SidePanelItem[];
 };
 type GroupedItem = ChatItem | ToolGroup | ThinkingGroup;
+
+function getGroupedItemKey(item: GroupedItem): string {
+  if (item.kind === "tool_group" || item.kind === "thinking_group") {
+    return item.groupId;
+  }
+  return item.id;
+}
 
 type ItemViews = {
   /** Items after dedup by `id`, in original order. */
@@ -371,7 +341,7 @@ type ItemViews = {
  */
 function deriveItemViews(
   items: ChatItem[],
-  showThinkingPanel: boolean
+  showThinkingPanel: boolean,
 ): ItemViews {
   // Pass 1: dedup by id (last occurrence wins, preserve original order).
   // Record the last index per id, then emit items whose index matches.
@@ -544,18 +514,22 @@ function parseQuestionArgs(args: unknown): QuestionInfo[] {
             .map((opt) => ({
               label: String(opt["label"] ?? ""),
               description:
-                typeof opt["description"] === "string" ? opt["description"] : undefined,
+                typeof opt["description"] === "string"
+                  ? opt["description"]
+                  : undefined,
             }))
             .filter((opt) => opt.label.length > 0)
         : [];
       // Detect when the only meaningful options are "Other"-like entries,
       // meaning the question expects free-text input.
       const nonOtherOptions = options.filter(
-        (opt) => !opt.label.toLowerCase().includes("other")
+        (opt) => !opt.label.toLowerCase().includes("other"),
       );
       return {
-        header: typeof entry["header"] === "string" ? entry["header"] : undefined,
-        question: typeof entry["question"] === "string" ? entry["question"] : undefined,
+        header:
+          typeof entry["header"] === "string" ? entry["header"] : undefined,
+        question:
+          typeof entry["question"] === "string" ? entry["question"] : undefined,
         options,
         multiple: Boolean(entry["multiple"] ?? entry["multiSelect"]),
         freeTextOnly: options.length > 0 && nonOtherOptions.length === 0,
@@ -572,8 +546,8 @@ function QuestionToolItem({
   onSubmit: (toolCallId: string, answers: string[][]) => Promise<void>;
 }) {
   const questions = useMemo(() => parseQuestionArgs(item.args), [item.args]);
-  const [answers, setAnswers] = useState<string[][]>(
-    () => questions.map(() => [])
+  const [answers, setAnswers] = useState<string[][]>(() =>
+    questions.map(() => []),
   );
   const [otherText, setOtherText] = useState<Record<number, string>>({});
   const [submitting, setSubmitting] = useState(false);
@@ -625,7 +599,7 @@ function QuestionToolItem({
         const selections = answers[idx] ?? [];
         if (!selections.length) return [];
         const otherLabel = q.options?.find((opt) =>
-          opt.label.toLowerCase().includes("other")
+          opt.label.toLowerCase().includes("other"),
         )?.label;
         return selections.map((label) => {
           if (otherLabel && label === otherLabel) {
@@ -660,16 +634,16 @@ function QuestionToolItem({
               const multiple = Boolean(q.multiple);
               const selections = new Set(answers[idx] ?? []);
               const hasOtherOption = (q.options ?? []).some((opt) =>
-                opt.label.toLowerCase().includes("other")
+                opt.label.toLowerCase().includes("other"),
               );
               const otherLabel = hasOtherOption
-                ? (q.options ?? []).find((opt) =>
-                    opt.label.toLowerCase().includes("other")
-                  )?.label ?? ""
+                ? ((q.options ?? []).find((opt) =>
+                    opt.label.toLowerCase().includes("other"),
+                  )?.label ?? "")
                 : "";
               // Non-Other options to render as buttons
               const regularOptions = (q.options ?? []).filter(
-                (opt) => !opt.label.toLowerCase().includes("other")
+                (opt) => !opt.label.toLowerCase().includes("other"),
               );
               return (
                 <div key={`${item.toolCallId}-q-${idx}`} className="space-y-2">
@@ -689,7 +663,12 @@ function QuestionToolItem({
                         }))
                       }
                       onKeyDown={(e) => {
-                        if (e.key === "Enter" && canSubmit && !submitting && !hasResult) {
+                        if (
+                          e.key === "Enter" &&
+                          canSubmit &&
+                          !submitting &&
+                          !hasResult
+                        ) {
                           handleSubmit();
                         }
                       }}
@@ -711,14 +690,16 @@ function QuestionToolItem({
                                 "flex items-start gap-2 rounded-lg border px-3 py-2 text-sm transition-colors cursor-pointer",
                                 checked
                                   ? "border-indigo-500/40 bg-indigo-500/10"
-                                  : "border-white/10 hover:border-white/20"
+                                  : "border-white/10 hover:border-white/20",
                               )}
                             >
                               <input
                                 type={multiple ? "checkbox" : "radio"}
                                 checked={checked}
                                 disabled={hasResult || submitting}
-                                onChange={() => handleToggle(idx, opt.label, multiple)}
+                                onChange={() =>
+                                  handleToggle(idx, opt.label, multiple)
+                                }
                                 className="mt-0.5"
                               />
                               <div>
@@ -740,14 +721,16 @@ function QuestionToolItem({
                               "flex items-start gap-2 rounded-lg border px-3 py-2 text-sm transition-colors cursor-pointer",
                               selections.has(otherLabel)
                                 ? "border-indigo-500/40 bg-indigo-500/10"
-                                : "border-white/10 hover:border-white/20"
+                                : "border-white/10 hover:border-white/20",
                             )}
                           >
                             <input
                               type={multiple ? "checkbox" : "radio"}
                               checked={selections.has(otherLabel)}
                               disabled={hasResult || submitting}
-                              onChange={() => handleToggle(idx, otherLabel, multiple)}
+                              onChange={() =>
+                                handleToggle(idx, otherLabel, multiple)
+                              }
                               className="mt-0.5"
                             />
                             <div className="flex-1">
@@ -765,7 +748,12 @@ function QuestionToolItem({
                                 }))
                               }
                               onKeyDown={(e) => {
-                                if (e.key === "Enter" && canSubmit && !submitting && !hasResult) {
+                                if (
+                                  e.key === "Enter" &&
+                                  canSubmit &&
+                                  !submitting &&
+                                  !hasResult
+                                ) {
                                   handleSubmit();
                                 }
                               }}
@@ -791,7 +779,7 @@ function QuestionToolItem({
                   "inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors",
                   !canSubmit || submitting
                     ? "bg-white/5 text-white/30 cursor-not-allowed"
-                    : "bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30"
+                    : "bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30",
                 )}
               >
                 {submitting ? "Sending…" : "Submit Answer"}
@@ -802,59 +790,6 @@ function QuestionToolItem({
       </div>
     </div>
   );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function parseCostSource(raw: unknown): CostSource {
-  if (raw === "actual" || raw === "estimated" || raw === "unknown") {
-    return raw;
-  }
-  return "unknown";
-}
-
-function parseCostAmount(raw: unknown): number | undefined {
-  if (typeof raw === "number" && Number.isFinite(raw)) {
-    return raw;
-  }
-  if (typeof raw === "string") {
-    const parsed = Number(raw);
-    if (Number.isFinite(parsed)) {
-      return parsed;
-    }
-  }
-  return undefined;
-}
-
-function parseCostMetadata(
-  meta: Record<string, unknown>,
-  fallback?: { costCents: number; costSource: CostSource }
-): { costCents: number; costSource: CostSource } {
-  const cost = meta["cost"];
-  if (isRecord(cost)) {
-    const parsedAmount = parseCostAmount(cost["amount_cents"]);
-    const hasSource = cost["source"] !== undefined;
-    return {
-      costCents: parsedAmount ?? fallback?.costCents ?? 0,
-      costSource: hasSource ? parseCostSource(cost["source"]) : fallback?.costSource ?? "unknown",
-    };
-  }
-
-  const parsedAmount = parseCostAmount(meta["cost_cents"]);
-  const hasSource = meta["cost_source"] !== undefined;
-  if (parsedAmount !== undefined || hasSource) {
-    return {
-      costCents: parsedAmount ?? fallback?.costCents ?? 0,
-      costSource: hasSource ? parseCostSource(meta["cost_source"]) : fallback?.costSource ?? "unknown",
-    };
-  }
-
-  return {
-    costCents: fallback?.costCents ?? 0,
-    costSource: fallback?.costSource ?? "unknown",
-  };
 }
 
 /**
@@ -872,14 +807,17 @@ function getMessageFingerprint(kind: string, content: string): string {
  */
 function hasHistoryChanged(
   items: ReadonlyArray<{ kind: string; content?: string }>,
-  history: ReadonlyArray<{ role: string; content?: string | null }>
+  history: ReadonlyArray<{ role: string; content?: string | null }>,
 ): boolean {
   const currentFingerprints = items
-    .filter(i => i.kind === "user" || i.kind === "assistant")
-    .map(i => getMessageFingerprint(i.kind, i.content || ""));
+    .filter((i) => i.kind === "user" || i.kind === "assistant")
+    .map((i) => getMessageFingerprint(i.kind, i.content || ""));
 
-  const newFingerprints = history.map(e =>
-    getMessageFingerprint(e.role === "user" ? "user" : "assistant", e.content || "")
+  const newFingerprints = history.map((e) =>
+    getMessageFingerprint(
+      e.role === "user" ? "user" : "assistant",
+      e.content || "",
+    ),
   );
 
   // If current items have MORE messages than API history, the API is stale (SSE delivered
@@ -887,7 +825,9 @@ function hasHistoryChanged(
   // But first verify the overlapping content matches to detect content mismatches.
   if (currentFingerprints.length > newFingerprints.length) {
     // Verify that all API messages match the corresponding local messages
-    const hasContentMismatch = newFingerprints.some((fp, i) => fp !== currentFingerprints[i]);
+    const hasContentMismatch = newFingerprints.some(
+      (fp, i) => fp !== currentFingerprints[i],
+    );
     // If content matches, keep local (has more messages). If mismatch, history changed.
     return hasContentMismatch;
   }
@@ -920,7 +860,10 @@ function statusLabel(state: ControlRunState): {
   return { label: "Idle", Icon: Clock, className: "text-white/40" };
 }
 
-function missionStatusLabel(status: MissionStatus, isRunning = false): {
+function missionStatusLabel(
+  status: MissionStatus,
+  isRunning = false,
+): {
   label: string;
   className: string;
 } {
@@ -946,15 +889,27 @@ function missionStatusLabel(status: MissionStatus, isRunning = false): {
     case "failed":
       return { label: "Failed", className: "bg-red-500/20 text-red-400" };
     case "interrupted":
-      return { label: "Interrupted", className: "bg-amber-500/20 text-amber-400" };
+      return {
+        label: "Interrupted",
+        className: "bg-amber-500/20 text-amber-400",
+      };
     case "blocked":
-      return { label: "Blocked", className: "bg-orange-500/20 text-orange-400" };
+      return {
+        label: "Blocked",
+        className: "bg-orange-500/20 text-orange-400",
+      };
     case "not_feasible":
-      return { label: "Not Feasible", className: "bg-rose-500/20 text-rose-400" };
+      return {
+        label: "Not Feasible",
+        className: "bg-rose-500/20 text-rose-400",
+      };
   }
 }
 
-function missionStatusDotClass(status: MissionStatus, isRunning = false): string {
+function missionStatusDotClass(
+  status: MissionStatus,
+  isRunning = false,
+): string {
   return getMissionDotColor(status, isRunning);
 }
 
@@ -981,7 +936,7 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
         "p-1.5 rounded-lg transition-all",
         "opacity-0 group-hover:opacity-100",
         "hover:bg-white/[0.08] text-white/40 hover:text-white/70",
-        className
+        className,
       )}
       title="Copy message"
     >
@@ -1020,7 +975,7 @@ function ChatLoadingSkeleton() {
             key={idx}
             className={cn(
               "flex gap-3",
-              isAssistant ? "justify-start" : "justify-end"
+              isAssistant ? "justify-start" : "justify-end",
             )}
           >
             {isAssistant && (
@@ -1031,19 +986,19 @@ function ChatLoadingSkeleton() {
                 "max-w-[80%] rounded-2xl px-4 py-3",
                 isAssistant
                   ? "rounded-tl-md border border-white/[0.06] bg-white/[0.03]"
-                  : "rounded-tr-md bg-indigo-500/70"
+                  : "rounded-tr-md bg-indigo-500/70",
               )}
             >
               <div
                 className={cn(
                   "h-3 w-48 rounded",
-                  isAssistant ? "bg-white/[0.08]" : "bg-white/30"
+                  isAssistant ? "bg-white/[0.08]" : "bg-white/30",
                 )}
               />
               <div
                 className={cn(
                   "mt-2 h-3 w-40 rounded",
-                  isAssistant ? "bg-white/[0.06]" : "bg-white/20"
+                  isAssistant ? "bg-white/[0.06]" : "bg-white/20",
                 )}
               />
               {isAssistant && (
@@ -1063,7 +1018,11 @@ function ChatLoadingSkeleton() {
 function isTextPreviewableSharedFile(file: SharedFile): boolean {
   const name = (file.name || "").toLowerCase();
   if (file.content_type.startsWith("text/")) return true;
-  if (file.content_type.includes("json") || file.content_type.includes("yaml") || file.content_type.includes("xml")) {
+  if (
+    file.content_type.includes("json") ||
+    file.content_type.includes("yaml") ||
+    file.content_type.includes("xml")
+  ) {
     return true;
   }
   return (
@@ -1083,9 +1042,20 @@ function isTextPreviewableSharedFile(file: SharedFile): boolean {
 
 function getLanguageFromSharedFile(file: SharedFile): string {
   const name = (file.name || "").toLowerCase();
-  if (name.endsWith(".md") || name.endsWith(".markdown") || file.content_type.includes("markdown")) return "markdown";
-  if (name.endsWith(".json") || file.content_type.includes("json")) return "json";
-  if (name.endsWith(".yaml") || name.endsWith(".yml") || file.content_type.includes("yaml")) return "yaml";
+  if (
+    name.endsWith(".md") ||
+    name.endsWith(".markdown") ||
+    file.content_type.includes("markdown")
+  )
+    return "markdown";
+  if (name.endsWith(".json") || file.content_type.includes("json"))
+    return "json";
+  if (
+    name.endsWith(".yaml") ||
+    name.endsWith(".yml") ||
+    file.content_type.includes("yaml")
+  )
+    return "yaml";
   if (name.endsWith(".xml") || file.content_type.includes("xml")) return "xml";
   if (name.endsWith(".csv")) return "csv";
   if (name.endsWith(".tsv")) return "tsv";
@@ -1138,7 +1108,9 @@ function SharedFilePreviewModal({
         const raw = await blob.text();
         const limit = 500_000;
         const finalText =
-          raw.length > limit ? `${raw.slice(0, limit)}\n\n... (file truncated, too large to preview)` : raw;
+          raw.length > limit
+            ? `${raw.slice(0, limit)}\n\n... (file truncated, too large to preview)`
+            : raw;
         if (!cancelled) {
           setSizeBytes(blob.size);
           setText(finalText);
@@ -1177,15 +1149,19 @@ function SharedFilePreviewModal({
         onClick={(e) => e.stopPropagation()}
         className={cn(
           "relative rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl w-full max-w-4xl",
-          "animate-in fade-in zoom-in-95 duration-200"
+          "animate-in fade-in zoom-in-95 duration-200",
         )}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
           <div className="min-w-0">
-            <h3 className="text-sm font-semibold text-white truncate">{file.name}</h3>
+            <h3 className="text-sm font-semibold text-white truncate">
+              {file.name}
+            </h3>
             <p className="text-xs text-white/40 truncate">
               {file.content_type}
-              {sizeBytes != null && <span className="ml-2">• {formatBytes(sizeBytes)}</span>}
+              {sizeBytes != null && (
+                <span className="ml-2">• {formatBytes(sizeBytes)}</span>
+              )}
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0 ml-3">
@@ -1195,7 +1171,11 @@ function SharedFilePreviewModal({
                 className="p-1.5 rounded-lg text-white/40 hover:text-white/70 hover:bg-white/[0.08] transition-colors"
                 title={copied ? "Copied" : "Copy"}
               >
-                {copied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
+                {copied ? (
+                  <Check className="h-4 w-4 text-emerald-400" />
+                ) : (
+                  <Copy className="h-4 w-4" />
+                )}
               </button>
             )}
             <button
@@ -1351,7 +1331,11 @@ function SharedFileCard({ file }: { file: SharedFile }) {
     // Render images inline (supports auth-protected API URLs).
     return (
       <div className="mt-3 rounded-lg overflow-hidden border border-white/[0.06] bg-black/20">
-        <button type="button" onClick={handleOpen} className="block w-full text-left">
+        <button
+          type="button"
+          onClick={handleOpen}
+          className="block w-full text-left"
+        >
           {loading && !blobUrl ? (
             <div className="h-[240px] w-full animate-pulse bg-white/[0.03]" />
           ) : (
@@ -1387,9 +1371,7 @@ function SharedFileCard({ file }: { file: SharedFile }) {
             <Download className={cn("h-3 w-3", loading && "animate-pulse")} />
           </button>
         </div>
-        {error && (
-          <div className="px-3 pb-2 text-xs text-red-400">{error}</div>
-        )}
+        {error && <div className="px-3 pb-2 text-xs text-red-400">{error}</div>}
       </div>
     );
   }
@@ -1400,7 +1382,7 @@ function SharedFileCard({ file }: { file: SharedFile }) {
       <div
         className={cn(
           "mt-3 flex items-center gap-3 px-4 py-3 rounded-lg border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] transition-colors group",
-          canPreview && "cursor-pointer"
+          canPreview && "cursor-pointer",
         )}
         onClick={() => {
           if (canPreview) setPreviewOpen(true);
@@ -1419,7 +1401,9 @@ function SharedFileCard({ file }: { file: SharedFile }) {
           <FileIcon className="h-5 w-5 text-indigo-400" />
         </div>
         <div className="flex-1 min-w-0">
-          <div className="font-medium text-sm text-white/80 truncate">{file.name}</div>
+          <div className="font-medium text-sm text-white/80 truncate">
+            {file.name}
+          </div>
           <div className="text-xs text-white/40 flex items-center gap-2">
             <span className="truncate">{file.content_type}</span>
             {sizeLabel && (
@@ -1529,29 +1513,27 @@ function ThinkingGroupItem({
   missionId?: string;
 }) {
   // Filter out empty items for display
-  const nonEmptyItems = useMemo(() =>
-    items.filter(item => item.content.trim()),
-    [items]
+  const nonEmptyItems = useMemo(
+    () => items.filter((item) => item.content.trim()),
+    [items],
   );
 
-  const hasActiveItem = items.some(item => !item.done);
+  const hasActiveItem = items.some((item) => !item.done);
   const [expanded, setExpanded] = useState(hasActiveItem);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const hasAutoCollapsedRef = useRef(false);
 
   // Get the earliest start time and latest end time
-  const startTime = Math.min(...items.map(item => item.startTime));
-  const endTime = items.every(item => item.done && item.endTime)
-    ? Math.max(...items.map(item => item.endTime || item.startTime))
+  const startTime = Math.min(...items.map((item) => item.startTime));
+  const endTime = items.every((item) => item.done && item.endTime)
+    ? Math.max(...items.map((item) => item.endTime || item.startTime))
     : undefined;
 
   // P1-#7: derive elapsed from the shared NowTickProvider so we have
   // one timer for the whole page instead of one per visible item.
   const nowMs = useNow();
-  useEffect(() => {
-    if (!hasActiveItem) return;
-    setElapsedSeconds(Math.max(0, Math.floor((nowMs - startTime) / 1000)));
-  }, [hasActiveItem, startTime, nowMs]);
+  const elapsedSeconds = hasActiveItem
+    ? Math.max(0, Math.floor((nowMs - startTime) / 1000))
+    : 0;
 
   // Auto-collapse when all thinking is done
   useEffect(() => {
@@ -1577,9 +1559,10 @@ function ThinkingGroupItem({
     return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
   };
 
-  const duration = !hasActiveItem && endTime
-    ? formatDuration(Math.floor((endTime - startTime) / 1000))
-    : formatDuration(elapsedSeconds);
+  const duration =
+    !hasActiveItem && endTime
+      ? formatDuration(Math.floor((endTime - startTime) / 1000))
+      : formatDuration(elapsedSeconds);
 
   // If no non-empty items, don't render anything
   if (nonEmptyItems.length === 0) {
@@ -1614,13 +1597,13 @@ function ThinkingGroupItem({
           "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
           "bg-white/[0.04] border border-white/[0.06]",
           "text-white/40 hover:text-white/60 hover:bg-white/[0.06]",
-          "transition-all duration-200"
+          "transition-all duration-200",
         )}
       >
         <Brain
           className={cn(
             "h-3 w-3",
-            hasActiveItem && "animate-pulse text-indigo-400"
+            hasActiveItem && "animate-pulse text-indigo-400",
           )}
         />
         <span className="text-xs">
@@ -1629,12 +1612,14 @@ function ThinkingGroupItem({
             : `${label} for ${duration}`}
         </span>
         {nonEmptyItems.length > 1 && (
-          <span className="text-xs text-white/30">({nonEmptyItems.length})</span>
+          <span className="text-xs text-white/30">
+            ({nonEmptyItems.length})
+          </span>
         )}
         <ChevronDown
           className={cn(
             "h-3 w-3 transition-transform duration-200",
-            expanded ? "rotate-0" : "-rotate-90"
+            expanded ? "rotate-0" : "-rotate-90",
           )}
         />
       </button>
@@ -1643,7 +1628,7 @@ function ThinkingGroupItem({
       <div
         className={cn(
           "overflow-hidden transition-all duration-200 ease-out",
-          expanded ? "max-h-[50vh] opacity-100 mt-2" : "max-h-0 opacity-0"
+          expanded ? "max-h-[50vh] opacity-100 mt-2" : "max-h-0 opacity-0",
         )}
       >
         <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
@@ -1694,7 +1679,10 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
   // P1-#7: shared NowTickProvider drives elapsed for all items.
   const nowMs = useNow();
   const elapsedSeconds = item.done
-    ? Math.max(0, Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000))
+    ? Math.max(
+        0,
+        Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000),
+      )
     : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
   const [isExpanded, setIsExpanded] = useState(false);
 
@@ -1706,41 +1694,47 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
     return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
   };
 
-  const duration = item.done && item.endTime
-    ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
-    : formatDuration(elapsedSeconds);
+  const duration =
+    item.done && item.endTime
+      ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
+      : formatDuration(elapsedSeconds);
 
   const activeLabel = item.kind === "stream" ? "Streaming" : "Thinking";
   const pastLabel = item.kind === "stream" ? "Draft" : "Thought";
 
   // For completed items, check if content is long enough to collapse
-  const isLongContent = !isActive && item.content.length > THOUGHT_COLLAPSE_THRESHOLD;
+  const isLongContent =
+    !isActive && item.content.length > THOUGHT_COLLAPSE_THRESHOLD;
   const shouldTruncate = isLongContent && !isExpanded;
-  
+
   // Get truncated content for display
   const displayContent = shouldTruncate
     ? item.content.slice(0, THOUGHT_COLLAPSE_THRESHOLD) + "..."
     : item.content;
 
   return (
-    <div className={cn(
-      "rounded-lg border p-3",
-      // Unified styling - subtle border highlight for active, same base appearance
-      isActive
-        ? "border-indigo-500/30 bg-white/[0.02]"
-        : "border-white/[0.06] bg-white/[0.02]"
-    )}>
+    <div
+      className={cn(
+        "rounded-lg border p-3",
+        // Unified styling - subtle border highlight for active, same base appearance
+        isActive
+          ? "border-indigo-500/30 bg-white/[0.02]"
+          : "border-white/[0.06] bg-white/[0.02]",
+      )}
+    >
       <div className="flex items-center gap-2 mb-2">
         <Brain
           className={cn(
             "h-3.5 w-3.5 shrink-0",
-            isActive ? "animate-pulse text-indigo-400" : "text-white/40"
+            isActive ? "animate-pulse text-indigo-400" : "text-white/40",
           )}
         />
-        <span className={cn(
-          "text-xs font-medium",
-          isActive ? "text-indigo-400" : "text-white/50"
-        )}>
+        <span
+          className={cn(
+            "text-xs font-medium",
+            isActive ? "text-indigo-400" : "text-white/50",
+          )}
+        >
           {isActive
             ? `${activeLabel} for ${duration}`
             : `${pastLabel} for ${duration}`}
@@ -1772,7 +1766,11 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
                 ) : (
                   <>
                     <ChevronDown className="h-3 w-3" />
-                    Show more ({Math.round((item.content.length - THOUGHT_COLLAPSE_THRESHOLD) / 100) * 100}+ chars)
+                    Show more (
+                    {Math.round(
+                      (item.content.length - THOUGHT_COLLAPSE_THRESHOLD) / 100,
+                    ) * 100}
+                    + chars)
                   </>
                 )}
               </button>
@@ -1801,28 +1799,33 @@ function ThinkingPanel({
   missionId?: string | null;
 }) {
   const hasOpenModalOverlay = useCallback((): boolean => {
-    const overlays = Array.from(document.querySelectorAll("body > div.fixed.inset-0"));
+    const overlays = Array.from(
+      document.querySelectorAll("body > div.fixed.inset-0"),
+    );
     return overlays.some((overlay) => {
       const classText = overlay.className;
-      if (!classText.includes("items-center") && !classText.includes("items-start")) {
+      if (
+        !classText.includes("items-center") &&
+        !classText.includes("items-start")
+      ) {
         return false;
       }
-      const zIndex = Number.parseInt(window.getComputedStyle(overlay).zIndex || "0", 10);
+      const zIndex = Number.parseInt(
+        window.getComputedStyle(overlay).zIndex || "0",
+        10,
+      );
       return Number.isFinite(zIndex) && zIndex >= 50;
     });
   }, []);
 
-  const activeItems = useMemo(
-    () => items.filter((t) => !t.done),
-    [items]
-  );
+  const activeItems = useMemo(() => items.filter((t) => !t.done), [items]);
   const hasActiveThinking = activeItems.some((i) => i.kind === "thinking");
   const hasActiveStream = activeItems.some((i) => i.kind === "stream");
 
   // Deduplicate completed items by content - keep first occurrence
   const completedItems = useMemo(() => {
     const seen = new Set<string>();
-    return items.filter(t => {
+    return items.filter((t) => {
       if (!t.done) return false;
       // Skip empty/whitespace-only content
       const trimmed = t.content.trim();
@@ -1834,52 +1837,70 @@ function ThinkingPanel({
   }, [items]);
 
   // Performance: limit visible thoughts, load more on demand
-  const INITIAL_VISIBLE_THOUGHTS = 10;
-  const LOAD_MORE_THOUGHTS = 10;
-  const [visibleThoughtsState, setVisibleThoughtsState] = useState({
-    missionId,
-    limit: INITIAL_VISIBLE_THOUGHTS,
-  });
-  const visibleThoughtsLimit =
-    visibleThoughtsState.missionId === missionId
-      ? visibleThoughtsState.limit
-      : INITIAL_VISIBLE_THOUGHTS;
-  const loadMoreThoughts = useCallback(() => {
-    setVisibleThoughtsState((prev) => ({
-      missionId,
-      limit:
-        prev.missionId === missionId
-          ? prev.limit + LOAD_MORE_THOUGHTS
-          : INITIAL_VISIBLE_THOUGHTS + LOAD_MORE_THOUGHTS,
-    }));
-  }, [missionId]);
-
-  // Memoize the visible slice to avoid re-rendering completed items when only active content changes
-  const visibleCompletedItems = useMemo(
-    () => completedItems.slice(-visibleThoughtsLimit),
-    [completedItems, visibleThoughtsLimit]
-  );
-
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [isThoughtsAtBottom, setIsThoughtsAtBottom] = useState(true);
+  const panelRows = useMemo(() => {
+    const rows: Array<
+      | { kind: "completed"; item: SidePanelItem }
+      | { kind: "current" }
+      | { kind: "active"; item: SidePanelItem }
+    > = completedItems.map((item) => ({ kind: "completed", item }));
+    if (activeItems.length > 0 && completedItems.length > 0) {
+      rows.push({ kind: "current" });
+    }
+    for (const item of activeItems) {
+      rows.push({ kind: "active", item });
+    }
+    return rows;
+  }, [activeItems, completedItems]);
+  const thoughtsVirtualizer = useVirtualizer({
+    count: panelRows.length,
+    getScrollElement: () => scrollRef.current,
+    getItemKey: (index) => {
+      const row = panelRows[index];
+      if (!row) return index;
+      if (row.kind === "current") return "current";
+      return `${row.kind}:${row.item.id}`;
+    },
+    estimateSize: (index) => {
+      const row = panelRows[index];
+      if (!row) return 96;
+      if (row.kind === "current") return 24;
+      return row.item.kind === "stream" ? 140 : 112;
+    },
+    overscan: 6,
+  });
 
   // Auto-scroll to bottom when active thought content changes.
   // Use useLayoutEffect to set scroll before paint (prevents flicker).
   // Only scroll if already near the bottom (user hasn't scrolled up to read history).
   const userScrolledUpRef = useRef(false);
+  useEffect(() => {
+    userScrolledUpRef.current = false;
+    setIsThoughtsAtBottom(true);
+  }, [missionId]);
+
   useLayoutEffect(() => {
-    const el = scrollRef.current;
-    if (el && activeItems.length > 0 && !userScrolledUpRef.current) {
-      el.scrollTop = el.scrollHeight;
+    if (activeItems.length > 0 && !userScrolledUpRef.current) {
+      thoughtsVirtualizer.scrollToIndex(Math.max(panelRows.length - 1, 0), {
+        align: "end",
+      });
     }
-  }, [activeItems.map((i) => `${i.id}:${i.content.length}`).join("|")]);
+  }, [
+    activeItems.map((i) => `${i.id}:${i.content.length}`).join("|"),
+    panelRows.length,
+    thoughtsVirtualizer,
+  ]);
 
   // Track whether user has manually scrolled up
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const handleScroll = () => {
-      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      const distanceFromBottom =
+        el.scrollHeight - el.scrollTop - el.clientHeight;
       userScrolledUpRef.current = distanceFromBottom > 80;
+      setIsThoughtsAtBottom(!userScrolledUpRef.current);
     };
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
@@ -1898,16 +1919,29 @@ function ThinkingPanel({
   }, [hasOpenModalOverlay, onClose]);
 
   return (
-    <div className={cn("w-full h-full flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden animate-slide-in-right", className)}>
+    <div
+      className={cn(
+        "w-full h-full flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden animate-slide-in-right",
+        className,
+      )}
+    >
       {/* Header */}
       <div className="flex items-center justify-between border-b border-white/[0.06] px-4 py-3">
         <div className="flex items-center gap-2">
-          <Brain className={cn(
-            "h-4 w-4",
-            activeItems.length > 0 ? "animate-pulse text-indigo-400" : "text-white/40"
-          )} />
+          <Brain
+            className={cn(
+              "h-4 w-4",
+              activeItems.length > 0
+                ? "animate-pulse text-indigo-400"
+                : "text-white/40",
+            )}
+          />
           <span className="text-sm font-medium text-white">
-            {hasActiveThinking ? "Thinking" : hasActiveStream ? "Streaming" : "Thoughts"}
+            {hasActiveThinking
+              ? "Thinking"
+              : hasActiveStream
+                ? "Streaming"
+                : "Thoughts"}
           </span>
           {(completedItems.length > 0 || activeItems.length > 0) && (
             <span className="text-xs text-white/30">
@@ -1924,7 +1958,7 @@ function ThinkingPanel({
       </div>
 
       {/* Content - flex-col with overflow, scrolls up for history */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-3 flex flex-col">
+      <div ref={scrollRef} className="relative flex-1 overflow-y-auto p-3">
         {items.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center p-4">
             <Brain className="h-8 w-8 text-white/20 mb-3" />
@@ -1935,45 +1969,56 @@ function ThinkingPanel({
           </div>
         ) : (
           <>
-            {/* Spacer to push content to bottom when not enough to fill */}
-            <div className="flex-1" />
-
-            {/* Completed thoughts (history - scroll up to see) */}
-            {completedItems.length > 0 && (
-              <>
-                {/* Load more button if there are hidden thoughts */}
-                {completedItems.length > visibleThoughtsLimit && (
-                  <button
-                    onClick={loadMoreThoughts}
-                    className="w-full py-1.5 px-3 text-[10px] text-white/40 hover:text-white/60 hover:bg-white/5 rounded-lg transition-colors flex items-center justify-center gap-1.5"
+            <div
+              className="relative w-full"
+              style={{
+                height: `${thoughtsVirtualizer.getTotalSize()}px`,
+                minHeight: "100%",
+              }}
+            >
+              {thoughtsVirtualizer.getVirtualItems().map((virtualRow) => {
+                const row = panelRows[virtualRow.index];
+                if (!row) return null;
+                return (
+                  <div
+                    key={virtualRow.key}
+                    ref={thoughtsVirtualizer.measureElement}
+                    data-index={virtualRow.index}
+                    className="absolute left-0 top-0 w-full pb-3"
+                    style={{
+                      transform: `translateY(${virtualRow.start}px)`,
+                    }}
                   >
-                    <ChevronUp className="w-3 h-3" />
-                    Load {Math.min(LOAD_MORE_THOUGHTS, completedItems.length - visibleThoughtsLimit)} older
-                    <span className="text-white/25">
-                      ({completedItems.length - visibleThoughtsLimit} hidden)
-                    </span>
-                  </button>
-                )}
-                {visibleCompletedItems.map((item) => (
-                  <ThinkingPanelItem key={item.id} item={item} isActive={false} basePath={basePath} />
-                ))}
-                {activeItems.length > 0 && (
-                  <div className="text-[10px] uppercase tracking-wider text-white/30 px-1">
-                    Current
+                    {row.kind === "current" ? (
+                      <div className="text-[10px] uppercase tracking-wider text-white/30 px-1">
+                        Current
+                      </div>
+                    ) : (
+                      <ThinkingPanelItem
+                        item={row.item}
+                        isActive={row.kind === "active"}
+                        basePath={basePath}
+                      />
+                    )}
                   </div>
-                )}
-              </>
+                );
+              })}
+            </div>
+            {!isThoughtsAtBottom && (
+              <button
+                type="button"
+                onClick={() =>
+                  thoughtsVirtualizer.scrollToIndex(
+                    Math.max(panelRows.length - 1, 0),
+                    { align: "end" },
+                  )
+                }
+                className="absolute bottom-3 right-3 flex h-8 w-8 items-center justify-center rounded-full border border-white/[0.1] bg-black/50 text-white/60 shadow-lg transition-colors hover:bg-white/[0.08] hover:text-white"
+                title="Scroll to bottom"
+              >
+                <ArrowDown className="h-4 w-4" />
+              </button>
             )}
-
-            {/* Active items at the bottom (sticky) */}
-            {activeItems.map((item) => (
-              <ThinkingPanelItem
-                key={item.id}
-                item={item}
-                isActive={true}
-                basePath={basePath}
-              />
-            ))}
           </>
         )}
       </div>
@@ -1987,7 +2032,6 @@ function MissionWorkbenchPanel({
   role,
   isRunning,
   childMissions,
-  runtime,
   onClose,
   onResume,
   onCancel,
@@ -2003,16 +2047,6 @@ function MissionWorkbenchPanel({
   role: ReturnType<typeof inferMissionRole>;
   isRunning: boolean;
   childMissions: Mission[];
-  /**
-   * Optional runtime block (queue + subtask progress) surfaced inside the
-   * workbench so the toolbar can drop these chips. Caller passes only the
-   * values it has — the section renders only when at least one is active.
-   */
-  runtime?: {
-    queueLen: number;
-    subtaskCompleted?: number;
-    subtaskTotal?: number;
-  };
   onClose: () => void;
   onResume: () => void;
   onCancel: (missionId: string) => void;
@@ -2028,13 +2062,17 @@ function MissionWorkbenchPanel({
   runSettingsSlot?: React.ReactNode;
   className?: string;
 }) {
-  const title = mission?.title?.trim() || (mission ? getMissionShortName(mission.id) : "No mission selected");
+  const title =
+    mission?.title?.trim() ||
+    (mission ? getMissionShortName(mission.id) : "No mission selected");
   const status = mission ? missionStatusLabel(mission.status, isRunning) : null;
   const canResume =
     mission &&
     !isRunning &&
     mission.resumable &&
-    (mission.status === "interrupted" || mission.status === "blocked" || mission.status === "failed");
+    (mission.status === "interrupted" ||
+      mission.status === "blocked" ||
+      mission.status === "failed");
 
   const [markAsOpen, setMarkAsOpen] = useState(false);
   const markAsRef = useRef<HTMLDivElement>(null);
@@ -2042,7 +2080,10 @@ function MissionWorkbenchPanel({
   useEffect(() => {
     if (!markAsOpen) return;
     function handlePointerDown(event: MouseEvent) {
-      if (markAsRef.current && !markAsRef.current.contains(event.target as Node)) {
+      if (
+        markAsRef.current &&
+        !markAsRef.current.contains(event.target as Node)
+      ) {
         setMarkAsOpen(false);
       }
     }
@@ -2065,14 +2106,16 @@ function MissionWorkbenchPanel({
     <aside
       className={cn(
         "w-full h-full flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden animate-slide-in-right",
-        className
+        className,
       )}
       aria-label="Mission workbench"
     >
       <div className="flex items-center justify-between border-b border-white/[0.06] px-4 py-3">
         <div className="flex min-w-0 items-center gap-2">
           <BriefcaseBusiness className="h-4 w-4 shrink-0 text-indigo-400" />
-          <span className="truncate text-sm font-medium text-white">Workbench</span>
+          <span className="truncate text-sm font-medium text-white">
+            Workbench
+          </span>
         </div>
         <button
           onClick={onClose}
@@ -2087,7 +2130,9 @@ function MissionWorkbenchPanel({
         {!mission ? (
           <div className="flex h-full flex-col items-center justify-center text-center">
             <Inbox className="mb-3 h-8 w-8 text-white/20" />
-            <p className="text-sm text-white/40">Select a mission to inspect.</p>
+            <p className="text-sm text-white/40">
+              Select a mission to inspect.
+            </p>
             <button
               onClick={onOpenSwitcher}
               className="mt-4 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
@@ -2099,8 +2144,13 @@ function MissionWorkbenchPanel({
           <>
             <section className="space-y-3">
               <div>
-                <p className="mb-1 text-[10px] uppercase tracking-wide text-white/30">Mission</p>
-                <h2 className="line-clamp-3 text-sm font-medium leading-snug text-white/85" title={title}>
+                <p className="mb-1 text-[10px] uppercase tracking-wide text-white/30">
+                  Mission
+                </p>
+                <h2
+                  className="line-clamp-3 text-sm font-medium leading-snug text-white/85"
+                  title={title}
+                >
                   {title}
                 </h2>
               </div>
@@ -2108,8 +2158,15 @@ function MissionWorkbenchPanel({
                 <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
                   <p className="text-[10px] text-white/30">Status</p>
                   <div className="mt-1 flex items-center gap-1.5">
-                    <span className={cn("h-2 w-2 rounded-full", missionStatusDotClass(mission.status, isRunning))} />
-                    <span className={cn("text-xs font-medium", status?.className)}>
+                    <span
+                      className={cn(
+                        "h-2 w-2 rounded-full",
+                        missionStatusDotClass(mission.status, isRunning),
+                      )}
+                    />
+                    <span
+                      className={cn("text-xs font-medium", status?.className)}
+                    >
                       {status?.label}
                     </span>
                   </div>
@@ -2122,13 +2179,19 @@ function MissionWorkbenchPanel({
                 </div>
                 <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
                   <p className="text-[10px] text-white/30">Workspace</p>
-                  <p className="mt-1 truncate text-xs font-medium text-white/70" title={workspaceLabel}>
+                  <p
+                    className="mt-1 truncate text-xs font-medium text-white/70"
+                    title={workspaceLabel}
+                  >
                     {workspaceLabel ?? "Unassigned"}
                   </p>
                 </div>
                 <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
                   <p className="text-[10px] text-white/30">Updated</p>
-                  <RelativeTime date={mission.updated_at} className="mt-1 text-xs font-medium text-white/70" />
+                  <RelativeTime
+                    date={mission.updated_at}
+                    className="mt-1 text-xs font-medium text-white/70"
+                  />
                 </div>
               </div>
               {mission.short_description && (
@@ -2138,38 +2201,10 @@ function MissionWorkbenchPanel({
               )}
             </section>
 
-            {runtime && (runtime.queueLen > 0 || (runtime.subtaskTotal ?? 0) > 0) && (
-              <section className="space-y-2">
-                <p className="text-[10px] uppercase tracking-wide text-white/30">Runtime</p>
-                <div className="grid grid-cols-2 gap-2">
-                  {runtime.queueLen > 0 && (
-                    <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
-                      <p className="text-[10px] text-white/30">Queue</p>
-                      <p
-                        className={cn(
-                          "mt-1 text-xs font-medium tabular-nums",
-                          runtime.queueLen < 3 ? "text-amber-400" : "text-orange-400"
-                        )}
-                        title={`${runtime.queueLen} message${runtime.queueLen > 1 ? "s" : ""} waiting`}
-                      >
-                        {runtime.queueLen}
-                      </p>
-                    </div>
-                  )}
-                  {(runtime.subtaskTotal ?? 0) > 0 && (
-                    <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
-                      <p className="text-[10px] text-white/30">Subtask</p>
-                      <p className="mt-1 text-xs font-medium text-emerald-400 tabular-nums">
-                        {Math.min((runtime.subtaskCompleted ?? 0) + 1, runtime.subtaskTotal ?? 0)}/{runtime.subtaskTotal}
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </section>
-            )}
-
             <section className="space-y-2">
-              <p className="text-[10px] uppercase tracking-wide text-white/30">Actions</p>
+              <p className="text-[10px] uppercase tracking-wide text-white/30">
+                Actions
+              </p>
               <div className="grid grid-cols-2 gap-2">
                 {canResume && (
                   <button
@@ -2210,7 +2245,7 @@ function MissionWorkbenchPanel({
                     aria-expanded={markAsOpen}
                     className={cn(
                       "inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs font-medium text-white/70 hover:bg-white/[0.04]",
-                      markAsOpen && "bg-white/[0.06] text-white"
+                      markAsOpen && "bg-white/[0.06] text-white",
                     )}
                   >
                     <Flag className="h-3.5 w-3.5" />
@@ -2221,7 +2256,9 @@ function MissionWorkbenchPanel({
                       role="menu"
                       className="absolute right-0 top-full z-20 mt-1 w-40 overflow-hidden rounded-lg border border-white/[0.08] bg-[#1a1a1a] shadow-xl"
                     >
-                      {(["completed", "blocked", "failed"] as MissionStatus[]).map((nextStatus) => (
+                      {(
+                        ["completed", "blocked", "failed"] as MissionStatus[]
+                      ).map((nextStatus) => (
                         <AsyncButton
                           key={nextStatus}
                           role="menuitem"
@@ -2256,8 +2293,12 @@ function MissionWorkbenchPanel({
             {childMissions.length > 0 && (
               <section className="space-y-2">
                 <div className="flex items-center justify-between">
-                  <p className="text-[10px] uppercase tracking-wide text-white/30">Worker Missions</p>
-                  <span className="text-[10px] tabular-nums text-white/30">{childMissions.length}</span>
+                  <p className="text-[10px] uppercase tracking-wide text-white/30">
+                    Worker Missions
+                  </p>
+                  <span className="text-[10px] tabular-nums text-white/30">
+                    {childMissions.length}
+                  </span>
                 </div>
                 <div className="space-y-1.5">
                   {childMissions.slice(0, 6).map((child) => (
@@ -2266,7 +2307,12 @@ function MissionWorkbenchPanel({
                       onClick={() => onViewMission(child.id)}
                       className="flex w-full items-center gap-2 rounded-md border border-white/[0.05] bg-white/[0.02] px-2.5 py-2 text-left hover:bg-white/[0.04]"
                     >
-                      <span className={cn("h-2 w-2 rounded-full", missionStatusDotClass(child.status))} />
+                      <span
+                        className={cn(
+                          "h-2 w-2 rounded-full",
+                          missionStatusDotClass(child.status),
+                        )}
+                      />
                       <span className="min-w-0 flex-1 truncate text-xs text-white/70">
                         {child.title?.trim() || getMissionShortName(child.id)}
                       </span>
@@ -2284,21 +2330,49 @@ function MissionWorkbenchPanel({
 }
 
 // Get icon for tool based on its name
-function ToolIcon({ toolName, className }: { toolName: string; className?: string }) {
+function ToolIcon({
+  toolName,
+  className,
+}: {
+  toolName: string;
+  className?: string;
+}) {
   const name = toolName.toLowerCase();
-  if (name.includes("bash") || name.includes("shell") || name.includes("terminal") || name.includes("exec")) {
+  if (
+    name.includes("bash") ||
+    name.includes("shell") ||
+    name.includes("terminal") ||
+    name.includes("exec")
+  ) {
     return <Terminal className={className} />;
   }
-  if (name.includes("read") || name.includes("file") || name.includes("write")) {
+  if (
+    name.includes("read") ||
+    name.includes("file") ||
+    name.includes("write")
+  ) {
     return <FileText className={className} />;
   }
-  if (name.includes("search") || name.includes("grep") || name.includes("find")) {
+  if (
+    name.includes("search") ||
+    name.includes("grep") ||
+    name.includes("find")
+  ) {
     return <Search className={className} />;
   }
-  if (name.includes("browser") || name.includes("web") || name.includes("http") || name.includes("url")) {
+  if (
+    name.includes("browser") ||
+    name.includes("web") ||
+    name.includes("http") ||
+    name.includes("url")
+  ) {
     return <Globe className={className} />;
   }
-  if (name.includes("code") || name.includes("edit") || name.includes("patch")) {
+  if (
+    name.includes("code") ||
+    name.includes("edit") ||
+    name.includes("patch")
+  ) {
     return <Code className={className} />;
   }
   if (name.includes("list") || name.includes("dir") || name.includes("ls")) {
@@ -2376,10 +2450,16 @@ function extractSubagentInfo(args: unknown): {
   }
   const argsObj = args as Record<string, unknown>;
   return {
-    agentName: typeof argsObj.agent === "string" ? argsObj.agent :
-               typeof argsObj.subagent_type === "string" ? argsObj.subagent_type :
-               typeof argsObj.name === "string" ? argsObj.name : null,
-    description: typeof argsObj.description === "string" ? argsObj.description : null,
+    agentName:
+      typeof argsObj.agent === "string"
+        ? argsObj.agent
+        : typeof argsObj.subagent_type === "string"
+          ? argsObj.subagent_type
+          : typeof argsObj.name === "string"
+            ? argsObj.name
+            : null,
+    description:
+      typeof argsObj.description === "string" ? argsObj.description : null,
     prompt: typeof argsObj.prompt === "string" ? argsObj.prompt : null,
   };
 }
@@ -2395,15 +2475,18 @@ function parseSubagentResult(result: unknown): {
   // Handle string results
   if (typeof result === "string") {
     // Strip out <task_metadata>...</task_metadata> blocks entirely
-    const cleanedResult = result.replace(/<task_metadata>[\s\S]*?<\/task_metadata>/gi, "").trim();
+    const cleanedResult = result
+      .replace(/<task_metadata>[\s\S]*?<\/task_metadata>/gi, "")
+      .trim();
     // Check for explicit error indicators at the start, not just keyword presence
     const trimmedLower = cleanedResult.toLowerCase();
-    const isError = trimmedLower.startsWith("error:") ||
-                    trimmedLower.startsWith("error -") ||
-                    trimmedLower.startsWith("failed:") ||
-                    trimmedLower.startsWith("exception:");
+    const isError =
+      trimmedLower.startsWith("error:") ||
+      trimmedLower.startsWith("error -") ||
+      trimmedLower.startsWith("failed:") ||
+      trimmedLower.startsWith("exception:");
     // Try to extract a meaningful summary from the result
-    const lines = cleanedResult.split("\n").filter(l => l.trim());
+    const lines = cleanedResult.split("\n").filter((l) => l.trim());
     const summary = lines.length > 0 ? truncateText(lines[0], 100) : null;
     return { success: !isError, cancelled: false, summary };
   }
@@ -2411,18 +2494,33 @@ function parseSubagentResult(result: unknown): {
   // Handle object results
   if (typeof result === "object") {
     const resultObj = result as Record<string, unknown>;
-    const statusLower = typeof resultObj.status === "string" ? resultObj.status.toLowerCase() : "";
+    const statusLower =
+      typeof resultObj.status === "string"
+        ? resultObj.status.toLowerCase()
+        : "";
     const isCancelled = statusLower === "cancelled";
-    const isError = !isCancelled && (
-                    resultObj.error !== undefined ||
-                    resultObj.is_error === true ||
-                    resultObj.success === false ||
-                    statusLower === "error" || statusLower === "failed");
-    const summary = typeof resultObj.summary === "string" ? resultObj.summary :
-                    typeof resultObj.message === "string" ? resultObj.message :
-                    typeof resultObj.reason === "string" ? resultObj.reason :
-                    typeof resultObj.result === "string" ? truncateText(resultObj.result, 100) : null;
-    return { success: !isError && !isCancelled, cancelled: isCancelled, summary };
+    const isError =
+      !isCancelled &&
+      (resultObj.error !== undefined ||
+        resultObj.is_error === true ||
+        resultObj.success === false ||
+        statusLower === "error" ||
+        statusLower === "failed");
+    const summary =
+      typeof resultObj.summary === "string"
+        ? resultObj.summary
+        : typeof resultObj.message === "string"
+          ? resultObj.message
+          : typeof resultObj.reason === "string"
+            ? resultObj.reason
+            : typeof resultObj.result === "string"
+              ? truncateText(resultObj.result, 100)
+              : null;
+    return {
+      success: !isError && !isCancelled,
+      cancelled: isCancelled,
+      summary,
+    };
   }
 
   return { success: true, cancelled: false, summary: null };
@@ -2444,19 +2542,25 @@ const SubagentToolItem = memo(function SubagentToolItem({
   // contributor to the timer storm seen in devtools.
   const nowMs = useNow();
   const elapsedSeconds = isDone
-    ? Math.max(0, Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000))
+    ? Math.max(
+        0,
+        Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000),
+      )
     : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
 
   // Memoize subagent info extraction
   const { agentName, description, prompt } = useMemo(
     () => extractSubagentInfo(item.args),
-    [item.args]
+    [item.args],
   );
 
   // Memoize result parsing
   const { success, cancelled, summary } = useMemo(
-    () => (isDone ? parseSubagentResult(item.result) : { success: false, cancelled: false, summary: null }),
-    [isDone, item.result]
+    () =>
+      isDone
+        ? parseSubagentResult(item.result)
+        : { success: false, cancelled: false, summary: null },
+    [isDone, item.result],
   );
 
   const formatDuration = (seconds: number) => {
@@ -2468,14 +2572,15 @@ const SubagentToolItem = memo(function SubagentToolItem({
     return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
   };
 
-  const duration = isDone && item.endTime
-    ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
-    : formatDuration(elapsedSeconds);
+  const duration =
+    isDone && item.endTime
+      ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
+      : formatDuration(elapsedSeconds);
 
   // Memoize result string formatting
   const resultStr = useMemo(
     () => (item.result !== undefined ? formatToolArgs(item.result) : null),
-    [item.result]
+    [item.result],
   );
 
   return (
@@ -2484,7 +2589,7 @@ const SubagentToolItem = memo(function SubagentToolItem({
       data-chat-item-id={item.id}
       className={cn(
         "my-3 rounded-xl transition-colors",
-        highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10"
+        highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10",
       )}
     >
       {/* Main card */}
@@ -2495,7 +2600,7 @@ const SubagentToolItem = memo(function SubagentToolItem({
           !isDone && "border-purple-500/30",
           isDone && cancelled && "border-amber-500/20",
           isDone && success && !cancelled && "border-emerald-500/20",
-          isDone && !success && !cancelled && "border-red-500/20"
+          isDone && !success && !cancelled && "border-red-500/20",
         )}
       >
         {/* Header */}
@@ -2503,17 +2608,19 @@ const SubagentToolItem = memo(function SubagentToolItem({
           onClick={() => setExpanded(!expanded)}
           className={cn(
             "w-full flex items-center gap-3 px-3 py-2",
-            "hover:bg-white/[0.02] transition-colors"
+            "hover:bg-white/[0.02] transition-colors",
           )}
         >
           {/* Icon */}
-          <div className={cn(
-            "flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center",
-            !isDone && "bg-purple-500/20",
-            isDone && cancelled && "bg-amber-500/20",
-            isDone && success && !cancelled && "bg-emerald-500/20",
-            isDone && !success && !cancelled && "bg-red-500/20"
-          )}>
+          <div
+            className={cn(
+              "flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center",
+              !isDone && "bg-purple-500/20",
+              isDone && cancelled && "bg-amber-500/20",
+              isDone && success && !cancelled && "bg-emerald-500/20",
+              isDone && !success && !cancelled && "bg-red-500/20",
+            )}
+          >
             {!isDone ? (
               <Cpu className="h-4 w-4 text-purple-400 animate-pulse" />
             ) : cancelled ? (
@@ -2528,13 +2635,15 @@ const SubagentToolItem = memo(function SubagentToolItem({
           {/* Info */}
           <div className="flex-1 text-left min-w-0">
             <div className="flex items-center gap-2">
-              <span className={cn(
-                "text-sm font-medium",
-                !isDone && "text-purple-300",
-                isDone && cancelled && "text-amber-300",
-                isDone && success && !cancelled && "text-emerald-300",
-                isDone && !success && !cancelled && "text-red-300"
-              )}>
+              <span
+                className={cn(
+                  "text-sm font-medium",
+                  !isDone && "text-purple-300",
+                  isDone && cancelled && "text-amber-300",
+                  isDone && success && !cancelled && "text-emerald-300",
+                  isDone && !success && !cancelled && "text-red-300",
+                )}
+              >
                 {agentName || "Subagent"}
               </span>
               {description && (
@@ -2548,7 +2657,9 @@ const SubagentToolItem = memo(function SubagentToolItem({
             <div className="flex items-center gap-2 mt-0.5">
               {!isDone ? (
                 <>
-                  <span className="text-xs text-white/50">Running for {duration}</span>
+                  <span className="text-xs text-white/50">
+                    Running for {duration}
+                  </span>
                   <Loader className="h-3 w-3 animate-spin text-purple-400" />
                 </>
               ) : cancelled ? (
@@ -2562,7 +2673,9 @@ const SubagentToolItem = memo(function SubagentToolItem({
                 </>
               ) : (
                 <>
-                  <span className="text-xs text-white/50">Completed in {duration}</span>
+                  <span className="text-xs text-white/50">
+                    Completed in {duration}
+                  </span>
                   {summary && (
                     <span className="text-xs text-white/40 truncate max-w-[200px]">
                       — {summary}
@@ -2575,16 +2688,18 @@ const SubagentToolItem = memo(function SubagentToolItem({
 
           {/* Peek toggle */}
           <div className="flex items-center gap-1 flex-shrink-0">
-            <span className={cn(
-              "text-[10px] uppercase tracking-wider transition-colors",
-              expanded ? "text-white/50" : "text-white/30"
-            )}>
+            <span
+              className={cn(
+                "text-[10px] uppercase tracking-wider transition-colors",
+                expanded ? "text-white/50" : "text-white/30",
+              )}
+            >
               {expanded ? "Hide" : "Peek"}
             </span>
             <ChevronDown
               className={cn(
                 "h-4 w-4 text-white/30 transition-transform duration-200",
-                expanded ? "rotate-0" : "-rotate-90"
+                expanded ? "rotate-0" : "-rotate-90",
               )}
             />
           </div>
@@ -2597,8 +2712,9 @@ const SubagentToolItem = memo(function SubagentToolItem({
               className="h-full bg-purple-500/50 animate-pulse"
               style={{
                 width: "100%",
-                background: "linear-gradient(90deg, transparent, rgba(168, 85, 247, 0.5), transparent)",
-                animation: "shimmer 2s infinite"
+                background:
+                  "linear-gradient(90deg, transparent, rgba(168, 85, 247, 0.5), transparent)",
+                animation: "shimmer 2s infinite",
               }}
             />
           </div>
@@ -2606,44 +2722,50 @@ const SubagentToolItem = memo(function SubagentToolItem({
 
         {/* Expandable content — conditionally rendered (issue #156) */}
         {expanded && (
-        <div>
-          <div className="px-3 py-3 space-y-3 border-t border-white/[0.06]">
-            {/* Prompt preview */}
-            {prompt && (
-              <div>
-                <div className="text-[10px] uppercase tracking-wider text-white/30 mb-1">
-                  Task
+          <div>
+            <div className="px-3 py-3 space-y-3 border-t border-white/[0.06]">
+              {/* Prompt preview */}
+              {prompt && (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-white/30 mb-1">
+                    Task
+                  </div>
+                  <div className="text-xs text-white/60 bg-black/20 rounded p-2 max-h-24 overflow-y-auto">
+                    {truncateText(prompt, 300)}
+                  </div>
                 </div>
-                <div className="text-xs text-white/60 bg-black/20 rounded p-2 max-h-24 overflow-y-auto">
-                  {truncateText(prompt, 300)}
-                </div>
-              </div>
-            )}
+              )}
 
-            {/* Result */}
-            {resultStr !== null && (
-              <div>
-                <div className={cn(
-                  "text-[10px] uppercase tracking-wider mb-1",
-                  !success ? "text-red-400/70" : "text-emerald-400/70"
-                )}>
-                  {!success ? "Error" : "Result"}
-                </div>
-                <div className={cn(
-                  "max-h-60 overflow-y-auto rounded",
-                  !success && "[&_pre]:!bg-red-500/10"
-                )}>
-                  <LazyJsonHighlighter
-                    background={!success ? "rgba(239, 68, 68, 0.1)" : undefined}
-                    textColor={!success ? "rgb(248, 113, 113)" : undefined}
+              {/* Result */}
+              {resultStr !== null && (
+                <div>
+                  <div
+                    className={cn(
+                      "text-[10px] uppercase tracking-wider mb-1",
+                      !success ? "text-red-400/70" : "text-emerald-400/70",
+                    )}
                   >
-                    {resultStr}
-                  </LazyJsonHighlighter>
+                    {!success ? "Error" : "Result"}
+                  </div>
+                  <div
+                    className={cn(
+                      "max-h-60 overflow-y-auto rounded",
+                      !success && "[&_pre]:!bg-red-500/10",
+                    )}
+                  >
+                    <LazyJsonHighlighter
+                      background={
+                        !success ? "rgba(239, 68, 68, 0.1)" : undefined
+                      }
+                      textColor={!success ? "rgb(248, 113, 113)" : undefined}
+                    >
+                      {resultStr}
+                    </LazyJsonHighlighter>
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
           </div>
-        </div>
         )}
       </div>
     </div>
@@ -2694,9 +2816,12 @@ function ImagePreview({
         const params = new URLSearchParams({ path });
         if (workspaceId) params.set("workspace_id", workspaceId);
         if (missionId) params.set("mission_id", missionId);
-        const res = await fetch(`${API_BASE}/api/fs/download?${params.toString()}`, {
-          headers: { ...authHeader() },
-        });
+        const res = await fetch(
+          `${API_BASE}/api/fs/download?${params.toString()}`,
+          {
+            headers: { ...authHeader() },
+          },
+        );
         if (!res.ok) {
           throw new Error(`Failed to load image: ${res.status}`);
         }
@@ -2706,7 +2831,7 @@ function ImagePreview({
         setImageUrl(url);
       } catch (e) {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : 'Failed to load image');
+        setError(e instanceof Error ? e.message : "Failed to load image");
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -2721,11 +2846,11 @@ function ImagePreview({
 
   const openInNewTab = () => {
     if (imageUrl) {
-      window.open(imageUrl, '_blank');
+      window.open(imageUrl, "_blank");
     }
   };
 
-  const fileName = path.split('/').pop() || path;
+  const fileName = path.split("/").pop() || path;
 
   if (loading) {
     return (
@@ -2758,7 +2883,7 @@ function ImagePreview({
       >
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
-          src={imageUrl || ''}
+          src={imageUrl || ""}
           alt={fileName}
           className="max-w-full max-h-60 object-contain bg-black/20"
         />
@@ -2792,7 +2917,10 @@ const ToolCallItem = memo(function ToolCallItem({
   // P1-#7: shared NowTickProvider drives the "elapsed" pill.
   const nowMs = useNow();
   const elapsedSeconds = isDone
-    ? Math.max(0, Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000))
+    ? Math.max(
+        0,
+        Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000),
+      )
     : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
 
   const formatDuration = (seconds: number) => {
@@ -2804,9 +2932,10 @@ const ToolCallItem = memo(function ToolCallItem({
   };
 
   // Use endTime for completed tools, otherwise use elapsed time for running tools
-  const duration = isDone && item.endTime
-    ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
-    : formatDuration(elapsedSeconds);
+  const duration =
+    isDone && item.endTime
+      ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
+      : formatDuration(elapsedSeconds);
 
   // Memoize expensive string formatting - only recompute when item.args changes
   const argsStr = useMemo(() => formatToolArgs(item.args), [item.args]);
@@ -2814,8 +2943,9 @@ const ToolCallItem = memo(function ToolCallItem({
   // P4-#24 preview cap: split into 10KB head + truncated flag so we
   // don't feed multi-MB bash outputs into the syntax highlighter.
   const resultPreview = useMemo(
-    () => (item.result !== undefined ? formatToolResultPreview(item.result) : null),
-    [item.result]
+    () =>
+      item.result !== undefined ? formatToolResultPreview(item.result) : null,
+    [item.result],
   );
   const resultStr = resultPreview?.preview ?? null;
   const [resultExpanded, setResultExpanded] = useState(false);
@@ -2836,28 +2966,37 @@ const ToolCallItem = memo(function ToolCallItem({
     // Check if the result is an object with explicit error fields
     if (typeof item.result === "object" && item.result !== null) {
       const resultObj = item.result as Record<string, unknown>;
-      if (resultObj.error !== undefined || resultObj.is_error === true || resultObj.success === false) {
+      if (
+        resultObj.error !== undefined ||
+        resultObj.is_error === true ||
+        resultObj.success === false
+      ) {
         return true;
       }
     }
 
     // Check if the string result starts with error indicators (more specific than keyword search)
     const trimmedLower = resultStr.trim().toLowerCase();
-    return trimmedLower.startsWith("error:") ||
-           trimmedLower.startsWith("error -") ||
-           trimmedLower.startsWith("failed:") ||
-           trimmedLower.startsWith("exception:");
+    return (
+      trimmedLower.startsWith("error:") ||
+      trimmedLower.startsWith("error -") ||
+      trimmedLower.startsWith("failed:") ||
+      trimmedLower.startsWith("exception:")
+    );
   }, [item.result, resultStr, isCancelled]);
 
   // Memoize args preview - only recompute when item.args changes
   const argsPreview = useMemo(
-    () => truncateText(
-      typeof item.args === "object" && item.args !== null
-        ? Object.keys(item.args as Record<string, unknown>).slice(0, 2).join(", ")
-        : argsStr,
-      50
-    ),
-    [item.args, argsStr]
+    () =>
+      truncateText(
+        typeof item.args === "object" && item.args !== null
+          ? Object.keys(item.args as Record<string, unknown>)
+              .slice(0, 2)
+              .join(", ")
+          : argsStr,
+        50,
+      ),
+    [item.args, argsStr],
   );
 
   return (
@@ -2866,7 +3005,7 @@ const ToolCallItem = memo(function ToolCallItem({
       data-chat-item-id={item.id}
       className={cn(
         "my-2 rounded-xl transition-colors",
-        highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10"
+        highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10",
       )}
     >
       {/* Compact header */}
@@ -2880,7 +3019,7 @@ const ToolCallItem = memo(function ToolCallItem({
           !isDone && "border-amber-500/20",
           isDone && isCancelled && "border-amber-500/20",
           isDone && !isError && !isCancelled && "border-emerald-500/20",
-          isDone && isError && "border-red-500/20"
+          isDone && isError && "border-red-500/20",
         )}
       >
         <ToolIcon
@@ -2890,7 +3029,7 @@ const ToolCallItem = memo(function ToolCallItem({
             !isDone && "animate-pulse text-amber-400",
             isDone && isCancelled && "text-amber-400",
             isDone && !isError && !isCancelled && "text-emerald-400",
-            isDone && isError && "text-red-400"
+            isDone && isError && "text-red-400",
           )}
         />
         <span className="text-xs font-mono text-indigo-400">{item.name}</span>
@@ -2902,14 +3041,18 @@ const ToolCallItem = memo(function ToolCallItem({
         <span className="text-xs text-white/30 ml-1">
           {isDone ? (isCancelled ? "cancelled" : duration) : `${duration}...`}
         </span>
-        {isDone && !isError && !isCancelled && <CheckCircle className="h-3 w-3 text-emerald-400" />}
-        {isDone && isCancelled && <XCircle className="h-3 w-3 text-amber-400" />}
+        {isDone && !isError && !isCancelled && (
+          <CheckCircle className="h-3 w-3 text-emerald-400" />
+        )}
+        {isDone && isCancelled && (
+          <XCircle className="h-3 w-3 text-amber-400" />
+        )}
         {isDone && isError && <XCircle className="h-3 w-3 text-red-400" />}
         {!isDone && <Loader className="h-3 w-3 animate-spin text-amber-400" />}
         <ChevronDown
           className={cn(
             "h-3 w-3 transition-transform duration-200 ml-1",
-            expanded ? "rotate-0" : "-rotate-90"
+            expanded ? "rotate-0" : "-rotate-90",
           )}
         />
       </button>
@@ -2917,94 +3060,103 @@ const ToolCallItem = memo(function ToolCallItem({
       {/* Expandable content — conditionally rendered to avoid mounting
           SyntaxHighlighter while collapsed (issue #156). */}
       {expanded && (
-      <div className="mt-2">
-        <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 space-y-3">
-          {/* Arguments */}
-          {argsStr && (
-            <div>
-              <div className="text-[10px] uppercase tracking-wider text-white/30 mb-1">
-                Arguments
-              </div>
-              <div className="max-h-40 overflow-y-auto rounded">
-                <LazyJsonHighlighter>
-                  {argsStr}
-                </LazyJsonHighlighter>
-              </div>
-            </div>
-          )}
-
-          {/* Result */}
-          {resultStr !== null && (
-            <div>
-              <div className={cn(
-                "text-[10px] uppercase tracking-wider mb-1",
-                isError ? "text-red-400/70" : "text-emerald-400/70"
-              )}>
-                {isError ? "Error" : "Result"}
-              </div>
-              <div className={cn(
-                "max-h-40 overflow-y-auto rounded",
-                isError && "[&_pre]:!bg-red-500/10"
-              )}>
-                <LazyJsonHighlighter
-                  background={isError ? "rgba(239, 68, 68, 0.1)" : undefined}
-                  textColor={isError ? "rgb(248, 113, 113)" : undefined}
-                >
-                  {resultExpanded && item.result !== undefined
-                    ? formatToolArgs(item.result)
-                    : resultStr}
-                </LazyJsonHighlighter>
-              </div>
-              {resultPreview?.truncated && (
-                <div className="mt-1 flex items-center justify-between text-[10px] text-white/40">
-                  <span>
-                    {resultExpanded
-                      ? `Showing full output (${(resultPreview.fullLength / 1024).toFixed(0)} KB)`
-                      : `Showing first ${(TOOL_RESULT_PREVIEW_BYTES / 1024).toFixed(0)} KB of ${(resultPreview.fullLength / 1024).toFixed(0)} KB`}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setResultExpanded((v) => !v)}
-                    className="rounded bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium text-white/70 hover:bg-white/[0.08]"
-                  >
-                    {resultExpanded ? "Show preview" : "Show full output"}
-                  </button>
+        <div className="mt-2">
+          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 space-y-3">
+            {/* Arguments */}
+            {argsStr && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-white/30 mb-1">
+                  Arguments
                 </div>
-              )}
-              {/* Image previews for screenshot results - only from tools that produce images */}
-              {(() => {
-                // Only extract images from tools that actually produce screenshots
-                const IMAGE_PRODUCING_TOOLS = ['capture', 'screenshot', 'desktop_screenshot', 'mccli', 'browser_take_screenshot'];
-                const toolName = item.name.toLowerCase();
-                if (!IMAGE_PRODUCING_TOOLS.some(t => toolName.includes(t))) return null;
+                <div className="max-h-40 overflow-y-auto rounded">
+                  <LazyJsonHighlighter>{argsStr}</LazyJsonHighlighter>
+                </div>
+              </div>
+            )}
 
-                const imagePaths = extractImagePaths(resultStr);
-                if (imagePaths.length === 0) return null;
-                return (
-                  <div className="space-y-2">
-                    {imagePaths.map((path) => (
-                      <ImagePreview
-                        key={path}
-                        path={path}
-                        workspaceId={workspaceId}
-                        missionId={missionId}
-                      />
-                    ))}
+            {/* Result */}
+            {resultStr !== null && (
+              <div>
+                <div
+                  className={cn(
+                    "text-[10px] uppercase tracking-wider mb-1",
+                    isError ? "text-red-400/70" : "text-emerald-400/70",
+                  )}
+                >
+                  {isError ? "Error" : "Result"}
+                </div>
+                <div
+                  className={cn(
+                    "max-h-40 overflow-y-auto rounded",
+                    isError && "[&_pre]:!bg-red-500/10",
+                  )}
+                >
+                  <LazyJsonHighlighter
+                    background={isError ? "rgba(239, 68, 68, 0.1)" : undefined}
+                    textColor={isError ? "rgb(248, 113, 113)" : undefined}
+                  >
+                    {resultExpanded && item.result !== undefined
+                      ? formatToolArgs(item.result)
+                      : resultStr}
+                  </LazyJsonHighlighter>
+                </div>
+                {resultPreview?.truncated && (
+                  <div className="mt-1 flex items-center justify-between text-[10px] text-white/40">
+                    <span>
+                      {resultExpanded
+                        ? `Showing full output (${(resultPreview.fullLength / 1024).toFixed(0)} KB)`
+                        : `Showing first ${(TOOL_RESULT_PREVIEW_BYTES / 1024).toFixed(0)} KB of ${(resultPreview.fullLength / 1024).toFixed(0)} KB`}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setResultExpanded((v) => !v)}
+                      className="rounded bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium text-white/70 hover:bg-white/[0.08]"
+                    >
+                      {resultExpanded ? "Show preview" : "Show full output"}
+                    </button>
                   </div>
-                );
-              })()}
-            </div>
-          )}
+                )}
+                {/* Image previews for screenshot results - only from tools that produce images */}
+                {(() => {
+                  // Only extract images from tools that actually produce screenshots
+                  const IMAGE_PRODUCING_TOOLS = [
+                    "capture",
+                    "screenshot",
+                    "desktop_screenshot",
+                    "mccli",
+                    "browser_take_screenshot",
+                  ];
+                  const toolName = item.name.toLowerCase();
+                  if (!IMAGE_PRODUCING_TOOLS.some((t) => toolName.includes(t)))
+                    return null;
 
-          {/* Still running indicator */}
-          {!isDone && (
-            <div className="flex items-center gap-2 text-xs text-amber-400/70">
-              <Loader className="h-3 w-3 animate-spin" />
-              <span>Running for {duration}...</span>
-            </div>
-          )}
+                  const imagePaths = extractImagePaths(resultStr);
+                  if (imagePaths.length === 0) return null;
+                  return (
+                    <div className="space-y-2">
+                      {imagePaths.map((path) => (
+                        <ImagePreview
+                          key={path}
+                          path={path}
+                          workspaceId={workspaceId}
+                          missionId={missionId}
+                        />
+                      ))}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* Still running indicator */}
+            {!isDone && (
+              <div className="flex items-center gap-2 text-xs text-amber-400/70">
+                <Loader className="h-3 w-3 animate-spin" />
+                <span>Running for {duration}...</span>
+              </div>
+            )}
+          </div>
         </div>
-      </div>
       )}
     </div>
   );
@@ -3052,11 +3204,13 @@ function CollapsedToolGroup({
             "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
             "bg-white/[0.02] border border-white/[0.04]",
             "text-white/30 hover:text-white/50 hover:bg-white/[0.04]",
-            "transition-all duration-200 text-xs"
+            "transition-all duration-200 text-xs",
           )}
         >
           <ChevronUp className="h-3 w-3" />
-          <span>Hide {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}</span>
+          <span>
+            Hide {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
+          </span>
         </button>
         {tools.map((tool) => renderTool(tool))}
       </div>
@@ -3072,11 +3226,13 @@ function CollapsedToolGroup({
           "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
           "bg-white/[0.02] border border-white/[0.04]",
           "text-white/30 hover:text-white/50 hover:bg-white/[0.04]",
-          "transition-all duration-200 text-xs"
+          "transition-all duration-200 text-xs",
         )}
       >
         <ChevronDown className="h-3 w-3" />
-        <span>Show {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}</span>
+        <span>
+          Show {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
+        </span>
       </button>
       {renderTool(lastTool)}
     </div>
@@ -3095,7 +3251,7 @@ type ChatItemRowProps = {
   onToolResult: (
     toolCallId: string,
     name: string,
-    result: unknown
+    result: unknown,
   ) => Promise<void>;
   onOptimisticToolResult: (toolCallId: string, result: unknown) => void;
 };
@@ -3126,7 +3282,7 @@ const ChatItemRow = memo(function ChatItemRow({
         data-chat-item-id={item.groupId}
         className={cn(
           "rounded-xl transition-colors",
-          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10"
+          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10",
         )}
       >
         <CollapsedToolGroup
@@ -3147,7 +3303,7 @@ const ChatItemRow = memo(function ChatItemRow({
         data-chat-item-id={item.id}
         className={cn(
           "flex justify-end gap-3 group rounded-xl transition-colors",
-          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10"
+          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10",
         )}
       >
         <CopyButton text={item.content} className="self-start mt-2" />
@@ -3157,7 +3313,7 @@ const ChatItemRow = memo(function ChatItemRow({
               "rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light",
               item.queued
                 ? "border-2 border-dashed border-indigo-500/60 bg-indigo-500/20"
-                : "bg-indigo-500"
+                : "bg-indigo-500",
             )}
           >
             <p className="whitespace-pre-wrap text-sm break-words">
@@ -3193,7 +3349,7 @@ const ChatItemRow = memo(function ChatItemRow({
         data-chat-item-id={item.id}
         className={cn(
           "flex justify-start gap-3 group rounded-xl transition-colors",
-          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10"
+          highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10",
         )}
       >
         <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
@@ -3204,7 +3360,7 @@ const ChatItemRow = memo(function ChatItemRow({
             <MessageStatusIcon
               className={cn(
                 "h-3 w-3",
-                item.success ? "text-emerald-400" : "text-red-400"
+                item.success ? "text-emerald-400" : "text-red-400",
               )}
             />
             <span>
@@ -3332,9 +3488,8 @@ const ChatItemRow = memo(function ChatItemRow({
           ? item.args
           : {};
 
-        let optionList: ReturnType<
-          typeof parseSerializableOptionList
-        > | null = null;
+        let optionList: ReturnType<typeof parseSerializableOptionList> | null =
+          null;
         let parseErr: string | null = null;
         try {
           optionList = parseSerializableOptionList({
@@ -3507,21 +3662,75 @@ export default function ControlClient() {
   const searchParams = useSearchParams();
   const router = useRouter();
 
-  const [items, setItems] = useState<ChatItem[]>([]);
+  const [items, setItems] = useControlItemsStore();
   const itemsRef = useRef<ChatItem[]>([]);
   const [draftInput, setDraftInput] = useLocalStorage("control-draft", "");
   const [input, setInput] = useState(draftInput);
   const [canSubmitInput, setCanSubmitInput] = useState(false);
   const [lastMissionId, setLastMissionId] = useLocalStorage<string | null>(
     "control-last-mission-id",
-    null
+    null,
   );
 
-  const [runState, setRunState] = useState<ControlRunState>("idle");
-  const [runStateMissionId, setRunStateMissionId] = useState<string | null>(
-    null
+  const [viewingMissionSlice, setViewingMissionSlice] =
+    useControlViewingMissionStore();
+  const {
+    currentMission,
+    viewingMission,
+    viewingMissionId,
+    runState,
+    runStateMissionId,
+  } = viewingMissionSlice;
+  const setCurrentMission = useCallback(
+    (next: Mission | null | ((prev: Mission | null) => Mission | null)) => {
+      setViewingMissionSlice((prev) => ({
+        ...prev,
+        currentMission:
+          typeof next === "function" ? next(prev.currentMission) : next,
+      }));
+    },
+    [setViewingMissionSlice],
   );
-  const [queueLen, setQueueLen] = useState(0);
+  const setViewingMission = useCallback(
+    (next: Mission | null | ((prev: Mission | null) => Mission | null)) => {
+      setViewingMissionSlice((prev) => ({
+        ...prev,
+        viewingMission:
+          typeof next === "function" ? next(prev.viewingMission) : next,
+      }));
+    },
+    [setViewingMissionSlice],
+  );
+  const setViewingMissionId = useCallback(
+    (next: string | null | ((prev: string | null) => string | null)) => {
+      setViewingMissionSlice((prev) => ({
+        ...prev,
+        viewingMissionId:
+          typeof next === "function" ? next(prev.viewingMissionId) : next,
+      }));
+    },
+    [setViewingMissionSlice],
+  );
+  const setRunState = useCallback(
+    (next: ControlRunState | ((prev: ControlRunState) => ControlRunState)) => {
+      setViewingMissionSlice((prev) => ({
+        ...prev,
+        runState: typeof next === "function" ? next(prev.runState) : next,
+      }));
+    },
+    [setViewingMissionSlice],
+  );
+  const setRunStateMissionId = useCallback(
+    (next: string | null | ((prev: string | null) => string | null)) => {
+      setViewingMissionSlice((prev) => ({
+        ...prev,
+        runStateMissionId:
+          typeof next === "function" ? next(prev.runStateMissionId) : next,
+      }));
+    },
+    [setViewingMissionSlice],
+  );
+  const [queueLen, setQueueLen] = useControlQueueStore();
   const lastQueueLenRef = useRef<number | null>(null);
   const syncingQueueRef = useRef(false);
 
@@ -3547,7 +3756,9 @@ export default function ControlClient() {
   //                               accumulated cache size to decide whether
   //                               more older events exist.
   const missionMinSeqRef = useRef<Map<string, number>>(new Map());
-  const missionHistoricEventsRef = useRef<Map<string, StoredEvent[]>>(new Map());
+  const missionHistoricEventsRef = useRef<Map<string, StoredEvent[]>>(
+    new Map(),
+  );
   const historicItemsCountRef = useRef<Map<string, number>>(new Map());
   const missionTotalHistoryRef = useRef<Map<string, number>>(new Map());
   // In-flight guard for backwards-paginate. The manual "Load older
@@ -3580,8 +3791,9 @@ export default function ControlClient() {
 
   // Performance optimization: limit rendered items for large conversations
   const INITIAL_VISIBLE_ITEMS = 30;
-  const LOAD_MORE_INCREMENT = 30;
-  const [visibleItemsLimit, setVisibleItemsLimit] = useState(INITIAL_VISIBLE_ITEMS);
+  const [visibleItemsLimit, setVisibleItemsLimit] = useState(
+    INITIAL_VISIBLE_ITEMS,
+  );
 
   // Memory pressure safety valve. Long-running missions (25k+ events, each
   // with large tool_result payloads) have crashed the Brave/Chrome tab with
@@ -3609,7 +3821,7 @@ export default function ControlClient() {
         console.warn(
           `[mission-debug] heap ${(used / 1_048_576).toFixed(0)} MB exceeded ` +
             `${SHED_HEAP_BYTES / 1_048_576} MB — trimming items ` +
-            `${prev.length} → ${KEEP_TAIL_ITEMS}`
+            `${prev.length} → ${KEEP_TAIL_ITEMS}`,
         );
         return prev.slice(-KEEP_TAIL_ITEMS);
       });
@@ -3642,12 +3854,8 @@ export default function ControlClient() {
   >("disconnected");
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [showStreamDiagnostics, setShowStreamDiagnostics] = useState(false);
-  const [streamDiagnostics, setStreamDiagnostics] = useState<StreamDiagnosticsState>({
-    phase: "idle",
-    url: null,
-    bytes: 0,
-    lastError: null,
-  });
+  const [streamDiagnostics, setStreamDiagnostics] =
+    useControlStreamingDiagnosticsStore();
   const [diagTick, setDiagTick] = useState(0);
 
   // Progress state (for "Subtask X of Y" indicator), tracked per mission
@@ -3663,9 +3871,8 @@ export default function ControlClient() {
     >
   >({});
 
-  // Mission state
-  const [currentMission, setCurrentMission] = useState<Mission | null>(null);
-  const [viewingMission, setViewingMission] = useState<Mission | null>(null);
+  // Mission state lives in `controlViewingMissionStore`; these local states
+  // cover lower-churn loading/list UI around it.
   const [missionLoading, setMissionLoading] = useState(false);
   const [recentMissions, setRecentMissions] = useState<Mission[]>([]);
   const [dismissedResumeUI, setDismissedResumeUI] = useState(false);
@@ -3676,7 +3883,10 @@ export default function ControlClient() {
   // Library context for agents
 
   // Only tick when stream is active to avoid unnecessary re-renders
-  const streamIsActive = streamDiagnostics.phase === "open" || streamDiagnostics.phase === "streaming" || streamDiagnostics.phase === "connecting";
+  const streamIsActive =
+    streamDiagnostics.phase === "open" ||
+    streamDiagnostics.phase === "streaming" ||
+    streamDiagnostics.phase === "connecting";
   useEffect(() => {
     if (!streamIsActive) return;
     const interval = setInterval(() => setDiagTick((prev) => prev + 1), 1000);
@@ -3685,38 +3895,43 @@ export default function ControlClient() {
 
   // Parallel missions state
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
-    []
+    [],
   );
   const [showMissionSwitcher, setShowMissionSwitcher] = useState(false);
   const [showWorkerPanel, setShowWorkerPanel] = useState(false);
-  const [highlightedItemId, setHighlightedItemId] = useState<string | null>(null);
+  const [highlightedItemId, setHighlightedItemId] = useState<string | null>(
+    null,
+  );
   const deepLinkFocusKeyRef = useRef<string | null>(null);
   const [showAutomationsDialog, setShowAutomationsDialog] = useState(false);
 
-  // Track which mission's events we're viewing (for parallel missions)
-  // This can differ from currentMission when viewing a parallel mission
-  const [viewingMissionId, setViewingMissionId] = useState<string | null>(null);
+  // Track which mission's events we're viewing (for parallel missions).
+  // This can differ from currentMission when viewing a parallel mission; the
+  // value itself lives in `controlViewingMissionStore`.
 
   // Store items per mission to preserve context when switching
   // Limited to MAX_CACHED_MISSIONS to prevent memory bloat
   const MAX_CACHED_MISSIONS = 5;
   const [missionItems, setMissionItems] = useState<Record<string, ChatItem[]>>(
-    {}
+    {},
   );
 
   // Helper to update missionItems with LRU-style cleanup
-  const updateMissionItems = useCallback((missionId: string, items: ChatItem[]) => {
-    setMissionItems((prev) => {
-      const updated = { ...prev, [missionId]: items };
-      const keys = Object.keys(updated);
-      // If over limit, remove oldest entries (first in object)
-      if (keys.length > MAX_CACHED_MISSIONS) {
-        const toRemove = keys.slice(0, keys.length - MAX_CACHED_MISSIONS);
-        toRemove.forEach(k => delete updated[k]);
-      }
-      return updated;
-    });
-  }, []);
+  const updateMissionItems = useCallback(
+    (missionId: string, items: ChatItem[]) => {
+      setMissionItems((prev) => {
+        const updated = { ...prev, [missionId]: items };
+        const keys = Object.keys(updated);
+        // If over limit, remove oldest entries (first in object)
+        if (keys.length > MAX_CACHED_MISSIONS) {
+          const toRemove = keys.slice(0, keys.length - MAX_CACHED_MISSIONS);
+          toRemove.forEach((k) => delete updated[k]);
+        }
+        return updated;
+      });
+    },
+    [],
+  );
 
   // Attachment state
   const [attachments, setAttachments] = useState<
@@ -3740,13 +3955,17 @@ export default function ControlClient() {
   const desktopDisplayIdRef = useRef(":99");
   const [showDisplaySelector, setShowDisplaySelector] = useState(false);
   const [hasDesktopSession, setHasDesktopSession] = useState(false);
-  const [desktopSessions, setDesktopSessions] = useState<DesktopSessionDetail[]>([]);
+  const [desktopSessions, setDesktopSessions] = useState<
+    DesktopSessionDetail[]
+  >([]);
   const desktopSessionsRef = useRef<DesktopSessionDetail[]>([]);
   const hasDesktopSessionRef = useRef(false);
   const [isClosingDesktop, setIsClosingDesktop] = useState<string | null>(null);
   // Track when we're expecting a desktop session (from ToolCall before ToolResult arrives)
   const expectingDesktopSessionRef = useRef(false);
-  const desktopRapidPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const desktopRapidPollRef = useRef<ReturnType<typeof setInterval> | null>(
+    null,
+  );
 
   // Thinking panel state. Defaults to closed; the auto-show effect below
   // (`hasActiveThinking && !thinkingPanelManuallyHidden → setShowThinkingPanel(true)`)
@@ -3754,13 +3973,33 @@ export default function ControlClient() {
   // actually starts streaming. Defaulting to open made every cold-load of
   // an old mission (often with no thinking content at all) render the
   // panel by default.
-  const [showThinkingPanel, setShowThinkingPanel] = useState(false);
+  const [thinkingSlice, setThinkingSlice] = useControlThinkingStore();
+  const showThinkingPanel = thinkingSlice.panelOpen;
+  const setShowThinkingPanel = useCallback(
+    (next: boolean | ((prev: boolean) => boolean)) => {
+      setThinkingSlice((prev) => ({
+        ...prev,
+        panelOpen: typeof next === "function" ? next(prev.panelOpen) : next,
+      }));
+    },
+    [setThinkingSlice],
+  );
   // Deferred mirror used by the heavy chat-list regrouping memo so the toggle
   // click stays interactive even on long missions.
   const deferredShowThinkingPanel = useDeferredValue(showThinkingPanel);
-  const [thinkingPanelManuallyHidden, setThinkingPanelManuallyHidden] = useState(false);
+  const thinkingPanelManuallyHidden = thinkingSlice.manuallyHidden;
+  const setThinkingPanelManuallyHidden = useCallback(
+    (next: boolean | ((prev: boolean) => boolean)) => {
+      setThinkingSlice((prev) => ({
+        ...prev,
+        manuallyHidden:
+          typeof next === "function" ? next(prev.manuallyHidden) : next,
+      }));
+    },
+    [setThinkingSlice],
+  );
   const [showWorkbenchPanel, setShowWorkbenchPanel] = useState(
-    () => searchParams.get("workbench") === "1"
+    () => searchParams.get("workbench") === "1",
   );
   const handleToggleThinkingPanel = useCallback(() => {
     setShowThinkingPanel((prev) => {
@@ -3802,9 +4041,11 @@ export default function ControlClient() {
     () => [
       "user_message",
       "assistant_message",
+      "assistant_message_canonical",
       "tool_call",
       "tool_result",
       "text_delta",
+      "text_op",
       "thinking",
       // Goal-mode events fed into goalInfoByMission on hydration so the
       // pill renders on a fresh page load instead of waiting for the
@@ -3812,10 +4053,11 @@ export default function ControlClient() {
       "goal_iteration",
       "goal_status",
     ],
-    []
+    [],
   );
   const renderDeferredTraceRef = useRef<
-    ((id: string, traceEvents: StoredEvent[], maxSequence?: number) => void) | null
+    | ((id: string, traceEvents: StoredEvent[], maxSequence?: number) => void)
+    | null
   >(null);
   /**
    * Per-mission high-water mark for `sequence`. When non-zero, reload
@@ -3875,7 +4117,9 @@ export default function ControlClient() {
         // otherwise the next poll would skip every event between the
         // returned tail and the true max.
         const lastSeq =
-          events.length > 0 ? events[events.length - 1].sequence : opts.sinceSeq;
+          events.length > 0
+            ? events[events.length - 1].sequence
+            : opts.sinceSeq;
         const cursor =
           events.length >= HISTORY_PAGE_SIZE && lastSeq < meta.maxSequence
             ? lastSeq
@@ -3952,7 +4196,13 @@ export default function ControlClient() {
         try {
           const transcript = await getMissionTranscript(id);
           sorted = transcript.messages
-            .map(({ trace_count: _traceCount, trace_summary: _traceSummary, ...event }) => event)
+            .map(
+              ({
+                trace_count: _traceCount,
+                trace_summary: _traceSummary,
+                ...event
+              }) => event,
+            )
             .sort((a, b) => a.sequence - b.sequence);
           metaMaxSeq = transcript.latest_sequence;
           // Only count types the client actually loads. The transcript's
@@ -3973,7 +4223,10 @@ export default function ControlClient() {
           // populated below `eventsToItems`; this avoids blocking transcript
           // display on the heavier activity trace.
           setTimeout(() => {
-            void getMissionTraceWithMeta(id, { sinceSeq: 0, limit: HISTORY_PAGE_SIZE })
+            void getMissionTraceWithMeta(id, {
+              sinceSeq: 0,
+              limit: HISTORY_PAGE_SIZE,
+            })
               .then(({ events, meta }) => {
                 renderDeferredTraceRef.current?.(id, events, meta.maxSequence);
               })
@@ -4028,7 +4281,7 @@ export default function ControlClient() {
         sorted.length > 0
       ) {
         void writeCachedEvents(id, sorted, metaMaxSeq, metaTotal).catch(
-          () => undefined
+          () => undefined,
         );
       }
 
@@ -4052,14 +4305,16 @@ export default function ControlClient() {
       }
       return sorted;
     },
-    [HISTORY_EVENT_TYPES, INITIAL_HISTORY_PAGE_SIZE]
+    [HISTORY_EVENT_TYPES, INITIAL_HISTORY_PAGE_SIZE],
   );
 
   // Bridge between `loadHistoryEvents` (declared above) and
   // `streamOlderHistory` (declared below). `loadHistoryEvents` schedules
   // the background fill at the tail end of its initial-load branch, but
   // can't reference `streamOlderHistory` by name without a TDZ violation.
-  const streamOlderHistoryRef = useRef<((id: string) => Promise<void>) | null>(null);
+  const streamOlderHistoryRef = useRef<((id: string) => Promise<void>) | null>(
+    null,
+  );
 
   /**
    * Recompute "is there more older history to load" for a mission, by
@@ -4102,14 +4357,16 @@ export default function ControlClient() {
         loading: false,
       });
     },
-    [computeHasMoreOlder]
+    [computeHasMoreOlder],
   );
 
   // `loadOlderHistoryEvents` is declared further down, after
   // `eventsToItems` (TDZ). Search for its definition there.
 
   // Tool groups expansion state - tracks which groups are expanded by their first tool's id
-  const [expandedToolGroups, setExpandedToolGroups] = useState<Set<string>>(new Set());
+  const [expandedToolGroups, setExpandedToolGroups] = useState<Set<string>>(
+    new Set(),
+  );
 
   // Single O(n) pass derives every downstream view. Replaces 7 separate
   // `useMemo` hooks that each looped over `items` (see `deriveItemViews`
@@ -4132,17 +4389,30 @@ export default function ControlClient() {
     // while the chat-list regrouping is treated as a non-urgent transition.
     () =>
       perfBus.time("replay:group", () =>
-        deriveItemViews(items, deferredShowThinkingPanel)
+        deriveItemViews(items, deferredShowThinkingPanel),
       ),
-    [items, deferredShowThinkingPanel]
+    [items, deferredShowThinkingPanel],
   );
 
-  // P2-#14: memoize the tail slice + "agent is working" predicate so
-  // they don't recompute on every parent render (e.g. each NowTick).
-  const visibleGroupedItems = useMemo(
-    () => groupedItems.slice(-visibleItemsLimit),
-    [groupedItems, visibleItemsLimit]
-  );
+  const chatVirtualizer = useVirtualizer({
+    count: groupedItems.length,
+    getScrollElement: () => containerRef.current,
+    getItemKey: (index) => {
+      const item = groupedItems[index];
+      return item ? getGroupedItemKey(item) : index;
+    },
+    estimateSize: (index) => {
+      const item = groupedItems[index];
+      if (!item) return 160;
+      if (item.kind === "user") return 96;
+      if (item.kind === "assistant") return 180;
+      if (item.kind === "tool_group") return 160;
+      if (item.kind === "thinking_group") return 120;
+      if (item.kind === "tool") return 140;
+      return 100;
+    },
+    overscan: 8,
+  });
 
   const showAgentWorkingIndicator = useMemo(() => {
     if (items.length === 0) return false;
@@ -4152,7 +4422,7 @@ export default function ControlClient() {
         ((it.kind === "thinking" || it.kind === "stream") &&
           !it.done &&
           !showThinkingPanel) ||
-        it.kind === "phase"
+        it.kind === "phase",
     );
   }, [items, showThinkingPanel]);
 
@@ -4172,7 +4442,11 @@ export default function ControlClient() {
 
   useEffect(() => {
     // Only auto-show when transitioning from no active thinking to active thinking
-    if (hasActiveThinking && !prevHasActiveThinking.current && !thinkingPanelManuallyHidden) {
+    if (
+      hasActiveThinking &&
+      !prevHasActiveThinking.current &&
+      !thinkingPanelManuallyHidden
+    ) {
       setShowThinkingPanel(true);
     }
     prevHasActiveThinking.current = hasActiveThinking;
@@ -4210,8 +4484,12 @@ export default function ControlClient() {
   const viewingRunState = useMemo<ControlRunState>(() => {
     if (!viewingMissionId) return "idle";
     if (viewingRunningInfo) {
-      if (viewingRunningInfo.state === "waiting_for_tool") return "waiting_for_tool";
-      if (viewingRunningInfo.state === "queued" || viewingRunningInfo.state === "running") {
+      if (viewingRunningInfo.state === "waiting_for_tool")
+        return "waiting_for_tool";
+      if (
+        viewingRunningInfo.state === "queued" ||
+        viewingRunningInfo.state === "running"
+      ) {
         return "running";
       }
       return "idle";
@@ -4301,11 +4579,12 @@ export default function ControlClient() {
         item.kind === "tool" &&
         (item.name === "question" || item.name === "AskUserQuestion") &&
         item.result === undefined &&
-        idx > lastUserIdx
+        idx > lastUserIdx,
     );
   }, [items]);
 
-  const viewingMissionStallSeconds = viewingMissionStallInfo?.seconds_since_activity ?? 0;
+  const viewingMissionStallSeconds =
+    viewingMissionStallInfo?.seconds_since_activity ?? 0;
   const isViewingMissionStalled = Boolean(viewingMissionStallInfo);
   const isViewingMissionSeverelyStalled =
     viewingMissionStallInfo?.severity === "severe";
@@ -4315,7 +4594,9 @@ export default function ControlClient() {
     const runningIds = new Set(runningMissions.map((m) => m.mission_id));
     const currentId = currentMission?.id ?? null;
     return recentMissions
-      .filter((mission) => mission.id !== currentId && !runningIds.has(mission.id))
+      .filter(
+        (mission) => mission.id !== currentId && !runningIds.has(mission.id),
+      )
       .slice(0, 6);
   }, [recentMissions, runningMissions, currentMission?.id]);
 
@@ -4410,8 +4691,13 @@ export default function ControlClient() {
   }, [items]);
 
   // Smart auto-scroll
-  const { containerRef, endRef, isAtBottom, scrollToBottom, scrollToBottomImmediate } =
-    useScrollToBottom();
+  const {
+    containerRef,
+    endRef,
+    isAtBottom,
+    scrollToBottom,
+    scrollToBottomImmediate,
+  } = useScrollToBottom();
 
   // Scroll to bottom synchronously before paint when items change.
   // This ensures the page appears at the bottom instantly when returning
@@ -4499,7 +4785,7 @@ export default function ControlClient() {
     bitmap.close();
 
     const blob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, "image/jpeg", 0.8)
+      canvas.toBlob(resolve, "image/jpeg", 0.8),
     );
     if (!blob) return file;
 
@@ -4514,74 +4800,94 @@ export default function ControlClient() {
   }, []);
 
   // Handle file upload - wrapped in useCallback to avoid stale closures
-  const handleFileUpload = useCallback(async (file: File, insertion?: InputInsertionState) => {
-    let fileToUpload = file;
-    try {
-      fileToUpload = await compressImageFile(file);
-    } catch (error) {
-      console.warn("Image compression failed, using original file", error);
-    }
-
-    const displayName = fileToUpload.name;
-    setUploadQueue((prev) => [...prev, displayName]);
-    setUploadProgress({ fileName: displayName, progress: { loaded: 0, total: fileToUpload.size, percentage: 0 } });
-
-    try {
-      // Upload to mission-specific context folder if we have a mission
-      // Upload into the workspace-local ./context (symlinked to mission context inside the container).
-      const contextPath = "./context/";
-
-      // Get workspace_id and mission_id from current or viewing mission
-      const mission = viewingMission ?? currentMission;
-      const workspaceId = mission?.workspace_id;
-      const missionId = mission?.id;
-
-      // Use chunked upload for files > 10MB, regular for smaller
-      const useChunked = fileToUpload.size > 10 * 1024 * 1024;
-
-      const result = useChunked
-        ? await uploadFileChunked(fileToUpload, contextPath, (progress) => {
-            setUploadProgress({ fileName: displayName, progress });
-          }, workspaceId, missionId)
-        : await uploadFile(fileToUpload, contextPath, (progress) => {
-            setUploadProgress({ fileName: displayName, progress });
-          }, workspaceId, missionId);
-
-      toast.success(`Uploaded ${result.name}`);
-
-      const uploadNote = `[Uploaded: ${result.path}]`;
-      if (insertion) {
-        setInput((prev) => {
-          const textToInsert = insertion.insertedCount > 0 ? `\n${uploadNote}` : uploadNote;
-          const inserted = insertTextAtSelection(prev, textToInsert, {
-            start: insertion.start,
-            end: insertion.end,
-          });
-          insertion.start = inserted.cursor;
-          insertion.end = inserted.cursor;
-          insertion.insertedCount += 1;
-          return inserted.value;
-        });
-      } else {
-        // Preserve existing non-paste behavior for attach/upload button paths.
-        setInput((prev) => {
-          return prev ? `${uploadNote}\n${prev}` : uploadNote;
-        });
+  const handleFileUpload = useCallback(
+    async (file: File, insertion?: InputInsertionState) => {
+      let fileToUpload = file;
+      try {
+        fileToUpload = await compressImageFile(file);
+      } catch (error) {
+        console.warn("Image compression failed, using original file", error);
       }
-    } catch (error) {
-      console.error("Upload failed:", error);
-      const detail = error instanceof Error
-        ? error.message.replace(/^Upload failed:\s*/, "").trim()
-        : "";
-      const suffix = detail
-        ? `: ${detail.slice(0, 180)}${detail.length > 180 ? "..." : ""}`
-        : "";
-      toast.error(`Failed to upload ${displayName}${suffix}`);
-    } finally {
-      setUploadQueue((prev) => prev.filter((name) => name !== displayName));
-      setUploadProgress(null);
-    }
-  }, [compressImageFile, currentMission, viewingMission]);
+
+      const displayName = fileToUpload.name;
+      setUploadQueue((prev) => [...prev, displayName]);
+      setUploadProgress({
+        fileName: displayName,
+        progress: { loaded: 0, total: fileToUpload.size, percentage: 0 },
+      });
+
+      try {
+        // Upload to mission-specific context folder if we have a mission
+        // Upload into the workspace-local ./context (symlinked to mission context inside the container).
+        const contextPath = "./context/";
+
+        // Get workspace_id and mission_id from current or viewing mission
+        const mission = viewingMission ?? currentMission;
+        const workspaceId = mission?.workspace_id;
+        const missionId = mission?.id;
+
+        // Use chunked upload for files > 10MB, regular for smaller
+        const useChunked = fileToUpload.size > 10 * 1024 * 1024;
+
+        const result = useChunked
+          ? await uploadFileChunked(
+              fileToUpload,
+              contextPath,
+              (progress) => {
+                setUploadProgress({ fileName: displayName, progress });
+              },
+              workspaceId,
+              missionId,
+            )
+          : await uploadFile(
+              fileToUpload,
+              contextPath,
+              (progress) => {
+                setUploadProgress({ fileName: displayName, progress });
+              },
+              workspaceId,
+              missionId,
+            );
+
+        toast.success(`Uploaded ${result.name}`);
+
+        const uploadNote = `[Uploaded: ${result.path}]`;
+        if (insertion) {
+          setInput((prev) => {
+            const textToInsert =
+              insertion.insertedCount > 0 ? `\n${uploadNote}` : uploadNote;
+            const inserted = insertTextAtSelection(prev, textToInsert, {
+              start: insertion.start,
+              end: insertion.end,
+            });
+            insertion.start = inserted.cursor;
+            insertion.end = inserted.cursor;
+            insertion.insertedCount += 1;
+            return inserted.value;
+          });
+        } else {
+          // Preserve existing non-paste behavior for attach/upload button paths.
+          setInput((prev) => {
+            return prev ? `${uploadNote}\n${prev}` : uploadNote;
+          });
+        }
+      } catch (error) {
+        console.error("Upload failed:", error);
+        const detail =
+          error instanceof Error
+            ? error.message.replace(/^Upload failed:\s*/, "").trim()
+            : "";
+        const suffix = detail
+          ? `: ${detail.slice(0, 180)}${detail.length > 180 ? "..." : ""}`
+          : "";
+        toast.error(`Failed to upload ${displayName}${suffix}`);
+      } finally {
+        setUploadQueue((prev) => prev.filter((name) => name !== displayName));
+        setUploadProgress(null);
+      }
+    },
+    [compressImageFile, currentMission, viewingMission],
+  );
 
   // Handle URL download
   const handleUrlDownload = useCallback(async () => {
@@ -4596,7 +4902,13 @@ export default function ControlClient() {
       const workspaceId = mission?.workspace_id;
       const missionId = mission?.id;
 
-      const result = await downloadFromUrl(urlInput.trim(), contextPath, undefined, workspaceId, missionId);
+      const result = await downloadFromUrl(
+        urlInput.trim(),
+        contextPath,
+        undefined,
+        workspaceId,
+        missionId,
+      );
       toast.success(`Downloaded ${result.name}`);
 
       // Add a message about the download at the beginning (use full path)
@@ -4615,10 +4927,9 @@ export default function ControlClient() {
     }
   }, [urlInput, currentMission, viewingMission]);
 
-
   // Handle file input change
   const handleFileChange = async (
-    event: React.ChangeEvent<HTMLInputElement>
+    event: React.ChangeEvent<HTMLInputElement>,
   ) => {
     const files = Array.from(event.target.files || []);
     for (const file of files) {
@@ -4631,16 +4942,19 @@ export default function ControlClient() {
   };
 
   // Handle paste to upload files (e.g., screenshots from clipboard)
-  const handleFilePaste = useCallback(async (files: File[], context: FilePasteContext) => {
-    const insertion: InputInsertionState = {
-      start: context.selectionStart,
-      end: context.selectionEnd,
-      insertedCount: 0,
-    };
-    for (const file of files) {
-      await handleFileUpload(file, insertion);
-    }
-  }, [handleFileUpload]);
+  const handleFilePaste = useCallback(
+    async (files: File[], context: FilePasteContext) => {
+      const insertion: InputInsertionState = {
+        start: context.selectionStart,
+        end: context.selectionEnd,
+        insertedCount: 0,
+      };
+      for (const file of files) {
+        await handleFileUpload(file, insertion);
+      }
+    },
+    [handleFileUpload],
+  );
 
   // Convert mission history to chat items
   const getActiveDesktopSession = useCallback((mission?: Mission | null) => {
@@ -4737,7 +5051,7 @@ export default function ControlClient() {
       }
       return hasSession;
     },
-    [getActiveDesktopSession]
+    [getActiveDesktopSession],
   );
 
   const applyDesktopSessionState = useCallback(
@@ -4749,7 +5063,7 @@ export default function ControlClient() {
         // but allows switching when changing to a different mission.
         const currentDisplayId = desktopDisplayIdRef.current;
         const currentBelongsToThisMission = mission.desktop_sessions?.some(
-          s => s.display === currentDisplayId && !s.stopped_at
+          (s) => s.display === currentDisplayId && !s.stopped_at,
         );
         if (!currentBelongsToThisMission) {
           setDesktopDisplayId(activeSession.display);
@@ -4766,7 +5080,7 @@ export default function ControlClient() {
         setHasDesktopSession(false);
       }
     },
-    [getActiveDesktopSession, missionHasDesktopSession]
+    [getActiveDesktopSession, missionHasDesktopSession],
   );
 
   // Detect desktop sessions from stored events (when loading from history)
@@ -4827,7 +5141,7 @@ export default function ControlClient() {
         }
       }
     },
-    [extractDesktopDisplay]
+    [extractDesktopDisplay],
   );
 
   const hasRunningDesktopSessionForMission = useCallback(
@@ -4844,10 +5158,10 @@ export default function ControlClient() {
         (session) =>
           session.process_running &&
           session.status !== "stopped" &&
-          session.mission_id === missionId
+          session.mission_id === missionId,
       );
     },
-    [getActiveDesktopSession]
+    [getActiveDesktopSession],
   );
 
   const missionForDownloads = viewingMission ?? currentMission;
@@ -4895,7 +5209,7 @@ export default function ControlClient() {
     // Find index of last assistant message to apply mission status
     const lastAssistantIdx = mission.history.reduce(
       (lastIdx, entry, i) => (entry.role === "assistant" ? i : lastIdx),
-      -1
+      -1,
     );
     // Mission is considered failed if status is "failed"
     const missionFailed = mission.status === "failed";
@@ -4924,7 +5238,8 @@ export default function ControlClient() {
           costSource: "unknown" as const,
           model: null,
           timestamp,
-          resumable: isLastAssistant && missionFailed ? mission.resumable : undefined,
+          resumable:
+            isLastAssistant && missionFailed ? mission.resumable : undefined,
         };
       }
     });
@@ -4936,7 +5251,9 @@ export default function ControlClient() {
         return eventItems;
       }
 
-      const historyHasAssistant = mission.history.some((entry) => entry.role === "assistant");
+      const historyHasAssistant = mission.history.some(
+        (entry) => entry.role === "assistant",
+      );
       if (!historyHasAssistant) {
         return eventItems;
       }
@@ -4953,284 +5270,139 @@ export default function ControlClient() {
       // prepend coarse mission history so the chat still has prior
       // user/assistant context.
       const basicIds = new Set(basicItems.map((item) => item.id));
-      const eventOnlyItems = eventItems.filter((item) => !basicIds.has(item.id));
+      const eventOnlyItems = eventItems.filter(
+        (item) => !basicIds.has(item.id),
+      );
       return [...basicItems, ...eventOnlyItems];
     },
-    [missionHistoryToItems]
+    [missionHistoryToItems],
   );
 
   // Convert stored events (from SQLite) to ChatItems for display
   // This enables full history replay including tool calls on page refresh
-  const eventsToItems = useCallback((events: StoredEvent[], mission?: Mission | null): ChatItem[] => {
-    return perfBus.time("replay:apply", () => eventsToItemsImpl(events, mission));
+  const eventsToItems = useCallback(
+    (events: StoredEvent[], mission?: Mission | null): ChatItem[] => {
+      return perfBus.time("replay:apply", () =>
+        eventsToItemsImpl(events, mission),
+      );
+    },
+    [],
+  );
+  const eventsWorkerRef = useRef<Worker | null | false>(null);
+  const eventsWorkerSeqRef = useRef(0);
+  const eventsWorkerPendingRef = useRef(
+    new Map<
+      number,
+      {
+        resolve: (items: ChatItem[]) => void;
+        reject: (error: Error) => void;
+      }
+    >(),
+  );
+
+  useEffect(() => {
+    const pendingMap = eventsWorkerPendingRef.current;
+    return () => {
+      if (eventsWorkerRef.current instanceof Worker) {
+        eventsWorkerRef.current.terminate();
+      }
+      for (const pending of pendingMap.values()) {
+        pending.reject(new Error("events worker terminated"));
+      }
+      pendingMap.clear();
+    };
   }, []);
 
-  // Implementation extracted so the perf wrapper above stays one-liner; the
-  // function body is unchanged from the original eventsToItems.
-  function eventsToItemsImpl(events: StoredEvent[], mission?: Mission | null): ChatItem[] {
-    const items: ChatItem[] = [];
-    const toolCallMap = new Map<string, number>(); // tool_call_id -> index in items
-    // Track seen event IDs to prevent duplicate items (backend may store duplicates)
-    const seenEventIds = new Set<string>();
-    // Track current in-progress thinking item index for consolidation
-    // Multiple thinking events (deltas) are streamed and stored; we consolidate them here
-    let currentThinkingIdx: number | null = null;
-    let lastTextDelta:
-      | { id: string; content: string; timestamp: number }
-      | null = null;
-    let lastAssistantTimestamp = 0;
-    const missionActive = mission?.status === "active";
+  const getEventsWorker = useCallback((): Worker | null => {
+    if (eventsWorkerRef.current === false) return null;
+    if (eventsWorkerRef.current) return eventsWorkerRef.current;
 
-    // Helper to finalize pending thinking item
-    const finalizePendingThinking = (endTime: number) => {
-      if (currentThinkingIdx !== null) {
-        const pending = items[currentThinkingIdx] as Extract<ChatItem, { kind: "thinking" }>;
-        if (!pending.done) {
-          items[currentThinkingIdx] = {
-            ...pending,
-            done: true,
-            endTime,
-          };
+    try {
+      const worker = new Worker(new URL("./events-worker.ts", import.meta.url));
+      worker.onmessage = (message: MessageEvent<EventsWorkerResponse>) => {
+        const response = message.data;
+        const pending = eventsWorkerPendingRef.current.get(response.id);
+        if (!pending) return;
+        eventsWorkerPendingRef.current.delete(response.id);
+        if (response.ok) {
+          pending.resolve(response.items);
+        } else {
+          pending.reject(new Error(response.error));
         }
-        currentThinkingIdx = null;
+      };
+      worker.onerror = (event) => {
+        for (const pending of eventsWorkerPendingRef.current.values()) {
+          pending.reject(
+            new Error(event.message || "events worker failed to load"),
+          );
+        }
+        eventsWorkerPendingRef.current.clear();
+        worker.terminate();
+        eventsWorkerRef.current = false;
+      };
+      eventsWorkerRef.current = worker;
+      return worker;
+    } catch {
+      eventsWorkerRef.current = false;
+      return null;
+    }
+  }, []);
+
+  const eventsToItemsAsync = useCallback(
+    async (events: StoredEvent[], mission?: Mission | null): Promise<ChatItem[]> => {
+      if (events.length < 500) {
+        return eventsToItems(events, mission);
       }
-    };
 
-    for (const event of events) {
-      const timestamp = new Date(event.timestamp).getTime();
-
-      switch (event.event_type) {
-        case "user_message": {
-          // Finalize any pending thinking before user message
-          finalizePendingThinking(timestamp);
-          // Use event_id (UUID) if available for deduplication with SSE events,
-          // fall back to row id for older events without event_id
-          const itemId = event.event_id ?? `event-${event.id}`;
-          // Skip duplicate events (backend may store the same event multiple times)
-          if (seenEventIds.has(itemId)) break;
-          seenEventIds.add(itemId);
-          items.push({
-            kind: "user" as const,
-            id: itemId,
-            content: event.content,
-            timestamp,
-          });
-          break;
-        }
-
-        case "assistant_message": {
-          // Finalize any pending thinking before assistant message
-          finalizePendingThinking(timestamp);
-          const meta = event.metadata || {};
-          const isFailure = meta.success === false;
-          const { costCents, costSource } = parseCostMetadata(meta);
-
-          // When mission fails, mark all pending tool calls as failed
-          // This ensures subagent headers don't stay stuck showing "Running for X"
-          if (isFailure) {
-            const errorMessage = event.content || "Mission failed";
-            for (let i = 0; i < items.length; i++) {
-              const it = items[i];
-              if (it.kind === "tool" && it.result === undefined) {
-                items[i] = {
-                  ...it,
-                  result: { error: errorMessage, status: "failed" },
-                  endTime: timestamp,
-                };
-              }
-            }
-          }
-
-          // Use event_id (UUID) if available for deduplication with SSE events
-          const assistantId = event.event_id ?? `event-${event.id}`;
-          // Skip duplicate events
-          if (seenEventIds.has(assistantId)) break;
-          seenEventIds.add(assistantId);
-          items.push({
-            kind: "assistant" as const,
-            id: assistantId,
-            content: event.content,
-            success: !isFailure,
-            costCents,
-            costSource,
-            model: typeof meta.model === "string" ? meta.model : null,
-            timestamp,
-          });
-          lastAssistantTimestamp = timestamp;
-          break;
-        }
-
-        case "text_delta": {
-          const content = event.content || "";
-          if (content.trim().length === 0) break;
-          lastTextDelta = {
-            id: event.event_id ?? `text-delta-${event.id}`,
-            content,
-            timestamp,
-          };
-          break;
-        }
-
-        case "thinking": {
-          // Consolidate thinking events: backend streams multiple deltas that we merge
-          const meta = event.metadata || {};
-          const isDone = meta.done === true;
-          const content = event.content || "";
-
-          if (currentThinkingIdx !== null) {
-            const existing = items[currentThinkingIdx] as Extract<ChatItem, { kind: "thinking" }>;
-            const existingContent = existing.content || "";
-            // P1-#8: tolerant continuation check — strips trailing
-            // whitespace/punct and allows a short tail wobble so the
-            // "NoNo newNo new CI…" double-emission pattern consolidates.
-            const isContinuation = isStreamContinuation(content, existingContent);
-
-            if (!isContinuation) {
-              // Treat as a new thought session: finalize previous and start a new item.
-              items[currentThinkingIdx] = {
-                ...existing,
-                done: true,
-                endTime: timestamp,
-              };
-              const newIdx = items.length;
-              items.push({
-                kind: "thinking" as const,
-                id: `event-${event.id}`,
-                content,
-                done: isDone,
-                startTime: timestamp,
-                endTime: isDone ? timestamp : undefined,
-              });
-              currentThinkingIdx = isDone ? null : newIdx;
-            } else {
-              // Continuation of the same thought: keep the longer content.
-              const newContent = content.length > existingContent.length ? content : existingContent;
-              items[currentThinkingIdx] = {
-                ...existing,
-                content: newContent,
-                done: isDone,
-                endTime: isDone ? timestamp : existing.endTime,
-              };
-              if (isDone) {
-                currentThinkingIdx = null; // Reset for next thinking session
-              }
-            }
-          } else {
-            const newIdx = items.length;
-            items.push({
-              kind: "thinking" as const,
-              id: `event-${event.id}`,
-              content,
-              done: isDone,
-              startTime: timestamp,
-              endTime: isDone ? timestamp : undefined,
-            });
-            if (!isDone) {
-              currentThinkingIdx = newIdx; // Track for consolidation
-            }
-          }
-          break;
-        }
-
-        case "tool_call": {
-          // Finalize any pending thinking before tool call
-          finalizePendingThinking(timestamp);
-          // Clear pending text delta — the text before this tool call belongs to
-          // the same assistant turn, so it shouldn't linger as a separate "Draft"
-          // stream item if the tool call hangs or the assistant_message is never emitted.
-          lastTextDelta = null;
-          const toolCallId = event.tool_call_id || `unknown-${event.id}`;
-          const name = event.tool_name || "unknown";
-          const isUiTool = name.startsWith("ui_") || name === "question" || name === "AskUserQuestion";
-          // Parse args from content (stored as JSON string)
-          let args: unknown = undefined;
-          try {
-            args = event.content ? JSON.parse(event.content) : undefined;
-          } catch {
-            args = event.content;
-          }
-          const toolItem: ChatItem = {
-            kind: "tool" as const,
-            id: `tool-${toolCallId}`,
-            toolCallId,
-            name,
-            args,
-            isUiTool,
-            startTime: timestamp,
-            result: undefined,
-            endTime: undefined,
-          };
-          toolCallMap.set(toolCallId, items.length);
-          items.push(toolItem);
-          break;
-        }
-
-        case "tool_result": {
-          const toolCallId = event.tool_call_id || "";
-          const idx = toolCallMap.get(toolCallId);
-          if (idx !== undefined) {
-            // Update existing tool item with result
-            const toolItem = items[idx] as Extract<ChatItem, { kind: "tool" }>;
-            // Parse result from content
-            let result: unknown = event.content;
-            try {
-              result = event.content ? JSON.parse(event.content) : event.content;
-            } catch {
-              // Keep as string if not valid JSON
-            }
-            items[idx] = {
-              ...toolItem,
-              result,
-              endTime: timestamp,
-            };
-          }
-          break;
-        }
-
-        // Skip other event types (error, mission_status_changed, etc.)
+      const worker = getEventsWorker();
+      if (!worker) {
+        return eventsToItems(events, mission);
       }
-    }
 
-    // Finalize any pending thinking item (e.g., if done event wasn't stored).
-    // For active missions, keep the last item "open" so the side panel can show ongoing progress.
-    if (!missionActive) {
-      finalizePendingThinking(Date.now());
-    }
-
-    if (lastTextDelta && lastTextDelta.timestamp > lastAssistantTimestamp) {
-      // If the text delta is stale (>5 min old) and mission is still active,
-      // treat it as finalized to avoid showing a permanent "Draft" label
-      // when a tool call hung or the assistant_message event was lost.
-      const STALE_THRESHOLD_MS = 5 * 60 * 1000;
-      const isStale =
-        missionActive && Date.now() - lastTextDelta.timestamp > STALE_THRESHOLD_MS;
-      const isDone = !missionActive || isStale;
-      items.push({
-        kind: "stream" as const,
-        id: lastTextDelta.id,
-        content: lastTextDelta.content,
-        done: isDone,
-        startTime: lastTextDelta.timestamp,
-        endTime: isDone ? lastTextDelta.timestamp : undefined,
-      });
-    }
-
-    return items;
-  }
+      const id = eventsWorkerSeqRef.current++;
+      try {
+        return await perfBus.time(
+          "replay:apply:worker",
+          () =>
+            new Promise<ChatItem[]>((resolve, reject) => {
+              eventsWorkerPendingRef.current.set(id, { resolve, reject });
+              worker.postMessage({
+                id,
+                events,
+                mission,
+              } satisfies EventsWorkerRequest);
+            }),
+        );
+      } catch (error) {
+        eventsWorkerPendingRef.current.delete(id);
+        eventsWorkerRef.current = false;
+        worker.terminate();
+        console.warn("[control] events worker failed; falling back to sync", error);
+        return eventsToItems(events, mission);
+      }
+    },
+    [eventsToItems, getEventsWorker],
+  );
 
   renderDeferredTraceRef.current = (id, traceEvents, maxSequence) => {
     if (traceEvents.length === 0) return;
     const liveCurrent = currentMissionRef.current;
     const liveViewing = viewingMissionRef.current;
     const mission =
-      liveCurrent?.id === id ? liveCurrent : liveViewing?.id === id ? liveViewing : null;
+      liveCurrent?.id === id
+        ? liveCurrent
+        : liveViewing?.id === id
+          ? liveViewing
+          : null;
     if (!mission) return;
 
     const existing = missionHistoricEventsRef.current.get(id) ?? [];
     const bySequence = new Map<number, StoredEvent>();
     for (const event of existing) bySequence.set(event.sequence, event);
     for (const event of traceEvents) bySequence.set(event.sequence, event);
-    const merged = [...bySequence.values()].sort((a, b) => a.sequence - b.sequence);
+    const merged = [...bySequence.values()].sort(
+      (a, b) => a.sequence - b.sequence,
+    );
     missionHistoricEventsRef.current.set(id, merged);
     if (merged.length > 0) {
       missionMinSeqRef.current.set(id, merged[0].sequence);
@@ -5259,7 +5431,7 @@ export default function ControlClient() {
     setOlderLoadState((prev) =>
       prev.missionId === id && !prev.loading
         ? { ...prev, hasMore: computeHasMoreOlder(id) }
-        : prev
+        : prev,
     );
   };
 
@@ -5309,139 +5481,145 @@ export default function ControlClient() {
       }
       try {
         try {
-        const { events: olderEvents } = await getMissionEventsWithMeta(id, {
-          types: HISTORY_EVENT_TYPES,
-          beforeSeq,
-          limit: opts?.limit ?? HISTORY_PAGE_SIZE,
-        });
-        if (olderEvents.length === 0) {
-          // Same per-mission gate as below — see comment on
-          // `stillActiveForId`. If the user switched missions while we
-          // were fetching, don't pin the new mission's UI to "no more
-          // older messages" based on the old mission's empty page.
-          if (
-            currentMissionRef.current?.id === id ||
-            viewingMissionRef.current?.id === id
-          ) {
-            setOlderLoadState({ missionId: id, hasMore: false, loading: false });
-          }
-          return;
-        }
-
-        // After the await, the user may have switched missions. Read the
-        // *currently-viewing* mission from refs (which the keep-in-sync
-        // useEffects update synchronously from state), NOT from the
-        // closure-captured `viewingMission` — that's stale across renders
-        // and would happily prepend the old mission's events into the new
-        // mission's items.
-        const liveCurrent = currentMissionRef.current;
-        const liveViewing = viewingMissionRef.current;
-        // Single shared gate. If false, this completion belongs to a
-        // mission the user has already navigated away from — every side
-        // effect below (cursor advance, cache merge, items splice,
-        // `olderLoadState` reset, scroll restore) MUST be skipped, or a
-        // stale-mission completion will corrupt refs that
-        // `loadHistoryEvents`/`reloadMissionHistory` may not reset on the
-        // user's eventual return path.
-        const stillActiveForId = liveCurrent?.id === id || liveViewing?.id === id;
-
-        if (stillActiveForId) {
-          const sortedOlder = olderEvents
-            .slice()
-            .sort((a, b) => a.sequence - b.sequence);
-
-          missionMinSeqRef.current.set(id, sortedOlder[0].sequence);
-          const existing = missionHistoricEventsRef.current.get(id) ?? [];
-          const merged = [...sortedOlder, ...existing];
-          missionHistoricEventsRef.current.set(id, merged);
-
-          const mission =
-            liveCurrent?.id === id
-              ? liveCurrent
-              : liveViewing?.id === id
-                ? liveViewing
-                : null;
-          const newHistoricItems = eventsToItems(merged, mission);
-          const oldHistoricCount = historicItemsCountRef.current.get(id) ?? 0;
-          historicItemsCountRef.current.set(id, newHistoricItems.length);
-
-          // Snapshot scroll geometry FIRST, then setItems. The
-          // `useLayoutEffect` watching `items` reads
-          // `pendingScrollRestoreRef` synchronously after commit and
-          // BEFORE paint, so the user never sees the longer DOM with
-          // the old scrollTop. (Doing this in `requestAnimationFrame`
-          // would land one frame late and produce a visible jump.)
-          const scrollEl = containerRef.current;
-          if (scrollEl) {
-            pendingScrollRestoreRef.current = {
-              oldScrollTop: scrollEl.scrollTop,
-              oldScrollHeight: scrollEl.scrollHeight,
-            };
-          }
-
-          setItems((prev) => {
-            const liveTail = prev.slice(oldHistoricCount);
-            return [...newHistoricItems, ...liveTail];
+          const { events: olderEvents } = await getMissionEventsWithMeta(id, {
+            types: HISTORY_EVENT_TYPES,
+            beforeSeq,
+            limit: opts?.limit ?? HISTORY_PAGE_SIZE,
           });
-
-          // The render path uses `groupedItems.slice(-visibleItemsLimit)` —
-          // the LAST N items. Prepended older items land at the START of
-          // the array, so without expanding the limit they'd never
-          // actually render and the chat would visually be unchanged
-          // (and the scroll-restore would no-op against an unchanged
-          // DOM). Grow the limit by exactly the number of newly-added
-          // historic items so the visible window now also covers the
-          // older page. We don't shrink it past `prev` — other code
-          // may have already grown it for unrelated reasons.
-          //
-          // In `silent` mode (post-initial background fill) we deliberately
-          // skip this — the user is reading the latest messages and the
-          // older content stays in the accumulated cache. When they scroll
-          // up the existing "load more visible items" handler grows the
-          // window, surfacing the already-fetched events without a network
-          // round-trip.
-          if (!opts?.silent) {
-            const addedHistoricItems = newHistoricItems.length - oldHistoricCount;
-            if (addedHistoricItems > 0) {
-              setVisibleItemsLimit((prev) => prev + addedHistoricItems);
+          if (olderEvents.length === 0) {
+            // Same per-mission gate as below — see comment on
+            // `stillActiveForId`. If the user switched missions while we
+            // were fetching, don't pin the new mission's UI to "no more
+            // older messages" based on the old mission's empty page.
+            if (
+              currentMissionRef.current?.id === id ||
+              viewingMissionRef.current?.id === id
+            ) {
+              setOlderLoadState({
+                missionId: id,
+                hasMore: false,
+                loading: false,
+              });
             }
+            return;
           }
 
-          setOlderLoadState({
-            missionId: id,
-            hasMore: computeHasMoreOlder(id),
-            loading: false,
-          });
+          // After the await, the user may have switched missions. Read the
+          // *currently-viewing* mission from refs (which the keep-in-sync
+          // useEffects update synchronously from state), NOT from the
+          // closure-captured `viewingMission` — that's stale across renders
+          // and would happily prepend the old mission's events into the new
+          // mission's items.
+          const liveCurrent = currentMissionRef.current;
+          const liveViewing = viewingMissionRef.current;
+          // Single shared gate. If false, this completion belongs to a
+          // mission the user has already navigated away from — every side
+          // effect below (cursor advance, cache merge, items splice,
+          // `olderLoadState` reset, scroll restore) MUST be skipped, or a
+          // stale-mission completion will corrupt refs that
+          // `loadHistoryEvents`/`reloadMissionHistory` may not reset on the
+          // user's eventual return path.
+          const stillActiveForId =
+            liveCurrent?.id === id || liveViewing?.id === id;
+
+          if (stillActiveForId) {
+            const sortedOlder = olderEvents
+              .slice()
+              .sort((a, b) => a.sequence - b.sequence);
+
+            missionMinSeqRef.current.set(id, sortedOlder[0].sequence);
+            const existing = missionHistoricEventsRef.current.get(id) ?? [];
+            const merged = [...sortedOlder, ...existing];
+            missionHistoricEventsRef.current.set(id, merged);
+
+            const mission =
+              liveCurrent?.id === id
+                ? liveCurrent
+                : liveViewing?.id === id
+                  ? liveViewing
+                  : null;
+            const newHistoricItems = eventsToItems(merged, mission);
+            const oldHistoricCount = historicItemsCountRef.current.get(id) ?? 0;
+            historicItemsCountRef.current.set(id, newHistoricItems.length);
+
+            // Snapshot scroll geometry FIRST, then setItems. The
+            // `useLayoutEffect` watching `items` reads
+            // `pendingScrollRestoreRef` synchronously after commit and
+            // BEFORE paint, so the user never sees the longer DOM with
+            // the old scrollTop. (Doing this in `requestAnimationFrame`
+            // would land one frame late and produce a visible jump.)
+            const scrollEl = containerRef.current;
+            if (scrollEl) {
+              pendingScrollRestoreRef.current = {
+                oldScrollTop: scrollEl.scrollTop,
+                oldScrollHeight: scrollEl.scrollHeight,
+              };
+            }
+
+            setItems((prev) => {
+              const liveTail = prev.slice(oldHistoricCount);
+              return [...newHistoricItems, ...liveTail];
+            });
+
+            // The render path uses `groupedItems.slice(-visibleItemsLimit)` —
+            // the LAST N items. Prepended older items land at the START of
+            // the array, so without expanding the limit they'd never
+            // actually render and the chat would visually be unchanged
+            // (and the scroll-restore would no-op against an unchanged
+            // DOM). Grow the limit by exactly the number of newly-added
+            // historic items so the visible window now also covers the
+            // older page. We don't shrink it past `prev` — other code
+            // may have already grown it for unrelated reasons.
+            //
+            // In `silent` mode (post-initial background fill) we deliberately
+            // skip this — the user is reading the latest messages and the
+            // older content stays in the accumulated cache. When they scroll
+            // up the existing "load more visible items" handler grows the
+            // window, surfacing the already-fetched events without a network
+            // round-trip.
+            if (!opts?.silent) {
+              const addedHistoricItems =
+                newHistoricItems.length - oldHistoricCount;
+              if (addedHistoricItems > 0) {
+                setVisibleItemsLimit((prev) => prev + addedHistoricItems);
+              }
+            }
+
+            setOlderLoadState({
+              missionId: id,
+              hasMore: computeHasMoreOlder(id),
+              loading: false,
+            });
+          }
+        } catch (err) {
+          console.error("Failed to load older events:", err);
+          // Background fill is invisible work — a fetch failure mid-stream
+          // shouldn't pop a toast. The user-driven "Load older messages"
+          // button does want one. `streamOlderHistory` rethrows nothing,
+          // it just stops walking on error, which is the right behavior
+          // (the user can still hit the manual button later).
+          if (!opts?.silent) {
+            toast.error("Failed to load older messages");
+          }
+          // Only clear the loading flag if the active mission is still the
+          // one we were paginating — otherwise we'd wipe state set for a
+          // newer, unrelated mission. (The missionId-tagged read selector
+          // also protects the UI here, but we keep this guard so we don't
+          // gratuitously rewrite state for a mission that isn't viewable.)
+          const stillActive =
+            currentMissionRef.current?.id === id ||
+            viewingMissionRef.current?.id === id;
+          if (stillActive && !opts?.silent) {
+            setOlderLoadState((prev) =>
+              prev.missionId === id ? { ...prev, loading: false } : prev,
+            );
+          }
+          if (opts?.silent) {
+            // Propagate so `streamOlderHistory` can stop the fill loop on
+            // failure instead of wedging in a tight retry.
+            throw err;
+          }
         }
-      } catch (err) {
-        console.error("Failed to load older events:", err);
-        // Background fill is invisible work — a fetch failure mid-stream
-        // shouldn't pop a toast. The user-driven "Load older messages"
-        // button does want one. `streamOlderHistory` rethrows nothing,
-        // it just stops walking on error, which is the right behavior
-        // (the user can still hit the manual button later).
-        if (!opts?.silent) {
-          toast.error("Failed to load older messages");
-        }
-        // Only clear the loading flag if the active mission is still the
-        // one we were paginating — otherwise we'd wipe state set for a
-        // newer, unrelated mission. (The missionId-tagged read selector
-        // also protects the UI here, but we keep this guard so we don't
-        // gratuitously rewrite state for a mission that isn't viewable.)
-        const stillActive =
-          currentMissionRef.current?.id === id ||
-          viewingMissionRef.current?.id === id;
-        if (stillActive && !opts?.silent) {
-          setOlderLoadState((prev) =>
-            prev.missionId === id ? { ...prev, loading: false } : prev
-          );
-        }
-        if (opts?.silent) {
-          // Propagate so `streamOlderHistory` can stop the fill loop on
-          // failure instead of wedging in a tight retry.
-          throw err;
-        }
-      }
       } finally {
         paginatingOlderRef.current.delete(id);
       }
@@ -5450,7 +5628,7 @@ export default function ControlClient() {
     // reads `viewingMissionRef.current` (synced from state by an effect
     // above), so capturing the state value would re-introduce the stale
     // closure that bugbot flagged.
-    [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder]
+    [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder],
   );
 
   // Background fill: after the initial fetch shows the newest events,
@@ -5507,7 +5685,7 @@ export default function ControlClient() {
         await new Promise((resolve) => setTimeout(resolve, 150));
       }
     },
-    [loadOlderHistoryEvents, BACKGROUND_FILL_PAGE_SIZE, BACKGROUND_FILL_TARGET]
+    [loadOlderHistoryEvents, BACKGROUND_FILL_PAGE_SIZE, BACKGROUND_FILL_TARGET],
   );
 
   // Wire the ref consumed by `loadHistoryEvents` (which is declared
@@ -5528,31 +5706,32 @@ export default function ControlClient() {
       setAuthRetryTrigger((prev) => prev + 1);
     };
     window.addEventListener("openagent:auth:success", onAuthSuccess);
-    return () => window.removeEventListener("openagent:auth:success", onAuthSuccess);
+    return () =>
+      window.removeEventListener("openagent:auth:success", onAuthSuccess);
   }, []);
 
   useEffect(() => {
     let cancelled = false;
-      const missionId = searchParams.get("mission");
+    const missionId = searchParams.get("mission");
 
-      const loadFromQuery = async (id: string) => {
-        const pendingId = pendingMissionNavRef.current;
-        if (pendingId && id !== pendingId) {
-          // Ignore stale query params while we navigate to a newly-created mission.
-          return;
-        }
-        if (pendingId && id === pendingId) {
-          pendingMissionNavRef.current = null;
-        }
-        // Skip loading if we already have this mission in state (e.g., after handleNewMission)
-        if (viewingMissionRef.current?.id === id) {
-          setViewingMissionId(id);
-          return;
-        }
-        // Skip if handleViewMission is already loading this mission (prevents double-load race)
-        if (handleViewMissionLoadingRef.current === id) {
-          return;
-        }
+    const loadFromQuery = async (id: string) => {
+      const pendingId = pendingMissionNavRef.current;
+      if (pendingId && id !== pendingId) {
+        // Ignore stale query params while we navigate to a newly-created mission.
+        return;
+      }
+      if (pendingId && id === pendingId) {
+        pendingMissionNavRef.current = null;
+      }
+      // Skip loading if we already have this mission in state (e.g., after handleNewMission)
+      if (viewingMissionRef.current?.id === id) {
+        setViewingMissionId(id);
+        return;
+      }
+      // Skip if handleViewMission is already loading this mission (prevents double-load race)
+      if (handleViewMissionLoadingRef.current === id) {
+        return;
+      }
       const previousViewingMission = viewingMissionRef.current;
       setMissionLoading(true);
       setViewingMissionId(id); // Set viewing ID immediately to prevent "Agent is working..." flash
@@ -5593,7 +5772,10 @@ export default function ControlClient() {
             const ev = events[i];
             const meta = (ev as { metadata?: unknown }).metadata;
             const metaRecord = isRecord(meta) ? meta : null;
-            if (latestIteration === undefined && ev.event_type === "goal_iteration") {
+            if (
+              latestIteration === undefined &&
+              ev.event_type === "goal_iteration"
+            ) {
               if (metaRecord && typeof metaRecord["iteration"] === "number") {
                 latestIteration = metaRecord["iteration"] as number;
               }
@@ -5609,13 +5791,19 @@ export default function ControlClient() {
                 latestObjective = ev.content;
               }
             }
-            if (latestIteration !== undefined && latestStatus !== undefined) break;
+            if (latestIteration !== undefined && latestStatus !== undefined)
+              break;
           }
           // Skip terminal statuses — those clear the pill, matching the live handler.
           const isTerminalStatus = latestStatus
-            ? ["complete", "cleared", "budgetLimited", "aborted"].includes(latestStatus)
+            ? ["complete", "cleared", "budgetLimited", "aborted"].includes(
+                latestStatus,
+              )
             : false;
-          if ((latestIteration !== undefined || latestStatus !== undefined) && !isTerminalStatus) {
+          if (
+            (latestIteration !== undefined || latestStatus !== undefined) &&
+            !isTerminalStatus
+          ) {
             setGoalInfoByMission((prev) => ({
               ...prev,
               [id]: {
@@ -5628,19 +5816,26 @@ export default function ControlClient() {
         }
         // Use events if available, otherwise fall back to basic history
         let historyItems = events
-          ? mergeEventItemsWithMissionHistoryFallback(eventsToItems(events, mission), mission)
+          ? mergeEventItemsWithMissionHistoryFallback(
+              await eventsToItemsAsync(events, mission),
+              mission,
+            )
           : missionHistoryToItems(mission);
         // Capture the events-derived count BEFORE the queue merge — this is
         // what `loadOlderHistoryEvents` needs to find the live tail
         // correctly (see `seedPaginationStateAfterInitialLoad`).
         const historicEventsLen = historyItems.length;
         // Merge queued messages that belong to this mission
-        const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === id);
+        const missionQueuedMessages = queuedMessages.filter(
+          (qm) => qm.mission_id === id,
+        );
         if (missionQueuedMessages.length > 0) {
           const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
           // Mark existing items as queued
           historyItems = historyItems.map((item) =>
-            item.kind === "user" && queuedIds.has(item.id) ? { ...item, queued: true } : item
+            item.kind === "user" && queuedIds.has(item.id)
+              ? { ...item, queued: true }
+              : item,
           );
           // Add any queued messages not already in history
           const existingIds = new Set(historyItems.map((item) => item.id));
@@ -5668,13 +5863,16 @@ export default function ControlClient() {
         if (cancelled || fetchingMissionIdRef.current !== id) return;
         console.error("Failed to load mission:", err);
         // Show error toast for mission load failures (skip if likely a 401 during initial page load)
-        const is401 = (err as Error)?.message?.includes("401") || (err as { status?: number })?.status === 401;
+        const is401 =
+          (err as Error)?.message?.includes("401") ||
+          (err as { status?: number })?.status === 401;
         if (!is401) {
           toast.error("Failed to load mission");
         }
 
         // Revert viewing state to the previous mission to avoid filtering out events
-        const fallbackMission = previousViewingMission ?? currentMissionRef.current;
+        const fallbackMission =
+          previousViewingMission ?? currentMissionRef.current;
         if (fallbackMission) {
           setViewingMissionId(fallbackMission.id);
           setViewingMission(fallbackMission);
@@ -5709,24 +5907,35 @@ export default function ControlClient() {
           applyDesktopSessionState(mission);
           router.replace(`/control?mission=${mission.id}`, { scroll: false });
           // Load full events and queue in background (including tool calls)
-          Promise.all([loadHistoryEvents(mission.id), getQueue().catch(() => [])])
-            .then(([events, queuedMessages]) => {
+          Promise.all([
+            loadHistoryEvents(mission.id),
+            getQueue().catch(() => []),
+          ])
+            .then(async ([events, queuedMessages]) => {
               if (cancelled) return;
               let historyItems = mergeEventItemsWithMissionHistoryFallback(
-                eventsToItems(events, mission),
-                mission
+                await eventsToItemsAsync(events, mission),
+                mission,
               );
               // Capture pre-queue length so pagination doesn't clip
               // queued items (see `seedPaginationStateAfterInitialLoad`).
               const historicEventsLen = historyItems.length;
               // Merge queued messages that belong to this mission
-              const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === mission.id);
+              const missionQueuedMessages = queuedMessages.filter(
+                (qm) => qm.mission_id === mission.id,
+              );
               if (missionQueuedMessages.length > 0) {
-                const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
-                historyItems = historyItems.map((item) =>
-                  item.kind === "user" && queuedIds.has(item.id) ? { ...item, queued: true } : item
+                const queuedIds = new Set(
+                  missionQueuedMessages.map((qm) => qm.id),
                 );
-                const existingIds = new Set(historyItems.map((item) => item.id));
+                historyItems = historyItems.map((item) =>
+                  item.kind === "user" && queuedIds.has(item.id)
+                    ? { ...item, queued: true }
+                    : item,
+                );
+                const existingIds = new Set(
+                  historyItems.map((item) => item.id),
+                );
                 const newQueuedItems: ChatItem[] = missionQueuedMessages
                   .filter((qm) => !existingIds.has(qm.id))
                   .map((qm) => ({
@@ -5741,7 +5950,10 @@ export default function ControlClient() {
               }
               setItems(historyItems);
               adjustVisibleItemsLimit(historyItems);
-              seedPaginationStateAfterInitialLoad(mission.id, historicEventsLen);
+              seedPaginationStateAfterInitialLoad(
+                mission.id,
+                historicEventsLen,
+              );
               // Also check events for desktop sessions
               applyDesktopSessionFromEvents(events);
             })
@@ -5773,7 +5985,7 @@ export default function ControlClient() {
     router,
     missionHistoryToItems,
     mergeEventItemsWithMissionHistoryFallback,
-    eventsToItems,
+    eventsToItemsAsync,
     adjustVisibleItemsLimit,
     loadHistoryEvents,
     seedPaginationStateAfterInitialLoad,
@@ -5816,7 +6028,7 @@ export default function ControlClient() {
   useEffect(() => {
     return startHealthBudgetWatcher(
       () => viewingMissionIdRef.current,
-      () => itemsCountRef.current
+      () => itemsCountRef.current,
     );
   }, []);
 
@@ -5830,94 +6042,98 @@ export default function ControlClient() {
     }
   }, []);
 
-  const handleStreamDiagnostics = useCallback((update: StreamDiagnosticUpdate) => {
-    if (typeof update.bytes === "number") {
-      perfBus.recordSseBytes(update.bytes);
-    }
-    switch (update.phase) {
-      case "connecting":
-        streamLog("info", "connecting", { url: update.url });
-        break;
-      case "open":
-        streamLog("info", "open", {
-          url: update.url,
-          status: update.status,
-          headers: update.headers,
-        });
-        break;
-      case "chunk":
-        streamLog("debug", "chunk", { url: update.url, bytes: update.bytes });
-        break;
-      case "event":
-        streamLog("debug", "event", { url: update.url, bytes: update.bytes });
-        break;
-      case "closed":
-        streamLog("warn", "closed", { url: update.url, bytes: update.bytes });
-        break;
-      case "error":
-        streamLog("error", "error", {
-          url: update.url,
-          status: update.status,
-          error: update.error,
-        });
-        break;
-    }
-
-    setStreamDiagnostics((prev) => {
-      const next: StreamDiagnosticsState = { ...prev };
-      if (update.url) next.url = update.url;
-
+  const handleStreamDiagnostics = useCallback(
+    (update: StreamDiagnosticUpdate) => {
+      if (typeof update.bytes === "number") {
+        perfBus.recordSseBytes(update.bytes);
+      }
       switch (update.phase) {
         case "connecting":
-          next.phase = "connecting";
-          next.lastError = null;
-          next.bytes = 0;
-          next.status = undefined;
-          next.contentType = undefined;
-          next.cacheControl = undefined;
-          next.transferEncoding = undefined;
-          next.contentEncoding = undefined;
-          next.server = undefined;
-          next.via = undefined;
-          next.lastEventAt = undefined;
-          next.lastChunkAt = undefined;
+          streamLog("info", "connecting", { url: update.url });
           break;
         case "open":
-          next.phase = "open";
-          next.status = update.status;
-          if (update.headers) {
-            next.contentType = update.headers["content-type"] ?? null;
-            next.cacheControl = update.headers["cache-control"] ?? null;
-            next.transferEncoding = update.headers["transfer-encoding"] ?? null;
-            next.contentEncoding = update.headers["content-encoding"] ?? null;
-            next.server = update.headers["server"] ?? null;
-            next.via = update.headers["via"] ?? null;
-          }
+          streamLog("info", "open", {
+            url: update.url,
+            status: update.status,
+            headers: update.headers,
+          });
           break;
         case "chunk":
-          next.phase = next.phase === "error" ? "error" : "streaming";
-          next.lastChunkAt = update.timestamp;
-          if (typeof update.bytes === "number") next.bytes = update.bytes;
+          streamLog("debug", "chunk", { url: update.url, bytes: update.bytes });
           break;
         case "event":
-          next.phase = next.phase === "error" ? "error" : "streaming";
-          next.lastEventAt = update.timestamp;
-          if (typeof update.bytes === "number") next.bytes = update.bytes;
+          streamLog("debug", "event", { url: update.url, bytes: update.bytes });
           break;
         case "closed":
-          next.phase = "closed";
+          streamLog("warn", "closed", { url: update.url, bytes: update.bytes });
           break;
         case "error":
-          next.phase = "error";
-          next.lastError = update.error ?? next.lastError ?? "Stream error";
-          if (typeof update.bytes === "number") next.bytes = update.bytes;
-          if (typeof update.status === "number") next.status = update.status;
+          streamLog("error", "error", {
+            url: update.url,
+            status: update.status,
+            error: update.error,
+          });
           break;
       }
 
-      return next;
-    });
-  }, []);
+      setStreamDiagnostics((prev) => {
+        const next: StreamDiagnosticsState = { ...prev };
+        if (update.url) next.url = update.url;
+
+        switch (update.phase) {
+          case "connecting":
+            next.phase = "connecting";
+            next.lastError = null;
+            next.bytes = 0;
+            next.status = undefined;
+            next.contentType = undefined;
+            next.cacheControl = undefined;
+            next.transferEncoding = undefined;
+            next.contentEncoding = undefined;
+            next.server = undefined;
+            next.via = undefined;
+            next.lastEventAt = undefined;
+            next.lastChunkAt = undefined;
+            break;
+          case "open":
+            next.phase = "open";
+            next.status = update.status;
+            if (update.headers) {
+              next.contentType = update.headers["content-type"] ?? null;
+              next.cacheControl = update.headers["cache-control"] ?? null;
+              next.transferEncoding =
+                update.headers["transfer-encoding"] ?? null;
+              next.contentEncoding = update.headers["content-encoding"] ?? null;
+              next.server = update.headers["server"] ?? null;
+              next.via = update.headers["via"] ?? null;
+            }
+            break;
+          case "chunk":
+            next.phase = next.phase === "error" ? "error" : "streaming";
+            next.lastChunkAt = update.timestamp;
+            if (typeof update.bytes === "number") next.bytes = update.bytes;
+            break;
+          case "event":
+            next.phase = next.phase === "error" ? "error" : "streaming";
+            next.lastEventAt = update.timestamp;
+            if (typeof update.bytes === "number") next.bytes = update.bytes;
+            break;
+          case "closed":
+            next.phase = "closed";
+            break;
+          case "error":
+            next.phase = "error";
+            next.lastError = update.error ?? next.lastError ?? "Stream error";
+            if (typeof update.bytes === "number") next.bytes = update.bytes;
+            if (typeof update.status === "number") next.status = update.status;
+            break;
+        }
+
+        return next;
+      });
+    },
+    [],
+  );
 
   // Refresh recent missions periodically (after the callback is defined).
   // Paused when the tab is hidden — there's nothing to update on screen
@@ -5931,12 +6147,15 @@ export default function ControlClient() {
       const sessions = await listDesktopSessions();
       setDesktopSessions(sessions);
       // Find running sessions
-      const runningSessions = sessions.filter(s => s.process_running && s.status !== 'stopped');
+      const runningSessions = sessions.filter(
+        (s) => s.process_running && s.status !== "stopped",
+      );
       const hasRunning = runningSessions.length > 0;
 
       if (hasRunning) {
         // Get current mission ID to scope auto-open behavior
-        const activeMission = viewingMissionRef.current ?? currentMissionRef.current;
+        const activeMission =
+          viewingMissionRef.current ?? currentMissionRef.current;
         const activeMissionId = activeMission?.id;
 
         // Only auto-open for sessions belonging to the current mission.
@@ -5945,17 +6164,21 @@ export default function ControlClient() {
         // background task may not have attributed them yet.
         const expecting = expectingDesktopSessionRef.current;
         const currentMissionSessions = activeMissionId
-          ? runningSessions.filter(s =>
-              s.mission_id === activeMissionId || (expecting && !s.mission_id)
+          ? runningSessions.filter(
+              (s) =>
+                s.mission_id === activeMissionId ||
+                (expecting && !s.mission_id),
             )
           : expecting
-            ? runningSessions.filter(s => !s.mission_id)
+            ? runningSessions.filter((s) => !s.mission_id)
             : [];
         const hasCurrentMissionSession = currentMissionSessions.length > 0;
 
         // Auto-select first active session from current mission if current display isn't running anywhere
         if (hasCurrentMissionSession) {
-          const currentIsRunningAnywhere = runningSessions.some(s => s.display === desktopDisplayId);
+          const currentIsRunningAnywhere = runningSessions.some(
+            (s) => s.display === desktopDisplayId,
+          );
           if (!currentIsRunningAnywhere) {
             setDesktopDisplayId(currentMissionSessions[0].display);
           }
@@ -5994,51 +6217,63 @@ export default function ControlClient() {
   }, []);
 
   // Handle closing a desktop session
-  const handleCloseDesktopSession = useCallback(async (display: string) => {
-    setIsClosingDesktop(display);
-    try {
-      await closeDesktopSession(display);
-      toast.success(`Desktop session ${display} closed`);
-      // Refresh sessions
-      await refreshDesktopSessions();
-      // If we closed the currently viewed display, switch to another or hide
-      if (desktopDisplayId === display) {
-        const remaining = desktopSessions.filter(s => s.display !== display && s.process_running);
-        if (remaining.length > 0) {
-          setDesktopDisplayId(remaining[0].display);
-        } else {
-          setShowDesktopStream(false);
-          setHasDesktopSession(false);
+  const handleCloseDesktopSession = useCallback(
+    async (display: string) => {
+      setIsClosingDesktop(display);
+      try {
+        await closeDesktopSession(display);
+        toast.success(`Desktop session ${display} closed`);
+        // Refresh sessions
+        await refreshDesktopSessions();
+        // If we closed the currently viewed display, switch to another or hide
+        if (desktopDisplayId === display) {
+          const remaining = desktopSessions.filter(
+            (s) => s.display !== display && s.process_running,
+          );
+          if (remaining.length > 0) {
+            setDesktopDisplayId(remaining[0].display);
+          } else {
+            setShowDesktopStream(false);
+            setHasDesktopSession(false);
+          }
         }
+      } catch (err) {
+        toast.error(
+          `Failed to close session: ${err instanceof Error ? err.message : "Unknown error"}`,
+        );
+      } finally {
+        setIsClosingDesktop(null);
       }
-    } catch (err) {
-      toast.error(`Failed to close session: ${err instanceof Error ? err.message : 'Unknown error'}`);
-    } finally {
-      setIsClosingDesktop(null);
-    }
-  }, [desktopDisplayId, desktopSessions, refreshDesktopSessions]);
+    },
+    [desktopDisplayId, desktopSessions, refreshDesktopSessions],
+  );
 
   // Handle extending keep-alive
-  const handleKeepAliveDesktopSession = useCallback(async (display: string) => {
-    try {
-      await keepAliveDesktopSession(display, 7200); // 2 hours
-      toast.success(`Keep-alive extended for ${display}`);
-      await refreshDesktopSessions();
-    } catch (err) {
-      toast.error(`Failed to extend keep-alive: ${err instanceof Error ? err.message : 'Unknown error'}`);
-    }
-  }, [refreshDesktopSessions]);
+  const handleKeepAliveDesktopSession = useCallback(
+    async (display: string) => {
+      try {
+        await keepAliveDesktopSession(display, 7200); // 2 hours
+        toast.success(`Keep-alive extended for ${display}`);
+        await refreshDesktopSessions();
+      } catch (err) {
+        toast.error(
+          `Failed to extend keep-alive: ${err instanceof Error ? err.message : "Unknown error"}`,
+        );
+      }
+    },
+    [refreshDesktopSessions],
+  );
 
   // Global keyboard shortcut for mission switcher (Cmd+K / Ctrl+K)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k' && !e.shiftKey) {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k" && !e.shiftKey) {
         e.preventDefault();
         setShowMissionSwitcher(true);
       }
     };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
   }, []);
 
   // Fetch workspaces and agents for mission creation
@@ -6129,18 +6364,25 @@ export default function ControlClient() {
 
         // Use events if available, otherwise fall back to basic history
         let historyItems = events
-          ? mergeEventItemsWithMissionHistoryFallback(eventsToItems(events, mission), mission)
+          ? mergeEventItemsWithMissionHistoryFallback(
+              await eventsToItemsAsync(events, mission),
+              mission,
+            )
           : missionHistoryToItems(mission);
 
         // Capture pre-queue length so pagination doesn't clip queued items
         // (see `seedPaginationStateAfterInitialLoad`).
         const historicEventsLen = historyItems.length;
         // Merge queued messages that belong to this mission
-        const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === missionId);
+        const missionQueuedMessages = queuedMessages.filter(
+          (qm) => qm.mission_id === missionId,
+        );
         if (missionQueuedMessages.length > 0) {
           const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
           historyItems = historyItems.map((item) =>
-            item.kind === "user" && queuedIds.has(item.id) ? { ...item, queued: true } : item
+            item.kind === "user" && queuedIds.has(item.id)
+              ? { ...item, queued: true }
+              : item,
           );
           const existingIds = new Set(historyItems.map((item) => item.id));
           const newQueuedItems: ChatItem[] = missionQueuedMessages
@@ -6182,20 +6424,25 @@ export default function ControlClient() {
         }
 
         // Revert viewing state to avoid filtering out events
-        const fallbackMission = previousViewingMission ?? currentMissionRef.current;
+        const fallbackMission =
+          previousViewingMission ?? currentMissionRef.current;
         if (fallbackMission) {
           setViewingMissionId(fallbackMission.id);
           setViewingMission(fallbackMission);
           setItems(missionHistoryToItems(fallbackMission));
           setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
           applyDesktopSessionState(fallbackMission);
-          router.replace(`/control?mission=${fallbackMission.id}`, { scroll: false });
+          router.replace(`/control?mission=${fallbackMission.id}`, {
+            scroll: false,
+          });
         } else if (previousViewingId && missionItems[previousViewingId]) {
           setViewingMissionId(previousViewingId);
           setViewingMission(null);
           setItems(missionItems[previousViewingId]);
           setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
-          router.replace(`/control?mission=${previousViewingId}`, { scroll: false });
+          router.replace(`/control?mission=${previousViewingId}`, {
+            scroll: false,
+          });
         } else {
           setViewingMissionId(null);
           setViewingMission(null);
@@ -6218,7 +6465,7 @@ export default function ControlClient() {
       missionItems,
       missionHistoryToItems,
       mergeEventItemsWithMissionHistoryFallback,
-      eventsToItems,
+      eventsToItemsAsync,
       applyDesktopSessionState,
       applyDesktopSessionFromEvents,
       adjustVisibleItemsLimit,
@@ -6226,7 +6473,7 @@ export default function ControlClient() {
       seedPaginationStateAfterInitialLoad,
       updateMissionItems,
       router,
-    ]
+    ],
   );
 
   const findChatItemIdForEntryIndex = useCallback(
@@ -6244,7 +6491,7 @@ export default function ControlClient() {
         if (item.kind === "tool_group") {
           return item.tools.reduce(
             (count, tool) => count + (tool.result === undefined ? 1 : 2),
-            0
+            0,
           );
         }
         return 0;
@@ -6288,7 +6535,11 @@ export default function ControlClient() {
           if (item.kind === "tool_group") {
             return item.groupId;
           }
-          if (item.kind === "user" || item.kind === "assistant" || item.kind === "tool") {
+          if (
+            item.kind === "user" ||
+            item.kind === "assistant" ||
+            item.kind === "tool"
+          ) {
             return item.id;
           }
         }
@@ -6300,19 +6551,25 @@ export default function ControlClient() {
       for (const item of groupedItems) {
         if (historyEntrySpan(item) <= 0) continue;
         if (
-          normalizeMetadataText(historyItemSearchText(item)).includes(normalizedSnippet)
+          normalizeMetadataText(historyItemSearchText(item)).includes(
+            normalizedSnippet,
+          )
         ) {
           if (item.kind === "tool_group") {
             return item.groupId;
           }
-          if (item.kind === "user" || item.kind === "assistant" || item.kind === "tool") {
+          if (
+            item.kind === "user" ||
+            item.kind === "assistant" ||
+            item.kind === "tool"
+          ) {
             return item.id;
           }
         }
       }
       return null;
     },
-    [groupedItems]
+    [groupedItems],
   );
 
   const focusChatItem = useCallback(
@@ -6321,7 +6578,7 @@ export default function ControlClient() {
       // tool rows aren't in the DOM yet — expand the enclosing group
       // so scrollIntoView has something to hit.
       const enclosingGroup = groupedItems.find(
-        (g) => g.kind === "tool_group" && g.tools.some((t) => t.id === itemId)
+        (g) => g.kind === "tool_group" && g.tools.some((t) => t.id === itemId),
       );
       if (enclosingGroup && enclosingGroup.kind === "tool_group") {
         setExpandedToolGroups((prev) => {
@@ -6339,7 +6596,7 @@ export default function ControlClient() {
             item.kind === "tool_group"
               ? item.tools.reduce(
                   (count, tool) => count + (tool.result === undefined ? 1 : 2),
-                  0
+                  0,
                 )
               : item.kind === "tool"
                 ? item.result === undefined
@@ -6351,7 +6608,8 @@ export default function ControlClient() {
           if (span <= 0) {
             return false;
           }
-          const matches = entryIndex >= historyIndex && entryIndex < historyIndex + span;
+          const matches =
+            entryIndex >= historyIndex && entryIndex < historyIndex + span;
           historyIndex += span;
           if (matches) {
             return true;
@@ -6380,7 +6638,7 @@ export default function ControlClient() {
       };
       requestAnimationFrame(tryFocus);
     },
-    [groupedItems]
+    [groupedItems],
   );
 
   useEffect(() => {
@@ -6411,7 +6669,9 @@ export default function ControlClient() {
           : normalizeMetadataText(rawQuery);
       if (!query) {
         toast.error("Missing moment query");
-        router.replace(`/control?mission=${missionFromQuery}`, { scroll: false });
+        router.replace(`/control?mission=${missionFromQuery}`, {
+          scroll: false,
+        });
         return;
       }
 
@@ -6428,26 +6688,38 @@ export default function ControlClient() {
           } else {
             toast.error("No matching moment found");
           }
-          router.replace(`/control?mission=${missionFromQuery}`, { scroll: false });
+          router.replace(`/control?mission=${missionFromQuery}`, {
+            scroll: false,
+          });
           return;
         }
 
-        const targetId = findChatItemIdForEntryIndex(best.entry_index, best.snippet);
+        const targetId = findChatItemIdForEntryIndex(
+          best.entry_index,
+          best.snippet,
+        );
         if (targetId) {
           focusChatItem(targetId, best.entry_index);
         } else {
           // Ensure older history is visible before failing deep-link focus.
           setVisibleItemsLimit((prev) => Math.max(prev, groupedItems.length));
           requestAnimationFrame(() => {
-            const retryTargetId = findChatItemIdForEntryIndex(best.entry_index, best.snippet);
+            const retryTargetId = findChatItemIdForEntryIndex(
+              best.entry_index,
+              best.snippet,
+            );
             if (retryTargetId) {
               focusChatItem(retryTargetId, best.entry_index);
             } else {
-              toast.error("Could not locate the target moment in loaded history");
+              toast.error(
+                "Could not locate the target moment in loaded history",
+              );
             }
           });
         }
-        router.replace(`/control?mission=${missionFromQuery}`, { scroll: false });
+        router.replace(`/control?mission=${missionFromQuery}`, {
+          scroll: false,
+        });
       } catch (err) {
         if (cancelled) return;
         console.error("Failed to search mission moments:", err);
@@ -6456,7 +6728,9 @@ export default function ControlClient() {
         } else {
           toast.error("Failed to locate mission moment");
         }
-        router.replace(`/control?mission=${missionFromQuery}`, { scroll: false });
+        router.replace(`/control?mission=${missionFromQuery}`, {
+          scroll: false,
+        });
       }
     })();
 
@@ -6528,7 +6802,9 @@ export default function ControlClient() {
       return { id: mission.id };
     } catch (err) {
       console.error("Failed to create mission:", err);
-      toast.error(err instanceof Error ? err.message : "Failed to create new mission");
+      toast.error(
+        err instanceof Error ? err.message : "Failed to create new mission",
+      );
       throw err; // Re-throw so dialog knows creation failed
     } finally {
       setMissionLoading(false);
@@ -6580,7 +6856,11 @@ export default function ControlClient() {
       return { id: updated.id };
     } catch (err) {
       console.error("Failed to update mission settings:", err);
-      toast.error(err instanceof Error ? err.message : "Failed to update mission settings");
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : "Failed to update mission settings",
+      );
       throw err;
     } finally {
       setMissionLoading(false);
@@ -6610,7 +6890,11 @@ export default function ControlClient() {
   // Handle resuming an interrupted mission
   const handleResumeMission = async () => {
     const mission = viewingMission ?? currentMission;
-    if (!mission || !["interrupted", "blocked", "failed"].includes(mission.status)) return;
+    if (
+      !mission ||
+      !["interrupted", "blocked", "failed"].includes(mission.status)
+    )
+      return;
     try {
       setMissionLoading(true);
       const resumed = await resumeMission(mission.id);
@@ -6628,14 +6912,14 @@ export default function ControlClient() {
           ? "Continuing mission"
           : mission.status === "failed"
             ? "Retrying mission"
-            : "Mission resumed"
+            : "Mission resumed",
       );
       // Load full events in background (including tool calls)
       loadHistoryEvents(resumed.id)
-        .then((events) => {
+        .then(async (events) => {
           const fullItems = mergeEventItemsWithMissionHistoryFallback(
-            eventsToItems(events, resumed),
-            resumed
+            await eventsToItemsAsync(events, resumed),
+            resumed,
           );
           setItems(fullItems);
           adjustVisibleItemsLimit(fullItems);
@@ -6704,11 +6988,11 @@ export default function ControlClient() {
         prev.map((it) =>
           it.kind === "tool" && it.toolCallId === toolCallId
             ? { ...it, result }
-            : it
-        )
+            : it,
+        ),
       );
     },
-    []
+    [],
   );
 
   const handleToolResultCommit = useCallback(
@@ -6719,21 +7003,23 @@ export default function ControlClient() {
         result,
       });
     },
-    []
+    [],
   );
 
   const handleOpenFailingToolCallById = useCallback(
     async (missionId: string) => {
-      router.replace(`/control?mission=${missionId}&focus=failure`, { scroll: false });
+      router.replace(`/control?mission=${missionId}&focus=failure`, {
+        scroll: false,
+      });
     },
-    [router]
+    [router],
   );
 
   const buildFollowUpPrompt = useCallback((mission: Mission) => {
     const sourceLabel =
-      mission.title?.trim()
-      || mission.short_description?.trim()
-      || `mission ${getMissionShortName(mission.id)}`;
+      mission.title?.trim() ||
+      mission.short_description?.trim() ||
+      `mission ${getMissionShortName(mission.id)}`;
     return `Follow up on "${sourceLabel}".\n\nSummarize current progress briefly, then continue with the next concrete steps.`;
   }, []);
 
@@ -6741,8 +7027,8 @@ export default function ControlClient() {
     async (missionId: string) => {
       const activeMission = viewingMission ?? currentMission;
       const cachedMission =
-        recentMissions.find((mission) => mission.id === missionId)
-        ?? (activeMission?.id === missionId ? activeMission : null);
+        recentMissions.find((mission) => mission.id === missionId) ??
+        (activeMission?.id === missionId ? activeMission : null);
 
       try {
         setMissionLoading(true);
@@ -6768,7 +7054,9 @@ export default function ControlClient() {
         setHasDesktopSession(false);
         setInput(buildFollowUpPrompt(sourceMission));
         setShowMissionSwitcher(false);
-        router.replace(`/control?mission=${followUpMission.id}`, { scroll: false });
+        router.replace(`/control?mission=${followUpMission.id}`, {
+          scroll: false,
+        });
         refreshRecentMissions();
         toast.success("Follow-up mission created");
       } catch (err) {
@@ -6785,7 +7073,7 @@ export default function ControlClient() {
       buildFollowUpPrompt,
       router,
       refreshRecentMissions,
-    ]
+    ],
   );
 
   // Debouncing for thinking updates to reduce re-renders during streaming
@@ -6795,7 +7083,9 @@ export default function ControlClient() {
     id: string;
     startTime: number;
   } | null>(null);
-  const thinkingFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const thinkingFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const thinkingFlushRafRef = useRef<number | null>(null);
   const thinkingIdCounterRef = useRef(0);
 
@@ -6803,7 +7093,9 @@ export default function ControlClient() {
     content: string;
     startTime: number;
   } | null>(null);
-  const streamFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const streamFlushRafRef = useRef<number | null>(null);
 
   // Auto-reconnecting stream with exponential backoff
@@ -6918,7 +7210,8 @@ export default function ControlClient() {
           shouldApplyStatus = effectiveMissionId === viewingId;
         } else {
           // No mission id available - only apply if viewing main mission or none selected
-          shouldApplyStatus = !viewingId || viewingId === currentMissionId || !currentMissionId;
+          shouldApplyStatus =
+            !viewingId || viewingId === currentMissionId || !currentMissionId;
         }
 
         const nextQueueLen = typeof q === "number" ? q : 0;
@@ -6942,7 +7235,10 @@ export default function ControlClient() {
           });
           if (shouldApplyStatus) {
             // Auto-close desktop stream when agent finishes, unless a session is still running.
-            if (!hasRunningDesktopSessionForMission(effectiveMissionId) && !hasDesktopSessionRef.current) {
+            if (
+              !hasRunningDesktopSessionForMission(effectiveMissionId) &&
+              !hasDesktopSessionRef.current
+            ) {
               setShowDesktopStream(false);
             }
           }
@@ -6950,13 +7246,17 @@ export default function ControlClient() {
 
         // If we reconnected and agent is already running, add a visual indicator
         setRunState((prevState) => {
-          if (shouldApplyStatus && newState === "running" && prevState === "idle") {
+          if (
+            shouldApplyStatus &&
+            newState === "running" &&
+            prevState === "idle"
+          ) {
             setItems((prevItems) => {
               const hasActiveThinking = prevItems.some(
                 (it) =>
                   ((it.kind === "thinking" || it.kind === "stream") &&
                     !it.done) ||
-                  it.kind === "phase"
+                  it.kind === "phase",
               );
               // If there's no active streaming item, the user is seeing stale state
               // The "Agent is working..." indicator will show via the render logic
@@ -6971,7 +7271,10 @@ export default function ControlClient() {
       if (event.type === "user_message" && isRecord(data)) {
         const msgId = String(data["id"] ?? Date.now());
         const msgContent = String(data["content"] ?? "");
-        const hasQueuedFlag = Object.prototype.hasOwnProperty.call(data, "queued");
+        const hasQueuedFlag = Object.prototype.hasOwnProperty.call(
+          data,
+          "queued",
+        );
         const queued = data["queued"] === true;
         setItems((prev) => {
           // Check if already added with this ID - if so, mark as not queued (being processed)
@@ -6995,7 +7298,7 @@ export default function ControlClient() {
             (item) =>
               item.kind === "user" &&
               item.id.startsWith("temp-") &&
-              item.content === msgContent
+              item.content === msgContent,
           );
 
           if (tempIndex !== -1) {
@@ -7016,12 +7319,14 @@ export default function ControlClient() {
           // (e.g., history-* ID from missionHistoryToItems that replaced the UUID-based item).
           // Search from the end to match the most recent message with this content,
           // and only match if the ID is not already a server-assigned UUID.
-          const contentIndex = [...prev].reverse().findIndex(
-            (item) =>
-              item.kind === "user" &&
-              item.content === msgContent &&
-              (item.id.startsWith("history-") || item.id.startsWith("temp-"))
-          );
+          const contentIndex = [...prev]
+            .reverse()
+            .findIndex(
+              (item) =>
+                item.kind === "user" &&
+                item.content === msgContent &&
+                (item.id.startsWith("history-") || item.id.startsWith("temp-")),
+            );
           if (contentIndex !== -1) {
             // Convert reversed index back to forward index
             const actualIndex = prev.length - 1 - contentIndex;
@@ -7059,20 +7364,29 @@ export default function ControlClient() {
         // assistant message so the chat badge reads "Iteration N · 14
         // tools" instead of the misleading per-turn "Turn complete".
         const eventMissionId =
-          typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
         const goalIterationForEvent = eventMissionId
           ? goalInfoByMission[eventMissionId]?.iteration
           : undefined;
         // Parse shared_files if present
         let sharedFiles: SharedFile[] | undefined;
         if (Array.isArray(data["shared_files"])) {
-          sharedFiles = (data["shared_files"] as unknown[]).filter(isRecord).map((f) => ({
-            name: String(f["name"] ?? "file"),
-            url: String(f["url"] ?? ""),
-            content_type: String(f["content_type"] ?? "application/octet-stream"),
-            size_bytes: typeof f["size_bytes"] === "number" ? f["size_bytes"] : undefined,
-            kind: (f["kind"] as SharedFile["kind"]) ?? "other",
-          }));
+          sharedFiles = (data["shared_files"] as unknown[])
+            .filter(isRecord)
+            .map((f) => ({
+              name: String(f["name"] ?? "file"),
+              url: String(f["url"] ?? ""),
+              content_type: String(
+                f["content_type"] ?? "application/octet-stream",
+              ),
+              size_bytes:
+                typeof f["size_bytes"] === "number"
+                  ? f["size_bytes"]
+                  : undefined,
+              kind: (f["kind"] as SharedFile["kind"]) ?? "other",
+            }));
         }
 
         const resumable = data["resumable"] === true;
@@ -7128,7 +7442,7 @@ export default function ControlClient() {
           }
 
           const existingIdx = filtered.findIndex(
-            (item) => item.kind === "assistant" && item.id === incomingId
+            (item) => item.kind === "assistant" && item.id === incomingId,
           );
           if (existingIdx !== -1) {
             const updated = [...filtered];
@@ -7144,7 +7458,9 @@ export default function ControlClient() {
                 costCents: existing.costCents,
                 costSource: existing.costSource,
               }),
-              model: data["model"] ? String(data["model"]) : existing.model ?? null,
+              model: data["model"]
+                ? String(data["model"])
+                : (existing.model ?? null),
               timestamp: now,
               sharedFiles: sharedFiles ?? existing.sharedFiles,
               resumable,
@@ -7170,7 +7486,7 @@ export default function ControlClient() {
           };
 
           const firstQueuedIdx = filtered.findIndex(
-            (item) => item.kind === "user" && item.queued
+            (item) => item.kind === "user" && item.queued,
           );
           if (firstQueuedIdx === -1) {
             return [...filtered, newItem];
@@ -7207,15 +7523,15 @@ export default function ControlClient() {
             autoGenerateMissionTitle(
               targetMissionId,
               firstUser.content,
-              assistantContent
+              assistantContent,
             ).then((title) => {
               if (title) {
                 // Update local mission state so the UI reflects the new title immediately
                 setCurrentMission((m) =>
-                  m?.id === targetMissionId ? { ...m, title } : m
+                  m?.id === targetMissionId ? { ...m, title } : m,
                 );
                 setViewingMission((m) =>
-                  m?.id === targetMissionId ? { ...m, title } : m
+                  m?.id === targetMissionId ? { ...m, title } : m,
                 );
               }
             });
@@ -7238,7 +7554,7 @@ export default function ControlClient() {
             // Remove phase items when thinking starts
             const filtered = prev.filter((it) => it.kind !== "phase");
             const existingIdx = filtered.findIndex(
-              (it) => it.kind === "thinking" && !it.done
+              (it) => it.kind === "thinking" && !it.done,
             );
             if (existingIdx >= 0) {
               const updated = [...filtered];
@@ -7248,7 +7564,11 @@ export default function ControlClient() {
               >;
 
               // Update existing item in place with buffered content
-              if (pending.done || !pending.content || existing.id === pending.id) {
+              if (
+                pending.done ||
+                !pending.content ||
+                existing.id === pending.id
+              ) {
                 updated[existingIdx] = {
                   ...existing,
                   content: pending.content || existing.content,
@@ -7305,14 +7625,18 @@ export default function ControlClient() {
         const existingContent = existingPending?.content ?? "";
         // P1-#8: tolerant continuation check (see stream-continuation.ts).
         const isContinuation = isStreamContinuation(content, existingContent);
-        const shouldStartNew = Boolean(existingPending && !isContinuation && existingContent.trim());
+        const shouldStartNew = Boolean(
+          existingPending && !isContinuation && existingContent.trim(),
+        );
 
         if (shouldStartNew) {
           // Finalize the previous thought before starting a new one.
           pendingThinkingRef.current = {
             content: existingContent,
             done: true,
-            id: existingPending?.id ?? `thinking-${thinkingIdCounterRef.current++}`,
+            id:
+              existingPending?.id ??
+              `thinking-${thinkingIdCounterRef.current++}`,
             startTime: existingPending?.startTime ?? now,
           };
           flushThinking();
@@ -7320,8 +7644,11 @@ export default function ControlClient() {
 
         const thinkingId = shouldStartNew
           ? `thinking-${thinkingIdCounterRef.current++}`
-          : existingPending?.id ?? `thinking-${thinkingIdCounterRef.current++}`;
-        const startTime = shouldStartNew ? now : existingPending?.startTime ?? now;
+          : (existingPending?.id ??
+            `thinking-${thinkingIdCounterRef.current++}`);
+        const startTime = shouldStartNew
+          ? now
+          : (existingPending?.startTime ?? now);
 
         // Buffer the content update
         pendingThinkingRef.current = {
@@ -7379,7 +7706,7 @@ export default function ControlClient() {
             const filtered = prev.filter((it) => it.kind !== "phase");
             const streamId = "text_delta_latest";
             const existingIdx = filtered.findIndex(
-              (it) => it.kind === "stream" && it.id === streamId
+              (it) => it.kind === "stream" && it.id === streamId,
             );
             if (existingIdx >= 0) {
               const updated = [...filtered];
@@ -7389,7 +7716,10 @@ export default function ControlClient() {
               >;
               const existingContent = existing.content ?? "";
               // P1-#8: tolerant continuation check (see stream-continuation.ts).
-              const isContinuation = isStreamContinuation(pending.content, existingContent);
+              const isContinuation = isStreamContinuation(
+                pending.content,
+                existingContent,
+              );
               updated[existingIdx] = {
                 ...existing,
                 content: pending.content || existing.content,
@@ -7425,7 +7755,7 @@ export default function ControlClient() {
 
         pendingStreamRef.current = {
           content: content || existingPending?.content || "",
-          startTime: isContinuation ? existingPending?.startTime ?? now : now,
+          startTime: isContinuation ? (existingPending?.startTime ?? now) : now,
         };
 
         if (streamFlushTimeoutRef.current) {
@@ -7447,14 +7777,86 @@ export default function ControlClient() {
         return;
       }
 
+      if (event.type === "text_op" && isRecord(data)) {
+        const bubbleId = String(data["bubble_id"] ?? "text-op-latest");
+        const rawOps = Array.isArray(data["ops"]) ? data["ops"] : [];
+        const now = Date.now();
+
+        setItems((prev) => {
+          const filtered = prev.filter((it) => it.kind !== "phase");
+          const existingIdx = filtered.findIndex(
+            (it) => it.kind === "stream" && it.id === bubbleId,
+          );
+          const existing =
+            existingIdx >= 0 && filtered[existingIdx]?.kind === "stream"
+              ? (filtered[existingIdx] as Extract<ChatItem, { kind: "stream" }>)
+              : undefined;
+          let content = existing?.content ?? "";
+          let finalized = false;
+
+          for (const op of rawOps) {
+            if (!isRecord(op)) continue;
+            if (op["type"] === "insert") {
+              const pos =
+                typeof op["pos"] === "number"
+                  ? Math.max(0, Math.min(op["pos"], content.length))
+                  : content.length;
+              const text = String(op["text"] ?? "");
+              content = content.slice(0, pos) + text + content.slice(pos);
+            } else if (op["type"] === "replace") {
+              const range = Array.isArray(op["range"]) ? op["range"] : [];
+              const start =
+                typeof range[0] === "number"
+                  ? Math.max(0, Math.min(range[0], content.length))
+                  : 0;
+              const end =
+                typeof range[1] === "number"
+                  ? Math.max(start, Math.min(range[1], content.length))
+                  : content.length;
+              const text = String(op["text"] ?? "");
+              content = content.slice(0, start) + text + content.slice(end);
+            } else if (op["type"] === "finalize") {
+              finalized = true;
+            }
+          }
+
+          if (existingIdx >= 0 && existing) {
+            const updated = [...filtered];
+            updated[existingIdx] = {
+              ...existing,
+              content,
+              done: finalized,
+              endTime: finalized ? now : undefined,
+            };
+            return updated;
+          }
+
+          return [
+            ...filtered,
+            {
+              kind: "stream" as const,
+              id: bubbleId,
+              content,
+              done: finalized,
+              startTime: now,
+              endTime: finalized ? now : undefined,
+            },
+          ];
+        });
+        return;
+      }
+
       if (event.type === "tool_call" && isRecord(data)) {
         const name = String(data["name"] ?? "");
-        const isUiTool = name.startsWith("ui_") || name === "question" || name === "AskUserQuestion";
+        const isUiTool =
+          name.startsWith("ui_") ||
+          name === "question" ||
+          name === "AskUserQuestion";
         const toolCallId = String(data["tool_call_id"] ?? "");
 
         setItems((prev) => {
           const existingIdx = prev.findIndex(
-            (item) => item.kind === "tool" && item.toolCallId === toolCallId
+            (item) => item.kind === "tool" && item.toolCallId === toolCallId,
           );
           if (existingIdx !== -1) {
             return prev;
@@ -7475,7 +7877,7 @@ export default function ControlClient() {
           // the assistant reply (it may be inserted before the queued message and then
           // scrolled out of view under a long tail of tools).
           const firstQueuedIdx = prev.findIndex(
-            (item) => item.kind === "user" && item.queued === true
+            (item) => item.kind === "user" && item.queued === true,
           );
           if (firstQueuedIdx === -1) {
             return [...prev, toolItem];
@@ -7495,7 +7897,8 @@ export default function ControlClient() {
           setShowDesktopStream(true);
           expectingDesktopSessionRef.current = true;
           // Start rapid polling (every 2s) to pick up the session once the backend attributes it
-          if (desktopRapidPollRef.current) clearInterval(desktopRapidPollRef.current);
+          if (desktopRapidPollRef.current)
+            clearInterval(desktopRapidPollRef.current);
           desktopRapidPollRef.current = setInterval(() => {
             refreshDesktopSessions();
           }, 2000);
@@ -7518,11 +7921,16 @@ export default function ControlClient() {
 
         // Extract display ID from desktop_start_session tool result
         // Get tool name from the event data (preferred) or fall back to stored tool item
-        const eventToolName = typeof data["name"] === "string" ? data["name"] : null;
+        const eventToolName =
+          typeof data["name"] === "string" ? data["name"] : null;
 
         // Check for desktop_start_session right away using event data
         // This handles the case where tool_call events might be filtered or missed
-        if (eventToolName === "desktop_start_session" || eventToolName === "desktop_desktop_start_session" || eventToolName === "mcp__desktop__desktop_start_session") {
+        if (
+          eventToolName === "desktop_start_session" ||
+          eventToolName === "desktop_desktop_start_session" ||
+          eventToolName === "mcp__desktop__desktop_start_session"
+        ) {
           const display = extractDesktopDisplay(data["result"] ?? data);
           if (display) {
             setDesktopDisplayId(display);
@@ -7532,7 +7940,11 @@ export default function ControlClient() {
           }
         }
         // Handle desktop session close
-        if (eventToolName === "desktop_close_session" || eventToolName === "desktop_desktop_close_session" || eventToolName === "mcp__desktop__desktop_close_session") {
+        if (
+          eventToolName === "desktop_close_session" ||
+          eventToolName === "desktop_desktop_close_session" ||
+          eventToolName === "mcp__desktop__desktop_close_session"
+        ) {
           setHasDesktopSession(false);
           setShowDesktopStream(false);
         }
@@ -7541,12 +7953,16 @@ export default function ControlClient() {
         // Use itemsRef for synchronous read to avoid side effects in state updaters
         if (!eventToolName) {
           const toolItem = itemsRef.current.find(
-            (it) => it.kind === "tool" && it.toolCallId === toolCallId
+            (it) => it.kind === "tool" && it.toolCallId === toolCallId,
           );
           if (toolItem && toolItem.kind === "tool") {
             const toolName = toolItem.name;
             // Check for desktop_start_session (with or without desktop_ prefix from MCP)
-            if (toolName === "desktop_start_session" || toolName === "desktop_desktop_start_session" || toolName === "mcp__desktop__desktop_start_session") {
+            if (
+              toolName === "desktop_start_session" ||
+              toolName === "desktop_desktop_start_session" ||
+              toolName === "mcp__desktop__desktop_start_session"
+            ) {
               const display = extractDesktopDisplay(data["result"] ?? data);
               if (display) {
                 setDesktopDisplayId(display);
@@ -7555,7 +7971,11 @@ export default function ControlClient() {
               }
             }
             // Check for desktop_close_session
-            if (toolName === "desktop_close_session" || toolName === "desktop_desktop_close_session" || toolName === "mcp__desktop__desktop_close_session") {
+            if (
+              toolName === "desktop_close_session" ||
+              toolName === "desktop_desktop_close_session" ||
+              toolName === "mcp__desktop__desktop_close_session"
+            ) {
               setHasDesktopSession(false);
               setShowDesktopStream(false);
             }
@@ -7566,8 +7986,8 @@ export default function ControlClient() {
           prev.map((it) =>
             it.kind === "tool" && it.toolCallId === toolCallId
               ? { ...it, result: data["result"], endTime }
-              : it
-          )
+              : it,
+          ),
         );
         return;
       }
@@ -7601,9 +8021,10 @@ export default function ControlClient() {
             ? String(data["message"])
             : null) ?? "An error occurred.";
         const resumable = isRecord(data) && data["resumable"] === true;
-        const missionId = isRecord(data) && typeof data["mission_id"] === "string"
-          ? data["mission_id"]
-          : undefined;
+        const missionId =
+          isRecord(data) && typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
         streamLog("error", "error event", {
           message: msg,
           missionId,
@@ -7618,7 +8039,14 @@ export default function ControlClient() {
         } else {
           setItems((prev) => [
             ...prev,
-            { kind: "system", id: `err-${Date.now()}`, content: msg, timestamp: Date.now(), resumable, missionId },
+            {
+              kind: "system",
+              id: `err-${Date.now()}`,
+              content: msg,
+              timestamp: Date.now(),
+              resumable,
+              missionId,
+            },
           ]);
           toast.error(msg);
         }
@@ -7633,14 +8061,17 @@ export default function ControlClient() {
       // user never sees a scary error toast for what is a transient
       // back-pressure event.
       if (event.type === "stream_lagged") {
-        const dropped = isRecord(data) && typeof data["dropped"] === "number"
-          ? (data["dropped"] as number)
-          : undefined;
+        const dropped =
+          isRecord(data) && typeof data["dropped"] === "number"
+            ? (data["dropped"] as number)
+            : undefined;
         streamLog("warn", "stream_lagged — refetching", { dropped });
         const viewingId = viewingMissionIdRef.current;
         if (viewingId) {
           void reloadMissionHistory(viewingId).catch((err) => {
-            streamLog("warn", "stream_lagged refetch failed", { err: String(err) });
+            streamLog("warn", "stream_lagged refetch failed", {
+              err: String(err),
+            });
           });
         }
         return;
@@ -7649,7 +8080,10 @@ export default function ControlClient() {
       // Handle mission status changes
       if (event.type === "mission_status_changed" && isRecord(data)) {
         const newStatus = String(data["status"] ?? "");
-        const missionId = typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+        const missionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
 
         // A mission starting/stopping changes the running-missions list.
         // Fire-and-forget refresh so we don't have to rely on the 15 s
@@ -7669,12 +8103,12 @@ export default function ControlClient() {
           });
           if (currentMissionRef.current?.id === missionId) {
             setCurrentMission((prev) =>
-              prev ? { ...prev, status: newStatus as MissionStatus } : prev
+              prev ? { ...prev, status: newStatus as MissionStatus } : prev,
             );
           }
           if (viewingMissionRef.current?.id === missionId) {
             setViewingMission((prev) =>
-              prev ? { ...prev, status: newStatus as MissionStatus } : prev
+              prev ? { ...prev, status: newStatus as MissionStatus } : prev,
             );
           }
         }
@@ -7684,18 +8118,24 @@ export default function ControlClient() {
           const now = Date.now();
           setItems((prev) =>
             prev.map((item) => {
-              if ((item.kind === "thinking" || item.kind === "stream") && !item.done) {
+              if (
+                (item.kind === "thinking" || item.kind === "stream") &&
+                !item.done
+              ) {
                 return { ...item, done: true, endTime: now };
               }
               if (item.kind === "tool" && item.result === undefined) {
                 return {
                   ...item,
-                  result: { status: "cancelled", reason: `Mission ${newStatus}` },
+                  result: {
+                    status: "cancelled",
+                    reason: `Mission ${newStatus}`,
+                  },
                   endTime: now,
                 };
               }
               return item;
-            })
+            }),
           );
           if (thinkingFlushTimeoutRef.current) {
             clearTimeout(thinkingFlushTimeoutRef.current);
@@ -7719,7 +8159,9 @@ export default function ControlClient() {
 
       if (event.type === "goal_iteration" && isRecord(data)) {
         const missionId =
-          typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
         const iteration =
           typeof data["iteration"] === "number" ? data["iteration"] : undefined;
         const objective =
@@ -7738,7 +8180,9 @@ export default function ControlClient() {
 
       if (event.type === "goal_status" && isRecord(data)) {
         const missionId =
-          typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
         const status =
           typeof data["status"] === "string" ? data["status"] : undefined;
         const objective =
@@ -7772,8 +8216,12 @@ export default function ControlClient() {
       }
 
       if (event.type === "mission_title_changed" && isRecord(data)) {
-        const missionId = typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
-        const title = typeof data["title"] === "string" ? data["title"] : undefined;
+        const missionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
+        const title =
+          typeof data["title"] === "string" ? data["title"] : undefined;
         if (missionId && title !== undefined) {
           setRecentMissions((prev) => {
             let changed = false;
@@ -7794,7 +8242,10 @@ export default function ControlClient() {
       }
 
       if (event.type === "mission_metadata_updated" && isRecord(data)) {
-        const missionId = typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+        const missionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
         if (missionId) {
           const title =
             data["title"] === null
@@ -7815,7 +8266,9 @@ export default function ControlClient() {
                 ? data["metadata_updated_at"]
                 : undefined;
           const updatedAt =
-            typeof data["updated_at"] === "string" ? data["updated_at"] : undefined;
+            typeof data["updated_at"] === "string"
+              ? data["updated_at"]
+              : undefined;
           const metadataSource =
             data["metadata_source"] === null
               ? null
@@ -7862,7 +8315,9 @@ export default function ControlClient() {
             });
             if (!changed) return prev;
             if (updatedAt === undefined) return next;
-            return [...next].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+            return [...next].sort((a, b) =>
+              b.updated_at.localeCompare(a.updated_at),
+            );
           });
 
           if (currentMissionRef.current?.id === missionId) {
@@ -7877,7 +8332,9 @@ export default function ControlClient() {
                     ...(metadataUpdatedAt !== undefined
                       ? { metadata_updated_at: metadataUpdatedAt }
                       : {}),
-                    ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
+                    ...(updatedAt !== undefined
+                      ? { updated_at: updatedAt }
+                      : {}),
                     ...(metadataSource !== undefined
                       ? { metadata_source: metadataSource }
                       : {}),
@@ -7888,7 +8345,7 @@ export default function ControlClient() {
                       ? { metadata_version: metadataVersion }
                       : {}),
                   }
-                : prev
+                : prev,
             );
           }
           if (viewingMissionRef.current?.id === missionId) {
@@ -7903,7 +8360,9 @@ export default function ControlClient() {
                     ...(metadataUpdatedAt !== undefined
                       ? { metadata_updated_at: metadataUpdatedAt }
                       : {}),
-                    ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
+                    ...(updatedAt !== undefined
+                      ? { updated_at: updatedAt }
+                      : {}),
                     ...(metadataSource !== undefined
                       ? { metadata_source: metadataSource }
                       : {}),
@@ -7914,16 +8373,20 @@ export default function ControlClient() {
                       ? { metadata_version: metadataVersion }
                       : {}),
                   }
-                : prev
+                : prev,
             );
           }
         }
       }
 
       if (event.type === "mission_settings_updated" && isRecord(data)) {
-        const missionId = typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+        const missionId =
+          typeof data["mission_id"] === "string"
+            ? data["mission_id"]
+            : undefined;
         if (missionId) {
-          const backend = typeof data["backend"] === "string" ? data["backend"] : undefined;
+          const backend =
+            typeof data["backend"] === "string" ? data["backend"] : undefined;
           const agent =
             data["agent"] === null
               ? null
@@ -7955,14 +8418,22 @@ export default function ControlClient() {
                 ? data["session_id"]
                 : undefined;
           const updatedAt =
-            typeof data["updated_at"] === "string" ? data["updated_at"] : undefined;
+            typeof data["updated_at"] === "string"
+              ? data["updated_at"]
+              : undefined;
           const applySettings = (mission: Mission): Mission => ({
             ...mission,
             ...(backend !== undefined ? { backend } : {}),
             ...(agent !== undefined ? { agent } : {}),
-            ...(modelOverride !== undefined ? { model_override: modelOverride } : {}),
-            ...(modelEffort !== undefined ? { model_effort: modelEffort as ModelEffort | null } : {}),
-            ...(configProfile !== undefined ? { config_profile: configProfile } : {}),
+            ...(modelOverride !== undefined
+              ? { model_override: modelOverride }
+              : {}),
+            ...(modelEffort !== undefined
+              ? { model_effort: modelEffort as ModelEffort | null }
+              : {}),
+            ...(configProfile !== undefined
+              ? { config_profile: configProfile }
+              : {}),
             ...(sessionId !== undefined ? { session_id: sessionId } : {}),
             ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
             resumable: false,
@@ -7976,7 +8447,9 @@ export default function ControlClient() {
               return applySettings(mission);
             });
             return changed && updatedAt !== undefined
-              ? [...next].sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+              ? [...next].sort((a, b) =>
+                  b.updated_at.localeCompare(a.updated_at),
+                )
               : changed
                 ? next
                 : prev;
@@ -7995,7 +8468,7 @@ export default function ControlClient() {
         const progressMissionId =
           typeof data["mission_id"] === "string"
             ? data["mission_id"]
-            : currentMissionRef.current?.id ?? null;
+            : (currentMissionRef.current?.id ?? null);
         if (progressMissionId) {
           setProgressByMission((prev) => ({
             ...prev,
@@ -8014,7 +8487,7 @@ export default function ControlClient() {
       if (!mounted) return;
       const delay = Math.min(
         baseDelay * Math.pow(2, reconnectAttempts),
-        maxReconnectDelay
+        maxReconnectDelay,
       );
       reconnectAttempts++;
       streamLog("warn", "reconnect scheduled", {
@@ -8035,6 +8508,9 @@ export default function ControlClient() {
       streamLog("info", "connecting stream", { missionFilter });
       cleanup = streamControl(handleEvent, handleStreamDiagnostics, {
         missionId: missionFilter,
+        sinceSeq: missionFilter
+          ? missionMaxSeqRef.current.get(missionFilter)
+          : undefined,
       });
     };
 
@@ -8085,10 +8561,15 @@ export default function ControlClient() {
         ? Date.now() - streamDiagnostics.lastChunkAt
         : null;
       if (lastChunkAge !== null && lastChunkAge > 30000) {
-        hints.push("No SSE chunks for >30s. Likely proxy buffering or connection drops.");
+        hints.push(
+          "No SSE chunks for >30s. Likely proxy buffering or connection drops.",
+        );
       }
     }
-    if (typeof streamDiagnostics.status === "number" && streamDiagnostics.status >= 400) {
+    if (
+      typeof streamDiagnostics.status === "number" &&
+      streamDiagnostics.status >= 400
+    ) {
       hints.push(`Stream request returned HTTP ${streamDiagnostics.status}.`);
     }
     return hints;
@@ -8098,13 +8579,15 @@ export default function ControlClient() {
     const mission = viewingMission ?? currentMission;
     const payload = {
       captured_at: new Date().toISOString(),
-      mission: mission ? {
-        id: mission.id,
-        status: mission.status,
-        title: mission.title,
-        workspace_id: mission.workspace_id,
-        workspace_name: mission.workspace_name,
-      } : null,
+      mission: mission
+        ? {
+            id: mission.id,
+            status: mission.status,
+            title: mission.title,
+            workspace_id: mission.workspace_id,
+            workspace_name: mission.workspace_name,
+          }
+        : null,
       stream: {
         phase: streamDiagnostics.phase,
         status: streamDiagnostics.status,
@@ -8121,7 +8604,13 @@ export default function ControlClient() {
     } catch {
       toast.error("Failed to copy");
     }
-  }, [connectionState, reconnectAttempt, streamDiagnostics, viewingMission, currentMission]);
+  }, [
+    connectionState,
+    reconnectAttempt,
+    streamDiagnostics,
+    viewingMission,
+    currentMission,
+  ]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -8134,7 +8623,9 @@ export default function ControlClient() {
     // The backend's current_mission can get out of sync (e.g., from another tab or auto-creation).
     if (targetMissionId) {
       try {
-        console.debug("[control] syncing mission before send", { targetMissionId });
+        console.debug("[control] syncing mission before send", {
+          targetMissionId,
+        });
         const mission = await loadMission(targetMissionId);
         if (!mission) {
           toast.error("Mission not found");
@@ -8151,7 +8642,9 @@ export default function ControlClient() {
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         console.error("Failed to sync mission before sending:", err);
-        toast.error(`Failed to sync mission: ${errMsg}. Check API connection in Settings.`);
+        toast.error(
+          `Failed to sync mission: ${errMsg}. Check API connection in Settings.`,
+        );
         return;
       }
     }
@@ -8191,16 +8684,20 @@ export default function ControlClient() {
       setItems((prev) => {
         // Check if SSE already added this message (race condition where SSE arrives before API response)
         // If so, just remove the temp message to avoid duplicates
-        const sseAlreadyAdded = prev.some((item) => item.id === id && item.id !== tempId);
+        const sseAlreadyAdded = prev.some(
+          (item) => item.id === id && item.id !== tempId,
+        );
         if (sseAlreadyAdded) {
           return prev.filter((item) => item.id !== tempId);
         }
 
-        const otherUserMessages = prev.filter((item) => item.kind === "user" && item.id !== tempId);
+        const otherUserMessages = prev.filter(
+          (item) => item.kind === "user" && item.id !== tempId,
+        );
         const isFirstMessage = otherUserMessages.length === 0;
         const effectiveQueued = isFirstMessage ? false : queued;
         return prev.map((item) =>
-          item.id === tempId ? { ...item, id, queued: effectiveQueued } : item
+          item.id === tempId ? { ...item, id, queued: effectiveQueued } : item,
         );
       });
     } catch (err) {
@@ -8212,123 +8709,139 @@ export default function ControlClient() {
   };
 
   // Handler for EnhancedInput that takes a payload with content and optional agent
-  const handleEnhancedSubmit = useCallback(async (payload: SubmitPayload) => {
-    const { content, agent } = payload;
-    const trimmedContent = content.trim();
-    if (!trimmedContent) return;
+  const handleEnhancedSubmit = useCallback(
+    async (payload: SubmitPayload) => {
+      const { content, agent } = payload;
+      const trimmedContent = content.trim();
+      if (!trimmedContent) return;
 
-    // Guard against double-submission (e.g., double-click, React StrictMode)
-    if (submittingRef.current) {
-      console.debug("[control] ignoring duplicate submission");
-      return;
-    }
-    submittingRef.current = true;
+      // Guard against double-submission (e.g., double-click, React StrictMode)
+      if (submittingRef.current) {
+        console.debug("[control] ignoring duplicate submission");
+        return;
+      }
+      submittingRef.current = true;
 
-    const targetMissionId = viewingMissionIdRef.current;
-    const tempId = crypto.randomUUID();
-    const timestamp = Date.now();
-    const hasExistingUserMessages = items.some((item) => item.kind === "user");
-    const willBeQueued = isBusy && hasExistingUserMessages;
+      const targetMissionId = viewingMissionIdRef.current;
+      const tempId = crypto.randomUUID();
+      const timestamp = Date.now();
+      const hasExistingUserMessages = items.some(
+        (item) => item.kind === "user",
+      );
+      const willBeQueued = isBusy && hasExistingUserMessages;
 
-    const restoreFailedOptimisticSend = () => {
-      setItems((prev) => prev.filter((item) => item.id !== tempId));
-      enhancedInputRef.current?.restoreDraft(trimmedContent, agent ?? null);
-      setInput(trimmedContent);
-      setDraftInput(trimmedContent);
-    };
+      const restoreFailedOptimisticSend = () => {
+        setItems((prev) => prev.filter((item) => item.id !== tempId));
+        enhancedInputRef.current?.restoreDraft(trimmedContent, agent ?? null);
+        setInput(trimmedContent);
+        setDraftInput(trimmedContent);
+      };
 
-    // Acknowledge the user's send immediately, before any mission sync or
-    // network round-trip. If sync/post fails below, the optimistic row is
-    // removed and the draft is restored.
-    setItems((prev) => [
-      ...prev,
-      {
-        kind: "user" as const,
-        id: tempId,
-        content: trimmedContent,
-        timestamp,
-        queued: willBeQueued,
-      },
-    ]);
-    enhancedInputRef.current?.clear();
-    setInput("");
-    setDraftInput("");
+      // Acknowledge the user's send immediately, before any mission sync or
+      // network round-trip. If sync/post fails below, the optimistic row is
+      // removed and the draft is restored.
+      setItems((prev) => [
+        ...prev,
+        {
+          kind: "user" as const,
+          id: tempId,
+          content: trimmedContent,
+          timestamp,
+          queued: willBeQueued,
+        },
+      ]);
+      enhancedInputRef.current?.clear();
+      setInput("");
+      setDraftInput("");
 
-    // Sync mission state before sending (backend needs current_mission set correctly).
-    // This now happens after the optimistic row so slow mission sync does not
-    // make the Send button feel ignored.
-    if (targetMissionId) {
-      try {
-        let mission = await loadMission(targetMissionId);
+      // Sync mission state before sending (backend needs current_mission set correctly).
+      // This now happens after the optimistic row so slow mission sync does not
+      // make the Send button feel ignored.
+      if (targetMissionId) {
+        try {
+          let mission = await loadMission(targetMissionId);
 
-        if (!mission) {
+          if (!mission) {
+            restoreFailedOptimisticSend();
+            toast.error("Mission not found");
+            submittingRef.current = false;
+            return;
+          }
+
+          // If the mission is in a resumable state (failed/interrupted/blocked),
+          // Resume/sync it first before sending the message.
+          // Use skipMessage to avoid the automatic resume message
+          // since the user is about to send their own custom message.
+          if (["failed", "interrupted", "blocked"].includes(mission.status)) {
+            mission = await resumeMission(mission.id, { skipMessage: true });
+          }
+
+          setCurrentMission(mission);
+          setViewingMission(mission);
+          setViewingMissionId(mission.id);
+          // Don't sync items from persisted history here - the local items state
+          // is the source of truth and may contain SSE-delivered content that
+          // hasn't been persisted yet. Replacing items would cause messages to disappear.
+          applyDesktopSessionState(mission);
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error("Failed to sync mission before sending:", err);
           restoreFailedOptimisticSend();
-          toast.error("Mission not found");
+          toast.error(
+            `Failed to sync mission: ${errMsg}. Check API connection in Settings.`,
+          );
           submittingRef.current = false;
           return;
         }
-
-        // If the mission is in a resumable state (failed/interrupted/blocked),
-        // Resume/sync it first before sending the message.
-        // Use skipMessage to avoid the automatic resume message
-        // since the user is about to send their own custom message.
-        if (["failed", "interrupted", "blocked"].includes(mission.status)) {
-          mission = await resumeMission(mission.id, { skipMessage: true });
-        }
-
-        setCurrentMission(mission);
-        setViewingMission(mission);
-        setViewingMissionId(mission.id);
-        // Don't sync items from persisted history here - the local items state
-        // is the source of truth and may contain SSE-delivered content that
-        // hasn't been persisted yet. Replacing items would cause messages to disappear.
-        applyDesktopSessionState(mission);
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        console.error("Failed to sync mission before sending:", err);
-        restoreFailedOptimisticSend();
-        toast.error(`Failed to sync mission: ${errMsg}. Check API connection in Settings.`);
-        submittingRef.current = false;
-        return;
       }
-    }
 
-    try {
-      // Send message with mission_id - backend handles routing (main vs parallel)
-      const { id, queued } = await postControlMessageWithRetry(trimmedContent, {
-        agent: agent || undefined,
-        mission_id: targetMissionId || undefined,
-        client_message_id: tempId,
-      });
-      setItems((prev) => {
-        // Check if SSE already added this message (race condition where SSE arrives before API response)
-        // If so, just remove the temp message to avoid duplicates
-        const sseAlreadyAdded = prev.some((item) => item.id === id && item.id !== tempId);
-        if (sseAlreadyAdded) {
-          return prev.filter((item) => item.id !== tempId);
-        }
-
-        const otherUserMessages = prev.filter((item) => item.kind === "user" && item.id !== tempId);
-        const isFirstMessage = otherUserMessages.length === 0;
-        const effectiveQueued = isFirstMessage ? false : queued;
-        return prev.map((item) =>
-          item.id === tempId ? { ...item, id, queued: effectiveQueued } : item
+      try {
+        // Send message with mission_id - backend handles routing (main vs parallel)
+        const { id, queued } = await postControlMessageWithRetry(
+          trimmedContent,
+          {
+            agent: agent || undefined,
+            mission_id: targetMissionId || undefined,
+            client_message_id: tempId,
+          },
         );
-      });
-    } catch (err) {
-      console.error(err);
-      // Restore via the imperative handle so a locked-agent badge is
-      // reinstated instead of surfacing as a raw "@agent " prefix.
-      // Use `trimmedContent` — it's what the optimistic item and the
-      // failed API call carried, so the restored draft matches what
-      // the user actually sent. Leading/trailing whitespace in
-      // `content` is intentionally dropped here.
-      restoreFailedOptimisticSend();
-      toast.error("Failed to send message");
-    } finally {
-      submittingRef.current = false;
-    }
-  }, [items, isBusy, applyDesktopSessionState, missionHistoryToItems]);
+        setItems((prev) => {
+          // Check if SSE already added this message (race condition where SSE arrives before API response)
+          // If so, just remove the temp message to avoid duplicates
+          const sseAlreadyAdded = prev.some(
+            (item) => item.id === id && item.id !== tempId,
+          );
+          if (sseAlreadyAdded) {
+            return prev.filter((item) => item.id !== tempId);
+          }
+
+          const otherUserMessages = prev.filter(
+            (item) => item.kind === "user" && item.id !== tempId,
+          );
+          const isFirstMessage = otherUserMessages.length === 0;
+          const effectiveQueued = isFirstMessage ? false : queued;
+          return prev.map((item) =>
+            item.id === tempId
+              ? { ...item, id, queued: effectiveQueued }
+              : item,
+          );
+        });
+      } catch (err) {
+        console.error(err);
+        // Restore via the imperative handle so a locked-agent badge is
+        // reinstated instead of surfacing as a raw "@agent " prefix.
+        // Use `trimmedContent` — it's what the optimistic item and the
+        // failed API call carried, so the restored draft matches what
+        // the user actually sent. Leading/trailing whitespace in
+        // `content` is intentionally dropped here.
+        restoreFailedOptimisticSend();
+        toast.error("Failed to send message");
+      } finally {
+        submittingRef.current = false;
+      }
+    },
+    [items, isBusy, applyDesktopSessionState, missionHistoryToItems],
+  );
 
   const handleStop = async () => {
     const targetId = viewingMissionIdRef.current;
@@ -8350,7 +8863,9 @@ export default function ControlClient() {
     syncingQueueRef.current = true;
     try {
       const queuedMessages = await getQueue();
-      const queuedForMission = queuedMessages.filter((qm) => qm.mission_id === missionId);
+      const queuedForMission = queuedMessages.filter(
+        (qm) => qm.mission_id === missionId,
+      );
       const queuedIds = new Set(queuedForMission.map((qm) => qm.id));
 
       setItems((prev) =>
@@ -8360,7 +8875,7 @@ export default function ControlClient() {
           const shouldBeQueued = queuedIds.has(item.id);
           if (item.queued === shouldBeQueued) return item;
           return { ...item, queued: shouldBeQueued };
-        })
+        }),
       );
     } catch (err) {
       console.warn("[control] failed to sync queue", err);
@@ -8388,7 +8903,9 @@ export default function ControlClient() {
         if (knownSeq > 0) {
           const [mission, deltaEvents, queuedMessages] = await Promise.all([
             getMission(missionId),
-            loadHistoryEvents(missionId, { sinceSeq: knownSeq }).catch(() => null),
+            loadHistoryEvents(missionId, { sinceSeq: knownSeq }).catch(
+              () => null,
+            ),
             getQueue().catch(() => []),
           ]);
           if (viewingMissionIdRef.current !== missionId) return;
@@ -8431,7 +8948,7 @@ export default function ControlClient() {
               (ev) =>
                 ev.event_type === "tool_result" &&
                 !!ev.tool_call_id &&
-                !deltaToolCallIds.has(ev.tool_call_id)
+                !deltaToolCallIds.has(ev.tool_call_id),
             );
             // Detect overlap with a live SSE row (case 2/3). We only
             // care when an in-flight stream/thinking row is currently
@@ -8440,13 +8957,13 @@ export default function ControlClient() {
             const hasLiveStreamingRow = itemsRef.current.some(
               (it) =>
                 (it.kind === "stream" && it.id === "text_delta_latest") ||
-                (it.kind === "thinking" && !it.done)
+                (it.kind === "thinking" && !it.done),
             );
             const deltaTouchesStreamingTypes = deltaEvents.some(
               (ev) =>
                 ev.event_type === "thinking" ||
                 ev.event_type === "text_delta" ||
-                ev.event_type === "assistant_message"
+                ev.event_type === "assistant_message",
             );
             needsFullReload =
               hasOrphanToolResult ||
@@ -8457,7 +8974,9 @@ export default function ControlClient() {
             const deltaItems = eventsToItems(deltaEvents, mission);
             setItems((prev) => {
               const existingIds = new Set(prev.map((it) => it.id));
-              const additions = deltaItems.filter((it) => !existingIds.has(it.id));
+              const additions = deltaItems.filter(
+                (it) => !existingIds.has(it.id),
+              );
               if (additions.length === 0) return prev;
               const merged = [...prev, ...additions];
               adjustVisibleItemsLimit(merged);
@@ -8470,7 +8989,7 @@ export default function ControlClient() {
           // Queue reconciliation still needs every tick — a message
           // could move from "queued" to "processing" with no new events.
           const missionQueuedMessages = queuedMessages.filter(
-            (qm) => qm.mission_id === missionId
+            (qm) => qm.mission_id === missionId,
           );
           const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
           setItems((prev) => {
@@ -8494,7 +9013,8 @@ export default function ControlClient() {
                 queued: true,
               }));
             if (newQueued.length === 0 && !changed) return prev;
-            const merged = newQueued.length > 0 ? [...next, ...newQueued] : next;
+            const merged =
+              newQueued.length > 0 ? [...next, ...newQueued] : next;
             updateMissionItems(missionId, merged);
             return merged;
           });
@@ -8513,21 +9033,24 @@ export default function ControlClient() {
         if (viewingMissionIdRef.current !== missionId) return;
 
         let historyItems = events
-          ? mergeEventItemsWithMissionHistoryFallback(eventsToItems(events, mission), mission)
+          ? mergeEventItemsWithMissionHistoryFallback(
+              await eventsToItemsAsync(events, mission),
+              mission,
+            )
           : missionHistoryToItems(mission);
 
         // Pre-queue length: pagination uses this to find the live tail
         // without clipping queued items (see `seedPaginationStateAfterInitialLoad`).
         const historicEventsLen = historyItems.length;
         const missionQueuedMessages = queuedMessages.filter(
-          (qm) => qm.mission_id === missionId
+          (qm) => qm.mission_id === missionId,
         );
         if (missionQueuedMessages.length > 0) {
           const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
           historyItems = historyItems.map((item) =>
             item.kind === "user" && queuedIds.has(item.id)
               ? { ...item, queued: true }
-              : item
+              : item,
           );
           const existingIds = new Set(historyItems.map((item) => item.id));
           const newQueuedItems: ChatItem[] = missionQueuedMessages
@@ -8557,13 +9080,14 @@ export default function ControlClient() {
     [
       loadHistoryEvents,
       eventsToItems,
+      eventsToItemsAsync,
       missionHistoryToItems,
       mergeEventItemsWithMissionHistoryFallback,
       adjustVisibleItemsLimit,
       seedPaginationStateAfterInitialLoad,
       updateMissionItems,
       applyDesktopSessionFromEvents,
-    ]
+    ],
   );
 
   // Reload full history when the tab regains visibility to catch missed SSE events
@@ -8574,7 +9098,8 @@ export default function ControlClient() {
       }
     };
     document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+    return () =>
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
   }, [viewingMissionId, reloadMissionHistory]);
 
   // Periodically sync history for running missions to catch missed SSE
@@ -8601,8 +9126,9 @@ export default function ControlClient() {
   // Compute queued items for the queue strip
   const queuedItems: QueueItem[] = useMemo(() => {
     return items
-      .filter((item): item is Extract<typeof item, { kind: "user" }> =>
-        item.kind === "user" && item.queued === true
+      .filter(
+        (item): item is Extract<typeof item, { kind: "user" }> =>
+          item.kind === "user" && item.queued === true,
       )
       .map((item) => ({
         id: item.id,
@@ -8629,8 +9155,12 @@ export default function ControlClient() {
     try {
       const { cleared } = await clearQueue();
       // Optimistically remove all queued items from local state
-      setItems((prev) => prev.filter((item) => !(item.kind === "user" && item.queued === true)));
-      toast.success(`Cleared ${cleared} message${cleared !== 1 ? "s" : ""} from queue`);
+      setItems((prev) =>
+        prev.filter((item) => !(item.kind === "user" && item.queued === true)),
+      );
+      toast.success(
+        `Cleared ${cleared} message${cleared !== 1 ? "s" : ""} from queue`,
+      );
     } catch (err) {
       console.error(err);
       toast.error("Failed to clear queue");
@@ -8645,12 +9175,15 @@ export default function ControlClient() {
   const workspaceNameById = useMemo(() => {
     return Object.fromEntries(workspaces.map((ws) => [ws.id, ws.name]));
   }, [workspaces]);
-  const activeWorkspaceLabel = activeMission?.workspace_name
-    || (activeMission?.workspace_id ? workspaceNameById[activeMission.workspace_id] : undefined);
+  const activeWorkspaceLabel =
+    activeMission?.workspace_name ||
+    (activeMission?.workspace_id
+      ? workspaceNameById[activeMission.workspace_id]
+      : undefined);
   const activeMissionSelectorLabel = activeMission
-    ? activeMission.title?.trim()
-      || activeMission.short_description?.trim()
-      || getMissionShortName(activeMission.id)
+    ? activeMission.title?.trim() ||
+      activeMission.short_description?.trim() ||
+      getMissionShortName(activeMission.id)
     : null;
   const missionStatus = activeMission
     ? missionStatusLabel(activeMission.status, viewingMissionIsRunning)
@@ -8674,7 +9207,9 @@ export default function ControlClient() {
     if (!currentMission) return [];
     return recentMissions.filter((m) => m.parent_mission_id === currentMission.id);
   }, [currentMission, recentMissions]);
-  const activeMissionRole = activeMission ? inferMissionRole(activeMission) : null;
+  const activeMissionRole = activeMission
+    ? inferMissionRole(activeMission)
+    : null;
 
   // In-mission sub-agents: Claude Code's in-process `Task` /
   // `background_task` / `spawn_agent`. These run inside the harness
@@ -8715,7 +9250,7 @@ export default function ControlClient() {
     if (childMissions.length > 0 || hasInMissionSubagents) {
       setShowWorkerPanel(true);
     }
-  }, [currentMission?.id, childMissions.length, hasInMissionSubagents]);
+  }, [activeMission?.id, childMissions.length, hasInMissionSubagents]);
 
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
@@ -8724,14 +9259,18 @@ export default function ControlClient() {
   // - User just sent a message (waiting for assistant response)
   // Note: For failed missions, we show resume even if lastTurnCompleted (error message is last)
   const lastItem = lastNonQueuedItem ?? items[items.length - 1];
-  const lastTurnCompleted = lastItem?.kind === 'assistant';
-  const waitingForResponse = lastItem?.kind === 'user';
-  const isFailed = activeMission?.status === 'failed';
-  const showResumeUI = activeMission &&
+  const lastTurnCompleted = lastItem?.kind === "assistant";
+  const waitingForResponse = lastItem?.kind === "user";
+  const isFailed = activeMission?.status === "failed";
+  const showResumeUI =
+    activeMission &&
     !viewingMissionIsRunning &&
     !waitingForResponse &&
     !dismissedResumeUI &&
-    (isFailed || (!lastTurnCompleted && (activeMission.status === 'interrupted' || activeMission.status === 'blocked')));
+    (isFailed ||
+      (!lastTurnCompleted &&
+        (activeMission.status === "interrupted" ||
+          activeMission.status === "blocked")));
 
   // Reset dismissedResumeUI when switching missions
   useEffect(() => {
@@ -8740,660 +9279,793 @@ export default function ControlClient() {
 
   return (
     <NowTickProvider>
-    <div className="flex h-screen flex-col p-6">
-      {/* Always-on debug overlay so any OOM-style crash leaves a trail
+      <div className="flex h-screen flex-col p-6">
+        {/* Always-on debug overlay so any OOM-style crash leaves a trail
           we can reconstruct from sessionStorage after reload. Cheap:
           a polling tick every 2s that reads performance.memory and
           publishes a CustomEvent the parent listens to for shedding. */}
-      <MissionDebugStats items={items} visibleItems={visibleItemsLimit} />
+        <MissionDebugStats items={items} visibleItems={visibleItemsLimit} />
 
-      {/* Opt-in perf overlay — `?debug=perf` only. Mounts no work in normal
+        {/* Opt-in perf overlay — `?debug=perf` only. Mounts no work in normal
           sessions; the bus and observer self-disable when the flag is off. */}
-      <PerfOverlay />
+        <PerfOverlay />
 
-      {/* Hidden file input */}
-      <input
-        ref={fileInputRef}
-        type="file"
-        multiple
-        onChange={handleFileChange}
-        className="hidden"
-      />
+        {/* Hidden file input */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          onChange={handleFileChange}
+          className="hidden"
+        />
 
-      {/* Mission Switcher Command Palette */}
-      <MissionSwitcher
-        open={showMissionSwitcher}
-        onClose={() => setShowMissionSwitcher(false)}
-        missions={recentMissions}
-        runningMissions={runningMissions}
-        currentMissionId={currentMission?.id}
-        viewingMissionId={viewingMissionId}
-        workspaceNameById={workspaceNameById}
-        onSelectMission={handleViewMission}
-        onCancelMission={handleCancelMission}
-        onResumeMission={handleResumeMissionById}
-        onOpenFailingToolCall={handleOpenFailingToolCallById}
-        onFollowUpMission={handleFollowUpMissionById}
-        onRefresh={refreshRecentMissions}
-      />
+        {/* Mission Switcher Command Palette */}
+        <MissionSwitcher
+          open={showMissionSwitcher}
+          onClose={() => setShowMissionSwitcher(false)}
+          missions={recentMissions}
+          runningMissions={runningMissions}
+          currentMissionId={currentMission?.id}
+          viewingMissionId={viewingMissionId}
+          workspaceNameById={workspaceNameById}
+          onSelectMission={handleViewMission}
+          onCancelMission={handleCancelMission}
+          onResumeMission={handleResumeMissionById}
+          onOpenFailingToolCall={handleOpenFailingToolCallById}
+          onFollowUpMission={handleFollowUpMissionById}
+          onRefresh={refreshRecentMissions}
+        />
 
-      <MissionAutomationsDialog
-        open={showAutomationsDialog}
-        missionId={activeMission?.id ?? null}
-        missionLabel={
-          activeMission
-            ? activeWorkspaceLabel
-              ? `${activeWorkspaceLabel} · ${activeMission.title?.trim() || getMissionShortName(activeMission.id)}`
-              : activeMission.title?.trim() || getMissionShortName(activeMission.id)
-            : null
-        }
-        missionBackend={activeMission?.backend ?? null}
-        onClose={() => setShowAutomationsDialog(false)}
-      />
+        <MissionAutomationsDialog
+          open={showAutomationsDialog}
+          missionId={activeMission?.id ?? null}
+          missionLabel={
+            activeMission
+              ? activeWorkspaceLabel
+                ? `${activeWorkspaceLabel} · ${activeMission.title?.trim() || getMissionShortName(activeMission.id)}`
+                : activeMission.title?.trim() ||
+                  getMissionShortName(activeMission.id)
+              : null
+          }
+          missionBackend={activeMission?.backend ?? null}
+          onClose={() => setShowAutomationsDialog(false)}
+        />
 
-      {/* Header */}
-      <div className="relative z-10 mb-6 flex items-center justify-between gap-2 lg:gap-4">
-        <div className="flex items-center gap-3 min-w-0 overflow-hidden">
-          {/* Unified Mission Selector */}
-          <div className="relative">
-            <button
-              onClick={() => setShowMissionSwitcher(true)}
-              className={cn(
-                "flex h-9 items-center gap-2 px-3 rounded-lg transition-colors",
-                "bg-indigo-500/20 hover:bg-indigo-500/30"
-              )}
-              title="Switch mission (⌘K)"
-            >
-              {activeMission ? (
-                <>
-                  <div
-                    className={cn(
-                      "h-2 w-2 rounded-full shrink-0",
-                      missionStatusDotClass(activeMission.status, viewingMissionIsRunning)
-                    )}
-                    title={missionStatus?.label}
-                  />
-                  <span
-                    className="text-sm font-medium text-white/70 truncate max-w-[180px] sm:max-w-[260px]"
-                    title={activeMissionSelectorLabel ?? undefined}
-                  >
-                    {activeMissionSelectorLabel}
-                  </span>
-                </>
-              ) : (
-                <>
-                  <Layers className="h-4 w-4 text-indigo-400" />
-                  <span className="text-sm font-medium text-white/50">No mission</span>
-                </>
-              )}
-              <ChevronDown className="h-3 w-3 text-white/40" />
-            </button>
+        {/* Header */}
+        <div className="relative z-10 mb-6 flex items-center justify-between gap-2 lg:gap-4">
+          <div className="flex items-center gap-3 min-w-0 overflow-hidden">
+            {/* Unified Mission Selector */}
+            <div className="relative">
+              <button
+                onClick={() => setShowMissionSwitcher(true)}
+                className={cn(
+                  "flex h-9 items-center gap-2 px-3 rounded-lg transition-colors",
+                  "bg-indigo-500/20 hover:bg-indigo-500/30",
+                )}
+                title="Switch mission (⌘K)"
+              >
+                {activeMission ? (
+                  <>
+                    <div
+                      className={cn(
+                        "h-2 w-2 rounded-full shrink-0",
+                        missionStatusDotClass(
+                          activeMission.status,
+                          viewingMissionIsRunning,
+                        ),
+                      )}
+                      title={missionStatus?.label}
+                    />
+                    <span
+                      className="text-sm font-medium text-white/70 truncate max-w-[180px] sm:max-w-[260px]"
+                      title={activeMissionSelectorLabel ?? undefined}
+                    >
+                      {activeMissionSelectorLabel}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <Layers className="h-4 w-4 text-indigo-400" />
+                    <span className="text-sm font-medium text-white/50">
+                      No mission
+                    </span>
+                  </>
+                )}
+                <ChevronDown className="h-3 w-3 text-white/40" />
+              </button>
+            </div>
           </div>
-        </div>
 
-        <div className="flex items-center gap-1.5 lg:gap-2 shrink-0">
-          <NewMissionDialog
-            workspaces={workspaces}
-            disabled={missionLoading}
-            onCreate={handleNewMission}
-            initialValues={activeMission ? {
-              workspaceId: activeMission.workspace_id,
-              agent: activeMission.agent || undefined,
-              backend: activeMission.backend,
-              modelOverride: activeMission.model_override || undefined,
-              modelEffort: activeMission.model_effort || undefined,
-              configProfile: activeMission.config_profile,
-            } : undefined}
-          />
+          <div className="flex items-center gap-1.5 lg:gap-2 shrink-0">
+            <NewMissionDialog
+              workspaces={workspaces}
+              disabled={missionLoading}
+              onCreate={handleNewMission}
+              initialValues={
+                activeMission
+                  ? {
+                      workspaceId: activeMission.workspace_id,
+                      agent: activeMission.agent || undefined,
+                      backend: activeMission.backend,
+                      modelOverride: activeMission.model_override || undefined,
+                      modelEffort: activeMission.model_effort || undefined,
+                      configProfile: activeMission.config_profile,
+                    }
+                  : undefined
+              }
+            />
 
-          <button
-            type="button"
-            onClick={() => setShowWorkbenchPanel((prev) => !prev)}
-            className={cn(
-              "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
-              showWorkbenchPanel
-                ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
-                : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
-            )}
-            title={showWorkbenchPanel ? "Hide mission workbench" : "Show mission workbench"}
-          >
-            <BriefcaseBusiness className="h-4 w-4" />
-            <span className="hidden sm:inline">Workbench</span>
-          </button>
-
-          {/* Thinking panel toggle */}
-          <button
-            onClick={handleToggleThinkingPanel}
-            className={cn(
-              "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
-              showThinkingPanel
-                ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
-                : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
-              hasActiveThinking && !showThinkingPanel && "border-indigo-500/50 animate-pulse-subtle"
-            )}
-            title={showThinkingPanel ? "Hide thinking panel" : "Show thinking panel"}
-          >
-            <Brain className={cn("h-4 w-4", hasActiveThinking && "animate-pulse")} />
-            <span className="hidden lg:inline">Thinking</span>
-            {thinkingItemsCount > 0 && (
-              <span className="text-xs opacity-60">{thinkingItemsCount}</span>
-            )}
-          </button>
-
-          {/* Worker panel toggle - only shown for boss missions */}
-          {isBossMission && (
             <button
-              onClick={() => setShowWorkerPanel((prev) => !prev)}
+              type="button"
+              onClick={() => setShowWorkbenchPanel((prev) => !prev)}
+              className={cn(
+                "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+                showWorkbenchPanel
+                  ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
+                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
+              )}
+              title={
+                showWorkbenchPanel
+                  ? "Hide mission workbench"
+                  : "Show mission workbench"
+              }
+            >
+              <BriefcaseBusiness className="h-4 w-4" />
+              <span className="hidden sm:inline">Workbench</span>
+            </button>
+
+            {/* Thinking panel toggle */}
+            <button
+              onClick={handleToggleThinkingPanel}
               className={cn(
                 "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
-                showWorkerPanel
-                  ? "border-violet-500/30 bg-violet-500/10 text-violet-400"
-                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
+                showThinkingPanel
+                  ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
+                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
+                hasActiveThinking &&
+                  !showThinkingPanel &&
+                  "border-indigo-500/50 animate-pulse-subtle",
               )}
-              title={showWorkerPanel ? "Hide worker panel" : "Show worker panel"}
+              title={
+                showThinkingPanel
+                  ? "Hide thinking panel"
+                  : "Show thinking panel"
+              }
             >
-              <Users className="h-4 w-4" />
-              <span className="hidden lg:inline">Workers</span>
-              {childMissions.length > 0 && (
-                <span className="text-xs opacity-60">{childMissions.length}</span>
+              <Brain
+                className={cn("h-4 w-4", hasActiveThinking && "animate-pulse")}
+              />
+              <span className="hidden lg:inline">Thinking</span>
+              {thinkingItemsCount > 0 && (
+                <span className="text-xs opacity-60">{thinkingItemsCount}</span>
               )}
             </button>
-          )}
 
-          {/* Desktop stream toggle with display selector - only shown when a desktop session is active */}
-          {hasDesktopSession && (
-            <div className="relative flex items-center">
+            {/* Worker panel toggle - only shown for boss missions */}
+            {isBossMission && (
               <button
-                onClick={() => setShowDesktopStream(!showDesktopStream)}
+                onClick={() => setShowWorkerPanel((prev) => !prev)}
                 className={cn(
-                  "flex items-center gap-1.5 rounded-l-lg border px-2.5 py-2 text-sm transition-colors",
-                  showDesktopStream
-                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                    : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
+                  "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
+                  showWorkerPanel
+                    ? "border-violet-500/30 bg-violet-500/10 text-violet-400"
+                    : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
                 )}
-                title={showDesktopStream ? "Hide desktop stream" : "Show desktop stream"}
+                title={
+                  showWorkerPanel ? "Hide worker panel" : "Show worker panel"
+                }
               >
-                <Monitor className="h-4 w-4" />
-                <span className="hidden lg:inline">Desktop</span>
-                {showDesktopStream ? (
-                  <PanelRightClose className="h-4 w-4" />
-                ) : (
-                  <PanelRight className="h-4 w-4" />
+                <Users className="h-4 w-4" />
+                <span className="hidden lg:inline">Workers</span>
+                {childMissions.length > 0 && (
+                  <span className="text-xs opacity-60">
+                    {childMissions.length}
+                  </span>
                 )}
               </button>
-              <div className="relative">
+            )}
+
+            {/* Desktop stream toggle with display selector - only shown when a desktop session is active */}
+            {hasDesktopSession && (
+              <div className="relative flex items-center">
                 <button
-                  onClick={() => setShowDisplaySelector(!showDisplaySelector)}
+                  onClick={() => setShowDesktopStream(!showDesktopStream)}
                   className={cn(
-                    "flex items-center gap-1.5 rounded-r-lg border-y border-r px-3 py-2 text-sm transition-colors",
+                    "flex items-center gap-1.5 rounded-l-lg border px-2.5 py-2 text-sm transition-colors",
                     showDesktopStream
                       ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                      : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
+                      : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
                   )}
-                  title="Select display"
+                  title={
+                    showDesktopStream
+                      ? "Hide desktop stream"
+                      : "Show desktop stream"
+                  }
                 >
-                  <span className="text-sm font-mono">{desktopDisplayId}</span>
-                  <ChevronDown className="h-3.5 w-3.5" />
+                  <Monitor className="h-4 w-4" />
+                  <span className="hidden lg:inline">Desktop</span>
+                  {showDesktopStream ? (
+                    <PanelRightClose className="h-4 w-4" />
+                  ) : (
+                    <PanelRight className="h-4 w-4" />
+                  )}
                 </button>
-                {showDisplaySelector && (
-                  <div className="absolute right-0 top-full mt-1 z-50 min-w-[280px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
-                    {/* Show sessions from API if available, otherwise show hardcoded list */}
-                    {desktopSessions.length > 0 ? (
-                      <>
-                        {desktopSessions.map((session, index) => (
-                          <div
-                            key={`${session.display}-${session.mission_id || index}`}
-                            className={cn(
-                              "flex w-full items-center gap-2 px-3 py-2 text-sm transition-colors hover:bg-white/[0.04]",
-                              desktopDisplayId === session.display
-                                ? "bg-white/[0.02]"
-                                : ""
-                            )}
-                          >
-                            <button
-                              onClick={() => {
-                                setDesktopDisplayId(session.display);
-                                setShowDisplaySelector(false);
-                              }}
-                              className="flex flex-1 items-center gap-2 text-left"
-                            >
-                              {/* Status indicator */}
-                              <span className={cn(
-                                "h-2 w-2 rounded-full",
-                                !session.process_running ? "bg-gray-600" :
-                                session.status === 'active' ? "bg-emerald-500" :
-                                session.status === 'orphaned' ? "bg-amber-500" :
-                                "bg-gray-500"
-                              )} title={session.process_running ? session.status : 'stopped'} />
-
-                              {/* Display ID */}
-                              <span className={cn(
-                                "font-mono",
+                <div className="relative">
+                  <button
+                    onClick={() => setShowDisplaySelector(!showDisplaySelector)}
+                    className={cn(
+                      "flex items-center gap-1.5 rounded-r-lg border-y border-r px-3 py-2 text-sm transition-colors",
+                      showDesktopStream
+                        ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                        : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
+                    )}
+                    title="Select display"
+                  >
+                    <span className="text-sm font-mono">
+                      {desktopDisplayId}
+                    </span>
+                    <ChevronDown className="h-3.5 w-3.5" />
+                  </button>
+                  {showDisplaySelector && (
+                    <div className="absolute right-0 top-full mt-1 z-50 min-w-[280px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
+                      {/* Show sessions from API if available, otherwise show hardcoded list */}
+                      {desktopSessions.length > 0 ? (
+                        <>
+                          {desktopSessions.map((session, index) => (
+                            <div
+                              key={`${session.display}-${session.mission_id || index}`}
+                              className={cn(
+                                "flex w-full items-center gap-2 px-3 py-2 text-sm transition-colors hover:bg-white/[0.04]",
                                 desktopDisplayId === session.display
-                                  ? "text-emerald-400"
-                                  : "text-white/70"
-                              )}>
-                                {session.display}
-                              </span>
+                                  ? "bg-white/[0.02]"
+                                  : "",
+                              )}
+                            >
+                              <button
+                                onClick={() => {
+                                  setDesktopDisplayId(session.display);
+                                  setShowDisplaySelector(false);
+                                }}
+                                className="flex flex-1 items-center gap-2 text-left"
+                              >
+                                {/* Status indicator */}
+                                <span
+                                  className={cn(
+                                    "h-2 w-2 rounded-full",
+                                    !session.process_running
+                                      ? "bg-gray-600"
+                                      : session.status === "active"
+                                        ? "bg-emerald-500"
+                                        : session.status === "orphaned"
+                                          ? "bg-amber-500"
+                                          : "bg-gray-500",
+                                  )}
+                                  title={
+                                    session.process_running
+                                      ? session.status
+                                      : "stopped"
+                                  }
+                                />
 
-                              {/* Status label */}
-                              <span className={cn(
-                                "text-xs",
-                                !session.process_running ? "text-white/30" :
-                                session.status === 'active' ? "text-emerald-500/70" :
-                                session.status === 'orphaned' ? "text-amber-500/70" :
-                                "text-white/40"
-                              )}>
-                                {!session.process_running ? 'Stopped' :
-                                 session.status === 'active' ? 'Active' :
-                                 session.status === 'orphaned' ? 'Orphaned' :
-                                 session.status}
-                              </span>
-
-                              {/* Auto-close countdown for orphaned sessions */}
-                              {session.status === 'orphaned' && session.auto_close_in_secs != null && session.auto_close_in_secs > 0 && (
-                                <span className="text-xs text-amber-500/50">
-                                  {Math.floor(session.auto_close_in_secs / 60)}m left
+                                {/* Display ID */}
+                                <span
+                                  className={cn(
+                                    "font-mono",
+                                    desktopDisplayId === session.display
+                                      ? "text-emerald-400"
+                                      : "text-white/70",
+                                  )}
+                                >
+                                  {session.display}
                                 </span>
+
+                                {/* Status label */}
+                                <span
+                                  className={cn(
+                                    "text-xs",
+                                    !session.process_running
+                                      ? "text-white/30"
+                                      : session.status === "active"
+                                        ? "text-emerald-500/70"
+                                        : session.status === "orphaned"
+                                          ? "text-amber-500/70"
+                                          : "text-white/40",
+                                  )}
+                                >
+                                  {!session.process_running
+                                    ? "Stopped"
+                                    : session.status === "active"
+                                      ? "Active"
+                                      : session.status === "orphaned"
+                                        ? "Orphaned"
+                                        : session.status}
+                                </span>
+
+                                {/* Auto-close countdown for orphaned sessions */}
+                                {session.status === "orphaned" &&
+                                  session.auto_close_in_secs != null &&
+                                  session.auto_close_in_secs > 0 && (
+                                    <span className="text-xs text-amber-500/50">
+                                      {Math.floor(
+                                        session.auto_close_in_secs / 60,
+                                      )}
+                                      m left
+                                    </span>
+                                  )}
+
+                                {desktopDisplayId === session.display && (
+                                  <CheckCircle className="ml-auto h-3.5 w-3.5 text-emerald-400" />
+                                )}
+                              </button>
+
+                              {/* Keep alive button for orphaned sessions */}
+                              {session.status === "orphaned" && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleKeepAliveDesktopSession(
+                                      session.display,
+                                    );
+                                  }}
+                                  className="p-1 text-white/40 hover:text-amber-400 transition-colors"
+                                  title="Extend keep-alive (+2h)"
+                                >
+                                  <Clock className="h-3.5 w-3.5" />
+                                </button>
                               )}
 
-                              {desktopDisplayId === session.display && (
-                                <CheckCircle className="ml-auto h-3.5 w-3.5 text-emerald-400" />
-                              )}
-                            </button>
-
-                            {/* Keep alive button for orphaned sessions */}
-                            {session.status === 'orphaned' && (
+                              {/* Close button */}
                               <button
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  handleKeepAliveDesktopSession(session.display);
+                                  handleCloseDesktopSession(session.display);
                                 }}
-                                className="p-1 text-white/40 hover:text-amber-400 transition-colors"
-                                title="Extend keep-alive (+2h)"
+                                disabled={isClosingDesktop === session.display}
+                                className={cn(
+                                  "p-1 transition-colors",
+                                  isClosingDesktop === session.display
+                                    ? "text-white/20"
+                                    : "text-white/40 hover:text-red-400",
+                                )}
+                                title="Close session"
                               >
-                                <Clock className="h-3.5 w-3.5" />
+                                {isClosingDesktop === session.display ? (
+                                  <Loader className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <X className="h-3.5 w-3.5" />
+                                )}
                               </button>
+                            </div>
+                          ))}
+
+                          {/* Separator and cleanup action if there are orphaned sessions */}
+                          {desktopSessions.some(
+                            (s) => s.status === "orphaned" && s.process_running,
+                          ) && (
+                            <>
+                              <div className="my-1 h-px bg-white/[0.06]" />
+                              <AsyncButton
+                                onClick={async () => {
+                                  try {
+                                    await cleanupOrphanedDesktopSessions();
+                                    toast.success(
+                                      "Orphaned sessions cleaned up",
+                                    );
+                                    await refreshDesktopSessions();
+                                  } catch (err) {
+                                    toast.error("Failed to cleanup sessions");
+                                  }
+                                }}
+                                className="flex w-full items-center gap-2 px-3 py-2 text-xs text-amber-500/70 hover:bg-white/[0.04] transition-colors disabled:cursor-not-allowed"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                                Close all orphaned
+                              </AsyncButton>
+                            </>
+                          )}
+
+                          {/* Separator and cleanup action if there are stopped sessions */}
+                          {desktopSessions.some(
+                            (s) => !s.process_running || s.status === "stopped",
+                          ) && (
+                            <>
+                              <div className="my-1 h-px bg-white/[0.06]" />
+                              <AsyncButton
+                                onClick={async () => {
+                                  try {
+                                    await cleanupStoppedDesktopSessions();
+                                    toast.success("Stopped sessions cleared");
+                                    await refreshDesktopSessions();
+                                  } catch (err) {
+                                    toast.error(
+                                      "Failed to clear stopped sessions",
+                                    );
+                                  }
+                                }}
+                                className="flex w-full items-center gap-2 px-3 py-2 text-xs text-white/40 hover:bg-white/[0.04] transition-colors disabled:cursor-not-allowed"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                                Clear stopped sessions
+                              </AsyncButton>
+                            </>
+                          )}
+                        </>
+                      ) : (
+                        /* Fallback to hardcoded list if no sessions from API */
+                        [":99", ":100", ":101", ":102"].map((display) => (
+                          <button
+                            key={display}
+                            onClick={() => {
+                              setDesktopDisplayId(display);
+                              setShowDisplaySelector(false);
+                            }}
+                            className={cn(
+                              "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
+                              desktopDisplayId === display
+                                ? "text-emerald-400"
+                                : "text-white/70",
                             )}
+                          >
+                            {display}
+                            {desktopDisplayId === display && (
+                              <CheckCircle className="ml-auto h-3.5 w-3.5" />
+                            )}
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
 
-                            {/* Close button */}
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleCloseDesktopSession(session.display);
-                              }}
-                              disabled={isClosingDesktop === session.display}
-                              className={cn(
-                                "p-1 transition-colors",
-                                isClosingDesktop === session.display
-                                  ? "text-white/20"
-                                  : "text-white/40 hover:text-red-400"
-                              )}
-                              title="Close session"
-                            >
-                              {isClosingDesktop === session.display ? (
-                                <Loader className="h-3.5 w-3.5 animate-spin" />
-                              ) : (
-                                <X className="h-3.5 w-3.5" />
-                              )}
-                            </button>
-                          </div>
-                        ))}
-
-                        {/* Separator and cleanup action if there are orphaned sessions */}
-                        {desktopSessions.some(s => s.status === 'orphaned' && s.process_running) && (
-                          <>
-                            <div className="my-1 h-px bg-white/[0.06]" />
-                            <AsyncButton
-                              onClick={async () => {
-                                try {
-                                  await cleanupOrphanedDesktopSessions();
-                                  toast.success('Orphaned sessions cleaned up');
-                                  await refreshDesktopSessions();
-                                } catch (err) {
-                                  toast.error('Failed to cleanup sessions');
-                                }
-                              }}
-                              className="flex w-full items-center gap-2 px-3 py-2 text-xs text-amber-500/70 hover:bg-white/[0.04] transition-colors disabled:cursor-not-allowed"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                              Close all orphaned
-                            </AsyncButton>
-                          </>
-                        )}
-
-                        {/* Separator and cleanup action if there are stopped sessions */}
-                        {desktopSessions.some(s => !s.process_running || s.status === 'stopped') && (
-                          <>
-                            <div className="my-1 h-px bg-white/[0.06]" />
-                            <AsyncButton
-                              onClick={async () => {
-                                try {
-                                  await cleanupStoppedDesktopSessions();
-                                  toast.success('Stopped sessions cleared');
-                                  await refreshDesktopSessions();
-                                } catch (err) {
-                                  toast.error('Failed to clear stopped sessions');
-                                }
-                              }}
-                              className="flex w-full items-center gap-2 px-3 py-2 text-xs text-white/40 hover:bg-white/[0.04] transition-colors disabled:cursor-not-allowed"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                              Clear stopped sessions
-                            </AsyncButton>
-                          </>
-                        )}
+            {/* Status panel */}
+            <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+              {/* Connection status indicator - only show when not connected */}
+              {connectionState !== "connected" && (
+                <>
+                  <div
+                    className={cn(
+                      "flex items-center gap-2",
+                      connectionState === "reconnecting"
+                        ? "text-amber-400"
+                        : "text-red-400",
+                    )}
+                  >
+                    {connectionState === "reconnecting" ? (
+                      <>
+                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                        <span className="text-sm font-medium">
+                          Reconnecting
+                          {reconnectAttempt > 1
+                            ? ` (${reconnectAttempt})`
+                            : "..."}
+                        </span>
                       </>
                     ) : (
-                      /* Fallback to hardcoded list if no sessions from API */
-                      [":99", ":100", ":101", ":102"].map((display) => (
-                        <button
-                          key={display}
-                          onClick={() => {
-                            setDesktopDisplayId(display);
-                            setShowDisplaySelector(false);
-                          }}
-                          className={cn(
-                            "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
-                            desktopDisplayId === display
-                              ? "text-emerald-400"
-                              : "text-white/70"
-                          )}
-                        >
-                          {display}
-                          {desktopDisplayId === display && (
-                            <CheckCircle className="ml-auto h-3.5 w-3.5" />
-                          )}
-                        </button>
-                      ))
+                      <>
+                        <WifiOff className="h-3.5 w-3.5" />
+                        <span className="text-sm font-medium">
+                          Disconnected
+                        </span>
+                      </>
                     )}
+                  </div>
+                  <div className="h-4 w-px bg-white/[0.08]" />
+                </>
+              )}
+
+              {/* Run state indicator with debug dropdown */}
+              <div className="relative">
+                <button
+                  onClick={() => setShowStreamDiagnostics((prev) => !prev)}
+                  className={cn(
+                    "flex items-center gap-2 rounded-md px-2 py-1 transition-colors hover:bg-white/[0.04]",
+                    status.className,
+                  )}
+                  title="Click for debug info"
+                >
+                  <StatusIcon
+                    className={cn(
+                      "h-3.5 w-3.5",
+                      viewingRunState !== "idle" && "animate-spin",
+                    )}
+                  />
+                  <span className="text-sm font-medium">{status.label}</span>
+                </button>
+
+                {showStreamDiagnostics && (
+                  <div className="absolute right-0 top-full z-50 mt-2 w-[280px] rounded-lg border border-white/[0.08] bg-[#121214] p-2.5 shadow-xl">
+                    {/* Mission Info */}
+                    {activeMission && (
+                      <div className="space-y-0.5 text-xs">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-white/40">Mission</span>
+                          <span className="font-mono text-[11px] text-white/60 select-all">
+                            {activeMission.id.slice(0, 8)}
+                          </span>
+                        </div>
+                        {activeMission.workspace_name && (
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-white/40">Workspace</span>
+                            <span className="font-mono text-white/80">
+                              {activeMission.workspace_name}
+                            </span>
+                          </div>
+                        )}
+                        {activeMission.agent && (
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-white/40">Agent</span>
+                            <span className="font-mono text-white/80">
+                              {activeMission.agent}
+                            </span>
+                          </div>
+                        )}
+                        {activeMission.backend && (
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-white/40">Backend</span>
+                            <span className="font-mono text-white/80">
+                              {activeMission.backend}
+                            </span>
+                          </div>
+                        )}
+                        {activeMission.model_override && (
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-white/40">
+                              Model override
+                            </span>
+                            <span
+                              className="font-mono text-[11px] text-indigo-400 truncate max-w-[160px]"
+                              title={activeMission.model_override}
+                            >
+                              {activeMission.model_override}
+                            </span>
+                          </div>
+                        )}
+                        {activeMission.model_effort && (
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-white/40">Model effort</span>
+                            <span
+                              className="font-mono text-[11px] text-amber-300 truncate max-w-[160px]"
+                              title={activeMission.model_effort}
+                            >
+                              {activeMission.model_effort}
+                            </span>
+                          </div>
+                        )}
+                        {lastResolvedModel && (
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-white/40">
+                              Resolved model
+                            </span>
+                            <span
+                              className="font-mono text-[11px] text-emerald-400 truncate max-w-[160px]"
+                              title={lastResolvedModel}
+                            >
+                              {lastResolvedModel}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Orchestrator: Boss with workers */}
+                    {(childMissions.length > 0 ||
+                      activeMissionRole === "boss") && (
+                      <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-1 text-xs">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-white/40">Role</span>
+                          <span className="font-mono text-[11px] text-violet-400">
+                            Boss
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                          <span className="text-white/40">Workers</span>
+                          <span className="font-mono text-[11px] text-white/60">
+                            {childMissions.length}
+                          </span>
+                        </div>
+                        {childMissions.length > 0 && (
+                          <div className="space-y-0.5 max-h-[120px] overflow-y-auto">
+                            {childMissions.map((w) => (
+                              <a
+                                key={w.id}
+                                href={`/control?mission=${w.id}`}
+                                className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-white/[0.04] transition-colors"
+                              >
+                                <span
+                                  className={cn(
+                                    "h-1.5 w-1.5 rounded-full shrink-0",
+                                    w.status === "active" && "bg-indigo-400",
+                                    w.status === "completed" &&
+                                      "bg-emerald-400",
+                                    w.status === "failed" && "bg-red-400",
+                                    w.status === "interrupted" &&
+                                      "bg-amber-400",
+                                    w.status === "not_feasible" &&
+                                      "bg-rose-400",
+                                    ![
+                                      "active",
+                                      "completed",
+                                      "failed",
+                                      "interrupted",
+                                      "not_feasible",
+                                    ].includes(w.status) && "bg-white/30",
+                                  )}
+                                />
+                                <span className="font-mono text-[11px] text-white/70 truncate">
+                                  {w.title || w.id.slice(0, 8)}
+                                </span>
+                              </a>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Orchestrator: Worker info */}
+                    {activeMission?.parent_mission_id && (
+                      <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-0.5 text-xs">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-white/40">Role</span>
+                          <span className="font-mono text-[11px] text-cyan-400">
+                            Worker
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-white/40">Boss</span>
+                          <a
+                            href={`/control?mission=${activeMission.parent_mission_id}`}
+                            className="font-mono text-[11px] text-cyan-400 hover:text-cyan-300 transition-colors select-all"
+                          >
+                            {activeMission.parent_mission_id.slice(0, 8)}
+                          </a>
+                        </div>
+                        {activeMission.working_directory && (
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-white/40">Worktree</span>
+                            <span
+                              className="font-mono text-[11px] text-white/60 truncate max-w-[160px]"
+                              title={activeMission.working_directory}
+                            >
+                              {activeMission.working_directory.split("/").pop()}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Stream Status */}
+                    <div
+                      className={cn(
+                        "space-y-0.5 text-xs",
+                        activeMission &&
+                          "mt-2 pt-2 border-t border-white/[0.06]",
+                      )}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-white/40">Stream</span>
+                        <span className="flex items-center gap-1.5 font-mono text-white/80">
+                          <span
+                            className={cn(
+                              "h-1.5 w-1.5 rounded-full",
+                              (streamDiagnostics.phase === "streaming" ||
+                                streamDiagnostics.phase === "open") &&
+                                "bg-emerald-400",
+                              streamDiagnostics.phase === "connecting" &&
+                                "bg-amber-400",
+                              streamDiagnostics.phase === "error" &&
+                                "bg-red-400",
+                              (streamDiagnostics.phase === "closed" ||
+                                streamDiagnostics.phase === "idle") &&
+                                "bg-white/30",
+                            )}
+                          />
+                          {streamDiagnostics.phase}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-white/40">Activity</span>
+                        <span className="font-mono text-white/60 text-[11px]">
+                          {formatDiagAge(streamDiagnostics.lastEventAt)}
+                        </span>
+                      </div>
+                    </div>
+
+                    {streamDiagnostics.lastError && (
+                      <div className="mt-2 rounded border border-red-500/30 bg-red-500/10 px-2 py-1 text-[11px] text-red-300">
+                        {streamDiagnostics.lastError}
+                      </div>
+                    )}
+
+                    {streamHints.length > 0 && (
+                      <div className="mt-2 space-y-0.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200">
+                        {streamHints.map((hint) => (
+                          <div key={hint}>{hint}</div>
+                        ))}
+                      </div>
+                    )}
+
+                    <button
+                      onClick={handleCopyDiagnostics}
+                      className="mt-2 w-full text-center text-[11px] text-white/40 hover:text-white/70 transition-colors"
+                    >
+                      Copy debug info
+                    </button>
                   </div>
                 )}
               </div>
-            </div>
-          )}
 
-          {/* Status panel */}
-          <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-            {/* Connection status indicator - only show when not connected */}
-            {connectionState !== "connected" && (
-              <>
-                <div className={cn(
-                  "flex items-center gap-2",
-                  connectionState === "reconnecting" ? "text-amber-400" : "text-red-400"
-                )}>
-                  {connectionState === "reconnecting" ? (
-                    <>
-                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                      <span className="text-sm font-medium">
-                        Reconnecting{reconnectAttempt > 1 ? ` (${reconnectAttempt})` : "..."}
-                      </span>
-                    </>
-                  ) : (
-                    <>
-                      <WifiOff className="h-3.5 w-3.5" />
-                      <span className="text-sm font-medium">Disconnected</span>
-                    </>
-                  )}
-                </div>
-                <div className="h-4 w-px bg-white/[0.08]" />
-              </>
-            )}
-
-            {/* Run state indicator with debug dropdown — icon only.
-                The mission selector already shows the mission status dot and
-                the Workbench shows "Status: Running"; a "Running" label here
-                is redundant. Clicking the icon still opens the diagnostics
-                popover for the deep-debug case. */}
-            <div className="relative">
-              <button
-                onClick={() => setShowStreamDiagnostics((prev) => !prev)}
-                className={cn(
-                  "flex items-center justify-center rounded-md p-1 transition-colors hover:bg-white/[0.04]",
-                  status.className
-                )}
-                title={`${status.label} — click for debug info`}
-                aria-label={`${status.label} — click for debug info`}
+              {/* Queue count */}
+              <div className="h-4 w-px bg-white/[0.08]" />
+              <div
+                className="flex items-center gap-1.5"
+                title={
+                  viewingQueueLen > 0
+                    ? `${viewingQueueLen} message${viewingQueueLen > 1 ? "s" : ""} waiting to be processed`
+                    : "No messages queued"
+                }
               >
-                <StatusIcon
+                <span className="text-[10px] uppercase tracking-wider text-white/40">
+                  Queue
+                </span>
+                <span
                   className={cn(
-                    "h-3.5 w-3.5",
-                    viewingRunState !== "idle" && "animate-spin"
+                    "text-sm font-medium tabular-nums",
+                    viewingQueueLen === 0 && "text-white/70",
+                    viewingQueueLen > 0 &&
+                      viewingQueueLen < 3 &&
+                      "text-amber-400",
+                    viewingQueueLen >= 3 && "text-orange-400",
                   )}
-                />
-              </button>
+                >
+                  {viewingQueueLen}
+                </span>
+              </div>
 
-              {showStreamDiagnostics && (
-                <div className="absolute right-0 top-full z-50 mt-2 w-[280px] rounded-lg border border-white/[0.08] bg-[#121214] p-2.5 shadow-xl">
-                  {/* Mission Info */}
-                  {activeMission && (
-                    <div className="space-y-0.5 text-xs">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-white/40">Mission</span>
-                        <span className="font-mono text-[11px] text-white/60 select-all">
-                          {activeMission.id.slice(0, 8)}
-                        </span>
-                      </div>
-                      {activeMission.workspace_name && (
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Workspace</span>
-                          <span className="font-mono text-white/80">{activeMission.workspace_name}</span>
-                        </div>
+              {/* Progress indicator */}
+              {viewingProgress && viewingProgress.total > 0 && (
+                <>
+                  <div className="h-4 w-px bg-white/[0.08]" />
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] uppercase tracking-wider text-white/40">
+                      Subtask
+                    </span>
+                    <span className="text-sm font-medium text-emerald-400 tabular-nums">
+                      {Math.min(
+                        viewingProgress.completed + 1,
+                        viewingProgress.total,
                       )}
-                      {activeMission.agent && (
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Agent</span>
-                          <span className="font-mono text-white/80">{activeMission.agent}</span>
-                        </div>
-                      )}
-                      {activeMission.backend && (
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Backend</span>
-                          <span className="font-mono text-white/80">{activeMission.backend}</span>
-                        </div>
-                      )}
-                      {activeMission.model_override && (
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Model override</span>
-                          <span className="font-mono text-[11px] text-indigo-400 truncate max-w-[160px]" title={activeMission.model_override}>
-                            {activeMission.model_override}
-                          </span>
-                        </div>
-                      )}
-                      {activeMission.model_effort && (
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Model effort</span>
-                          <span className="font-mono text-[11px] text-amber-300 truncate max-w-[160px]" title={activeMission.model_effort}>
-                            {activeMission.model_effort}
-                          </span>
-                        </div>
-                      )}
-                      {lastResolvedModel && (
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Resolved model</span>
-                          <span className="font-mono text-[11px] text-emerald-400 truncate max-w-[160px]" title={lastResolvedModel}>
-                            {lastResolvedModel}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Orchestrator: Boss with workers */}
-                  {(childMissions.length > 0 || activeMissionRole === "boss") && (
-                    <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-1 text-xs">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-white/40">Role</span>
-                        <span className="font-mono text-[11px] text-violet-400">Boss</span>
-                      </div>
-                      <div className="flex items-center justify-between gap-2 mb-1">
-                        <span className="text-white/40">Workers</span>
-                        <span className="font-mono text-[11px] text-white/60">{childMissions.length}</span>
-                      </div>
-                      {childMissions.length > 0 && (
-                        <div className="space-y-0.5 max-h-[120px] overflow-y-auto">
-                          {childMissions.map((w) => (
-                            <a
-                              key={w.id}
-                              href={`/control?mission=${w.id}`}
-                              className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-white/[0.04] transition-colors"
-                            >
-                              <span className={cn(
-                                "h-1.5 w-1.5 rounded-full shrink-0",
-                                w.status === "active" && "bg-indigo-400",
-                                w.status === "completed" && "bg-emerald-400",
-                                w.status === "failed" && "bg-red-400",
-                                w.status === "interrupted" && "bg-amber-400",
-                                w.status === "not_feasible" && "bg-rose-400",
-                                !["active", "completed", "failed", "interrupted", "not_feasible"].includes(w.status) && "bg-white/30"
-                              )} />
-                              <span className="font-mono text-[11px] text-white/70 truncate">
-                                {w.title || w.id.slice(0, 8)}
-                              </span>
-                            </a>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Orchestrator: Worker info */}
-                  {activeMission?.parent_mission_id && (
-                    <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-0.5 text-xs">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-white/40">Role</span>
-                        <span className="font-mono text-[11px] text-cyan-400">Worker</span>
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-white/40">Boss</span>
-                        <a
-                          href={`/control?mission=${activeMission.parent_mission_id}`}
-                          className="font-mono text-[11px] text-cyan-400 hover:text-cyan-300 transition-colors select-all"
-                        >
-                          {activeMission.parent_mission_id.slice(0, 8)}
-                        </a>
-                      </div>
-                      {activeMission.working_directory && (
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Worktree</span>
-                          <span className="font-mono text-[11px] text-white/60 truncate max-w-[160px]" title={activeMission.working_directory}>
-                            {activeMission.working_directory.split('/').pop()}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Stream Status */}
-                  <div className={cn("space-y-0.5 text-xs", activeMission && "mt-2 pt-2 border-t border-white/[0.06]")}>
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-white/40">Stream</span>
-                      <span className="flex items-center gap-1.5 font-mono text-white/80">
-                        <span
-                          className={cn(
-                            "h-1.5 w-1.5 rounded-full",
-                            (streamDiagnostics.phase === "streaming" || streamDiagnostics.phase === "open") && "bg-emerald-400",
-                            streamDiagnostics.phase === "connecting" && "bg-amber-400",
-                            streamDiagnostics.phase === "error" && "bg-red-400",
-                            (streamDiagnostics.phase === "closed" || streamDiagnostics.phase === "idle") && "bg-white/30"
-                          )}
-                        />
-                        {streamDiagnostics.phase}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-white/40">Activity</span>
-                      <span className="font-mono text-white/60 text-[11px]">
-                        {formatDiagAge(streamDiagnostics.lastEventAt)}
-                      </span>
-                    </div>
+                      /{viewingProgress.total}
+                    </span>
                   </div>
-
-                  {streamDiagnostics.lastError && (
-                    <div className="mt-2 rounded border border-red-500/30 bg-red-500/10 px-2 py-1 text-[11px] text-red-300">
-                      {streamDiagnostics.lastError}
-                    </div>
-                  )}
-
-                  {streamHints.length > 0 && (
-                    <div className="mt-2 space-y-0.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200">
-                      {streamHints.map((hint) => (
-                        <div key={hint}>{hint}</div>
-                      ))}
-                    </div>
-                  )}
-
-                  <button
-                    onClick={handleCopyDiagnostics}
-                    className="mt-2 w-full text-center text-[11px] text-white/40 hover:text-white/70 transition-colors"
-                  >
-                    Copy debug info
-                  </button>
-                </div>
+                </>
               )}
             </div>
-
-            {/* Queue count — only when something is queued.
-                Idle missions previously rendered a permanent "QUEUE 0" badge,
-                which added noise without information. The workbench mirrors
-                this count in its Runtime section when the user wants detail. */}
-            {viewingQueueLen > 0 && (
-              <>
-                <div className="h-4 w-px bg-white/[0.08]" />
-                <div
-                  className="flex items-center gap-1.5"
-                  title={`${viewingQueueLen} message${viewingQueueLen > 1 ? 's' : ''} waiting to be processed`}
-                >
-                  <span className="text-[10px] uppercase tracking-wider text-white/40">
-                    Queue
-                  </span>
-                  <span className={cn(
-                    "text-sm font-medium tabular-nums",
-                    viewingQueueLen < 3 ? "text-amber-400" : "text-orange-400"
-                  )}>
-                    {viewingQueueLen}
-                  </span>
-                </div>
-              </>
-            )}
-
-            {/* Progress indicator */}
-            {viewingProgress && viewingProgress.total > 0 && (
-              <>
-                <div className="h-4 w-px bg-white/[0.08]" />
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] uppercase tracking-wider text-white/40">
-                    Subtask
-                  </span>
-                  <span className="text-sm font-medium text-emerald-400 tabular-nums">
-                    {Math.min(viewingProgress.completed + 1, viewingProgress.total)}/{viewingProgress.total}
-                  </span>
-                </div>
-              </>
-            )}
           </div>
         </div>
-      </div>
 
-      {/* Main content area - Chat and Desktop stream side by side */}
-      <div className="flex-1 min-h-0 flex gap-4">
-        {/* Chat container */}
-        <div className={cn(
-          "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative transition-all duration-300",
-          showDesktopStream && "flex-[2]"
-        )}>
-        {/* Active workers strip — sticky above the scrolling messages so the
+        {/* Main content area - Chat and Desktop stream side by side */}
+        <div className="flex-1 min-h-0 flex gap-4">
+          {/* Chat container */}
+          <div
+            className={cn(
+              "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative transition-all duration-300",
+              showDesktopStream && "flex-[2]",
+            )}
+          >
+            {/* Active workers strip — sticky above the scrolling messages so the
             boss can see and hop into delegated workers without opening a side
             panel. Self-hides when there are no child missions. */}
-        <WorkersStrip
-          childMissions={childMissions}
-          runningMissions={runningMissions}
-          viewingMissionId={viewingMissionId}
-          onSelectWorker={handleViewMission}
-        />
-        {/* Messages */}
-        <div ref={containerRef} className="flex-1 overflow-y-auto p-6">
-          {/* Backwards pagination — only when there's actually more older
+            <WorkersStrip
+              childMissions={childMissions}
+              runningMissions={runningMissions}
+              viewingMissionId={viewingMissionId}
+              onSelectWorker={handleViewMission}
+            />
+            {/* Messages */}
+            <div ref={containerRef} className="flex-1 overflow-y-auto p-6">
+              {/* Backwards pagination — only when there's actually more older
               history to fetch and the chat isn't empty. Click prepends the
               previous page; scroll position is preserved so the message
               currently in view stays put.
@@ -9402,628 +10074,698 @@ export default function ControlClient() {
               actually viewing. Otherwise a stale completion (or a
               still-in-flight fetch from a previously-viewed mission)
               could pin this button to a wrong "Loading…" / hidden state. */}
-          {items.length > 0 &&
-            olderLoadState.missionId === viewingMissionId &&
-            olderLoadState.hasMore &&
-            viewingMissionId && (
-            <div className="flex justify-center mb-4">
-              <button
-                type="button"
-                disabled={olderLoadState.loading}
-                onClick={() => {
-                  void loadOlderHistoryEvents(viewingMissionId);
-                }}
-                className={cn(
-                  "px-4 py-1.5 text-xs rounded-full border transition-colors",
-                  "border-white/10 bg-white/[0.03] text-white/60 hover:bg-white/[0.06] hover:text-white/80",
-                  olderLoadState.loading && "opacity-60 cursor-wait"
-                )}
-              >
-                {olderLoadState.loading ? "Loading older messages…" : "Load older messages"}
-              </button>
-            </div>
-          )}
-          {isMissionSwitching ? (
-            <ChatLoadingSkeleton />
-          ) : items.length === 0 ? (
-            <div className="flex h-full items-center justify-center">
-              <div className="text-center">
-                <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
-                  {viewingMissionIsRunning && activeMission?.status === "active" ? (
-                    <Loader className="h-8 w-8 text-indigo-400 animate-spin" />
-                  ) : (
-                    <Bot className="h-8 w-8 text-indigo-400" />
-                  )}
-                </div>
-                {missionLoading ? (
-                  <Shimmer className="max-w-xs mx-auto" />
-                ) : viewingMissionIsRunning && activeMission?.status === "active" ? (
-                  <>
-                    <h2 className="text-lg font-medium text-white">
-                      Agent is working...
-                    </h2>
-                    <p className="mt-2 text-sm text-white/40 max-w-sm">
-                      Processing your request. Updates will appear here as they
-                      arrive.
-                    </p>
-                  </>
-                ) : activeMission && activeMission.status !== "active" ? (
-                  <>
-                    <h2 className="text-lg font-medium text-white">
-                      {activeMission.status === "interrupted" 
-                        ? "Mission Interrupted" 
-                        : activeMission.status === "blocked"
-                        ? "Iteration Limit Reached"
-                        : "No conversation history"}
-                    </h2>
-                    <p className="mt-2 text-sm text-white/40 max-w-sm">
-                      {activeMission.status === "interrupted" ? (
-                        <>This mission was interrupted (server shutdown or cancellation). Click the <strong className="text-amber-400">Resume</strong> button in the mission menu to continue where you left off.</>
-                      ) : activeMission.status === "blocked" ? (
-                        <>The agent reached its iteration limit ({maxIterations}). You can continue the mission to give it more iterations.</>
-                      ) : activeMission.status === "failed" ? (
-                        <>This mission failed without producing any messages.</>
-                      ) : activeMission.status === "not_feasible" ? (
-                        <>The agent determined this task was not feasible.</>
-                      ) : (
-                        <>This mission was {activeMission.status} without any messages.
-                        {activeMission.status === "completed" && " You can reactivate it to continue."}</>
+              {items.length > 0 &&
+                olderLoadState.missionId === viewingMissionId &&
+                olderLoadState.hasMore &&
+                viewingMissionId && (
+                  <div className="flex justify-center mb-4">
+                    <button
+                      type="button"
+                      disabled={olderLoadState.loading}
+                      onClick={() => {
+                        void loadOlderHistoryEvents(viewingMissionId);
+                      }}
+                      className={cn(
+                        "px-4 py-1.5 text-xs rounded-full border transition-colors",
+                        "border-white/10 bg-white/[0.03] text-white/60 hover:bg-white/[0.06] hover:text-white/80",
+                        olderLoadState.loading && "opacity-60 cursor-wait",
                       )}
-                    </p>
-                    {activeMission.status === "blocked" && (
-                      <div className="mt-4 flex gap-2">
+                    >
+                      {olderLoadState.loading
+                        ? "Loading older messages…"
+                        : "Load older messages"}
+                    </button>
+                  </div>
+                )}
+              {isMissionSwitching ? (
+                <ChatLoadingSkeleton />
+              ) : items.length === 0 ? (
+                <div className="flex h-full items-center justify-center">
+                  <div className="text-center">
+                    <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
+                      {viewingMissionIsRunning &&
+                      activeMission?.status === "active" ? (
+                        <Loader className="h-8 w-8 text-indigo-400 animate-spin" />
+                      ) : (
+                        <Bot className="h-8 w-8 text-indigo-400" />
+                      )}
+                    </div>
+                    {missionLoading ? (
+                      <Shimmer className="max-w-xs mx-auto" />
+                    ) : viewingMissionIsRunning &&
+                      activeMission?.status === "active" ? (
+                      <>
+                        <h2 className="text-lg font-medium text-white">
+                          Agent is working...
+                        </h2>
+                        <p className="mt-2 text-sm text-white/40 max-w-sm">
+                          Processing your request. Updates will appear here as
+                          they arrive.
+                        </p>
+                      </>
+                    ) : activeMission && activeMission.status !== "active" ? (
+                      <>
+                        <h2 className="text-lg font-medium text-white">
+                          {activeMission.status === "interrupted"
+                            ? "Mission Interrupted"
+                            : activeMission.status === "blocked"
+                              ? "Iteration Limit Reached"
+                              : "No conversation history"}
+                        </h2>
+                        <p className="mt-2 text-sm text-white/40 max-w-sm">
+                          {activeMission.status === "interrupted" ? (
+                            <>
+                              This mission was interrupted (server shutdown or
+                              cancellation). Click the{" "}
+                              <strong className="text-amber-400">Resume</strong>{" "}
+                              button in the mission menu to continue where you
+                              left off.
+                            </>
+                          ) : activeMission.status === "blocked" ? (
+                            <>
+                              The agent reached its iteration limit (
+                              {maxIterations}). You can continue the mission to
+                              give it more iterations.
+                            </>
+                          ) : activeMission.status === "failed" ? (
+                            <>
+                              This mission failed without producing any
+                              messages.
+                            </>
+                          ) : activeMission.status === "not_feasible" ? (
+                            <>
+                              The agent determined this task was not feasible.
+                            </>
+                          ) : (
+                            <>
+                              This mission was {activeMission.status} without
+                              any messages.
+                              {activeMission.status === "completed" &&
+                                " You can reactivate it to continue."}
+                            </>
+                          )}
+                        </p>
+                        {activeMission.status === "blocked" && (
+                          <div className="mt-4 flex gap-2">
+                            <button
+                              onClick={() => handleResumeMission()}
+                              disabled={missionLoading}
+                              className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                            >
+                              {missionLoading ? (
+                                <Loader className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <PlayCircle className="h-4 w-4" />
+                              )}
+                              Continue Mission
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <h2 className="text-lg font-medium text-white">
+                          Start a conversation
+                        </h2>
+                        <p className="mt-2 text-sm text-white/40 max-w-sm">
+                          Ask the agent to do something — messages queue while
+                          it&apos;s busy
+                        </p>
+
+                        <p className="mt-4 text-xs text-white/30">
+                          Tip: Paste files directly to upload to context folder
+                        </p>
+                      </>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="mx-auto max-w-3xl space-y-6">
+                  <div
+                    className="relative w-full"
+                    style={{ height: `${chatVirtualizer.getTotalSize()}px` }}
+                  >
+                    {chatVirtualizer.getVirtualItems().map((virtualRow) => {
+                      const item = groupedItems[virtualRow.index];
+                      if (!item) return null;
+                      const key = getGroupedItemKey(item);
+                      const isToolGroupExpanded =
+                        item.kind === "tool_group"
+                          ? expandedToolGroups.has(item.groupId)
+                          : false;
+                      return (
+                        <div
+                          key={virtualRow.key}
+                          ref={chatVirtualizer.measureElement}
+                          data-index={virtualRow.index}
+                          className="absolute left-0 top-0 w-full pb-6"
+                          style={{
+                            transform: `translateY(${virtualRow.start}px)`,
+                          }}
+                        >
+                          <ChatItemRow
+                            item={item}
+                            highlighted={highlightedItemId === key}
+                            workspaceId={missionForDownloads?.workspace_id}
+                            missionId={missionForDownloads?.id}
+                            basePath={missionWorkingDirectory}
+                            isToolGroupExpanded={isToolGroupExpanded}
+                            onToggleToolGroup={handleToggleToolGroup}
+                            onResume={stableResumeMission}
+                            onToolResult={handleToolResultCommit}
+                            onOptimisticToolResult={handleOptimisticToolResult}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Show streaming indicator when running but no active thinking/phase visible inline.
+                  P2-#14: the items.some + last-index lookup live in `showAgentWorkingIndicator`
+                  memo so each NowTick render doesn't re-walk the whole items array. */}
+                  {viewingMissionIsRunning &&
+                    activeMission?.status === "active" &&
+                    showAgentWorkingIndicator && (
+                      <div className="flex justify-start gap-3 animate-fade-in">
+                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+                          <Bot className="h-4 w-4 text-indigo-400 animate-pulse" />
+                        </div>
+                        <div className="rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <Loader className="h-4 w-4 text-indigo-400 animate-spin" />
+                            <span className="text-sm text-white/60">
+                              Agent is working...
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                  {/* Waiting banner for question tool */}
+                  {hasPendingQuestion && (
+                    <div className="flex justify-center py-4 animate-fade-in">
+                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4 bg-indigo-500/10 border border-indigo-500/20">
+                        <div className="flex items-center gap-3">
+                          <HelpCircle className="h-5 w-5 shrink-0 text-indigo-300" />
+                          <div className="text-sm">
+                            <span className="font-medium text-indigo-200">
+                              Waiting for your response
+                            </span>
+                            <p className="text-white/50">
+                              The agent asked a question and is paused until you
+                              answer.
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Stall warning banner when agent hasn't reported activity for 60+ seconds */}
+                  {isViewingMissionStalled &&
+                    viewingMissionId &&
+                    !hasPendingQuestion && (
+                      <div className="flex justify-center py-4 animate-fade-in">
+                        <div
+                          className={cn(
+                            "flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4",
+                            isViewingMissionSeverelyStalled
+                              ? "bg-red-500/10 border border-red-500/20"
+                              : "bg-amber-500/10 border border-amber-500/20",
+                          )}
+                        >
+                          <div className="flex items-center gap-3">
+                            <AlertTriangle
+                              className={cn(
+                                "h-5 w-5 shrink-0",
+                                isViewingMissionSeverelyStalled
+                                  ? "text-red-400"
+                                  : "text-amber-400",
+                              )}
+                            />
+                            <div className="text-sm">
+                              <span
+                                className={cn(
+                                  "font-medium",
+                                  isViewingMissionSeverelyStalled
+                                    ? "text-red-400"
+                                    : "text-amber-400",
+                                )}
+                              >
+                                Agent may be stuck
+                              </span>
+                              <span className="text-white/50 ml-1">
+                                — No activity for{" "}
+                                {Math.floor(viewingMissionStallSeconds)}s
+                              </span>
+                              <p className="text-white/40 text-xs mt-1">
+                                {isViewingMissionSeverelyStalled
+                                  ? "The agent appears to be stuck on a long-running operation. Consider stopping it."
+                                  : "A tool or external operation may be taking longer than expected."}
+                              </p>
+                            </div>
+                          </div>
+                          <button
+                            onClick={() =>
+                              handleCancelMission(viewingMissionId)
+                            }
+                            className={cn(
+                              "shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors",
+                              isViewingMissionSeverelyStalled
+                                ? "bg-red-500 text-white hover:bg-red-400"
+                                : "bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 border border-amber-500/30",
+                            )}
+                          >
+                            <Square className="h-3.5 w-3.5" />
+                            {isViewingMissionSeverelyStalled
+                              ? "Force Stop"
+                              : "Stop"}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                  {/* Continue banner for blocked missions */}
+                  {activeMission?.status === "blocked" && items.length > 0 && (
+                    <div className="flex justify-center py-4">
+                      <div className="flex items-center gap-3 rounded-xl bg-amber-500/10 border border-amber-500/20 px-5 py-3">
+                        <Clock className="h-5 w-5 text-amber-400" />
+                        <div className="text-sm">
+                          <span className="text-amber-400 font-medium">
+                            Iteration limit reached
+                          </span>
+                          <span className="text-white/50 ml-1">
+                            — Agent used all {maxIterations} iterations
+                          </span>
+                        </div>
                         <button
                           onClick={() => handleResumeMission()}
                           disabled={missionLoading}
-                          className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                          className="ml-2 inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-sm font-medium text-black hover:bg-amber-400 transition-colors disabled:opacity-50"
                         >
                           {missionLoading ? (
-                            <Loader className="h-4 w-4 animate-spin" />
+                            <Loader className="h-3.5 w-3.5 animate-spin" />
                           ) : (
-                            <PlayCircle className="h-4 w-4" />
+                            <PlayCircle className="h-3.5 w-3.5" />
                           )}
-                          Continue Mission
+                          Continue
                         </button>
                       </div>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <h2 className="text-lg font-medium text-white">
-                      Start a conversation
-                    </h2>
-                    <p className="mt-2 text-sm text-white/40 max-w-sm">
-                      Ask the agent to do something — messages queue while
-                      it&apos;s busy
-                    </p>
+                    </div>
+                  )}
 
-                    <p className="mt-4 text-xs text-white/30">
-                      Tip: Paste files directly to upload to context folder
-                    </p>
-                  </>
-                )}
-              </div>
+                  <div ref={endRef} />
+                </div>
+              )}
             </div>
-          ) : (
-            <div className="mx-auto max-w-3xl space-y-6">
-              {/* Performance: only render recent items, with option to load more */}
-              {groupedItems.length > visibleItemsLimit && (
-                <button
-                  onClick={() => setVisibleItemsLimit(prev => prev + LOAD_MORE_INCREMENT)}
-                  className="w-full py-2 px-4 text-sm text-white/50 hover:text-white/80 hover:bg-white/5 rounded-lg transition-colors flex items-center justify-center gap-2"
-                >
-                  <ChevronUp className="w-4 h-4" />
-                  Load {Math.min(LOAD_MORE_INCREMENT, groupedItems.length - visibleItemsLimit)} older messages
-                  <span className="text-white/30">
-                    ({groupedItems.length - visibleItemsLimit} hidden)
-                  </span>
-                </button>
-              )}
-              {visibleGroupedItems.map((item) => {
-                const key =
-                  item.kind === "tool_group" || item.kind === "thinking_group"
-                    ? item.groupId
-                    : item.id;
-                const isToolGroupExpanded =
-                  item.kind === "tool_group"
-                    ? expandedToolGroups.has(item.groupId)
-                    : false;
-                // `content-visibility: auto` tells the browser to skip
-                // layout and paint for rows that are scrolled off-screen,
-                // and `contain-intrinsic-size: auto 140px` tells it to
-                // reserve the last-rendered height (fallback 140px on
-                // first render) so scroll position stays stable when
-                // rows are re-entered. This is the CSS-level equivalent
-                // of windowing — a measurable paint-time win on missions
-                // with hundreds of messages without the refactor cost of
-                // a full virtualizer. See issue #156 (OOM on 5k-item
-                // missions). Supported in Chrome 107+ / Safari 17+;
-                // older browsers just render every row as before.
-                return (
-                  <div
-                    key={key}
-                    style={{
-                      contentVisibility: "auto",
-                      containIntrinsicSize: "auto 140px",
-                    }}
-                  >
-                    <ChatItemRow
-                      item={item}
-                      highlighted={highlightedItemId === key}
-                      workspaceId={missionForDownloads?.workspace_id}
-                      missionId={missionForDownloads?.id}
-                      basePath={missionWorkingDirectory}
-                      isToolGroupExpanded={isToolGroupExpanded}
-                      onToggleToolGroup={handleToggleToolGroup}
-                      onResume={stableResumeMission}
-                      onToolResult={handleToolResultCommit}
-                      onOptimisticToolResult={handleOptimisticToolResult}
-                    />
-                  </div>
-                );
-              })}
 
-              {/* Show streaming indicator when running but no active thinking/phase visible inline.
-                  P2-#14: the items.some + last-index lookup live in `showAgentWorkingIndicator`
-                  memo so each NowTick render doesn't re-walk the whole items array. */}
-              {viewingMissionIsRunning &&
-                activeMission?.status === "active" &&
-                showAgentWorkingIndicator && (
-                  <div className="flex justify-start gap-3 animate-fade-in">
-                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                      <Bot className="h-4 w-4 text-indigo-400 animate-pulse" />
-                    </div>
-                    <div className="rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-                      <div className="flex items-center gap-2">
-                        <Loader className="h-4 w-4 text-indigo-400 animate-spin" />
-                        <span className="text-sm text-white/60">
-                          Agent is working...
+            {/* Scroll to bottom button */}
+            {!isAtBottom && items.length > 0 && (
+              <button
+                onClick={() => scrollToBottom()}
+                className="absolute bottom-20 right-6 p-2 rounded-full bg-white/[0.1] border border-white/[0.1] text-white/60 hover:bg-white/[0.15] hover:text-white/80 transition-all shadow-lg"
+                title="Scroll to bottom"
+              >
+                <ArrowDown className="h-4 w-4" />
+              </button>
+            )}
+
+            {/* Input */}
+            <div className="border-t border-white/[0.06] bg-white/[0.01] p-4">
+              {/* Upload progress */}
+              {uploadProgress && (
+                <div className="mx-auto max-w-3xl mb-3">
+                  <div className="flex items-center gap-3 rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3">
+                    <Loader className="h-4 w-4 animate-spin text-indigo-400" />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between text-sm mb-1">
+                        <span className="text-white/70 truncate">
+                          {uploadProgress.fileName}
+                        </span>
+                        <span className="text-white/50 ml-2 shrink-0">
+                          {formatBytes(uploadProgress.progress.loaded)} /{" "}
+                          {formatBytes(uploadProgress.progress.total)}
                         </span>
                       </div>
-                    </div>
-                  </div>
-                )}
-
-              {/* Waiting banner for question tool */}
-              {hasPendingQuestion && (
-                <div className="flex justify-center py-4 animate-fade-in">
-                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4 bg-indigo-500/10 border border-indigo-500/20">
-                    <div className="flex items-center gap-3">
-                      <HelpCircle className="h-5 w-5 shrink-0 text-indigo-300" />
-                      <div className="text-sm">
-                        <span className="font-medium text-indigo-200">
-                          Waiting for your response
-                        </span>
-                        <p className="text-white/50">
-                          The agent asked a question and is paused until you answer.
-                        </p>
+                      <div className="h-1.5 bg-white/[0.06] rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-indigo-500 rounded-full transition-all duration-300"
+                          style={{
+                            width: `${uploadProgress.progress.percentage}%`,
+                          }}
+                        />
                       </div>
                     </div>
-                  </div>
-                </div>
-              )}
-
-              {/* Stall warning banner when agent hasn't reported activity for 60+ seconds */}
-              {isViewingMissionStalled && viewingMissionId && !hasPendingQuestion && (
-                <div className="flex justify-center py-4 animate-fade-in">
-                  <div className={cn(
-                    "flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4",
-                    isViewingMissionSeverelyStalled
-                      ? "bg-red-500/10 border border-red-500/20"
-                      : "bg-amber-500/10 border border-amber-500/20"
-                  )}>
-                    <div className="flex items-center gap-3">
-                      <AlertTriangle className={cn(
-                        "h-5 w-5 shrink-0",
-                        isViewingMissionSeverelyStalled ? "text-red-400" : "text-amber-400"
-                      )} />
-                      <div className="text-sm">
-                        <span className={cn(
-                          "font-medium",
-                          isViewingMissionSeverelyStalled ? "text-red-400" : "text-amber-400"
-                        )}>
-                          Agent may be stuck
-                        </span>
-                        <span className="text-white/50 ml-1">
-                          — No activity for {Math.floor(viewingMissionStallSeconds)}s
-                        </span>
-                        <p className="text-white/40 text-xs mt-1">
-                          {isViewingMissionSeverelyStalled
-                            ? "The agent appears to be stuck on a long-running operation. Consider stopping it."
-                            : "A tool or external operation may be taking longer than expected."}
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => handleCancelMission(viewingMissionId)}
-                      className={cn(
-                        "shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors",
-                        isViewingMissionSeverelyStalled
-                          ? "bg-red-500 text-white hover:bg-red-400"
-                          : "bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 border border-amber-500/30"
-                      )}
-                    >
-                      <Square className="h-3.5 w-3.5" />
-                      {isViewingMissionSeverelyStalled ? "Force Stop" : "Stop"}
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {/* Continue banner for blocked missions */}
-              {activeMission?.status === "blocked" && items.length > 0 && (
-                <div className="flex justify-center py-4">
-                  <div className="flex items-center gap-3 rounded-xl bg-amber-500/10 border border-amber-500/20 px-5 py-3">
-                    <Clock className="h-5 w-5 text-amber-400" />
-                    <div className="text-sm">
-                      <span className="text-amber-400 font-medium">Iteration limit reached</span>
-                      <span className="text-white/50 ml-1">— Agent used all {maxIterations} iterations</span>
-                    </div>
-                    <button
-                      onClick={() => handleResumeMission()}
-                      disabled={missionLoading}
-                      className="ml-2 inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-sm font-medium text-black hover:bg-amber-400 transition-colors disabled:opacity-50"
-                    >
-                      {missionLoading ? (
-                        <Loader className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <PlayCircle className="h-3.5 w-3.5" />
-                      )}
-                      Continue
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              <div ref={endRef} />
-            </div>
-          )}
-        </div>
-
-        {/* Scroll to bottom button */}
-        {!isAtBottom && items.length > 0 && (
-          <button
-            onClick={() => scrollToBottom()}
-            className="absolute bottom-20 right-6 p-2 rounded-full bg-white/[0.1] border border-white/[0.1] text-white/60 hover:bg-white/[0.15] hover:text-white/80 transition-all shadow-lg"
-            title="Scroll to bottom"
-          >
-            <ArrowDown className="h-4 w-4" />
-          </button>
-        )}
-
-        {/* Input */}
-        <div className="border-t border-white/[0.06] bg-white/[0.01] p-4">
-          {/* Upload progress */}
-          {uploadProgress && (
-            <div className="mx-auto max-w-3xl mb-3">
-              <div className="flex items-center gap-3 rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3">
-                <Loader className="h-4 w-4 animate-spin text-indigo-400" />
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center justify-between text-sm mb-1">
-                    <span className="text-white/70 truncate">{uploadProgress.fileName}</span>
-                    <span className="text-white/50 ml-2 shrink-0">
-                      {formatBytes(uploadProgress.progress.loaded)} / {formatBytes(uploadProgress.progress.total)}
+                    <span className="text-sm text-white/50 shrink-0">
+                      {uploadProgress.progress.percentage}%
                     </span>
                   </div>
-                  <div className="h-1.5 bg-white/[0.06] rounded-full overflow-hidden">
-                    <div 
-                      className="h-full bg-indigo-500 rounded-full transition-all duration-300"
-                      style={{ width: `${uploadProgress.progress.percentage}%` }}
+                </div>
+              )}
+
+              {/* Upload queue (for files waiting) */}
+              {uploadQueue.length > 0 && !uploadProgress && (
+                <div className="mx-auto max-w-3xl mb-3 flex flex-wrap gap-2">
+                  {uploadQueue.map((name) => (
+                    <AttachmentPreview
+                      key={name}
+                      file={{ name, type: "" }}
+                      isUploading
                     />
+                  ))}
+                </div>
+              )}
+
+              {/* URL Input */}
+              {showUrlInput && (
+                <div className="mx-auto max-w-3xl mb-3">
+                  <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                    <Link2 className="h-4 w-4 text-white/40 shrink-0" />
+                    <input
+                      type="url"
+                      value={urlInput}
+                      onChange={(e) => setUrlInput(e.target.value)}
+                      placeholder="Paste URL to download (Dropbox, Google Drive, direct link...)"
+                      className="flex-1 bg-transparent text-sm text-white placeholder:text-white/30 focus:outline-none"
+                      autoFocus
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          handleUrlDownload();
+                        } else if (e.key === "Escape") {
+                          setShowUrlInput(false);
+                          setUrlInput("");
+                        }
+                      }}
+                    />
+                    {urlDownloading ? (
+                      <Loader className="h-4 w-4 animate-spin text-indigo-400" />
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={handleUrlDownload}
+                          disabled={!urlInput.trim()}
+                          className="text-sm text-indigo-400 hover:text-indigo-300 disabled:text-white/20 disabled:cursor-not-allowed"
+                        >
+                          Download
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowUrlInput(false);
+                            setUrlInput("");
+                          }}
+                          className="text-white/40 hover:text-white/70"
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
+                      </>
+                    )}
                   </div>
+                  <p className="text-xs text-white/30 mt-1.5 px-1">
+                    Server will download the file directly — faster for large
+                    files
+                  </p>
                 </div>
-                <span className="text-sm text-white/50 shrink-0">{uploadProgress.progress.percentage}%</span>
-              </div>
-            </div>
-          )}
+              )}
 
-          {/* Upload queue (for files waiting) */}
-          {uploadQueue.length > 0 && !uploadProgress && (
-            <div className="mx-auto max-w-3xl mb-3 flex flex-wrap gap-2">
-              {uploadQueue.map((name) => (
-                <AttachmentPreview
-                  key={name}
-                  file={{ name, type: "" }}
-                  isUploading
-                />
-              ))}
-            </div>
-          )}
-
-          {/* URL Input */}
-          {showUrlInput && (
-            <div className="mx-auto max-w-3xl mb-3">
-              <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-                <Link2 className="h-4 w-4 text-white/40 shrink-0" />
-                <input
-                  type="url"
-                  value={urlInput}
-                  onChange={(e) => setUrlInput(e.target.value)}
-                  placeholder="Paste URL to download (Dropbox, Google Drive, direct link...)"
-                  className="flex-1 bg-transparent text-sm text-white placeholder:text-white/30 focus:outline-none"
-                  autoFocus
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      handleUrlDownload();
-                    } else if (e.key === "Escape") {
-                      setShowUrlInput(false);
-                      setUrlInput("");
-                    }
-                  }}
-                />
-                {urlDownloading ? (
-                  <Loader className="h-4 w-4 animate-spin text-indigo-400" />
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={handleUrlDownload}
-                      disabled={!urlInput.trim()}
-                      className="text-sm text-indigo-400 hover:text-indigo-300 disabled:text-white/20 disabled:cursor-not-allowed"
-                    >
-                      Download
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => { setShowUrlInput(false); setUrlInput(""); }}
-                      className="text-white/40 hover:text-white/70"
-                    >
-                      <X className="h-4 w-4" />
-                    </button>
-                  </>
+              {/* Show resume buttons for interrupted/blocked missions, otherwise show normal input */}
+              {/* Both are always rendered to prevent unmounting the input (which loses typed text) */}
+              {showResumeUI && (
+                <div className="mx-auto flex max-w-3xl gap-3 items-center justify-center py-2">
+                  <div className="flex items-center gap-2 text-sm text-white/50 mr-4">
+                    <AlertTriangle className="h-4 w-4 text-amber-400" />
+                    <span>
+                      Mission{" "}
+                      {activeMission.status === "blocked"
+                        ? "blocked"
+                        : activeMission.status === "failed"
+                          ? "failed"
+                          : "interrupted"}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => handleResumeMission()}
+                    disabled={missionLoading}
+                    className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] px-5 py-3 text-sm font-medium text-white/70 transition-colors disabled:opacity-50"
+                  >
+                    <PlayCircle className="h-4 w-4" />
+                    {activeMission.status === "blocked"
+                      ? "Continue"
+                      : activeMission.status === "failed"
+                        ? "Retry"
+                        : "Resume"}
+                  </button>
+                  <button
+                    onClick={() => setDismissedResumeUI(true)}
+                    className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] px-5 py-3 text-sm font-medium text-white/70 transition-colors"
+                  >
+                    <MessageSquare className="h-4 w-4" />
+                    Custom Message
+                  </button>
+                </div>
+              )}
+              <div
+                className={cn(
+                  "mx-auto max-w-3xl w-full space-y-2",
+                  showResumeUI && "hidden",
                 )}
-              </div>
-              <p className="text-xs text-white/30 mt-1.5 px-1">
-                Server will download the file directly — faster for large files
-              </p>
-            </div>
-          )}
-
-          {/* Show resume buttons for interrupted/blocked missions, otherwise show normal input */}
-          {/* Both are always rendered to prevent unmounting the input (which loses typed text) */}
-          {showResumeUI && (
-            <div className="mx-auto flex max-w-3xl gap-3 items-center justify-center py-2">
-              <div className="flex items-center gap-2 text-sm text-white/50 mr-4">
-                <AlertTriangle className="h-4 w-4 text-amber-400" />
-                <span>Mission {activeMission.status === 'blocked' ? 'blocked' : activeMission.status === 'failed' ? 'failed' : 'interrupted'}</span>
-              </div>
-              <button
-                onClick={() => handleResumeMission()}
-                disabled={missionLoading}
-                className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] px-5 py-3 text-sm font-medium text-white/70 transition-colors disabled:opacity-50"
               >
-                <PlayCircle className="h-4 w-4" />
-                {activeMission.status === 'blocked' ? 'Continue' : activeMission.status === 'failed' ? 'Retry' : 'Resume'}
-              </button>
-              <button
-                onClick={() => setDismissedResumeUI(true)}
-                className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] px-5 py-3 text-sm font-medium text-white/70 transition-colors"
-              >
-                <MessageSquare className="h-4 w-4" />
-                Custom Message
-              </button>
-            </div>
-          )}
-          <div className={cn("mx-auto max-w-3xl w-full space-y-2", showResumeUI && "hidden")}>
-              {/* Queue Strip - shows queued messages when present */}
-              <QueueStrip
-                items={queuedItems}
-                onRemove={handleRemoveFromQueue}
-                onClearAll={handleClearQueue}
-              />
-
-              <form
-                onSubmit={(e) => e.preventDefault()}
-                className="flex gap-3 items-end"
-              >
-                <div className="flex gap-1">
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
-                    title="Attach files"
-                  >
-                    <Paperclip className="h-5 w-5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setShowUrlInput(!showUrlInput)}
-                    className={`p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0 ${showUrlInput ? 'text-indigo-400 border-indigo-500/30' : ''}`}
-                    title="Download from URL"
-                  >
-                    <Link2 className="h-5 w-5" />
-                  </button>
-                </div>
-
-                <EnhancedInput
-                  ref={enhancedInputRef}
-                  value={input}
-                  onChange={setInput}
-                  onSubmit={handleEnhancedSubmit}
-                  onCanSubmitChange={setCanSubmitInput}
-                  onFilePaste={handleFilePaste}
-                  placeholder="Message the root agent… (paste files to upload)"
-                  backend={viewingMission?.backend ?? currentMission?.backend}
+                {/* Queue Strip - shows queued messages when present */}
+                <QueueStrip
+                  items={queuedItems}
+                  onRemove={handleRemoveFromQueue}
+                  onClearAll={handleClearQueue}
                 />
-                {(() => {
-                  // Goal-mode pill — shown above the composer while a codex
-                  // `/goal` continuation loop is active. Cleared automatically
-                  // by the SSE handler when status hits a terminal value.
-                  const activeMissionId = viewingMission?.id ?? currentMission?.id;
-                  const goal = activeMissionId
-                    ? goalInfoByMission[activeMissionId]
-                    : undefined;
-                  if (!goal) return null;
-                  const statusLabel =
-                    goal.status === "active"
-                      ? `iter ${goal.iteration}`
-                      : goal.status === "paused"
-                        ? "paused"
-                        : goal.status;
-                  return (
-                    <div
-                      className="absolute -top-9 left-2 right-2 flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-200 max-w-fit"
-                      title={goal.objective}
-                    >
-                      <span className="font-semibold">Goal</span>
-                      <span className="text-indigo-300/60">·</span>
-                      <span>{statusLabel}</span>
-                      {goal.objective && (
-                        <>
-                          <span className="text-indigo-300/60">·</span>
-                          <span className="truncate max-w-[40ch] text-indigo-200/70">
-                            {goal.objective}
-                          </span>
-                        </>
-                      )}
-                    </div>
-                  );
-                })()}
 
-                {isBusy ? (
-                  <>
+                <form
+                  onSubmit={(e) => e.preventDefault()}
+                  className="flex gap-3 items-end"
+                >
+                  <div className="flex gap-1">
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
+                      title="Attach files"
+                    >
+                      <Paperclip className="h-5 w-5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowUrlInput(!showUrlInput)}
+                      className={`p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0 ${showUrlInput ? "text-indigo-400 border-indigo-500/30" : ""}`}
+                      title="Download from URL"
+                    >
+                      <Link2 className="h-5 w-5" />
+                    </button>
+                  </div>
+
+                  <EnhancedInput
+                    ref={enhancedInputRef}
+                    value={input}
+                    onChange={setInput}
+                    onSubmit={handleEnhancedSubmit}
+                    onCanSubmitChange={setCanSubmitInput}
+                    onFilePaste={handleFilePaste}
+                    placeholder="Message the root agent… (paste files to upload)"
+                    backend={viewingMission?.backend ?? currentMission?.backend}
+                  />
+                  {(() => {
+                    // Goal-mode pill — shown above the composer while a codex
+                    // `/goal` continuation loop is active. Cleared automatically
+                    // by the SSE handler when status hits a terminal value.
+                    const activeMissionId =
+                      viewingMission?.id ?? currentMission?.id;
+                    const goal = activeMissionId
+                      ? goalInfoByMission[activeMissionId]
+                      : undefined;
+                    if (!goal) return null;
+                    const statusLabel =
+                      goal.status === "active"
+                        ? `iter ${goal.iteration}`
+                        : goal.status === "paused"
+                          ? "paused"
+                          : goal.status;
+                    return (
+                      <div
+                        className="absolute -top-9 left-2 right-2 flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-200 max-w-fit"
+                        title={goal.objective}
+                      >
+                        <span className="font-semibold">Goal</span>
+                        <span className="text-indigo-300/60">·</span>
+                        <span>{statusLabel}</span>
+                        {goal.objective && (
+                          <>
+                            <span className="text-indigo-300/60">·</span>
+                            <span className="truncate max-w-[40ch] text-indigo-200/70">
+                              {goal.objective}
+                            </span>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {isBusy ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => enhancedInputRef.current?.submit()}
+                        disabled={!canSubmitComposer}
+                        className="flex items-center gap-2 rounded-xl bg-indigo-500/80 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500/80"
+                      >
+                        <ListPlus className="h-4 w-4" />
+                        Queue
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleStop}
+                        className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
+                      >
+                        <Square className="h-4 w-4" />
+                        Stop
+                      </button>
+                    </>
+                  ) : (
                     <button
                       type="button"
                       onClick={() => enhancedInputRef.current?.submit()}
                       disabled={!canSubmitComposer}
-                      className="flex items-center gap-2 rounded-xl bg-indigo-500/80 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500/80"
+                      className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500"
                     >
-                      <ListPlus className="h-4 w-4" />
-                      Queue
+                      <Send className="h-4 w-4" />
+                      Send
                     </button>
-                    <button
-                      type="button"
-                      onClick={handleStop}
-                      className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
-                    >
-                      <Square className="h-4 w-4" />
-                      Stop
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => enhancedInputRef.current?.submit()}
-                    disabled={!canSubmitComposer}
-                    className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500"
-                  >
-                    <Send className="h-4 w-4" />
-                    Send
-                  </button>
-              )}
-              </form>
+                  )}
+                </form>
+              </div>
             </div>
+          </div>
+
+          {/* Right column: Workbench, Thinking Panel and Desktop Stream stacked */}
+          {(showWorkbenchPanel ||
+            showThinkingPanel ||
+            showDesktopStream ||
+            (showWorkerPanel && isBossMission)) && (
+            <div
+              className={cn(
+                "min-h-0 flex flex-col gap-4 transition-all duration-300 animate-fade-in shrink-0",
+                showDesktopStream ? "flex-1 max-w-md" : "w-80",
+              )}
+            >
+              {showWorkbenchPanel && (
+                <MissionWorkbenchPanel
+                  mission={activeMission}
+                  workspaceLabel={activeWorkspaceLabel}
+                  role={activeMissionRole}
+                  isRunning={viewingMissionIsRunning}
+                  childMissions={childMissions}
+                  onClose={() => setShowWorkbenchPanel(false)}
+                  onResume={handleResumeMission}
+                  onCancel={handleCancelMission}
+                  onOpenAutomations={() => setShowAutomationsDialog(true)}
+                  onOpenSwitcher={() => setShowMissionSwitcher(true)}
+                  onViewMission={handleViewMission}
+                  onSetStatus={handleSetStatus}
+                  runSettingsSlot={
+                    activeMission && !viewingMissionIsRunning ? (
+                      <NewMissionDialog
+                        workspaces={workspaces}
+                        disabled={missionLoading}
+                        onCreate={handleUpdateMissionSettings}
+                        mode="edit"
+                        lockWorkspace
+                        initialValues={{
+                          workspaceId: activeMission.workspace_id,
+                          agent: activeMission.agent || undefined,
+                          backend: activeMission.backend,
+                          modelOverride:
+                            activeMission.model_override || undefined,
+                          modelEffort: activeMission.model_effort || undefined,
+                          configProfile: activeMission.config_profile,
+                        }}
+                      />
+                    ) : undefined
+                  }
+                  className="flex-1 min-h-0"
+                />
+              )}
+
+              {/* Worker Panel — real child missions (parent_mission_id) */}
+              {showWorkerPanel && isBossMission && (
+                <WorkerPanel
+                  childMissions={childMissions}
+                  runningMissions={runningMissions}
+                  bossMissionId={activeMission?.id ?? ""}
+                  viewingMissionId={viewingMissionId}
+                  onSelectWorker={(missionId) => handleViewMission(missionId)}
+                  onClose={() => setShowWorkerPanel(false)}
+                  className={cn(
+                    showWorkbenchPanel ||
+                      showThinkingPanel ||
+                      showDesktopStream ||
+                      hasInMissionSubagents
+                      ? "flex-shrink-0 max-h-[50%]"
+                      : "flex-1",
+                  )}
+                />
+              )}
+
+              {/* Sub-agents Panel — in-mission Task / orchestrator workers */}
+              {showWorkerPanel && hasInMissionSubagents && (
+                <SubagentsPanel
+                  subagents={inMissionSubagents}
+                  onFocusItem={focusChatItem}
+                  onClose={() => setShowWorkerPanel(false)}
+                  className={cn(
+                    showWorkbenchPanel ||
+                      showThinkingPanel ||
+                      showDesktopStream ||
+                      childMissions.length > 0
+                      ? "flex-shrink-0 max-h-[50%]"
+                      : "flex-1",
+                  )}
+                />
+              )}
+
+              {/* Thinking Panel */}
+              {showThinkingPanel && (
+                <ThinkingPanel
+                  items={thinkingItems}
+                  onClose={handleCloseThinkingPanel}
+                  className={
+                    showWorkbenchPanel ||
+                    showDesktopStream ||
+                    (showWorkerPanel && isBossMission)
+                      ? "flex-shrink-0 max-h-[40%]"
+                      : "flex-1"
+                  }
+                  basePath={missionWorkingDirectory}
+                  missionId={viewingMissionId}
+                />
+              )}
+
+              {/* Desktop Stream Panel */}
+              {showDesktopStream && (
+                <div
+                  className={cn(
+                    "min-h-0",
+                    showThinkingPanel ? "flex-1" : "flex-1",
+                  )}
+                >
+                  <DesktopStream
+                    displayId={desktopDisplayId}
+                    className="h-full"
+                    onClose={() => setShowDesktopStream(false)}
+                  />
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
-
-        {/* Right column: Workbench, Thinking Panel and Desktop Stream stacked */}
-        {(showWorkbenchPanel || showThinkingPanel || showDesktopStream || (showWorkerPanel && isBossMission)) && (
-          <div className={cn(
-            "min-h-0 flex flex-col gap-4 transition-all duration-300 animate-fade-in shrink-0",
-            showDesktopStream ? "flex-1 max-w-md" : "w-80"
-          )}>
-            {showWorkbenchPanel && (
-              <MissionWorkbenchPanel
-                mission={activeMission}
-                workspaceLabel={activeWorkspaceLabel}
-                role={activeMissionRole}
-                isRunning={viewingMissionIsRunning}
-                childMissions={childMissions}
-                runtime={{
-                  queueLen: viewingQueueLen,
-                  subtaskCompleted: viewingProgress?.completed,
-                  subtaskTotal: viewingProgress?.total,
-                }}
-                onClose={() => setShowWorkbenchPanel(false)}
-                onResume={handleResumeMission}
-                onCancel={handleCancelMission}
-                onOpenAutomations={() => setShowAutomationsDialog(true)}
-                onOpenSwitcher={() => setShowMissionSwitcher(true)}
-                onViewMission={handleViewMission}
-                onSetStatus={handleSetStatus}
-                runSettingsSlot={
-                  activeMission && !viewingMissionIsRunning ? (
-                    <NewMissionDialog
-                      workspaces={workspaces}
-                      disabled={missionLoading}
-                      onCreate={handleUpdateMissionSettings}
-                      mode="edit"
-                      lockWorkspace
-                      initialValues={{
-                        workspaceId: activeMission.workspace_id,
-                        agent: activeMission.agent || undefined,
-                        backend: activeMission.backend,
-                        modelOverride: activeMission.model_override || undefined,
-                        modelEffort: activeMission.model_effort || undefined,
-                        configProfile: activeMission.config_profile,
-                      }}
-                    />
-                  ) : undefined
-                }
-                className="flex-1 min-h-0"
-              />
-            )}
-
-            {/* Worker Panel — real child missions (parent_mission_id) */}
-            {showWorkerPanel && isBossMission && (
-              <WorkerPanel
-                childMissions={childMissions}
-                runningMissions={runningMissions}
-                bossMissionId={activeMission?.id ?? ''}
-                viewingMissionId={viewingMissionId}
-                onSelectWorker={(missionId) => handleViewMission(missionId)}
-                onClose={() => setShowWorkerPanel(false)}
-                className={cn(
-                  showWorkbenchPanel || showThinkingPanel || showDesktopStream || hasInMissionSubagents
-                    ? "flex-shrink-0 max-h-[50%]"
-                    : "flex-1"
-                )}
-              />
-            )}
-
-            {/* Sub-agents Panel — in-mission Task / orchestrator workers */}
-            {showWorkerPanel && hasInMissionSubagents && (
-              <SubagentsPanel
-                subagents={inMissionSubagents}
-                onFocusItem={focusChatItem}
-                onClose={() => setShowWorkerPanel(false)}
-                className={cn(
-                  showWorkbenchPanel || showThinkingPanel || showDesktopStream || childMissions.length > 0
-                    ? "flex-shrink-0 max-h-[50%]"
-                    : "flex-1"
-                )}
-              />
-            )}
-
-            {/* Thinking Panel */}
-            {showThinkingPanel && (
-              <ThinkingPanel
-                items={thinkingItems}
-                onClose={handleCloseThinkingPanel}
-                className={showWorkbenchPanel || showDesktopStream || (showWorkerPanel && isBossMission) ? "flex-shrink-0 max-h-[40%]" : "flex-1"}
-                basePath={missionWorkingDirectory}
-                missionId={viewingMissionId}
-              />
-            )}
-
-            {/* Desktop Stream Panel */}
-            {showDesktopStream && (
-              <div className={cn(
-                "min-h-0",
-                showThinkingPanel ? "flex-1" : "flex-1"
-              )}>
-                <DesktopStream
-                  displayId={desktopDisplayId}
-                  className="h-full"
-                  onClose={() => setShowDesktopStream(false)}
-                />
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    </div>
     </NowTickProvider>
   );
 }

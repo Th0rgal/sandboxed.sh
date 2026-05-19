@@ -625,7 +625,7 @@ final class APIService {
         let session = Self.streamSession
 
         return Task { [weak self] in
-            guard let url = URL(string: "\(base)/api/control/stream") else { return }
+            guard let url = URL(string: "\(base)/api/control/stream?cap=text_op") else { return }
 
             var request = URLRequest(url: url)
             request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -652,6 +652,7 @@ final class APIService {
                         return
                     }
                 }
+                onEvent("connected", ["type": "connected"])
 
                 // `rawStream.lines` decodes chunks as UTF-8 and yields per
                 // line. Replaces the previous byte-by-byte

@@ -1,20 +1,21 @@
 # Streaming contract
 
-The control plane emits agent activity to dashboard and iOS clients via a
-single SSE stream (`GET /api/control/stream`) plus a database-backed
-event log (`GET /api/control/missions/:id/events`, `…/trace`,
-`…/transcript`). This document is the canonical contract for what each
+The control plane emits agent activity to dashboard and iOS clients via
+SSE (`GET /api/control/stream`), WebSocket (`GET /api/control/ws`), and
+a database-backed event log (`GET /api/control/missions/:id/events`,
+`…/trace`, `…/transcript`). This document is the canonical contract for what each
 backend emits and what each client expects. It exists because two
 incidents (the iOS replay-text-delta bug, the verity duplicated-thoughts
 freeze) traced back to drift between these three implementations.
 
 ## SSE channel
 
-`GET /api/control/stream?mission=<uuid>`
+`GET /api/control/stream?mission=<uuid>&cap=text_op`
 
 | Param | Meaning |
 | --- | --- |
 | `mission` | When present, the server only emits events whose `mission_id` matches. `status` and `stream_lagged` (connection-scoped) always pass. Omit the param to receive every event the authenticated user can see (used by the mission list and the `?debug=perf` overlay). |
+| `cap` | Optional comma-separated client capabilities. `text_op` asks the transport to convert cumulative `text_delta` events into negotiated CRDT-style `text_op` operations for this connection. Omit it for the cumulative compatibility path. |
 
 Each line is one of:
 
@@ -25,6 +26,27 @@ Each line is one of:
   rather than treating this as fatal.
 - `event: <type>\ndata: <json>\n\n` — a single `AgentEvent`. See the
   type list below.
+
+## WebSocket channel
+
+`GET /api/control/ws?mission=<uuid>&cap=text_op`
+
+The WebSocket stream carries the same JSON `AgentEvent` payloads as SSE,
+including the `type` discriminator. The dashboard attempts WebSocket first
+and falls back to SSE if the upgrade fails.
+
+Additional WebSocket-only messages:
+
+- Server heartbeat every 15s: `{"seq": N}` where `N` is the latest stored
+  event sequence for the filtered mission, or `0` without a mission filter.
+- Client resume request: `{"type":"resume","since_seq": N}`. When the
+  socket has a `mission=<uuid>` filter, the server fetches stored events
+  with `sequence > N`, converts known rows back into `AgentEvent` shape,
+  and sends them before continuing live broadcast delivery.
+
+When `mission=<uuid>` is present, WebSocket uses the same per-mission
+broadcast channel as SSE. Connection-scoped `status` and FIDO events still
+come from the global channel.
 
 ### Event types
 
@@ -37,6 +59,7 @@ Listed with the backends that emit them.
 | `user_message` | server | `{id, mission_id, content, queued}` | Echoes the user message back after persisting. |
 | `assistant_message` | server | `{id, mission_id, content, success, cost_cents?, cost_source?, model?, shared_files?}` | One per completed agent turn. **Cumulative content** — the message is the final consolidated text. |
 | `text_delta` | grok, codex | `{mission_id, content, event_id?}` | **Cumulative buffer** — the `content` field contains the *entire* text so far, not the new tokens. Clients must consolidate by replacing, not appending. See "Continuation rule". |
+| `text_op` | negotiated streaming backends | `{mission_id, bubble_id, ops}` | CRDT-style delta stream. `ops` entries are `insert`, `replace`, or `finalize`; clients apply them to a local buffer keyed by `bubble_id`. Backends only emit this when the client advertises support; `text_delta` remains the compatibility path. |
 | `thinking` | grok, codex | `{mission_id, content, done, goal_role?, event_id?}` | Cumulative buffer. `done: true` finalises the current thought; subsequent non-prefix payloads start a new thought. |
 | `tool_call` | all | `{mission_id, tool_call_id, name, args}` | One per tool invocation. |
 | `tool_result` | all | `{mission_id, tool_call_id, name, result}` | Pairs with `tool_call` via `tool_call_id`. |
@@ -127,11 +150,20 @@ Events NOT persisted:
 - `status`, `stream_lagged`, `fido_sign_request` — connection-scoped.
 - `mission_activity` — diagnostic only, intentionally not stored.
 
+For negotiated `text_op` streams, in-flight ops persist as `text_op` rows.
+When a `finalize` op arrives, the mission store applies the full op log for
+that `bubble_id`, deletes those delta rows, and writes one
+`assistant_message_canonical` row. Future `/events` fetches return the
+canonical row rather than the op log. Existing missions and cumulative
+`text_delta` rows are unchanged.
+
 ## Client expectations
 
 ### Dashboard (`dashboard/src/app/control/control-client.tsx`)
 
-- Connects with `?mission=<id>` when viewing a specific mission.
+- Connects with `?mission=<id>` when viewing a specific mission. The
+  transport prefers `/api/control/ws` and falls back to `/api/control/stream`
+  on WebSocket connection error.
 - Reconnects whenever the viewing mission changes.
 - Coalesces `text_delta` and `thinking` re-renders via
   `requestAnimationFrame` — at most one React commit per frame.

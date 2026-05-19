@@ -19,20 +19,22 @@ verity fixture missions.
 | P1 | #8 tolerant continuation | ✅ shipped #438 |
 | P1 | #9 navigation leak | ✅ shipped #438 |
 | P1 | #10 markdown size cap | ✅ shipped #438 |
-| P2 | #11 virtualize chat | ⏸ deferred — see below |
-| P2 | #12 virtualize thoughts sheet | ⏸ deferred — see below |
+| P2 | #11 virtualize chat | ✅ implemented in this branch |
+| P2 | #12 virtualize thoughts sheet | ✅ implemented in this branch |
 | P2 | #13 lazy markdown | ✅ shipped #443 |
 | P2 | #14 memoize derived slices | ✅ shipped #442 |
-| P2 | #15 split ControlView | ⏸ deferred — see below |
-| P2 | #16 worker reducer | ⏸ deferred — see below |
-| P3 | #17 delta summarization | ⏸ deferred — backend, large |
+| P2 | #15 split ControlView | ✅ implemented in this branch (slice stores) |
+| P2 | #16 worker reducer | ✅ implemented in this branch |
+| P3 | #17 delta summarization | ✅ implemented in this branch |
 | P3 | #18 since_seq cursors | ⏸ deferred — backend, large |
-| P3 | #19 WS migration | ⏸ deferred — backend, large |
+| P3 | #19 WS migration | ✅ implemented in this branch |
 | P3 | #20 per-mission channels | ⏸ deferred — backend, medium |
 | P3 | #21 backend text_delta backpressure | ⏸ deferred — backend, medium |
-| P4 | #22-24 content model | ⏸ deferred — cross-stack |
+| P4 | #22 negotiated `text_op` protocol | ✅ implemented in this branch |
+| P4 | #23 canonical assistant rows | ✅ implemented in this branch |
+| P4 | #24 tool-output truncation | ⏸ deferred — backend, medium |
 | P5 | #25 health budget telemetry | ⏸ deferred — needs ingestion |
-| P5 | #26 Playwright perf CI | ⏸ deferred — flaky-risk in CI |
+| P5 | #26 Playwright perf CI | ✅ implemented in this branch |
 | P5 | #27 STREAMING.md | ✅ shipped (this file's sibling) |
 
 ## Before / after (verity mission `3a902278`, 1882 events)
@@ -52,66 +54,90 @@ The original symptom (74-second freezes on opening verity #1884)
 disappeared after P1-#4..#10 alone. Subsequent items are
 optimisations, not bug fixes.
 
+## New measurements from this branch
+
+| Item | Measurement |
+| --- | --- |
+| P2-#11/#12 virtualization | `dashboard/tests/control-perf.spec.ts` fixture mission with 500 messages passes DOM `<5k`; local Chromium run completed in 34.0s. |
+| P3-#17 summarization | `inactive_stream_summary_reduces_large_payload_by_ten_x` covers the read-side collapse and asserts the synthetic payload reduction is at least 10x. |
+| P4-#22 negotiated deltas | `text_op_stream_transform_converts_cumulative_delta_to_insert_then_replace` and `text_op_stream_transform_finalizes_before_assistant_message` cover the `cap=text_op` transport conversion path. |
+| P4-#23 canonical rows | `finalized_text_ops_collapse_to_canonical_assistant_row` proves a finalized `text_op` log is replaced by one `assistant_message_canonical` row. |
+| P5-#26 perf CI | Playwright `control @perf keeps large mission within browser budgets` asserts heap `<300MB`, max longtask `<500ms`, and DOM `<5k`. |
+
+Validation commands run locally:
+
+```bash
+cargo fmt --all --check
+cargo check -q
+cargo test -q inactive_stream_summary --lib
+cargo test -q text_op_stream_transform --lib
+cargo test -q finalized_text_ops_collapse_to_canonical_assistant_row --lib
+cd dashboard && npx tsc --noEmit
+cd dashboard && bun run build
+cd dashboard && PLAYWRIGHT_PORT=3001 PLAYWRIGHT_BASE_URL=http://localhost:3001 bunx playwright test tests/control-perf.spec.ts --project=chromium
+cd ios_dashboard && xcodebuild -project SandboxedDashboard.xcodeproj -scheme SandboxedDashboard -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=26.4' build
+```
+
+iOS simulator smoke evidence:
+
+- `ios-control-direct-after-sequential.png` shows historical replay of the
+  goal fixture mission against the dev backend.
+- The first dev-backend run surfaced a Swift concurrency abort in
+  `loadMission`; the saved-mission metadata/transcript fetch was made
+  sequential and the fixture rendered after rebuild/reinstall.
+
 ## Deferred items, with reasoning
 
 These are intentional decisions to stop work, not abandoned TODOs.
 
 ### P2-#11/12: virtualize chat list + thoughts sheet
 
-The chat list already uses CSS `content-visibility: auto` +
-`contain-intrinsic-size: auto 140px` on every row, which gives the
-browser permission to skip layout and paint for off-screen rows
-without any JS-level virtualizer. Combined with P2-#13 (lazy
-markdown) and the P2-#14 memoization, the perf overlay no longer
-shows DOM-traversal cost in the longtask profile on a 1.8k-event
-mission. A `@tanstack/react-virtual` integration would add 30 KB to
-the bundle and a non-trivial scroll-anchor refactor; cost > benefit
-at current data sizes. Revisit if a mission with >5k visible items
-becomes routine.
+The main transcript and thoughts sheet now use `@tanstack/react-virtual`
+with estimated row heights, mount-time measurement, bottom anchoring,
+and a scroll-to-bottom pill when the user is away from the bottom. The
+Playwright perf fixture holds the 500-message mission under the DOM
+budget.
 
 ### P2-#15: split ControlView into subscribers
 
-The win here is preventing the entire 9k-line component from
-re-rendering on every state tick. Half the win has already been
-captured: `ChatItemRow` is `memo()`-wrapped, the derived views go
-through `useMemo`+`useDeferredValue`, the 1Hz timer is shared
-(P1-#7), and SSE bursts coalesce into one commit per frame (P1-#6).
-The remaining win comes from migrating to Zustand-or-similar so
-unrelated state slices stop triggering global re-renders. That's a
-multi-day refactor with high regression risk. Track separately;
-don't bundle it into the perf overhaul.
+The dashboard now mirrors the iOS-style split with explicit stores for
+items, queue, thinking, streaming diagnostics, and the viewing mission.
+The layout component owns layout state while panels subscribe to the
+slices they render.
 
 ### P2-#16: Web Worker for `eventsToItems`
 
-After P0+P1 landed the `replay:apply` reducer runs at most
-**65 ms** for a 5000-event replay on the verity fixture (measured
-via the `replay:apply` console.time + the metrics overlay's
-"Reducers (cum)" panel). Moving it to a worker requires extracting
-~250 lines of helpers, building a worker bundle in Next.js, and
-paying ~100ms of structured-clone cost on every call to ship a 5k
-ChatItem[] back across the boundary. Net: probably break-even at
-current sizes, regression on small-list call sites that fire
-hundreds of times per session. Deferred until a mission size emerges
-where the reducer alone exceeds 200ms.
+`eventsToItemsImpl` and its parsing/continuation helpers live in
+`events-reducer.ts`; `events-worker.ts` exposes a Promise RPC worker
+using Next's `new Worker(new URL(..., import.meta.url))` bundling path.
+Existing synchronous `eventsToItems()` call sites remain available, while
+initial transcript and `since_seq=0` replays route through the worker
+with a sync fallback if worker startup fails.
 
 ### P3-#17..#21: backend streaming changes
 
-All five require coordinated dashboard + iOS + backend changes and
-substantial test coverage. The current SSE + `/events` shape is
-stable across three clients; changing it has high blast radius. The
-per-mission broadcast channels (P3-#20) and the text_delta
-backpressure (P3-#21) are the cheapest wins remaining; track them as
-follow-up issues.
+P3-#17 adds a pure read-side summarization pass for inactive missions:
+`thinking` and `text_delta` runs are collapsed for `/events`, `/trace`,
+and transcript wrappers only when `updated_at` is older than five
+minutes. Persisted rows are unchanged, and active missions keep the
+incremental path.
+
+P3-#19 adds `/api/control/ws` with 15s heartbeats, client resume, and
+dashboard WS-first/SSE-fallback behavior. P3-#18, #20, and #21 remain
+deferred follow-ups.
 
 ### P4-#22..#24: content model changes
 
-CRDT-style deltas (P4-#22), canonical-bubble persistence (P4-#23),
-and tool-output truncation (P4-#24) all imply data-model migrations.
-The P1-#8 tolerant continuation heuristic absorbs most of the
-duplicate-token symptom that motivated #22. #23 needs a clear
-data-loss story before it's worth the risk. #24 should be done but
-also needs backend cooperation (the streaming download endpoint
-doesn't exist yet).
+P4-#22 is implemented as a negotiated transport capability:
+dashboard and iOS append `cap=text_op`, the backend converts cumulative
+`text_delta` buffers into `TextOp::Insert`/`Replace` events for that
+connection, and older clients continue receiving cumulative
+`text_delta`.
+
+P4-#23 persists in-flight `text_op` rows and collapses a finalized
+`bubble_id` into one `assistant_message_canonical` row. Historical
+fetches return that canonical row instead of the delta log. Existing
+missions are unchanged. P4-#24 remains a deferred follow-up.
 
 ### P5-#25: health budget telemetry
 
@@ -123,11 +149,9 @@ on where the telemetry should land.
 
 ### P5-#26: Playwright perf CI
 
-`@playwright/test --grep perf` runs that load a fixture mission and
-assert heap/longtask/DOM budgets are flaky-prone — the Vercel
-preview deploy lifecycle alone introduces 30s+ of variance. Better
-done as a manual regression script that the perf overlay's
-`?debug=perf` already supports.
+`dashboard/tests/control-perf.spec.ts` is marked `@perf`, loads the
+fixture with `?debug=perf`, waits 30s, and asserts heap, longtask, and
+DOM budgets.
 
 ## Operational
 

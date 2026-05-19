@@ -342,6 +342,16 @@ export type ControlAgentEvent =
     }
   | { type: "thinking"; content: string; done: boolean; mission_id?: string }
   | {
+      type: "text_op";
+      mission_id: string;
+      bubble_id: string;
+      ops: Array<
+        | { type: "insert"; pos: number; text: string }
+        | { type: "replace"; range: [number, number]; text: string }
+        | { type: "finalize" }
+      >;
+    }
+  | {
       // Codex `/goal` continuation loop — `iteration` is 1-based, monotonic
       // within a mission. Surfaced once per `turn/started` while the goal
       // is active.
@@ -503,6 +513,7 @@ export type StreamControlOptions = {
    * connection-scoped status / stream_lagged). Omit to receive every event
    * the user can see. */
   missionId?: string;
+  sinceSeq?: number;
 };
 
 export function streamControl(
@@ -515,9 +526,22 @@ export function streamControl(
   let buffer = "";
   let bytesRead = 0;
   const baseUrl = apiUrl("/api/control/stream");
-  const streamUrl = options?.missionId
-    ? `${baseUrl}?mission=${encodeURIComponent(options.missionId)}`
-    : baseUrl;
+  const streamParams = new URLSearchParams();
+  streamParams.set("cap", "text_op");
+  if (options?.missionId) {
+    streamParams.set("mission", options.missionId);
+  }
+  const streamUrl = `${baseUrl}?${streamParams.toString()}`;
+  const wsBaseUrl = apiUrl("/api/control/ws").replace(/^http/, "ws");
+  const wsParams = new URLSearchParams();
+  wsParams.set("cap", "text_op");
+  if (options?.missionId) {
+    wsParams.set("mission", options.missionId);
+  }
+  const wsUrl = `${wsBaseUrl}?${wsParams.toString()}`;
+  let ws: WebSocket | null = null;
+  let sseStarted = false;
+  let wsOpened = false;
 
   onDiagnostics?.({
     phase: "connecting",
@@ -525,7 +549,10 @@ export function streamControl(
     timestamp: Date.now(),
   });
 
-  void (async () => {
+  const startSse = () => {
+    if (sseStarted || controller.signal.aborted) return;
+    sseStarted = true;
+    void (async () => {
     try {
       const res = await apiFetch(streamUrl, {
         method: "GET",
@@ -661,9 +688,99 @@ export function streamControl(
         });
       }
     }
-  })();
+    })();
+  };
 
-  return () => controller.abort();
+  if (typeof WebSocket !== "undefined") {
+    try {
+      onDiagnostics?.({
+        phase: "connecting",
+        url: wsUrl,
+        timestamp: Date.now(),
+      });
+      ws = new WebSocket(wsUrl);
+      ws.onopen = () => {
+        wsOpened = true;
+        onDiagnostics?.({
+          phase: "open",
+          url: wsUrl,
+          status: 101,
+          headers: { upgrade: "websocket" },
+          timestamp: Date.now(),
+        });
+        if (options?.sinceSeq !== undefined) {
+          ws?.send(
+            JSON.stringify({ type: "resume", since_seq: options.sinceSeq }),
+          );
+        }
+      };
+      ws.onmessage = (message) => {
+        if (typeof message.data !== "string") return;
+        bytesRead += message.data.length;
+        try {
+          const data = JSON.parse(message.data);
+          if (
+            data &&
+            typeof data === "object" &&
+            "seq" in data &&
+            !("type" in data)
+          ) {
+            onDiagnostics?.({
+              phase: "event",
+              url: wsUrl,
+              bytes: bytesRead,
+              timestamp: Date.now(),
+            });
+            return;
+          }
+          const type =
+            data && typeof data === "object" && typeof data.type === "string"
+              ? data.type
+              : "message";
+          onEvent({ type, data });
+          onDiagnostics?.({
+            phase: "event",
+            url: wsUrl,
+            bytes: bytesRead,
+            timestamp: Date.now(),
+          });
+        } catch {
+          // ignore parse errors
+        }
+      };
+      ws.onerror = () => {
+        if (!wsOpened) {
+          startSse();
+        }
+      };
+      ws.onclose = () => {
+        if (controller.signal.aborted) return;
+        if (!wsOpened) {
+          startSse();
+          return;
+        }
+        onEvent({
+          type: "error",
+          data: { message: "WebSocket stream closed - reconnecting" },
+        });
+        onDiagnostics?.({
+          phase: "closed",
+          url: wsUrl,
+          bytes: bytesRead,
+          timestamp: Date.now(),
+        });
+      };
+    } catch {
+      startSse();
+    }
+  } else {
+    startSse();
+  }
+
+  return () => {
+    controller.abort();
+    ws?.close();
+  };
 }
 
 // ==================== MCP Management ====================

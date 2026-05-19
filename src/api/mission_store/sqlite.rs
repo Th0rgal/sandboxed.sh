@@ -11,7 +11,7 @@ use super::{
     TelegramStructuredMemorySearchHit, TelegramWorkflow, TelegramWorkflowEvent,
     TelegramWorkflowKind, TelegramWorkflowStatus, TriggerType, WebhookConfig,
 };
-use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo};
+use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo, TextOp};
 use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -398,6 +398,27 @@ fn parse_uuid_or_nil(raw: &str) -> Uuid {
         );
         Uuid::nil()
     })
+}
+
+fn apply_text_ops(buffer: &mut String, ops: &[TextOp]) {
+    for op in ops {
+        match op {
+            TextOp::Insert { pos, text } => {
+                let mut chars: Vec<char> = buffer.chars().collect();
+                let pos = (*pos).min(chars.len());
+                chars.splice(pos..pos, text.chars());
+                *buffer = chars.into_iter().collect();
+            }
+            TextOp::Replace { range, text } => {
+                let mut chars: Vec<char> = buffer.chars().collect();
+                let start = range.0.min(chars.len());
+                let end = range.1.min(chars.len()).max(start);
+                chars.splice(start..end, text.chars());
+                *buffer = chars.into_iter().collect();
+            }
+            TextOp::Finalize => {}
+        }
+    }
 }
 
 const SCHEMA: &str = r#"
@@ -3126,6 +3147,125 @@ impl MissionStore for SqliteMissionStore {
         let now = now_string();
         let mid = mission_id.to_string();
 
+        if let AgentEvent::TextOp { bubble_id, ops, .. } = event {
+            let bubble_id = bubble_id.clone();
+            let ops = ops.clone();
+            let has_finalize = ops.iter().any(|op| matches!(op, TextOp::Finalize));
+            return tokio::task::spawn_blocking(move || {
+                let conn = conn.blocking_lock();
+
+                if has_finalize {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT content, content_file
+                             FROM mission_events
+                             WHERE mission_id = ?1
+                               AND event_type = 'text_op'
+                               AND json_extract(metadata, '$.bubble_id') = ?2
+                             ORDER BY sequence ASC",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![&mid, &bubble_id], |row| {
+                            let content: Option<String> = row.get(0)?;
+                            let content_file: Option<String> = row.get(1)?;
+                            Ok(SqliteMissionStore::load_content(
+                                content.as_deref(),
+                                content_file.as_deref(),
+                            ))
+                        })
+                        .map_err(|e| e.to_string())?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| e.to_string())?;
+                    drop(stmt);
+
+                    let mut content = String::new();
+                    for row in rows {
+                        let row_ops: Vec<TextOp> = serde_json::from_str(&row).unwrap_or_default();
+                        apply_text_ops(&mut content, &row_ops);
+                    }
+                    apply_text_ops(&mut content, &ops);
+
+                    conn.execute(
+                        "DELETE FROM mission_events
+                         WHERE mission_id = ?1
+                           AND event_type = 'text_op'
+                           AND json_extract(metadata, '$.bubble_id') = ?2",
+                        params![&mid, &bubble_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+
+                    let sequence: i64 = conn
+                        .query_row(
+                            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM mission_events WHERE mission_id = ?1",
+                            params![&mid],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(1);
+                    let (content_inline, content_file) = SqliteMissionStore::store_content(
+                        &content_dir,
+                        mission_id,
+                        sequence,
+                        "assistant_message_canonical",
+                        &content,
+                    );
+                    conn.execute(
+                        "INSERT INTO mission_events
+                         (mission_id, sequence, event_type, timestamp, event_id, content, content_file, metadata)
+                         VALUES (?1, ?2, 'assistant_message_canonical', ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            &mid,
+                            sequence,
+                            &now,
+                            &bubble_id,
+                            content_inline,
+                            content_file,
+                            serde_json::json!({
+                                "bubble_id": bubble_id,
+                                "canonical_from": "text_op"
+                            })
+                            .to_string(),
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    let sequence: i64 = conn
+                        .query_row(
+                            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM mission_events WHERE mission_id = ?1",
+                            params![&mid],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(1);
+                    let content = serde_json::to_string(&ops).unwrap_or_else(|_| "[]".to_string());
+                    let (content_inline, content_file) = SqliteMissionStore::store_content(
+                        &content_dir,
+                        mission_id,
+                        sequence,
+                        "text_op",
+                        &content,
+                    );
+                    conn.execute(
+                        "INSERT INTO mission_events
+                         (mission_id, sequence, event_type, timestamp, content, content_file, metadata)
+                         VALUES (?1, ?2, 'text_op', ?3, ?4, ?5, ?6)",
+                        params![
+                            &mid,
+                            sequence,
+                            &now,
+                            content_inline,
+                            content_file,
+                            serde_json::json!({ "bubble_id": bubble_id }).to_string(),
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+
         // Extract event data
         let (event_type, event_id, tool_call_id, tool_name, content, metadata) = match event {
             AgentEvent::UserMessage {
@@ -3222,6 +3362,7 @@ impl MissionStore for SqliteMissionStore {
                 content.clone(),
                 serde_json::json!({}),
             ),
+            AgentEvent::TextOp { .. } => return Ok(()),
             AgentEvent::MissionStatusChanged {
                 status, summary, ..
             } => (
@@ -8401,6 +8542,61 @@ mod tests {
                 ("assistant".to_string(), "reply B".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn finalized_text_ops_collapse_to_canonical_assistant_row() {
+        use crate::api::control::{AgentEvent, TextOp};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("text ops"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::TextOp {
+                    mission_id: mission.id,
+                    bubble_id: "bubble-a".to_string(),
+                    ops: vec![TextOp::Insert {
+                        pos: 0,
+                        text: "Hello wrld".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("first op");
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::TextOp {
+                    mission_id: mission.id,
+                    bubble_id: "bubble-a".to_string(),
+                    ops: vec![
+                        TextOp::Insert {
+                            pos: 7,
+                            text: "o".to_string(),
+                        },
+                        TextOp::Finalize,
+                    ],
+                },
+            )
+            .await
+            .expect("finalize op");
+
+        let events = store
+            .get_events(mission.id, None, None, None)
+            .await
+            .expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "assistant_message_canonical");
+        assert_eq!(events[0].event_id.as_deref(), Some("bubble-a"));
+        assert_eq!(events[0].content, "Hello world");
     }
 
     #[tokio::test]

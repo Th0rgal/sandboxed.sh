@@ -93,6 +93,7 @@ struct ControlView: View {
 
     // Thoughts panel state
     @State private var showThoughts = false
+    @State private var textOpBuffers: [String: String] = [:]
 
     // Tool grouping state - track which groups are expanded
     @State private var expandedToolGroups: Set<String> = []
@@ -1486,6 +1487,11 @@ struct ControlView: View {
             // Add core fields last (higher priority - these should never be overwritten)
             data["mission_id"] = event.missionId
             data["content"] = event.content
+            if event.eventType == "text_op",
+               let jsonData = event.content.data(using: .utf8),
+               let ops = try? JSONSerialization.jsonObject(with: jsonData) {
+                data["ops"] = ops
+            }
 
             if let eventId = event.eventId {
                 data["id"] = eventId
@@ -1550,6 +1556,11 @@ struct ControlView: View {
             }
             data["mission_id"] = event.missionId
             data["content"] = event.content
+            if event.eventType == "text_op",
+               let jsonData = event.content.data(using: .utf8),
+               let ops = try? JSONSerialization.jsonObject(with: jsonData) {
+                data["ops"] = ops
+            }
             if let eventId = event.eventId { data["id"] = eventId }
             if let toolCallId = event.toolCallId { data["tool_call_id"] = toolCallId }
             if let toolName = event.toolName { data["name"] = toolName }
@@ -1606,7 +1617,7 @@ struct ControlView: View {
                 // Fetch events for event-based display
                 if updateViewing || viewingMissionId == nil || viewingMissionId == mission.id {
                     do {
-                        let eventTypes = ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta", "thinking"]
+                        let eventTypes = historyEventTypes
                         let result = try await api.getMissionEventsWithMeta(id: mission.id, types: eventTypes, limit: Self.initialEventLimit, latest: true)
                         let events = result.events
 
@@ -1676,10 +1687,8 @@ struct ControlView: View {
         }
 
         do {
-            async let metadataTask = api.getMission(id: id)
-            async let transcriptTask: MissionTranscriptResult? = try? await api.getMissionTranscript(id: id)
-            let mission = try await metadataTask
-            let transcriptResult = await transcriptTask
+            let mission = try await api.getMission(id: id)
+            let transcriptResult: MissionTranscriptResult? = try? await api.getMissionTranscript(id: id)
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -2706,7 +2715,7 @@ struct ControlView: View {
     }
 
     private var historyEventTypes: [String] {
-        ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta", "thinking"]
+        ["user_message", "assistant_message", "assistant_message_canonical", "tool_call", "tool_result", "text_delta", "text_op", "thinking"]
     }
 
     private var streamingThoughtPrefix: String {
@@ -2877,7 +2886,7 @@ struct ControlView: View {
                 }
             }
             
-        case "assistant_message":
+        case "assistant_message", "assistant_message_canonical":
             if let content = data["content"] as? String,
                let id = data["id"] as? String {
                 // Skip if already present — historical replay or delta resume
@@ -2926,6 +2935,35 @@ struct ControlView: View {
             if !isHistoricalReplay, let content = data["content"] as? String {
                 upsertStreamingFallbackThought(content: content, done: false)
             }
+
+        case "text_op":
+            let bubbleId = data["bubble_id"] as? String ?? "text-op-latest"
+            let ops = data["ops"] as? [[String: Any]] ?? []
+            var content = textOpBuffers[bubbleId] ?? ""
+            var finalized = false
+
+            for op in ops {
+                switch op["type"] as? String {
+                case "insert":
+                    let pos = min(max(op["pos"] as? Int ?? content.count, 0), content.count)
+                    let index = content.index(content.startIndex, offsetBy: pos)
+                    content.insert(contentsOf: op["text"] as? String ?? "", at: index)
+                case "replace":
+                    let range = op["range"] as? [Int] ?? []
+                    let start = min(max(range.first ?? 0, 0), content.count)
+                    let end = min(max(range.dropFirst().first ?? content.count, start), content.count)
+                    let startIndex = content.index(content.startIndex, offsetBy: start)
+                    let endIndex = content.index(content.startIndex, offsetBy: end)
+                    content.replaceSubrange(startIndex..<endIndex, with: op["text"] as? String ?? "")
+                case "finalize":
+                    finalized = true
+                default:
+                    continue
+                }
+            }
+
+            textOpBuffers[bubbleId] = finalized ? nil : content
+            upsertStreamingFallbackThought(content: content, done: finalized)
 
         case "goal_iteration":
             // Goal-mode iteration marker — increment the counter shown in
