@@ -1,7 +1,7 @@
 //! Git operations for the configuration library.
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use super::types::LibraryStatus;
@@ -367,6 +367,64 @@ pub async fn commit(path: &Path, message: &str, author: Option<&GitAuthor>) -> R
     let output = cmd.output().await.context("Failed to execute git commit")?;
 
     // Exit code 1 means nothing to commit, which is fine
+    if !output.status.success() && output.status.code() != Some(1) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git commit failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
+/// Commit a restricted set of paths without staging unrelated working-tree changes.
+pub(crate) async fn commit_paths(
+    path: &Path,
+    paths: &[PathBuf],
+    message: &str,
+    author: Option<&GitAuthor>,
+) -> Result<()> {
+    if paths.is_empty() || !path.join(".git").exists() {
+        return Ok(());
+    }
+
+    let relative_paths: Vec<String> = paths
+        .iter()
+        .map(|item| {
+            item.strip_prefix(path)
+                .unwrap_or(item)
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+
+    let mut add_args = vec!["add".to_string(), "--".to_string()];
+    add_args.extend(relative_paths.iter().cloned());
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(add_args)
+        .output()
+        .await
+        .context("Failed to execute git add")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git add failed: {}", stderr);
+    }
+
+    let mut cmd = Command::new("git");
+    cmd.current_dir(path).args(["commit", "-m", message, "--"]);
+    cmd.args(relative_paths.iter());
+
+    if let Some(author) = author {
+        if let (Some(name), Some(email)) = (&author.name, &author.email) {
+            cmd.env("GIT_AUTHOR_NAME", name)
+                .env("GIT_AUTHOR_EMAIL", email)
+                .env("GIT_COMMITTER_NAME", name)
+                .env("GIT_COMMITTER_EMAIL", email);
+        }
+    }
+
+    let output = cmd.output().await.context("Failed to execute git commit")?;
+
     if !output.status.success() && output.status.code() != Some(1) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("git commit failed: {}", stderr);

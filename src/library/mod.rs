@@ -123,6 +123,7 @@ impl LibraryStore {
 
     /// Seed bundled showcase Library items without overwriting user-owned Library content.
     async fn seed_bundled_hackathon_items(&self) -> Result<()> {
+        let mut seeded_paths = Vec::new();
         let skill_dir = self.skills_dir().join(OKX_SECURITY_SKILL_NAME);
         let skill_md = skill_dir.join("SKILL.md");
         if !skill_md.exists() {
@@ -132,13 +133,13 @@ impl LibraryStore {
             fs::write(&skill_md, OKX_SECURITY_SKILL)
                 .await
                 .context("Failed to write bundled OKX security skill")?;
-        }
 
-        let source_path = skill_dir.join(".skill-source.json");
-        if !source_path.exists() {
+            let source_path = skill_dir.join(".skill-source.json");
             fs::write(&source_path, OKX_SECURITY_SOURCE)
                 .await
                 .context("Failed to write bundled OKX skill source metadata")?;
+            seeded_paths.push(skill_md);
+            seeded_paths.push(source_path);
         }
 
         let templates_dir = self.path.join(WORKSPACE_TEMPLATE_DIR);
@@ -156,7 +157,20 @@ impl LibraryStore {
             fs::write(&template_path, AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE)
                 .await
                 .context("Failed to write bundled OKX workspace template")?;
+            seeded_paths.push(template_path);
         }
+
+        let seed_author = git::GitAuthor::new(
+            Some("sandboxed.sh".to_string()),
+            Some("agent@sandboxed.sh".to_string()),
+        );
+        git::commit_paths(
+            &self.path,
+            &seeded_paths,
+            "Seed bundled hackathon library items",
+            Some(&seed_author),
+        )
+        .await?;
 
         Ok(())
     }
@@ -2612,12 +2626,39 @@ This is the body."#;
 
         let custom = "---\nname: okx-security\n---\n\n# Custom local copy\n";
         let skill_path = temp.path().join("skill/okx-security/SKILL.md");
+        let source_path = skill_path.parent().unwrap().join(".skill-source.json");
         tokio::fs::write(&skill_path, custom).await.unwrap();
+        tokio::fs::remove_file(&source_path).await.unwrap();
 
         store.seed_bundled_hackathon_items().await.unwrap();
 
         let preserved = tokio::fs::read_to_string(&skill_path).await.unwrap();
         assert_eq!(preserved, custom);
+        assert!(!source_path.exists());
+    }
+
+    #[tokio::test]
+    async fn bundled_hackathon_items_seed_commits_created_files_in_git_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = tokio::process::Command::new("git")
+            .current_dir(temp.path())
+            .args(["init"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+
+        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
+        store.seed_bundled_hackathon_items().await.unwrap();
+
+        let output = tokio::process::Command::new("git")
+            .current_dir(temp.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     }
 
     #[test]

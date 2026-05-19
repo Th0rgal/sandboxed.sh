@@ -35,13 +35,8 @@ Do not run commands whose primary purpose is trading, sending, signing, broadcas
 Before the first `onchainos` command in a workspace:
 
 1. Check whether `onchainos --version` works.
-2. If it is missing, install the official OKX OnchainOS CLI from the latest stable release:
-
-```bash
-curl -sSL https://raw.githubusercontent.com/okx/onchainos-skills/main/install.sh | sh
-```
-
-3. Run `onchainos --version` again and stop if the binary is still unavailable.
+2. If it is missing, stop and ask the human to install the official OKX OnchainOS CLI from a pinned release or package manager they trust. Do not download and execute remote install scripts.
+3. Run `onchainos --version` again only after the human confirms installation, and stop if the binary is still unavailable.
 
 Do not ask for OKX account credentials or Agentic Wallet keys. Security commands can produce a useful report from public inputs.
 
