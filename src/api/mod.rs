@@ -38,6 +38,7 @@ mod model_routing;
 mod monitoring;
 mod native_loop_observer;
 pub mod opencode;
+mod provider_usage_cache;
 mod providers;
 pub(crate) mod proxy;
 mod proxy_keys;

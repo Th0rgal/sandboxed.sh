@@ -1987,6 +1987,7 @@ function MissionWorkbenchPanel({
   role,
   isRunning,
   childMissions,
+  runtime,
   onClose,
   onResume,
   onCancel,
@@ -2002,6 +2003,16 @@ function MissionWorkbenchPanel({
   role: ReturnType<typeof inferMissionRole>;
   isRunning: boolean;
   childMissions: Mission[];
+  /**
+   * Optional runtime block (queue + subtask progress) surfaced inside the
+   * workbench so the toolbar can drop these chips. Caller passes only the
+   * values it has — the section renders only when at least one is active.
+   */
+  runtime?: {
+    queueLen: number;
+    subtaskCompleted?: number;
+    subtaskTotal?: number;
+  };
   onClose: () => void;
   onResume: () => void;
   onCancel: (missionId: string) => void;
@@ -2126,6 +2137,36 @@ function MissionWorkbenchPanel({
                 </p>
               )}
             </section>
+
+            {runtime && (runtime.queueLen > 0 || (runtime.subtaskTotal ?? 0) > 0) && (
+              <section className="space-y-2">
+                <p className="text-[10px] uppercase tracking-wide text-white/30">Runtime</p>
+                <div className="grid grid-cols-2 gap-2">
+                  {runtime.queueLen > 0 && (
+                    <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
+                      <p className="text-[10px] text-white/30">Queue</p>
+                      <p
+                        className={cn(
+                          "mt-1 text-xs font-medium tabular-nums",
+                          runtime.queueLen < 3 ? "text-amber-400" : "text-orange-400"
+                        )}
+                        title={`${runtime.queueLen} message${runtime.queueLen > 1 ? "s" : ""} waiting`}
+                      >
+                        {runtime.queueLen}
+                      </p>
+                    </div>
+                  )}
+                  {(runtime.subtaskTotal ?? 0) > 0 && (
+                    <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
+                      <p className="text-[10px] text-white/30">Subtask</p>
+                      <p className="mt-1 text-xs font-medium text-emerald-400 tabular-nums">
+                        {Math.min((runtime.subtaskCompleted ?? 0) + 1, runtime.subtaskTotal ?? 0)}/{runtime.subtaskTotal}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </section>
+            )}
 
             <section className="space-y-2">
               <p className="text-[10px] uppercase tracking-wide text-white/30">Actions</p>
@@ -8627,11 +8668,12 @@ export default function ControlClient() {
     return null;
   }, [items]);
 
-  // Derive child (worker) missions for the active mission
+  // Derive child (worker) missions from the route's current mission, not the
+  // viewed worker, so the worker strip stays visible after selecting a chip.
   const childMissions = useMemo(() => {
-    if (!activeMission) return [];
-    return recentMissions.filter((m) => m.parent_mission_id === activeMission.id);
-  }, [activeMission, recentMissions]);
+    if (!currentMission) return [];
+    return recentMissions.filter((m) => m.parent_mission_id === currentMission.id);
+  }, [currentMission, recentMissions]);
   const activeMissionRole = activeMission ? inferMissionRole(activeMission) : null;
 
   // In-mission sub-agents: Claude Code's in-process `Task` /
@@ -8673,7 +8715,7 @@ export default function ControlClient() {
     if (childMissions.length > 0 || hasInMissionSubagents) {
       setShowWorkerPanel(true);
     }
-  }, [activeMission?.id, childMissions.length, hasInMissionSubagents]);
+  }, [currentMission?.id, childMissions.length, hasInMissionSubagents]);
 
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
@@ -9098,15 +9140,20 @@ export default function ControlClient() {
               </>
             )}
 
-            {/* Run state indicator with debug dropdown */}
+            {/* Run state indicator with debug dropdown — icon only.
+                The mission selector already shows the mission status dot and
+                the Workbench shows "Status: Running"; a "Running" label here
+                is redundant. Clicking the icon still opens the diagnostics
+                popover for the deep-debug case. */}
             <div className="relative">
               <button
                 onClick={() => setShowStreamDiagnostics((prev) => !prev)}
                 className={cn(
-                  "flex items-center gap-2 rounded-md px-2 py-1 transition-colors hover:bg-white/[0.04]",
+                  "flex items-center justify-center rounded-md p-1 transition-colors hover:bg-white/[0.04]",
                   status.className
                 )}
-                title="Click for debug info"
+                title={`${status.label} — click for debug info`}
+                aria-label={`${status.label} — click for debug info`}
               >
                 <StatusIcon
                   className={cn(
@@ -9114,7 +9161,6 @@ export default function ControlClient() {
                     viewingRunState !== "idle" && "animate-spin"
                   )}
                 />
-                <span className="text-sm font-medium">{status.label}</span>
               </button>
 
               {showStreamDiagnostics && (
@@ -9287,24 +9333,29 @@ export default function ControlClient() {
               )}
             </div>
 
-            {/* Queue count */}
-            <div className="h-4 w-px bg-white/[0.08]" />
-            <div
-              className="flex items-center gap-1.5"
-              title={viewingQueueLen > 0 ? `${viewingQueueLen} message${viewingQueueLen > 1 ? 's' : ''} waiting to be processed` : 'No messages queued'}
-            >
-              <span className="text-[10px] uppercase tracking-wider text-white/40">
-                Queue
-              </span>
-              <span className={cn(
-                "text-sm font-medium tabular-nums",
-                viewingQueueLen === 0 && "text-white/70",
-                viewingQueueLen > 0 && viewingQueueLen < 3 && "text-amber-400",
-                viewingQueueLen >= 3 && "text-orange-400"
-              )}>
-                {viewingQueueLen}
-              </span>
-            </div>
+            {/* Queue count — only when something is queued.
+                Idle missions previously rendered a permanent "QUEUE 0" badge,
+                which added noise without information. The workbench mirrors
+                this count in its Runtime section when the user wants detail. */}
+            {viewingQueueLen > 0 && (
+              <>
+                <div className="h-4 w-px bg-white/[0.08]" />
+                <div
+                  className="flex items-center gap-1.5"
+                  title={`${viewingQueueLen} message${viewingQueueLen > 1 ? 's' : ''} waiting to be processed`}
+                >
+                  <span className="text-[10px] uppercase tracking-wider text-white/40">
+                    Queue
+                  </span>
+                  <span className={cn(
+                    "text-sm font-medium tabular-nums",
+                    viewingQueueLen < 3 ? "text-amber-400" : "text-orange-400"
+                  )}>
+                    {viewingQueueLen}
+                  </span>
+                </div>
+              </>
+            )}
 
             {/* Progress indicator */}
             {viewingProgress && viewingProgress.total > 0 && (
@@ -9879,6 +9930,11 @@ export default function ControlClient() {
                 role={activeMissionRole}
                 isRunning={viewingMissionIsRunning}
                 childMissions={childMissions}
+                runtime={{
+                  queueLen: viewingQueueLen,
+                  subtaskCompleted: viewingProgress?.completed,
+                  subtaskTotal: viewingProgress?.total,
+                }}
                 onClose={() => setShowWorkbenchPanel(false)}
                 onResume={handleResumeMission}
                 onCancel={handleCancelMission}

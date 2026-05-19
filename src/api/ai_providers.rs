@@ -937,6 +937,9 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/opencode-auth", get(get_opencode_auth))
         .route("/opencode-auth", post(set_opencode_auth))
         .route("/for-backend/:backend_id", get(get_provider_for_backend))
+        // Bulk usage snapshot for the dashboard — returns the entire cache map
+        // and triggers async background refreshes for any stale entries.
+        .route("/usage", get(list_all_provider_usage))
         .route("/:id", get(get_provider))
         .route("/:id", put(update_provider))
         .route("/:id", delete(delete_provider))
@@ -946,7 +949,7 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/:id/oauth/callback", post(oauth_callback))
         .route("/:id/default", post(set_default))
         .route("/:id/health", post(check_provider_health))
-        .route("/:id/usage", get(get_provider_usage))
+        .route("/:id/usage", get(get_provider_usage_cached))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6488,6 +6491,152 @@ async fn get_provider_usage(
     };
 
     Ok(Json(usage_result))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cached usage handlers
+//
+// `get_provider_usage` above performs a live API call to the provider and is
+// the only place that knows how to do so. We expose it through a thin caching
+// layer so the dashboard sees fresh-but-instant data:
+//   * `get_provider_usage_cached` (GET /api/ai/providers/:id/usage) returns
+//     the cached value immediately when fresh, otherwise re-fetches live and
+//     repopulates the cache. Pass `?force=1` to bypass the freshness check.
+//   * `list_all_provider_usage` (GET /api/ai/providers/usage) returns the full
+//     cache snapshot and spawns background refresh tasks for any stale entries
+//     so subsequent reads land on fresh data.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct UsageQuery {
+    #[serde(default)]
+    pub force: bool,
+    /// If true, return the cached value (or 404 if none) without ever
+    /// triggering a live fetch.
+    #[serde(default)]
+    pub cached_only: bool,
+}
+
+/// Wrap the (axum) live fetch into a cache-write side-effect.
+async fn live_fetch_and_cache(
+    state: Arc<super::routes::AppState>,
+    id: String,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let result = get_provider_usage(State(Arc::clone(&state)), AxumPath(id.clone())).await?;
+    let value = result.0;
+    state.provider_usage_cache.insert(id, value.clone()).await;
+    Ok(value)
+}
+
+/// GET /api/ai/providers/:id/usage — cache-aware variant of get_provider_usage.
+async fn get_provider_usage_cached(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(id): AxumPath<String>,
+    axum::extract::Query(q): axum::extract::Query<UsageQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !q.force {
+        if let Some(cached) = state.provider_usage_cache.get(&id).await {
+            let is_fresh = cached.is_fresh();
+            let is_stale = cached.is_stale();
+            let fetched_at_iso = cached.fetched_at_iso.clone();
+            if is_fresh || q.cached_only {
+                let mut value = cached.value;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("cached".to_string(), serde_json::json!(true));
+                    obj.insert("fetched_at".to_string(), serde_json::json!(fetched_at_iso));
+                    if is_stale {
+                        obj.insert("stale".to_string(), serde_json::json!(true));
+                    }
+                }
+                // Kick off a background refresh if the value is older than
+                // REFRESH_AFTER but we returned the stale copy because the
+                // caller didn't ask for cached_only.
+                if !is_fresh && !q.cached_only {
+                    let bg_state = Arc::clone(&state);
+                    let bg_id = id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = live_fetch_and_cache(bg_state, bg_id).await {
+                            tracing::debug!("background usage refresh failed: {:?}", e);
+                        }
+                    });
+                }
+                return Ok(Json(value));
+            }
+        }
+        if q.cached_only {
+            return Err((StatusCode::NOT_FOUND, "Usage not yet cached".to_string()));
+        }
+    }
+    let value = live_fetch_and_cache(state, id).await?;
+    Ok(Json(value))
+}
+
+/// GET /api/ai/providers/usage — bulk snapshot of every cached entry.
+async fn list_all_provider_usage(
+    State(state): State<Arc<super::routes::AppState>>,
+) -> Json<serde_json::Value> {
+    let snapshot = state.provider_usage_cache.snapshot().await;
+    let providers = state.ai_providers.list().await;
+
+    // Decide which provider ids to refresh in the background — every stored
+    // provider whose entry is missing or older than REFRESH_AFTER.
+    let candidate_ids: Vec<String> = providers.iter().map(|p| p.id.to_string()).collect();
+    let stale = state.provider_usage_cache.stale_keys(&candidate_ids).await;
+    for id in stale {
+        let bg_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = live_fetch_and_cache(bg_state, id.clone()).await {
+                tracing::debug!(provider = %id, "background usage refresh failed: {:?}", e);
+            }
+        });
+    }
+
+    let mut entries = serde_json::Map::new();
+    for (key, cached) in snapshot {
+        let is_stale = cached.is_stale();
+        let fetched_at_iso = cached.fetched_at_iso.clone();
+        let mut value = cached.value;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("cached".to_string(), serde_json::json!(true));
+            obj.insert("fetched_at".to_string(), serde_json::json!(fetched_at_iso));
+            if is_stale {
+                obj.insert("stale".to_string(), serde_json::json!(true));
+            }
+        }
+        entries.insert(key, value);
+    }
+    Json(serde_json::json!({
+        "entries": entries,
+        "refresh_after_seconds": super::provider_usage_cache::REFRESH_AFTER.as_secs(),
+    }))
+}
+
+/// Start the recurring background refresh loop. Iterates every `REFRESH_AFTER`
+/// and re-fetches usage for every stored AI provider whose cache entry is
+/// stale (or never fetched).
+pub fn spawn_usage_refresh_loop(state: Arc<super::routes::AppState>) {
+    tokio::spawn(async move {
+        // Initial nudge: give the rest of the app a moment to settle before
+        // we hammer external providers.
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        loop {
+            let providers = state.ai_providers.list().await;
+            for p in providers {
+                let id = p.id.to_string();
+                let bg_state = Arc::clone(&state);
+                if let Err(e) = live_fetch_and_cache(bg_state, id.clone()).await {
+                    tracing::debug!(
+                        provider = %id,
+                        "scheduled usage refresh failed: {:?}",
+                        e
+                    );
+                }
+                // Spread the load — don't burst all providers in a single tick.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            tokio::time::sleep(super::provider_usage_cache::REFRESH_AFTER).await;
+        }
+    });
 }
 
 /// POST /api/ai/providers - Create a new provider.

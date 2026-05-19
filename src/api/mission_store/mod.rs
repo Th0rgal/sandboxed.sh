@@ -149,6 +149,18 @@ pub struct ModelUsageStats {
     pub cost_cents: u64,
 }
 
+/// Aggregated AI usage for one UTC day.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyUsageStats {
+    /// ISO-8601 day (YYYY-MM-DD, UTC) derived from the event timestamp.
+    pub day: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Automation Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1104,6 +1116,12 @@ pub trait MissionStore: Send + Sync {
         &self,
         _since: Option<&str>,
     ) -> Result<Vec<ModelUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate AI usage per UTC day. Days with no usage are omitted; the
+    /// caller is responsible for filling gaps if a contiguous series is needed.
+    async fn get_usage_by_day(&self, _since: Option<&str>) -> Result<Vec<DailyUsageStats>, String> {
         Ok(Vec::new())
     }
 

@@ -318,6 +318,24 @@ export async function getProviderUsage(id: string): Promise<ProviderUsage> {
   return apiGet(`/api/ai/providers/${id}/usage`, "Failed to get provider usage");
 }
 
+/** Force-refresh a single provider's usage data (bypasses the server cache). */
+export async function refreshProviderUsage(id: string): Promise<ProviderUsage> {
+  return apiGet(
+    `/api/ai/providers/${id}/usage?force=1`,
+    "Failed to refresh provider usage"
+  );
+}
+
+/** Bulk usage snapshot for every provider that has cached data on the server. */
+export interface AllProviderUsageResponse {
+  entries: Record<string, ProviderUsage>;
+  refresh_after_seconds: number;
+}
+
+export async function getAllProviderUsage(): Promise<AllProviderUsageResponse> {
+  return apiGet("/api/ai/providers/usage", "Failed to load provider usage");
+}
+
 // ---------------------------------------------------------------------------
 // Aggregated usage summary (across all missions)
 // ---------------------------------------------------------------------------
@@ -336,6 +354,15 @@ export interface ModelUsageSummary {
   cost_cents: number;
 }
 
+export interface DailyUsage {
+  day: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_cents: number;
+}
+
 export interface UsageSummary {
   window: UsageWindow;
   since: string | null;
@@ -348,6 +375,7 @@ export interface UsageSummary {
     cost_cents: number;
   };
   by_model: ModelUsageSummary[];
+  by_day: DailyUsage[];
 }
 
 export async function getUsageSummary(window: UsageWindow = "all"): Promise<UsageSummary> {
