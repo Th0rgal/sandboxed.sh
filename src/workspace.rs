@@ -4891,7 +4891,7 @@ mod tests {
         write_claudecode_skills_to_workspace(temp.path(), &skills)
             .await
             .unwrap();
-        write_amp_skills_to_workspace(temp.path(), &skills)
+        write_codex_skills_to_workspace(&temp.path().join(".codex"), &skills)
             .await
             .unwrap();
 
@@ -4905,11 +4905,11 @@ mod tests {
             .exists());
         assert!(temp
             .path()
-            .join(".agents/skills/okx-security/SKILL.md")
+            .join(".codex/skills/okx-security/SKILL.md")
             .exists());
         assert!(temp
             .path()
-            .join(".agents/skills/okx-security/references/read-only.md")
+            .join(".codex/skills/okx-security/references/read-only.md")
             .exists());
     }
 }
