@@ -135,6 +135,10 @@ pub struct AppState {
     /// /events + /running req rates, broadcast events per mission. Read
     /// via `GET /api/control/metrics`.
     pub control_metrics: Arc<super::control_metrics::ControlMetrics>,
+    /// Cache of per-provider live rate-limit / usage data. Filled lazily by
+    /// `/api/ai/providers/:id/usage` and refreshed in the background so the
+    /// dashboard sees fresh values without paying a round-trip latency cost.
+    pub provider_usage_cache: Arc<super::provider_usage_cache::ProviderUsageCache>,
 }
 
 /// Start the HTTP server.
@@ -491,7 +495,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         telegram_bridge,
         fido_hub: Arc::new(super::fido::FidoSigningHub::new()),
         control_metrics: Arc::new(super::control_metrics::ControlMetrics::new()),
+        provider_usage_cache: super::provider_usage_cache::ProviderUsageCache::new(),
     });
+
+    // Start background refresh of provider rate-limit / usage info so the
+    // dashboard always reads a fresh-enough cache.
+    super::ai_providers::spawn_usage_refresh_loop(Arc::clone(&state));
 
     // Initialize the metadata LLM client for AI-powered mission titles/descriptions
     {
@@ -1355,6 +1364,18 @@ pub struct UsageSummaryResponse {
     pub since: Option<String>,
     pub totals: UsageSummaryTotals,
     pub by_model: Vec<ModelUsageResponse>,
+    pub by_day: Vec<DailyUsageResponse>,
+}
+
+/// One day's worth of aggregated usage — used to draw the sparkline.
+#[derive(Debug, Serialize)]
+pub struct DailyUsageResponse {
+    pub day: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
 }
 
 /// Map a normalized model identifier to a provider type id.
@@ -1413,6 +1434,11 @@ async fn get_ai_usage_summary(
         .get_usage_by_model(since.as_deref())
         .await
         .unwrap_or_default();
+    let daily = control_state
+        .mission_store
+        .get_usage_by_day(since.as_deref())
+        .await
+        .unwrap_or_default();
 
     let mut totals = UsageSummaryTotals {
         requests: 0,
@@ -1449,11 +1475,24 @@ async fn get_ai_usage_summary(
         });
     }
 
+    let by_day = daily
+        .into_iter()
+        .map(|d| DailyUsageResponse {
+            day: d.day,
+            requests: d.requests,
+            input_tokens: d.input_tokens,
+            output_tokens: d.output_tokens,
+            cache_read_tokens: d.cache_read_tokens,
+            cost_cents: d.cost_cents,
+        })
+        .collect();
+
     Json(UsageSummaryResponse {
         window: window.to_string(),
         since,
         totals,
         by_model,
+        by_day,
     })
 }
 

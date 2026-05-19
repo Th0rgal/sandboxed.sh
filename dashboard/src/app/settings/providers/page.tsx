@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import {
@@ -11,6 +11,8 @@ import {
   authenticateAIProvider,
   setDefaultAIProvider,
   getProviderUsage,
+  refreshProviderUsage,
+  getAllProviderUsage,
   AIProvider,
   AIProviderTypeInfo,
   ProviderUsage,
@@ -337,10 +339,34 @@ export default function ProvidersPage() {
     { revalidateOnFocus: false, fallbackData: defaultProviderTypes }
   );
 
-  const fetchUsage = useCallback(async (providerId: string) => {
+  // Pull the entire bulk cache so the rate-limit panel is instant the moment
+  // the user expands a provider. Refreshes itself on a slow tick — the server
+  // already refreshes in the background, so we just need to read the snapshot.
+  const { data: bulkUsage } = useSWR(
+    'ai-providers-usage-bulk',
+    getAllProviderUsage,
+    { revalidateOnFocus: false, refreshInterval: 60_000 }
+  );
+
+  // Merge the bulk snapshot into local usage state — only for providers we
+  // haven't already fetched fresh (or that have errored) so an explicit
+  // refresh doesn't get overwritten by the cache.
+  const cachedEntries = bulkUsage?.entries;
+  const cachedSeen = useMemo(() => {
+    if (!cachedEntries) return {};
+    const next: Record<string, ProviderUsage> = {};
+    for (const [k, v] of Object.entries(cachedEntries)) {
+      next[k] = v;
+    }
+    return next;
+  }, [cachedEntries]);
+
+  const fetchUsage = useCallback(async (providerId: string, force = false) => {
     setUsageLoading((prev) => ({ ...prev, [providerId]: true }));
     try {
-      const data = await getProviderUsage(providerId);
+      const data = force
+        ? await refreshProviderUsage(providerId)
+        : await getProviderUsage(providerId);
       setUsageData((prev) => ({ ...prev, [providerId]: data }));
     } catch {
       setUsageData((prev) => ({
@@ -362,11 +388,16 @@ export default function ProvidersPage() {
         setExpandedProvider(null);
       } else {
         setExpandedProvider(providerId);
-        // Fetch fresh usage when expanding
+        // Seed from the bulk cache immediately for an instant render…
+        if (!usageData[providerId] && cachedSeen[providerId]) {
+          setUsageData((prev) => ({ ...prev, [providerId]: cachedSeen[providerId] }));
+        }
+        // …then fetch via the cached endpoint (cheap, server returns cached
+        // copy if fresh).
         fetchUsage(providerId);
       }
     },
-    [expandedProvider, fetchUsage]
+    [expandedProvider, fetchUsage, usageData, cachedSeen]
   );
 
   const handleAuthenticate = async (provider: AIProvider) => {
@@ -723,7 +754,7 @@ export default function ProvidersPage() {
                             <div className="flex items-center justify-between pt-2 pb-1">
                               <span className="text-[11px] text-white/30 uppercase tracking-wider">Usage & Limits</span>
                               <button
-                                onClick={() => fetchUsage(provider.id)}
+                                onClick={() => fetchUsage(provider.id, true)}
                                 disabled={usageLoading[provider.id]}
                                 className="p-1 rounded text-white/20 hover:text-white/50 transition-colors cursor-pointer disabled:opacity-50"
                                 title="Refresh"

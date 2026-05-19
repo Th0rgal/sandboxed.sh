@@ -40,6 +40,7 @@ mod native_loop_observer;
 pub mod opencode;
 mod providers;
 pub(crate) mod proxy;
+mod provider_usage_cache;
 mod proxy_keys;
 mod routes;
 pub mod secrets;
