@@ -2277,6 +2277,35 @@ function formatToolArgs(args: unknown): string {
   }
 }
 
+/**
+ * P4-#24: tool-output preview cap. Bash and similar tools can return
+ * multi-MB result strings; rendering them inline freezes the page even
+ * with the markdown cap. This helper splits the full string into a
+ * 10KB preview + a `truncated` flag so the renderer can show a
+ * "Show full output" affordance. We deliberately keep the preview
+ * *prefix* (the first 10KB) since the head of a tool output is usually
+ * what the user reads — the tail is logs or stack traces.
+ */
+const TOOL_RESULT_PREVIEW_BYTES = 10_000;
+
+type ToolResultPreview = {
+  preview: string;
+  truncated: boolean;
+  fullLength: number;
+};
+
+function formatToolResultPreview(result: unknown): ToolResultPreview {
+  const full = formatToolArgs(result);
+  if (full.length <= TOOL_RESULT_PREVIEW_BYTES) {
+    return { preview: full, truncated: false, fullLength: full.length };
+  }
+  return {
+    preview: full.slice(0, TOOL_RESULT_PREVIEW_BYTES),
+    truncated: true,
+    fullLength: full.length,
+  };
+}
+
 // Truncate text for preview
 function truncateText(text: string, maxLength: number = 100): string {
   if (text.length <= maxLength) return text;
@@ -2741,11 +2770,14 @@ const ToolCallItem = memo(function ToolCallItem({
   // Memoize expensive string formatting - only recompute when item.args changes
   const argsStr = useMemo(() => formatToolArgs(item.args), [item.args]);
 
-  // Memoize result string - only recompute when item.result changes
-  const resultStr = useMemo(
-    () => (item.result !== undefined ? formatToolArgs(item.result) : null),
+  // P4-#24 preview cap: split into 10KB head + truncated flag so we
+  // don't feed multi-MB bash outputs into the syntax highlighter.
+  const resultPreview = useMemo(
+    () => (item.result !== undefined ? formatToolResultPreview(item.result) : null),
     [item.result]
   );
+  const resultStr = resultPreview?.preview ?? null;
+  const [resultExpanded, setResultExpanded] = useState(false);
 
   // Memoize cancelled detection - check if tool was cancelled due to mission ending
   const isCancelled = useMemo(() => {
@@ -2877,9 +2909,27 @@ const ToolCallItem = memo(function ToolCallItem({
                   background={isError ? "rgba(239, 68, 68, 0.1)" : undefined}
                   textColor={isError ? "rgb(248, 113, 113)" : undefined}
                 >
-                  {resultStr}
+                  {resultExpanded && item.result !== undefined
+                    ? formatToolArgs(item.result)
+                    : resultStr}
                 </LazyJsonHighlighter>
               </div>
+              {resultPreview?.truncated && (
+                <div className="mt-1 flex items-center justify-between text-[10px] text-white/40">
+                  <span>
+                    {resultExpanded
+                      ? `Showing full output (${(resultPreview.fullLength / 1024).toFixed(0)} KB)`
+                      : `Showing first ${(TOOL_RESULT_PREVIEW_BYTES / 1024).toFixed(0)} KB of ${(resultPreview.fullLength / 1024).toFixed(0)} KB`}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setResultExpanded((v) => !v)}
+                    className="rounded bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium text-white/70 hover:bg-white/[0.08]"
+                  >
+                    {resultExpanded ? "Show preview" : "Show full output"}
+                  </button>
+                </div>
+              )}
               {/* Image previews for screenshot results - only from tools that produce images */}
               {(() => {
                 // Only extract images from tools that actually produce screenshots
