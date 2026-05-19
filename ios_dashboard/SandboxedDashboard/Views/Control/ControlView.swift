@@ -4345,8 +4345,8 @@ private struct ThoughtsSheet: View {
         var seen = Set<String>()
         return thinkingMessages.filter { msg in
             let trimmed = msg.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return false }
             guard msg.thinkingDone else { return true }
+            guard !trimmed.isEmpty else { return false }
             guard !seen.contains(trimmed) else { return false }
             seen.insert(trimmed)
             return true
