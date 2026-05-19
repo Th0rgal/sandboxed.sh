@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect, useMemo, memo } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef, memo } from "react";
 import { createRoot } from "react-dom/client";
 import Markdown, { Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -1058,3 +1058,69 @@ export const MarkdownContent = memo(function MarkdownContent({
     </div>
   );
 });
+
+/**
+ * P2-#13: lazy-mount wrapper around `MarkdownContent`.
+ *
+ * Renders the raw text inside a `<pre>` until the first IntersectionObserver
+ * hit, then upgrades to the full markdown pipeline. One-way upgrade: once
+ * a bubble has been seen we keep the rich renderer mounted so scroll-out
+ * doesn't unmount + remount the syntax-highlighted code blocks.
+ *
+ * Bubbles smaller than the threshold skip the lazy path entirely — the
+ * setup cost of an IO observer + the placeholder swap isn't worth it for
+ * a 100-char ack message.
+ */
+const LAZY_THRESHOLD_BYTES = 1_000;
+
+export function LazyMarkdownContent(props: MarkdownContentProps) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const small = props.content.length < LAZY_THRESHOLD_BYTES;
+  const [visible, setVisible] = useState(small);
+
+  useEffect(() => {
+    if (visible) return;
+    const node = ref.current;
+    if (!node) return;
+    if (typeof IntersectionObserver === "undefined") {
+      // Older browser — just upgrade immediately. CSS content-visibility
+      // already provides the bulk of the win on the chat list.
+      setVisible(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            setVisible(true);
+            observer.disconnect();
+            break;
+          }
+        }
+      },
+      // 200px rootMargin so the upgrade fires just before the bubble
+      // scrolls into view; users almost never see the placeholder.
+      { rootMargin: "200px" }
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [visible]);
+
+  if (visible) {
+    return <MarkdownContent {...props} />;
+  }
+
+  // Placeholder: raw text in a pre block. Reserves a similar vertical
+  // footprint to the rendered markdown so scroll position stays stable
+  // when the upgrade swaps the children.
+  return (
+    <div
+      ref={ref}
+      className={cn("prose-glass text-sm [&_p]:my-2", props.className)}
+    >
+      <pre className="whitespace-pre-wrap break-words text-sm leading-relaxed text-white/80">
+        {props.content}
+      </pre>
+    </div>
+  );
+}

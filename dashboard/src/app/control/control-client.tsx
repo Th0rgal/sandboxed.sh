@@ -4,7 +4,7 @@ import type React from "react";
 import { useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo, startTransition } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
-import { MarkdownContent } from "@/components/markdown-content";
+import { MarkdownContent, LazyMarkdownContent } from "@/components/markdown-content";
 import { StreamingMarkdown } from "@/components/streaming-markdown";
 import {
   EnhancedInput,
@@ -3163,7 +3163,9 @@ const ChatItemRow = memo(function ChatItemRow({
             <span>•</span>
             <span className="text-white/30">{formatTime(item.timestamp)}</span>
           </div>
-          <MarkdownContent
+          {/* P2-#13: lazy markdown — bubbles render as raw text until they
+              scroll near the viewport, then upgrade to full markdown. */}
+          <LazyMarkdownContent
             content={item.content}
             basePath={basePath}
             workspaceId={workspaceId}
