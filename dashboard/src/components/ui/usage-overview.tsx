@@ -31,7 +31,6 @@ import {
 } from '@/lib/api';
 import { cn, formatCents } from '@/lib/utils';
 import {
-  Activity,
   ArrowDownToLine,
   ArrowUpFromLine,
   Calendar,
@@ -174,7 +173,7 @@ function CostSparkline({
 
   return (
     <div
-      className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4"
+      className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4 h-full flex flex-col"
       data-testid="usage-sparkline"
     >
       <div className="flex items-center justify-between mb-3">
@@ -187,8 +186,11 @@ function CostSparkline({
         </div>
       </div>
 
-      <div className="h-28 flex items-end gap-[2px]" data-testid="usage-sparkline-bars">
-        {series.map((d, idx) => {
+      <div
+        className="flex-1 min-h-[7rem] flex items-end gap-[2px]"
+        data-testid="usage-sparkline-bars"
+      >
+        {series.map((d) => {
           const height = maxCost > 0 ? (d.cost_cents / maxCost) * 100 : 0;
           const date = new Date(d.day + 'T00:00:00Z');
           const dow = date.getUTCDay();
@@ -218,7 +220,7 @@ function CostSparkline({
         })}
       </div>
       {/* Axis labels under the bars */}
-      <div className="mt-1 flex gap-[2px] text-[9px] text-white/30 tabular-nums">
+      <div className="mt-1.5 flex gap-[2px] text-[9px] text-white/30 tabular-nums">
         {series.map((d, idx) => {
           const showLabel =
             idx === 0 || idx === series.length - 1 || idx % labelStep === 0;
@@ -268,9 +270,27 @@ function ProviderDistribution({ models }: { models: ModelUsageSummary[] }) {
     };
   }, [models]);
 
+  // Collapse the long tail into a single "Other" row so the legend never
+  // dominates the layout when there are many tiny providers (<1% each).
+  // The stacked bar above still shows the true distribution.
+  const TOP_N = 5;
+  const display = useMemo(() => {
+    if (entries.length <= TOP_N + 1) return entries;
+    const top = entries.slice(0, TOP_N);
+    const rest = entries.slice(TOP_N);
+    const restTotal = rest.reduce((s, e) => s + e.value, 0);
+    if (restTotal === 0) return top;
+    return [
+      ...top,
+      { provider: '__other__', value: restTotal, count: rest.length } as
+        | { provider: string; value: number }
+        | { provider: string; value: number; count: number },
+    ];
+  }, [entries]);
+
   return (
     <div
-      className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4 flex flex-col"
+      className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4 h-full flex flex-col"
       data-testid="usage-distribution"
     >
       <div className="flex items-center justify-between mb-3">
@@ -286,7 +306,7 @@ function ProviderDistribution({ models }: { models: ModelUsageSummary[] }) {
         </div>
       ) : (
         <>
-          {/* Stacked bar */}
+          {/* Stacked bar — keep the long-tail providers visible here */}
           <div className="flex h-1.5 overflow-hidden rounded-full bg-white/[0.04]">
             {entries.map(({ provider, value }) => {
               const pct = (value / total) * 100;
@@ -303,22 +323,35 @@ function ProviderDistribution({ models }: { models: ModelUsageSummary[] }) {
 
           {/* Legend rows */}
           <div className="mt-3 flex-1 space-y-1.5 min-h-0">
-            {entries.map(({ provider, value }) => {
-              const pct = (value / total) * 100;
+            {display.map((row) => {
+              const pct = (row.value / total) * 100;
+              const isOther = row.provider === '__other__';
+              const count = (row as { count?: number }).count;
               return (
                 <div
-                  key={provider}
+                  key={row.provider}
                   className="grid grid-cols-[minmax(0,1fr)_3.5rem_2.25rem] items-center gap-2 text-[11px]"
                 >
                   <span className="flex items-center gap-2 text-white/65 truncate">
                     <span
-                      className="h-1.5 w-1.5 flex-shrink-0 rounded-sm"
-                      style={{ backgroundColor: providerColor(provider) }}
+                      className={cn(
+                        'h-1.5 w-1.5 flex-shrink-0 rounded-sm',
+                        isOther && 'opacity-30'
+                      )}
+                      style={
+                        isOther
+                          ? { backgroundColor: '#a1a1aa' }
+                          : { backgroundColor: providerColor(row.provider) }
+                      }
                     />
-                    <span className="truncate">{provider}</span>
+                    <span className="truncate">
+                      {isOther
+                        ? `Other${count ? ` (${count})` : ''}`
+                        : row.provider}
+                    </span>
                   </span>
                   <span className="text-right font-mono text-white/55 tabular-nums">
-                    {unit === 'cost' ? formatCents(value) : fmtCompact(value)}
+                    {unit === 'cost' ? formatCents(row.value) : fmtCompact(row.value)}
                   </span>
                   <span className="text-right font-mono text-white/30 tabular-nums">
                     {pct.toFixed(pct < 10 ? 1 : 0)}%
@@ -606,8 +639,8 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
             />
           </div>
 
-          {/* Sparkline + provider distribution */}
-          <div className="grid gap-3 md:grid-cols-3">
+          {/* Sparkline + provider distribution — equal-height row */}
+          <div className="grid gap-3 md:grid-cols-3 md:items-stretch">
             <div className="md:col-span-2">
               <CostSparkline byDay={data.by_day} windowKey={window} />
             </div>
@@ -618,15 +651,6 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
 
           {/* Model table */}
           <ModelTable models={data.by_model} totalRequests={totals!.requests} />
-
-          {/* Footer note */}
-          <div className="flex items-center gap-1.5 text-[10px] text-white/30">
-            <Activity className="h-3 w-3" />
-            <span>
-              Aggregated from {fmtCompact(totals!.requests)} assistant calls
-              {data.since ? ` since ${new Date(data.since).toLocaleDateString()}` : ''}.
-            </span>
-          </div>
         </>
       )}
     </div>
