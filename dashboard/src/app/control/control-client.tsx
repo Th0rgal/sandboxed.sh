@@ -16,6 +16,7 @@ import { MissionAutomationsDialog } from "@/components/mission-automations-dialo
 import { PerfOverlay } from "@/components/perf-overlay";
 import { perfBus } from "@/lib/perf-bus";
 import { isStreamContinuation } from "@/lib/stream-continuation";
+import { NowTickProvider, useNow } from "@/lib/now-tick";
 import { MissionDebugStats } from "./MissionDebugStats";
 import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
@@ -1542,14 +1543,13 @@ function ThinkingGroupItem({
     ? Math.max(...items.map(item => item.endTime || item.startTime))
     : undefined;
 
-  // Update elapsed time while any thinking is active
+  // P1-#7: derive elapsed from the shared NowTickProvider so we have
+  // one timer for the whole page instead of one per visible item.
+  const nowMs = useNow();
   useEffect(() => {
     if (!hasActiveItem) return;
-    const interval = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - startTime) / 1000));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [hasActiveItem, startTime]);
+    setElapsedSeconds(Math.max(0, Math.floor((nowMs - startTime) / 1000)));
+  }, [hasActiveItem, startTime, nowMs]);
 
   // Auto-collapse when all thinking is done
   useEffect(() => {
@@ -1689,16 +1689,12 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
   workspaceId?: string;
   missionId?: string;
 }) {
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  // P1-#7: shared NowTickProvider drives elapsed for all items.
+  const nowMs = useNow();
+  const elapsedSeconds = item.done
+    ? Math.max(0, Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000))
+    : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
   const [isExpanded, setIsExpanded] = useState(false);
-
-  useEffect(() => {
-    if (item.done) return;
-    const interval = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - item.startTime) / 1000));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [item.done, item.startTime]);
 
   const formatDuration = (seconds: number) => {
     if (seconds <= 0) return "<1s";
@@ -2370,8 +2366,14 @@ const SubagentToolItem = memo(function SubagentToolItem({
   highlighted?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const isDone = item.result !== undefined;
+  // P1-#7: derived from the shared NowTickProvider instead of a per-row
+  // setInterval. With dozens of visible tool calls this was the biggest
+  // contributor to the timer storm seen in devtools.
+  const nowMs = useNow();
+  const elapsedSeconds = isDone
+    ? Math.max(0, Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000))
+    : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
 
   // Memoize subagent info extraction
   const { agentName, description, prompt } = useMemo(
@@ -2384,15 +2386,6 @@ const SubagentToolItem = memo(function SubagentToolItem({
     () => (isDone ? parseSubagentResult(item.result) : { success: false, cancelled: false, summary: null }),
     [isDone, item.result]
   );
-
-  // Update elapsed time while tool is running
-  useEffect(() => {
-    if (isDone) return;
-    const interval = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - item.startTime) / 1000));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [isDone, item.startTime]);
 
   const formatDuration = (seconds: number) => {
     // Handle negative or zero durations
@@ -2723,17 +2716,12 @@ const ToolCallItem = memo(function ToolCallItem({
   missionId?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const isDone = item.result !== undefined;
-
-  // Update elapsed time while tool is running
-  useEffect(() => {
-    if (isDone) return;
-    const interval = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - item.startTime) / 1000));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [isDone, item.startTime]);
+  // P1-#7: shared NowTickProvider drives the "elapsed" pill.
+  const nowMs = useNow();
+  const elapsedSeconds = isDone
+    ? Math.max(0, Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000))
+    : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
 
   const formatDuration = (seconds: number) => {
     if (seconds <= 0) return "<1s";
@@ -8621,6 +8609,7 @@ export default function ControlClient() {
   }, [activeMission?.id]);
 
   return (
+    <NowTickProvider>
     <div className="flex h-screen flex-col p-6">
       {/* Always-on debug overlay so any OOM-style crash leaves a trail
           we can reconstruct from sessionStorage after reload. Cheap:
@@ -9890,5 +9879,6 @@ export default function ControlClient() {
         )}
       </div>
     </div>
+    </NowTickProvider>
   );
 }
