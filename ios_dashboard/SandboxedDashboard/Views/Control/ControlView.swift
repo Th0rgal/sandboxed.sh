@@ -94,6 +94,7 @@ struct ControlView: View {
     // Thoughts panel state
     @State private var showThoughts = false
     @State private var textOpBuffers: [String: String] = [:]
+    @State private var deferredTraceLoads: Set<String> = []
 
     // Tool grouping state - track which groups are expanded
     @State private var expandedToolGroups: Set<String> = []
@@ -1292,6 +1293,7 @@ struct ControlView: View {
     }
 
     private static let maxCachedMissions = 10  // Limit cache size
+    private static let maxCachedEventsPerMission = 1_500
     /// Legacy key prefix used when mission blobs lived in UserDefaults. Kept
     /// only so the one-time migration below can purge them on first launch
     /// after upgrade — every payload bloats cfprefsd's in-memory plist.
@@ -1327,7 +1329,11 @@ struct ControlView: View {
     // event payload no longer freezes the chat thread while it serialises.
     private func cacheMissionWithEvents(_ mission: Mission, events: [StoredEvent]) {
         let missionId = mission.id
-        let cacheData = CachedMissionData(mission: mission, events: events, cachedAt: Date())
+        let cacheData = CachedMissionData(
+            mission: mission,
+            events: Self.trimEventsForCache(Self.compactEventsForCache(events)),
+            cachedAt: Date()
+        )
 
         // LRU key list still lives in UserDefaults — it's a tiny string array
         // so it's free, and keeping it there means the LRU survives Caches
@@ -1360,6 +1366,104 @@ struct ControlView: View {
                 try? Self.writeCachedMissionFile(missionId: missionId, data: encoded)
             }
         }
+    }
+
+    private static func compactEventsForCache(_ events: [StoredEvent]) -> [StoredEvent] {
+        let sorted = events.sorted { lhs, rhs in
+            if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+            if lhs.timestamp != rhs.timestamp { return lhs.timestamp < rhs.timestamp }
+            return lhs.id < rhs.id
+        }
+
+        var compacted: [StoredEvent] = []
+        var thinkingFirst: StoredEvent?
+        var thinkingLatest: StoredEvent?
+        var thinkingContent = ""
+
+        func flushThinking() {
+            guard let first = thinkingFirst, let latest = thinkingLatest else { return }
+            compacted.append(
+                StoredEvent(
+                    id: first.id,
+                    missionId: first.missionId,
+                    sequence: first.sequence,
+                    eventType: first.eventType,
+                    timestamp: latest.timestamp,
+                    eventId: first.eventId,
+                    toolCallId: first.toolCallId,
+                    toolName: first.toolName,
+                    content: thinkingContent,
+                    metadata: first.metadata.merging(latest.metadata) { _, latest in latest }
+                )
+            )
+            thinkingFirst = nil
+            thinkingLatest = nil
+            thinkingContent = ""
+        }
+
+        for event in sorted {
+            guard event.eventType == "thinking" else {
+                flushThinking()
+                compacted.append(event)
+                continue
+            }
+
+            let content = event.content
+            let done = event.metadata["done"]?.value as? Bool == true
+            guard let _ = thinkingFirst else {
+                thinkingFirst = event
+                thinkingLatest = event
+                thinkingContent = content
+                if done { flushThinking() }
+                continue
+            }
+
+            if !Self.isStreamContinuation(content, previous: thinkingContent) {
+                flushThinking()
+                thinkingFirst = event
+                thinkingLatest = event
+                thinkingContent = content
+                if done { flushThinking() }
+                continue
+            }
+
+            thinkingLatest = event
+            if content.count > thinkingContent.count {
+                thinkingContent = content
+            }
+            if done { flushThinking() }
+        }
+
+        flushThinking()
+        return compacted
+    }
+
+    private static func trimEventsForCache(_ events: [StoredEvent]) -> [StoredEvent] {
+        guard events.count > maxCachedEventsPerMission else { return events }
+
+        let protectedTypes: Set<String> = ["thinking", "text_delta", "text_op"]
+        let protectedEvents = events.filter { protectedTypes.contains($0.eventType) }
+        let protectedSlice = protectedEvents.count > maxCachedEventsPerMission
+            ? Array(protectedEvents.suffix(maxCachedEventsPerMission))
+            : protectedEvents
+        var keep = Set<Int64>(protectedSlice.map(\.sequence))
+
+        var remaining = maxCachedEventsPerMission - keep.count
+        if remaining > 0 {
+            for event in events.reversed() where !keep.contains(event.sequence) {
+                keep.insert(event.sequence)
+                remaining -= 1
+                if remaining == 0 { break }
+            }
+        }
+
+        return events.filter { keep.contains($0.sequence) }
+    }
+
+    private static func isStreamContinuation(_ content: String, previous: String) -> Bool {
+        if previous.isEmpty || content.isEmpty { return true }
+        if content.hasPrefix(previous) || previous.hasPrefix(content) { return true }
+        return content.commonPrefix(with: previous).count >= min(content.count, previous.count) / 2
     }
 
     private func loadCachedMissionData(_ missionId: String) -> CachedMissionData? {
@@ -1724,11 +1828,14 @@ struct ControlView: View {
                         missionMaxSeq[id] = transcript.latestSequence
                     }
                     cacheMissionWithEvents(mission, events: events)
-                    Task { [api] in
-                        if let trace = try? await api.getMissionTraceWithMeta(id: id, limit: Self.initialEventLimit, sinceSeq: 0),
-                           !trace.events.isEmpty {
+                    if !deferredTraceLoads.contains(id) {
+                        deferredTraceLoads.insert(id)
+                        Task { [api] in
+                            let trace = try? await api.getMissionTraceWithMeta(id: id, limit: Self.initialEventLimit, sinceSeq: 0)
                             await MainActor.run {
+                                deferredTraceLoads.remove(id)
                                 guard fetchingMissionId == id || viewingMissionId == id else { return }
+                                guard let trace, !trace.events.isEmpty else { return }
                                 // Deduplicate by sequence — transcript and
                                 // trace endpoints can overlap on shared
                                 // sequence numbers (the web client does the
@@ -4251,18 +4358,15 @@ private struct ThoughtsSheet: View {
         messages.filter { $0.isThinking }
     }
 
-    /// Active (in-progress) thoughts
-    private var activeThoughts: [ChatMessage] {
-        thinkingMessages.filter { !$0.thinkingDone }
-    }
-
-    /// Completed thoughts, deduplicated by content
-    private var completedThoughts: [ChatMessage] {
+    /// Stable, chronological thought rows. Completed rows are deduplicated,
+    /// but they do not move between separate active/completed sections when
+    /// streaming finishes.
+    private var visibleThoughts: [ChatMessage] {
         var seen = Set<String>()
         return thinkingMessages.filter { msg in
-            guard msg.thinkingDone else { return false }
             let trimmed = msg.content.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return false }
+            guard msg.thinkingDone else { return true }
             guard !seen.contains(trimmed) else { return false }
             seen.insert(trimmed)
             return true
@@ -4270,12 +4374,12 @@ private struct ThoughtsSheet: View {
     }
 
     private var hasActiveThinking: Bool {
-        !activeThoughts.isEmpty
+        visibleThoughts.contains { !$0.thinkingDone }
     }
 
     /// Count aligned with what is actually rendered in the sheet.
     private var visibleThoughtCount: Int {
-        activeThoughts.count + completedThoughts.count
+        visibleThoughts.count
     }
 
     private var hasVisibleThoughts: Bool {
@@ -4294,20 +4398,8 @@ private struct ThoughtsSheet: View {
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 14) {
-                            if !activeThoughts.isEmpty {
-                                ThoughtSection(title: "Thinking Now", icon: "brain") {
-                                    ForEach(activeThoughts) { msg in
-                                        ThoughtTimelineRow(message: msg, emphasize: true)
-                                    }
-                                }
-                            }
-
-                            if !completedThoughts.isEmpty {
-                                ThoughtSection(title: "Recent Thoughts", icon: "clock.arrow.circlepath") {
-                                    ForEach(completedThoughts.reversed()) { msg in
-                                        ThoughtTimelineRow(message: msg, emphasize: false)
-                                    }
-                                }
+                            ForEach(visibleThoughts) { msg in
+                                ThoughtTimelineRow(message: msg, emphasize: !msg.thinkingDone)
                             }
                         }
                         .padding()
@@ -4335,30 +4427,6 @@ private struct ThoughtsSheet: View {
                 }
             }
         }
-    }
-}
-
-private struct ThoughtSection<Content: View>: View {
-    let title: String
-    let icon: String
-    @ViewBuilder let content: () -> Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(.caption)
-                    .foregroundStyle(Theme.textSecondary)
-                Text(title)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Theme.textSecondary)
-            }
-
-            LazyVStack(spacing: 10) {
-                content()
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
