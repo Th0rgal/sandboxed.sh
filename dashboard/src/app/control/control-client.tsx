@@ -8715,7 +8715,7 @@ export default function ControlClient() {
     if (childMissions.length > 0 || hasInMissionSubagents) {
       setShowWorkerPanel(true);
     }
-  }, [activeMission?.id, childMissions.length, hasInMissionSubagents]);
+  }, [currentMission?.id, childMissions.length, hasInMissionSubagents]);
 
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
