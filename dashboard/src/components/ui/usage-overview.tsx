@@ -20,7 +20,7 @@
  * the selected window so bars always fill the chart even on sparse data.
  */
 
-import { useMemo, useState, useRef, useCallback } from 'react';
+import { useMemo, useState, useRef, useCallback, useId } from 'react';
 import useSWR from 'swr';
 import {
   getUsageSummary,
@@ -99,7 +99,7 @@ function buildSeries(
   const hourMap = new Map(byHour.map((h) => [h.hour, h]));
   const now = new Date();
 
-  if (windowKey === '24h' && byHour.length > 0) {
+  if (windowKey === '24h') {
     const out: ChartPoint[] = [];
     for (let i = 23; i >= 0; i--) {
       const d = new Date(now);
@@ -135,9 +135,8 @@ function buildSeries(
     return { points: out, granularity: 'hour' };
   }
 
-  // Daily granularity for 24h/7d fallback, 30d, all.
-  const count =
-    windowKey === '24h' ? 1 : windowKey === '7d' ? 7 : windowKey === '30d' ? 30 : 60;
+  // Daily granularity for 7d fallback, 30d, all.
+  const count = windowKey === '7d' ? 7 : windowKey === '30d' ? 30 : 60;
   if (windowKey === 'all' && byDay.length > 0) {
     const slice = byDay.slice(-count);
     return {
@@ -271,6 +270,7 @@ function CostAreaChart({
     [points]
   );
   const rangeLabel = windowKey === 'all' ? 'All' : windowKey;
+  const fillGradientId = `usage-fill-${useId().replace(/:/g, '')}`;
 
   // Internal SVG coordinates; preserveAspectRatio="none" stretches them.
   const W = 600;
@@ -365,7 +365,7 @@ function CostAreaChart({
           onMouseLeave={onLeave}
         >
           <defs>
-            <linearGradient id="usage-fill" x1="0" y1="0" x2="0" y2="1">
+            <linearGradient id={fillGradientId} x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="rgb(99,102,241)" stopOpacity="0.45" />
               <stop offset="100%" stopColor="rgb(99,102,241)" stopOpacity="0" />
             </linearGradient>
@@ -386,7 +386,7 @@ function CostAreaChart({
 
           {maxCost > 0 && (
             <>
-              <path d={fillPath} fill="url(#usage-fill)" />
+              <path d={fillPath} fill={`url(#${fillGradientId})`} />
               <path
                 d={linePath}
                 fill="none"
