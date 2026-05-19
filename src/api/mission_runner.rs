@@ -10079,6 +10079,33 @@ async fn sync_grok_oauth_auth_file(
         return Ok(false);
     }
 
+    let source_expires_at = grok_auth_file_expires_at(&auth_json);
+    let existing_output = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &[
+                "-lc".to_string(),
+                "test -s \"${HOME:-/root}/.grok/auth.json\" && cat \"${HOME:-/root}/.grok/auth.json\""
+                    .to_string(),
+            ],
+            HashMap::new(),
+        )
+        .await
+        .map_err(|e| format!("Failed to inspect workspace Grok auth file: {}", e))?;
+    if existing_output.status.success() {
+        let existing_json = String::from_utf8_lossy(&existing_output.stdout);
+        let existing_expires_at = grok_auth_file_expires_at(&existing_json);
+        if existing_expires_at >= source_expires_at {
+            tracing::debug!(
+                source_expires_at,
+                existing_expires_at,
+                "Skipping Grok auth sync because workspace auth is at least as fresh"
+            );
+            return Ok(false);
+        }
+    }
+
     let encoded = {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(auth_json.as_bytes())
@@ -10114,6 +10141,22 @@ async fn sync_grok_oauth_auth_file(
             stdout.trim()
         ))
     }
+}
+
+fn grok_auth_file_expires_at(contents: &str) -> i64 {
+    const GROK_OAUTH_CLIENT_KEY: &str = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828";
+
+    serde_json::from_str::<serde_json::Value>(contents)
+        .ok()
+        .and_then(|auth| auth.get(GROK_OAUTH_CLIENT_KEY).cloned())
+        .and_then(|entry| {
+            entry
+                .get("expires_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp_millis())
+        })
+        .unwrap_or(0)
 }
 
 /// Result of a backend preflight check
