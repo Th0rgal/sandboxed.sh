@@ -12784,6 +12784,40 @@ fn grok_event_is_error(value: &serde_json::Value) -> bool {
         || value.get("error").is_some()
 }
 
+/// P3-#21 text_delta rate limiter.
+///
+/// Streaming backends (grok, codex) emit a fresh cumulative-buffer
+/// TextDelta on every token. With 100+ tokens/sec the SSE channel and
+/// every subscribed client pay the serialization + send cost for each
+/// even though the dashboard rAF-coalesces them into one render per
+/// frame anyway. This coalescer enforces a minimum 50ms gap between
+/// successful emits per turn; intermediate updates are dropped because
+/// the next emit will carry their content (cumulative semantics).
+///
+/// Caller must perform a final unconditional emit after the loop to
+/// guarantee the last buffer state reaches the dashboard.
+struct TextDeltaCoalescer {
+    last_emit: Option<std::time::Instant>,
+}
+
+impl TextDeltaCoalescer {
+    fn new() -> Self {
+        Self { last_emit: None }
+    }
+
+    fn should_emit(&mut self) -> bool {
+        const MIN_GAP: std::time::Duration = std::time::Duration::from_millis(50);
+        let now = std::time::Instant::now();
+        match self.last_emit {
+            Some(prev) if now.duration_since(prev) < MIN_GAP => false,
+            _ => {
+                self.last_emit = Some(now);
+                true
+            }
+        }
+    }
+}
+
 /// Execute a turn using the Grok Build CLI backend.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_grok_turn(
@@ -12898,6 +12932,7 @@ pub async fn run_grok_turn(
     let mut had_error = false;
     let mut model_used = model.map(str::to_string);
     let mut last_streamed_len = 0usize;
+    let mut text_delta_coalescer = TextDeltaCoalescer::new();
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
 
@@ -12960,7 +12995,18 @@ pub async fn run_grok_turn(
                                 } else {
                                     final_result = text;
                                 }
-                                if final_result.len() > last_streamed_len {
+                                // P3-#21: rate-limit TextDelta emissions
+                                // to at most one per ~50ms per turn. Grok
+                                // bursts can hit ~100 tokens/sec; without
+                                // this every token becomes its own SSE
+                                // frame even though the dashboard rAF
+                                // coalesces them into a single render.
+                                // The cumulative-buffer semantics mean
+                                // skipping intermediate frames loses no
+                                // content — each emit replaces the prior.
+                                if final_result.len() > last_streamed_len
+                                    && text_delta_coalescer.should_emit()
+                                {
                                     last_streamed_len = final_result.len();
                                     let _ = events_tx.send(AgentEvent::TextDelta {
                                         content: final_result.clone(),
@@ -12985,6 +13031,19 @@ pub async fn run_grok_turn(
     if let Some(handle) = stderr_handle {
         let _ = handle.await;
     }
+
+    // P3-#21 final flush: the coalescer may have dropped the very last
+    // delta within the trailing 50ms window. Always emit one more
+    // TextDelta carrying the full buffer so the dashboard sees the
+    // closing tokens; the AssistantMessage that follows will replace it.
+    if final_result.len() > last_streamed_len {
+        let _ = events_tx.send(AgentEvent::TextDelta {
+            content: final_result.clone(),
+            mission_id: Some(mission_id),
+        });
+        last_streamed_len = final_result.len();
+    }
+    let _ = last_streamed_len; // silence "unused after final assignment"
 
     if final_result.trim().is_empty() {
         let stderr_content = stderr_capture.lock().await;
@@ -13490,6 +13549,8 @@ pub async fn run_codex_turn(
 
     // Process events until completion or cancellation
     let mut assistant_message = String::new();
+    let mut text_delta_coalescer = TextDeltaCoalescer::new();
+    let mut text_delta_pending = false;
     let mut success = false;
     let mut error_message: Option<String> = None;
     let mut pending_tools: std::collections::HashMap<String, String> =
@@ -13516,10 +13577,18 @@ pub async fn run_codex_turn(
                         // the currently active assistant message item. Replacing here avoids
                         // concatenating intermediate assistant updates into the final message.
                         assistant_message = content;
-                        let _ = events_tx.send(AgentEvent::TextDelta {
-                            content: assistant_message.clone(),
-                            mission_id: Some(mission_id),
-                        });
+                        // P3-#21: rate-limit to ≤1 emit per ~50ms. Skipped
+                        // deltas are not lost because the buffer is
+                        // cumulative — the next emit replaces it.
+                        if text_delta_coalescer.should_emit() {
+                            text_delta_pending = false;
+                            let _ = events_tx.send(AgentEvent::TextDelta {
+                                content: assistant_message.clone(),
+                                mission_id: Some(mission_id),
+                            });
+                        } else {
+                            text_delta_pending = true;
+                        }
                     }
                     ExecutionEvent::Thinking { content } => {
                         // Stream incrementally for real-time UI
@@ -13668,6 +13737,17 @@ pub async fn run_codex_turn(
                 break;
             }
         }
+    }
+
+    // P3-#21 final flush: ensure the closing delta the coalescer may
+    // have suppressed reaches the dashboard. AssistantMessage emits
+    // below will replace it, so this is purely a safety net for clients
+    // that render the streaming buffer ahead of completion.
+    if text_delta_pending {
+        let _ = events_tx.send(AgentEvent::TextDelta {
+            content: assistant_message.clone(),
+            mission_id: Some(mission_id),
+        });
     }
 
     if !thinking_emitted {
@@ -13998,6 +14078,9 @@ pub async fn run_gemini_turn(
     };
 
     // Process events until completion or cancellation
+    // Gemini emits incremental token deltas (not cumulative buffers),
+    // so it doesn't apply P3-#21 coalescing — skipping a delta there
+    // would drop content.
     let mut assistant_message = String::new();
     let mut success = false;
     let mut error_message: Option<String> = None;
