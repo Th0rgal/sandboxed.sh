@@ -5828,10 +5828,16 @@ pub fn run_claudecode_turn<'a>(
             // text/thinking-buffer fallbacks managed to recover. Surface that
             // partial work but mark the mission Interrupted/ServerShutdown
             // so the dashboard renders the resume affordance.
+            //
+            // Snapshot the cancel marker once — calling
+            // `cancel_or_shutdown_failure()` twice could pair "Mission
+            // cancelled" text with ServerShutdown (or vice versa) if a
+            // shutdown signal arrives between reads.
+            let cancel_marker = cancel_or_shutdown_failure();
             if final_result.trim().is_empty() {
-                final_result = cancel_or_shutdown_failure().output;
+                final_result = cancel_marker.output.clone();
             }
-            let cancel_reason = cancel_or_shutdown_failure()
+            let cancel_reason = cancel_marker
                 .terminal_reason
                 .unwrap_or(TerminalReason::Cancelled);
             AgentResult::failure(final_result, cost_cents).with_terminal_reason(cancel_reason)
@@ -13825,6 +13831,16 @@ pub async fn run_codex_turn(
         );
     }
 
+    // Snapshot the cancel marker (output + terminal_reason) once. The marker
+    // reads `is_shutdown_initiated()` internally, and a shutdown signal
+    // arriving between two reads could pair "Mission cancelled" text with a
+    // ServerShutdown reason (or vice versa) — TOCTOU race flagged by bugbot.
+    let cancel_marker = if cancelled {
+        Some(cancel_or_shutdown_failure())
+    } else {
+        None
+    };
+
     let mut final_message = if let Some(err) = error_message {
         err
     } else if !assistant_message.is_empty() {
@@ -13836,10 +13852,10 @@ pub async fn run_codex_turn(
         // dashboard's final-message slot matches what's already visible in
         // the thinking panel.
         thinking_text
-    } else if cancelled {
+    } else if let Some(marker) = cancel_marker.as_ref() {
         // Mid-turn cancellation with nothing accumulated — preserve the
         // historical "Mission cancelled" / shutdown text for the UI.
-        cancel_or_shutdown_failure().output
+        marker.output.clone()
     } else {
         "No response from Codex".to_string()
     };
@@ -13892,14 +13908,14 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
     let model_for_cost = resolved_model.as_deref();
     let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
 
-    let mut result = if cancelled {
+    let mut result = if let Some(marker) = cancel_marker {
         // Cancellation outranks success/error classification: keep the partial
         // assistant_message / thinking content as the visible final message
         // but mark the mission Interrupted (or ServerShutdown) so the
         // dashboard renders the resume affordance and not a fake completion.
-        let cancel_reason = cancel_or_shutdown_failure()
-            .terminal_reason
-            .unwrap_or(TerminalReason::Cancelled);
+        // Reusing the marker from the final-message picker keeps the
+        // text/reason pair consistent if shutdown fires mid-finalize.
+        let cancel_reason = marker.terminal_reason.unwrap_or(TerminalReason::Cancelled);
         AgentResult::failure(final_message, cost_cents).with_terminal_reason(cancel_reason)
     } else if success {
         AgentResult::success(final_message, cost_cents)
@@ -14299,14 +14315,22 @@ pub async fn run_gemini_turn(
         );
     }
 
+    // See run_codex_turn: snapshot the cancel marker once to keep the
+    // output/terminal_reason pair consistent if shutdown fires mid-finalize.
+    let cancel_marker = if cancelled {
+        Some(cancel_or_shutdown_failure())
+    } else {
+        None
+    };
+
     let final_message = if let Some(err) = error_message {
         err
     } else if !assistant_message.is_empty() {
         assistant_message
     } else if let Some(thinking_text) = thinking_for_fallback {
         thinking_text
-    } else if cancelled {
-        cancel_or_shutdown_failure().output
+    } else if let Some(marker) = cancel_marker.as_ref() {
+        marker.output.clone()
     } else {
         "No response from Gemini CLI".to_string()
     };
@@ -14321,10 +14345,8 @@ pub async fn run_gemini_turn(
     let model_for_cost = resolved_model.as_deref();
     let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
 
-    let mut result = if cancelled {
-        let cancel_reason = cancel_or_shutdown_failure()
-            .terminal_reason
-            .unwrap_or(TerminalReason::Cancelled);
+    let mut result = if let Some(marker) = cancel_marker {
+        let cancel_reason = marker.terminal_reason.unwrap_or(TerminalReason::Cancelled);
         AgentResult::failure(final_message, cost_cents).with_terminal_reason(cancel_reason)
     } else if success {
         AgentResult::success(final_message, cost_cents)

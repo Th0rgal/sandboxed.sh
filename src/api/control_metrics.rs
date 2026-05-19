@@ -217,7 +217,7 @@ impl ControlMetrics {
                 };
                 let mut entries: Vec<(uuid::Uuid, u64)> =
                     map.iter().map(|(k, v)| (*k, *v)).collect();
-                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
                 let top: Vec<TopMission> = entries
                     .into_iter()
                     .take(5)
