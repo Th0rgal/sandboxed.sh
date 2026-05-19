@@ -500,19 +500,19 @@ export default function ProvidersPage() {
         providerTypes={providerTypes}
       />
 
-      <div className="w-full max-w-xl">
-        <div className="mb-8">
+      <div className="w-full max-w-4xl">
+        <div className="mb-6">
           <h1 className="text-xl font-semibold text-white">AI Providers</h1>
           <p className="mt-1 text-sm text-white/50">
             Manage API keys and authentication
           </p>
         </div>
 
-        <div className="mb-4">
+        <div className="mb-6">
           <UsageOverview window={usageWindow} onWindowChange={setUsageWindow} />
         </div>
 
-        <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+        <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 max-w-xl mx-auto">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-3">
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-violet-500/10">

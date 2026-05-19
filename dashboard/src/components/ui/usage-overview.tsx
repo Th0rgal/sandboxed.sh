@@ -1,13 +1,23 @@
 'use client';
 
 /**
- * UsageOverview — usage summary card matching the design language of the
- * Analytics page (`/analytics`):
- *  - The same four-tile metric grid (icon · label · large mono value · sub),
- *  - A 14-day cost sparkline rendered with hand-rolled flex bars (no chart lib),
- *  - A thin provider-mix strip + per-model table.
+ * UsageOverview — compact, analytics-page-styled summary of AI usage.
  *
- * Data: `GET /api/ai/usage/summary?window=<window>`.
+ * Layout (top to bottom, all in one card stack):
+ *   1. Header row: title + window picker (24h / 7d / 30d / All).
+ *   2. Four metric tiles (Spend, Input, Output, Cache hit) on one row.
+ *   3. Two-column row: cost-over-time bar chart + provider mix legend.
+ *   4. Compact model table (rank, swatch + model, calls, tokens, spend, share).
+ *
+ * The visual tokens match `/analytics`:
+ *   - card: `bg-white/[0.02] border border-white/[0.06] rounded-xl`
+ *   - metric value: `text-2xl font-semibold font-mono tabular-nums`
+ *   - axis bar: indigo-500/50 with weekend opacity dim
+ *   - section label: `text-xs uppercase tracking-[0.08em] text-white/40`
+ *
+ * Data: `GET /api/ai/usage/summary?window=<window>` returns
+ * `{ totals, by_model, by_day }`. The sparkline aligns its day series to
+ * the selected window so bars always fill the chart even on sparse data.
  */
 
 import { useMemo } from 'react';
@@ -20,18 +30,22 @@ import {
   type UsageWindow,
 } from '@/lib/api';
 import { cn, formatCents } from '@/lib/utils';
-import { Activity, ArrowDownToLine, ArrowUpFromLine, Calendar, DollarSign, Database } from 'lucide-react';
+import {
+  Activity,
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  Calendar,
+  Database,
+  DollarSign,
+} from 'lucide-react';
 
 const WINDOWS: { id: UsageWindow; label: string }[] = [
   { id: '24h', label: '24h' },
   { id: '7d', label: '7d' },
   { id: '30d', label: '30d' },
-  { id: 'all', label: 'All time' },
+  { id: 'all', label: 'All' },
 ];
 
-/** Single hex per provider; reused for both the distribution bar and the
- * per-model swatch. Matches the analytics palette (semantic indigo for the
- * sparkline; one accent per provider for the strip). */
 const PROVIDER_COLOR: Record<string, string> = {
   anthropic: '#d97757',
   openai: '#10a37f',
@@ -59,6 +73,53 @@ function fmtCompact(n: number): string {
   return `${(n / 1_000_000_000).toFixed(1)}B`;
 }
 
+/** Number of bars to draw for each window. The data may have fewer days; we
+ * fill gaps with zero-height placeholders so the axis width is stable. */
+function daysForWindow(w: UsageWindow): number {
+  switch (w) {
+    case '24h':
+      return 7;
+    case '7d':
+      return 7;
+    case '30d':
+      return 30;
+    case 'all':
+    default:
+      return 30;
+  }
+}
+
+function buildDailySeries(
+  byDay: DailyUsage[],
+  windowKey: UsageWindow
+): { day: string; cost_cents: number; requests: number }[] {
+  const map = new Map(byDay.map((d) => [d.day, d]));
+  // For "all" we prefer to span the actual data range (latest 30) so we don't
+  // show 30 empty bars when there's only 10 days of history.
+  if (windowKey === 'all' && byDay.length > 0) {
+    return byDay.slice(-30).map((d) => ({
+      day: d.day,
+      cost_cents: d.cost_cents,
+      requests: d.requests,
+    }));
+  }
+  const count = daysForWindow(windowKey);
+  const series: { day: string; cost_cents: number; requests: number }[] = [];
+  const now = new Date();
+  for (let i = count - 1; i >= 0; i--) {
+    const d = new Date(now);
+    d.setUTCDate(now.getUTCDate() - i);
+    const key = d.toISOString().slice(0, 10);
+    const found = map.get(key);
+    series.push({
+      day: key,
+      cost_cents: found?.cost_cents ?? 0,
+      requests: found?.requests ?? 0,
+    });
+  }
+  return series;
+}
+
 // ─── Tiles ───────────────────────────────────────────────────────────────────
 
 function MetricTile({
@@ -74,47 +135,22 @@ function MetricTile({
 }) {
   return (
     <div
-      className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4"
+      className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-3.5"
       data-testid="usage-metric"
     >
-      <div className="flex items-center gap-2 mb-2">
+      <div className="flex items-center gap-2 mb-1.5">
         {icon}
-        <span className="text-xs text-white/50">{label}</span>
+        <span className="text-[11px] text-white/50">{label}</span>
       </div>
-      <div className="text-2xl font-semibold text-white font-mono tabular-nums">
+      <div className="text-xl font-semibold text-white font-mono tabular-nums leading-tight">
         {value}
       </div>
-      {sub && <div className="text-xs text-white/40 mt-1">{sub}</div>}
+      {sub && <div className="text-[11px] text-white/40 mt-0.5 truncate">{sub}</div>}
     </div>
   );
 }
 
-// ─── Sparkline / cost-over-time bar chart ────────────────────────────────────
-
-function buildDailySeries(
-  byDay: DailyUsage[],
-  windowKey: UsageWindow
-): { day: string; cost_cents: number; requests: number }[] {
-  // Build a contiguous series for visualisation: one entry per day in the
-  // selected window. Gaps in the data become 0-height bars so we always show
-  // a stable axis width.
-  const daysCount = windowKey === '24h' ? 14 : windowKey === '7d' ? 14 : windowKey === '30d' ? 30 : 30;
-  const map = new Map(byDay.map((d) => [d.day, d]));
-  const out: { day: string; cost_cents: number; requests: number }[] = [];
-  const now = new Date();
-  for (let i = daysCount - 1; i >= 0; i--) {
-    const d = new Date(now);
-    d.setUTCDate(now.getUTCDate() - i);
-    const key = d.toISOString().slice(0, 10);
-    const found = map.get(key);
-    out.push({
-      day: key,
-      cost_cents: found?.cost_cents ?? 0,
-      requests: found?.requests ?? 0,
-    });
-  }
-  return out;
-}
+// ─── Cost-over-time sparkline ────────────────────────────────────────────────
 
 function CostSparkline({
   byDay,
@@ -133,56 +169,63 @@ function CostSparkline({
     [series]
   );
 
+  // Show day labels every ~5 bars (plus first + last)
+  const labelStep = Math.max(1, Math.floor(series.length / 6));
+
   return (
     <div
       className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4"
       data-testid="usage-sparkline"
     >
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-sm font-medium text-white flex items-center gap-2">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2 text-sm font-medium text-white">
           <Calendar className="h-4 w-4 text-white/50" />
-          Cost over time
-        </h2>
-        <div className="font-mono text-xs text-white/40 tabular-nums">
-          {formatCents(totalCost)} · {series.length} days
+          <span>Cost over time</span>
+        </div>
+        <div className="font-mono text-[11px] text-white/40 tabular-nums">
+          {formatCents(totalCost)} · {series.length}d
         </div>
       </div>
 
-      <div className="h-48 flex items-end gap-1">
+      <div className="h-28 flex items-end gap-[2px]" data-testid="usage-sparkline-bars">
         {series.map((d, idx) => {
           const height = maxCost > 0 ? (d.cost_cents / maxCost) * 100 : 0;
           const date = new Date(d.day + 'T00:00:00Z');
           const dow = date.getUTCDay();
           const isWeekend = dow === 0 || dow === 6;
-          // Show a date label every ~5 days, plus first and last
-          const showLabel =
-            idx === 0 ||
-            idx === series.length - 1 ||
-            idx % 5 === 0;
+          const isEmpty = d.cost_cents === 0;
           return (
-            <div key={d.day} className="flex-1 flex flex-col items-center gap-1 min-w-0">
-              <div className="relative w-full flex flex-col items-center">
-                <div
-                  className={cn(
-                    'w-full rounded-t transition-all',
-                    d.cost_cents === 0
-                      ? 'bg-white/[0.04]'
-                      : isWeekend
-                      ? 'bg-indigo-500/30 hover:bg-indigo-500/60'
-                      : 'bg-indigo-500/50 hover:bg-indigo-500/70'
-                  )}
-                  style={{ height: `${Math.max(height, 2)}%` }}
-                  title={`${d.day}: ${formatCents(d.cost_cents)} · ${d.requests} req`}
-                />
-              </div>
-              <span
+            <div
+              key={d.day}
+              className="flex-1 flex flex-col items-center justify-end min-w-0 h-full"
+            >
+              <div
                 className={cn(
-                  'text-[9px] tabular-nums',
-                  showLabel ? 'text-white/30' : 'text-transparent'
+                  'w-full rounded-sm transition-colors',
+                  isEmpty
+                    ? 'bg-white/[0.05]'
+                    : isWeekend
+                    ? 'bg-indigo-500/30 hover:bg-indigo-500/60'
+                    : 'bg-indigo-500/55 hover:bg-indigo-500/80'
                 )}
-              >
-                {date.getUTCDate()}
-              </span>
+                style={{ height: `${Math.max(height, isEmpty ? 4 : 6)}%` }}
+                title={`${d.day} · ${formatCents(d.cost_cents)} · ${d.requests} req`}
+                data-testid="usage-sparkline-bar"
+                data-empty={isEmpty ? '1' : '0'}
+              />
+            </div>
+          );
+        })}
+      </div>
+      {/* Axis labels under the bars */}
+      <div className="mt-1 flex gap-[2px] text-[9px] text-white/30 tabular-nums">
+        {series.map((d, idx) => {
+          const showLabel =
+            idx === 0 || idx === series.length - 1 || idx % labelStep === 0;
+          const date = new Date(d.day + 'T00:00:00Z');
+          return (
+            <div key={d.day} className="flex-1 text-center">
+              {showLabel ? date.getUTCDate() : ' '}
             </div>
           );
         })}
@@ -191,9 +234,9 @@ function CostSparkline({
   );
 }
 
-// ─── Provider distribution strip ─────────────────────────────────────────────
+// ─── Provider distribution card ──────────────────────────────────────────────
 
-function ProviderStrip({ models }: { models: ModelUsageSummary[] }) {
+function ProviderDistribution({ models }: { models: ModelUsageSummary[] }) {
   const { entries, total, unit } = useMemo(() => {
     const byCost = new Map<string, number>();
     for (const m of models) {
@@ -225,59 +268,67 @@ function ProviderStrip({ models }: { models: ModelUsageSummary[] }) {
     };
   }, [models]);
 
-  if (total === 0) return null;
-
   return (
     <div
-      className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4"
+      className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4 flex flex-col"
       data-testid="usage-distribution"
     >
       <div className="flex items-center justify-between mb-3">
-        <h2 className="text-sm font-medium text-white">
-          By provider
-          <span className="ml-2 text-xs text-white/40">
-            {unit === 'cost' ? 'share of spend' : 'share of requests'}
-          </span>
-        </h2>
-        <span className="font-mono text-xs text-white/40 tabular-nums">
-          {entries.length} {entries.length === 1 ? 'provider' : 'providers'}
+        <div className="text-sm font-medium text-white">By provider</div>
+        <span className="font-mono text-[10px] text-white/40 tabular-nums">
+          {entries.length} · {unit === 'cost' ? 'spend' : 'requests'}
         </span>
       </div>
-      <div className="flex h-1.5 overflow-hidden rounded-full bg-white/[0.04] mb-3">
-        {entries.map(({ provider, value }) => {
-          const pct = (value / total) * 100;
-          return (
-            <div
-              key={provider}
-              className="h-full"
-              style={{ width: `${pct}%`, backgroundColor: providerColor(provider) }}
-              title={`${provider} — ${pct.toFixed(1)}%`}
-            />
-          );
-        })}
-      </div>
-      <div className="space-y-1.5">
-        {entries.map(({ provider, value }) => {
-          const pct = (value / total) * 100;
-          return (
-            <div key={provider} className="flex items-center justify-between text-xs">
-              <span className="flex items-center gap-2 text-white/65">
-                <span
-                  className="h-1.5 w-1.5 rounded-sm"
-                  style={{ backgroundColor: providerColor(provider) }}
+
+      {total === 0 ? (
+        <div className="flex-1 flex items-center justify-center text-[11px] text-white/30">
+          No data
+        </div>
+      ) : (
+        <>
+          {/* Stacked bar */}
+          <div className="flex h-1.5 overflow-hidden rounded-full bg-white/[0.04]">
+            {entries.map(({ provider, value }) => {
+              const pct = (value / total) * 100;
+              return (
+                <div
+                  key={provider}
+                  className="h-full"
+                  style={{ width: `${pct}%`, backgroundColor: providerColor(provider) }}
+                  title={`${provider} — ${pct.toFixed(1)}%`}
                 />
-                {provider}
-              </span>
-              <span className="font-mono text-white/45 tabular-nums">
-                {unit === 'cost' ? formatCents(value) : `${fmtCompact(value)} req`}
-                <span className="ml-2 text-white/30">
-                  {pct.toFixed(pct < 10 ? 1 : 0)}%
-                </span>
-              </span>
-            </div>
-          );
-        })}
-      </div>
+              );
+            })}
+          </div>
+
+          {/* Legend rows */}
+          <div className="mt-3 flex-1 space-y-1.5 min-h-0">
+            {entries.map(({ provider, value }) => {
+              const pct = (value / total) * 100;
+              return (
+                <div
+                  key={provider}
+                  className="grid grid-cols-[minmax(0,1fr)_3.5rem_2.25rem] items-center gap-2 text-[11px]"
+                >
+                  <span className="flex items-center gap-2 text-white/65 truncate">
+                    <span
+                      className="h-1.5 w-1.5 flex-shrink-0 rounded-sm"
+                      style={{ backgroundColor: providerColor(provider) }}
+                    />
+                    <span className="truncate">{provider}</span>
+                  </span>
+                  <span className="text-right font-mono text-white/55 tabular-nums">
+                    {unit === 'cost' ? formatCents(value) : fmtCompact(value)}
+                  </span>
+                  <span className="text-right font-mono text-white/30 tabular-nums">
+                    {pct.toFixed(pct < 10 ? 1 : 0)}%
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -304,7 +355,7 @@ function ModelTable({
   if (sorted.length === 0) {
     return (
       <div className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4">
-        <h2 className="text-sm font-medium text-white mb-3">By model</h2>
+        <div className="text-sm font-medium text-white mb-3">By model</div>
         <div className="rounded-md border border-white/[0.05] bg-white/[0.01] px-3 py-6 text-center text-xs text-white/40">
           No model usage recorded.
         </div>
@@ -318,13 +369,13 @@ function ModelTable({
       data-testid="usage-model-table"
     >
       <div className="flex items-center justify-between mb-3">
-        <h2 className="text-sm font-medium text-white">By model</h2>
-        <span className="font-mono text-xs text-white/40 tabular-nums">
+        <div className="text-sm font-medium text-white">By model</div>
+        <span className="font-mono text-[10px] text-white/40 tabular-nums">
           {models.length} {models.length === 1 ? 'model' : 'models'}
         </span>
       </div>
-      <div className="overflow-hidden rounded-md border border-white/[0.06]">
-        <div className="grid grid-cols-[1.25rem_minmax(0,1fr)_4.5rem_5.5rem_4.5rem_4rem] gap-x-3 border-b border-white/[0.06] bg-white/[0.02] px-3 py-2 text-[10px] uppercase tracking-[0.08em] text-white/40">
+      <div className="overflow-hidden rounded-md border border-white/[0.05]">
+        <div className="grid grid-cols-[1.5rem_minmax(0,1fr)_5rem_5.5rem_5rem_3.5rem] gap-x-3 border-b border-white/[0.05] bg-white/[0.02] px-3 py-1.5 text-[10px] uppercase tracking-[0.08em] text-white/40">
           <span>#</span>
           <span>Model</span>
           <span className="text-right">Calls</span>
@@ -341,11 +392,11 @@ function ModelTable({
           return (
             <div
               key={m.model + idx}
-              className="group relative grid grid-cols-[1.25rem_minmax(0,1fr)_4.5rem_5.5rem_4.5rem_4rem] gap-x-3 border-b border-white/[0.04] px-3 py-2 last:border-b-0 hover:bg-white/[0.015]"
+              className="group relative grid grid-cols-[1.5rem_minmax(0,1fr)_5rem_5.5rem_5rem_3.5rem] gap-x-3 border-b border-white/[0.04] px-3 py-1.5 last:border-b-0 hover:bg-white/[0.015]"
               data-testid="usage-model-row"
             >
               <div
-                className="pointer-events-none absolute inset-y-0 left-0 opacity-[0.08] transition-opacity group-hover:opacity-[0.14]"
+                className="pointer-events-none absolute inset-y-0 left-0 opacity-[0.07] transition-opacity group-hover:opacity-[0.13]"
                 style={{ width: `${barWidth}%`, backgroundColor: providerColor(m.provider) }}
               />
               <span className="relative font-mono text-[11px] text-white/35 tabular-nums">
@@ -356,7 +407,7 @@ function ModelTable({
                   className="h-1.5 w-1.5 flex-shrink-0 rounded-sm"
                   style={{ backgroundColor: providerColor(m.provider) }}
                 />
-                <span className="truncate text-[12px] text-white/80">
+                <span className="truncate text-[12px] text-white/85">
                   {m.model || 'unknown'}
                 </span>
               </div>
@@ -380,17 +431,70 @@ function ModelTable({
   );
 }
 
-// ─── Skeleton ─────────────────────────────────────────────────────────────────
+// ─── Skeleton ────────────────────────────────────────────────────────────────
 
-function MetricSkeleton() {
+function ShimmerBar({ className }: { className?: string }) {
   return (
-    <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-      {Array.from({ length: 4 }).map((_, i) => (
-        <div
-          key={i}
-          className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4 h-[100px] animate-pulse"
-        />
-      ))}
+    <div
+      className={cn(
+        'relative overflow-hidden rounded bg-white/[0.04]',
+        className
+      )}
+    >
+      <div className="absolute inset-0 -translate-x-full animate-[shimmer_1.6s_infinite] bg-gradient-to-r from-transparent via-white/[0.06] to-transparent" />
+    </div>
+  );
+}
+
+function UsageSkeleton() {
+  return (
+    <div className="space-y-3" data-testid="usage-skeleton">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div
+            key={i}
+            className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-3.5"
+          >
+            <ShimmerBar className="h-3 w-20" />
+            <ShimmerBar className="mt-2 h-6 w-24" />
+            <ShimmerBar className="mt-2 h-3 w-16" />
+          </div>
+        ))}
+      </div>
+      <div className="grid gap-3 md:grid-cols-3">
+        <div className="md:col-span-2 bg-white/[0.02] border border-white/[0.06] rounded-xl p-4">
+          <div className="flex items-center justify-between mb-3">
+            <ShimmerBar className="h-4 w-28" />
+            <ShimmerBar className="h-3 w-20" />
+          </div>
+          <div className="h-28 flex items-end gap-[2px]">
+            {Array.from({ length: 14 }).map((_, i) => (
+              <div
+                key={i}
+                className="flex-1 rounded-sm bg-white/[0.04]"
+                style={{ height: `${20 + ((i * 53) % 75)}%` }}
+              />
+            ))}
+          </div>
+        </div>
+        <div className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4">
+          <ShimmerBar className="h-4 w-24" />
+          <ShimmerBar className="mt-3 h-1.5 w-full rounded-full" />
+          <div className="mt-3 space-y-2">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <ShimmerBar key={i} className="h-3 w-full" />
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4">
+        <ShimmerBar className="h-4 w-20 mb-3" />
+        <div className="space-y-1.5">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <ShimmerBar key={i} className="h-5 w-full" />
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -417,18 +521,20 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
     return (totals.cache_read_tokens / denom) * 100;
   }, [totals]);
 
+  const hasData = !!data && (data.by_model.length > 0 || (totals?.requests ?? 0) > 0);
+
   return (
-    <div className="space-y-4" data-testid="usage-overview">
-      {/* Header: section title + window picker */}
+    <div className="space-y-3" data-testid="usage-overview">
+      {/* Header row */}
       <div className="flex items-center justify-between">
-        <div>
+        <div className="flex items-baseline gap-3 min-w-0">
           <h2 className="text-sm font-medium text-white">Usage</h2>
-          <p className="text-xs text-white/40">
+          <p className="text-xs text-white/40 truncate">
             Token consumption and cost across every mission
           </p>
         </div>
         <div
-          className="flex items-center gap-1 rounded-md border border-white/[0.06] bg-white/[0.02] p-0.5"
+          className="flex items-center gap-0.5 rounded-md border border-white/[0.06] bg-white/[0.02] p-0.5 flex-shrink-0"
           role="tablist"
           aria-label="Usage time window"
         >
@@ -441,10 +547,10 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
               aria-selected={window === w.id}
               data-testid={`usage-window-${w.id}`}
               className={cn(
-                'rounded px-2.5 py-1 text-[11px] font-medium transition-colors cursor-pointer',
+                'rounded px-2 py-0.5 text-[11px] font-medium transition-colors cursor-pointer',
                 window === w.id
                   ? 'bg-indigo-500/20 text-indigo-300'
-                  : 'text-white/50 hover:text-white/70'
+                  : 'text-white/50 hover:text-white/80'
               )}
             >
               {w.label}
@@ -458,8 +564,8 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
           Failed to load usage data.
         </div>
       ) : isLoading || !data ? (
-        <MetricSkeleton />
-      ) : data.by_model.length === 0 && totals?.requests === 0 ? (
+        <UsageSkeleton />
+      ) : !hasData ? (
         <div className="bg-white/[0.02] border border-white/[0.06] rounded-xl px-5 py-10 text-center">
           <div className="text-sm text-white/55">No usage recorded in this window.</div>
           <div className="mt-1 text-xs text-white/30">
@@ -468,22 +574,22 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
         </div>
       ) : (
         <>
-          {/* Top metric tiles — matches analytics page card style */}
+          {/* Top metric tiles */}
           <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
             <MetricTile
-              icon={<DollarSign className="h-4 w-4 text-emerald-400" />}
+              icon={<DollarSign className="h-3.5 w-3.5 text-emerald-400" />}
               label="Total spend"
               value={formatCents(totals!.cost_cents)}
               sub={`${fmtCompact(totals!.requests)} calls`}
             />
             <MetricTile
-              icon={<ArrowDownToLine className="h-4 w-4 text-indigo-400" />}
+              icon={<ArrowDownToLine className="h-3.5 w-3.5 text-indigo-400" />}
               label="Input tokens"
               value={fmtCompact(totals!.input_tokens)}
               sub={`+${fmtCompact(totals!.cache_read_tokens)} from cache`}
             />
             <MetricTile
-              icon={<ArrowUpFromLine className="h-4 w-4 text-amber-400" />}
+              icon={<ArrowUpFromLine className="h-3.5 w-3.5 text-amber-400" />}
               label="Output tokens"
               value={fmtCompact(totals!.output_tokens)}
               sub={
@@ -493,34 +599,32 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
               }
             />
             <MetricTile
-              icon={<Database className="h-4 w-4 text-cyan-400" />}
+              icon={<Database className="h-3.5 w-3.5 text-cyan-400" />}
               label="Cache hit rate"
               value={`${cacheHitRate.toFixed(0)}%`}
               sub={`${fmtCompact(totals!.cache_read_tokens)} tokens reused`}
             />
           </div>
 
-          {/* Two-column section: sparkline + provider strip */}
+          {/* Sparkline + provider distribution */}
           <div className="grid gap-3 md:grid-cols-3">
             <div className="md:col-span-2">
               <CostSparkline byDay={data.by_day} windowKey={window} />
             </div>
             <div className="md:col-span-1">
-              <ProviderStrip models={data.by_model} />
+              <ProviderDistribution models={data.by_model} />
             </div>
           </div>
 
-          {/* Full-width model table */}
+          {/* Model table */}
           <ModelTable models={data.by_model} totalRequests={totals!.requests} />
 
-          {/* Footer note — power-user hint */}
-          <div className="flex items-center gap-1.5 text-[11px] text-white/30">
+          {/* Footer note */}
+          <div className="flex items-center gap-1.5 text-[10px] text-white/30">
             <Activity className="h-3 w-3" />
             <span>
-              Aggregated from {fmtCompact(totals!.requests)} assistant calls.
-              {data.since && (
-                <> Since {new Date(data.since).toLocaleDateString()}.</>
-              )}
+              Aggregated from {fmtCompact(totals!.requests)} assistant calls
+              {data.since ? ` since ${new Date(data.since).toLocaleDateString()}` : ''}.
             </span>
           </div>
         </>
