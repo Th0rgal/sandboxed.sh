@@ -3186,6 +3186,17 @@ impl Default for FrontendToolHub {
 pub struct ControlState {
     pub cmd_tx: mpsc::Sender<ControlCommand>,
     pub events_tx: broadcast::Sender<AgentEvent>,
+    /// P3-#20: per-mission broadcast channels. A fan-out task subscribed
+    /// to `events_tx` mirrors each `AgentEvent` with a non-empty
+    /// `mission_id()` into the matching per-mission channel here.
+    /// SSE/WS clients with a mission filter subscribe directly to the
+    /// per-mission channel and avoid receiving — and filtering out —
+    /// events for missions they don't care about. The HashMap entry is
+    /// created lazily on first subscribe and never garbage-collected
+    /// because a long-running mission may have intermittent subscribers
+    /// over its lifetime; the cost per entry is one Sender<Arc<…>>.
+    pub mission_channels:
+        Arc<RwLock<std::collections::HashMap<Uuid, broadcast::Sender<AgentEvent>>>>,
     pub tool_hub: Arc<FrontendToolHub>,
     pub status: Arc<RwLock<ControlStatus>>,
     /// Current mission ID (if any) - primary mission in the old sequential model
@@ -5196,9 +5207,26 @@ pub async fn stream(
     axum::extract::Query(query): axum::extract::Query<StreamQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
-    let mut rx = control.events_tx.subscribe();
-    let stream_id = Uuid::new_v4();
     let mission_filter = query.mission;
+    // P3-#20: when a mission filter is set, subscribe to that mission's
+    // dedicated channel — the fan-out task in spawn_control_session
+    // mirrors events from the global tx into per-mission txs. Avoids
+    // every connected SSE client iterating all events for missions
+    // they don't care about. Status events are connection-scoped so we
+    // *also* subscribe to the global channel and merge both streams
+    // for the duration of the connection.
+    let mut rx = control.events_tx.subscribe();
+    let mut mission_rx = if let Some(mid) = mission_filter {
+        let mut map = control.mission_channels.write().await;
+        let entry = map.entry(mid).or_insert_with(|| {
+            let (tx, _rx) = broadcast::channel::<AgentEvent>(8192);
+            tx
+        });
+        Some(entry.subscribe())
+    } else {
+        None
+    };
+    let stream_id = Uuid::new_v4();
     tracing::info!(
         stream_id = %stream_id,
         user_id = %user.id,
@@ -5269,16 +5297,92 @@ pub async fn stream(
                         break;
                     }
                 }
+                // P3-#20: read from either the per-mission channel (when
+                // a mission filter is set) or the global broadcast (when
+                // it isn't). The select arm using `as_mut().unwrap()` is
+                // guarded by the `if mission_rx.is_some()` precondition
+                // so the unwrap can't panic; tokio::select treats false
+                // preconditions as disabled arms.
+                ev_result = async {
+                    match mission_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if mission_rx.is_some() => {
+                    match ev_result {
+                        Ok(ev) => {
+                            let mission_id = ev.mission_id();
+                            // Per-mission channel only carries events that
+                            // already match the filter (the fan-out task
+                            // is the gate); no further filtering needed.
+                            match &ev {
+                                AgentEvent::Thinking { .. } => {
+                                    tracing::trace!(
+                                        stream_id = %stream_id,
+                                        event = %ev.event_name(),
+                                        mission_id = ?mission_id,
+                                        "Control SSE event (per-mission)"
+                                    );
+                                }
+                                _ => {
+                                    tracing::debug!(
+                                        stream_id = %stream_id,
+                                        event = %ev.event_name(),
+                                        mission_id = ?mission_id,
+                                        "Control SSE event (per-mission)"
+                                    );
+                                }
+                            }
+                            match serde_json::to_string(&ev) {
+                                Ok(payload) => {
+                                    metrics.record_sse_chunk(payload.len());
+                                    metrics.record_broadcast(mission_id);
+                                    yield Ok(Event::default()
+                                        .event(ev.event_name())
+                                        .data(payload));
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        stream_id = %stream_id,
+                                        event = %ev.event_name(),
+                                        error = %e,
+                                        "Failed to serialize SSE event; dropping"
+                                    );
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            tracing::warn!(stream_id = %stream_id, dropped, "Per-mission SSE lagged");
+                            match Event::default()
+                                .event("stream_lagged")
+                                .json_data(serde_json::json!({ "dropped": dropped }))
+                            {
+                                Ok(sse) => yield Ok(sse),
+                                Err(_) => {}
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
                 result = rx.recv() => {
                     match result {
                         Ok(ev) => {
                             let mission_id = ev.mission_id();
-                            // Server-side mission filter (P1-#4). When the client
-                            // opened the stream with `?mission=<uuid>`, drop events
-                            // whose mission_id doesn't match. `Status` always passes
-                            // because it's the connection-keepalive and carries the
-                            // global running/queue state, not a per-mission update.
-                            if let Some(filter) = mission_filter {
+                            // When a per-mission channel is active, the
+                            // global arm only forwards connection-scoped
+                            // events (Status, FidoSignRequest). Per-mission
+                            // payloads are delivered above via the dedicated
+                            // channel.
+                            if mission_rx.is_some() {
+                                let is_status = matches!(&ev, AgentEvent::Status { .. });
+                                let is_fido = matches!(&ev, AgentEvent::FidoSignRequest { .. });
+                                if !is_status && !is_fido {
+                                    continue;
+                                }
+                            } else if let Some(filter) = mission_filter {
+                                // Fallback: per-mission channel not present
+                                // (e.g. first-event race). Apply the P1-#4
+                                // filter directly.
                                 let is_status = matches!(&ev, AgentEvent::Status { .. });
                                 if !is_status && mission_id != Some(filter) {
                                     continue;
@@ -5422,9 +5526,42 @@ fn spawn_control_session(
     let max_parallel =
         crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
 
+    let mission_channels: Arc<
+        RwLock<std::collections::HashMap<Uuid, broadcast::Sender<AgentEvent>>>,
+    > = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+    // P3-#20 fan-out task: subscribe to the global channel and mirror
+    // every event into its per-mission channel. Lives for the process
+    // lifetime; closes cleanly when the channel ends. Keeps the cost
+    // out of every send-site so existing `events_tx.send()` calls
+    // don't need to know about the per-mission split.
+    {
+        let mut rx = events_tx.subscribe();
+        let mission_channels = Arc::clone(&mission_channels);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        let Some(mid) = ev.mission_id() else { continue };
+                        let sender = {
+                            let map = mission_channels.read().await;
+                            map.get(&mid).cloned()
+                        };
+                        if let Some(sender) = sender {
+                            let _ = sender.send(ev);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     let state = ControlState {
         cmd_tx,
         events_tx: events_tx.clone(),
+        mission_channels,
         tool_hub: Arc::clone(&tool_hub),
         status: Arc::clone(&status),
         current_mission: Arc::clone(&current_mission),
