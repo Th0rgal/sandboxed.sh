@@ -873,6 +873,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         // P0-#3: in-process metrics for perf validation.
         .route("/api/control/metrics", get(control::get_control_metrics))
+        // P5-#25: client health-budget telemetry sink.
+        .route(
+            "/api/control/telemetry/perf",
+            post(control::post_control_telemetry_perf),
+        )
         // Memory endpoints
         .route("/api/runs", get(list_runs))
         .route("/api/runs/:id", get(get_run))
@@ -1357,7 +1362,11 @@ fn infer_provider_for_model(model: &str) -> Option<String> {
     let m = model.to_lowercase();
     if m.contains("claude") {
         Some("anthropic".to_string())
-    } else if m.contains("gpt") || m.starts_with("o3") || m.starts_with("o4") || m.contains("openai") {
+    } else if m.contains("gpt")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("openai")
+    {
         Some("openai".to_string())
     } else if m.contains("gemini") {
         Some("google".to_string())
@@ -1421,9 +1430,7 @@ async fn get_ai_usage_summary(
         totals.cache_creation_tokens = totals
             .cache_creation_tokens
             .saturating_add(r.cache_creation_tokens);
-        totals.cache_read_tokens = totals
-            .cache_read_tokens
-            .saturating_add(r.cache_read_tokens);
+        totals.cache_read_tokens = totals.cache_read_tokens.saturating_add(r.cache_read_tokens);
         totals.cost_cents = totals.cost_cents.saturating_add(r.cost_cents);
         let provider = if r.model.is_empty() {
             None

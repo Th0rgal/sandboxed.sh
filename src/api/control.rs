@@ -4976,6 +4976,18 @@ pub async fn get_control_metrics(
     Json(state.control_metrics.snapshot())
 }
 
+/// P5-#25: client telemetry sink. Dashboard POSTs here when its 5-second
+/// longtask budget breaches the 2s threshold so we can correlate freezes
+/// with mission shape (event count, heap).
+pub async fn post_control_telemetry_perf(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+    Json(report): Json<super::control_metrics::HealthReport>,
+) -> StatusCode {
+    state.control_metrics.record_health_report(report);
+    StatusCode::ACCEPTED
+}
+
 /// Request body for starting a mission in parallel.
 #[derive(Debug, Deserialize)]
 pub struct StartParallelRequest {

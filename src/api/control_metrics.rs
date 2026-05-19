@@ -41,6 +41,23 @@ pub struct ControlMetrics {
 
     broadcast_events_total: AtomicU64,
     broadcast_events_by_mission: Mutex<HashMap<uuid::Uuid, u64>>,
+
+    /// P5-#25 health budget reports — bounded ring of recent client
+    /// telemetry pings. A client posts when its 5-second longtask total
+    /// exceeds 2s; we keep the last 256 to surface in /metrics.
+    health_reports: Mutex<Vec<HealthReport>>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct HealthReport {
+    pub mission_id: Option<uuid::Uuid>,
+    pub longtask_total_ms: u64,
+    pub longtask_max_ms: u64,
+    pub event_count: u64,
+    pub heap_used_mb: f64,
+    pub dom_nodes: u64,
+    /// Client wall-clock when the budget breach was observed (ms since epoch).
+    pub at: u64,
 }
 
 struct RingSamples {
@@ -103,6 +120,18 @@ impl ControlMetrics {
             running_endpoint_hits: Mutex::new(Vec::with_capacity(128)),
             broadcast_events_total: AtomicU64::new(0),
             broadcast_events_by_mission: Mutex::new(HashMap::new()),
+            health_reports: Mutex::new(Vec::with_capacity(256)),
+        }
+    }
+
+    /// Record a client-side health budget breach (P5-#25). Caps the
+    /// in-memory ring at 256 entries so a runaway client can't OOM us.
+    pub fn record_health_report(&self, report: HealthReport) {
+        if let Ok(mut buf) = self.health_reports.lock() {
+            if buf.len() >= 256 {
+                buf.remove(0);
+            }
+            buf.push(report);
         }
     }
 
@@ -200,8 +229,15 @@ impl ControlMetrics {
 
         let uptime_secs = now.saturating_duration_since(self.start).as_secs();
 
+        let health_reports = self
+            .health_reports
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+
         MetricsSnapshot {
             uptime_secs,
+            health_reports,
             sse: SseStats {
                 chunks_total: self.sse_chunks_total.load(Ordering::Relaxed),
                 bytes_total: self.sse_bytes_total.load(Ordering::Relaxed),
@@ -229,6 +265,8 @@ pub struct MetricsSnapshot {
     pub sse: SseStats,
     pub endpoints: EndpointStats,
     pub broadcast: BroadcastStats,
+    /// Most recent client-side health budget breaches (P5-#25).
+    pub health_reports: Vec<HealthReport>,
 }
 
 #[derive(Debug, Serialize)]

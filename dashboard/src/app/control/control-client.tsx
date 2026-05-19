@@ -17,6 +17,7 @@ import { PerfOverlay } from "@/components/perf-overlay";
 import { perfBus } from "@/lib/perf-bus";
 import { isStreamContinuation } from "@/lib/stream-continuation";
 import { NowTickProvider, useNow } from "@/lib/now-tick";
+import { startHealthBudgetWatcher } from "@/lib/health-budget";
 import { MissionDebugStats } from "./MissionDebugStats";
 import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
@@ -5712,6 +5713,21 @@ export default function ControlClient() {
   }, []);
 
   useVisibilityPolling(refreshRunningMissions, { interval: 15_000 });
+
+  // P5-#25: client health-budget watcher. Posts to /telemetry/perf
+  // whenever the 5s longtask total breaches 2s. Cheap when healthy
+  // (no requests at all); refs avoid recreating the watcher on every
+  // mission/item change.
+  const itemsCountRef = useRef(0);
+  useEffect(() => {
+    itemsCountRef.current = items.length;
+  }, [items]);
+  useEffect(() => {
+    return startHealthBudgetWatcher(
+      () => viewingMissionIdRef.current,
+      () => itemsCountRef.current
+    );
+  }, []);
 
   const refreshRecentMissions = useCallback(async () => {
     try {
