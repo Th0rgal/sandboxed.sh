@@ -99,7 +99,7 @@ function buildSeries(
   const hourMap = new Map(byHour.map((h) => [h.hour, h]));
   const now = new Date();
 
-  if (windowKey === '24h') {
+  if (windowKey === '24h' && byHour.length > 0) {
     const out: ChartPoint[] = [];
     for (let i = 23; i >= 0; i--) {
       const d = new Date(now);
@@ -135,8 +135,9 @@ function buildSeries(
     return { points: out, granularity: 'hour' };
   }
 
-  // Daily granularity for 7d (fallback), 30d, all
-  const count = windowKey === '7d' ? 7 : windowKey === '30d' ? 30 : 60;
+  // Daily granularity for 24h/7d fallback, 30d, all.
+  const count =
+    windowKey === '24h' ? 1 : windowKey === '7d' ? 7 : windowKey === '30d' ? 30 : 60;
   if (windowKey === 'all' && byDay.length > 0) {
     const slice = byDay.slice(-count);
     return {
@@ -307,8 +308,9 @@ function CostAreaChart({
   const tickCount = granularity === 'hour' ? (windowKey === '24h' ? 6 : 7) : 6;
   const tickIdxs: number[] = [];
   if (points.length > 0) {
-    for (let i = 0; i < Math.min(tickCount, points.length); i++) {
-      const t = Math.max(1, tickCount - 1);
+    const visibleTickCount = Math.min(tickCount, points.length);
+    for (let i = 0; i < visibleTickCount; i++) {
+      const t = Math.max(1, visibleTickCount - 1);
       const idx = Math.round((i / t) * (points.length - 1));
       tickIdxs.push(idx);
     }
