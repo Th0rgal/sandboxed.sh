@@ -3,13 +3,13 @@
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, ExecutionStatus,
     FreshSession, Mission, MissionHistoryEntry, MissionMode, MissionStatus, MissionStore,
-    RetryConfig, StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
-    TelegramActionExecutionStatus, TelegramChannel, TelegramChatMission, TelegramConversation,
-    TelegramConversationMessage, TelegramConversationMessageDirection, TelegramScheduledMessage,
-    TelegramScheduledMessageStatus, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
-    TelegramStructuredMemoryScope, TelegramStructuredMemorySearchHit, TelegramWorkflow,
-    TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus, TriggerType,
-    WebhookConfig,
+    ModelUsageStats, RetryConfig, StopPolicy, StoredEvent, TelegramActionExecution,
+    TelegramActionExecutionKind, TelegramActionExecutionStatus, TelegramChannel,
+    TelegramChatMission, TelegramConversation, TelegramConversationMessage,
+    TelegramConversationMessageDirection, TelegramScheduledMessage, TelegramScheduledMessageStatus,
+    TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
+    TelegramStructuredMemorySearchHit, TelegramWorkflow, TelegramWorkflowEvent,
+    TelegramWorkflowKind, TelegramWorkflowStatus, TriggerType, WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
@@ -3865,6 +3865,102 @@ impl MissionStore for SqliteMissionStore {
             }
         }
         Ok((actual, estimated, unknown))
+    }
+
+    async fn get_usage_by_model(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<ModelUsageStats>, String> {
+        let conn = self.conn.lock().await;
+
+        // Aggregate by normalized model from assistant_message events. Falls back
+        // to the raw `model` string if `model_normalized` is missing. Token and
+        // cost fields tolerate the legacy flat shape (`cost_cents`) and missing
+        // values via COALESCE.
+        let base_query = r#"
+            SELECT
+                COALESCE(
+                    json_extract(metadata, '$.model_normalized'),
+                    json_extract(metadata, '$.model'),
+                    ''
+                ) AS model,
+                COUNT(*) AS requests,
+                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER)), 0) AS input_tokens,
+                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER)), 0) AS output_tokens,
+                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER)), 0) AS cache_creation_tokens,
+                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER)), 0) AS cache_read_tokens,
+                COALESCE(SUM(
+                    CASE WHEN CAST(
+                        COALESCE(
+                            json_extract(metadata, '$.cost.amount_cents'),
+                            json_extract(metadata, '$.cost_cents'),
+                            0
+                        ) AS INTEGER
+                    ) > 0
+                    THEN CAST(
+                        COALESCE(
+                            json_extract(metadata, '$.cost.amount_cents'),
+                            json_extract(metadata, '$.cost_cents'),
+                            0
+                        ) AS INTEGER
+                    ) ELSE 0 END
+                ), 0) AS cost_cents
+            FROM mission_events
+            WHERE event_type = 'assistant_message'
+        "#;
+
+        let sql = match since {
+            Some(_) => format!(
+                "{base_query} AND timestamp >= ?1 GROUP BY model ORDER BY cost_cents DESC, requests DESC"
+            ),
+            None => format!(
+                "{base_query} GROUP BY model ORDER BY cost_cents DESC, requests DESC"
+            ),
+        };
+
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let since_owned = since.map(|s| s.to_string());
+        let params: Vec<&dyn rusqlite::ToSql> = match since_owned.as_ref() {
+            Some(s) => vec![s],
+            None => vec![],
+        };
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                let model: String = row.get(0)?;
+                let requests: i64 = row.get(1)?;
+                let input_tokens: i64 = row.get(2)?;
+                let output_tokens: i64 = row.get(3)?;
+                let cache_creation_tokens: i64 = row.get(4)?;
+                let cache_read_tokens: i64 = row.get(5)?;
+                let cost_cents: i64 = row.get(6)?;
+                Ok(ModelUsageStats {
+                    model,
+                    requests: requests.max(0) as u64,
+                    input_tokens: input_tokens.max(0) as u64,
+                    output_tokens: output_tokens.max(0) as u64,
+                    cache_creation_tokens: cache_creation_tokens.max(0) as u64,
+                    cache_read_tokens: cache_read_tokens.max(0) as u64,
+                    cost_cents: cost_cents.max(0) as u64,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut out: Vec<ModelUsageStats> = Vec::new();
+        for r in rows {
+            let row = r.map_err(|e| e.to_string())?;
+            // Skip empty-model rows that carry no usage signal at all
+            if row.model.is_empty()
+                && row.input_tokens == 0
+                && row.output_tokens == 0
+                && row.cache_creation_tokens == 0
+                && row.cache_read_tokens == 0
+                && row.cost_cents == 0
+            {
+                continue;
+            }
+            out.push(row);
+        }
+        Ok(out)
     }
 
     async fn create_automation(&self, automation: Automation) -> Result<Automation, String> {
@@ -7824,6 +7920,127 @@ mod tests {
         assert_eq!(estimated, 50);
         // Unknown (10) + legacy (5) both go into the unknown bucket
         assert_eq!(unknown, 15);
+    }
+
+    #[tokio::test]
+    async fn get_usage_by_model_aggregates_tokens_and_cost_per_model() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(
+                Some("Usage by model mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission");
+
+        let conn = store.conn.lock().await;
+        let query = r#"
+            INSERT INTO mission_events (
+                mission_id, sequence, event_type, timestamp, metadata
+            ) VALUES (?1, ?2, 'assistant_message', ?3, ?4)
+        "#;
+
+        // Two calls to claude-3-5-sonnet with usage + cost
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                1i64,
+                "2026-04-22T00:00:00Z",
+                json!({
+                    "model": "claude-3-5-sonnet-20241022",
+                    "model_normalized": "claude-3-5-sonnet",
+                    "usage": {
+                        "input_tokens": 1000,
+                        "output_tokens": 500,
+                        "cache_creation_input_tokens": 200,
+                        "cache_read_input_tokens": 300
+                    },
+                    "cost": { "amount_cents": 12, "source": "actual" }
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert sonnet 1");
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                2i64,
+                "2026-04-22T00:01:00Z",
+                json!({
+                    "model": "claude-3-5-sonnet-20241022",
+                    "model_normalized": "claude-3-5-sonnet",
+                    "usage": {
+                        "input_tokens": 2000,
+                        "output_tokens": 800,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 100
+                    },
+                    "cost": { "amount_cents": 25, "source": "actual" }
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert sonnet 2");
+
+        // One call to gpt-4o with usage + cost
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                3i64,
+                "2026-04-22T00:02:00Z",
+                json!({
+                    "model": "gpt-4o-2024-08-06",
+                    "model_normalized": "gpt-4o",
+                    "usage": {
+                        "input_tokens": 500,
+                        "output_tokens": 200
+                    },
+                    "cost": { "amount_cents": 4, "source": "estimated" }
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert gpt-4o");
+
+        drop(conn);
+
+        let rows = store
+            .get_usage_by_model(None)
+            .await
+            .expect("aggregate by model");
+
+        // Ordered by cost_cents DESC: sonnet (37) before gpt-4o (4).
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].model, "claude-3-5-sonnet");
+        assert_eq!(rows[0].requests, 2);
+        assert_eq!(rows[0].input_tokens, 3000);
+        assert_eq!(rows[0].output_tokens, 1300);
+        assert_eq!(rows[0].cache_creation_tokens, 200);
+        assert_eq!(rows[0].cache_read_tokens, 400);
+        assert_eq!(rows[0].cost_cents, 37);
+
+        assert_eq!(rows[1].model, "gpt-4o");
+        assert_eq!(rows[1].requests, 1);
+        assert_eq!(rows[1].cost_cents, 4);
+
+        // since=… filter should drop the older entries.
+        let recent = store
+            .get_usage_by_model(Some("2026-04-22T00:01:30Z"))
+            .await
+            .expect("filtered aggregate");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].model, "gpt-4o");
     }
 
     #[tokio::test]

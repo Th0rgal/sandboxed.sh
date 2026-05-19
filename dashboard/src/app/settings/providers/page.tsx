@@ -30,6 +30,8 @@ import {
 import { cn } from '@/lib/utils';
 import { AddProviderModal } from '@/components/ui/add-provider-modal';
 import { AsyncButton } from '@/components/ui/async-button';
+import { ProviderUsageHud } from '@/components/ui/provider-usage-hud';
+import type { UsageWindow } from '@/lib/api';
 
 const providerConfig: Record<string, { color: string; icon: string }> = {
   anthropic: { color: 'bg-orange-500/10 text-orange-400', icon: '🧠' },
@@ -313,6 +315,7 @@ export default function ProvidersPage() {
   const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
   const [usageData, setUsageData] = useState<Record<string, ProviderUsage>>({});
   const [usageLoading, setUsageLoading] = useState<Record<string, boolean>>({});
+  const [hudWindow, setHudWindow] = useState<UsageWindow>('7d');
   const [editForm, setEditForm] = useState<{
     name?: string;
     label?: string;
@@ -472,6 +475,10 @@ export default function ProvidersPage() {
           <p className="mt-1 text-sm text-white/50">
             Manage API keys and authentication
           </p>
+        </div>
+
+        <div className="mb-4">
+          <ProviderUsageHud window={hudWindow} onWindowChange={setHudWindow} />
         </div>
 
         <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">

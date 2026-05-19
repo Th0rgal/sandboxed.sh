@@ -135,6 +135,20 @@ pub struct StoredEvent {
     pub metadata: serde_json::Value,
 }
 
+/// Aggregated AI token/cost usage for a single (normalized) model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUsageStats {
+    /// Canonical model identifier (e.g. "claude-3-5-sonnet", "gpt-4o").
+    /// Empty string when the model was not recorded for an event.
+    pub model: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Automation Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1082,6 +1096,15 @@ pub trait MissionStore: Send + Sync {
     /// Get cost in cents grouped by source, for events on or after `since` (ISO-8601).
     async fn get_cost_by_source_since(&self, _since: &str) -> Result<(u64, u64, u64), String> {
         Ok((0, 0, 0))
+    }
+
+    /// Aggregate AI usage per (normalized) model across all assistant_message events.
+    /// Returns per-model totals (requests, tokens, cost). Time-window optional.
+    async fn get_usage_by_model(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<ModelUsageStats>, String> {
+        Ok(Vec::new())
     }
 
     // === Automation methods (default no-op for backward compatibility) ===

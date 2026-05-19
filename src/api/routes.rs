@@ -31,7 +31,7 @@ use axum::{
     Router,
 };
 use futures::stream::Stream;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -604,6 +604,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     let protected_routes = Router::new()
         .route("/api/stats", get(get_stats))
+        .route("/api/ai/usage/summary", get(get_ai_usage_summary))
         .route("/api/task", post(create_task))
         .route("/api/task/:id", get(get_task))
         .route("/api/task/:id/stop", post(stop_task))
@@ -1301,6 +1302,144 @@ async fn get_stats(
         estimated_cost_cents,
         unknown_cost_cents,
         success_rate,
+    })
+}
+
+/// Optional query parameters for the AI usage summary endpoint.
+#[derive(Debug, Deserialize)]
+pub struct UsageSummaryQuery {
+    /// Time window: "24h", "7d", "30d", or "all". Default "all".
+    window: Option<String>,
+}
+
+/// Per-model usage row in the API response.
+#[derive(Debug, Serialize)]
+pub struct ModelUsageResponse {
+    pub model: String,
+    /// Inferred provider type (e.g. "anthropic", "openai", "google", "xai") or
+    /// `null` when unknown.
+    pub provider: Option<String>,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageSummaryTotals {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageSummaryResponse {
+    pub window: String,
+    pub since: Option<String>,
+    pub totals: UsageSummaryTotals,
+    pub by_model: Vec<ModelUsageResponse>,
+}
+
+/// Map a normalized model identifier to a provider type id.
+fn infer_provider_for_model(model: &str) -> Option<String> {
+    let m = model.to_lowercase();
+    if m.contains("claude") {
+        Some("anthropic".to_string())
+    } else if m.contains("gpt") || m.starts_with("o3") || m.starts_with("o4") || m.contains("openai") {
+        Some("openai".to_string())
+    } else if m.contains("gemini") {
+        Some("google".to_string())
+    } else if m.contains("grok") {
+        Some("xai".to_string())
+    } else if m.contains("glm") || m.contains("z-ai") || m.contains("zai") {
+        Some("zai".to_string())
+    } else if m.contains("minimax") || m.contains("abab") {
+        Some("minimax".to_string())
+    } else if m.contains("mistral") || m.contains("codestral") {
+        Some("mistral".to_string())
+    } else if m.contains("llama") && m.contains("groq") {
+        Some("groq".to_string())
+    } else if m.contains("command") || m.contains("cohere") {
+        Some("cohere".to_string())
+    } else if m.contains("qwen") || m.contains("deepseek") {
+        // Common open-router / together-ai models; default to open-router
+        Some("open-router".to_string())
+    } else {
+        None
+    }
+}
+
+/// GET /api/ai/usage/summary — aggregated AI token/cost usage.
+///
+/// Query params:
+/// - `window`: "24h" | "7d" | "30d" | "all" (default "all").
+async fn get_ai_usage_summary(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(params): Query<UsageSummaryQuery>,
+) -> Json<UsageSummaryResponse> {
+    let window = params.window.as_deref().unwrap_or("all");
+    let since: Option<String> = match window {
+        "24h" => Some((chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339()),
+        "7d" => Some((chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339()),
+        "30d" => Some((chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339()),
+        _ => None,
+    };
+
+    let control_state = state.control.get_or_spawn(&user).await;
+    let rows = control_state
+        .mission_store
+        .get_usage_by_model(since.as_deref())
+        .await
+        .unwrap_or_default();
+
+    let mut totals = UsageSummaryTotals {
+        requests: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+        cost_cents: 0,
+    };
+    let mut by_model: Vec<ModelUsageResponse> = Vec::with_capacity(rows.len());
+    for r in rows {
+        totals.requests = totals.requests.saturating_add(r.requests);
+        totals.input_tokens = totals.input_tokens.saturating_add(r.input_tokens);
+        totals.output_tokens = totals.output_tokens.saturating_add(r.output_tokens);
+        totals.cache_creation_tokens = totals
+            .cache_creation_tokens
+            .saturating_add(r.cache_creation_tokens);
+        totals.cache_read_tokens = totals
+            .cache_read_tokens
+            .saturating_add(r.cache_read_tokens);
+        totals.cost_cents = totals.cost_cents.saturating_add(r.cost_cents);
+        let provider = if r.model.is_empty() {
+            None
+        } else {
+            infer_provider_for_model(&r.model)
+        };
+        by_model.push(ModelUsageResponse {
+            model: r.model,
+            provider,
+            requests: r.requests,
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+            cache_creation_tokens: r.cache_creation_tokens,
+            cache_read_tokens: r.cache_read_tokens,
+            cost_cents: r.cost_cents,
+        });
+    }
+
+    Json(UsageSummaryResponse {
+        window: window.to_string(),
+        since,
+        totals,
+        by_model,
     })
 }
 

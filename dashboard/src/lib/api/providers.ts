@@ -318,6 +318,45 @@ export async function getProviderUsage(id: string): Promise<ProviderUsage> {
   return apiGet(`/api/ai/providers/${id}/usage`, "Failed to get provider usage");
 }
 
+// ---------------------------------------------------------------------------
+// Aggregated usage summary (across all missions)
+// ---------------------------------------------------------------------------
+
+export type UsageWindow = "24h" | "7d" | "30d" | "all";
+
+export interface ModelUsageSummary {
+  model: string;
+  /** Inferred provider id ("anthropic", "openai", ...). Null if unknown. */
+  provider: string | null;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  cost_cents: number;
+}
+
+export interface UsageSummary {
+  window: UsageWindow;
+  since: string | null;
+  totals: {
+    requests: number;
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_tokens: number;
+    cache_read_tokens: number;
+    cost_cents: number;
+  };
+  by_model: ModelUsageSummary[];
+}
+
+export async function getUsageSummary(window: UsageWindow = "all"): Promise<UsageSummary> {
+  return apiGet(
+    `/api/ai/usage/summary?window=${encodeURIComponent(window)}`,
+    "Failed to get usage summary"
+  );
+}
+
 export async function listProviders(options?: { includeAll?: boolean }): Promise<ProvidersResponse> {
   const params = new URLSearchParams();
   if (options?.includeAll) {
