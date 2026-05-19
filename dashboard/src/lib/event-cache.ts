@@ -22,6 +22,7 @@
  */
 
 import type { StoredEvent } from "./api/missions";
+import { isStreamContinuation } from "./stream-continuation";
 
 const DB_NAME = "openagent.event-cache";
 const DB_VERSION = 1;
@@ -29,12 +30,100 @@ const STORE = "missions";
 
 /**
  * Per-mission cap on cached events. Newest entries are kept on overflow.
- * Sized to comfortably exceed the typical `INITIAL_HISTORY_PAGE_SIZE` so a
- * cache hit on reopen surfaces noticeably more context than a cold load,
- * while keeping per-mission storage well under a megabyte for typical
- * `tool_result` payload sizes (~1–2 KB on average).
+ * Sized to keep the transcript plus the recent deferred trace together for
+ * active missions. If this is too small, reopen renders chat first and then
+ * has to refetch thoughts/tools as a second pass, which causes a visible
+ * redraw.
  */
-const MAX_CACHED_EVENTS = 400;
+const MAX_CACHED_EVENTS = 1_500;
+
+function compactEventsForCache(events: StoredEvent[]): StoredEvent[] {
+  const sorted =
+    events.length > 1
+      ? events.slice().sort((a, b) => a.sequence - b.sequence)
+      : events.slice();
+  const compacted: StoredEvent[] = [];
+  let thinkingRun: {
+    first: StoredEvent;
+    latest: StoredEvent;
+    content: string;
+  } | null = null;
+
+  const flushThinking = () => {
+    if (!thinkingRun) return;
+    compacted.push({
+      ...thinkingRun.first,
+      content: thinkingRun.content,
+      metadata: {
+        ...thinkingRun.first.metadata,
+        ...thinkingRun.latest.metadata,
+      },
+      timestamp: thinkingRun.latest.timestamp,
+    });
+    thinkingRun = null;
+  };
+
+  for (const event of sorted) {
+    if (event.event_type !== "thinking") {
+      flushThinking();
+      compacted.push(event);
+      continue;
+    }
+
+    const content = event.content || "";
+    const done = event.metadata?.done === true;
+    if (!thinkingRun) {
+      thinkingRun = { first: event, latest: event, content };
+      if (done) flushThinking();
+      continue;
+    }
+
+    if (!isStreamContinuation(content, thinkingRun.content)) {
+      flushThinking();
+      thinkingRun = { first: event, latest: event, content };
+      if (done) flushThinking();
+      continue;
+    }
+
+    thinkingRun.latest = event;
+    if (content.length > thinkingRun.content.length) {
+      thinkingRun.content = content;
+    }
+    if (done) flushThinking();
+  }
+
+  flushThinking();
+  return compacted;
+}
+
+function trimEventsForCache(events: StoredEvent[]): StoredEvent[] {
+  if (events.length <= MAX_CACHED_EVENTS) return events;
+
+  const mustKeepTypes = new Set(["thinking", "text_delta", "text_op"]);
+  const keep = new Set<number>();
+  const mustKeep = events.filter((event) =>
+    mustKeepTypes.has(event.event_type),
+  );
+
+  const protectedEvents =
+    mustKeep.length > MAX_CACHED_EVENTS
+      ? mustKeep.slice(mustKeep.length - MAX_CACHED_EVENTS)
+      : mustKeep;
+  for (const event of protectedEvents) {
+    keep.add(event.sequence);
+  }
+
+  let remaining = MAX_CACHED_EVENTS - keep.size;
+  for (let i = events.length - 1; i >= 0 && remaining > 0; i -= 1) {
+    const event = events[i];
+    if (!keep.has(event.sequence)) {
+      keep.add(event.sequence);
+      remaining -= 1;
+    }
+  }
+
+  return events.filter((event) => keep.has(event.sequence));
+}
 
 /** Drop entries this old at read time — server state may have diverged
  * (mission deleted, rebuilt, etc.) and we'd rather miss the cache than
@@ -86,7 +175,7 @@ function openDb(): Promise<IDBDatabase | null> {
 }
 
 export async function readCachedEvents(
-  missionId: string
+  missionId: string,
 ): Promise<CachedEvents | null> {
   const db = await openDb();
   if (!db) return null;
@@ -137,23 +226,17 @@ export async function writeCachedEvents(
   missionId: string,
   events: StoredEvent[],
   maxSequence: number,
-  totalEvents: number
+  totalEvents: number,
 ): Promise<void> {
   if (!missionId || events.length === 0) return;
   const db = await openDb();
   if (!db) return;
 
-  // Keep only the newest tail. Sort defensively in case callers passed an
-  // unsorted set — cheap on small arrays and stops a stale `sequence` row
-  // from leaking past the slice.
-  const sorted =
-    events.length > 1
-      ? events.slice().sort((a, b) => a.sequence - b.sequence)
-      : events.slice();
-  const trimmed =
-    sorted.length > MAX_CACHED_EVENTS
-      ? sorted.slice(sorted.length - MAX_CACHED_EVENTS)
-      : sorted;
+  // Keep only the newest render-equivalent tail. Thinking streams are
+  // cumulative, so hundreds of intermediate rows often render as one final
+  // thought; compact them before applying the cache cap.
+  const sorted = compactEventsForCache(events);
+  const trimmed = trimEventsForCache(sorted);
 
   const record: CachedEvents = {
     missionId,

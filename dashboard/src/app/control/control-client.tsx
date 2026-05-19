@@ -268,7 +268,7 @@ import {
   DataTable,
   parseSerializableDataTable,
 } from "@/components/tool-ui/data-table";
-import { useScrollToBottom } from "@/hooks/use-scroll-to-bottom";
+import { useVirtualTimelineAnchor } from "@/hooks/use-virtual-timeline-anchor";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { useVisibilityPolling } from "@/hooks/use-visibility-polling";
@@ -1684,7 +1684,7 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
         Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000),
       )
     : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(!item.done);
 
   const formatDuration = (seconds: number) => {
     if (seconds <= 0) return "<1s";
@@ -1822,89 +1822,51 @@ function ThinkingPanel({
   const hasActiveThinking = activeItems.some((i) => i.kind === "thinking");
   const hasActiveStream = activeItems.some((i) => i.kind === "stream");
 
-  // Deduplicate completed items by content - keep first occurrence
-  const completedItems = useMemo(() => {
-    const seen = new Set<string>();
-    return items.filter((t) => {
-      if (!t.done) return false;
-      // Skip empty/whitespace-only content
-      const trimmed = t.content.trim();
-      if (!trimmed) return false;
-      if (seen.has(trimmed)) return false;
-      seen.add(trimmed);
-      return true;
-    });
-  }, [items]);
-
   // Performance: limit visible thoughts, load more on demand
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [isThoughtsAtBottom, setIsThoughtsAtBottom] = useState(true);
   const panelRows = useMemo(() => {
-    const rows: Array<
-      | { kind: "completed"; item: SidePanelItem }
-      | { kind: "current" }
-      | { kind: "active"; item: SidePanelItem }
-    > = completedItems.map((item) => ({ kind: "completed", item }));
-    if (activeItems.length > 0 && completedItems.length > 0) {
-      rows.push({ kind: "current" });
-    }
-    for (const item of activeItems) {
-      rows.push({ kind: "active", item });
-    }
-    return rows;
-  }, [activeItems, completedItems]);
+    const seenDoneContent = new Set<string>();
+    return items
+      .filter((item) => {
+        const trimmed = item.content.trim();
+        if (!trimmed) return false;
+        if (!item.done) return true;
+        if (seenDoneContent.has(trimmed)) return false;
+        seenDoneContent.add(trimmed);
+        return true;
+      })
+      .map((item) => ({ item }));
+  }, [items]);
   const thoughtsVirtualizer = useVirtualizer({
     count: panelRows.length,
     getScrollElement: () => scrollRef.current,
     getItemKey: (index) => {
       const row = panelRows[index];
       if (!row) return index;
-      if (row.kind === "current") return "current";
-      return `${row.kind}:${row.item.id}`;
+      return row.item.id;
     },
     estimateSize: (index) => {
       const row = panelRows[index];
       if (!row) return 96;
-      if (row.kind === "current") return 24;
       return row.item.kind === "stream" ? 140 : 112;
     },
     overscan: 6,
   });
-
-  // Auto-scroll to bottom when active thought content changes.
-  // Use useLayoutEffect to set scroll before paint (prevents flicker).
-  // Only scroll if already near the bottom (user hasn't scrolled up to read history).
-  const userScrolledUpRef = useRef(false);
-  useEffect(() => {
-    userScrolledUpRef.current = false;
-    setIsThoughtsAtBottom(true);
-  }, [missionId]);
-
-  useLayoutEffect(() => {
-    if (activeItems.length > 0 && !userScrolledUpRef.current) {
-      thoughtsVirtualizer.scrollToIndex(Math.max(panelRows.length - 1, 0), {
-        align: "end",
-      });
-    }
-  }, [
-    activeItems.map((i) => `${i.id}:${i.content.length}`).join("|"),
-    panelRows.length,
-    thoughtsVirtualizer,
-  ]);
-
-  // Track whether user has manually scrolled up
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const handleScroll = () => {
-      const distanceFromBottom =
-        el.scrollHeight - el.scrollTop - el.clientHeight;
-      userScrolledUpRef.current = distanceFromBottom > 80;
-      setIsThoughtsAtBottom(!userScrolledUpRef.current);
-    };
-    el.addEventListener("scroll", handleScroll, { passive: true });
-    return () => el.removeEventListener("scroll", handleScroll);
-  }, []);
+  const {
+    isAtBottom: isThoughtsAtBottom,
+    scrollToBottom: scrollThoughtsToBottom,
+  } = useVirtualTimelineAnchor({
+    scrollElementRef: scrollRef,
+    virtualizer: thoughtsVirtualizer,
+    itemCount: panelRows.length,
+    changeKey: panelRows
+      .map(
+        ({ item }) =>
+          `${item.id}:${item.done ? "done" : "active"}:${item.content.length}`,
+      )
+      .join("|"),
+    resetKey: missionId ?? null,
+  });
 
   // Handle Escape key
   useEffect(() => {
@@ -1943,10 +1905,8 @@ function ThinkingPanel({
                 ? "Streaming"
                 : "Thoughts"}
           </span>
-          {(completedItems.length > 0 || activeItems.length > 0) && (
-            <span className="text-xs text-white/30">
-              ({completedItems.length + activeItems.length})
-            </span>
+          {panelRows.length > 0 && (
+            <span className="text-xs text-white/30">({panelRows.length})</span>
           )}
         </div>
         <button
@@ -1958,7 +1918,11 @@ function ThinkingPanel({
       </div>
 
       {/* Content - flex-col with overflow, scrolls up for history */}
-      <div ref={scrollRef} className="relative flex-1 overflow-y-auto p-3">
+      <div
+        ref={scrollRef}
+        data-testid="thoughts-scroll-container"
+        className="relative flex-1 overflow-y-auto p-3"
+      >
         {items.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center p-4">
             <Brain className="h-8 w-8 text-white/20 mb-3" />
@@ -1989,17 +1953,12 @@ function ThinkingPanel({
                       transform: `translateY(${virtualRow.start}px)`,
                     }}
                   >
-                    {row.kind === "current" ? (
-                      <div className="text-[10px] uppercase tracking-wider text-white/30 px-1">
-                        Current
-                      </div>
-                    ) : (
-                      <ThinkingPanelItem
-                        item={row.item}
-                        isActive={row.kind === "active"}
-                        basePath={basePath}
-                      />
-                    )}
+                    <ThinkingPanelItem
+                      item={row.item}
+                      isActive={!row.item.done}
+                      basePath={basePath}
+                      missionId={missionId ?? undefined}
+                    />
                   </div>
                 );
               })}
@@ -2007,12 +1966,7 @@ function ThinkingPanel({
             {!isThoughtsAtBottom && (
               <button
                 type="button"
-                onClick={() =>
-                  thoughtsVirtualizer.scrollToIndex(
-                    Math.max(panelRows.length - 1, 0),
-                    { align: "end" },
-                  )
-                }
+                onClick={() => scrollThoughtsToBottom()}
                 className="absolute bottom-3 right-3 flex h-8 w-8 items-center justify-center rounded-full border border-white/[0.1] bg-black/50 text-white/60 shadow-lg transition-colors hover:bg-white/[0.08] hover:text-white"
                 title="Scroll to bottom"
               >
@@ -4059,6 +4013,7 @@ export default function ControlClient() {
     | ((id: string, traceEvents: StoredEvent[], maxSequence?: number) => void)
     | null
   >(null);
+  const deferredTraceLoadsRef = useRef<Set<string>>(new Set());
   /**
    * Per-mission high-water mark for `sequence`. When non-zero, reload
    * paths pass it as `since_seq` to `/events` so the server returns
@@ -4223,6 +4178,8 @@ export default function ControlClient() {
           // populated below `eventsToItems`; this avoids blocking transcript
           // display on the heavier activity trace.
           setTimeout(() => {
+            if (deferredTraceLoadsRef.current.has(id)) return;
+            deferredTraceLoadsRef.current.add(id);
             void getMissionTraceWithMeta(id, {
               sinceSeq: 0,
               limit: HISTORY_PAGE_SIZE,
@@ -4230,7 +4187,10 @@ export default function ControlClient() {
               .then(({ events, meta }) => {
                 renderDeferredTraceRef.current?.(id, events, meta.maxSequence);
               })
-              .catch(() => undefined);
+              .catch(() => undefined)
+              .finally(() => {
+                deferredTraceLoadsRef.current.delete(id);
+              });
           }, 0);
         } catch {
           // Older backends do not expose `/transcript`; keep the existing full
@@ -4394,6 +4354,7 @@ export default function ControlClient() {
     [items, deferredShowThinkingPanel],
   );
 
+  const containerRef = useRef<HTMLDivElement>(null);
   const chatVirtualizer = useVirtualizer({
     count: groupedItems.length,
     getScrollElement: () => containerRef.current,
@@ -4412,6 +4373,30 @@ export default function ControlClient() {
       return 100;
     },
     overscan: 8,
+  });
+  const { isAtBottom, scrollToBottom } = useVirtualTimelineAnchor({
+    scrollElementRef: containerRef,
+    virtualizer: chatVirtualizer,
+    itemCount: groupedItems.length,
+    changeKey: groupedItems
+      .map((item) => {
+        const key = getGroupedItemKey(item);
+        if (item.kind === "thinking_group") {
+          return `${key}:${item.thoughts.map((thought) => `${thought.id}:${thought.done ? "done" : "active"}:${thought.content.length}`).join(",")}`;
+        }
+        if (item.kind === "tool_group") {
+          return `${key}:${item.tools.length}`;
+        }
+        if (item.kind === "thinking" || item.kind === "stream") {
+          return `${key}:${item.done ? "done" : "active"}:${item.content.length}`;
+        }
+        if (item.kind === "assistant" || item.kind === "user") {
+          return `${key}:${item.content.length}`;
+        }
+        return key;
+      })
+      .join("|"),
+    resetKey: viewingMissionId,
   });
 
   const showAgentWorkingIndicator = useMemo(() => {
@@ -4688,25 +4673,6 @@ export default function ControlClient() {
 
   useEffect(() => {
     itemsRef.current = items;
-  }, [items]);
-
-  // Smart auto-scroll
-  const {
-    containerRef,
-    endRef,
-    isAtBottom,
-    scrollToBottom,
-    scrollToBottomImmediate,
-  } = useScrollToBottom();
-
-  // Scroll to bottom synchronously before paint when items change.
-  // This ensures the page appears at the bottom instantly when returning
-  // to the control page (no visible scroll animation).
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useLayoutEffect(() => {
-    if (items.length > 0 && isAtBottom) {
-      scrollToBottomImmediate();
-    }
   }, [items]);
 
   // Backwards-pagination scroll restore. `loadOlderHistoryEvents` snapshots
@@ -5349,7 +5315,10 @@ export default function ControlClient() {
   }, []);
 
   const eventsToItemsAsync = useCallback(
-    async (events: StoredEvent[], mission?: Mission | null): Promise<ChatItem[]> => {
+    async (
+      events: StoredEvent[],
+      mission?: Mission | null,
+    ): Promise<ChatItem[]> => {
       if (events.length < 500) {
         return eventsToItems(events, mission);
       }
@@ -5377,7 +5346,10 @@ export default function ControlClient() {
         eventsWorkerPendingRef.current.delete(id);
         eventsWorkerRef.current = false;
         worker.terminate();
-        console.warn("[control] events worker failed; falling back to sync", error);
+        console.warn(
+          "[control] events worker failed; falling back to sync",
+          error,
+        );
         return eventsToItems(events, mission);
       }
     },
@@ -5409,6 +5381,16 @@ export default function ControlClient() {
     }
     if (maxSequence !== undefined && maxSequence > 0) {
       missionMaxSeqRef.current.set(id, maxSequence);
+    }
+    const cacheMaxSequence =
+      maxSequence ??
+      missionMaxSeqRef.current.get(id) ??
+      merged.at(-1)?.sequence;
+    const cacheTotal = missionTotalHistoryRef.current.get(id) ?? merged.length;
+    if (cacheMaxSequence !== undefined && cacheMaxSequence > 0) {
+      void writeCachedEvents(id, merged, cacheMaxSequence, cacheTotal).catch(
+        () => undefined,
+      );
     }
 
     const newHistoricItems = eventsToItems(merged, mission);
@@ -9205,7 +9187,9 @@ export default function ControlClient() {
   // viewed worker, so the worker strip stays visible after selecting a chip.
   const childMissions = useMemo(() => {
     if (!currentMission) return [];
-    return recentMissions.filter((m) => m.parent_mission_id === currentMission.id);
+    return recentMissions.filter(
+      (m) => m.parent_mission_id === currentMission.id,
+    );
   }, [currentMission, recentMissions]);
   const activeMissionRole = activeMission
     ? inferMissionRole(activeMission)
@@ -10064,7 +10048,11 @@ export default function ControlClient() {
               onSelectWorker={handleViewMission}
             />
             {/* Messages */}
-            <div ref={containerRef} className="flex-1 overflow-y-auto p-6">
+            <div
+              ref={containerRef}
+              data-testid="chat-scroll-container"
+              className="flex-1 overflow-y-auto p-6"
+            >
               {/* Backwards pagination — only when there's actually more older
               history to fetch and the chat isn't empty. Click prepends the
               previous page; scroll position is preserved so the message
@@ -10373,8 +10361,6 @@ export default function ControlClient() {
                       </div>
                     </div>
                   )}
-
-                  <div ref={endRef} />
                 </div>
               )}
             </div>

@@ -125,8 +125,10 @@ async function mockLargeControlMission(page: Page, events: StoredEvent[]) {
       const limit = Number(url.searchParams.get("limit") ?? "0");
       let selected = events;
 
-      if (sinceSeq > 0) selected = events.filter((event) => event.sequence > sinceSeq);
-      if (beforeSeq > 0) selected = events.filter((event) => event.sequence < beforeSeq);
+      if (sinceSeq > 0)
+        selected = events.filter((event) => event.sequence > sinceSeq);
+      if (beforeSeq > 0)
+        selected = events.filter((event) => event.sequence < beforeSeq);
       if (latest && limit > 0) selected = selected.slice(-limit);
       else if (limit > 0) selected = selected.slice(0, limit);
 
@@ -162,7 +164,11 @@ async function mockLargeControlMission(page: Page, events: StoredEvent[]) {
     }
     if (path === "/api/workspaces") {
       await fulfillJson(route, [
-        { id: WORKSPACE_ID, name: "perf-workspace", path: "/tmp/perf-workspace" },
+        {
+          id: WORKSPACE_ID,
+          name: "perf-workspace",
+          path: "/tmp/perf-workspace",
+        },
       ]);
       return;
     }
@@ -199,7 +205,81 @@ async function mockLargeControlMission(page: Page, events: StoredEvent[]) {
   });
 }
 
-test("control @perf keeps large mission within browser budgets", async ({ page }) => {
+async function mockControlWebSocket(
+  page: Page,
+  messages: Array<Record<string, unknown>>,
+) {
+  await page.addInitScript(
+    ({ messages }) => {
+      class ControlWebSocket extends EventTarget {
+        static CONNECTING = 0;
+        static OPEN = 1;
+        static CLOSING = 2;
+        static CLOSED = 3;
+        readyState = ControlWebSocket.CONNECTING;
+        onopen: ((event: Event) => void) | null = null;
+        onmessage: ((event: MessageEvent) => void) | null = null;
+        onerror: ((event: Event) => void) | null = null;
+        onclose: ((event: CloseEvent) => void) | null = null;
+
+        constructor(url: string | URL) {
+          super();
+          if (!String(url).includes("/api/control/ws")) {
+            setTimeout(() => this.onerror?.(new Event("error")), 0);
+            return;
+          }
+          setTimeout(() => {
+            this.readyState = ControlWebSocket.OPEN;
+            this.onopen?.(new Event("open"));
+            messages.forEach((message, index) => {
+              setTimeout(
+                () => {
+                  this.onmessage?.(
+                    new MessageEvent("message", {
+                      data: JSON.stringify(message),
+                    }),
+                  );
+                },
+                2000 * (index + 1),
+              );
+            });
+          }, 0);
+        }
+
+        close() {
+          this.readyState = ControlWebSocket.CLOSED;
+        }
+
+        send(_data?: unknown) {}
+      }
+      window.WebSocket = ControlWebSocket as unknown as typeof WebSocket;
+    },
+    { messages },
+  );
+}
+
+async function expectPinnedToBottom(page: Page, testId: string) {
+  await expect
+    .poll(async () =>
+      page.getByTestId(testId).evaluate((el) => {
+        const node = el as HTMLElement;
+        return Math.round(
+          node.scrollHeight - node.scrollTop - node.clientHeight,
+        );
+      }),
+    )
+    .toBeLessThan(120);
+}
+
+async function getScrollTop(page: Page, testId: string) {
+  return page
+    .getByTestId(testId)
+    .evaluate((el) => (el as HTMLElement).scrollTop);
+}
+
+test("control @perf keeps large mission within browser budgets", async ({
+  page,
+}) => {
   test.setTimeout(60_000);
 
   await page.addInitScript(() => {
@@ -260,4 +340,173 @@ test("control @perf keeps large mission within browser budgets", async ({ page }
   }
   expect(budgets.maxLongtaskMs).toBeLessThan(500);
   expect(budgets.domNodes).toBeLessThan(5_000);
+});
+
+test("control lets users scroll down without anchor bounce", async ({
+  page,
+}) => {
+  const events = buildLargeMissionEvents(80);
+  await mockLargeControlMission(page, events);
+  await page.goto(`/control?mission=${PERF_MISSION_ID}`);
+
+  const chat = page.getByTestId("chat-scroll-container");
+  await expect(page.getByText("Assistant response 79")).toBeVisible({
+    timeout: 15_000,
+  });
+  await chat.evaluate((el) => {
+    const node = el as HTMLElement;
+    node.scrollTop = 0;
+  });
+  await page.waitForTimeout(100);
+
+  await chat.evaluate((el) => {
+    const node = el as HTMLElement;
+    node.scrollTop = 900;
+  });
+  const afterScroll = await getScrollTop(page, "chat-scroll-container");
+  await page.waitForTimeout(600);
+  const afterSettled = await getScrollTop(page, "chat-scroll-container");
+
+  expect(afterScroll).toBeGreaterThan(500);
+  expect(afterSettled).toBeGreaterThan(afterScroll - 80);
+});
+
+test("control does not tug scroll while streamed rows update off bottom", async ({
+  page,
+}) => {
+  const draftOne =
+    Array.from({ length: 30 }, (_, i) => `draft update one ${i + 1}`).join(
+      "\n\n",
+    ) + "\n\nDRAFT_ONE_TAIL";
+  const draftTwo =
+    Array.from({ length: 45 }, (_, i) => `draft update two ${i + 1}`).join(
+      "\n\n",
+    ) + "\n\nDRAFT_TWO_TAIL";
+  const events = buildLargeMissionEvents(80);
+
+  await mockControlWebSocket(page, [
+    {
+      type: "text_delta",
+      mission_id: PERF_MISSION_ID,
+      content: draftOne,
+    },
+    {
+      type: "text_delta",
+      mission_id: PERF_MISSION_ID,
+      content: draftTwo,
+    },
+  ]);
+  await mockLargeControlMission(page, events);
+  await page.goto(`/control?mission=${PERF_MISSION_ID}`);
+
+  const chat = page.getByTestId("chat-scroll-container");
+  await expect(page.getByText("Assistant response 79")).toBeVisible({
+    timeout: 15_000,
+  });
+  await chat.evaluate((el) => {
+    const node = el as HTMLElement;
+    node.scrollTop = 900;
+  });
+  const beforeUpdate = await getScrollTop(page, "chat-scroll-container");
+  await page.waitForTimeout(4600);
+  const afterUpdate = await getScrollTop(page, "chat-scroll-container");
+
+  expect(afterUpdate).toBeGreaterThan(beforeUpdate - 80);
+  expect(afterUpdate).toBeLessThan(beforeUpdate + 80);
+});
+
+test("control keeps thoughts pinned while streamed thought finalizes", async ({
+  page,
+}) => {
+  const longThought =
+    Array.from({ length: 42 }, (_, i) => `reasoning line ${i + 1}`).join(
+      "\n\n",
+    ) + "\n\nTHOUGHT_TAIL_MARKER";
+  const events: StoredEvent[] = [
+    {
+      id: 1,
+      mission_id: PERF_MISSION_ID,
+      sequence: 1,
+      event_type: "user_message",
+      timestamp: new Date().toISOString(),
+      event_id: "scroll-user",
+      content: "think out loud",
+      metadata: {},
+    },
+  ];
+
+  await mockControlWebSocket(page, [
+    {
+      type: "thinking",
+      mission_id: PERF_MISSION_ID,
+      content: longThought,
+      done: false,
+    },
+    {
+      type: "thinking",
+      mission_id: PERF_MISSION_ID,
+      content: longThought,
+      done: true,
+    },
+  ]);
+  await mockLargeControlMission(page, events);
+  await page.goto(`/control?mission=${PERF_MISSION_ID}`);
+
+  await expect(page.getByText("THOUGHT_TAIL_MARKER")).toBeVisible({
+    timeout: 10_000,
+  });
+  await expectPinnedToBottom(page, "thoughts-scroll-container");
+  await expect(page.getByText(/Thought for|Draft for/)).toBeVisible({
+    timeout: 10_000,
+  });
+  await expect(page.getByText("THOUGHT_TAIL_MARKER")).toBeVisible();
+  await expectPinnedToBottom(page, "thoughts-scroll-container");
+});
+
+test("control keeps chat pinned when streaming draft becomes assistant message", async ({
+  page,
+}) => {
+  const draft =
+    Array.from({ length: 48 }, (_, i) => `draft line ${i + 1}`).join("\n\n") +
+    "\n\nCHAT_TAIL_MARKER";
+  const finalAnswer =
+    Array.from({ length: 48 }, (_, i) => `final line ${i + 1}`).join("\n\n") +
+    "\n\nASSISTANT_TAIL_MARKER";
+  const events: StoredEvent[] = [
+    {
+      id: 1,
+      mission_id: PERF_MISSION_ID,
+      sequence: 1,
+      event_type: "user_message",
+      timestamp: new Date().toISOString(),
+      event_id: "chat-scroll-user",
+      content: "stream a long answer",
+      metadata: {},
+    },
+  ];
+
+  await mockControlWebSocket(page, [
+    {
+      type: "text_delta",
+      mission_id: PERF_MISSION_ID,
+      content: draft,
+    },
+    {
+      type: "assistant_message",
+      id: "chat-scroll-assistant",
+      mission_id: PERF_MISSION_ID,
+      content: finalAnswer,
+      success: true,
+      cost_cents: 0,
+      cost_source: "unknown",
+    },
+  ]);
+  await mockLargeControlMission(page, events);
+  await page.goto(`/control?mission=${PERF_MISSION_ID}`);
+
+  const chat = page.getByTestId("chat-scroll-container");
+  await expect(chat.getByText("ASSISTANT_TAIL_MARKER")).toBeVisible({
+    timeout: 10_000,
+  });
+  await expectPinnedToBottom(page, "chat-scroll-container");
 });
