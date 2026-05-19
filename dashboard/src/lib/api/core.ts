@@ -133,10 +133,16 @@ export async function ensureLibraryResponse(
 ): Promise<Response> {
   if (res.ok) return res;
   const text = await res.text().catch(() => "");
+  const contentType = res.headers.get("content-type") || "";
+  const looksLikeHtml =
+    contentType.includes("text/html") || /^\s*<!doctype html/i.test(text) || /^\s*<html[\s>]/i.test(text);
+  const message = looksLikeHtml
+    ? `${fallbackMessage}. Received an HTML page instead of API JSON; check Settings -> API URL.`
+    : text || fallbackMessage;
   if (res.status === 503) {
-    throw new LibraryUnavailableError(text || "Library not initialized");
+    throw new LibraryUnavailableError(looksLikeHtml ? "Library not initialized" : text || "Library not initialized");
   }
-  throw new Error(text || fallbackMessage);
+  throw new Error(message);
 }
 
 export async function libGet<T>(path: string, errorMsg: string): Promise<T> {

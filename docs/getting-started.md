@@ -4,7 +4,7 @@ This guide will walk you through setting up and using sandboxed.sh for the first
 
 ## What is sandboxed.sh?
 
-sandboxed.sh is a powerful AI agent orchestration platform that manages multiple AI coding assistants (OpenCode, Claude Code, Amp) through a unified dashboard. It provides:
+sandboxed.sh is a powerful AI agent orchestration platform that manages multiple AI coding assistants (OpenCode, Claude Code, Codex, Gemini, and Grok) through a unified dashboard. It provides:
 
 - **Git-backed configuration library** - Store and version control your skills, agents, commands, and tools
 - **Multiple workspace support** - Isolated containers for different projects
@@ -125,7 +125,7 @@ The System page shows:
   - Sandboxed.sh (current version shown)
   - OpenCode (with update notifications)
   - Claude Code (with update notifications)
-  - Amp
+  - Codex where installed
   - oh-my-opencode plugin
 
 ### 2.3 Change Backend URL
@@ -180,7 +180,7 @@ The default library uses the sandboxed.sh template repository. To use your own:
 
 4. Click **Save**
 
-**Note**: The backend will clone your repository on first use. If it's empty, consider forking the [sandboxed.sh-library-template](https://github.com/Th0rgal/sandboxed-library-template) as a starting point.
+**Note**: The backend will clone your repository on first use. If it's empty, consider forking the [sandboxed-library-template](https://github.com/Th0rgal/sandboxed-library-template) as a starting point.
 
 ### 3.3 Sync Library
 
@@ -216,7 +216,7 @@ You can modify the content directly and click **Save** to update the library.
 
 ## Step 5: Configure AI Harness Settings
 
-sandboxed.sh supports multiple AI coding harnesses (OpenCode, Claude Code, Amp). Each harness can have different configurations stored in profiles.
+sandboxed.sh supports multiple AI coding harnesses (OpenCode, Claude Code, Codex, Gemini, and Grok). OpenCode, Claude Code, Codex, and sandboxed.sh settings can be managed through configuration profiles.
 
 ### 5.1 Access Config Editor
 
@@ -225,7 +225,7 @@ Click **Library** > **Configs** to access the file-based config editor:
 ![Config Editor](images/getting-started/07-config-editor.webp)
 
 The config editor shows:
-- **Harness tabs** - Switch between OpenCode, Claude Code, Amp, sandboxed.sh
+- **Harness tabs** - Switch between OpenCode, Claude Code, Codex, and sandboxed.sh settings
 - **Profile selector** - Choose or create config profiles (default, custom)
 - **Git status** - Branch and sync state
 - **File browser** - Navigate config files (`.opencode/`, `.claudecode/`, etc.)
@@ -293,6 +293,8 @@ Configure your mission:
 3. **Model Override (optional)** - Force a specific model for this mission:
    - **Claude Code**: use a raw model ID (e.g., `claude-opus-4-7`)
    - **Codex**: use a raw model ID (e.g., `gpt-5.5` or `gpt-5.3-codex`)
+   - **Gemini**: use a raw model ID (e.g., `gemini-3.1-pro-preview`)
+   - **Grok**: use a raw model ID (e.g., `grok-4.3`)
    - **OpenCode**: use `provider/model` (e.g., `openai/gpt-5.5`)
    - **Model effort**: set effort separately (`low`, `medium`, `high`, `xhigh`) instead of encoding it in the model ID
 
@@ -387,9 +389,9 @@ Now that you're set up, explore these features:
 
 ## Getting Help
 
-- **Documentation**: [https://github.com/Th0rgal/sandboxed-sh/tree/master/docs](https://github.com/Th0rgal/sandboxed-sh/tree/master/docs)
-- **Issues**: [https://github.com/Th0rgal/sandboxed-sh/issues](https://github.com/Th0rgal/sandboxed-sh/issues)
-- **Discussions**: [https://github.com/Th0rgal/sandboxed-sh/discussions](https://github.com/Th0rgal/sandboxed-sh/discussions)
+- **Documentation**: [https://github.com/Th0rgal/sandboxed.sh/tree/master/docs](https://github.com/Th0rgal/sandboxed.sh/tree/master/docs)
+- **Issues**: [https://github.com/Th0rgal/sandboxed.sh/issues](https://github.com/Th0rgal/sandboxed.sh/issues)
+- **Discussions**: [https://github.com/Th0rgal/sandboxed.sh/discussions](https://github.com/Th0rgal/sandboxed.sh/discussions)
 
 ## Summary
 

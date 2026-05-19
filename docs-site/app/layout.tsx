@@ -16,14 +16,14 @@ export const viewport: Viewport = {
 };
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://openagent.thomas.md"),
+  metadataBase: new URL("https://sandboxed.sh"),
   title: {
-    default: "Open Agent | Cloud Orchestrator for AI Coding Agents",
-    template: "%s | Open Agent",
+    default: "sandboxed.sh | Cloud Orchestrator for AI Coding Agents",
+    template: "%s | sandboxed.sh",
   },
   description:
-    "Self-hosted cloud orchestrator for AI coding agents (Claude Code & OpenCode). Mission orchestration, workspace management, and library sync.",
-  applicationName: "Open Agent",
+    "Self-hosted cloud orchestrator for AI coding agents (Claude Code, OpenCode, Codex, Gemini, and Grok). Mission orchestration, workspace management, and library sync.",
+  applicationName: "sandboxed.sh",
   generator: "Next.js",
   keywords: [
     "ai agent",
@@ -37,33 +37,33 @@ export const metadata: Metadata = {
   ],
   authors: [{ name: "Thomas Marchand", url: "https://thomas.md" }],
   creator: "Thomas Marchand",
-  publisher: "Open Agent",
+  publisher: "sandboxed.sh",
   robots: {
     index: true,
     follow: true,
   },
   twitter: {
     card: "summary_large_image",
-    title: "Open Agent",
+    title: "sandboxed.sh",
     description:
-      "Self-hosted cloud orchestrator for AI coding agents (Claude Code & OpenCode). Mission orchestration, workspace management, and library sync.",
+      "Self-hosted cloud orchestrator for AI coding agents (Claude Code, OpenCode, Codex, Gemini, and Grok). Mission orchestration, workspace management, and library sync.",
     creator: "@music_music_yo",
     images: ["/og-image.png"],
   },
   openGraph: {
     type: "website",
     locale: "en_US",
-    url: "https://openagent.thomas.md",
-    siteName: "Open Agent",
-    title: "Open Agent",
+    url: "https://sandboxed.sh",
+    siteName: "sandboxed.sh",
+    title: "sandboxed.sh",
     description:
-      "Self-hosted cloud orchestrator for AI coding agents (Claude Code & OpenCode). Mission orchestration, workspace management, and library sync.",
+      "Self-hosted cloud orchestrator for AI coding agents (Claude Code, OpenCode, Codex, Gemini, and Grok). Mission orchestration, workspace management, and library sync.",
     images: [
       {
         url: "/og-image.png",
         width: 1200,
         height: 630,
-        alt: "Open Agent - Cloud Orchestrator for AI Coding Agents",
+        alt: "sandboxed.sh - Cloud Orchestrator for AI Coding Agents",
       },
     ],
   },
@@ -74,7 +74,7 @@ export const metadata: Metadata = {
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
-    title: "Open Agent",
+    title: "sandboxed.sh",
   },
   other: {
     "msapplication-TileColor": "#0c0b0a",

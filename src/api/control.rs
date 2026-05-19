@@ -55,6 +55,15 @@ const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.
 /// CancelMission re-check to keep the two views of "stalled" consistent.
 const STUCK_SECONDS: u64 = 900;
 
+/// Grace period after the user first opens an `AwaitingUser` mission before
+/// the ack-promotion tick auto-archives it to `Acknowledged` (Finished).
+/// Resets whenever the user sends a new message (status returns to Active and
+/// `first_viewed_at` is cleared).
+const ACK_GRACE_SECONDS: u64 = 3600;
+
+/// How often the ack-promotion tick scans for stale `AwaitingUser` missions.
+const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
 pub(super) fn safe_truncate_index(s: &str, max: usize) -> usize {
     if s.len() <= max {
@@ -278,10 +287,12 @@ fn is_terminal_mission_status(status: &MissionStatus) -> bool {
     matches!(
         status,
         MissionStatus::Completed
+            | MissionStatus::Acknowledged
             | MissionStatus::Failed
             | MissionStatus::Interrupted
             | MissionStatus::Blocked
             | MissionStatus::NotFeasible
+            | MissionStatus::AwaitingUser
     )
 }
 
@@ -2272,6 +2283,16 @@ pub(crate) fn resolve_gemini_default_model() -> String {
     "gemini-3.1-pro-preview".to_string()
 }
 
+/// Return the default model for Grok Build when no override is specified.
+///
+/// Mirrors the dashboard's `KNOWN_BACKEND_DEFAULT_MODELS` entry for grok and
+/// the value advertised by `/api/providers` for xAI. Pinning here prevents
+/// grok missions from inheriting the global `DEFAULT_MODEL`
+/// (e.g. `anthropic/claude-opus-4-6`) which grok rejects as "unknown model id".
+pub(crate) fn resolve_grok_default_model() -> String {
+    "grok-build".to_string()
+}
+
 async fn close_mission_desktop_sessions(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
@@ -2323,6 +2344,12 @@ async fn close_mission_desktop_sessions(
 #[derive(Debug, Clone, Deserialize)]
 pub struct ControlMessageRequest {
     pub content: String,
+    /// Client-generated idempotency key for the send action. When present,
+    /// the backend uses it as the message id and ignores duplicate commands
+    /// with the same id, so a slow/lost POST response can be retried without
+    /// creating two user messages.
+    #[serde(default)]
+    pub client_message_id: Option<Uuid>,
     /// Optional agent override for this specific message (e.g., from @agent mention)
     #[serde(default)]
     pub agent: Option<String>,
@@ -2743,7 +2770,7 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
     },
-    /// Session ID update (for backends like Amp that generate their own session IDs)
+    /// Session ID update (for backends that generate their own session IDs)
     SessionIdUpdate {
         /// The new session ID to use for continuation
         session_id: String,
@@ -3012,6 +3039,12 @@ pub enum MissionStatus {
     /// Mission created but hasn't received any messages yet
     Pending,
     Active,
+    /// Agent's turn / automation cycle finished cleanly with no follow-up
+    /// queued; mission is parked waiting for the user to read it.
+    AwaitingUser,
+    /// User opened the mission while it was AwaitingUser and the ack grace
+    /// period elapsed without a new message — mission is auto-archived.
+    Acknowledged,
     Completed,
     Failed,
     /// Mission was interrupted (server shutdown, cancellation, etc.)
@@ -3027,6 +3060,8 @@ impl std::fmt::Display for MissionStatus {
         match self {
             Self::Pending => write!(f, "pending"),
             Self::Active => write!(f, "active"),
+            Self::AwaitingUser => write!(f, "awaiting_user"),
+            Self::Acknowledged => write!(f, "acknowledged"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
             Self::Blocked => write!(f, "blocked"),
@@ -3151,6 +3186,17 @@ impl Default for FrontendToolHub {
 pub struct ControlState {
     pub cmd_tx: mpsc::Sender<ControlCommand>,
     pub events_tx: broadcast::Sender<AgentEvent>,
+    /// P3-#20: per-mission broadcast channels. A fan-out task subscribed
+    /// to `events_tx` mirrors each `AgentEvent` with a non-empty
+    /// `mission_id()` into the matching per-mission channel here.
+    /// SSE/WS clients with a mission filter subscribe directly to the
+    /// per-mission channel and avoid receiving — and filtering out —
+    /// events for missions they don't care about. The HashMap entry is
+    /// created lazily on first subscribe and never garbage-collected
+    /// because a long-running mission may have intermittent subscribers
+    /// over its lifetime; the cost per entry is one Sender<Arc<…>>.
+    pub mission_channels:
+        Arc<RwLock<std::collections::HashMap<Uuid, broadcast::Sender<AgentEvent>>>>,
     pub tool_hub: Arc<FrontendToolHub>,
     pub status: Arc<RwLock<ControlStatus>>,
     /// Current mission ID (if any) - primary mission in the old sequential model
@@ -3377,7 +3423,7 @@ pub async fn post_message(
         return Err((StatusCode::BAD_REQUEST, "content is required".to_string()));
     }
 
-    let id = Uuid::new_v4();
+    let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
     let control = control_for_user(&state, &user).await;
@@ -4107,10 +4153,11 @@ pub async fn create_mission(
     };
 
     // Validate agent exists before creating mission (fail fast with clear error)
-    // Skip validation for Claude Code, Amp, Codex, and Gemini - they have their own built-in agents
+    // Skip validation for Claude Code, Codex, Gemini, and Grok - they have their own built-in agents
     if let Some(ref agent_name) = agent {
         let backend_id = backend.as_deref();
-        let skip_validation = matches!(backend_id, Some("claudecode" | "amp" | "codex" | "gemini"));
+        let skip_validation =
+            matches!(backend_id, Some("claudecode" | "codex" | "gemini" | "grok"));
         if !skip_validation {
             super::library::validate_agent_exists(
                 &state,
@@ -4224,9 +4271,6 @@ pub async fn update_mission_settings(
     if backend_changed && model_effort.is_none() {
         model_effort = Some(None);
     }
-    if effective_backend == "amp" {
-        model_override = Some(None);
-    }
     if !matches!(effective_backend.as_str(), "codex" | "claudecode") {
         model_effort = Some(None);
     }
@@ -4253,7 +4297,7 @@ pub async fn update_mission_settings(
     if let Some(ref agent_name) = effective_agent {
         let skip_validation = matches!(
             effective_backend.as_str(),
-            "claudecode" | "amp" | "codex" | "gemini"
+            "claudecode" | "codex" | "gemini" | "grok"
         );
         if !skip_validation {
             super::library::validate_agent_exists(
@@ -4363,6 +4407,40 @@ pub async fn load_mission(
             (StatusCode::INTERNAL_SERVER_ERROR, e)
         }
     })
+}
+
+/// Record that the user opened this mission for the first time since it last
+/// entered `AwaitingUser`. Sets `first_viewed_at` to now (no-op if already set)
+/// and broadcasts a `MissionStatusChanged` event so other clients can render
+/// the "opened" dot. The dashboard and iOS clients call this from their
+/// mission-detail entry points; the periodic ack-promotion tick uses the
+/// timestamp to decide when to move the mission to `Acknowledged`.
+pub async fn mark_mission_opened(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let now = chrono::Utc::now().to_rfc3339();
+    let newly_set = control
+        .mission_store
+        .set_mission_first_viewed_at_if_unset(id, &now)
+        .await
+        .map_err(internal_error)?;
+    let mission = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
+    if newly_set.is_some() {
+        let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+            mission_id: id,
+            status: mission.status,
+            summary: None,
+        });
+    }
+    Ok(Json(mission))
 }
 
 /// Set mission status (completed/failed).
@@ -4496,7 +4574,21 @@ pub async fn get_progress(
     Json(progress)
 }
 
-/// Query params for events endpoint.
+/// Query params for the unified mission events endpoint (P3-#18).
+///
+/// `GET /api/control/missions/:id/events` is the canonical cursor
+/// endpoint for fetching persisted events. With `since_seq=N` it
+/// returns events strictly after sequence N (forward delta — what
+/// SSE reconnect uses). With `before_seq=N` it pages backwards. With
+/// `types=tool_call,tool_result` it filters to a subset (replaces
+/// `/trace`). With `types=user_message,assistant_message,thinking,...`
+/// + a high `limit` it returns the full transcript shape.
+///
+/// `/trace` and `/transcript` remain as thin alias handlers for
+/// backward compatibility with iOS clients on older binaries — both
+/// forward to the same `mission_store.list_events` call. Document
+/// the migration: new clients should use `/events?since_seq=N`
+/// exclusively.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GetEventsQuery {
     /// Comma-separated event types to filter (e.g., "tool_call,tool_result")
@@ -4538,6 +4630,7 @@ pub async fn get_mission_events(
     Path(mission_id): Path<Uuid>,
     axum::extract::Query(query): axum::extract::Query<GetEventsQuery>,
 ) -> Result<Response, (StatusCode, String)> {
+    state.control_metrics.record_events_request();
     let control = control_for_user(&state, &user).await;
 
     // Check mission exists
@@ -4628,6 +4721,231 @@ pub async fn get_mission_events(
     Ok(response)
 }
 
+const TRANSCRIPT_EVENT_TYPES: &[&str] = &["user_message", "assistant_message"];
+const TRACE_EVENT_TYPES: &[&str] = &[
+    "thinking",
+    "tool_call",
+    "tool_result",
+    "text_delta",
+    "error",
+    "phase",
+    "status",
+];
+
+fn event_visibility(event_type: &str) -> &'static str {
+    match event_type {
+        "user_message" | "assistant_message" | "mission_status_changed" => "transcript",
+        "thinking" | "tool_call" | "tool_result" | "text_delta" | "phase" | "status" | "error" => {
+            "trace"
+        }
+        _ => "debug",
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TranscriptMessage {
+    #[serde(flatten)]
+    pub event: mission_store::StoredEvent,
+    /// Count of non-transcript events after the previous transcript row and
+    /// before this row. Lets clients reserve a Thinking/Activity affordance
+    /// without downloading the trace on the first mission paint.
+    pub trace_count: usize,
+    pub trace_summary: HashMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MissionTranscriptResponse {
+    pub mission: Mission,
+    pub messages: Vec<TranscriptMessage>,
+    pub event_counts: HashMap<String, usize>,
+    pub visibility_counts: HashMap<String, usize>,
+    pub latest_sequence: i64,
+}
+
+async fn event_count_map(
+    store: &(dyn MissionStore + Send + Sync),
+    mission_id: Uuid,
+    event_types: &[&str],
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for event_type in event_types {
+        if let Ok(count) = store.count_events(mission_id, Some(&[*event_type])).await {
+            counts.insert((*event_type).to_string(), count);
+        }
+    }
+    counts
+}
+
+fn trace_summary_between(
+    trace_events: &[mission_store::StoredEvent],
+    after_sequence: i64,
+    before_sequence: i64,
+) -> HashMap<String, usize> {
+    let mut summary = HashMap::new();
+    for event in trace_events {
+        if event.sequence > after_sequence && event.sequence < before_sequence {
+            *summary.entry(event.event_type.clone()).or_insert(0) += 1;
+        }
+    }
+    summary
+}
+
+/// Lightweight initial mission payload: final chat transcript only, plus event
+/// counts/cursors so clients can fetch the hidden activity trace afterward.
+pub async fn get_mission_transcript(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+) -> Result<Json<MissionTranscriptResponse>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mut mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "Mission not found".to_string()))?;
+
+    if let Some(workspace) = state.workspaces.get(mission.workspace_id).await {
+        mission.workspace_name = Some(workspace.name);
+    }
+
+    let transcript_events = control
+        .mission_store
+        .get_events(mission_id, Some(TRANSCRIPT_EVENT_TYPES), None, None)
+        .await
+        .map_err(internal_error)?;
+    let trace_events = control
+        .mission_store
+        .get_events(mission_id, Some(TRACE_EVENT_TYPES), None, None)
+        .await
+        .map_err(internal_error)?;
+    let latest_sequence = control
+        .mission_store
+        .max_event_sequence(mission_id)
+        .await
+        .map_err(internal_error)?;
+
+    let mut previous_transcript_sequence = 0;
+    let mut messages = Vec::with_capacity(transcript_events.len());
+    for event in transcript_events {
+        let trace_summary =
+            trace_summary_between(&trace_events, previous_transcript_sequence, event.sequence);
+        let trace_count = trace_summary.values().sum();
+        previous_transcript_sequence = event.sequence;
+        messages.push(TranscriptMessage {
+            event,
+            trace_count,
+            trace_summary,
+        });
+    }
+
+    let mut known_types = Vec::new();
+    known_types.extend_from_slice(TRANSCRIPT_EVENT_TYPES);
+    known_types.extend_from_slice(TRACE_EVENT_TYPES);
+    known_types.push("mission_status_changed");
+    let event_counts = event_count_map(&*control.mission_store, mission_id, &known_types).await;
+
+    let mut visibility_counts: HashMap<String, usize> = HashMap::new();
+    for (event_type, count) in &event_counts {
+        *visibility_counts
+            .entry(event_visibility(event_type).to_string())
+            .or_insert(0) += *count;
+    }
+
+    Ok(Json(MissionTranscriptResponse {
+        mission,
+        messages,
+        event_counts,
+        visibility_counts,
+        latest_sequence,
+    }))
+}
+
+/// Deferred intermediate activity for a mission. This returns thoughts, tool
+/// calls/results, text deltas, and runtime/status events while keeping the
+/// first transcript request small.
+pub async fn get_mission_trace(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<GetEventsQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    state.control_metrics.record_events_request();
+    let control = control_for_user(&state, &user).await;
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?;
+    if mission.is_none() {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    }
+
+    let events = if let Some(before_seq) = query.before_seq {
+        control
+            .mission_store
+            .get_events_before(mission_id, before_seq, Some(TRACE_EVENT_TYPES), query.limit)
+            .await
+            .map_err(internal_error)?
+    } else if let Some(since_seq) = query.since_seq {
+        control
+            .mission_store
+            .get_events_since(mission_id, since_seq, Some(TRACE_EVENT_TYPES), query.limit)
+            .await
+            .map_err(internal_error)?
+    } else {
+        let offset = if query.latest.unwrap_or(false) {
+            if let Some(limit) = query.limit {
+                let total = control
+                    .mission_store
+                    .count_events(mission_id, Some(TRACE_EVENT_TYPES))
+                    .await
+                    .map_err(internal_error)?;
+                Some(total.saturating_sub(limit))
+            } else {
+                query.offset
+            }
+        } else {
+            query.offset
+        };
+        control
+            .mission_store
+            .get_events(mission_id, Some(TRACE_EVENT_TYPES), query.limit, offset)
+            .await
+            .map_err(internal_error)?
+    };
+
+    let total = control
+        .mission_store
+        .count_events(mission_id, Some(TRACE_EVENT_TYPES))
+        .await
+        .ok();
+    let max_seq = control
+        .mission_store
+        .max_event_sequence(mission_id)
+        .await
+        .ok();
+
+    let mut response = Json(events).into_response();
+    let headers = response.headers_mut();
+    if let Some(total) = total {
+        if let Ok(v) = header::HeaderValue::from_str(&total.to_string()) {
+            headers.insert("X-Total-Events", v);
+        }
+    }
+    if let Some(max_seq) = max_seq {
+        if let Ok(v) = header::HeaderValue::from_str(&max_seq.to_string()) {
+            headers.insert("X-Max-Sequence", v);
+        }
+    }
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        header::HeaderValue::from_static("X-Total-Events, X-Max-Sequence"),
+    );
+
+    Ok(response)
+}
+
 // ==================== Diagnostic Endpoints ====================
 
 /// Response for OpenCode diagnostic endpoint.
@@ -4669,9 +4987,30 @@ pub async fn list_running_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<super::mission_runner::RunningMissionInfo>>, (StatusCode, String)> {
+    state.control_metrics.record_running_request();
     let control = control_for_user(&state, &user).await;
     let running = get_running_missions(&control).await?;
     Ok(Json(running))
+}
+
+/// P0-#3: in-process metrics snapshot for perf validation.
+pub async fn get_control_metrics(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+) -> Json<super::control_metrics::MetricsSnapshot> {
+    Json(state.control_metrics.snapshot())
+}
+
+/// P5-#25: client telemetry sink. Dashboard POSTs here when its 5-second
+/// longtask budget breaches the 2s threshold so we can correlate freezes
+/// with mission shape (event count, heap).
+pub async fn post_control_telemetry_perf(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+    Json(report): Json<super::control_metrics::HealthReport>,
+) -> StatusCode {
+    state.control_metrics.record_health_report(report);
+    StatusCode::ACCEPTED
 }
 
 /// Request body for starting a mission in parallel.
@@ -4851,17 +5190,48 @@ pub async fn cleanup_empty_missions(
 }
 
 /// Stream control session events via SSE.
+#[derive(Debug, Deserialize)]
+pub struct StreamQuery {
+    /// Optional mission filter. When set, the server only emits events whose
+    /// `mission_id` matches (plus the connection-scoped `status` /
+    /// `stream_lagged` events the dashboard relies on). Cuts cross-mission
+    /// noise to zero for a focused tab. Omit the param to receive every
+    /// event the user can see (used by the mission list / debug overlay).
+    #[serde(default)]
+    pub mission: Option<Uuid>,
+}
+
 pub async fn stream(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    axum::extract::Query(query): axum::extract::Query<StreamQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
+    let mission_filter = query.mission;
+    // P3-#20: when a mission filter is set, subscribe to that mission's
+    // dedicated channel — the fan-out task in spawn_control_session
+    // mirrors events from the global tx into per-mission txs. Avoids
+    // every connected SSE client iterating all events for missions
+    // they don't care about. Status events are connection-scoped so we
+    // *also* subscribe to the global channel and merge both streams
+    // for the duration of the connection.
     let mut rx = control.events_tx.subscribe();
+    let mut mission_rx = if let Some(mid) = mission_filter {
+        let mut map = control.mission_channels.write().await;
+        let entry = map.entry(mid).or_insert_with(|| {
+            let (tx, _rx) = broadcast::channel::<AgentEvent>(8192);
+            tx
+        });
+        Some(entry.subscribe())
+    } else {
+        None
+    };
     let stream_id = Uuid::new_v4();
     tracing::info!(
         stream_id = %stream_id,
         user_id = %user.id,
         username = %user.username,
+        mission_filter = ?mission_filter,
         "Control SSE stream opened"
     );
 
@@ -4890,6 +5260,10 @@ pub async fn stream(
         user_id: user.id.clone(),
         username: user.username.clone(),
     };
+
+    // Clone the metrics Arc into the stream closure so we can record
+    // each delivered chunk + per-mission broadcast count (P0-#3).
+    let metrics = state.control_metrics.clone();
 
     let stream = async_stream::stream! {
         let _guard = drop_guard;
@@ -4923,10 +5297,97 @@ pub async fn stream(
                         break;
                     }
                 }
+                // P3-#20: read from either the per-mission channel (when
+                // a mission filter is set) or the global broadcast (when
+                // it isn't). The select arm using `as_mut().unwrap()` is
+                // guarded by the `if mission_rx.is_some()` precondition
+                // so the unwrap can't panic; tokio::select treats false
+                // preconditions as disabled arms.
+                ev_result = async {
+                    match mission_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if mission_rx.is_some() => {
+                    match ev_result {
+                        Ok(ev) => {
+                            let mission_id = ev.mission_id();
+                            // Per-mission channel only carries events that
+                            // already match the filter (the fan-out task
+                            // is the gate); no further filtering needed.
+                            match &ev {
+                                AgentEvent::Thinking { .. } => {
+                                    tracing::trace!(
+                                        stream_id = %stream_id,
+                                        event = %ev.event_name(),
+                                        mission_id = ?mission_id,
+                                        "Control SSE event (per-mission)"
+                                    );
+                                }
+                                _ => {
+                                    tracing::debug!(
+                                        stream_id = %stream_id,
+                                        event = %ev.event_name(),
+                                        mission_id = ?mission_id,
+                                        "Control SSE event (per-mission)"
+                                    );
+                                }
+                            }
+                            match serde_json::to_string(&ev) {
+                                Ok(payload) => {
+                                    metrics.record_sse_chunk(payload.len());
+                                    metrics.record_broadcast(mission_id);
+                                    yield Ok(Event::default()
+                                        .event(ev.event_name())
+                                        .data(payload));
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        stream_id = %stream_id,
+                                        event = %ev.event_name(),
+                                        error = %e,
+                                        "Failed to serialize SSE event; dropping"
+                                    );
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            tracing::warn!(stream_id = %stream_id, dropped, "Per-mission SSE lagged");
+                            match Event::default()
+                                .event("stream_lagged")
+                                .json_data(serde_json::json!({ "dropped": dropped }))
+                            {
+                                Ok(sse) => yield Ok(sse),
+                                Err(_) => {}
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
                 result = rx.recv() => {
                     match result {
                         Ok(ev) => {
                             let mission_id = ev.mission_id();
+                            // When a per-mission channel is active, the
+                            // global arm only forwards connection-scoped
+                            // events (Status, FidoSignRequest). Per-mission
+                            // payloads are delivered above via the dedicated
+                            // channel.
+                            if mission_rx.is_some() {
+                                let is_status = matches!(&ev, AgentEvent::Status { .. });
+                                let is_fido = matches!(&ev, AgentEvent::FidoSignRequest { .. });
+                                if !is_status && !is_fido {
+                                    continue;
+                                }
+                            } else if let Some(filter) = mission_filter {
+                                // Fallback: per-mission channel not present
+                                // (e.g. first-event race). Apply the P1-#4
+                                // filter directly.
+                                let is_status = matches!(&ev, AgentEvent::Status { .. });
+                                if !is_status && mission_id != Some(filter) {
+                                    continue;
+                                }
+                            }
                             match &ev {
                                 AgentEvent::Thinking { .. } => {
                                     tracing::trace!(
@@ -4945,8 +5406,19 @@ pub async fn stream(
                                     );
                                 }
                             }
-                            match Event::default().event(ev.event_name()).json_data(&ev) {
-                                Ok(sse) => yield Ok(sse),
+                            // Serialize once so we can both ship the SSE
+                            // frame and record an accurate byte count for
+                            // the metrics endpoint (P0-#3). The payload
+                            // size approximates the on-the-wire chunk
+                            // length closely enough for p50/p99 use.
+                            match serde_json::to_string(&ev) {
+                                Ok(payload) => {
+                                    metrics.record_sse_chunk(payload.len());
+                                    metrics.record_broadcast(mission_id);
+                                    yield Ok(Event::default()
+                                        .event(ev.event_name())
+                                        .data(payload));
+                                }
                                 Err(e) => {
                                     tracing::error!(
                                         stream_id = %stream_id,
@@ -4957,26 +5429,41 @@ pub async fn stream(
                                 }
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            // This receiver's cursor slipped behind the
+                            // broadcast buffer's tail by `dropped` events.
+                            // The stream itself is still alive — `recv()`
+                            // will keep yielding fresh events on the next
+                            // tick — so we deliberately don't emit an
+                            // `error` event here. The dashboard treats
+                            // `error` as fatal (red toast + system-error
+                            // row in the chat) and it caused a confusing
+                            // user-facing alert every time a chatty
+                            // mission (text_delta burst, big tool result)
+                            // outpaced the browser tab's event handler.
+                            //
+                            // Instead, emit a distinct `stream_lagged`
+                            // event with the dropped count. The dashboard
+                            // reacts by silently refetching the viewing
+                            // mission via the existing `since_seq` path
+                            // so any dropped events are recovered from
+                            // the database. No user toast, no chat
+                            // pollution.
                             tracing::warn!(
                                 stream_id = %stream_id,
-                                "Control SSE stream lagged; events dropped"
+                                dropped = dropped,
+                                "Control SSE stream lagged; signalling client refetch"
                             );
                             match Event::default()
-                                .event("error")
-                                .json_data(AgentEvent::Error {
-                                    message:
-                                        "event stream lagged; some events were dropped"
-                                            .to_string(),
-                                    mission_id: None,
-                                    resumable: false,
-                                }) {
+                                .event("stream_lagged")
+                                .json_data(serde_json::json!({ "dropped": dropped }))
+                            {
                                 Ok(sse) => yield Ok(sse),
                                 Err(e) => {
                                     tracing::error!(
                                         stream_id = %stream_id,
                                         error = %e,
-                                        "Failed to serialize SSE lag error event"
+                                        "Failed to serialize SSE stream_lagged event"
                                     );
                                 }
                             }
@@ -5013,7 +5500,13 @@ fn spawn_control_session(
     telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
-    let (events_tx, events_rx) = broadcast::channel::<AgentEvent>(1024);
+    // 8 192 slots ≈ ~8 s of headroom even for chatty missions (text_delta
+    // bursts during long completions push ~1 k events / sec). The previous
+    // 1 024 cap regularly overflowed for any tab whose JS event handler
+    // momentarily slowed (large React reducer work, tab backgrounded by
+    // Chrome). Per-receiver cursor + Arc<AgentEvent> internal layout keeps
+    // the memory cost bounded.
+    let (events_tx, events_rx) = broadcast::channel::<AgentEvent>(8192);
     let tool_hub = Arc::new(FrontendToolHub::new());
     let status = Arc::new(RwLock::new(ControlStatus {
         state: ControlRunState::Idle,
@@ -5033,9 +5526,42 @@ fn spawn_control_session(
     let max_parallel =
         crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
 
+    let mission_channels: Arc<
+        RwLock<std::collections::HashMap<Uuid, broadcast::Sender<AgentEvent>>>,
+    > = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+    // P3-#20 fan-out task: subscribe to the global channel and mirror
+    // every event into its per-mission channel. Lives for the process
+    // lifetime; closes cleanly when the channel ends. Keeps the cost
+    // out of every send-site so existing `events_tx.send()` calls
+    // don't need to know about the per-mission split.
+    {
+        let mut rx = events_tx.subscribe();
+        let mission_channels = Arc::clone(&mission_channels);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        let Some(mid) = ev.mission_id() else { continue };
+                        let sender = {
+                            let map = mission_channels.read().await;
+                            map.get(&mid).cloned()
+                        };
+                        if let Some(sender) = sender {
+                            let _ = sender.send(ev);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     let state = ControlState {
         cmd_tx,
         events_tx: events_tx.clone(),
+        mission_channels,
         tool_hub: Arc::clone(&tool_hub),
         status: Arc::clone(&status),
         current_mission: Arc::clone(&current_mission),
@@ -5108,6 +5634,10 @@ fn spawn_control_session(
             state.cmd_tx.clone(),
             events_tx.clone(),
         ));
+        tokio::spawn(ack_promotion_loop(
+            Arc::clone(&state.mission_store),
+            events_tx.clone(),
+        ));
     }
 
     // Spawn event logger task (logs all events to SQLite for debugging/replay)
@@ -5147,6 +5677,17 @@ fn spawn_control_session(
                 }
             }
             tracing::info!("Event logger task stopped");
+        });
+    }
+
+    // Spawn native-loop observer: turns harness goal events into
+    // Automation rows + AutomationExecution iterations so the
+    // automations panel shows /goal alongside scheduled automations.
+    if state.mission_store.is_persistent() && config.automations_enabled {
+        let store = Arc::clone(&state.mission_store);
+        let tx = state.events_tx.clone();
+        tokio::spawn(async move {
+            super::native_loop_observer::run(store, tx).await;
         });
     }
 
@@ -5400,6 +5941,41 @@ async fn cleanup_stale_active_missions_once(
 ///
 /// Threshold is intentionally generous (15 min) so a model in the
 /// middle of a slow API turn or a long shell command isn't false-killed.
+/// Periodic ack-promotion: scans `AwaitingUser` missions whose
+/// `first_viewed_at` is older than `ACK_GRACE_SECONDS` and flips them to
+/// `Acknowledged`. Broadcasts `MissionStatusChanged` so dashboard/iOS clients
+/// move the row from "Needs You" to "Finished" without a refresh.
+async fn ack_promotion_loop(
+    mission_store: Arc<dyn MissionStore>,
+    events_tx: broadcast::Sender<AgentEvent>,
+) {
+    tracing::info!(
+        "Ack-promotion loop started: grace {}s, tick {}s",
+        ACK_GRACE_SECONDS,
+        ACK_PROMOTION_TICK_INTERVAL.as_secs()
+    );
+    loop {
+        tokio::time::sleep(ACK_PROMOTION_TICK_INTERVAL).await;
+        match mission_store
+            .acknowledge_stale_awaiting_user_missions(ACK_GRACE_SECONDS)
+            .await
+        {
+            Ok(promoted) => {
+                for mission_id in promoted {
+                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                        mission_id,
+                        status: MissionStatus::Acknowledged,
+                        summary: None,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Ack-promotion tick failed: {}", e);
+            }
+        }
+    }
+}
+
 async fn stuck_mission_watchdog_loop(
     mission_store: Arc<dyn MissionStore>,
     cmd_tx: mpsc::Sender<ControlCommand>,
@@ -5938,6 +6514,12 @@ async fn automation_scheduler_loop(
                     }
                 }
                 CommandSource::Inline { content } => content.clone(),
+                CommandSource::NativeLoop { .. } => {
+                    // Harness-driven loops iterate via the harness CLI itself,
+                    // not the OA scheduler. Skip — the native_loop_observer
+                    // records executions when the harness emits goal events.
+                    continue;
+                }
             };
 
             // Build substitution context for variable replacement
@@ -6181,6 +6763,7 @@ async fn resolve_automation_command(
             tokio::fs::read_to_string(ws.path.join(path)).await.ok()?
         }
         CommandSource::Inline { content } => content.clone(),
+        CommandSource::NativeLoop { .. } => return None,
     };
 
     let mut context = SubstitutionContext::new(mission.id);
@@ -6215,6 +6798,219 @@ fn enqueue_agent_finished_messages(
     }
 }
 
+/// Backend id for a mission, or `None` if the mission isn't found.
+///
+/// Used by [`maybe_begin_grok_goal`] / [`post_turn_handle_grok_goal`] to
+/// gate the `/goal` loop behavior on backend identity without having to
+/// thread the backend id through every queue-dispatch path.
+async fn lookup_mission_backend(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+) -> Option<String> {
+    match mission_store.get_mission(mission_id).await {
+        Ok(Some(m)) => Some(m.backend),
+        _ => None,
+    }
+}
+
+/// Outcome of [`maybe_begin_grok_goal`]: either a rewritten first-turn
+/// prompt (the message should now carry this content) or a user-facing
+/// error to surface in the message ack.
+pub(crate) enum GrokGoalKickoff {
+    /// Not a grok-goal request; queue the original content unchanged.
+    Passthrough,
+    /// `/goal X` accepted; queue `prompt` (the wrapped first-turn prompt)
+    /// in place of the original message content.
+    Rewritten { prompt: String },
+    /// `/goal X` rejected — surface this string to the user.
+    Rejected { reason: String },
+}
+
+/// Detect `/goal <objective>` for a grok mission and, if recognised,
+/// create the AgentFinished-driven automation row that will iterate the
+/// loop. Returns the wrapped first-turn prompt to use in place of the
+/// raw `/goal X` message.
+///
+/// Non-grok backends fall through unchanged — claudecode and codex have
+/// their own `/goal` handling (CLI-native and `thread/goal/set`
+/// respectively); only grok needs sandboxed.sh to drive iteration.
+async fn maybe_begin_grok_goal(
+    mission_store: &Arc<dyn MissionStore>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    mission_id: Option<Uuid>,
+    content: &str,
+) -> GrokGoalKickoff {
+    let (is_goal, objective) = super::grok_goal::parse_goal_prefix(content);
+    if !is_goal {
+        return GrokGoalKickoff::Passthrough;
+    }
+    let Some(mid) = mission_id else {
+        // No target mission resolved yet (auto-create path) — let the
+        // normal flow create a mission, then we'll catch the next turn.
+        // For now treat as passthrough; the user can re-send `/goal X`
+        // once the mission exists. This avoids a chicken/egg with
+        // mission creation happening *after* this hook.
+        return GrokGoalKickoff::Passthrough;
+    };
+    if !matches!(
+        lookup_mission_backend(mission_store, mid).await.as_deref(),
+        Some("grok")
+    ) {
+        return GrokGoalKickoff::Passthrough;
+    }
+    if objective.is_empty() {
+        return GrokGoalKickoff::Rejected {
+            reason: "/goal requires an objective (e.g. `/goal write the docs`)".to_string(),
+        };
+    }
+    if super::grok_goal::active_goal_for_mission(mission_store, mid)
+        .await
+        .is_some()
+    {
+        return GrokGoalKickoff::Rejected {
+            reason: "this mission already has an active /goal loop — wait for it to finish or cancel before starting a new one".to_string(),
+        };
+    }
+    if let Err(e) = super::grok_goal::create_goal_automation(mission_store, mid, &objective).await {
+        tracing::warn!(
+            "grok_goal: failed to create automation for mission {}: {}",
+            mid,
+            e
+        );
+        return GrokGoalKickoff::Rejected {
+            reason: format!("failed to set up /goal loop: {}", e),
+        };
+    }
+    tracing::info!(
+        mission_id = %mid,
+        objective_len = objective.len(),
+        "grok_goal: started loop"
+    );
+    let _ = events_tx.send(AgentEvent::GoalIteration {
+        iteration: 1,
+        objective: objective.clone(),
+        mission_id: Some(mid),
+    });
+    GrokGoalKickoff::Rewritten {
+        prompt: super::grok_goal::first_turn_prompt(&objective),
+    }
+}
+
+/// Post-turn hook for grok-goal missions. Parses the sentinel from the
+/// assistant's final text and either ends the loop (terminal sentinel,
+/// budget exhausted, sentinel-missing streak, or explicit cancellation)
+/// or bumps the iteration counter so the existing AgentFinished hook
+/// re-fires the continuation prompt.
+///
+/// `terminal_reason` is the runner's structured exit reason. A `Cancelled`
+/// turn ends the loop immediately with status `aborted:cancelled` —
+/// otherwise the cancelled output (typically the literal string
+/// `"Cancelled"`) would look like a sentinel-missing turn and burn through
+/// the missing-count budget before the loop tore down.
+async fn post_turn_handle_grok_goal(
+    mission_store: &Arc<dyn MissionStore>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    mission_id: Uuid,
+    assistant_text: &str,
+    terminal_reason: Option<TerminalReason>,
+) {
+    let Some(mut row) = super::grok_goal::active_goal_for_mission(mission_store, mission_id).await
+    else {
+        return;
+    };
+    let objective = super::grok_goal::objective_of(&row);
+    let iteration = super::grok_goal::iteration_of(&row);
+    let prev_missing = super::grok_goal::missing_count_of(&row);
+
+    // Cancellation short-circuits sentinel parsing — there's no agent
+    // output to interpret and continuing the loop would re-fire prompts
+    // after the user explicitly stopped the mission.
+    if matches!(terminal_reason, Some(TerminalReason::Cancelled)) {
+        if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
+            tracing::warn!("grok_goal: disable_goal failed: {}", e);
+        }
+        let _ = events_tx.send(AgentEvent::GoalStatus {
+            status: "aborted:cancelled".to_string(),
+            objective,
+            mission_id: Some(mission_id),
+        });
+        return;
+    }
+
+    let sentinel = super::grok_goal::parse_goal_sentinel(assistant_text);
+    tracing::info!(
+        mission_id = %mission_id,
+        iteration,
+        prev_missing,
+        ?sentinel,
+        "grok_goal: post-turn sentinel"
+    );
+    match sentinel {
+        super::grok_goal::GoalSentinel::Complete => {
+            if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
+                tracing::warn!("grok_goal: disable_goal failed: {}", e);
+            }
+            let _ = events_tx.send(AgentEvent::GoalStatus {
+                status: "complete".to_string(),
+                objective,
+                mission_id: Some(mission_id),
+            });
+        }
+        super::grok_goal::GoalSentinel::Aborted { reason } => {
+            if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
+                tracing::warn!("grok_goal: disable_goal failed: {}", e);
+            }
+            let _ = events_tx.send(AgentEvent::GoalStatus {
+                status: format!("aborted:{}", reason),
+                objective,
+                mission_id: Some(mission_id),
+            });
+        }
+        super::grok_goal::GoalSentinel::Continue | super::grok_goal::GoalSentinel::Missing => {
+            let was_missing = matches!(sentinel, super::grok_goal::GoalSentinel::Missing);
+            let new_missing = if was_missing {
+                prev_missing.saturating_add(1)
+            } else {
+                0
+            };
+            if new_missing >= super::grok_goal::MAX_MISSING_SENTINELS {
+                if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
+                    tracing::warn!("grok_goal: disable_goal failed: {}", e);
+                }
+                let _ = events_tx.send(AgentEvent::GoalStatus {
+                    status: "aborted:no_goal_sentinel".to_string(),
+                    objective,
+                    mission_id: Some(mission_id),
+                });
+                return;
+            }
+            let next_iter = iteration.saturating_add(1);
+            if next_iter > super::grok_goal::MAX_ITERATIONS {
+                if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
+                    tracing::warn!("grok_goal: disable_goal failed: {}", e);
+                }
+                let _ = events_tx.send(AgentEvent::GoalStatus {
+                    status: "budget_limited".to_string(),
+                    objective,
+                    mission_id: Some(mission_id),
+                });
+                return;
+            }
+            if let Err(e) =
+                super::grok_goal::update_counters(mission_store, &mut row, next_iter, new_missing)
+                    .await
+            {
+                tracing::warn!("grok_goal: update_counters failed: {}", e);
+            }
+            let _ = events_tx.send(AgentEvent::GoalIteration {
+                iteration: next_iter,
+                objective,
+                mission_id: Some(mission_id),
+            });
+        }
+    }
+}
+
 fn queue_has_pending_target_mission(
     queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
     mission_id: Uuid,
@@ -6224,13 +7020,23 @@ fn queue_has_pending_target_mission(
         .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id))
 }
 
+fn accept_user_message_id(accepted: &mut HashSet<Uuid>, id: Uuid) -> bool {
+    accepted.insert(id)
+}
+
 fn mission_status_for_terminal_reason(
     reason: TerminalReason,
     complete_turn_without_follow_up: bool,
 ) -> Option<(MissionStatus, &'static str)> {
     match reason {
         TerminalReason::TurnComplete if complete_turn_without_follow_up => {
-            Some((MissionStatus::Completed, "completed"))
+            // Agent finished its turn cleanly and there is no queued follow-up
+            // message or scheduled wakeup — the mission is parked waiting for
+            // the user to read it. The dashboard / iOS clients surface this in
+            // the "Needs You" column. An explicit `TerminalReason::Completed`
+            // (the path below) is used when the agent declares the work fully
+            // done, not just a turn boundary.
+            Some((MissionStatus::AwaitingUser, "turn_complete"))
         }
         TerminalReason::TurnComplete => None,
         TerminalReason::Completed => Some((MissionStatus::Completed, "completed")),
@@ -6377,6 +7183,15 @@ fn is_bare_llm_error_output(output: &str) -> bool {
             && (normalized.contains("api error: 401")
                 || normalized.contains("api error: 403")
                 || normalized.contains("api error: 407")))
+        // Codex / ChatGPT-OAuth refresh-token reuse surfaces as a short
+        // user-visible string. Without these the soft-error recovery
+        // fake-promoted the mission to TurnComplete after rotation had
+        // already exhausted every configured account, hiding the real
+        // failure from the UI.
+        || (normalized.len() < 400
+            && (normalized.contains("refresh token was already used")
+                || normalized.contains("refresh_token_reused")
+                || normalized.contains("please log out and sign in again")))
 }
 
 fn looks_like_structured_provider_error(output: &str) -> bool {
@@ -6708,6 +7523,12 @@ async fn agent_finished_automation_messages(
                 }
             }
             CommandSource::Inline { content } => content.clone(),
+            CommandSource::NativeLoop { .. } => {
+                // Harness-driven loops iterate via the harness CLI itself.
+                // Skip — the native_loop_observer records executions when
+                // the harness emits goal events.
+                continue;
+            }
         };
 
         // Build substitution context for variable replacement
@@ -6818,6 +7639,12 @@ async fn control_actor_loop(
     let mut main_runner_last_activity: std::time::Instant = std::time::Instant::now();
     // Track current activity label for the main runner
     let mut main_runner_activity: Option<String> = None;
+    // Idempotency guard for user sends. The dashboard may retry a POST if a
+    // weak connection drops after the command reached this actor but before
+    // the HTTP response got back. Since the client can now provide the UUID,
+    // ignore repeated commands with the same id instead of queueing/running
+    // the same user message twice.
+    let mut accepted_user_message_ids: HashSet<Uuid> = HashSet::new();
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
     // Track number of in-flight tool calls on the main runner so the stall
@@ -7017,6 +7844,12 @@ async fn control_actor_loop(
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, respond } => {
+                        if !accept_user_message_id(&mut accepted_user_message_ids, id) {
+                            let status_snapshot = status.read().await;
+                            let _ = respond.send(status_snapshot.state != ControlRunState::Idle);
+                            continue;
+                        }
+
                         // Smart routing: decide where to send this message based on target_mission_id
                         // and what's currently running.
 
@@ -7054,6 +7887,36 @@ async fn control_actor_loop(
                         let target_is_main = effective_target
                             .map(|tid| main_mission_id == Some(tid))
                             .unwrap_or(true); // No target = use main
+
+                        // Grok `/goal <objective>` kickoff: rewrite the message
+                        // to the wrapped first-turn prompt and create the
+                        // AgentFinished automation row that will drive the
+                        // loop. Non-grok backends and non-/goal messages fall
+                        // through unchanged. See `api/grok_goal.rs`.
+                        let goal_target_mission = effective_target.or(main_mission_id);
+                        let mut content = content;
+                        match maybe_begin_grok_goal(
+                            &mission_store,
+                            &events_tx,
+                            goal_target_mission,
+                            &content,
+                        )
+                        .await
+                        {
+                            GrokGoalKickoff::Passthrough => {}
+                            GrokGoalKickoff::Rewritten { prompt } => {
+                                content = prompt;
+                            }
+                            GrokGoalKickoff::Rejected { reason } => {
+                                let _ = events_tx.send(AgentEvent::Error {
+                                    message: reason,
+                                    mission_id: goal_target_mission,
+                                    resumable: true,
+                                });
+                                let _ = respond.send(false);
+                                continue;
+                            }
+                        }
 
                         // Case 1: Target is already running in parallel_runners - queue to it
                         if let Some(tid) = effective_target {
@@ -7130,6 +7993,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating parallel mission {} (was {})",
@@ -7239,6 +8104,8 @@ async fn control_actor_loop(
                                                 | MissionStatus::Blocked
                                                 | MissionStatus::Completed
                                                 | MissionStatus::Failed
+                                                | MissionStatus::AwaitingUser
+                                                | MissionStatus::Acknowledged
                                         ) {
                                             tracing::info!(
                                                 "Activating main mission {} (was {})",
@@ -7285,6 +8152,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating switched mission {} (was {})",
@@ -7326,6 +8195,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating reloaded mission {} (was {})",
@@ -7424,6 +8295,8 @@ async fn control_actor_loop(
                                                     | MissionStatus::Blocked
                                                     | MissionStatus::Completed
                                                     | MissionStatus::Failed
+                                                    | MissionStatus::AwaitingUser
+                                                    | MissionStatus::Acknowledged
                                             ) {
                                                 tracing::info!(
                                                     "Activating mission {} (was {})",
@@ -8552,10 +9425,16 @@ async fn control_actor_loop(
                     // Runner cleared itself; cancel the force-clear watchdog.
                     runner_force_clear_deadline = None;
                     let mut completed_terminal_reason = None;
+                    // Captured for the post-turn `grok_goal` sentinel hook (see
+                    // `post_turn_handle_grok_goal`), which runs after this
+                    // `match` closes — `agent_result` itself is out of scope
+                    // by then. Empty string when the join errored.
+                    let mut completed_agent_output = String::new();
                     match res {
                         Ok((_mid, _user_msg, mut agent_result)) => {
                             maybe_recover_soft_llm_error(&mut agent_result);
                             completed_terminal_reason = agent_result.terminal_reason;
+                            completed_agent_output = agent_result.output.clone();
                             // Only append assistant to local history if this mission is still the current mission.
                             // Note: User message was already added before execution started.
                             // If the user created a new mission mid-execution, history was cleared for that new mission,
@@ -8787,6 +9666,27 @@ async fn control_actor_loop(
                         let already_queued_for_mission = queue
                             .iter()
                             .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id));
+
+                        // Grok `/goal` post-turn: parse the sentinel from the
+                        // assistant's last text and either disable the goal
+                        // automation (terminal sentinel / budget exhausted /
+                        // sentinel-missing streak) or bump the iteration
+                        // counter. Must run BEFORE
+                        // `agent_finished_automation_messages` so a Complete /
+                        // Aborted disable takes effect on this very turn —
+                        // otherwise the existing hook would still fire the
+                        // continuation. Skipped on transient infra failures
+                        // for the same reason regular automations are.
+                        if !is_transient_infra_failure {
+                            post_turn_handle_grok_goal(
+                                &mission_store,
+                                &events_tx,
+                                mission_id,
+                                &completed_agent_output,
+                                completed_terminal_reason,
+                            )
+                            .await;
+                        }
                         if !already_queued_for_mission && !is_transient_infra_failure {
                             // Small delay so the UI can display the completion before restarting.
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -9044,6 +9944,22 @@ async fn control_actor_loop(
                                     | Some(TerminalReason::CapacityLimited)
                             );
                             let was_queue_empty = runner.queue.is_empty();
+                            // Grok /goal sentinel hook for the parallel-runner
+                            // path. Same contract as the main-session hook
+                            // above: runs before the AgentFinished automations
+                            // so a terminal sentinel disables the loop on this
+                            // turn rather than after one extra continuation
+                            // fire. (See `post_turn_handle_grok_goal`.)
+                            if !is_transient_infra_failure {
+                                post_turn_handle_grok_goal(
+                                    &mission_store,
+                                    &events_tx,
+                                    *mission_id,
+                                    &result.output,
+                                    result.terminal_reason,
+                                )
+                                .await;
+                            }
                             if was_queue_empty && !is_transient_infra_failure {
                                 // Small delay so the UI can display the completion before restarting.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -9296,7 +10212,7 @@ async fn control_actor_loop(
                                 }
 
                                 // Desktop session detection from ToolCall.
-                                // Claude Code and Amp don't emit ToolResult for MCP tools,
+                                // Claude Code does not emit ToolResult for MCP tools,
                                 // so we detect the session start from the ToolCall and
                                 // spawn a background task to attribute Xvfb processes.
                                 let is_desktop_start = matches!(
@@ -9542,7 +10458,7 @@ async fn control_actor_loop(
                         }
                     }
 
-                    // Handle session ID updates (for backends like Amp that generate their own IDs)
+                    // Handle session ID updates for backends that generate their own IDs.
                     if let AgentEvent::SessionIdUpdate { mission_id, session_id } = &event {
                         if let Err(err) = mission_store
                             .update_mission_session_id(*mission_id, session_id)
@@ -9663,6 +10579,7 @@ async fn run_single_control_turn(
         && effective_config_profile.is_some()
         && requested_model.is_none())
         || (backend_id.as_deref() == Some("codex") && requested_model.is_none())
+        || (backend_id.as_deref() == Some("grok") && requested_model.is_none())
     {
         config.default_model = None;
     } else if backend_id.as_deref() == Some("gemini") && requested_model.is_none() {
@@ -10093,26 +11010,26 @@ async fn run_single_control_turn(
 
             result
         }
-        Some("amp") => {
-            let mid = match require_mission_id(mission_id, "Amp", &events_tx) {
+        Some("grok") => {
+            let mid = match require_mission_id(mission_id, "Grok Build", &events_tx) {
                 Ok(id) => id,
                 Err(r) => return r,
             };
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
-            let api_key = super::mission_runner::get_amp_api_key_from_config();
-            Box::pin(super::mission_runner::run_amp_turn(
+            Box::pin(super::mission_runner::run_grok_turn(
                 exec_workspace,
                 &ctx.working_dir,
                 &user_message,
-                config.opencode_agent.as_deref(), // mode (smart/rush)
+                requested_model
+                    .as_deref()
+                    .or(config.default_model.as_deref()),
                 mid,
                 events_tx.clone(),
                 cancel,
                 &config.working_dir,
                 session_id.as_deref(),
                 is_continuation,
-                api_key.as_deref(),
             ))
             .await
         }
@@ -10427,6 +11344,7 @@ pub async fn create_automation(
         last_triggered_at,
         retry_config: req.retry_config.unwrap_or_default(),
         consecutive_failures: 0,
+        driver: mission_store::AutomationDriver::Scheduler,
     };
 
     let mut automation = control
@@ -11658,6 +12576,12 @@ pub async fn webhook_receiver(
             }
         }
         CommandSource::Inline { content } => content.clone(),
+        CommandSource::NativeLoop { .. } => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Webhook triggers are not supported for native-loop automations".to_string(),
+            ));
+        }
     };
 
     // Apply webhook variable mappings
@@ -13001,6 +13925,7 @@ mod tests {
             stop_policy: mission_store::StopPolicy::Never,
             fresh_session,
             consecutive_failures: 0,
+            driver: mission_store::AutomationDriver::Scheduler,
         }
     }
 
@@ -15539,6 +16464,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -15569,6 +16495,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let strong_score = mission_search_relevance_score(
@@ -15614,6 +16541,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15656,6 +16584,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15698,6 +16627,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15740,6 +16670,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15866,6 +16797,7 @@ And the report:
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
+            first_viewed_at: None,
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {
@@ -16067,13 +16999,33 @@ Investigate <service/> failures.
     }
 
     #[test]
+    fn test_accept_user_message_id_rejects_duplicate_retry_id() {
+        let message_id = Uuid::new_v4();
+        let mut accepted = HashSet::new();
+
+        assert!(accept_user_message_id(&mut accepted, message_id));
+        assert!(!accept_user_message_id(&mut accepted, message_id));
+    }
+
+    #[test]
     fn test_mission_status_for_terminal_reason_defers_turn_complete_until_idle_finalization() {
+        // With a follow-up still queued/scheduled the mission stays whatever
+        // it was — the next turn will resolve its status.
         assert_eq!(
             mission_status_for_terminal_reason(TerminalReason::TurnComplete, false),
             None
         );
+        // No follow-up: the agent's turn ended cleanly and the mission is
+        // parked waiting for the user. The Needs-You bucket is keyed on
+        // exactly this state.
         assert_eq!(
             mission_status_for_terminal_reason(TerminalReason::TurnComplete, true),
+            Some((MissionStatus::AwaitingUser, "turn_complete"))
+        );
+        // Explicit agent-declared completion still maps to Completed (green
+        // in Finished), distinct from the auto AwaitingUser path above.
+        assert_eq!(
+            mission_status_for_terminal_reason(TerminalReason::Completed, true),
             Some((MissionStatus::Completed, "completed"))
         );
     }
@@ -16392,5 +17344,50 @@ Investigate <service/> failures.
         ));
         let files = validate_rich_tags(&tags, root, None, None).await;
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn transcript_visibility_categorizes_known_event_types() {
+        assert_eq!(event_visibility("user_message"), "transcript");
+        assert_eq!(event_visibility("assistant_message"), "transcript");
+        assert_eq!(event_visibility("mission_status_changed"), "transcript");
+        assert_eq!(event_visibility("thinking"), "trace");
+        assert_eq!(event_visibility("tool_call"), "trace");
+        assert_eq!(event_visibility("tool_result"), "trace");
+        assert_eq!(event_visibility("text_delta"), "trace");
+        assert_eq!(event_visibility("error"), "trace");
+        assert_eq!(event_visibility("raw_backend_packet"), "debug");
+    }
+
+    #[test]
+    fn transcript_trace_summary_counts_only_events_between_transcript_rows() {
+        let mission_id = Uuid::new_v4();
+        let event = |sequence, event_type: &str| mission_store::StoredEvent {
+            id: sequence,
+            mission_id,
+            sequence,
+            event_type: event_type.to_string(),
+            timestamp: "2026-05-16T00:00:00Z".to_string(),
+            event_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            content: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        let trace_events = vec![
+            event(2, "thinking"),
+            event(3, "thinking"),
+            event(4, "tool_call"),
+            event(7, "tool_result"),
+        ];
+
+        let first = trace_summary_between(&trace_events, 1, 5);
+        assert_eq!(first.get("thinking"), Some(&2));
+        assert_eq!(first.get("tool_call"), Some(&1));
+        assert_eq!(first.get("tool_result"), None);
+
+        let second = trace_summary_between(&trace_events, 5, 8);
+        assert_eq!(second.get("tool_result"), Some(&1));
+        assert_eq!(second.get("thinking"), None);
     }
 }

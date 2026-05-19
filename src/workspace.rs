@@ -1,6 +1,6 @@
 //! Workspace management for OpenCode sessions.
 //!
-//! Open Agent acts as a workspace host for OpenCode. This module prepares
+//! sandboxed.sh acts as a workspace host for OpenCode. This module prepares
 //! per-workspace directories (shared across missions) and writes `opencode.json`
 //! with the currently configured MCP servers.
 //!
@@ -553,7 +553,7 @@ fn unique_key(base: &str, used: &mut std::collections::HashSet<String>) -> Strin
     }
 }
 
-/// Root directory for Open Agent config data (versioned with repo).
+/// Root directory for sandboxed.sh config data (versioned with repo).
 pub fn config_root(working_dir: &Path) -> PathBuf {
     working_dir.join(".sandboxed-sh")
 }
@@ -1807,112 +1807,6 @@ async fn write_claudecode_config(
     Ok(())
 }
 
-/// Write Amp configuration to the workspace.
-/// Generates `AGENTS.md`, `.agents/skills/`, and optionally `settings.json`.
-async fn write_amp_config(
-    workspace_dir: &Path,
-    mcp_configs: Vec<McpServerConfig>,
-    workspace_root: &Path,
-    workspace_type: WorkspaceType,
-    workspace_env: &HashMap<String, String>,
-    skill_contents: Option<&[SkillContent]>,
-    _shared_network: Option<bool>,
-) -> anyhow::Result<()> {
-    // Create .agents directory for skills
-    let agents_dir = workspace_dir.join(".agents");
-    tokio::fs::create_dir_all(&agents_dir).await?;
-
-    // Write skills to .agents/skills/ using Amp's native format
-    if let Some(skills) = skill_contents {
-        write_amp_skills_to_workspace(workspace_dir, skills).await?;
-    }
-
-    // Build MCP servers config for Amp (amp.mcpServers format)
-    let mut mcp_servers = serde_json::Map::new();
-    let mut used = std::collections::HashSet::new();
-
-    let filtered_configs = mcp_configs.into_iter().filter(|c| c.enabled);
-
-    for config in filtered_configs {
-        let base = sanitize_key(&config.name);
-        let key = unique_key(&base, &mut used);
-        mcp_servers.insert(
-            key,
-            amp_entry_from_mcp(
-                &config,
-                workspace_dir,
-                workspace_root,
-                workspace_type,
-                workspace_env,
-            ),
-        );
-    }
-
-    // Write settings.json if we have MCP servers or need permissions
-    if !mcp_servers.is_empty() {
-        let settings = json!({
-            "amp.mcpServers": mcp_servers,
-            "amp.permissions": [
-                // Allow all bash commands in managed workspaces
-                { "tool": "Bash", "action": "allow" },
-                // Allow all file operations
-                { "tool": "Read", "action": "allow" },
-                { "tool": "Write", "action": "allow" },
-                { "tool": "Edit", "action": "allow" },
-                // Allow all MCP tools
-                { "tool": "mcp__*", "action": "allow" }
-            ]
-        });
-        let settings_path = workspace_dir.join("settings.json");
-        let settings_content = serde_json::to_string_pretty(&settings)?;
-        tokio::fs::write(&settings_path, settings_content).await?;
-    }
-
-    // Write AGENTS.md with workspace context
-    let agents_md_path = workspace_dir.join("AGENTS.md");
-    let mut agents_md = String::new();
-    agents_md.push_str("# sandboxed.sh Workspace\n\n");
-
-    match workspace_type {
-        WorkspaceType::Container => {
-            agents_md.push_str(
-                "This is an **isolated container workspace** managed by sandboxed.sh.\n\n",
-            );
-            agents_md.push_str("- Shell commands execute inside the container\n");
-            agents_md.push_str("- Use the built-in `Bash` tool for shell commands\n");
-        }
-        WorkspaceType::Host => {
-            agents_md.push_str("This is a **host workspace** managed by sandboxed.sh.\n\n");
-            agents_md.push_str("- Use the built-in `Bash` tool to run shell commands directly\n");
-        }
-    }
-
-    // Include skill references using Amp's @-mention syntax
-    if let Some(skills) = skill_contents {
-        if !skills.is_empty() {
-            agents_md.push_str("\n## Available Skills\n\n");
-            agents_md.push_str(
-                "The following skills provide specialized instructions for specific tasks.\n",
-            );
-            agents_md.push_str("Read a skill when the task matches its description.\n\n");
-            for skill in skills {
-                let desc = skill
-                    .description
-                    .as_deref()
-                    .unwrap_or("A specialized skill");
-                agents_md.push_str(&format!(
-                    "- **{}**: {} - See @.agents/skills/{}/SKILL.md\n",
-                    skill.name, desc, skill.name
-                ));
-            }
-        }
-    }
-
-    tokio::fs::write(&agents_md_path, agents_md).await?;
-
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn write_codex_config(
     workspace_dir: &Path,
@@ -2244,136 +2138,6 @@ fn toml_key(key: &str) -> String {
     toml_string(key)
 }
 
-/// Convert an MCP config to Amp settings.json format.
-fn amp_entry_from_mcp(
-    config: &McpServerConfig,
-    _workspace_dir: &Path,
-    _workspace_root: &Path,
-    _workspace_type: WorkspaceType,
-    _workspace_env: &HashMap<String, String>,
-) -> serde_json::Value {
-    use crate::mcp::McpTransport;
-
-    let mut entry = serde_json::Map::new();
-
-    match &config.transport {
-        McpTransport::Http { endpoint, headers } => {
-            // HTTP/SSE-based MCP server
-            entry.insert("url".to_string(), json!(endpoint));
-            if !headers.is_empty() {
-                entry.insert("headers".to_string(), json!(headers));
-            }
-        }
-        McpTransport::Stdio { command, args, env } => {
-            // Command-based MCP server
-            entry.insert("command".to_string(), json!(command));
-            if !args.is_empty() {
-                entry.insert("args".to_string(), json!(args));
-            }
-            if !env.is_empty() {
-                entry.insert("env".to_string(), json!(env));
-            }
-        }
-    }
-
-    serde_json::Value::Object(entry)
-}
-
-/// Write skill files to the workspace's `.agents/skills/` directory.
-/// This makes skills available to Amp using its native skills format.
-pub async fn write_amp_skills_to_workspace(
-    workspace_dir: &Path,
-    skills: &[SkillContent],
-) -> anyhow::Result<()> {
-    let skills_dir = workspace_dir.join(".agents").join("skills");
-
-    // Clean up old skills directory to remove stale skills
-    if skills_dir.exists() {
-        let _ = tokio::fs::remove_dir_all(&skills_dir).await;
-    }
-
-    if skills.is_empty() {
-        return Ok(());
-    }
-
-    tokio::fs::create_dir_all(&skills_dir).await?;
-
-    for skill in skills {
-        let skill_dir = skills_dir.join(&skill.name);
-        tokio::fs::create_dir_all(&skill_dir).await?;
-
-        // Ensure skill content has required frontmatter fields for Amp
-        let content_with_frontmatter =
-            ensure_amp_skill_frontmatter(&skill.content, &skill.name, skill.description.as_deref());
-
-        // Write SKILL.md
-        let skill_md_path = skill_dir.join("SKILL.md");
-        tokio::fs::write(&skill_md_path, &content_with_frontmatter).await?;
-
-        // Write additional files (preserving subdirectory structure)
-        for (relative_path, file_content) in &skill.files {
-            let file_path = skill_dir.join(relative_path);
-            if let Some(parent) = file_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            tokio::fs::write(&file_path, file_content).await?;
-        }
-
-        tracing::debug!(
-            skill = %skill.name,
-            workspace = %workspace_dir.display(),
-            "Wrote Amp skill to workspace"
-        );
-    }
-
-    tracing::info!(
-        count = skills.len(),
-        workspace = %workspace_dir.display(),
-        "Wrote Amp skills to workspace"
-    );
-
-    Ok(())
-}
-
-/// Ensure the skill content has required YAML frontmatter fields for Amp.
-fn ensure_amp_skill_frontmatter(
-    content: &str,
-    skill_name: &str,
-    description: Option<&str>,
-) -> String {
-    // Check if the content already has frontmatter
-    if let Some(without_prefix) = content.strip_prefix("---") {
-        // Already has frontmatter, check if name is present
-        if let Some(end_idx) = without_prefix.find("---") {
-            let frontmatter = &without_prefix[..end_idx];
-            let has_name = frontmatter.lines().any(|line| {
-                let trimmed = line.trim();
-                trimmed.starts_with("name:") || trimmed.starts_with("name :")
-            });
-
-            if has_name {
-                return content.to_string();
-            }
-
-            // Insert name field
-            let rest = &without_prefix[end_idx..];
-            return format!(
-                "---\nname: {}\n{}\n{}",
-                skill_name,
-                frontmatter.trim(),
-                rest.trim_start_matches('\n')
-            );
-        }
-    }
-
-    // No frontmatter, add it
-    let desc = description.unwrap_or("A skill for this workspace");
-    format!(
-        "---\nname: {}\ndescription: {}\n---\n{}",
-        skill_name, desc, content
-    )
-}
-
 /// Write backend-specific configuration to the workspace.
 /// This is the main entry point for config generation.
 #[allow(clippy::too_many_arguments)]
@@ -2434,18 +2198,6 @@ pub async fn write_backend_config(
             )
             .await
         }
-        "amp" => {
-            write_amp_config(
-                workspace_dir,
-                mcp_configs,
-                workspace_root,
-                workspace_type,
-                workspace_env,
-                skill_contents,
-                shared_network,
-            )
-            .await
-        }
         "codex" => {
             write_codex_config(
                 workspace_dir,
@@ -2459,9 +2211,9 @@ pub async fn write_backend_config(
             )
             .await
         }
-        "gemini" => {
-            // Gemini CLI doesn't need its own config format; use OpenCode config
-            // for workspace setup (skills, commands, etc.)
+        "gemini" | "grok" => {
+            // These CLIs don't need a Sandboxed.sh-specific config format; use
+            // OpenCode config for workspace setup (skills, commands, etc.).
             write_opencode_config(
                 workspace_dir,
                 mcp_configs,
@@ -3503,7 +3255,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         }
 
         // Collect skills (for backends that use skill contents directly)
-        if matches!(backend_id, "claudecode" | "amp" | "codex" | "gemini") {
+        if matches!(backend_id, "claudecode" | "codex" | "gemini" | "grok") {
             let skill_names = match resolve_workspace_skill_names(workspace, lib).await {
                 Ok(names) => {
                     tracing::debug!(
@@ -4463,8 +4215,9 @@ async fn bootstrap_workspace_harnesses(workspace: &Workspace) -> anyhow::Result<
 
     let install_claudecode = env_var_bool("SANDBOXED_SH_BOOTSTRAP_CLAUDECODE", true);
     let install_opencode = env_var_bool("SANDBOXED_SH_BOOTSTRAP_OPENCODE", true);
+    let install_grok = env_var_bool("SANDBOXED_SH_BOOTSTRAP_GROK", true);
 
-    if !install_claudecode && !install_opencode {
+    if !install_claudecode && !install_opencode && !install_grok {
         return Ok(());
     }
 
@@ -4564,6 +4317,17 @@ if [ -n "$PKG_MGR" ]; then
     if ! $PKG_MGR install -g oh-my-opencode@latest; then
       echo "[sandboxed] OpenCode plugin install failed"
     fi
+  fi
+fi
+
+if [ "{install_grok}" = "true" ] && ! command -v grok >/dev/null 2>&1; then
+  if command -v curl >/dev/null 2>&1; then
+    echo "[sandboxed] Installing Grok Build..."
+    if ! curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash; then
+      echo "[sandboxed] Grok Build CLI install failed"
+    fi
+  else
+    echo "[sandboxed] curl not found; skipping Grok Build install"
   fi
 fi
 

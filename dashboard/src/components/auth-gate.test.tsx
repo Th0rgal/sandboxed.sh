@@ -76,4 +76,22 @@ describe('AuthGate', () => {
 
     await waitFor(() => expect(screen.getByText('Dashboard content')).toBeVisible());
   });
+
+  test('mounts children immediately when a valid token is stored', () => {
+    mockedGetHealth.mockReturnValue(new Promise<never>(() => undefined));
+    localStorage.setItem('openagent.jwt', 'stored-token');
+    localStorage.setItem(
+      'openagent.jwt_exp',
+      String(Math.floor(Date.now() / 1000) + 3600)
+    );
+
+    render(
+      <AuthGate>
+        <div>Dashboard content</div>
+      </AuthGate>
+    );
+
+    expect(screen.getByText('Dashboard content')).toBeVisible();
+    expect(screen.queryByLabelText('Checking authentication')).not.toBeInTheDocument();
+  });
 });

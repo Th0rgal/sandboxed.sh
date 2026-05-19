@@ -36,8 +36,9 @@ use crate::workspace_exec::WorkspaceExec;
 
 use super::automation_variables::substitute_custom_variables;
 use super::control::{
-    resolve_claudecode_default_model, resolve_gemini_default_model, safe_truncate_index,
-    AgentEvent, AgentTreeNode, ControlRunState, ControlStatus, ExecutionProgress, FrontendToolHub,
+    resolve_claudecode_default_model, resolve_gemini_default_model, resolve_grok_default_model,
+    safe_truncate_index, AgentEvent, AgentTreeNode, ControlRunState, ControlStatus,
+    ExecutionProgress, FrontendToolHub,
 };
 use super::library::SharedLibrary;
 
@@ -249,6 +250,129 @@ fn public_api_base_url_from_env() -> Option<String> {
 
 pub(super) fn localhost_api_base_url_from_env() -> Option<String> {
     localhost_api_base_url(std::env::var("PORT").ok().as_deref())
+}
+
+/// Claude Code's built-in `ScheduleWakeup` tool ends the agent's turn with a
+/// promise that "the harness re-invokes you when the wakeup fires" — but in
+/// `--print` mode, open_agent is the harness and would otherwise have no way
+/// to know about the request. These helpers translate the built-in tool call
+/// into an open_agent interval automation that fires the prompt back into the
+/// mission after the requested delay (mirroring `automation_manager_mcp`'s
+/// `schedule_wakeup`). The delay is clamped to the same [60, 3600] range
+/// open_agent's own wakeup tool advertises.
+const CLAUDE_BUILTIN_WAKEUP_MIN_SECONDS: u64 = 60;
+const CLAUDE_BUILTIN_WAKEUP_MAX_SECONDS: u64 = 3600;
+
+fn mint_internal_service_jwt() -> Option<String> {
+    use jsonwebtoken::{EncodingKey, Header};
+
+    let secret = std::env::var("JWT_SECRET").ok()?;
+    if secret.trim().is_empty() {
+        return None;
+    }
+    let identity = std::env::var("SANDBOXED_SINGLE_TENANT_USER_ID")
+        .or_else(|_| std::env::var("SINGLE_TENANT_USER_ID"))
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+
+    let now = chrono::Utc::now();
+    let exp = now + chrono::Duration::hours(24);
+
+    #[derive(serde::Serialize)]
+    struct ServiceJwtClaims {
+        sub: String,
+        usr: String,
+        iat: i64,
+        exp: i64,
+    }
+    let claims = ServiceJwtClaims {
+        sub: identity.clone(),
+        usr: identity,
+        iat: now.timestamp(),
+        exp: exp.timestamp(),
+    };
+    jsonwebtoken::encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .ok()
+}
+
+fn spawn_claude_builtin_wakeup_automation(
+    mission_id: Uuid,
+    delay_seconds: u64,
+    prompt: String,
+    reason: String,
+) {
+    let Some(api_base) = localhost_api_base_url_from_env() else {
+        tracing::warn!(
+            mission_id = %mission_id,
+            "Observed Claude built-in ScheduleWakeup but PORT env is unset; cannot create wakeup automation"
+        );
+        return;
+    };
+
+    let delay = delay_seconds.clamp(
+        CLAUDE_BUILTIN_WAKEUP_MIN_SECONDS,
+        CLAUDE_BUILTIN_WAKEUP_MAX_SECONDS,
+    );
+
+    tokio::spawn(async move {
+        let url = format!(
+            "{}/api/control/missions/{}/automations",
+            api_base, mission_id
+        );
+
+        let mut variables: HashMap<String, String> = HashMap::new();
+        variables.insert("__wakeup_reason".to_string(), reason.clone());
+        variables.insert("__wakeup_source".to_string(), "claude-builtin".to_string());
+
+        let body = serde_json::json!({
+            "command_source": { "type": "inline", "content": prompt },
+            "trigger": { "type": "interval", "seconds": delay },
+            "stop_policy": { "type": "after_first_fire" },
+            "fresh_session": "keep",
+            "variables": variables,
+            "start_immediately": false,
+        });
+
+        let client = reqwest::Client::new();
+        let mut request = client.post(&url).json(&body);
+        if let Some(token) = mint_internal_service_jwt() {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        match request.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    delay_seconds = delay,
+                    reason = %reason,
+                    "Created interval automation for Claude built-in ScheduleWakeup"
+                );
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                tracing::error!(
+                    mission_id = %mission_id,
+                    status = %status,
+                    body = %body,
+                    "Failed to create wakeup automation for Claude built-in ScheduleWakeup"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    mission_id = %mission_id,
+                    error = %e,
+                    "HTTP error creating wakeup automation for Claude built-in ScheduleWakeup"
+                );
+            }
+        }
+    });
 }
 
 fn write_telegram_action_cli_helpers(work_dir: &Path) {
@@ -2549,6 +2673,14 @@ async fn run_mission_turn(
         // Pin Gemini to a stable backend default instead of inheriting the
         // global model or relying on the CLI's own default.
         config.default_model = Some(resolve_gemini_default_model());
+    } else if backend_id == "grok" && model_override.is_none() {
+        // Pin Grok Build to its own default model. Without this the global
+        // DEFAULT_MODEL (typically `anthropic/claude-opus-4-6`) flows
+        // through to `--model` and the grok CLI rejects it as "unknown
+        // model id" — the mission then fails on the first turn with a
+        // confusing chdir error from the rejected-CLI path. See prod
+        // mission 1aef657a (2026-05-16).
+        config.default_model = Some(resolve_grok_default_model());
     }
     tracing::info!(
         mission_id = %mission_id,
@@ -3130,80 +3262,20 @@ async fn run_mission_turn(
             )
             .await
         }
-        "amp" => {
-            let api_key = get_amp_api_key_from_config();
-            let mut result = run_amp_turn(
+        "grok" => {
+            run_grok_turn(
                 &workspace,
                 &mission_work_dir,
                 &user_message,
-                effective_agent.as_deref(), // Used as mode (smart/rush)
+                config.default_model.as_deref(),
                 mission_id,
                 events_tx.clone(),
-                cancel.clone(),
+                cancel,
                 &config.working_dir,
                 session_id.as_deref(),
                 is_continuation,
-                api_key.as_deref(),
             )
-            .await;
-
-            // Account rotation: if rate-limited, try alternate Amp API keys.
-            if result.terminal_reason == Some(TerminalReason::RateLimited) {
-                let alt_keys = super::ai_providers::get_all_amp_api_keys(&config.working_dir);
-                if alt_keys.len() > 1 {
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        total_keys = alt_keys.len(),
-                        "Amp rate limited; trying alternate API keys"
-                    );
-                    // Skip the key we already tried (explicit config key or env var fallback)
-                    let already_tried = api_key.map(|s| s.to_string()).or_else(|| {
-                        std::env::var("AMP_API_KEY")
-                            .ok()
-                            .filter(|s| !s.trim().is_empty())
-                    });
-                    for (idx, alt_key) in alt_keys.into_iter().enumerate() {
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        if Some(&alt_key) == already_tried.as_ref() {
-                            continue;
-                        }
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            attempt = idx + 2,
-                            "Rotating to alternate Amp API key"
-                        );
-                        result = run_amp_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            &user_message,
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            &config.working_dir,
-                            session_id.as_deref(),
-                            is_continuation,
-                            Some(&alt_key),
-                        )
-                        .await;
-                        match result.terminal_reason {
-                            Some(TerminalReason::RateLimited) => {
-                                tracing::info!(
-                                    mission_id = %mission_id,
-                                    attempt = idx + 2,
-                                    "Amp rate limited; rotating to next key"
-                                );
-                                continue;
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            }
-
-            result
+            .await
         }
         "codex" => {
             let requested_model = config.default_model.as_deref();
@@ -3441,11 +3513,16 @@ async fn run_mission_turn(
                         drop(lease);
 
                         match result.terminal_reason {
-                            Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
-                                if attempted_credentials.len() < all_creds.len() =>
-                            {
+                            Some(
+                                TerminalReason::RateLimited
+                                | TerminalReason::CapacityLimited
+                                | TerminalReason::AuthError,
+                            ) if attempted_credentials.len() < all_creds.len() => {
                                 let reason = match result.terminal_reason {
                                     Some(TerminalReason::CapacityLimited) => "capacity limited",
+                                    Some(TerminalReason::AuthError) => {
+                                        "auth failed (likely refresh-token reuse)"
+                                    }
                                     _ => "rate limited",
                                 };
                                 tracing::info!(
@@ -3538,7 +3615,7 @@ fn read_backend_configs() -> Option<Vec<serde_json::Value>> {
     );
 
     // Always check /root/.sandboxed-sh as fallback since the dashboard saves config there
-    // and Open Agent service may run with a different HOME (e.g., /var/lib/opencode)
+    // and the sandboxed.sh service may run with a different HOME (e.g., /var/lib/opencode)
     if home != "/root" {
         candidates.push(
             std::path::PathBuf::from("/root")
@@ -3605,33 +3682,6 @@ fn get_backend_bool_setting(backend_id: &str, key: &str) -> Option<bool> {
         }
     }
     None
-}
-
-/// Read API key from Amp backend config file if available.
-pub fn get_amp_api_key_from_config() -> Option<String> {
-    let key = get_backend_string_setting("amp", "api_key")?;
-    if key.starts_with("[REDACTED") || key == "********" {
-        return None;
-    }
-    Some(key)
-}
-
-/// Read amp.url from Amp CLI settings file (~/.config/amp/settings.json)
-fn get_amp_url_from_settings() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let settings_path = std::path::PathBuf::from(&home)
-        .join(".config")
-        .join("amp")
-        .join("settings.json");
-
-    let contents = std::fs::read_to_string(&settings_path).ok()?;
-    let settings: serde_json::Value = serde_json::from_str(&contents).ok()?;
-
-    settings
-        .get("amp.url")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
 }
 
 /// Execute a turn using Claude Code CLI backend.
@@ -3726,43 +3776,38 @@ pub fn run_claudecode_turn<'a>(
         }
 
         fn claude_cli_credentials_info(path: &std::path::Path) -> Option<(i64, bool)> {
-            let metadata = match std::fs::metadata(path) {
-                Ok(m) => m,
-                Err(_) => return None,
-            };
+            let (_, expires_at, _, has_refresh) = read_claude_cli_credentials(path)?;
+            Some((expires_at, has_refresh))
+        }
+
+        /// Read the full claudeAiOauth payload from a credentials file.
+        /// Returns `(access_token, expires_at, refresh_token, has_refresh)`.
+        fn read_claude_cli_credentials(
+            path: &std::path::Path,
+        ) -> Option<(String, i64, String, bool)> {
+            let metadata = std::fs::metadata(path).ok()?;
             if metadata.len() == 0 {
                 return None;
             }
-            let contents = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => return None,
-            };
-            let creds: serde_json::Value = match serde_json::from_str(&contents) {
-                Ok(v) => v,
-                Err(_) => return None,
-            };
-            let oauth = match creds.get("claudeAiOauth") {
-                Some(o) => o,
-                None => return None,
-            };
-            let has_access_token = oauth
+            let contents = std::fs::read_to_string(path).ok()?;
+            let creds: serde_json::Value = serde_json::from_str(&contents).ok()?;
+            let oauth = creds.get("claudeAiOauth")?;
+            let access_token = oauth
                 .get("accessToken")
                 .and_then(|v| v.as_str())
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
-            if !has_access_token {
-                return None;
-            }
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty())?;
             let expires_at = oauth
                 .get("expiresAt")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(i64::MAX);
-            let has_refresh = oauth
+            let refresh_token = oauth
                 .get("refreshToken")
                 .and_then(|v| v.as_str())
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
-            Some((expires_at, has_refresh))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let has_refresh = !refresh_token.trim().is_empty();
+            Some((access_token, expires_at, refresh_token, has_refresh))
         }
 
         fn looks_like_claude_cli_credentials(path: &std::path::Path) -> bool {
@@ -3825,6 +3870,46 @@ pub fn run_claudecode_turn<'a>(
                 }
             }
         }
+        // Propagate mission → host BEFORE deciding whether to copy host → mission.
+        // Anthropic's OAuth uses rotating refresh tokens (each refresh returns a
+        // new refresh_token and invalidates the old one). If a previous turn's
+        // Claude CLI rotated tokens inside the mission directory, the host file
+        // still holds the old (now-invalid) refresh_token. Without this back-sync
+        // the next backend refresh — or any sibling mission that copies host
+        // creds — would hit "refresh_token already used" / invalid_grant.
+        if !using_override_auth {
+            if let (Some(host_path), Some((m_access, m_expires, m_refresh, m_has_refresh))) = (
+                find_host_claude_cli_credentials(),
+                read_claude_cli_credentials(&mission_creds_path),
+            ) {
+                if m_has_refresh {
+                    let host_expires = claude_cli_credentials_info(&host_path)
+                        .map(|(e, _)| e)
+                        .unwrap_or(i64::MIN);
+                    if m_expires > host_expires {
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            mission_expires_at = m_expires,
+                            host_expires_at = host_expires,
+                            "Mission credentials are fresher than host; syncing back to all storage tiers"
+                        );
+                        if let Err(e) = super::ai_providers::sync_oauth_to_all_tiers(
+                            crate::ai_providers::ProviderType::Anthropic,
+                            &m_refresh,
+                            &m_access,
+                            m_expires,
+                        ) {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                error = %e,
+                                "Failed to write mission-rotated Anthropic credentials back to host"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Copy host credentials if missing OR if the existing ones are expired/near-expiry.
         let needs_copy = if using_override_auth {
             false
@@ -3835,13 +3920,15 @@ pub fn run_claudecode_turn<'a>(
             if expires_at < now_ms + 120_000 {
                 true // expired or about to expire
             } else {
-                // Even if not expired, re-copy if host credentials have a different
-                // (newer) expiry.  This catches server-side token revocations: the
-                // old token's expiry hasn't passed yet but the token itself was
-                // revoked when a new one was minted via OAuth refresh.
+                // Re-copy only when host credentials are STRICTLY newer than the
+                // mission's local copy. The previous `!=` check overwrote a
+                // mission's freshly-rotated tokens with the host's stale ones
+                // whenever the two diverged, which destroyed the only valid
+                // refresh_token and triggered the invalid_grant we're guarding
+                // against.
                 if let Some(host_path) = find_host_claude_cli_credentials() {
                     if let Some((host_expires, _)) = claude_cli_credentials_info(&host_path) {
-                        host_expires != expires_at
+                        host_expires > expires_at
                     } else {
                         false
                     }
@@ -4785,6 +4872,10 @@ pub fn run_claudecode_turn<'a>(
 
         // Track tool calls for result mapping
         let mut pending_tools: HashMap<String, String> = HashMap::new();
+        // Track Claude Code's built-in ScheduleWakeup calls so we can convert
+        // a successful tool result into an open_agent wakeup automation.
+        // Maps tool_use_id -> (delay_seconds, prompt, reason).
+        let mut pending_wakeups: HashMap<String, (u64, String, String)> = HashMap::new();
         let mut total_cost_usd: Option<f64> = None;
         let mut total_input_tokens: u64 = 0;
         let mut total_output_tokens: u64 = 0;
@@ -4797,6 +4888,10 @@ pub fn run_claudecode_turn<'a>(
         let mut process_exited_without_result = false;
         let mut idle_timeout_triggered = false;
         let mut transport_failure_stage: Option<ClaudeTransportFailureStage> = None;
+        // Cancellation breaks out of the loop instead of returning immediately,
+        // so the post-loop fallback (final_result ← text_buffer ← thinking_buffer)
+        // can surface whatever the agent already produced. See run_codex_turn.
+        let mut cancelled = false;
 
         // Track content block types and accumulated content for Claude Code streaming
         // This is needed because Claude sends incremental deltas that need to be accumulated
@@ -4834,6 +4929,21 @@ pub fn run_claudecode_turn<'a>(
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(30),
         );
+        // Heartbeat interval used to signal liveness to the actor-level
+        // stuck-mission watchdog. During extended thinking (notably with
+        // model_effort=max), Claude CLI can emit only scaffolding stream
+        // events (message_start, content_block_start, signature_delta…)
+        // for many minutes without any thinking_delta. Those reset the
+        // per-turn PTY idle timer but never become broadcast events, so
+        // the actor's main_runner_last_activity never updates and the
+        // 900s stuck-mission watchdog cancels the mission mid-turn.
+        let heartbeat_interval = Duration::from_secs(
+            std::env::var("SANDBOXED_SH_CLAUDECODE_HEARTBEAT_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300),
+        );
+        let mut last_heartbeat_at = Instant::now();
         let startup_deadline = Instant::now() + startup_timeout;
         let mut turn_wait_state = ClaudeTurnWaitState::Startup;
         let mut tool_timeout_override: Option<tokio::time::Instant> = None;
@@ -4889,8 +4999,8 @@ pub fn run_claudecode_turn<'a>(
                     // Kill the process to stop consuming API resources
                     pty.kill();
                     reader_handle.abort();
-                    return AgentResult::failure("Cancelled".to_string(), 0)
-                        .with_terminal_reason(TerminalReason::Cancelled);
+                    cancelled = true;
+                    break;
                 }
                 _ = tokio::time::sleep_until(startup_deadline), if !saw_non_init_event => {
                     tracing::warn!(
@@ -5180,6 +5290,38 @@ pub fn run_claudecode_turn<'a>(
                                                     mission_id: Some(mission_id),
                                                 });
 
+                                                // Capture args from Claude Code's built-in
+                                                // ScheduleWakeup so the matching ToolResult
+                                                // can turn it into a real wakeup automation.
+                                                if name == "ScheduleWakeup" {
+                                                    let delay = input
+                                                        .get("delaySeconds")
+                                                        .or_else(|| input.get("delay_seconds"))
+                                                        .and_then(|v| v.as_u64());
+                                                    let prompt = input
+                                                        .get("prompt")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(|s| s.to_string());
+                                                    let reason = input
+                                                        .get("reason")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(|s| s.to_string())
+                                                        .unwrap_or_default();
+                                                    match (delay, prompt) {
+                                                        (Some(d), Some(p)) => {
+                                                            pending_wakeups
+                                                                .insert(id.clone(), (d, p, reason));
+                                                        }
+                                                        _ => {
+                                                            tracing::warn!(
+                                                                mission_id = %mission_id,
+                                                                tool_use_id = %id,
+                                                                "Claude built-in ScheduleWakeup tool call missing delaySeconds or prompt; skipping wakeup automation"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+
                                                 // Extend idle timeout when tool has its own timeout.
                                                 // Long-running commands (e.g. `lake build` with timeout: 600000ms)
                                                 // produce no PTY output while waiting, so our default idle
@@ -5371,6 +5513,28 @@ pub fn run_claudecode_turn<'a>(
                                                 );
                                             }
 
+                                            // Convert a successful Claude built-in
+                                            // ScheduleWakeup into an open_agent wakeup
+                                            // automation. Claude Code's CLI handles the
+                                            // tool locally and emits a confirmation result
+                                            // but no further re-invocation happens in
+                                            // --print mode — we have to schedule it.
+                                            if let Some((delay, prompt, reason)) =
+                                                pending_wakeups.remove(&tool_use_id)
+                                            {
+                                                if !is_error {
+                                                    spawn_claude_builtin_wakeup_automation(
+                                                        mission_id, delay, prompt, reason,
+                                                    );
+                                                } else {
+                                                    tracing::warn!(
+                                                        mission_id = %mission_id,
+                                                        tool_use_id = %tool_use_id,
+                                                        "Claude built-in ScheduleWakeup result was an error; skipping wakeup automation"
+                                                    );
+                                                }
+                                            }
+
                                             // Convert content to string representation (handles both text and image results)
                                             let content_str = content.to_string_lossy();
 
@@ -5444,6 +5608,25 @@ pub fn run_claudecode_turn<'a>(
                         post_tool_result_idle_timeout,
                         tool_timeout_override,
                     );
+                    // Emit a throttled liveness heartbeat so the stuck-mission
+                    // watchdog (control.rs:stuck_mission_watchdog_loop) does not
+                    // cancel us while Claude is producing CLI scaffolding events
+                    // that don't translate to broadcast events (e.g. extended
+                    // thinking without thinking_delta).
+                    if last_heartbeat_at.elapsed() >= heartbeat_interval {
+                        let label = match turn_wait_state {
+                            ClaudeTurnWaitState::Startup => "Claude Code starting…",
+                            ClaudeTurnWaitState::AwaitingClaude => "Claude is responding…",
+                            ClaudeTurnWaitState::AwaitingToolResults => "Awaiting tool results…",
+                            ClaudeTurnWaitState::AwaitingTerminalResult => "Claude is thinking…",
+                        };
+                        let _ = events_tx.send(AgentEvent::MissionActivity {
+                            label: label.to_string(),
+                            tool_name: "claudecode_heartbeat".to_string(),
+                            mission_id: Some(mission_id),
+                        });
+                        last_heartbeat_at = Instant::now();
+                    }
                 }
             }
         }
@@ -5522,7 +5705,12 @@ pub fn run_claudecode_turn<'a>(
             );
         }
 
-        if !had_error && !saw_terminal_result_event {
+        // Cancellation suppresses the "no terminal result" / "no output"
+        // failure-message construction below: those messages describe a
+        // broken Claude Code transport, but a user/system cancel is not a
+        // transport failure. We want the accumulated text/thinking buffers
+        // (or, as a last resort, the synthetic cancel string) to surface.
+        if !cancelled && !had_error && !saw_terminal_result_event {
             had_error = true;
             let exit_summary = describe_pty_exit_status(&exit_status);
             if !saw_non_init_event {
@@ -5578,7 +5766,7 @@ pub fn run_claudecode_turn<'a>(
             }
         }
 
-        if final_result.trim().is_empty() && !had_error {
+        if !cancelled && final_result.trim().is_empty() && !had_error {
             had_error = true;
             if !non_json_output.is_empty() {
                 tracing::warn!(
@@ -5634,7 +5822,26 @@ pub fn run_claudecode_turn<'a>(
             final_result = format!("Claude Code error: {}", non_json_output.join(" | "));
         }
 
-        let mut result = if had_error {
+        let mut result = if cancelled {
+            // The cancel arm fell through here instead of returning a synthetic
+            // "Cancelled" failure, so final_result still holds whatever the
+            // text/thinking-buffer fallbacks managed to recover. Surface that
+            // partial work but mark the mission Interrupted/ServerShutdown
+            // so the dashboard renders the resume affordance.
+            //
+            // Snapshot the cancel marker once — calling
+            // `cancel_or_shutdown_failure()` twice could pair "Mission
+            // cancelled" text with ServerShutdown (or vice versa) if a
+            // shutdown signal arrives between reads.
+            let cancel_marker = cancel_or_shutdown_failure();
+            if final_result.trim().is_empty() {
+                final_result = cancel_marker.output.clone();
+            }
+            let cancel_reason = cancel_marker
+                .terminal_reason
+                .unwrap_or(TerminalReason::Cancelled);
+            AgentResult::failure(final_result, cost_cents).with_terminal_reason(cancel_reason)
+        } else if had_error {
             // Detect rate limit / overloaded errors for account rotation.
             //
             // We check for specific Anthropic error types and HTTP status codes.
@@ -5917,7 +6124,7 @@ fn install_opencode_serve_port_wrapper(
     // Note: We exclude our wrapper directory from PATH when searching for the real binary
     // to avoid finding ourselves in an infinite loop.
     let wrapper_script = r#"#!/bin/sh
-# opencode serve port override wrapper (installed by Open Agent)
+# opencode serve port override wrapper (installed by sandboxed.sh)
 WRAPPER_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLEAN_PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^$WRAPPER_DIR$" | tr '\n' ':' | sed 's/:$//')"
 REAL_OPENCODE="$(PATH="$CLEAN_PATH" command -v opencode 2>/dev/null || echo /usr/local/bin/opencode)"
@@ -6071,13 +6278,21 @@ fn ascii_lower(byte: u8) -> u8 {
 }
 
 fn is_auth_error(message: &str) -> bool {
-    const AUTH_MARKERS: [&str; 6] = [
+    const AUTH_MARKERS: [&str; 10] = [
         "invalid authentication credentials",
         "authentication_error",
         "invalid api key",
         "invalid x-api-key",
         "failed to authenticate",
         "error: 401",
+        // Codex/ChatGPT OAuth surfaces refresh-token reuse with these
+        // phrasings; both should drive account rotation rather than failing
+        // the mission outright (the user may have another configured account
+        // whose refresh_token is still valid).
+        "refresh token was already used",
+        "refresh_token was already used",
+        "refresh_token_reused",
+        "please log out and sign in again",
     ];
 
     AUTH_MARKERS
@@ -9059,19 +9274,15 @@ async fn ensure_claudecode_cli_available(
     }
 
     // Check bun's global bin directories. Depending on bun version and config,
-    // globals may be in ~/.bun/bin/ or ~/.cache/.bun/bin/.
+    // globals may be in ~/.bun/bin/ or ~/.cache/.bun/bin/. We rely exclusively on
+    // bun's bin symlink — its target tracks the package's `bin` field in
+    // package.json, which changed in newer claude-code releases (cli.js → bin/claude.exe).
+    // Hard-coding `cli.js` here is wrong for 2.1.10x+ and probing it directly
+    // created dangling-symlink poisoning on hosts running bun ≥1.3.5.
     const BUN_GLOBAL_CLAUDE_PATHS: &[&str] =
         &["/root/.bun/bin/claude", "/root/.cache/.bun/bin/claude"];
-    // Also check the direct cli.js path as a fallback — some bun versions
-    // install the package but fail to create the bin symlink.
-    const BUN_GLOBAL_CLAUDE_CLI_JS: &str =
-        "/root/.bun/install/global/node_modules/@anthropic-ai/claude-code/cli.js";
 
-    for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS
-        .iter()
-        .copied()
-        .chain(std::iter::once(BUN_GLOBAL_CLAUDE_CLI_JS))
-    {
+    for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS.iter().copied() {
         if command_available(workspace_exec, cwd, bun_claude_path).await
             && claude_cli_matches_desired_version(
                 workspace_exec,
@@ -9081,36 +9292,8 @@ async fn ensure_claudecode_cli_available(
             )
             .await
         {
-            // cli.js is a raw JS file — it needs an explicit node/bun prefix.
-            // Bin symlinks (e.g. /root/.bun/bin/claude) have shebangs and can run directly.
-            let is_raw_js = bun_claude_path == BUN_GLOBAL_CLAUDE_CLI_JS;
-
-            if command_available(workspace_exec, cwd, "node").await {
-                let cmd = if is_raw_js {
-                    format!("node {}", bun_claude_path)
-                } else {
-                    bun_claude_path.to_string()
-                };
-                tracing::debug!(
-                    "Found Claude Code at {} (resolved: {})",
-                    bun_claude_path,
-                    cmd
-                );
-                return Ok(cmd);
-            } else if let Some(bun) = available_bun_command(workspace_exec, cwd).await {
-                let bun_cmd = format!("{} {}", bun, bun_claude_path);
-                tracing::debug!(
-                    "Found Claude Code at {} (using bun to run it: {})",
-                    bun_claude_path,
-                    bun_cmd
-                );
-                return Ok(bun_cmd);
-            } else {
-                tracing::debug!(
-                    "Found Claude Code at {} but neither node nor bun available to run it",
-                    bun_claude_path
-                );
-            }
+            tracing::debug!("Found Claude Code at {}", bun_claude_path);
+            return Ok(bun_claude_path.to_string());
         }
     }
 
@@ -9145,14 +9328,21 @@ async fn ensure_claudecode_cli_available(
     }
 
     // Use bun if available (faster), otherwise npm.
-    // Bun installs globals to ~/.bun/install/global/ with bin symlinks in ~/.bun/bin/.
-    // Some bun versions (e.g. 1.3.x) report success but silently fail to create
-    // the bin symlink, so we manually link it as a workaround.
+    //
+    // Bun-specific quirks we have to handle:
+    //   1. A prior install attempt may have left a dangling symlink at
+    //      /root/.bun/bin/claude (e.g. pointing at an old cli.js path that no
+    //      longer exists in claude-code ≥2.1.10x). Remove broken symlinks
+    //      before install so bun can recreate them cleanly.
+    //   2. Bun ≥1.3 blocks postinstall scripts by default ("untrusted").
+    //      claude-code's postinstall (install.cjs) is what downloads the
+    //      platform-native binary; without it the bin shim prints
+    //      "claude native binary not installed." `bun pm -g trust` runs it.
     let install_cmd = if let Some(bun) = bun_command.as_deref() {
         format!(
-            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && {} install -g @anthropic-ai/claude-code@{} && {{ test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null || true; }}"#,
-            shell_quote(bun),
-            shell_quote(&desired_version)
+            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && for p in /root/.bun/bin/claude /root/.cache/.bun/bin/claude; do [ -L "$p" ] && [ ! -e "$p" ] && rm -f "$p"; done; {bun} install -g @anthropic-ai/claude-code@{ver} && {{ {bun} pm -g trust @anthropic-ai/claude-code 2>/dev/null || true; }}"#,
+            bun = shell_quote(bun),
+            ver = shell_quote(&desired_version)
         )
     } else {
         format!(
@@ -9192,11 +9382,7 @@ async fn ensure_claudecode_cli_available(
     {
         return Ok(cli_path.to_string());
     }
-    for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS
-        .iter()
-        .copied()
-        .chain(std::iter::once(BUN_GLOBAL_CLAUDE_CLI_JS))
-    {
+    for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS.iter().copied() {
         if command_available(workspace_exec, cwd, bun_claude_path).await
             && claude_cli_matches_desired_version(
                 workspace_exec,
@@ -9206,30 +9392,25 @@ async fn ensure_claudecode_cli_available(
             )
             .await
         {
-            let is_raw_js = bun_claude_path == BUN_GLOBAL_CLAUDE_CLI_JS;
-            if command_available(workspace_exec, cwd, "node").await {
-                return Ok(if is_raw_js {
-                    format!("node {}", bun_claude_path)
-                } else {
-                    bun_claude_path.to_string()
-                });
-            } else if let Some(bun) = available_bun_command(workspace_exec, cwd).await {
-                return Ok(format!("{} {}", bun, bun_claude_path));
-            }
+            return Ok(bun_claude_path.to_string());
         }
     }
 
     Err(format!(
-        "Claude Code install completed but '{}' is still not available in workspace PATH. Checked: {:?} and {}",
-        cli_path, BUN_GLOBAL_CLAUDE_PATHS, BUN_GLOBAL_CLAUDE_CLI_JS,
+        "Claude Code install completed but '{}' is still not available in workspace PATH. Checked: {:?}",
+        cli_path, BUN_GLOBAL_CLAUDE_PATHS,
     ))
 }
 
 fn desired_claudecode_version() -> String {
+    // 2.1.140 ships the bug-fixed native `/goal` slash command (added in
+    // 2.1.139, hardened against `disableAllHooks` / `allowManagedHooksOnly`
+    // in 2.1.140). Bumping the pin so the per-workspace install matches what
+    // `run_claudecode_native_goal` relies on.
     std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "2.1.139".to_string())
+        .unwrap_or_else(|| "2.1.140".to_string())
 }
 
 async fn claude_cli_matches_desired_version(
@@ -9809,6 +9990,132 @@ async fn ensure_opencode_cli_available(
     Ok(())
 }
 
+async fn ensure_grok_cli_available(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> Result<String, String> {
+    let program = cli_path.split(' ').next().unwrap_or(cli_path);
+    if command_available(workspace_exec, cwd, program).await {
+        return Ok(cli_path.to_string());
+    }
+
+    let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_GROK", true);
+    if !auto_install {
+        return Err(format!(
+            "Grok Build CLI '{}' not found in workspace. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash",
+            cli_path
+        ));
+    }
+
+    if !command_available(workspace_exec, cwd, "curl").await {
+        return Err(format!(
+            "Grok Build CLI '{}' not found and curl is not available in the workspace. Install curl or install Grok manually.",
+            cli_path
+        ));
+    }
+
+    tracing::info!("Auto-installing Grok Build CLI");
+    let output = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &[
+                "-lc".to_string(),
+                "curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash 2>&1"
+                    .to_string(),
+            ],
+            HashMap::new(),
+        )
+        .await
+        .map_err(|e| format!("Failed to run Grok Build installer: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut message = String::new();
+        if !stderr.trim().is_empty() {
+            message.push_str(stderr.trim());
+        }
+        if !stdout.trim().is_empty() {
+            if !message.is_empty() {
+                message.push_str(" | ");
+            }
+            message.push_str(stdout.trim());
+        }
+        if message.is_empty() {
+            message = "Grok Build install failed with no output".to_string();
+        }
+        return Err(format!("Grok Build install failed: {}", message));
+    }
+
+    if command_available(workspace_exec, cwd, cli_path).await {
+        Ok(cli_path.to_string())
+    } else if command_available(workspace_exec, cwd, "/usr/local/bin/grok").await {
+        Ok("/usr/local/bin/grok".to_string())
+    } else {
+        Err(
+            "Grok Build install completed but 'grok' is still not available in workspace PATH."
+                .to_string(),
+        )
+    }
+}
+
+async fn sync_grok_oauth_auth_file(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Result<bool, String> {
+    let auth_path = std::path::PathBuf::from(crate::util::home_dir())
+        .join(".grok")
+        .join("auth.json");
+    if !auth_path.is_file() {
+        return Ok(false);
+    }
+
+    let auth_json = tokio::fs::read_to_string(&auth_path)
+        .await
+        .map_err(|e| format!("Failed to read Grok auth file: {}", e))?;
+    if auth_json.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let encoded = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(auth_json.as_bytes())
+    };
+    let output = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &[
+                "-lc".to_string(),
+                format!(
+                    "mkdir -p \"${{HOME:-/root}}/.grok\" && printf %s '{}' | base64 -d > \"${{HOME:-/root}}/.grok/auth.json\" && chmod 600 \"${{HOME:-/root}}/.grok/auth.json\"",
+                    encoded
+                ),
+            ],
+            HashMap::new(),
+        )
+        .await
+        .map_err(|e| format!("Failed to sync Grok auth file: {}", e))?;
+    if output.status.success() {
+        Ok(true)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Err(format!(
+            "Failed to sync Grok auth file into workspace: {}{}{}",
+            stderr.trim(),
+            if stderr.trim().is_empty() || stdout.trim().is_empty() {
+                ""
+            } else {
+                " | "
+            },
+            stdout.trim()
+        ))
+    }
+}
+
 /// Result of a backend preflight check
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BackendPreflightResult {
@@ -9840,13 +10147,32 @@ pub async fn check_backend_prerequisites(
             let cli = cli_path.unwrap_or("codex");
             check_codex_prerequisites(&workspace_exec, cwd, cli).await
         }
-        "amp" => {
-            let cli = cli_path.unwrap_or("amp");
-            check_amp_prerequisites(&workspace_exec, cwd, cli).await
-        }
         "gemini" => {
             let cli = cli_path.unwrap_or("gemini");
             check_gemini_prerequisites(&workspace_exec, cwd, cli).await
+        }
+        "grok" => {
+            let cli = cli_path.unwrap_or("grok");
+            let available = command_available(&workspace_exec, cwd, cli).await;
+            BackendPreflightResult {
+                backend_id: "grok".to_string(),
+                available,
+                cli_available: available,
+                auto_install_possible: false,
+                missing_dependencies: if available {
+                    Vec::new()
+                } else {
+                    vec!["grok CLI".to_string()]
+                },
+                message: if available {
+                    Some("Grok Build CLI is available".to_string())
+                } else {
+                    Some(
+                        "Grok Build CLI not found. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash"
+                            .to_string(),
+                    )
+                },
+            }
         }
         _ => BackendPreflightResult {
             backend_id: backend_id.to_string(),
@@ -9855,7 +10181,7 @@ pub async fn check_backend_prerequisites(
             auto_install_possible: false,
             missing_dependencies: vec![format!("unknown backend: {}", backend_id)],
             message: Some(format!(
-                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, amp, gemini",
+                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, gemini, grok",
                 backend_id
             )),
         },
@@ -9997,52 +10323,6 @@ async fn check_codex_prerequisites(
             Some("Codex CLI not found and neither npm nor bun is available. Install Node.js/npm or Bun in the workspace template.".to_string())
         } else {
             Some("Codex CLI not found but can be auto-installed via npm/bun.".to_string())
-        },
-    }
-}
-
-async fn check_amp_prerequisites(
-    workspace_exec: &WorkspaceExec,
-    cwd: &std::path::Path,
-    cli_path: &str,
-) -> BackendPreflightResult {
-    let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
-
-    let cli_available = command_available(workspace_exec, cwd, program).await
-        || command_available(workspace_exec, cwd, "/root/.bun/bin/amp").await
-        || command_available(workspace_exec, cwd, "/root/.cache/.bun/bin/amp").await;
-
-    if cli_available {
-        return BackendPreflightResult {
-            backend_id: "amp".to_string(),
-            available: true,
-            cli_available: true,
-            auto_install_possible: false,
-            missing_dependencies: vec![],
-            message: None,
-        };
-    }
-
-    let has_npm = command_available(workspace_exec, cwd, "npm").await;
-    let has_bun = command_available(workspace_exec, cwd, "bun").await
-        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
-
-    let auto_install_possible = has_npm || has_bun;
-
-    BackendPreflightResult {
-        backend_id: "amp".to_string(),
-        available: auto_install_possible,
-        cli_available: false,
-        auto_install_possible,
-        missing_dependencies: if !auto_install_possible {
-            vec!["npm or bun".to_string()]
-        } else {
-            vec![]
-        },
-        message: if !auto_install_possible {
-            Some("Amp CLI not found and neither npm nor bun is available. Install Node.js/npm or Bun in the workspace template.".to_string())
-        } else {
-            Some("Amp CLI not found but can be auto-installed via npm/bun.".to_string())
         },
     }
 }
@@ -10648,24 +10928,30 @@ pub async fn run_opencode_turn(
     // Vanilla `opencode` is the default. oh-my-opencode wraps opencode with extra
     // features (todo enforcement, background tasks, opinionated agent profiles)
     // and is opt-in per workspace/profile via `enable_oh_my_opencode`.
-    // The `sisyphus` agent name is an oh-my-opencode-only identifier; if it is
-    // selected explicitly, fall back to plain opencode (the wrapper is not
-    // available) rather than failing.
     let oh_my_opencode_enabled = workspace
         .config
         .get("enable_oh_my_opencode")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let agent_needs_plain_opencode = agent
-        .map(|a| a.eq_ignore_ascii_case("sisyphus"))
-        .unwrap_or(false);
-    let use_plain_opencode = !oh_my_opencode_enabled || agent_needs_plain_opencode;
+    let use_plain_opencode = !oh_my_opencode_enabled;
+
+    // `sisyphus` only exists inside the oh-my-opencode wrapper. Warn loudly when
+    // it is requested without the wrapper so the failure mode is obvious.
+    if use_plain_opencode
+        && agent
+            .map(|a| a.eq_ignore_ascii_case("sisyphus"))
+            .unwrap_or(false)
+    {
+        tracing::warn!(
+            mission_id = %mission_id,
+            "Agent 'sisyphus' requires oh-my-opencode, but enable_oh_my_opencode is false; mission will likely fail"
+        );
+    }
 
     tracing::info!(
         mission_id = %mission_id,
         use_plain_opencode = use_plain_opencode,
         oh_my_opencode_enabled = oh_my_opencode_enabled,
-        agent_needs_plain_opencode = agent_needs_plain_opencode,
         "OpenCode mode selection"
     );
 
@@ -12438,596 +12724,433 @@ pub async fn run_opencode_turn(
     result
 }
 
-/// Execute a turn using Amp CLI backend.
+fn grok_event_is_reasoning_type(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
+        let lower = t.to_ascii_lowercase();
+        lower == "reasoning" || lower == "thinking" || lower == "reasoning_delta"
+    })
+}
+
+fn grok_event_text(value: &serde_json::Value) -> Option<String> {
+    if grok_event_is_reasoning_type(value) {
+        return None;
+    }
+
+    if let Some(text) = value
+        .get("delta")
+        .and_then(|delta| delta.get("text").or_else(|| delta.get("content")))
+        .and_then(|v| v.as_str())
+    {
+        return Some(text.to_string());
+    }
+
+    if value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("text"))
+    {
+        if let Some(text) = value.get("data").and_then(|v| v.as_str()) {
+            return Some(text.to_string());
+        }
+    }
+
+    if let Some(content) = value.get("content") {
+        if let Some(text) = content.as_str() {
+            return Some(text.to_string());
+        }
+        if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
+            return Some(text.to_string());
+        }
+    }
+
+    if let Some(text) = value.get("message").and_then(|message| {
+        message.as_str().map(str::to_string).or_else(|| {
+            message.get("content").and_then(|content| {
+                content.as_str().map(str::to_string).or_else(|| {
+                    content.as_array().map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                })
+            })
+        })
+    }) {
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+
+    for key in ["text", "answer", "result", "output"] {
+        if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
+            return Some(text.to_string());
+        }
+    }
+
+    None
+}
+
+/// Extract Grok / xAI reasoning text from a streamed JSONL event.
 ///
-/// For Host workspaces: spawns the CLI directly on the host.
-/// For Container workspaces: spawns the CLI inside the container using systemd-nspawn.
+/// The Grok Build CLI mostly mirrors the xAI Chat Completions stream, which
+/// puts chain-of-thought in `delta.reasoning_content` (some builds) or
+/// `delta.reasoning` (others), and sometimes wraps it as a typed event
+/// (`type: "reasoning" | "thinking"` with `data` or `text`). Field name
+/// discovery is conservative — return None if no known key is present so a
+/// CLI version bump doesn't accidentally show user-visible noise as
+/// reasoning.
+fn grok_event_reasoning(value: &serde_json::Value) -> Option<String> {
+    let is_reasoning_type = grok_event_is_reasoning_type(value);
+
+    if let Some(delta) = value.get("delta") {
+        for key in ["reasoning_content", "reasoning", "thinking"] {
+            if let Some(text) = delta.get(key).and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+        if is_reasoning_type {
+            for key in ["text", "content"] {
+                if let Some(text) = delta.get(key).and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if is_reasoning_type {
+        for key in ["data", "text", "content", "reasoning"] {
+            if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(text) = value
+        .get("message")
+        .and_then(|m| m.get("reasoning_content").or_else(|| m.get("reasoning")))
+        .and_then(|v| v.as_str())
+    {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+
+    None
+}
+
+fn grok_event_session_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("session_id")
+        .or_else(|| value.get("sessionId"))
+        .or_else(|| value.get("session").and_then(|session| session.get("id")))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
+fn grok_event_model(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("model")
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("model"))
+        })
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
+fn grok_event_is_error(value: &serde_json::Value) -> bool {
+    value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("error"))
+        || value.get("error").is_some()
+}
+
+/// P3-#21 text_delta rate limiter.
+///
+/// Streaming backends (grok, codex) emit a fresh cumulative-buffer
+/// TextDelta on every token. With 100+ tokens/sec the SSE channel and
+/// every subscribed client pay the serialization + send cost for each
+/// even though the dashboard rAF-coalesces them into one render per
+/// frame anyway. This coalescer enforces a minimum 50ms gap between
+/// successful emits per turn; intermediate updates are dropped because
+/// the next emit will carry their content (cumulative semantics).
+///
+/// Caller must perform a final unconditional emit after the loop to
+/// guarantee the last buffer state reaches the dashboard.
+struct TextDeltaCoalescer {
+    last_emit: Option<std::time::Instant>,
+}
+
+impl TextDeltaCoalescer {
+    fn new() -> Self {
+        Self { last_emit: None }
+    }
+
+    fn should_emit(&mut self) -> bool {
+        const MIN_GAP: std::time::Duration = std::time::Duration::from_millis(50);
+        let now = std::time::Instant::now();
+        match self.last_emit {
+            Some(prev) if now.duration_since(prev) < MIN_GAP => false,
+            _ => {
+                self.last_emit = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// Execute a turn using the Grok Build CLI backend.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_amp_turn(
+pub async fn run_grok_turn(
     workspace: &Workspace,
     work_dir: &std::path::Path,
     message: &str,
-    mode: Option<&str>,
+    model: Option<&str>,
     mission_id: Uuid,
     events_tx: broadcast::Sender<AgentEvent>,
     cancel: CancellationToken,
-    _app_working_dir: &std::path::Path,
+    app_working_dir: &std::path::Path,
     session_id: Option<&str>,
     is_continuation: bool,
-    api_key: Option<&str>,
 ) -> AgentResult {
-    use crate::backend::amp::client::{AmpEvent, ContentBlock, StreamEvent};
-    use std::collections::HashMap;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let workspace_exec = WorkspaceExec::new(workspace.clone());
-
-    // Check if amp CLI is available
-    if !command_available(&workspace_exec, work_dir, "amp").await {
-        let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_AMP", true);
-        if auto_install {
-            // Try to install via bun first (preferred for container templates), then npm
-            let has_bun = command_available(&workspace_exec, work_dir, "bun").await;
-            let has_npm = command_available(&workspace_exec, work_dir, "npm").await;
-
-            if has_bun {
-                tracing::info!(mission_id = %mission_id, "Auto-installing Amp CLI via bun");
-                let install_result = workspace_exec
-                    .output(
-                        work_dir,
-                        "/bin/sh",
-                        &[
-                            "-lc".to_string(),
-                            "bun install -g @sourcegraph/amp 2>&1".to_string(),
-                        ],
-                        HashMap::new(),
-                    )
-                    .await;
-                match &install_result {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        if output.status.success() {
-                            tracing::info!(mission_id = %mission_id, stdout = %stdout, "Amp CLI installed via bun");
-                        } else {
-                            tracing::warn!(mission_id = %mission_id, stdout = %stdout, stderr = %stderr, exit_code = ?output.status.code(), "bun install for Amp CLI failed");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(mission_id = %mission_id, error = %e, "Failed to run bun install for Amp CLI");
-                    }
-                }
-            } else if has_npm {
-                tracing::info!(mission_id = %mission_id, "Auto-installing Amp CLI via npm");
-                let install_result = workspace_exec
-                    .output(
-                        work_dir,
-                        "/bin/sh",
-                        &[
-                            "-lc".to_string(),
-                            "npm install -g @sourcegraph/amp".to_string(),
-                        ],
-                        HashMap::new(),
-                    )
-                    .await;
-                if let Err(e) = &install_result {
-                    tracing::warn!(mission_id = %mission_id, error = %e, "Failed to auto-install Amp CLI via npm");
-                }
-            } else {
-                tracing::warn!(mission_id = %mission_id, "Neither bun nor npm available for Amp CLI auto-install");
-            }
-        }
-    }
-
-    // Check if node is available (amp CLI is a Node.js script)
-    let has_node = command_available(&workspace_exec, work_dir, "node").await;
-    let has_bun = command_available(&workspace_exec, work_dir, "bun").await
-        || command_available(&workspace_exec, work_dir, "/root/.bun/bin/bun").await;
-
-    // Find the amp binary - check standard PATH first, then bun's global bin paths
-    // The amp CLI is a Node.js script, so if node is not available but bun is,
-    // we need to run it via "bun run amp" or "bun /path/to/main.js"
-    let (amp_binary, amp_args_prefix): (String, Vec<String>) = if has_node
-        && command_available(&workspace_exec, work_dir, "amp").await
-    {
-        // Node available and amp in PATH - run directly
-        ("amp".to_string(), vec![])
-    } else if has_bun {
-        // No node, but bun is available - use "bun run amp" or run the JS directly
-        // First check for bun's global install paths
-        let bun_path = if command_available(&workspace_exec, work_dir, "bun").await {
-            "bun".to_string()
-        } else {
-            "/root/.bun/bin/bun".to_string()
-        };
-
-        // Check for amp's main.js in bun's global install location
-        let amp_main_js_paths = [
-            "/root/.bun/install/global/node_modules/@sourcegraph/amp/dist/main.js",
-            "/root/.cache/.bun/install/global/node_modules/@sourcegraph/amp/dist/main.js",
-        ];
-
-        let mut found_js = None;
-        for path in &amp_main_js_paths {
-            let check_result = workspace_exec
-                .output(
-                    work_dir,
-                    "/bin/sh",
-                    &["-c".to_string(), format!("test -f {} && echo exists", path)],
-                    HashMap::new(),
-                )
-                .await;
-            if let Ok(output) = check_result {
-                if String::from_utf8_lossy(&output.stdout).contains("exists") {
-                    found_js = Some(path.to_string());
-                    break;
-                }
-            }
-        }
-
-        if let Some(js_path) = found_js {
-            tracing::info!(
-                mission_id = %mission_id,
-                js_path = %js_path,
-                "Running Amp CLI via bun (node not available)"
-            );
-            (bun_path, vec![js_path])
-        } else {
-            // Try "bun run amp" as fallback
-            tracing::info!(
-                mission_id = %mission_id,
-                "Trying 'bun run amp' (amp main.js not found in expected locations)"
-            );
-            (bun_path, vec!["run".to_string(), "amp".to_string()])
-        }
-    } else if command_available(&workspace_exec, work_dir, "/root/.bun/bin/amp").await {
-        // Amp exists but may fail without node - try anyway
-        ("/root/.bun/bin/amp".to_string(), vec![])
-    } else if command_available(&workspace_exec, work_dir, "/root/.cache/.bun/bin/amp").await {
-        ("/root/.cache/.bun/bin/amp".to_string(), vec![])
-    } else {
-        let err_msg = "Amp CLI not found. Install it with: bun install -g @sourcegraph/amp (or npm install -g @sourcegraph/amp)";
-        tracing::error!(mission_id = %mission_id, "{}", err_msg);
-        return AgentResult::failure(err_msg.to_string(), 0)
-            .with_terminal_reason(TerminalReason::LlmError);
-    };
-
-    tracing::info!(
-        mission_id = %mission_id,
-        work_dir = %work_dir.display(),
-        workspace_type = ?workspace.workspace_type,
-        mode = ?mode,
-        is_continuation = is_continuation,
-        amp_binary = %amp_binary,
-        "Starting Amp execution via WorkspaceExec"
-    );
-
-    // Build CLI arguments
-    // Amp CLI format: amp [subcommand] --execute "message" [flags]
-    // For continuation: amp threads continue <session_id> --execute "message" [flags]
-    // When running via bun, amp_args_prefix contains ["/path/to/main.js"] or ["run", "amp"]
-    let mut args = amp_args_prefix;
-
-    // For continuation, use threads continue subcommand
-    if is_continuation {
-        if let Some(sid) = session_id {
-            args.push("threads".to_string());
-            args.push("continue".to_string());
-            args.push(sid.to_string());
-        }
-    }
-
-    // --execute with message as its argument (must come before other flags)
-    args.push("--execute".to_string());
-    args.push(message.to_string());
-
-    // Remaining flags
-    args.push("--stream-json".to_string());
-    args.push("--dangerously-allow-all".to_string());
-
-    // Mode (smart/rush)
-    if let Some(m) = mode {
-        args.push("--mode".to_string());
-        args.push(m.to_string());
-    }
-
-    // Build environment
-    let mut env = HashMap::new();
-
-    // Use API key from config, or fall back to environment variable
-    if let Some(key) = api_key {
-        env.insert("AMP_API_KEY".to_string(), key.to_string());
-    } else if let Ok(key) = std::env::var("AMP_API_KEY") {
-        env.insert("AMP_API_KEY".to_string(), key);
-    }
-
-    // Pass through AMP_URL for CLIProxyAPI integration
-    // This allows routing Amp requests through a local proxy (e.g., CLIProxyAPI)
-    // AMP_URL sets the Amp service URL (default: https://ampcode.com/)
-    if let Ok(amp_url) = std::env::var("AMP_URL") {
-        env.insert("AMP_URL".to_string(), amp_url);
-    }
-
-    // Also support legacy AMP_PROVIDER_URL as an alias
-    if !env.contains_key("AMP_URL") {
-        if let Ok(provider_url) = std::env::var("AMP_PROVIDER_URL") {
-            env.insert("AMP_URL".to_string(), provider_url);
-        }
-    }
-
-    // Fall back to reading amp.url from Amp CLI settings file if no env var set
-    if !env.contains_key("AMP_URL") {
-        if let Some(amp_url) = get_amp_url_from_settings() {
-            tracing::debug!(mission_id = %mission_id, amp_url = %amp_url, "Using amp.url from Amp CLI settings");
-            env.insert("AMP_URL".to_string(), amp_url);
-        }
-    }
-
-    // Log the environment for debugging
-    tracing::debug!(
-        mission_id = %mission_id,
-        env_vars = ?env.keys().collect::<Vec<_>>(),
-        amp_url = ?env.get("AMP_URL"),
-        amp_api_key_present = env.contains_key("AMP_API_KEY"),
-        "Spawning Amp CLI with environment"
-    );
-
-    // Use WorkspaceExec to spawn the CLI
-    let mut child = match workspace_exec
-        .spawn_streaming(work_dir, &amp_binary, &args, env)
-        .await
-    {
-        Ok(child) => child,
-        Err(e) => {
-            let err_msg = format!("Failed to start Amp CLI: {}", e);
-            tracing::error!("{}", err_msg);
+    let cli_path =
+        get_backend_string_setting("grok", "cli_path").unwrap_or_else(|| "grok".to_string());
+    let cli_path = match ensure_grok_cli_available(&workspace_exec, work_dir, &cli_path).await {
+        Ok(cli_path) => cli_path,
+        Err(err_msg) => {
             return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
     };
 
-    // Close stdin immediately - Amp uses --execute with args, not stdin
-    // Leaving the pipe open can cause issues with Node.js process lifecycle
-    drop(child.stdin.take());
+    let mut args = Vec::new();
+    // Use `-s/--session-id` for both first-turn and continuation when we
+    // already have a session id from the mission store. Per grok headless
+    // docs, `--session-id` has upsert semantics — loads the session if it
+    // exists, creates one with that id otherwise — so it self-heals the
+    // "orphan session" case where the first turn failed before grok could
+    // persist the session and `--resume <sid>` would error with "Session
+    // does not exist". `--resume` is strict-existence-only; we only fall
+    // through to `--continue` when we have no session id at all.
+    if let Some(sid) = session_id {
+        args.push("--session-id".to_string());
+        args.push(sid.to_string());
+    } else if is_continuation {
+        args.push("--continue".to_string());
+    }
+    args.push("-p".to_string());
+    args.push(message.to_string());
+    args.push("--output-format".to_string());
+    args.push("streaming-json".to_string());
+    args.push("--always-approve".to_string());
+    args.push("--cwd".to_string());
+    args.push(workspace_exec.translate_path_for_container(work_dir));
+    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
 
-    // Get stdout for reading events
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            let err_msg = "Failed to capture Amp stdout";
-            tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg.to_string(), 0)
+    if let Err(err) = sync_grok_oauth_auth_file(&workspace_exec, work_dir).await {
+        tracing::warn!(mission_id = %mission_id, error = %err, "Failed to sync Grok OAuth auth file");
+    }
+
+    let mut env = HashMap::new();
+    if let Some(key) = crate::api::ai_providers::get_xai_api_key_for_grok(app_working_dir) {
+        env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
+    } else if let Ok(key) = std::env::var("GROK_CODE_XAI_API_KEY") {
+        if !key.trim().is_empty() {
+            env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
+        }
+    } else if let Ok(key) = std::env::var("XAI_API_KEY") {
+        if !key.trim().is_empty() {
+            env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
+        }
+    }
+
+    let mut child = match workspace_exec
+        .spawn_streaming(work_dir, &cli_path, &args, env)
+        .await
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return AgentResult::failure(format!("Failed to start Grok Build CLI: {}", e), 0)
                 .with_terminal_reason(TerminalReason::LlmError);
         }
     };
+    drop(child.stdin.take());
 
-    // Capture stderr for debugging
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            return AgentResult::failure("Failed to capture Grok stdout".to_string(), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
     let stderr = child.stderr.take();
     let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
     let stderr_capture_clone = stderr_capture.clone();
-    let mission_id_for_stderr = mission_id;
-    let stderr_handle = stderr.map(|stderr| {
+    let mut stderr_handle = stderr.map(|stderr| {
         tokio::spawn(async move {
-            let stderr_reader = BufReader::new(stderr);
-            let mut stderr_lines = stderr_reader.lines();
-            while let Ok(Some(line)) = stderr_lines.next_line().await {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
                 let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    tracing::debug!(mission_id = %mission_id_for_stderr, stderr = %trimmed, "Amp CLI stderr");
-                    let mut captured = stderr_capture_clone.lock().await;
-                    if !captured.is_empty() {
-                        captured.push('\n');
-                    }
-                    captured.push_str(trimmed);
+                if trimmed.is_empty() {
+                    continue;
                 }
+                let mut captured = stderr_capture_clone.lock().await;
+                if !captured.is_empty() {
+                    captured.push('\n');
+                }
+                captured.push_str(trimmed);
             }
         })
     });
 
-    // Track tool calls for result mapping
-    let mut pending_tools: HashMap<String, String> = HashMap::new();
     let mut final_result = String::new();
     let mut had_error = false;
-    let mut model_used: Option<String> = None;
-
-    // Track token usage for cost calculation
-    let mut total_input_tokens: u64 = 0;
-    let mut total_output_tokens: u64 = 0;
-    let mut total_cache_creation_tokens: u64 = 0;
-    let mut total_cache_read_tokens: u64 = 0;
-
-    // Track content blocks for streaming
-    let mut block_types: HashMap<u32, String> = HashMap::new();
-    let mut thinking_buffer: HashMap<u32, String> = HashMap::new();
-    let mut text_buffer: HashMap<u32, String> = HashMap::new();
-    let mut active_thinking_index: Option<u32> = None;
-    let mut finalized_thinking_indices: std::collections::HashSet<u32> =
-        std::collections::HashSet::new();
-    let mut last_text_len: usize = 0;
-    let mut thinking_streamed = false; // Track if thinking was already streamed
-
+    let mut model_used = model.map(str::to_string);
+    let mut last_streamed_len = 0usize;
+    let mut text_delta_coalescer = TextDeltaCoalescer::new();
+    // Accumulate Grok's reasoning deltas into a cumulative buffer and
+    // throttle Thinking emissions the same way text deltas are throttled.
+    // Grok's CLI delivers reasoning as incremental tokens, mirroring the
+    // text path.
+    let mut reasoning_buffer = String::new();
+    let mut last_reasoning_len = 0usize;
+    let mut reasoning_delta_coalescer = TextDeltaCoalescer::new();
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
+    let mut cancelled = false;
 
-    // Process events until completion or cancellation
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                tracing::info!(mission_id = %mission_id, "Amp execution cancelled, killing process");
                 let _ = child.kill().await;
-                if let Some(handle) = stderr_handle {
+                if let Some(handle) = stderr_handle.take() {
                     handle.abort();
                 }
-                return AgentResult::failure("Cancelled".to_string(), 0)
-                    .with_terminal_reason(TerminalReason::Cancelled);
+                cancelled = true;
+                break;
             }
             line_result = lines.next_line() => {
                 match line_result {
                     Ok(Some(line)) => {
-                        if line.is_empty() {
+                        if line.trim().is_empty() {
                             continue;
                         }
-
-                        let amp_event: AmpEvent = match serde_json::from_str(&line) {
-                            Ok(event) => event,
-                            Err(e) => {
-                                tracing::warn!(
-                                    mission_id = %mission_id,
-                                    error = %e,
-                                    line = %if line.len() > 200 { let end = safe_truncate_index(&line, 200); format!("{}...", &line[..end]) } else { line.clone() },
-                                    "Failed to parse Amp event"
-                                );
+                        let value: serde_json::Value = match serde_json::from_str(&line) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                if final_result.is_empty() {
+                                    final_result.push_str(&line);
+                                } else {
+                                    final_result.push('\n');
+                                    final_result.push_str(&line);
+                                }
                                 continue;
                             }
                         };
-
-                        match amp_event {
-                            AmpEvent::System(sys) => {
-                                tracing::debug!(
-                                    mission_id = %mission_id,
-                                    session_id = %sys.session_id,
-                                    model = ?sys.model,
-                                    "Amp session init"
-                                );
-                                if sys.model.is_some() {
-                                    model_used = sys.model;
-                                }
-                                // Amp generates its own session/thread ID; emit an update so the
-                                // mission's session_id gets updated for continuation.
-                                let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                                    session_id: sys.session_id.clone(),
-                                    mission_id,
-                                });
+                        if let Some(sid) = grok_event_session_id(&value) {
+                            let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                                session_id: sid,
+                                mission_id,
+                            });
+                        }
+                        if model_used.is_none() {
+                            model_used = grok_event_model(&value);
+                        }
+                        if grok_event_is_error(&value) {
+                            had_error = true;
+                            if let Some(text) = grok_event_text(&value) {
+                                final_result = text;
+                            } else {
+                                final_result = value.to_string();
                             }
-                            AmpEvent::StreamEvent(wrapper) => {
-                                match wrapper.event {
-                                    StreamEvent::ContentBlockDelta { index, delta } => {
-                                        let block_type = block_types
-                                            .get(&index)
-                                            .map(|value| value.as_str());
-                                        let is_thinking_block =
-                                            matches!(block_type, Some("thinking"));
-                                        if delta.delta_type == "thinking_delta"
-                                            || (is_thinking_block
-                                                && delta.delta_type == "text_delta")
-                                        {
-                                            let thinking_text = delta.thinking.or(delta.text.clone());
-                                            if let Some(thinking_text) = thinking_text {
-                                                if !thinking_text.is_empty() {
-                                                    // If a new thinking block started, finalize the previous one
-                                                    if let Some(prev_idx) = active_thinking_index {
-                                                        if prev_idx != index {
-                                                            let _ = events_tx.send(AgentEvent::Thinking {
-                                                                content: String::new(),
-                                                                done: true,
-                                                                mission_id: Some(mission_id),
-                                                            });
-                                                            finalized_thinking_indices.insert(prev_idx);
-                                                        }
-                                                    }
-                                                    active_thinking_index = Some(index);
-
-                                                    let buffer = thinking_buffer.entry(index).or_default();
-                                                    buffer.push_str(&thinking_text);
-                                                    thinking_streamed = true;
-
-                                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                                        content: buffer.clone(),
-                                                        done: false,
-                                                        mission_id: Some(mission_id),
-                                                    });
-                                                }
-                                            }
-                                        } else if delta.delta_type == "text_delta" {
-                                            if let Some(text) = delta.text {
-                                                if !text.is_empty() {
-                                                    let buffer = text_buffer.entry(index).or_default();
-                                                    buffer.push_str(&text);
-
-                                                    // Stream text deltas similar to thinking
-                                                    let total_len = text_buffer.values().map(|s| s.len()).sum::<usize>();
-                                                    if total_len > last_text_len {
-                                                        let accumulated: String = text_buffer.values().cloned().collect::<Vec<_>>().join("");
-                                                        last_text_len = total_len;
-
-                                                        let _ = events_tx.send(AgentEvent::TextDelta {
-                                                            content: accumulated,
-                                                            mission_id: Some(mission_id),
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    StreamEvent::ContentBlockStart { index, content_block }
-                                        if content_block.block_type == "tool_use" =>
-                                    {
-                                        block_types.insert(index, content_block.block_type.clone());
-
-                                        if let (Some(id), Some(name)) =
-                                            (content_block.id, content_block.name)
-                                        {
-                                            pending_tools.insert(id, name);
-                                        }
-                                    }
-                                    StreamEvent::ContentBlockStart { index, content_block } => {
-                                        block_types.insert(index, content_block.block_type);
-                                    }
-                                    _ => {}
+                            continue;
+                        }
+                        if let Some(reasoning) = grok_event_reasoning(&value) {
+                            if !reasoning.is_empty() {
+                                reasoning_buffer.push_str(&reasoning);
+                                // Mirror the TextDelta coalescing strategy:
+                                // emit cumulative snapshots throttled to ~50ms.
+                                if reasoning_buffer.len() > last_reasoning_len
+                                    && reasoning_delta_coalescer.should_emit()
+                                {
+                                    last_reasoning_len = reasoning_buffer.len();
+                                    let _ = events_tx.send(AgentEvent::Thinking {
+                                        content: reasoning_buffer.clone(),
+                                        done: false,
+                                        mission_id: Some(mission_id),
+                                    });
                                 }
                             }
-                            AmpEvent::Assistant(evt) => {
-                                // Track model from assistant message
-                                if evt.message.model.is_some() {
-                                    model_used = evt.message.model.clone();
+                        }
+                        if let Some(text) = grok_event_text(&value) {
+                            if !text.is_empty() {
+                                // The first non-reasoning content marks the
+                                // boundary between thinking and answer; flush
+                                // a final Thinking { done: true } so the
+                                // dashboard collapses the reasoning panel
+                                // before streaming text deltas.
+                                if !reasoning_buffer.is_empty() {
+                                    let _ = events_tx.send(AgentEvent::Thinking {
+                                        content: std::mem::take(&mut reasoning_buffer),
+                                        done: true,
+                                        mission_id: Some(mission_id),
+                                    });
+                                    last_reasoning_len = 0;
                                 }
-
-                                // Accumulate token usage for cost calculation
-                                if let Some(usage) = &evt.message.usage {
-                                    total_input_tokens += usage.input_tokens.unwrap_or(0);
-                                    total_output_tokens += usage.output_tokens.unwrap_or(0);
-                                    total_cache_creation_tokens += usage.cache_creation_input_tokens.unwrap_or(0);
-                                    total_cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0);
-                                }
-
-                                for (content_idx, block) in evt.message.content.into_iter().enumerate() {
-                                    let content_idx = content_idx as u32;
-                                    match block {
-                                        ContentBlock::Text { text } if !text.is_empty() => {
-                                            if !thinking_streamed {
-                                                if let Some((thought, cleaned)) =
-                                                    extract_thought_line(&text)
-                                                {
-                                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                                        content: thought,
-                                                        done: true,
-                                                        mission_id: Some(mission_id),
-                                                    });
-                                                    thinking_streamed = true;
-                                                    final_result = cleaned;
-                                                } else {
-                                                    final_result = text;
-                                                }
-                                            } else {
-                                                final_result = text;
-                                            }
-                                        }
-                                        ContentBlock::ToolUse { id, name, input } => {
-                                            pending_tools.insert(id.clone(), name.clone());
-                                            let _ = events_tx.send(AgentEvent::ToolCall {
-                                                tool_call_id: id.clone(),
-                                                name: name.clone(),
-                                                args: input,
-                                                mission_id: Some(mission_id),
-                                            });
-                                        }
-                                        ContentBlock::Thinking { thinking } => {
-                                            // Skip blocks already finalized during streaming
-                                            if finalized_thinking_indices.contains(&content_idx) {
-                                                continue;
-                                            }
-                                            if !thinking.is_empty() && !thinking_streamed {
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: thinking,
-                                                    done: true,
-                                                    mission_id: Some(mission_id),
-                                                });
-                                            } else if thinking_streamed {
-                                                // Send done=true signal without content to indicate thinking is complete
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: String::new(),
-                                                    done: true,
-                                                    mission_id: Some(mission_id),
-                                                });
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                // Reset per-turn accumulation state so the next turn
-                                // starts fresh (block indices restart from 0 each turn)
-                                thinking_buffer.clear();
-                                text_buffer.clear();
-                                active_thinking_index = None;
-                                finalized_thinking_indices.clear();
-                                last_text_len = 0;
-                                block_types.clear();
-                                thinking_streamed = false;
-                            }
-                            AmpEvent::User(evt) => {
-                                for block in evt.message.content {
-                                    if let ContentBlock::ToolResult { tool_use_id, content, is_error } = block {
-                                        // Get tool name and remove from pending (tool is now complete)
-                                        let name = pending_tools
-                                            .remove(&tool_use_id)
-                                            .unwrap_or_else(|| "unknown".to_string());
-
-                                        let content_str = content.to_string_lossy();
-
-                                        let result_value = if let Some(ref extra) = evt.tool_use_result {
-                                            serde_json::json!({
-                                                "content": content_str,
-                                                "stdout": extra.stdout(),
-                                                "stderr": extra.stderr(),
-                                                "is_error": is_error,
-                                                "interrupted": extra.interrupted(),
-                                            })
-                                        } else {
-                                            serde_json::json!(content_str)
-                                        };
-
-                                        let _ = events_tx.send(AgentEvent::ToolResult {
-                                            tool_call_id: tool_use_id,
-                                            name,
-                                            result: result_value,
-                                            mission_id: Some(mission_id),
-                                        });
-                                    }
-                                }
-                            }
-                            AmpEvent::Result(res) => {
-                                if res.is_error || res.subtype == "error" {
-                                    had_error = true;
-                                    let err_msg = res.error_message();
-                                    tracing::warn!(
-                                        mission_id = %mission_id,
-                                        subtype = %res.subtype,
-                                        result = ?res.result,
-                                        error = ?res.error,
-                                        message = ?res.message,
-                                        raw_line = %if line.len() > 500 { let end = safe_truncate_index(&line, 500); format!("{}...", &line[..end]) } else { line.clone() },
-                                        "Amp error result event"
-                                    );
-                                    // Don't send an Error event here - let the failure propagate
-                                    // through the AgentResult. control.rs will emit an AssistantMessage
-                                    // with success=false which the UI displays as a failure message.
-                                    // Sending Error here would cause duplicate messages.
-                                    final_result = err_msg;
+                                if value
+                                    .get("delta")
+                                    .is_some()
+                                    || value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
+                                        t.contains("delta") || t.contains("chunk") || t == "text"
+                                    })
+                                {
+                                    final_result.push_str(&text);
                                 } else {
-                                    apply_terminal_result_text(&mut final_result, res.result);
+                                    final_result = text;
                                 }
-
-                                tracing::debug!(
-                                    mission_id = %mission_id,
-                                    subtype = %res.subtype,
-                                    duration_ms = ?res.duration_ms,
-                                    num_turns = ?res.num_turns,
-                                    "Amp result received"
-                                );
-
-                                // Result event means we're done
-                                break;
-                            }
-                            AmpEvent::Unknown => {
-                                // Forward-compatibility: silently ignore unknown events.
+                                // P3-#21: rate-limit TextDelta emissions
+                                // to at most one per ~50ms per turn. Grok
+                                // bursts can hit ~100 tokens/sec; without
+                                // this every token becomes its own SSE
+                                // frame even though the dashboard rAF
+                                // coalesces them into a single render.
+                                // The cumulative-buffer semantics mean
+                                // skipping intermediate frames loses no
+                                // content — each emit replaces the prior.
+                                if final_result.len() > last_streamed_len
+                                    && text_delta_coalescer.should_emit()
+                                {
+                                    last_streamed_len = final_result.len();
+                                    let _ = events_tx.send(AgentEvent::TextDelta {
+                                        content: final_result.clone(),
+                                        mission_id: Some(mission_id),
+                                    });
+                                }
                             }
                         }
                     }
-                    Ok(None) => {
-                        // EOF
-                        break;
-                    }
+                    Ok(None) => break,
                     Err(e) => {
-                        tracing::error!(mission_id = %mission_id, error = %e, "Error reading Amp stdout");
+                        had_error = true;
+                        final_result = format!("Error reading Grok stdout: {}", e);
                         break;
                     }
                 }
@@ -13035,142 +13158,82 @@ pub async fn run_amp_turn(
         }
     }
 
-    // Wait for process to finish
     let exit_status = child.wait().await;
-
-    // Wait for stderr capture to complete (don't abort - we need the content)
     if let Some(handle) = stderr_handle {
         let _ = handle.await;
     }
 
-    // Compute cost from accumulated token usage
-    let usage = crate::cost::TokenUsage {
-        input_tokens: total_input_tokens,
-        output_tokens: total_output_tokens,
-        cache_creation_input_tokens: if total_cache_creation_tokens > 0 {
-            Some(total_cache_creation_tokens)
-        } else {
-            None
-        },
-        cache_read_input_tokens: if total_cache_read_tokens > 0 {
-            Some(total_cache_read_tokens)
-        } else {
-            None
-        },
-    };
-    let (cost_cents, cost_source) =
-        resolve_cost_cents_and_source(None, model_used.as_deref(), &usage);
-
-    tracing::debug!(
-        mission_id = %mission_id,
-        model = ?model_used,
-        input_tokens = total_input_tokens,
-        output_tokens = total_output_tokens,
-        cache_creation_tokens = total_cache_creation_tokens,
-        cache_read_tokens = total_cache_read_tokens,
-        cost_cents = cost_cents,
-        "Amp cost computed from token usage"
-    );
-
-    // If no final result from Assistant or Result events, use accumulated text buffer
-    if final_result.trim().is_empty() && !text_buffer.is_empty() {
-        let mut sorted_entries: Vec<_> = text_buffer.iter().collect();
-        sorted_entries.sort_by_key(|(idx, _)| *idx);
-        final_result = sorted_entries
-            .into_iter()
-            .map(|(_, text)| text.clone())
-            .collect::<Vec<_>>()
-            .join("");
-        tracing::debug!(
-            mission_id = %mission_id,
-            "Using accumulated text buffer as final result ({} chars)",
-            final_result.len()
-        );
+    // P3-#21 final flush: the coalescer may have dropped the very last
+    // delta within the trailing 50ms window. Always emit one more
+    // TextDelta carrying the full buffer so the dashboard sees the
+    // closing tokens; the AssistantMessage that follows will replace it.
+    if final_result.len() > last_streamed_len {
+        let _ = events_tx.send(AgentEvent::TextDelta {
+            content: final_result.clone(),
+            mission_id: Some(mission_id),
+        });
+        last_streamed_len = final_result.len();
     }
+    let _ = last_streamed_len; // silence "unused after final assignment"
 
-    // If result is still empty/generic, include stderr for a useful error message
-    if (final_result.trim().is_empty() || final_result == "Unknown error") && !had_error {
-        had_error = true;
-        let stderr_content = stderr_capture.lock().await;
-        if !stderr_content.is_empty() {
-            tracing::warn!(
-                mission_id = %mission_id,
-                stderr = %stderr_content,
-                exit_status = ?exit_status,
-                "Amp CLI produced no useful output but had stderr"
-            );
-            final_result = format!(
-                "Amp error: {}",
-                stderr_content
-                    .lines()
-                    .take(5)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            );
-        } else {
-            tracing::warn!(
-                mission_id = %mission_id,
-                exit_status = ?exit_status,
-                "Amp CLI produced no output and no stderr"
-            );
-            final_result =
-                "Amp CLI produced no output. Check CLI installation or API key.".to_string();
-        }
-    } else if had_error && (final_result.trim().is_empty() || final_result == "Unknown error") {
-        // Error was flagged by Result event but message is empty/generic - enrich with stderr
-        let stderr_content = stderr_capture.lock().await;
-        if !stderr_content.is_empty() {
-            tracing::warn!(
-                mission_id = %mission_id,
-                stderr = %stderr_content,
-                "Amp error with no result text, using stderr"
-            );
-            final_result = format!(
-                "Amp error: {}",
-                stderr_content
-                    .lines()
-                    .take(5)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            );
-        } else {
-            final_result = "Amp CLI returned an error with no details. Check API key and network connectivity.".to_string();
-        }
-    }
-
-    // Check exit status
-    let success = match exit_status {
-        Ok(status) => status.success() && !had_error,
-        Err(e) => {
-            tracing::error!(mission_id = %mission_id, error = %e, "Failed to wait for Amp process");
-            false
-        }
-    };
-
-    // Note: Do NOT emit AssistantMessage here - control.rs emits it based on AgentResult.
-    // Emitting here would cause duplicate messages in the UI.
-
-    let mut result = if success {
-        AgentResult::success(final_result, cost_cents)
-            .with_terminal_reason(TerminalReason::TurnComplete)
+    let reasoning_for_fallback = if reasoning_buffer.trim().is_empty() {
+        None
     } else {
-        // Detect rate limit / overloaded errors for account rotation.
-        let reason = if is_rate_limited_error(&final_result) {
-            TerminalReason::RateLimited
-        } else {
-            TerminalReason::LlmError
-        };
-        AgentResult::failure(final_result, cost_cents).with_terminal_reason(reason)
+        Some(reasoning_buffer.clone())
     };
 
-    if let Some(model) = model_used {
-        result = result.with_model(model);
+    // Flush any remaining reasoning that never got followed by a text
+    // delta (e.g., reasoning-only turns or the trailing coalescer window).
+    // Emit done: true so the dashboard finalizes the thinking block in the
+    // event store.
+    if !reasoning_buffer.is_empty() {
+        let _ = events_tx.send(AgentEvent::Thinking {
+            content: std::mem::take(&mut reasoning_buffer),
+            done: true,
+            mission_id: Some(mission_id),
+        });
+    }
+    let _ = last_reasoning_len;
+
+    let cancel_marker = if cancelled {
+        Some(cancel_or_shutdown_failure())
+    } else {
+        None
+    };
+
+    if final_result.trim().is_empty() {
+        let stderr_content = stderr_capture.lock().await;
+        if let Some(reasoning) = reasoning_for_fallback {
+            final_result = reasoning;
+        } else if let Some(marker) = cancel_marker.as_ref() {
+            final_result = marker.output.clone();
+        } else if !stderr_content.trim().is_empty() {
+            final_result = format!(
+                "Grok Build error: {}",
+                stderr_content
+                    .lines()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+            had_error = true;
+        } else {
+            final_result = "Grok Build produced no output. Run `grok login` or configure an xAI provider for Grok Build.".to_string();
+            had_error = true;
+        }
     }
 
-    if usage.has_usage() {
-        result = result.with_usage(usage);
-    }
-    result.with_cost_source(cost_source)
+    let success = exit_status.map(|status| status.success()).unwrap_or(false) && !had_error;
+    let mut result = if success {
+        AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::TurnComplete)
+    } else if let Some(marker) = cancel_marker {
+        AgentResult::failure(final_result, 0)
+            .with_terminal_reason(marker.terminal_reason.unwrap_or(TerminalReason::Cancelled))
+    } else {
+        AgentResult::failure(final_result, 0).with_terminal_reason(TerminalReason::LlmError)
+    };
+    result = result.with_model(model_used.unwrap_or_else(|| "grok-build".to_string()));
+    result
 }
 
 /// Compact info about a running mission (for API responses).
@@ -13649,6 +13712,8 @@ pub async fn run_codex_turn(
 
     // Process events until completion or cancellation
     let mut assistant_message = String::new();
+    let mut text_delta_coalescer = TextDeltaCoalescer::new();
+    let mut text_delta_pending = false;
     let mut success = false;
     let mut error_message: Option<String> = None;
     let mut pending_tools: std::collections::HashMap<String, String> =
@@ -13660,13 +13725,20 @@ pub async fn run_codex_turn(
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
     let mut tool_events_seen: usize = 0;
+    // Set when the cancellation token fires mid-turn. Instead of returning a
+    // synthetic "Mission cancelled" failure and discarding everything the
+    // model already produced (the common shape for /goal missions, where the
+    // closing audit lives in `thinking_accumulated`), we break out of the
+    // loop and let the post-loop finalization recover whatever it can.
+    let mut cancelled = false;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("Codex turn cancelled for mission {}", mission_id);
                 // Note: Codex process will be cleaned up automatically when the event stream task ends
-                return cancel_or_shutdown_failure();
+                cancelled = true;
+                break;
             }
             Some(event) = event_rx.recv() => {
                 match event {
@@ -13675,10 +13747,18 @@ pub async fn run_codex_turn(
                         // the currently active assistant message item. Replacing here avoids
                         // concatenating intermediate assistant updates into the final message.
                         assistant_message = content;
-                        let _ = events_tx.send(AgentEvent::TextDelta {
-                            content: assistant_message.clone(),
-                            mission_id: Some(mission_id),
-                        });
+                        // P3-#21: rate-limit to ≤1 emit per ~50ms. Skipped
+                        // deltas are not lost because the buffer is
+                        // cumulative — the next emit replaces it.
+                        if text_delta_coalescer.should_emit() {
+                            text_delta_pending = false;
+                            let _ = events_tx.send(AgentEvent::TextDelta {
+                                content: assistant_message.clone(),
+                                mission_id: Some(mission_id),
+                            });
+                        } else {
+                            text_delta_pending = true;
+                        }
                     }
                     ExecutionEvent::Thinking { content } => {
                         // Stream incrementally for real-time UI
@@ -13829,6 +13909,17 @@ pub async fn run_codex_turn(
         }
     }
 
+    // P3-#21 final flush: ensure the closing delta the coalescer may
+    // have suppressed reaches the dashboard. AssistantMessage emits
+    // below will replace it, so this is purely a safety net for clients
+    // that render the streaming buffer ahead of completion.
+    if text_delta_pending {
+        let _ = events_tx.send(AgentEvent::TextDelta {
+            content: assistant_message.clone(),
+            mission_id: Some(mission_id),
+        });
+    }
+
     if !thinking_emitted {
         if let Some((thought, cleaned)) = extract_thought_line(&assistant_message) {
             let _ = events_tx.send(AgentEvent::Thinking {
@@ -13842,6 +13933,18 @@ pub async fn run_codex_turn(
         }
     }
 
+    // Capture a copy of the accumulated reasoning before the flush below
+    // moves it into the broadcast event. /goal missions frequently end with
+    // the model emitting a self-audit as reasoning and then calling
+    // `update_goal { status: "complete" }` without a closing chat message;
+    // in that case `assistant_message` is empty (or stale from an earlier
+    // iteration) and the only place the audit lives is `thinking_accumulated`.
+    let thinking_for_fallback = if thinking_accumulated.trim().is_empty() {
+        None
+    } else {
+        Some(thinking_accumulated.clone())
+    };
+
     // Flush any remaining accumulated thinking with full content so
     // the event logger persists it for replay/history.
     if thinking_emitted && !thinking_done_emitted {
@@ -13852,8 +13955,10 @@ pub async fn run_codex_turn(
         });
     }
 
-    let no_output = assistant_message.trim().is_empty() && last_summary.is_none();
-    if no_output && error_message.is_none() {
+    let no_output = assistant_message.trim().is_empty()
+        && last_summary.is_none()
+        && thinking_for_fallback.is_none();
+    if no_output && error_message.is_none() && !cancelled {
         success = false;
         error_message = Some(
             "Codex produced no output. This usually means the Codex CLI failed before emitting JSON (often authentication). Check that the host has a valid `~/.codex/auth.json` and that the backend can access it."
@@ -13861,12 +13966,31 @@ pub async fn run_codex_turn(
         );
     }
 
+    // Snapshot the cancel marker (output + terminal_reason) once. The marker
+    // reads `is_shutdown_initiated()` internally, and a shutdown signal
+    // arriving between two reads could pair "Mission cancelled" text with a
+    // ServerShutdown reason (or vice versa) — TOCTOU race flagged by bugbot.
+    let cancel_marker = if cancelled {
+        Some(cancel_or_shutdown_failure())
+    } else {
+        None
+    };
+
     let mut final_message = if let Some(err) = error_message {
         err
     } else if !assistant_message.is_empty() {
         assistant_message
     } else if let Some(summary) = last_summary {
         summary
+    } else if let Some(thinking_text) = thinking_for_fallback {
+        // Surface the model's reasoning as the assistant message so the
+        // dashboard's final-message slot matches what's already visible in
+        // the thinking panel.
+        thinking_text
+    } else if let Some(marker) = cancel_marker.as_ref() {
+        // Mid-turn cancellation with nothing accumulated — preserve the
+        // historical "Mission cancelled" / shutdown text for the UI.
+        marker.output.clone()
     } else {
         "No response from Codex".to_string()
     };
@@ -13919,17 +14043,31 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
     let model_for_cost = resolved_model.as_deref();
     let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
 
-    let mut result = if success {
+    let mut result = if let Some(marker) = cancel_marker {
+        // Cancellation outranks success/error classification: keep the partial
+        // assistant_message / thinking content as the visible final message
+        // but mark the mission Interrupted (or ServerShutdown) so the
+        // dashboard renders the resume affordance and not a fake completion.
+        // Reusing the marker from the final-message picker keeps the
+        // text/reason pair consistent if shutdown fires mid-finalize.
+        let cancel_reason = marker.terminal_reason.unwrap_or(TerminalReason::Cancelled);
+        AgentResult::failure(final_message, cost_cents).with_terminal_reason(cancel_reason)
+    } else if success {
         AgentResult::success(final_message, cost_cents)
             .with_terminal_reason(TerminalReason::TurnComplete)
     } else {
         // Distinguish provider concurrency exhaustion from classic rate limits.
+        // Refresh-token reuse (ChatGPT OAuth races between sibling missions)
+        // is_auth_error-classified so the codex arm rotates to another
+        // configured account instead of surfacing the bare error.
         let reason = if stopped_before_required_tools || stopped_on_progress_update {
             TerminalReason::Stalled
         } else if is_capacity_limited_error(&final_message) {
             TerminalReason::CapacityLimited
         } else if is_rate_limited_error(&final_message) {
             TerminalReason::RateLimited
+        } else if is_auth_error(&final_message) {
+            TerminalReason::AuthError
         } else if stopped_with_pending_tool_error {
             TerminalReason::Stalled
         } else {
@@ -14152,6 +14290,9 @@ pub async fn run_gemini_turn(
     };
 
     // Process events until completion or cancellation
+    // Gemini emits incremental token deltas (not cumulative buffers),
+    // so it doesn't apply P3-#21 coalescing — skipping a delta there
+    // would drop content.
     let mut assistant_message = String::new();
     let mut success = false;
     let mut error_message: Option<String> = None;
@@ -14162,6 +14303,10 @@ pub async fn run_gemini_turn(
     let mut thinking_accumulated = String::new();
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    // See run_codex_turn: on cancellation we break instead of returning so
+    // the post-loop fallback can surface accumulated text / reasoning as the
+    // final assistant message.
+    let mut cancelled = false;
 
     loop {
         tokio::select! {
@@ -14171,7 +14316,8 @@ pub async fn run_gemini_turn(
                 backend.kill().await;
                 // Abort the event-conversion task
                 handle.abort();
-                return cancel_or_shutdown_failure();
+                cancelled = true;
+                break;
             }
             Some(event) = event_rx.recv() => {
                 match event {
@@ -14278,6 +14424,14 @@ pub async fn run_gemini_turn(
         }
     }
 
+    // See run_codex_turn: capture thinking before the flush below moves it,
+    // so the final-message picker can surface it when no text was produced.
+    let thinking_for_fallback = if thinking_accumulated.trim().is_empty() {
+        None
+    } else {
+        Some(thinking_accumulated.clone())
+    };
+
     // Flush any remaining accumulated thinking with full content
     if thinking_emitted && !thinking_done_emitted {
         let _ = events_tx.send(AgentEvent::Thinking {
@@ -14287,8 +14441,8 @@ pub async fn run_gemini_turn(
         });
     }
 
-    let no_output = assistant_message.trim().is_empty();
-    if no_output && error_message.is_none() {
+    let no_output = assistant_message.trim().is_empty() && thinking_for_fallback.is_none();
+    if no_output && error_message.is_none() && !cancelled {
         success = false;
         error_message = Some(
             "Gemini CLI produced no output. Check that the Gemini CLI is installed and configured with valid credentials (GEMINI_API_KEY or Google OAuth)."
@@ -14296,10 +14450,22 @@ pub async fn run_gemini_turn(
         );
     }
 
+    // See run_codex_turn: snapshot the cancel marker once to keep the
+    // output/terminal_reason pair consistent if shutdown fires mid-finalize.
+    let cancel_marker = if cancelled {
+        Some(cancel_or_shutdown_failure())
+    } else {
+        None
+    };
+
     let final_message = if let Some(err) = error_message {
         err
     } else if !assistant_message.is_empty() {
         assistant_message
+    } else if let Some(thinking_text) = thinking_for_fallback {
+        thinking_text
+    } else if let Some(marker) = cancel_marker.as_ref() {
+        marker.output.clone()
     } else {
         "No response from Gemini CLI".to_string()
     };
@@ -14314,7 +14480,10 @@ pub async fn run_gemini_turn(
     let model_for_cost = resolved_model.as_deref();
     let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
 
-    let mut result = if success {
+    let mut result = if let Some(marker) = cancel_marker {
+        let cancel_reason = marker.terminal_reason.unwrap_or(TerminalReason::Cancelled);
+        AgentResult::failure(final_message, cost_cents).with_terminal_reason(cancel_reason)
+    } else if success {
         AgentResult::success(final_message, cost_cents)
             .with_terminal_reason(TerminalReason::TurnComplete)
     } else {
@@ -14718,8 +14887,8 @@ mod tests {
         STALL_WARN_SECS,
     };
     use super::{
-        extract_telegram_instructions, inject_telegram_identity_into_claude_md,
-        localhost_api_base_url, public_api_base_url,
+        extract_telegram_instructions, grok_event_reasoning, grok_event_text,
+        inject_telegram_identity_into_claude_md, localhost_api_base_url, public_api_base_url,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
@@ -14728,6 +14897,61 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn grok_typed_reasoning_event_is_not_answer_text() {
+        let event = json!({
+            "type": "thinking",
+            "text": "private reasoning"
+        });
+
+        assert_eq!(
+            grok_event_reasoning(&event).as_deref(),
+            Some("private reasoning")
+        );
+        assert_eq!(grok_event_text(&event), None);
+    }
+
+    #[test]
+    fn grok_typed_reasoning_content_event_is_not_answer_text() {
+        let event = json!({
+            "type": "reasoning",
+            "content": "private reasoning"
+        });
+
+        assert_eq!(
+            grok_event_reasoning(&event).as_deref(),
+            Some("private reasoning")
+        );
+        assert_eq!(grok_event_text(&event), None);
+    }
+
+    #[test]
+    fn grok_reasoning_delta_text_is_reasoning_not_answer_text() {
+        let event = json!({
+            "type": "reasoning_delta",
+            "delta": {
+                "text": "private reasoning"
+            }
+        });
+
+        assert_eq!(
+            grok_event_reasoning(&event).as_deref(),
+            Some("private reasoning")
+        );
+        assert_eq!(grok_event_text(&event), None);
+    }
+
+    #[test]
+    fn grok_text_event_still_extracts_answer_text() {
+        let event = json!({
+            "type": "text",
+            "data": "visible answer"
+        });
+
+        assert_eq!(grok_event_text(&event).as_deref(), Some("visible answer"));
+        assert_eq!(grok_event_reasoning(&event), None);
+    }
 
     #[test]
     fn codex_turn_requires_tool_activity_for_file_shell_prompt() {

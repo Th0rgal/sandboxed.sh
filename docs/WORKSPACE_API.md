@@ -127,8 +127,10 @@ Manually syncs the workspace's skills and tools from the library.
 Note: Mission workspaces generate backend-specific config on execution:
 - **OpenCode**: `opencode.json`, `.opencode/opencode.json`, `.opencode/oh-my-opencode.json`
 - **Claude Code**: `.claude/settings.local.json`, `.claude/skills/<name>/SKILL.md`, `CLAUDE.md`
+- **Codex**: `.codex/config.toml`, `.codex/skills/<name>/SKILL.md`
+- **Gemini/Grok**: OpenCode-style MCP/tool config for the native CLI backend
 
-Skills are written to `.opencode/skill/` for OpenCode and `.claude/skills/` for Claude Code.
+Skills are written to the backend-specific skill directory during mission setup.
 
 ## Execute Command
 
@@ -502,7 +504,7 @@ curl -X PUT "http://localhost:3000/api/workspaces/{id}" \
   -H "Content-Type: application/json" \
   -d '{"skills": ["python-dev", "rust-dev"]}'
 
-# Force sync skills to .opencode/
+# Force sync workspace skills/tools
 curl -X POST "http://localhost:3000/api/workspaces/{id}/sync" \
   -H "Authorization: Bearer <token>"
 ```

@@ -1,9 +1,9 @@
-# Open Agent Documentation
-# https://openagent.thomas.md
+# sandboxed.sh Documentation
+# https://sandboxed.sh
 
 User-agent: *
 Allow: /
 
 # AI agent documentation index
 # See /llms.txt for structured documentation access
-Sitemap: https://openagent.thomas.md/sitemap.xml
+Sitemap: https://sandboxed.sh/sitemap.xml

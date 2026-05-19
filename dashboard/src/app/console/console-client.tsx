@@ -118,12 +118,13 @@ async function downloadFile(path: string) {
   URL.revokeObjectURL(url);
 }
 
-async function fetchFileContent(path: string): Promise<string> {
+async function fetchFileContent(path: string, signal?: AbortSignal): Promise<string> {
   const API_BASE = getRuntimeApiBase();
   const res = await fetch(
     `${API_BASE}/api/fs/download?path=${encodeURIComponent(path)}`,
     {
       headers: { ...authHeader() },
+      signal,
     }
   );
   if (!res.ok) throw new Error(await res.text());
@@ -247,6 +248,7 @@ function FilePreviewModal({
 
   useEffect(() => {
     let isStale = false;
+    const controller = new AbortController();
 
     // Revoke previous blob URL if any
     if (blobUrlRef.current) {
@@ -266,6 +268,7 @@ function FilePreviewModal({
             `${API_BASE}/api/fs/download?path=${encodeURIComponent(path)}`,
             {
               headers: { ...authHeader() },
+              signal: controller.signal,
             }
           );
           if (!res.ok) throw new Error(await res.text());
@@ -280,7 +283,7 @@ function FilePreviewModal({
           setImageBlobUrl(blobUrl);
           setContent("image");
         } else {
-          const text = await fetchFileContent(path);
+          const text = await fetchFileContent(path, controller.signal);
           if (isStale) return;
           // Limit preview size
           if (text.length > 500000) {
@@ -291,6 +294,7 @@ function FilePreviewModal({
         }
       } catch (err) {
         if (isStale) return;
+        if (err instanceof DOMException && err.name === "AbortError") return;
         setError(err instanceof Error ? err.message : String(err));
       } finally {
         if (!isStale) {
@@ -303,6 +307,7 @@ function FilePreviewModal({
     // Cleanup blob URL on unmount or path change
     return () => {
       isStale = true;
+      controller.abort();
       if (blobUrlRef.current) {
         URL.revokeObjectURL(blobUrlRef.current);
         blobUrlRef.current = null;
@@ -355,11 +360,20 @@ function FilePreviewModal({
         {/* Content */}
         <div className="flex-1 overflow-auto min-h-0">
           {loading ? (
-            <div className="flex items-center justify-center py-16">
-              <svg className="h-6 w-6 animate-spin text-[var(--foreground-muted)]" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-              </svg>
+            <div className="p-6 animate-pulse">
+              {isImage ? (
+                <div className="mx-auto h-[45vh] max-w-2xl rounded-lg bg-white/[0.04]" />
+              ) : (
+                <div className="space-y-3">
+                  {Array.from({ length: 12 }).map((_, idx) => (
+                    <div
+                      key={idx}
+                      className="h-3 rounded bg-white/[0.06]"
+                      style={{ width: `${92 - (idx % 4) * 12}%` }}
+                    />
+                  ))}
+                </div>
+              )}
             </div>
           ) : error ? (
             <div className="flex flex-col items-center justify-center py-16 text-red-400">
@@ -1115,6 +1129,8 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
   const lastLoadedDirRef = useRef<string | null>(null);
   const hasEverLoadedRef = useRef(false);
   const dragCounterRef = useRef(0);
+  const dirCacheRef = useRef<Map<string, FsEntry[]>>(new Map());
+  const dirRequestSeqRef = useRef(0);
 
   // Check if a file can be previewed
   const canPreview = useCallback((entry: FsEntry) => {
@@ -1165,19 +1181,33 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
     if (!force && lastLoadedDirRef.current === path && hasEverLoadedRef.current) {
       return;
     }
-    
-    setFsLoading(true);
+
+    const cached = dirCacheRef.current.get(path);
+    if (cached && !force) {
+      setEntries(cached);
+      setFsLoading(false);
+    } else {
+      setFsLoading(true);
+    }
     setFsError(null);
+    const seq = ++dirRequestSeqRef.current;
     try {
       const data = await listDir(path);
+      if (seq !== dirRequestSeqRef.current) return;
+      dirCacheRef.current.set(path, data);
       setEntries(data);
-      setSelected(null);
+      setSelected((prev) =>
+        prev && data.some((entry) => entry.path === prev.path) ? prev : null
+      );
       lastLoadedDirRef.current = path;
       hasEverLoadedRef.current = true;
     } catch (e) {
+      if (seq !== dirRequestSeqRef.current) return;
       setFsError(e instanceof Error ? e.message : String(e));
     } finally {
-      setFsLoading(false);
+      if (seq === dirRequestSeqRef.current) {
+        setFsLoading(false);
+      }
     }
   }, []);
 
@@ -1692,8 +1722,9 @@ export default function ConsoleClient() {
       );
 
       if (existingTab) {
-        // Just activate the existing tab
-        setActiveTabId(existingTab.id);
+        // Just activate the existing tab. Defer the state write so this
+        // URL-param synchronizer doesn't cascade during the effect body.
+        setTimeout(() => setActiveTabId(existingTab.id), 0);
       } else {
         // Create a new workspace shell tab
         const newTabId = generateTabId();
@@ -1704,8 +1735,10 @@ export default function ConsoleClient() {
           workspaceId,
           workspaceName,
         };
-        setTabs(prev => [...prev, newTab]);
-        setActiveTabId(newTabId);
+        setTimeout(() => {
+          setTabs(prev => [...prev, newTab]);
+          setActiveTabId(newTabId);
+        }, 0);
       }
 
       // Clear the URL params after processing

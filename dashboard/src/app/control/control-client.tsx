@@ -4,7 +4,7 @@ import type React from "react";
 import { useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo, startTransition } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
-import { MarkdownContent } from "@/components/markdown-content";
+import { MarkdownContent, LazyMarkdownContent } from "@/components/markdown-content";
 import { StreamingMarkdown } from "@/components/streaming-markdown";
 import {
   EnhancedInput,
@@ -13,6 +13,11 @@ import {
   type FilePasteContext,
 } from "@/components/enhanced-input";
 import { MissionAutomationsDialog } from "@/components/mission-automations-dialog";
+import { PerfOverlay } from "@/components/perf-overlay";
+import { perfBus } from "@/lib/perf-bus";
+import { isStreamContinuation } from "@/lib/stream-continuation";
+import { NowTickProvider, useNow } from "@/lib/now-tick";
+import { startHealthBudgetWatcher } from "@/lib/health-budget";
 import { MissionDebugStats } from "./MissionDebugStats";
 import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
@@ -23,14 +28,22 @@ import { getMissionDotColor, isFinishedStatus } from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import {
+  readCachedEvents,
+  writeCachedEvents,
+  deleteCachedEvents,
+} from "@/lib/event-cache";
+import {
   cancelControl,
   postControlMessage,
   postControlToolResult,
   streamControl,
   loadMission,
+  markMissionOpened,
   getMission,
   getMissionEvents,
   getMissionEventsWithMeta,
+  getMissionTranscript,
+  getMissionTraceWithMeta,
   searchMissionMoments,
   createMission,
   updateMissionSettings,
@@ -164,6 +177,31 @@ function formatDiagAge(ts?: number) {
   return `${hrs}h ${remMins}m ago`;
 }
 
+function isRetriableSendError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("failed to fetch") ||
+    message.includes("networkerror") ||
+    message.includes("load failed") ||
+    message.includes("network request failed") ||
+    message.includes("offline")
+  );
+}
+
+async function postControlMessageWithRetry(
+  content: string,
+  options: { agent?: string; mission_id?: string; client_message_id: string }
+): Promise<{ id: string; queued: boolean }> {
+  try {
+    return await postControlMessage(content, options);
+  } catch (error) {
+    if (!isRetriableSendError(error)) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    return postControlMessage(content, options);
+  }
+}
+
 type StreamLogLevel = "debug" | "info" | "warn" | "error";
 
 function streamLog(level: StreamLogLevel, message: string, meta?: Record<string, unknown>) {
@@ -207,6 +245,7 @@ import { DesktopStream } from "@/components/desktop-stream";
 import { NewMissionDialog } from "@/components/new-mission-dialog";
 import { MissionSwitcher, normalizeMetadataText } from "@/components/mission-switcher";
 import { WorkerPanel } from "@/components/worker-panel";
+import { WorkersStrip } from "@/components/workers-strip";
 import { SubagentsPanel, type SubagentEntry } from "@/components/subagents-panel";
 import { RelativeTime } from "@/components/ui/relative-time";
 
@@ -878,6 +917,7 @@ function statusLabel(state: ControlRunState): {
     case "waiting_for_tool":
       return { label: "Waiting", Icon: Loader, className: "text-amber-400" };
   }
+  return { label: "Idle", Icon: Clock, className: "text-white/40" };
 }
 
 function missionStatusLabel(status: MissionStatus, isRunning = false): {
@@ -891,6 +931,13 @@ function missionStatusLabel(status: MissionStatus, isRunning = false): {
   switch (status) {
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
+    case "awaiting_user":
+      return { label: "Needs You", className: "bg-sky-500/20 text-sky-400" };
+    case "acknowledged":
+      return {
+        label: "Acknowledged",
+        className: "bg-emerald-500/20 text-emerald-400",
+      };
     case "completed":
       return {
         label: "Completed",
@@ -954,6 +1001,61 @@ function Shimmer({ className }: { className?: string }) {
       <div className="h-4 bg-white/[0.06] rounded w-3/4 mb-2" />
       <div className="h-4 bg-white/[0.06] rounded w-1/2 mb-2" />
       <div className="h-4 bg-white/[0.06] rounded w-5/6" />
+    </div>
+  );
+}
+
+function ChatLoadingSkeleton() {
+  // Mirrors ChatItemRow: assistant rows are left-aligned with a Bot avatar
+  // (h-8 w-8 bg-indigo-500/20), user rows are right-aligned with a User
+  // avatar (bg-white/[0.08]) and a solid indigo bubble. Both bubbles use
+  // max-w-[80%].
+  const rows: Array<"assistant" | "user"> = ["assistant", "user", "assistant"];
+  return (
+    <div className="mx-auto max-w-3xl space-y-6 animate-pulse">
+      {rows.map((role, idx) => {
+        const isAssistant = role === "assistant";
+        return (
+          <div
+            key={idx}
+            className={cn(
+              "flex gap-3",
+              isAssistant ? "justify-start" : "justify-end"
+            )}
+          >
+            {isAssistant && (
+              <div className="h-8 w-8 shrink-0 rounded-full bg-indigo-500/20" />
+            )}
+            <div
+              className={cn(
+                "max-w-[80%] rounded-2xl px-4 py-3",
+                isAssistant
+                  ? "rounded-tl-md border border-white/[0.06] bg-white/[0.03]"
+                  : "rounded-tr-md bg-indigo-500/70"
+              )}
+            >
+              <div
+                className={cn(
+                  "h-3 w-48 rounded",
+                  isAssistant ? "bg-white/[0.08]" : "bg-white/30"
+                )}
+              />
+              <div
+                className={cn(
+                  "mt-2 h-3 w-40 rounded",
+                  isAssistant ? "bg-white/[0.06]" : "bg-white/20"
+                )}
+              />
+              {isAssistant && (
+                <div className="mt-2 h-3 w-32 rounded bg-white/[0.06]" />
+              )}
+            </div>
+            {!isAssistant && (
+              <div className="h-8 w-8 shrink-0 rounded-full bg-white/[0.08]" />
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1443,14 +1545,13 @@ function ThinkingGroupItem({
     ? Math.max(...items.map(item => item.endTime || item.startTime))
     : undefined;
 
-  // Update elapsed time while any thinking is active
+  // P1-#7: derive elapsed from the shared NowTickProvider so we have
+  // one timer for the whole page instead of one per visible item.
+  const nowMs = useNow();
   useEffect(() => {
     if (!hasActiveItem) return;
-    const interval = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - startTime) / 1000));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [hasActiveItem, startTime]);
+    setElapsedSeconds(Math.max(0, Math.floor((nowMs - startTime) / 1000)));
+  }, [hasActiveItem, startTime, nowMs]);
 
   // Auto-collapse when all thinking is done
   useEffect(() => {
@@ -1590,16 +1691,12 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
   workspaceId?: string;
   missionId?: string;
 }) {
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  // P1-#7: shared NowTickProvider drives elapsed for all items.
+  const nowMs = useNow();
+  const elapsedSeconds = item.done
+    ? Math.max(0, Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000))
+    : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
   const [isExpanded, setIsExpanded] = useState(false);
-
-  useEffect(() => {
-    if (item.done) return;
-    const interval = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - item.startTime) / 1000));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [item.done, item.startTime]);
 
   const formatDuration = (seconds: number) => {
     if (seconds <= 0) return "<1s";
@@ -1890,6 +1987,7 @@ function MissionWorkbenchPanel({
   role,
   isRunning,
   childMissions,
+  runtime,
   onClose,
   onResume,
   onCancel,
@@ -1905,6 +2003,16 @@ function MissionWorkbenchPanel({
   role: ReturnType<typeof inferMissionRole>;
   isRunning: boolean;
   childMissions: Mission[];
+  /**
+   * Optional runtime block (queue + subtask progress) surfaced inside the
+   * workbench so the toolbar can drop these chips. Caller passes only the
+   * values it has — the section renders only when at least one is active.
+   */
+  runtime?: {
+    queueLen: number;
+    subtaskCompleted?: number;
+    subtaskTotal?: number;
+  };
   onClose: () => void;
   onResume: () => void;
   onCancel: (missionId: string) => void;
@@ -2029,6 +2137,36 @@ function MissionWorkbenchPanel({
                 </p>
               )}
             </section>
+
+            {runtime && (runtime.queueLen > 0 || (runtime.subtaskTotal ?? 0) > 0) && (
+              <section className="space-y-2">
+                <p className="text-[10px] uppercase tracking-wide text-white/30">Runtime</p>
+                <div className="grid grid-cols-2 gap-2">
+                  {runtime.queueLen > 0 && (
+                    <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
+                      <p className="text-[10px] text-white/30">Queue</p>
+                      <p
+                        className={cn(
+                          "mt-1 text-xs font-medium tabular-nums",
+                          runtime.queueLen < 3 ? "text-amber-400" : "text-orange-400"
+                        )}
+                        title={`${runtime.queueLen} message${runtime.queueLen > 1 ? "s" : ""} waiting`}
+                      >
+                        {runtime.queueLen}
+                      </p>
+                    </div>
+                  )}
+                  {(runtime.subtaskTotal ?? 0) > 0 && (
+                    <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
+                      <p className="text-[10px] text-white/30">Subtask</p>
+                      <p className="mt-1 text-xs font-medium text-emerald-400 tabular-nums">
+                        {Math.min((runtime.subtaskCompleted ?? 0) + 1, runtime.subtaskTotal ?? 0)}/{runtime.subtaskTotal}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </section>
+            )}
 
             <section className="space-y-2">
               <p className="text-[10px] uppercase tracking-wide text-white/30">Actions</p>
@@ -2180,6 +2318,35 @@ function formatToolArgs(args: unknown): string {
   }
 }
 
+/**
+ * P4-#24: tool-output preview cap. Bash and similar tools can return
+ * multi-MB result strings; rendering them inline freezes the page even
+ * with the markdown cap. This helper splits the full string into a
+ * 10KB preview + a `truncated` flag so the renderer can show a
+ * "Show full output" affordance. We deliberately keep the preview
+ * *prefix* (the first 10KB) since the head of a tool output is usually
+ * what the user reads — the tail is logs or stack traces.
+ */
+const TOOL_RESULT_PREVIEW_BYTES = 10_000;
+
+type ToolResultPreview = {
+  preview: string;
+  truncated: boolean;
+  fullLength: number;
+};
+
+function formatToolResultPreview(result: unknown): ToolResultPreview {
+  const full = formatToolArgs(result);
+  if (full.length <= TOOL_RESULT_PREVIEW_BYTES) {
+    return { preview: full, truncated: false, fullLength: full.length };
+  }
+  return {
+    preview: full.slice(0, TOOL_RESULT_PREVIEW_BYTES),
+    truncated: true,
+    fullLength: full.length,
+  };
+}
+
 // Truncate text for preview
 function truncateText(text: string, maxLength: number = 100): string {
   if (text.length <= maxLength) return text;
@@ -2271,8 +2438,14 @@ const SubagentToolItem = memo(function SubagentToolItem({
   highlighted?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const isDone = item.result !== undefined;
+  // P1-#7: derived from the shared NowTickProvider instead of a per-row
+  // setInterval. With dozens of visible tool calls this was the biggest
+  // contributor to the timer storm seen in devtools.
+  const nowMs = useNow();
+  const elapsedSeconds = isDone
+    ? Math.max(0, Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000))
+    : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
 
   // Memoize subagent info extraction
   const { agentName, description, prompt } = useMemo(
@@ -2285,15 +2458,6 @@ const SubagentToolItem = memo(function SubagentToolItem({
     () => (isDone ? parseSubagentResult(item.result) : { success: false, cancelled: false, summary: null }),
     [isDone, item.result]
   );
-
-  // Update elapsed time while tool is running
-  useEffect(() => {
-    if (isDone) return;
-    const interval = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - item.startTime) / 1000));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [isDone, item.startTime]);
 
   const formatDuration = (seconds: number) => {
     // Handle negative or zero durations
@@ -2624,17 +2788,12 @@ const ToolCallItem = memo(function ToolCallItem({
   missionId?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const isDone = item.result !== undefined;
-
-  // Update elapsed time while tool is running
-  useEffect(() => {
-    if (isDone) return;
-    const interval = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - item.startTime) / 1000));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [isDone, item.startTime]);
+  // P1-#7: shared NowTickProvider drives the "elapsed" pill.
+  const nowMs = useNow();
+  const elapsedSeconds = isDone
+    ? Math.max(0, Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000))
+    : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
 
   const formatDuration = (seconds: number) => {
     if (seconds <= 0) return "<1s";
@@ -2652,11 +2811,14 @@ const ToolCallItem = memo(function ToolCallItem({
   // Memoize expensive string formatting - only recompute when item.args changes
   const argsStr = useMemo(() => formatToolArgs(item.args), [item.args]);
 
-  // Memoize result string - only recompute when item.result changes
-  const resultStr = useMemo(
-    () => (item.result !== undefined ? formatToolArgs(item.result) : null),
+  // P4-#24 preview cap: split into 10KB head + truncated flag so we
+  // don't feed multi-MB bash outputs into the syntax highlighter.
+  const resultPreview = useMemo(
+    () => (item.result !== undefined ? formatToolResultPreview(item.result) : null),
     [item.result]
   );
+  const resultStr = resultPreview?.preview ?? null;
+  const [resultExpanded, setResultExpanded] = useState(false);
 
   // Memoize cancelled detection - check if tool was cancelled due to mission ending
   const isCancelled = useMemo(() => {
@@ -2788,9 +2950,27 @@ const ToolCallItem = memo(function ToolCallItem({
                   background={isError ? "rgba(239, 68, 68, 0.1)" : undefined}
                   textColor={isError ? "rgb(248, 113, 113)" : undefined}
                 >
-                  {resultStr}
+                  {resultExpanded && item.result !== undefined
+                    ? formatToolArgs(item.result)
+                    : resultStr}
                 </LazyJsonHighlighter>
               </div>
+              {resultPreview?.truncated && (
+                <div className="mt-1 flex items-center justify-between text-[10px] text-white/40">
+                  <span>
+                    {resultExpanded
+                      ? `Showing full output (${(resultPreview.fullLength / 1024).toFixed(0)} KB)`
+                      : `Showing first ${(TOOL_RESULT_PREVIEW_BYTES / 1024).toFixed(0)} KB of ${(resultPreview.fullLength / 1024).toFixed(0)} KB`}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setResultExpanded((v) => !v)}
+                    className="rounded bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium text-white/70 hover:bg-white/[0.08]"
+                  >
+                    {resultExpanded ? "Show preview" : "Show full output"}
+                  </button>
+                </div>
+              )}
               {/* Image previews for screenshot results - only from tools that produce images */}
               {(() => {
                 // Only extract images from tools that actually produce screenshots
@@ -3045,35 +3225,39 @@ const ChatItemRow = memo(function ChatItemRow({
                 </span>
               </>
             )}
-            <>
-              <span>•</span>
-              <span
-                className={
-                  item.costSource === "actual"
-                    ? "text-emerald-400"
+            {(item.costSource !== "unknown" || item.costCents > 0) && (
+              <>
+                <span>•</span>
+                <span
+                  className={
+                    item.costSource === "actual"
+                      ? "text-emerald-400"
+                      : item.costSource === "estimated"
+                        ? "text-amber-300"
+                        : "text-white/50"
+                  }
+                >
+                  {item.costSource === "unknown"
+                    ? item.costCents > 0
+                      ? `$${(item.costCents / 100).toFixed(4)}`
+                      : "N/A"
+                    : `$${(item.costCents / 100).toFixed(4)}`}
+                </span>
+                <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/60">
+                  {item.costSource === "actual"
+                    ? "Actual"
                     : item.costSource === "estimated"
-                      ? "text-amber-300"
-                      : "text-white/50"
-                }
-              >
-                {item.costSource === "unknown"
-                  ? item.costCents > 0
-                    ? `$${(item.costCents / 100).toFixed(4)}`
-                    : "N/A"
-                  : `$${(item.costCents / 100).toFixed(4)}`}
-              </span>
-              <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/60">
-                {item.costSource === "actual"
-                  ? "Actual"
-                  : item.costSource === "estimated"
-                    ? "Estimated"
-                    : "Unknown"}
-              </span>
-            </>
+                      ? "Estimated"
+                      : "Unknown"}
+                </span>
+              </>
+            )}
             <span>•</span>
             <span className="text-white/30">{formatTime(item.timestamp)}</span>
           </div>
-          <MarkdownContent
+          {/* P2-#13: lazy markdown — bubbles render as raw text until they
+              scroll near the viewport, then upgrade to full markdown. */}
+          <LazyMarkdownContent
             content={item.content}
             basePath={basePath}
             workspaceId={workspaceId}
@@ -3366,6 +3550,12 @@ export default function ControlClient() {
   const missionHistoricEventsRef = useRef<Map<string, StoredEvent[]>>(new Map());
   const historicItemsCountRef = useRef<Map<string, number>>(new Map());
   const missionTotalHistoryRef = useRef<Map<string, number>>(new Map());
+  // In-flight guard for backwards-paginate. The manual "Load older
+  // messages" click and the post-initial background fill both advance
+  // the `missionMinSeqRef` cursor; if they fire concurrently they'd
+  // race on the same `before_seq` value and prepend duplicate events.
+  // The set holds the mission ids currently mid-fetch.
+  const paginatingOlderRef = useRef<Set<string>>(new Set());
   // Captured scroll geometry from the moment of `setItems` during a
   // paginate-back. Consumed by a `useLayoutEffect` watching `items` so the
   // restoration runs synchronously after commit but BEFORE the browser
@@ -3558,7 +3748,12 @@ export default function ControlClient() {
   const expectingDesktopSessionRef = useRef(false);
   const desktopRapidPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Thinking panel state
+  // Thinking panel state. Defaults to closed; the auto-show effect below
+  // (`hasActiveThinking && !thinkingPanelManuallyHidden → setShowThinkingPanel(true)`)
+  // is the canonical path that opens the panel when thinking content
+  // actually starts streaming. Defaulting to open made every cold-load of
+  // an old mission (often with no thinking content at all) render the
+  // panel by default.
   const [showThinkingPanel, setShowThinkingPanel] = useState(false);
   // Deferred mirror used by the heavy chat-list regrouping memo so the toggle
   // click stays interactive even on long missions.
@@ -3619,6 +3814,9 @@ export default function ControlClient() {
     ],
     []
   );
+  const renderDeferredTraceRef = useRef<
+    ((id: string, traceEvents: StoredEvent[], maxSequence?: number) => void) | null
+  >(null);
   /**
    * Per-mission high-water mark for `sequence`. When non-zero, reload
    * paths pass it as `since_seq` to `/events` so the server returns
@@ -3629,10 +3827,26 @@ export default function ControlClient() {
    */
   const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
 
-  // Page size for both the initial history load and each backwards-
-  // paginate-older fetch. Tuned for memory headroom on long missions —
-  // see the `chatScrollContainerRef` comment block above.
+  // Page size for the initial history fetch. Kept deliberately small so the
+  // newest messages render fast on a fresh mission load — a long-running
+  // mission with hundreds of events used to ship 1.5 MB / 20+ s of payload
+  // before the UI could paint a single message. We then `streamOlderHistory`
+  // in the background to fill in older events without blocking first paint.
+  const INITIAL_HISTORY_PAGE_SIZE = 200;
+  // Page size for each backwards-paginate-older fetch (both the explicit
+  // "Load older messages" button and the post-initial background fill).
+  // Tuned for memory headroom on long missions — see the
+  // `chatScrollContainerRef` comment block above.
   const HISTORY_PAGE_SIZE = 5000;
+  // Cap how far the background fill walks back from the head on first load.
+  // Past this depth the user has to click "Load older messages" — keeps
+  // memory + render cost predictable on huge missions while still feeling
+  // "complete" for typical ones.
+  const BACKGROUND_FILL_TARGET = 2000;
+  // Per-page size used by the background fill. Smaller than the explicit
+  // "Load older" button so each chunk costs less and we can interleave with
+  // live SSE events without long main-thread stalls.
+  const BACKGROUND_FILL_PAGE_SIZE = 500;
 
   const loadHistoryEvents = useCallback(
     async (id: string, opts?: { sinceSeq?: number }) => {
@@ -3670,25 +3884,123 @@ export default function ControlClient() {
         return events;
       }
 
-      // Initial load — request the most recent HISTORY_PAGE_SIZE events.
-      // `latest=true` lets the server compute the tail offset in one
-      // shot, so clients no longer need the binary-search probe loop
-      // to handle 25k+ event missions.
-      const { events, meta } = await getMissionEventsWithMeta(id, {
-        types: HISTORY_EVENT_TYPES,
-        latest: true,
-        limit: HISTORY_PAGE_SIZE,
-      });
+      // Initial load. Two-phase strategy:
+      //
+      // 1. If a recent IDB cache exists for this mission, hydrate from it
+      //    and issue a small `since_seq` delta fetch — most reopens find
+      //    zero or a handful of new events, turning a 1.5 MB / 20 s
+      //    `latest=true` round-trip into a sub-second catch-up.
+      //
+      // 2. Cache miss (or stale / regressed server state) falls through to
+      //    the original `latest=true` fetch with a small page size. The
+      //    background `streamOlderHistory` then fills in older context
+      //    after first paint either way.
+      let sorted: StoredEvent[] | null = null;
+      let metaMaxSeq: number | undefined;
+      let metaTotal: number | undefined;
+
+      const cached = await readCachedEvents(id).catch(() => null);
+      if (cached && cached.events.length > 0) {
+        try {
+          const delta = await getMissionEventsWithMeta(id, {
+            types: HISTORY_EVENT_TYPES,
+            sinceSeq: cached.maxSequence,
+            limit: HISTORY_PAGE_SIZE,
+          });
+          // If the server doesn't expose `X-Max-Sequence` it's an older
+          // build that ignored `since_seq` and returned offset=0 rows.
+          // Don't trust it — fall through to a fresh `latest` fetch.
+          //
+          // If the server's max sequence is *behind* what we cached, the
+          // mission was reset or replaced server-side and our cache is
+          // bogus — drop it and reload fresh.
+          if (
+            delta.meta.maxSequence === undefined ||
+            delta.meta.maxSequence < cached.maxSequence
+          ) {
+            void deleteCachedEvents(id).catch(() => undefined);
+          } else {
+            // Merge cached tail + delta. Both are sorted by sequence;
+            // dedup defensively in case the server re-sent an overlap row.
+            const seen = new Set<number>();
+            const merged: StoredEvent[] = [];
+            for (const ev of cached.events) {
+              if (!seen.has(ev.sequence)) {
+                seen.add(ev.sequence);
+                merged.push(ev);
+              }
+            }
+            for (const ev of delta.events) {
+              if (!seen.has(ev.sequence)) {
+                seen.add(ev.sequence);
+                merged.push(ev);
+              }
+            }
+            merged.sort((a, b) => a.sequence - b.sequence);
+            sorted = merged;
+            metaMaxSeq = delta.meta.maxSequence;
+            metaTotal = delta.meta.totalEvents;
+          }
+        } catch {
+          // Network or auth failure on the delta — fall through to the
+          // fresh `latest` fetch path. The cache row stays so a future
+          // reopen can try again.
+        }
+      }
+
+      if (!sorted) {
+        try {
+          const transcript = await getMissionTranscript(id);
+          sorted = transcript.messages
+            .map(({ trace_count: _traceCount, trace_summary: _traceSummary, ...event }) => event)
+            .sort((a, b) => a.sequence - b.sequence);
+          metaMaxSeq = transcript.latest_sequence;
+          // Only count types the client actually loads. The transcript's
+          // `event_counts` includes debug/status events outside
+          // `HISTORY_EVENT_TYPES`; summing them all inflates the total and
+          // makes `computeHasMoreOlder(id)` (which compares against the
+          // count of *loaded* events) return true forever, leaving the
+          // "Load older messages" button permanently visible. The fallback
+          // branch below already does this correctly via the meta returned
+          // by the typed `getMissionEventsWithMeta` call.
+          metaTotal = Object.entries(transcript.event_counts).reduce(
+            (sum, [type, count]) =>
+              HISTORY_EVENT_TYPES.includes(type) ? sum + count : sum,
+            0,
+          );
+
+          // Fetch hidden thoughts/tools after first paint. The renderer ref is
+          // populated below `eventsToItems`; this avoids blocking transcript
+          // display on the heavier activity trace.
+          setTimeout(() => {
+            void getMissionTraceWithMeta(id, { sinceSeq: 0, limit: HISTORY_PAGE_SIZE })
+              .then(({ events, meta }) => {
+                renderDeferredTraceRef.current?.(id, events, meta.maxSequence);
+              })
+              .catch(() => undefined);
+          }, 0);
+        } catch {
+          // Older backends do not expose `/transcript`; keep the existing full
+          // tail fetch as a compatibility fallback.
+          const { events, meta } = await getMissionEventsWithMeta(id, {
+            types: HISTORY_EVENT_TYPES,
+            latest: true,
+            limit: INITIAL_HISTORY_PAGE_SIZE,
+          });
+          sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
+          metaMaxSeq = meta.maxSequence;
+          metaTotal = meta.totalEvents;
+        }
+      }
+
       // Only seed `missionMaxSeqRef` when the server has confirmed it
       // supports the resume protocol via `X-Max-Sequence`. Seeding from
       // `event.sequence` alone would enable the delta path against old
       // backends that ignore `since_seq`, causing them to return
       // offset=0 rows that'd get appended as bogus "new" events.
-      if (meta.maxSequence !== undefined && meta.maxSequence > 0) {
-        missionMaxSeqRef.current.set(id, meta.maxSequence);
+      if (metaMaxSeq !== undefined && metaMaxSeq > 0) {
+        missionMaxSeqRef.current.set(id, metaMaxSeq);
       }
-      // Defensive: sort by sequence ASC in case upstream contract changes.
-      const sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
       // Seed pagination caches: snapshot of historic events, lowest seq
       // (cursor for next backwards page), and total filtered count from
       // the server (so we know when the user has reached the start).
@@ -3698,15 +4010,56 @@ export default function ControlClient() {
       } else {
         missionMinSeqRef.current.delete(id);
       }
-      if (meta.totalEvents !== undefined) {
-        missionTotalHistoryRef.current.set(id, meta.totalEvents);
+      if (metaTotal !== undefined) {
+        missionTotalHistoryRef.current.set(id, metaTotal);
       } else {
         missionTotalHistoryRef.current.delete(id);
       }
+
+      // Persist the freshly-loaded tail to the IDB cache so the next
+      // reopen hits the fast path. Best-effort — write failures are
+      // silently ignored. We only write when the server confirmed the
+      // delta protocol via `X-Max-Sequence`; otherwise we'd risk
+      // poisoning the cache with offset=0 rows from a legacy backend.
+      if (
+        metaMaxSeq !== undefined &&
+        metaMaxSeq > 0 &&
+        metaTotal !== undefined &&
+        sorted.length > 0
+      ) {
+        void writeCachedEvents(id, sorted, metaMaxSeq, metaTotal).catch(
+          () => undefined
+        );
+      }
+
+      // Kick off the background fill so the rest of the history streams in
+      // after first paint. Scheduled via setTimeout(0) so the caller's
+      // setItems/render commits first — running the next fetch synchronously
+      // here would just stall the same task we tried to free up. The ref
+      // indirection breaks TDZ against `streamOlderHistory`, which is
+      // declared after the older-paginator below.
+      const hasMoreLocal =
+        metaTotal !== undefined
+          ? sorted.length < metaTotal
+          : sorted.length >= INITIAL_HISTORY_PAGE_SIZE;
+      if (hasMoreLocal) {
+        const fillFn = streamOlderHistoryRef.current;
+        if (fillFn) {
+          setTimeout(() => {
+            void fillFn(id);
+          }, 0);
+        }
+      }
       return sorted;
     },
-    [HISTORY_EVENT_TYPES]
+    [HISTORY_EVENT_TYPES, INITIAL_HISTORY_PAGE_SIZE]
   );
+
+  // Bridge between `loadHistoryEvents` (declared above) and
+  // `streamOlderHistory` (declared below). `loadHistoryEvents` schedules
+  // the background fill at the tail end of its initial-load branch, but
+  // can't reference `streamOlderHistory` by name without a TDZ violation.
+  const streamOlderHistoryRef = useRef<((id: string) => Promise<void>) | null>(null);
 
   /**
    * Recompute "is there more older history to load" for a mission, by
@@ -3777,9 +4130,31 @@ export default function ControlClient() {
     // block the main thread for several seconds, so feed it through
     // `useDeferredValue`: the toggle button + panel mount react instantly
     // while the chat-list regrouping is treated as a non-urgent transition.
-    () => deriveItemViews(items, deferredShowThinkingPanel),
+    () =>
+      perfBus.time("replay:group", () =>
+        deriveItemViews(items, deferredShowThinkingPanel)
+      ),
     [items, deferredShowThinkingPanel]
   );
+
+  // P2-#14: memoize the tail slice + "agent is working" predicate so
+  // they don't recompute on every parent render (e.g. each NowTick).
+  const visibleGroupedItems = useMemo(
+    () => groupedItems.slice(-visibleItemsLimit),
+    [groupedItems, visibleItemsLimit]
+  );
+
+  const showAgentWorkingIndicator = useMemo(() => {
+    if (items.length === 0) return false;
+    if (items[items.length - 1]?.kind === "assistant") return false;
+    return !items.some(
+      (it) =>
+        ((it.kind === "thinking" || it.kind === "stream") &&
+          !it.done &&
+          !showThinkingPanel) ||
+        it.kind === "phase"
+    );
+  }, [items, showThinkingPanel]);
 
   // Auto-show thinking panel when thinking starts (only on transition to active)
   const prevHasActiveThinking = useRef(false);
@@ -3805,6 +4180,18 @@ export default function ControlClient() {
 
   useEffect(() => {
     setThinkingPanelManuallyHidden(false);
+  }, [viewingMissionId]);
+
+  // Tell the backend the user opened this mission. The server records
+  // `first_viewed_at` on the first call (starting the 1h ack grace timer
+  // for `awaiting_user` missions and painting the "opened" dot for
+  // Finished missions); later calls are no-ops on the server. Fire-and-
+  // forget — failure to record opening is not user-visible.
+  useEffect(() => {
+    if (!viewingMissionId) return;
+    markMissionOpened(viewingMissionId).catch((err) => {
+      console.warn("markMissionOpened failed", err);
+    });
   }, [viewingMissionId]);
 
   // `groupedItems`, `thinkingItems`, etc. are all produced in the single
@@ -3947,6 +4334,15 @@ export default function ControlClient() {
   const streamCleanupRef = useRef<null | (() => void)>(null);
   const enhancedInputRef = useRef<EnhancedInputHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  /** Reconnect the SSE stream with the freshest mission filter. Set by the
+   * stream effect; called from the per-mission switcher effect. Ref-based so
+   * the SSE useEffect can keep its empty deps array. */
+  const reconnectStreamRef = useRef<(() => void) | null>(null);
+  /** Wall-clock timestamp (ms) of the last SSE event we received. The 15s
+   * "running mission" history reload (P1-#5) checks this and skips the
+   * refetch when the SSE stream is fresh — saves a 5000-row /events trip
+   * (and the longtask that comes with it) on every running mission. */
+  const lastSseEventAtRef = useRef<number>(0);
   const viewingMissionIdRef = useRef<string | null>(null);
   const runStateMissionIdRef = useRef<string | null>(null);
   const runningMissionsRef = useRef<RunningMissionInfo[]>([]);
@@ -3958,6 +4354,39 @@ export default function ControlClient() {
   // Keep refs in sync with state
   useEffect(() => {
     viewingMissionIdRef.current = viewingMissionId;
+    // Reconnect the SSE stream so the server-side ?mission=<uuid> filter
+    // (P1-#4) re-binds to the freshly-viewed mission. Skipped on the very
+    // first render — the stream effect makes the initial connection itself.
+    if (reconnectStreamRef.current) {
+      reconnectStreamRef.current();
+    }
+    // P1-#9 navigation leak guard. Every entry path eventually changes
+    // `viewingMissionId` — handleViewMission, the URL-driven effect, the
+    // mission switcher palette. Centralizing the cleanup here means a
+    // future path can't forget to clear refs. Bubble-buffer refs hold the
+    // *previous* mission's tail of streaming deltas; if we don't drop them
+    // here they get appended to the new mission's first bubble on the
+    // next flush, and the abandoned setTimeout keeps the previous closure
+    // alive (the main contributor to the ~150 MB-per-visit heap ratchet
+    // we measured).
+    if (thinkingFlushTimeoutRef.current) {
+      clearTimeout(thinkingFlushTimeoutRef.current);
+      thinkingFlushTimeoutRef.current = null;
+    }
+    if (thinkingFlushRafRef.current !== null) {
+      cancelAnimationFrame(thinkingFlushRafRef.current);
+      thinkingFlushRafRef.current = null;
+    }
+    if (streamFlushTimeoutRef.current) {
+      clearTimeout(streamFlushTimeoutRef.current);
+      streamFlushTimeoutRef.current = null;
+    }
+    if (streamFlushRafRef.current !== null) {
+      cancelAnimationFrame(streamFlushRafRef.current);
+      streamFlushRafRef.current = null;
+    }
+    pendingThinkingRef.current = null;
+    pendingStreamRef.current = null;
   }, [viewingMissionId]);
 
   useEffect(() => {
@@ -4533,6 +4962,12 @@ export default function ControlClient() {
   // Convert stored events (from SQLite) to ChatItems for display
   // This enables full history replay including tool calls on page refresh
   const eventsToItems = useCallback((events: StoredEvent[], mission?: Mission | null): ChatItem[] => {
+    return perfBus.time("replay:apply", () => eventsToItemsImpl(events, mission));
+  }, []);
+
+  // Implementation extracted so the perf wrapper above stays one-liner; the
+  // function body is unchanged from the original eventsToItems.
+  function eventsToItemsImpl(events: StoredEvent[], mission?: Mission | null): ChatItem[] {
     const items: ChatItem[] = [];
     const toolCallMap = new Map<string, number>(); // tool_call_id -> index in items
     // Track seen event IDs to prevent duplicate items (backend may store duplicates)
@@ -4645,11 +5080,10 @@ export default function ControlClient() {
           if (currentThinkingIdx !== null) {
             const existing = items[currentThinkingIdx] as Extract<ChatItem, { kind: "thinking" }>;
             const existingContent = existing.content || "";
-            const isContinuation =
-              !content ||
-              !existingContent ||
-              content.startsWith(existingContent) ||
-              existingContent.startsWith(content);
+            // P1-#8: tolerant continuation check — strips trailing
+            // whitespace/punct and allows a short tail wobble so the
+            // "NoNo newNo new CI…" double-emission pattern consolidates.
+            const isContinuation = isStreamContinuation(content, existingContent);
 
             if (!isContinuation) {
               // Treat as a new thought session: finalize previous and start a new item.
@@ -4782,7 +5216,52 @@ export default function ControlClient() {
     }
 
     return items;
-  }, []);
+  }
+
+  renderDeferredTraceRef.current = (id, traceEvents, maxSequence) => {
+    if (traceEvents.length === 0) return;
+    const liveCurrent = currentMissionRef.current;
+    const liveViewing = viewingMissionRef.current;
+    const mission =
+      liveCurrent?.id === id ? liveCurrent : liveViewing?.id === id ? liveViewing : null;
+    if (!mission) return;
+
+    const existing = missionHistoricEventsRef.current.get(id) ?? [];
+    const bySequence = new Map<number, StoredEvent>();
+    for (const event of existing) bySequence.set(event.sequence, event);
+    for (const event of traceEvents) bySequence.set(event.sequence, event);
+    const merged = [...bySequence.values()].sort((a, b) => a.sequence - b.sequence);
+    missionHistoricEventsRef.current.set(id, merged);
+    if (merged.length > 0) {
+      missionMinSeqRef.current.set(id, merged[0].sequence);
+    }
+    if (maxSequence !== undefined && maxSequence > 0) {
+      missionMaxSeqRef.current.set(id, maxSequence);
+    }
+
+    const newHistoricItems = eventsToItems(merged, mission);
+    const oldHistoricCount = historicItemsCountRef.current.get(id) ?? 0;
+    historicItemsCountRef.current.set(id, newHistoricItems.length);
+    setItems((prev) => {
+      const liveTail = prev.slice(oldHistoricCount);
+      return [...newHistoricItems, ...liveTail];
+    });
+
+    // Re-derive `hasMore` now that the deferred trace has merged in.
+    // `seedPaginationStateAfterInitialLoad` ran with only transcript
+    // messages in `missionHistoricEventsRef`, so its comparison against
+    // the all-event-types `totalEvents` was always under-counted and
+    // pinned `hasMore` to true. With the trace merged the counts match,
+    // and short missions correctly hide the "Load older messages" button.
+    // We don't touch state if the user is already paginating (loading=true)
+    // or has switched missions — both are handled by the existing
+    // missionId-tagged read selector elsewhere.
+    setOlderLoadState((prev) =>
+      prev.missionId === id && !prev.loading
+        ? { ...prev, hasMore: computeHasMoreOlder(id) }
+        : prev
+    );
+  };
 
   /**
    * Fetch the next page of older history events (events with `sequence`
@@ -4796,12 +5275,19 @@ export default function ControlClient() {
    * reference it without hitting `const` TDZ at component init.
    */
   const loadOlderHistoryEvents = useCallback(
-    async (id: string) => {
+    async (id: string, opts?: { silent?: boolean; limit?: number }) => {
       const beforeSeq = missionMinSeqRef.current.get(id);
       if (beforeSeq === undefined || beforeSeq <= 1) {
         setOlderLoadState({ missionId: id, hasMore: false, loading: false });
         return;
       }
+      // Race guard. If another path (manual click vs background fill)
+      // is already paginating older for this mission, drop this call
+      // rather than fetch the same page and prepend duplicate events.
+      if (paginatingOlderRef.current.has(id)) {
+        return;
+      }
+      paginatingOlderRef.current.add(id);
       // The button click that fired this is for the currently-viewing
       // mission, so writing `missionId: id` here is correct. If the user
       // switches missions during the in-flight fetch, the UI's
@@ -4809,16 +5295,24 @@ export default function ControlClient() {
       // (it filters on `missionId === viewingMissionId`), so a fetch
       // that never gets to clear `loading: false` can't pin the new
       // mission's button to a stuck "Loading…" state.
-      setOlderLoadState((prev) => ({
-        missionId: id,
-        hasMore: prev.missionId === id ? prev.hasMore : false,
-        loading: true,
-      }));
+      //
+      // `silent: true` (used by the background fill after initial load)
+      // skips toggling `olderLoadState.loading` so the "Load older
+      // messages…" button doesn't flicker into a loading state while the
+      // user is just reading the latest messages.
+      if (!opts?.silent) {
+        setOlderLoadState((prev) => ({
+          missionId: id,
+          hasMore: prev.missionId === id ? prev.hasMore : false,
+          loading: true,
+        }));
+      }
       try {
+        try {
         const { events: olderEvents } = await getMissionEventsWithMeta(id, {
           types: HISTORY_EVENT_TYPES,
           beforeSeq,
-          limit: HISTORY_PAGE_SIZE,
+          limit: opts?.limit ?? HISTORY_PAGE_SIZE,
         });
         if (olderEvents.length === 0) {
           // Same per-mission gate as below — see comment on
@@ -4899,9 +5393,18 @@ export default function ControlClient() {
           // historic items so the visible window now also covers the
           // older page. We don't shrink it past `prev` — other code
           // may have already grown it for unrelated reasons.
-          const addedHistoricItems = newHistoricItems.length - oldHistoricCount;
-          if (addedHistoricItems > 0) {
-            setVisibleItemsLimit((prev) => prev + addedHistoricItems);
+          //
+          // In `silent` mode (post-initial background fill) we deliberately
+          // skip this — the user is reading the latest messages and the
+          // older content stays in the accumulated cache. When they scroll
+          // up the existing "load more visible items" handler grows the
+          // window, surfacing the already-fetched events without a network
+          // round-trip.
+          if (!opts?.silent) {
+            const addedHistoricItems = newHistoricItems.length - oldHistoricCount;
+            if (addedHistoricItems > 0) {
+              setVisibleItemsLimit((prev) => prev + addedHistoricItems);
+            }
           }
 
           setOlderLoadState({
@@ -4912,7 +5415,14 @@ export default function ControlClient() {
         }
       } catch (err) {
         console.error("Failed to load older events:", err);
-        toast.error("Failed to load older messages");
+        // Background fill is invisible work — a fetch failure mid-stream
+        // shouldn't pop a toast. The user-driven "Load older messages"
+        // button does want one. `streamOlderHistory` rethrows nothing,
+        // it just stops walking on error, which is the right behavior
+        // (the user can still hit the manual button later).
+        if (!opts?.silent) {
+          toast.error("Failed to load older messages");
+        }
         // Only clear the loading flag if the active mission is still the
         // one we were paginating — otherwise we'd wipe state set for a
         // newer, unrelated mission. (The missionId-tagged read selector
@@ -4921,11 +5431,19 @@ export default function ControlClient() {
         const stillActive =
           currentMissionRef.current?.id === id ||
           viewingMissionRef.current?.id === id;
-        if (stillActive) {
+        if (stillActive && !opts?.silent) {
           setOlderLoadState((prev) =>
             prev.missionId === id ? { ...prev, loading: false } : prev
           );
         }
+        if (opts?.silent) {
+          // Propagate so `streamOlderHistory` can stop the fill loop on
+          // failure instead of wedging in a tight retry.
+          throw err;
+        }
+      }
+      } finally {
+        paginatingOlderRef.current.delete(id);
       }
     },
     // Note: `viewingMission` is intentionally NOT in deps — the body now
@@ -4934,6 +5452,72 @@ export default function ControlClient() {
     // closure that bugbot flagged.
     [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder]
   );
+
+  // Background fill: after the initial fetch shows the newest events,
+  // walk older pages until we've reached `BACKGROUND_FILL_TARGET` total
+  // history events or there are no more. Runs `silent` so the
+  // "Load older messages" button doesn't flash a loading state; bails
+  // if the user switches missions, if a fetch fails, or if the mission
+  // turns out to have fewer events than the target (server total reached).
+  const streamOlderHistory = useCallback(
+    async (id: string) => {
+      // Yield once so the initial-render setItems can commit and paint
+      // before we start eating network/main-thread time on background
+      // fills. Without this the first chunk can land before the user
+      // sees the latest message at all.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const stillActive = (): boolean =>
+        currentMissionRef.current?.id === id ||
+        viewingMissionRef.current?.id === id;
+
+      // Up to a few page-loads, with a small inter-page yield so live
+      // SSE events can interleave on the main thread without jank.
+      // Hard ceiling (16) is a backstop; the loop normally exits via
+      // the `hasMore`/target check first.
+      for (let i = 0; i < 16; i++) {
+        if (!stillActive()) return;
+        const accumulated =
+          missionHistoricEventsRef.current.get(id)?.length ?? 0;
+        const total = missionTotalHistoryRef.current.get(id);
+        if (total !== undefined && accumulated >= total) return;
+        if (accumulated >= BACKGROUND_FILL_TARGET) return;
+        const minSeq = missionMinSeqRef.current.get(id);
+        if (minSeq === undefined || minSeq <= 1) return;
+
+        try {
+          await loadOlderHistoryEvents(id, {
+            silent: true,
+            limit: BACKGROUND_FILL_PAGE_SIZE,
+          });
+        } catch {
+          // Stop on error — the user's manual "Load older messages"
+          // path remains available for retry.
+          return;
+        }
+
+        // If accumulated didn't grow, the server returned an empty
+        // page and there's nothing left to fetch. Avoid the
+        // pathological tight loop.
+        const after = missionHistoricEventsRef.current.get(id)?.length ?? 0;
+        if (after <= accumulated) return;
+
+        // Small pause between pages so the main thread can run other
+        // work (live event handlers, scroll, input).
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+    },
+    [loadOlderHistoryEvents, BACKGROUND_FILL_PAGE_SIZE, BACKGROUND_FILL_TARGET]
+  );
+
+  // Wire the ref consumed by `loadHistoryEvents` (which is declared
+  // above `streamOlderHistory`, so it can't reference it directly).
+  useEffect(() => {
+    streamOlderHistoryRef.current = streamOlderHistory;
+    return () => {
+      streamOlderHistoryRef.current = null;
+    };
+  }, [streamOlderHistory]);
 
   // Load mission from URL param on mount (and retry on auth success)
   const [authRetryTrigger, setAuthRetryTrigger] = useState(0);
@@ -5221,6 +5805,21 @@ export default function ControlClient() {
 
   useVisibilityPolling(refreshRunningMissions, { interval: 15_000 });
 
+  // P5-#25: client health-budget watcher. Posts to /telemetry/perf
+  // whenever the 5s longtask total breaches 2s. Cheap when healthy
+  // (no requests at all); refs avoid recreating the watcher on every
+  // mission/item change.
+  const itemsCountRef = useRef(0);
+  useEffect(() => {
+    itemsCountRef.current = items.length;
+  }, [items]);
+  useEffect(() => {
+    return startHealthBudgetWatcher(
+      () => viewingMissionIdRef.current,
+      () => itemsCountRef.current
+    );
+  }, []);
+
   const refreshRecentMissions = useCallback(async () => {
     try {
       const missions = await listMissions();
@@ -5232,6 +5831,9 @@ export default function ControlClient() {
   }, []);
 
   const handleStreamDiagnostics = useCallback((update: StreamDiagnosticUpdate) => {
+    if (typeof update.bytes === "number") {
+      perfBus.recordSseBytes(update.bytes);
+    }
     switch (update.phase) {
       case "connecting":
         streamLog("info", "connecting", { url: update.url });
@@ -5505,6 +6107,7 @@ export default function ControlClient() {
       setViewingMissionId(missionId);
       fetchingMissionIdRef.current = missionId;
       handleViewMissionLoadingRef.current = missionId;
+      setMissionLoading(true);
 
       // Update URL immediately so it's shareable/bookmarkable
       router.replace(`/control?mission=${missionId}`, { scroll: false });
@@ -5600,6 +6203,14 @@ export default function ControlClient() {
           setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
           setHasDesktopSession(false);
           router.replace(`/control`, { scroll: false });
+        }
+      } finally {
+        if (fetchingMissionIdRef.current === missionId) {
+          setMissionLoading(false);
+          fetchingMissionIdRef.current = null;
+        }
+        if (handleViewMissionLoadingRef.current === missionId) {
+          handleViewMissionLoadingRef.current = null;
         }
       }
     },
@@ -6185,6 +6796,7 @@ export default function ControlClient() {
     startTime: number;
   } | null>(null);
   const thinkingFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const thinkingFlushRafRef = useRef<number | null>(null);
   const thinkingIdCounterRef = useRef(0);
 
   const pendingStreamRef = useRef<{
@@ -6192,6 +6804,7 @@ export default function ControlClient() {
     startTime: number;
   } | null>(null);
   const streamFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamFlushRafRef = useRef<number | null>(null);
 
   // Auto-reconnecting stream with exponential backoff
   useEffect(() => {
@@ -6232,6 +6845,8 @@ export default function ControlClient() {
           ? String(data["mission_id"])
           : null;
       const currentMissionId = currentMissionRef.current?.id;
+      perfBus.recordSseEvent("received");
+      lastSseEventAtRef.current = Date.now();
       streamLog("debug", "received", {
         type: event.type,
         eventMissionId,
@@ -6262,6 +6877,7 @@ export default function ControlClient() {
           }
         }
         if (filterReason) {
+          perfBus.recordSseEvent("filtered");
           streamLog("debug", "filtered", {
             type: event.type,
             eventMissionId,
@@ -6470,10 +7086,18 @@ export default function ControlClient() {
           clearTimeout(thinkingFlushTimeoutRef.current);
           thinkingFlushTimeoutRef.current = null;
         }
+        if (thinkingFlushRafRef.current !== null) {
+          cancelAnimationFrame(thinkingFlushRafRef.current);
+          thinkingFlushRafRef.current = null;
+        }
         pendingThinkingRef.current = null;
         if (streamFlushTimeoutRef.current) {
           clearTimeout(streamFlushTimeoutRef.current);
           streamFlushTimeoutRef.current = null;
+        }
+        if (streamFlushRafRef.current !== null) {
+          cancelAnimationFrame(streamFlushRafRef.current);
+          streamFlushRafRef.current = null;
         }
         pendingStreamRef.current = null;
 
@@ -6679,11 +7303,8 @@ export default function ControlClient() {
         // Get or create stable ID for current thinking session
         const existingPending = pendingThinkingRef.current;
         const existingContent = existingPending?.content ?? "";
-        const isContinuation =
-          !content ||
-          !existingContent ||
-          content.startsWith(existingContent) ||
-          existingContent.startsWith(content);
+        // P1-#8: tolerant continuation check (see stream-continuation.ts).
+        const isContinuation = isStreamContinuation(content, existingContent);
         const shouldStartNew = Boolean(existingPending && !isContinuation && existingContent.trim());
 
         if (shouldStartNew) {
@@ -6710,26 +7331,35 @@ export default function ControlClient() {
           startTime,
         };
 
-        // Clear any pending flush timeout
+        // Clear any pending flush handles
         if (thinkingFlushTimeoutRef.current) {
           clearTimeout(thinkingFlushTimeoutRef.current);
           thinkingFlushTimeoutRef.current = null;
+        }
+        if (thinkingFlushRafRef.current !== null) {
+          cancelAnimationFrame(thinkingFlushRafRef.current);
+          thinkingFlushRafRef.current = null;
         }
 
         // Flush immediately on:
         //  - `done: true` (finalization)
         //  - first delta of a brand-new thought (no pending content yet)
         //  - the existing thought session was just (re)started
-        // Otherwise debounce at 30 ms — codex's reasoning summary deltas
-        // arrive in tight ~10–20 ms bursts and the previous 100 ms
-        // debounce kept resetting until `done`, so the user only ever
-        // saw the final snapshot ("Thought for <1s") with no streaming.
+        // Otherwise coalesce on the next animation frame (P1-#6). The
+        // previous 30 ms setTimeout caused codex's tight 10-20 ms reasoning
+        // bursts to trigger a React commit per delta even though only one
+        // could ever be painted per frame. rAF guarantees ≤1 commit per
+        // frame regardless of arrival rate; pending content keeps
+        // accumulating in `pendingThinkingRef.current` so no delta is lost.
         const shouldFlushNow =
           done || shouldStartNew || !existingPending || !existingContent;
         if (shouldFlushNow) {
           flushThinking();
         } else {
-          thinkingFlushTimeoutRef.current = setTimeout(flushThinking, 30);
+          thinkingFlushRafRef.current = requestAnimationFrame(() => {
+            thinkingFlushRafRef.current = null;
+            flushThinking();
+          });
         }
         return;
       }
@@ -6758,11 +7388,8 @@ export default function ControlClient() {
                 { kind: "stream" }
               >;
               const existingContent = existing.content ?? "";
-              const isContinuation =
-                !pending.content ||
-                !existingContent ||
-                pending.content.startsWith(existingContent) ||
-                existingContent.startsWith(pending.content);
+              // P1-#8: tolerant continuation check (see stream-continuation.ts).
+              const isContinuation = isStreamContinuation(pending.content, existingContent);
               updated[existingIdx] = {
                 ...existing,
                 content: pending.content || existing.content,
@@ -6793,11 +7420,8 @@ export default function ControlClient() {
 
         const existingPending = pendingStreamRef.current;
         const existingContent = existingPending?.content ?? "";
-        const isContinuation =
-          !content ||
-          !existingContent ||
-          content.startsWith(existingContent) ||
-          existingContent.startsWith(content);
+        // P1-#8: tolerant continuation check (see stream-continuation.ts).
+        const isContinuation = isStreamContinuation(content, existingContent);
 
         pendingStreamRef.current = {
           content: content || existingPending?.content || "",
@@ -6808,7 +7432,18 @@ export default function ControlClient() {
           clearTimeout(streamFlushTimeoutRef.current);
           streamFlushTimeoutRef.current = null;
         }
-        streamFlushTimeoutRef.current = setTimeout(flushStream, 100);
+        if (streamFlushRafRef.current !== null) {
+          cancelAnimationFrame(streamFlushRafRef.current);
+          streamFlushRafRef.current = null;
+        }
+        // P1-#6: schedule the flush on the next animation frame. Multiple
+        // deltas arriving within the same frame collapse to a single React
+        // commit because pendingStreamRef accumulates content while the
+        // pending rAF callback hasn't fired yet.
+        streamFlushRafRef.current = requestAnimationFrame(() => {
+          streamFlushRafRef.current = null;
+          flushStream();
+        });
         return;
       }
 
@@ -6850,7 +7485,7 @@ export default function ControlClient() {
           return updated;
         });
 
-        // Detect desktop_start_session from ToolCall (Claude Code/Amp don't emit ToolResult for MCP tools)
+        // Detect desktop_start_session from ToolCall (Claude Code does not emit ToolResult for MCP tools)
         const isDesktopStart =
           name === "desktop_start_session" ||
           name === "desktop_desktop_start_session" ||
@@ -6987,6 +7622,28 @@ export default function ControlClient() {
           ]);
           toast.error(msg);
         }
+      }
+
+      // `stream_lagged` is emitted by the server when this SSE
+      // subscriber's broadcast cursor falls behind the channel buffer
+      // (chatty mission outpaces the browser tab's event handler). The
+      // stream itself stays alive — we just missed a window of events.
+      // Silently catch up via the existing delta-resume path
+      // (`reloadMissionHistory` → `loadHistoryEvents(sinceSeq)`) so the
+      // user never sees a scary error toast for what is a transient
+      // back-pressure event.
+      if (event.type === "stream_lagged") {
+        const dropped = isRecord(data) && typeof data["dropped"] === "number"
+          ? (data["dropped"] as number)
+          : undefined;
+        streamLog("warn", "stream_lagged — refetching", { dropped });
+        const viewingId = viewingMissionIdRef.current;
+        if (viewingId) {
+          void reloadMissionHistory(viewingId).catch((err) => {
+            streamLog("warn", "stream_lagged refetch failed", { err: String(err) });
+          });
+        }
+        return;
       }
 
       // Handle mission status changes
@@ -7374,12 +8031,20 @@ export default function ControlClient() {
 
     const connect = () => {
       cleanup?.();
-      streamLog("info", "connecting stream");
-      cleanup = streamControl(handleEvent, handleStreamDiagnostics);
+      const missionFilter = viewingMissionIdRef.current ?? undefined;
+      streamLog("info", "connecting stream", { missionFilter });
+      cleanup = streamControl(handleEvent, handleStreamDiagnostics, {
+        missionId: missionFilter,
+      });
     };
 
     connect();
     streamCleanupRef.current = cleanup;
+    // Expose the reconnect hook so the per-mission switcher effect (below)
+    // can tear down the current SSE and open a new one filtered for the
+    // freshly-viewed mission. Reading from a ref keeps this effect's deps
+    // empty so we don't recycle the SSE on every unrelated render.
+    reconnectStreamRef.current = connect;
 
     return () => {
       mounted = false;
@@ -7496,7 +8161,7 @@ export default function ControlClient() {
 
     // Generate temp ID and add message optimistically BEFORE the API call
     // This ensures messages appear in send order, not response order
-    const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const tempId = crypto.randomUUID();
     const timestamp = Date.now();
 
     // Message is queued only if agent is currently busy AND there are existing user messages
@@ -7516,7 +8181,9 @@ export default function ControlClient() {
     ]);
 
     try {
-      const { id, queued } = await postControlMessage(content);
+      const { id, queued } = await postControlMessageWithRetry(content, {
+        client_message_id: tempId,
+      });
 
       // Replace temp ID with server-assigned ID and update queued status
       // This allows SSE handler to correctly deduplicate
@@ -7524,7 +8191,7 @@ export default function ControlClient() {
       setItems((prev) => {
         // Check if SSE already added this message (race condition where SSE arrives before API response)
         // If so, just remove the temp message to avoid duplicates
-        const sseAlreadyAdded = prev.some((item) => item.id === id);
+        const sseAlreadyAdded = prev.some((item) => item.id === id && item.id !== tempId);
         if (sseAlreadyAdded) {
           return prev.filter((item) => item.id !== tempId);
         }
@@ -7558,16 +8225,44 @@ export default function ControlClient() {
     submittingRef.current = true;
 
     const targetMissionId = viewingMissionIdRef.current;
+    const tempId = crypto.randomUUID();
+    const timestamp = Date.now();
+    const hasExistingUserMessages = items.some((item) => item.kind === "user");
+    const willBeQueued = isBusy && hasExistingUserMessages;
+
+    const restoreFailedOptimisticSend = () => {
+      setItems((prev) => prev.filter((item) => item.id !== tempId));
+      enhancedInputRef.current?.restoreDraft(trimmedContent, agent ?? null);
+      setInput(trimmedContent);
+      setDraftInput(trimmedContent);
+    };
+
+    // Acknowledge the user's send immediately, before any mission sync or
+    // network round-trip. If sync/post fails below, the optimistic row is
+    // removed and the draft is restored.
+    setItems((prev) => [
+      ...prev,
+      {
+        kind: "user" as const,
+        id: tempId,
+        content: trimmedContent,
+        timestamp,
+        queued: willBeQueued,
+      },
+    ]);
+    enhancedInputRef.current?.clear();
+    setInput("");
+    setDraftInput("");
 
     // Sync mission state before sending (backend needs current_mission set correctly).
-    // Mission-sync error paths below return early BEFORE we call
-    // `enhancedInputRef.current?.clear()`, so the user's typed draft
-    // stays intact and doesn't need to be explicitly restored.
+    // This now happens after the optimistic row so slow mission sync does not
+    // make the Send button feel ignored.
     if (targetMissionId) {
       try {
         let mission = await loadMission(targetMissionId);
 
         if (!mission) {
+          restoreFailedOptimisticSend();
           toast.error("Mission not found");
           submittingRef.current = false;
           return;
@@ -7591,44 +8286,24 @@ export default function ControlClient() {
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         console.error("Failed to sync mission before sending:", err);
+        restoreFailedOptimisticSend();
         toast.error(`Failed to sync mission: ${errMsg}. Check API connection in Settings.`);
         submittingRef.current = false;
         return;
       }
     }
 
-    const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const timestamp = Date.now();
-    const hasExistingUserMessages = items.some((item) => item.kind === "user");
-    const willBeQueued = isBusy && hasExistingUserMessages;
-
-    // Use trimmed content for optimistic message (not prefixed with agent)
-    // so it matches exactly what the backend stores and SSE echoes back,
-    // preventing duplicate messages when SSE arrives before the API response
-    setItems((prev) => [
-      ...prev,
-      {
-        kind: "user" as const,
-        id: tempId,
-        content: trimmedContent,
-        timestamp,
-        queued: willBeQueued,
-      },
-    ]);
-    enhancedInputRef.current?.clear();
-    setInput("");
-    setDraftInput("");
-
     try {
       // Send message with mission_id - backend handles routing (main vs parallel)
-      const { id, queued } = await postControlMessage(trimmedContent, {
+      const { id, queued } = await postControlMessageWithRetry(trimmedContent, {
         agent: agent || undefined,
         mission_id: targetMissionId || undefined,
+        client_message_id: tempId,
       });
       setItems((prev) => {
         // Check if SSE already added this message (race condition where SSE arrives before API response)
         // If so, just remove the temp message to avoid duplicates
-        const sseAlreadyAdded = prev.some((item) => item.id === id);
+        const sseAlreadyAdded = prev.some((item) => item.id === id && item.id !== tempId);
         if (sseAlreadyAdded) {
           return prev.filter((item) => item.id !== tempId);
         }
@@ -7642,16 +8317,13 @@ export default function ControlClient() {
       });
     } catch (err) {
       console.error(err);
-      setItems((prev) => prev.filter((item) => item.id !== tempId));
       // Restore via the imperative handle so a locked-agent badge is
       // reinstated instead of surfacing as a raw "@agent " prefix.
       // Use `trimmedContent` — it's what the optimistic item and the
       // failed API call carried, so the restored draft matches what
       // the user actually sent. Leading/trailing whitespace in
       // `content` is intentionally dropped here.
-      enhancedInputRef.current?.restoreDraft(trimmedContent, agent ?? null);
-      setInput(trimmedContent);
-      setDraftInput(trimmedContent);
+      restoreFailedOptimisticSend();
       toast.error("Failed to send message");
     } finally {
       submittingRef.current = false;
@@ -7905,13 +8577,23 @@ export default function ControlClient() {
     return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
   }, [viewingMissionId, reloadMissionHistory]);
 
-  // Periodically sync history for running missions to catch missed SSE events
+  // Periodically sync history for running missions to catch missed SSE
+  // events. P1-#5: skip the refetch when the SSE stream is fresh (<30s
+  // since the last received event). The old unconditional refetch was the
+  // main /events traffic driver — on busy long-running missions it fired
+  // a 5000-row trip every 15s for every open tab, costing a 1-5s longtask
+  // in the dashboard reducer each time.
   useEffect(() => {
     if (!viewingMissionId || !viewingMissionIsRunning) return;
+    const SSE_FRESH_WINDOW_MS = 30_000;
     const interval = setInterval(() => {
-      if (document.visibilityState === "visible") {
-        reloadMissionHistory(viewingMissionId);
+      if (document.visibilityState !== "visible") return;
+      const since = Date.now() - lastSseEventAtRef.current;
+      if (lastSseEventAtRef.current > 0 && since < SSE_FRESH_WINDOW_MS) {
+        // SSE is healthy; trust the live stream rather than refetching.
+        return;
       }
+      reloadMissionHistory(viewingMissionId);
     }, 15_000);
     return () => clearInterval(interval);
   }, [viewingMissionId, viewingMissionIsRunning, reloadMissionHistory]);
@@ -7956,6 +8638,10 @@ export default function ControlClient() {
   };
 
   const activeMission = viewingMission ?? currentMission;
+  const isMissionSwitching =
+    missionLoading &&
+    !!viewingMissionId &&
+    activeMission?.id !== viewingMissionId;
   const workspaceNameById = useMemo(() => {
     return Object.fromEntries(workspaces.map((ws) => [ws.id, ws.name]));
   }, [workspaces]);
@@ -7982,11 +8668,12 @@ export default function ControlClient() {
     return null;
   }, [items]);
 
-  // Derive child (worker) missions for the active mission
+  // Derive child (worker) missions from the route's current mission, not the
+  // viewed worker, so the worker strip stays visible after selecting a chip.
   const childMissions = useMemo(() => {
-    if (!activeMission) return [];
-    return recentMissions.filter((m) => m.parent_mission_id === activeMission.id);
-  }, [activeMission, recentMissions]);
+    if (!currentMission) return [];
+    return recentMissions.filter((m) => m.parent_mission_id === currentMission.id);
+  }, [currentMission, recentMissions]);
   const activeMissionRole = activeMission ? inferMissionRole(activeMission) : null;
 
   // In-mission sub-agents: Claude Code's in-process `Task` /
@@ -8028,7 +8715,7 @@ export default function ControlClient() {
     if (childMissions.length > 0 || hasInMissionSubagents) {
       setShowWorkerPanel(true);
     }
-  }, [activeMission?.id, childMissions.length, hasInMissionSubagents]);
+  }, [currentMission?.id, childMissions.length, hasInMissionSubagents]);
 
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
@@ -8052,12 +8739,17 @@ export default function ControlClient() {
   }, [activeMission?.id]);
 
   return (
+    <NowTickProvider>
     <div className="flex h-screen flex-col p-6">
       {/* Always-on debug overlay so any OOM-style crash leaves a trail
           we can reconstruct from sessionStorage after reload. Cheap:
           a polling tick every 2s that reads performance.memory and
           publishes a CustomEvent the parent listens to for shedding. */}
       <MissionDebugStats items={items} visibleItems={visibleItemsLimit} />
+
+      {/* Opt-in perf overlay — `?debug=perf` only. Mounts no work in normal
+          sessions; the bus and observer self-disable when the flag is off. */}
+      <PerfOverlay />
 
       {/* Hidden file input */}
       <input
@@ -8095,6 +8787,7 @@ export default function ControlClient() {
               : activeMission.title?.trim() || getMissionShortName(activeMission.id)
             : null
         }
+        missionBackend={activeMission?.backend ?? null}
         onClose={() => setShowAutomationsDialog(false)}
       />
 
@@ -8447,15 +9140,20 @@ export default function ControlClient() {
               </>
             )}
 
-            {/* Run state indicator with debug dropdown */}
+            {/* Run state indicator with debug dropdown — icon only.
+                The mission selector already shows the mission status dot and
+                the Workbench shows "Status: Running"; a "Running" label here
+                is redundant. Clicking the icon still opens the diagnostics
+                popover for the deep-debug case. */}
             <div className="relative">
               <button
                 onClick={() => setShowStreamDiagnostics((prev) => !prev)}
                 className={cn(
-                  "flex items-center gap-2 rounded-md px-2 py-1 transition-colors hover:bg-white/[0.04]",
+                  "flex items-center justify-center rounded-md p-1 transition-colors hover:bg-white/[0.04]",
                   status.className
                 )}
-                title="Click for debug info"
+                title={`${status.label} — click for debug info`}
+                aria-label={`${status.label} — click for debug info`}
               >
                 <StatusIcon
                   className={cn(
@@ -8463,7 +9161,6 @@ export default function ControlClient() {
                     viewingRunState !== "idle" && "animate-spin"
                   )}
                 />
-                <span className="text-sm font-medium">{status.label}</span>
               </button>
 
               {showStreamDiagnostics && (
@@ -8636,24 +9333,29 @@ export default function ControlClient() {
               )}
             </div>
 
-            {/* Queue count */}
-            <div className="h-4 w-px bg-white/[0.08]" />
-            <div
-              className="flex items-center gap-1.5"
-              title={viewingQueueLen > 0 ? `${viewingQueueLen} message${viewingQueueLen > 1 ? 's' : ''} waiting to be processed` : 'No messages queued'}
-            >
-              <span className="text-[10px] uppercase tracking-wider text-white/40">
-                Queue
-              </span>
-              <span className={cn(
-                "text-sm font-medium tabular-nums",
-                viewingQueueLen === 0 && "text-white/70",
-                viewingQueueLen > 0 && viewingQueueLen < 3 && "text-amber-400",
-                viewingQueueLen >= 3 && "text-orange-400"
-              )}>
-                {viewingQueueLen}
-              </span>
-            </div>
+            {/* Queue count — only when something is queued.
+                Idle missions previously rendered a permanent "QUEUE 0" badge,
+                which added noise without information. The workbench mirrors
+                this count in its Runtime section when the user wants detail. */}
+            {viewingQueueLen > 0 && (
+              <>
+                <div className="h-4 w-px bg-white/[0.08]" />
+                <div
+                  className="flex items-center gap-1.5"
+                  title={`${viewingQueueLen} message${viewingQueueLen > 1 ? 's' : ''} waiting to be processed`}
+                >
+                  <span className="text-[10px] uppercase tracking-wider text-white/40">
+                    Queue
+                  </span>
+                  <span className={cn(
+                    "text-sm font-medium tabular-nums",
+                    viewingQueueLen < 3 ? "text-amber-400" : "text-orange-400"
+                  )}>
+                    {viewingQueueLen}
+                  </span>
+                </div>
+              </>
+            )}
 
             {/* Progress indicator */}
             {viewingProgress && viewingProgress.total > 0 && (
@@ -8680,6 +9382,15 @@ export default function ControlClient() {
           "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative transition-all duration-300",
           showDesktopStream && "flex-[2]"
         )}>
+        {/* Active workers strip — sticky above the scrolling messages so the
+            boss can see and hop into delegated workers without opening a side
+            panel. Self-hides when there are no child missions. */}
+        <WorkersStrip
+          childMissions={childMissions}
+          runningMissions={runningMissions}
+          viewingMissionId={viewingMissionId}
+          onSelectWorker={handleViewMission}
+        />
         {/* Messages */}
         <div ref={containerRef} className="flex-1 overflow-y-auto p-6">
           {/* Backwards pagination — only when there's actually more older
@@ -8712,7 +9423,9 @@ export default function ControlClient() {
               </button>
             </div>
           )}
-          {items.length === 0 ? (
+          {isMissionSwitching ? (
+            <ChatLoadingSkeleton />
+          ) : items.length === 0 ? (
             <div className="flex h-full items-center justify-center">
               <div className="text-center">
                 <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
@@ -8806,7 +9519,7 @@ export default function ControlClient() {
                   </span>
                 </button>
               )}
-              {groupedItems.slice(-visibleItemsLimit).map((item) => {
+              {visibleGroupedItems.map((item) => {
                 const key =
                   item.kind === "tool_group" || item.kind === "thinking_group"
                     ? item.groupId
@@ -8850,20 +9563,12 @@ export default function ControlClient() {
                 );
               })}
 
-              {/* Show streaming indicator when running but no active thinking/phase visible inline */}
+              {/* Show streaming indicator when running but no active thinking/phase visible inline.
+                  P2-#14: the items.some + last-index lookup live in `showAgentWorkingIndicator`
+                  memo so each NowTick render doesn't re-walk the whole items array. */}
               {viewingMissionIsRunning &&
                 activeMission?.status === "active" &&
-                items.length > 0 &&
-                !items.some(
-                  (it) =>
-                    // Only block for undone thinking if it's visible inline (panel closed)
-                    ((it.kind === "thinking" || it.kind === "stream") &&
-                      !it.done &&
-                      !showThinkingPanel) ||
-                    it.kind === "phase"
-                ) &&
-                // Hide if the last item is an assistant message (response complete, waiting for state change)
-                items[items.length - 1]?.kind !== "assistant" && (
+                showAgentWorkingIndicator && (
                   <div className="flex justify-start gap-3 animate-fade-in">
                     <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
                       <Bot className="h-4 w-4 text-indigo-400 animate-pulse" />
@@ -9225,6 +9930,11 @@ export default function ControlClient() {
                 role={activeMissionRole}
                 isRunning={viewingMissionIsRunning}
                 childMissions={childMissions}
+                runtime={{
+                  queueLen: viewingQueueLen,
+                  subtaskCompleted: viewingProgress?.completed,
+                  subtaskTotal: viewingProgress?.total,
+                }}
                 onClose={() => setShowWorkbenchPanel(false)}
                 onResume={handleResumeMission}
                 onCancel={handleCancelMission}
@@ -9256,7 +9966,7 @@ export default function ControlClient() {
             )}
 
             {/* Worker Panel — real child missions (parent_mission_id) */}
-            {showWorkerPanel && childMissions.length > 0 && (
+            {showWorkerPanel && isBossMission && (
               <WorkerPanel
                 childMissions={childMissions}
                 runningMissions={runningMissions}
@@ -9314,5 +10024,6 @@ export default function ControlClient() {
         )}
       </div>
     </div>
+    </NowTickProvider>
   );
 }

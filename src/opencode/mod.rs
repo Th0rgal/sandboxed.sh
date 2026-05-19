@@ -5,14 +5,14 @@
 //!
 //! ## Timeout Philosophy
 //!
-//! Open Agent acts as a **pure pass-through frontend** to OpenCode. We intentionally
+//! sandboxed.sh acts as a **pure pass-through frontend** to OpenCode. We intentionally
 //! do NOT impose any timeouts on the SSE event stream. All timeout handling is
 //! delegated to OpenCode, which manages tool execution timeouts internally.
 //!
 //! This design ensures:
 //! - Long-running tools (vision analysis, large file operations) complete naturally
 //! - Users can abort missions manually via the dashboard if needed
-//! - No artificial timeout mismatches between Open Agent and OpenCode
+//! - No artificial timeout mismatches between sandboxed.sh and OpenCode
 //! - OpenCode remains the single source of truth for execution limits
 //!
 //! The only timeout we apply is `DEFAULT_REQUEST_TIMEOUT` for initial HTTP connections,

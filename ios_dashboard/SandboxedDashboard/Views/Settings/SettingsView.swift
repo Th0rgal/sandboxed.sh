@@ -17,7 +17,7 @@ struct SettingsView: View {
     
     // Default agent settings
     @State private var backends: [Backend] = Backend.defaults
-    @State private var enabledBackendIds: Set<String> = ["opencode", "claudecode", "amp"]
+    @State private var enabledBackendIds: Set<String> = ["opencode", "claudecode", "amp", "codex", "gemini", "grok"]
     @State private var backendAgents: [String: [BackendAgent]] = [:]
     @State private var selectedDefaultAgent: String = ""
     @State private var isLoadingAgents = true

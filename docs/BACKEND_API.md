@@ -12,7 +12,10 @@ GET /api/backends
 ```json
 [
   {"id": "opencode", "name": "OpenCode"},
-  {"id": "claudecode", "name": "Claude Code"}
+  {"id": "claudecode", "name": "Claude Code"},
+  {"id": "codex", "name": "Codex"},
+  {"id": "gemini", "name": "Gemini"},
+  {"id": "grok", "name": "Grok Build"}
 ]
 ```
 
@@ -58,7 +61,10 @@ GET /api/backends/:id/config
 }
 ```
 
-For `claudecode`, `settings` includes `api_key_configured` and optional fields like `default_model`.
+For `claudecode`, `settings` includes `api_key_configured` and optional fields
+like `default_model`. Grok settings include an optional `cli_path`. Codex and
+Gemini currently use empty settings unless configured by future backend-specific
+fields.
 
 ## Update Backend Config
 
@@ -78,7 +84,8 @@ PUT /api/backends/:id/config
 }
 ```
 
-Claude Code accepts `api_key` in `settings` to store it securely in the secrets vault.
+Claude Code accepts `api_key` in `settings` to store it securely in the secrets
+vault. Grok accepts `cli_path` to override the CLI binary path.
 
 **Response**:
 ```json

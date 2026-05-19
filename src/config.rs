@@ -1,6 +1,6 @@
-//! Configuration management for Open Agent.
+//! Configuration management for sandboxed.sh.
 //!
-//! Open Agent uses per-mission CLI execution for both OpenCode and Claude Code.
+//! sandboxed.sh uses per-mission CLI execution for agent backends.
 //! Configuration can be set via environment variables:
 //! - `DEFAULT_MODEL` - Optional. Override default model (provider/model format). If unset, uses backend default.
 //! - `WORKING_DIR` - Optional. Default working directory for relative paths. Defaults to `/root` in production, current directory in dev.
@@ -17,8 +17,8 @@
 //! - `LIBRARY_REMOTE` - Optional. Initial library remote URL (can be changed via Settings in the dashboard).
 //!   This environment variable is used as the initial default when no settings file exists.
 //!   If not set, defaults to: https://github.com/Th0rgal/sandboxed-library-template.git
-//! - `DEFAULT_BACKEND` - Optional. Default backend to use (claudecode, opencode, or amp).
-//!   If not set, defaults to the first available backend with priority: claudecode → opencode → amp.
+//! - `DEFAULT_BACKEND` - Optional. Default backend to use.
+//!   If not set, defaults to the first available backend with priority: claudecode → opencode → grok → gemini → codex.
 //!
 //! Note: The agent has **full system access**. It can read/write any file, execute any command,
 //! and search anywhere on the machine. The `WORKING_DIR` is just the default for relative paths.
@@ -252,6 +252,25 @@ pub struct AuthConfig {
 
     /// Multi-user accounts (if set, overrides dashboard_password auth).
     pub users: Vec<UserAccount>,
+
+    /// GitHub OAuth App client ID. Required to enable "Sign in with GitHub".
+    pub github_oauth_client_id: Option<String>,
+
+    /// GitHub OAuth App client secret. Required to enable "Sign in with GitHub".
+    pub github_oauth_client_secret: Option<String>,
+
+    /// Allowlist of GitHub usernames permitted to sign in.
+    /// Empty => GitHub login is disabled. Use `["*"]` to allow any GitHub user.
+    pub github_oauth_allowlist: Vec<String>,
+
+    /// Allowlist of redirect URIs the OAuth callback may forward to.
+    /// Defaults to `["sandboxed://auth/callback"]`.
+    pub github_oauth_redirect_allowlist: Vec<String>,
+
+    /// Public-facing base URL used to build the GitHub `redirect_uri`
+    /// (e.g. `https://dashboard.example.com`). Falls back to the request's
+    /// `Host` header at runtime if unset.
+    pub public_base_url: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -261,6 +280,11 @@ impl Default for AuthConfig {
             jwt_secret: None,
             jwt_ttl_days: 30,
             users: Vec::new(),
+            github_oauth_client_id: None,
+            github_oauth_client_secret: None,
+            github_oauth_allowlist: Vec::new(),
+            github_oauth_redirect_allowlist: vec!["sandboxed://auth/callback".to_string()],
+            public_base_url: None,
         }
     }
 }
@@ -304,6 +328,37 @@ impl AuthConfig {
             return AuthMode::SingleTenant;
         }
         AuthMode::Disabled
+    }
+
+    /// Whether "Sign in with GitHub" is fully configured and should be
+    /// advertised on `/api/health`. Requires the OAuth App credentials,
+    /// a non-empty user allowlist, and a JWT secret to issue tokens.
+    pub fn github_enabled(&self) -> bool {
+        self.github_oauth_client_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+            && self
+                .github_oauth_client_secret
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            && !self.github_oauth_allowlist.is_empty()
+            && self.jwt_secret.as_deref().is_some_and(|s| !s.is_empty())
+    }
+
+    /// True iff `gh_login` is permitted to sign in via GitHub OAuth.
+    pub fn github_user_allowed(&self, gh_login: &str) -> bool {
+        let login = gh_login.trim().to_lowercase();
+        self.github_oauth_allowlist.iter().any(|entry| {
+            let e = entry.trim();
+            e == "*" || e.eq_ignore_ascii_case(&login)
+        })
+    }
+
+    /// True iff `redirect_uri` is on the redirect allowlist.
+    pub fn github_redirect_allowed(&self, redirect_uri: &str) -> bool {
+        self.github_oauth_redirect_allowlist
+            .iter()
+            .any(|allowed| allowed.trim() == redirect_uri.trim())
     }
 }
 
@@ -413,6 +468,26 @@ impl Config {
             })
             .collect::<Vec<_>>();
 
+        let github_oauth_allowlist = std::env::var("GITHUB_OAUTH_ALLOWLIST")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let github_oauth_redirect_allowlist = std::env::var("GITHUB_OAUTH_REDIRECT_ALLOWLIST")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec!["sandboxed://auth/callback".to_string()]);
+
         let auth = AuthConfig {
             dashboard_password: std::env::var("DASHBOARD_PASSWORD").ok(),
             jwt_secret: std::env::var("JWT_SECRET").ok(),
@@ -426,6 +501,18 @@ impl Config {
                 .transpose()?
                 .unwrap_or(30),
             users,
+            github_oauth_client_id: std::env::var("GITHUB_OAUTH_CLIENT_ID")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            github_oauth_client_secret: std::env::var("GITHUB_OAUTH_CLIENT_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            github_oauth_allowlist,
+            github_oauth_redirect_allowlist,
+            public_base_url: std::env::var("SANDBOXED_PUBLIC_URL")
+                .or_else(|_| std::env::var("PUBLIC_BASE_URL"))
+                .ok()
+                .filter(|s| !s.is_empty()),
         };
 
         // In non-dev mode, require auth secrets to be set.
@@ -482,10 +569,10 @@ impl Config {
         // Default backend configuration
         let default_backend = std::env::var("DEFAULT_BACKEND").ok().and_then(|v| {
             let backend = v.trim().to_lowercase();
-            if backend.is_empty() || !["claudecode", "opencode", "amp"].contains(&backend.as_str())
+            if backend.is_empty() || !["claudecode", "opencode", "grok", "gemini", "codex"].contains(&backend.as_str())
             {
                 tracing::warn!(
-                    "Invalid DEFAULT_BACKEND '{}'. Expected one of: claudecode, opencode, amp",
+                    "Invalid DEFAULT_BACKEND '{}'. Expected one of: claudecode, opencode, grok, gemini, codex",
                     v
                 );
                 None

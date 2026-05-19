@@ -12,7 +12,7 @@ vi.mock('next/navigation', () => ({
 
 vi.mock('@/lib/api', () => ({
   getVisibleAgents: vi.fn().mockResolvedValue([]),
-  getOpenAgentConfig: vi.fn().mockResolvedValue({ hidden_agents: [] }),
+  getSandboxedConfig: vi.fn().mockResolvedValue({ hidden_agents: [] }),
   listBackends: vi.fn().mockResolvedValue([{ id: 'codex', name: 'Codex' }]),
   listBackendAgents: vi.fn().mockResolvedValue([{ id: 'default', name: 'Default' }]),
   getBackendConfig: vi.fn().mockResolvedValue({ enabled: true, cli_available: true }),

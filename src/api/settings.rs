@@ -501,23 +501,30 @@ async fn restore_backup(
             )
         })?;
 
-        let name = file.name().to_string();
-
-        // Determine target path based on archive name
-        let (target_path, display_name) = if name.starts_with(".sandboxed-sh/") {
-            // Standard .sandboxed-sh files
-            let relative_path = name.strip_prefix(".sandboxed-sh/").unwrap_or(&name);
-            if relative_path.is_empty() {
-                continue;
-            }
-            (sandboxed_dir.join(relative_path), relative_path.to_string())
-        } else if name == ".claude/.credentials.json" {
-            // Claude credentials file - restore to the appropriate .claude directory
-            (claude_creds_dir.join(".credentials.json"), name.clone())
-        } else {
-            // Skip unknown files
+        let Some(enclosed_name) = file.enclosed_name().map(|path| path.to_path_buf()) else {
+            errors.push(format!("Skipped unsafe archive entry: {}", file.name()));
             continue;
         };
+        let name = enclosed_name.to_string_lossy().to_string();
+
+        // Determine target path based on archive name
+        let (target_path, display_name) =
+            if let Ok(relative_path) = enclosed_name.strip_prefix(".sandboxed-sh") {
+                // Standard .sandboxed-sh files
+                if relative_path.as_os_str().is_empty() {
+                    continue;
+                }
+                (
+                    sandboxed_dir.join(relative_path),
+                    relative_path.to_string_lossy().to_string(),
+                )
+            } else if enclosed_name == std::path::Path::new(".claude/.credentials.json") {
+                // Claude credentials file - restore to the appropriate .claude directory
+                (claude_creds_dir.join(".credentials.json"), name.clone())
+            } else {
+                // Skip unknown files
+                continue;
+            };
 
         // Ensure parent directory exists
         if let Some(parent) = target_path.parent() {

@@ -34,16 +34,16 @@ library/
 
 ## Getting Started
 
-Fork the [template library](https://github.com/Th0rgal/openagent-library-template) and customize it:
+Fork the [template library](https://github.com/Th0rgal/sandboxed-library-template) and customize it:
 
 ```bash
-git clone https://github.com/Th0rgal/openagent-library-template my-library
+git clone https://github.com/Th0rgal/sandboxed-library-template my-library
 cd my-library
 git remote set-url origin git@github.com:you/your-library.git
 git push -u origin main
 ```
 
-Then configure your library in Open Agent's **Settings** page (preferred) or set `LIBRARY_REMOTE` as an environment variable.
+Then configure your library in sandboxed.sh's **Settings** page (preferred) or set `LIBRARY_REMOTE` as an environment variable.
 
 ## Skills
 
@@ -190,7 +190,7 @@ Create workspaces from templates for consistent, reproducible environments.
 
 ## Syncing
 
-Open Agent automatically syncs your Library:
+sandboxed.sh automatically syncs your Library:
 
 1. Pulls latest changes from `LIBRARY_REMOTE`
 2. Copies relevant files to workspace `.opencode/` directories

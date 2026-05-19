@@ -1,0 +1,12 @@
+.gradle/
+build/
+.idea/
+*.iml
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+.kotlin/
+
+# Throwaway dev signing material — generate your own and pass via env vars.
+keys/

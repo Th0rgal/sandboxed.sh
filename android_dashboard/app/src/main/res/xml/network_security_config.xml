@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config xmlns:tools="http://schemas.android.com/tools"
+    tools:ignore="InsecureBaseConfiguration,AcceptsUserCertificates">
+    <!--
+        Self-hosted server use case: users may run the backend on a local
+        network (HTTP) or with a self-signed certificate they have installed
+        on the device. Both cleartext and user certs are intentionally
+        trusted; the warnings are suppressed deliberately.
+    -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

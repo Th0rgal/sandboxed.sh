@@ -11,6 +11,7 @@ enum StatusType {
     case pending
     case running
     case active
+    case awaitingUser
     case completed
     case failed
     case cancelled
@@ -21,33 +22,34 @@ enum StatusType {
     case connecting
     case interrupted
     case blocked
-    
+
     var color: Color {
         switch self {
         case .pending, .idle:
             return Theme.textMuted
         case .running, .active, .connecting:
             return Theme.accent
+        case .awaitingUser:
+            return Theme.warning
         case .completed, .connected:
             return Theme.success
-        case .failed, .error:
+        case .failed, .error, .interrupted, .blocked:
             return Theme.error
         case .cancelled, .disconnected:
             return Theme.textTertiary
-        case .interrupted, .blocked:
-            return Theme.warning
         }
     }
-    
+
     var backgroundColor: Color {
         color.opacity(0.15)
     }
-    
+
     var label: String {
         switch self {
         case .pending: return "Pending"
         case .running: return "Running"
         case .active: return "Active"
+        case .awaitingUser: return "Needs You"
         case .completed: return "Completed"
         case .failed: return "Failed"
         case .cancelled: return "Cancelled"
@@ -60,12 +62,13 @@ enum StatusType {
         case .blocked: return "Blocked"
         }
     }
-    
+
     var icon: String {
         switch self {
         case .pending: return "clock"
         case .running, .connecting: return "arrow.trianglehead.2.clockwise"
         case .active: return "circle.fill"
+        case .awaitingUser: return "hand.wave.fill"
         case .completed: return "checkmark.circle.fill"
         case .failed, .error: return "xmark.circle.fill"
         case .cancelled: return "slash.circle"
@@ -76,7 +79,7 @@ enum StatusType {
         case .blocked: return "exclamationmark.triangle.fill"
         }
     }
-    
+
     var shouldPulse: Bool {
         switch self {
         case .running, .active, .connecting:

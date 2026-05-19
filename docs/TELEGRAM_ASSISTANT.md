@@ -107,7 +107,7 @@ specified defaults.
 
 | Field | Required | Description |
 |---|---|---|
-| `default_backend` | No | Backend for auto-created missions (e.g. `claudecode`, `opencode`, `amp`) |
+| `default_backend` | No | Backend for auto-created missions (e.g. `claudecode`, `opencode`, `codex`, `grok`) |
 | `default_model_override` | No | Model override for auto-created missions |
 | `default_model_effort` | No | Model effort level (`low`, `medium`, `high`) |
 | `default_workspace_id` | No | Workspace for auto-created missions |

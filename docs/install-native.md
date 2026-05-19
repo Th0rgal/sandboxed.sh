@@ -8,8 +8,8 @@ systemd-nspawn container isolation.
 > — one command gets you running on any OS.
 
 Sandboxed.sh is the orchestrator/UI backend. **It does not run model inference**;
-it executes OpenCode, Claude Code, and Amp **inside each workspace**
-(host/container), so bash commands and file operations are scoped correctly. A
+it executes OpenCode, Claude Code, Codex, Gemini, and Grok **inside each
+workspace** (host/container), so bash commands and file operations are scoped correctly. A
 standalone OpenCode server is **optional** and only required if you want
 centralized OpenCode services (provider/auth management, health checks, etc.).
 
@@ -368,65 +368,28 @@ via the API.
 
 ---
 
-## 3.5) Configure Amp (Sourcegraph's coding agent)
+## 3.5) Configure Codex, Gemini, and Grok
 
-Amp is Sourcegraph's frontier coding agent with multi-model support. Unlike
-Claude Code and OpenCode which can use your own API keys, **Amp requires paid
-credits purchased through Sourcegraph**.
+Codex, Gemini, and Grok use their native CLIs plus credentials stored in the
+provider settings or the CLI's own login cache.
 
-### 3.5.1 Get Amp API credentials
+### 3.5.1 Codex
 
-1. Visit [ampcode.com](https://ampcode.com) and create an account
-2. Purchase credits (Amp does not have a free tier for API access)
-3. Generate an API key from your account dashboard
+Configure OpenAI API keys or Codex/ChatGPT credentials in **Settings →
+Providers**. Codex missions use raw model ids such as `gpt-5.5`,
+`gpt-5.3-codex`, or another model visible to the connected account.
 
-### 3.5.2 Configure Amp in Sandboxed.sh
+### 3.5.2 Gemini
 
-**Option A: Via Dashboard Settings (recommended)**
+Configure Google/Gemini credentials in **Settings → Providers** or use the
+Gemini CLI login flow. Gemini missions use raw model ids such as
+`gemini-3.1-pro-preview`.
 
-1. Go to **Settings → AI Backends**
-2. Find the "Amp" backend and click to configure
-3. Enter your `AMP_API_KEY`
-4. Choose default mode: `smart` (full capability) or `rush` (faster, cheaper)
+### 3.5.3 Grok
 
-**Option B: Via environment file**
-
-Add to `/etc/sandboxed_sh/sandboxed_sh.env`:
-
-```bash
-AMP_API_KEY=sgamp_user_XXXXX...
-```
-
-### 3.5.3 Amp modes
-
-| Mode      | Description                                 |
-| --------- | ------------------------------------------- |
-| **smart** | Full capability mode with extended thinking |
-| **rush**  | Faster responses, lower cost, less thorough |
-
-### 3.5.4 Using CLIProxyAPI (cost optimization)
-
-To route Amp requests through a local proxy (e.g.,
-[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)), set the `AMP_URL`
-environment variable:
-
-```bash
-# In /etc/sandboxed_sh/sandboxed_sh.env
-AMP_URL=http://localhost:8080
-```
-
-This redirects Amp CLI requests to your proxy instead of ampcode.com.
-
-### 3.5.5 Troubleshooting Amp
-
-**"Insufficient credits" error**: Amp requires paid credits. Purchase credits at
-ampcode.com.
-
-**"Network timeout" error**: This was a known issue in earlier versions. Update
-to the latest Sandboxed.sh which includes the fix.
-
-**CLI not found**: Sandboxed.sh auto-installs the Amp CLI via bun/npm. Ensure bun
-or npm is available in your PATH.
+Configure xAI credentials in **Settings → Providers**, set `XAI_API_KEY` or
+`GROK_CODE_XAI_API_KEY`, or run the Grok CLI login flow. Grok missions use raw
+model ids such as `grok-4.3`.
 
 ---
 
@@ -480,14 +443,14 @@ cd /opt/sandboxed_sh/vaduz-v1
 source /root/.cargo/env
 
 # Debug build (fast) - recommended for rapid iteration
-cargo build --bin sandboxed_sh --bin workspace-mcp --bin desktop-mcp
-install -m 0755 target/debug/sandboxed_sh /usr/local/bin/sandboxed_sh
+cargo build --bin sandboxed-sh --bin workspace-mcp --bin desktop-mcp
+install -m 0755 target/debug/sandboxed-sh /usr/local/bin/sandboxed-sh
 install -m 0755 target/debug/workspace-mcp /usr/local/bin/workspace-mcp
 install -m 0755 target/debug/desktop-mcp /usr/local/bin/desktop-mcp
 
 # Or: Release build (slower compile, faster runtime)
-# cargo build --release --bin sandboxed_sh --bin workspace-mcp --bin desktop-mcp
-# install -m 0755 target/release/sandboxed_sh /usr/local/bin/sandboxed_sh
+# cargo build --release --bin sandboxed-sh --bin workspace-mcp --bin desktop-mcp
+# install -m 0755 target/release/sandboxed-sh /usr/local/bin/sandboxed-sh
 # install -m 0755 target/release/workspace-mcp /usr/local/bin/workspace-mcp
 # install -m 0755 target/release/desktop-mcp /usr/local/bin/desktop-mcp
 ```
@@ -515,7 +478,7 @@ One way to bootstrap:
 
 ```bash
 # On your machine
-git clone git@github.com:Th0rgal/sandboxed.sh-library-template.git sandboxed.sh-library
+git clone git@github.com:Th0rgal/sandboxed-library-template.git sandboxed.sh-library
 cd sandboxed.sh-library
 
 # Point it at your own repo
@@ -658,7 +621,7 @@ User=root
 Group=root
 EnvironmentFile=/etc/sandboxed_sh/sandboxed_sh.env
 WorkingDirectory=/root
-ExecStart=/usr/local/bin/sandboxed_sh
+ExecStart=/usr/local/bin/sandboxed-sh
 Restart=on-failure
 RestartSec=2
 
@@ -799,7 +762,7 @@ Or follow `docs/DESKTOP_SETUP.md`.
 
 ### 9.1 Update Sandboxed.sh via Dashboard (recommended)
 
-The Settings page shows available updates for Sandboxed.sh, OpenCode, and
+The Settings page shows available updates for Sandboxed.sh, OpenCode, Grok, and
 oh-my-opencode. When a new version is available:
 
 1. Go to **Settings → System Components**
@@ -826,8 +789,8 @@ cd /opt/sandboxed_sh/vaduz-v1
 git fetch --tags origin
 git checkout <version-tag>  # e.g., v0.2.1
 source /root/.cargo/env
-cargo build --bin sandboxed_sh --bin workspace-mcp --bin desktop-mcp
-install -m 0755 target/debug/sandboxed_sh /usr/local/bin/sandboxed_sh
+cargo build --bin sandboxed-sh --bin workspace-mcp --bin desktop-mcp
+install -m 0755 target/debug/sandboxed-sh /usr/local/bin/sandboxed-sh
 install -m 0755 target/debug/workspace-mcp /usr/local/bin/workspace-mcp
 install -m 0755 target/debug/desktop-mcp /usr/local/bin/desktop-mcp
 systemctl restart sandboxed_sh.service
@@ -836,8 +799,8 @@ systemctl restart sandboxed_sh.service
 Quick rebuild (main binary only, if MCP binaries haven't changed):
 
 ```bash
-cargo build --bin sandboxed_sh
-install -m 0755 target/debug/sandboxed_sh /usr/local/bin/sandboxed_sh
+cargo build --bin sandboxed-sh
+install -m 0755 target/debug/sandboxed-sh /usr/local/bin/sandboxed-sh
 systemctl restart sandboxed_sh.service
 ```
 

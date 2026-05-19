@@ -1,4 +1,4 @@
-//! HTTP API for the Open Agent.
+//! HTTP API for sandboxed.sh.
 //!
 //! ## Endpoints
 //!
@@ -16,18 +16,20 @@
 //! - `POST /api/tools/{name}/toggle` - Enable/disable a tool
 
 pub mod ai_providers;
-pub mod ampcode;
 mod auth;
 pub mod automation_variables;
 pub mod backends;
 pub mod claudecode;
 mod console;
 pub mod control;
+pub mod control_metrics;
 pub mod deferred_proxy;
 pub mod desktop;
 mod desktop_stream;
 pub mod fido;
 mod fs;
+mod github_auth;
+pub(crate) mod grok_goal;
 pub mod library;
 pub mod mcp;
 pub mod metadata_llm;
@@ -35,7 +37,9 @@ pub mod mission_runner;
 pub mod mission_store;
 mod model_routing;
 mod monitoring;
+mod native_loop_observer;
 pub mod opencode;
+mod provider_usage_cache;
 mod providers;
 pub(crate) mod proxy;
 mod proxy_keys;

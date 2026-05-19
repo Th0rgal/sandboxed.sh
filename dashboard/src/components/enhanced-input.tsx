@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback, useMemo, forwardRef, useImperativeHandle, memo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, forwardRef, useImperativeHandle, memo } from 'react';
 import { listLibraryCommands, getBuiltinCommands as fetchBuiltinCommands, getVisibleAgents, type CommandSummary, type CommandParam } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
@@ -303,7 +303,7 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
     resizeTextarea(textarea);
   }, [resizeTextarea]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     adjustTextareaHeight();
   }, [displayValue, adjustTextareaHeight]);
 
@@ -670,6 +670,22 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
     onChange(newValue);
   };
 
+  const handleInput = (e: React.FormEvent<HTMLTextAreaElement>) => {
+    const newValue = e.currentTarget.value;
+    resizeTextarea(e.currentTarget);
+    onCanSubmitChange?.(!!(newValue.trim() || lockedAgent));
+
+    // React's onChange should normally carry every textarea edit, but this
+    // raw input fallback keeps the composer responsive during edge cases like
+    // IME/autofill/browser event ordering while the parent is doing heavy
+    // work after a mission create/switch.
+    const currentValue = lockedAgent ? displayValue : value;
+    if (newValue !== currentValue) {
+      historyIndexRef.current = -1;
+      onChange(newValue);
+    }
+  };
+
   const removeBadge = () => {
     if (lockedAgent) {
       onChange(`@${lockedAgent}${displayValue}`);
@@ -722,6 +738,7 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
           <textarea
             ref={textareaRef}
             value={lockedAgent ? displayValue : value}
+            onInput={handleInput}
             onChange={handleChange}
             onKeyDown={handleKeyDown}
             placeholder={lockedAgent ? "Type your message..." : placeholder}

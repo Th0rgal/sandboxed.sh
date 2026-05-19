@@ -47,7 +47,7 @@ npx --yes @xagt/agent-plugin@latest setup --target all
 
 <p align="center">
   <strong>Self-hosted cloud orchestrator for AI coding agents</strong><br/>
-  Isolated Linux workspaces with Claude Code, OpenCode & Amp runtimes
+  Isolated Linux workspaces with Claude Code, OpenCode, Codex, Gemini, and Grok runtimes
 </p>
 
 <p align="center">
@@ -95,8 +95,8 @@ literature. Local inference, isolated containers, nothing leaves your machines.
 
 ## Features
 
-- **Multi-Runtime Support**: Run Claude Code, OpenCode, or Amp agents in the same
-  infrastructure
+- **Multi-Runtime Support**: Run Claude Code, OpenCode, Codex, Gemini, and Grok
+  agents in the same infrastructure
 - **Mission Control**: Start, stop, and monitor agents remotely with real-time
   streaming
 - **Isolated Workspaces**: Containerized Linux environments (systemd-nspawn)
@@ -125,8 +125,8 @@ sandboxed.sh orchestrates multiple AI coding agent runtimes:
   official coding agent with native skills support (`.claude/skills/`)
 - **[OpenCode](https://github.com/anomalyco/opencode)**: Open-source alternative
   via [oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode)
-- **[Amp](https://ampcode.com)**: Sourcegraph's frontier coding agent with
-  multi-model support
+- **Codex, Gemini, and Grok**: Native CLI backends for OpenAI, Google, and xAI
+  coding agents
 
 Each runtime executes inside isolated workspaces, so bash commands and file
 operations are scoped correctly. sandboxed.sh handles orchestration, workspace
@@ -229,7 +229,6 @@ deployment:
 ### Setup Guides
 - **[Telegram Assistant](docs/TELEGRAM_ASSISTANT.md)** - Connect Telegram bots to missions
 - **[Desktop Setup](docs/DESKTOP_SETUP.md)** - X11/Xvfb configuration for GUI automation
-- **[Amp Proxy Setup](docs/AMP_PROXY_SETUP.md)** - Amp backend proxy configuration
 
 ### Reference
 - **[agents.md](agents.md)** - Agent configuration and harness details

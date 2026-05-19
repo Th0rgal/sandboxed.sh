@@ -148,7 +148,11 @@ pub fn verify_password_hash(password: &str, stored: &str) -> bool {
     constant_time_eq(&hex::encode(&computed), &hex::encode(&expected_hash))
 }
 
-fn issue_jwt(secret: &str, ttl_days: i64, user: &AuthUser) -> anyhow::Result<(String, i64)> {
+pub(super) fn issue_jwt(
+    secret: &str,
+    ttl_days: i64,
+    user: &AuthUser,
+) -> anyhow::Result<(String, i64)> {
     let now = Utc::now();
     let exp = now + Duration::days(ttl_days.max(1));
     let claims = Claims {
@@ -337,12 +341,16 @@ pub async fn require_auth(
     match verify_jwt(token, secret) {
         Ok(claims) => {
             let user = match state.config.auth.auth_mode(state.config.dev_mode) {
-                AuthMode::MultiUser => match user_for_claims(&claims, &state.config.auth.users) {
-                    Some(u) => u,
-                    None => {
-                        return (StatusCode::UNAUTHORIZED, "Invalid user").into_response();
+                AuthMode::MultiUser => {
+                    match user_for_claims(&claims, &state.config.auth.users)
+                        .or_else(|| github_user_for_claims(&claims, &state.config))
+                    {
+                        Some(u) => u,
+                        None => {
+                            return (StatusCode::UNAUTHORIZED, "Invalid user").into_response();
+                        }
                     }
-                },
+                }
                 AuthMode::SingleTenant => AuthUser {
                     id: claims.sub,
                     username: claims.usr,
@@ -373,6 +381,19 @@ fn user_for_claims(claims: &Claims, users: &[UserAccount]) -> Option<AuthUser> {
             id: effective_user_id(u),
             username: u.username.clone(),
         })
+}
+
+fn github_user_for_claims(claims: &Claims, config: &Config) -> Option<AuthUser> {
+    if !claims.sub.starts_with("github:") || claims.usr.trim().is_empty() {
+        return None;
+    }
+    if !config.auth.github_enabled() || !config.auth.github_user_allowed(&claims.usr) {
+        return None;
+    }
+    Some(AuthUser {
+        id: claims.sub.clone(),
+        username: claims.usr.clone(),
+    })
 }
 
 // ─── Auth status & password change endpoints ─────────────────────────────

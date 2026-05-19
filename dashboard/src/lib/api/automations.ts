@@ -7,7 +7,24 @@ import { apiFetch, apiGet, apiPatch, apiDel } from "./core";
 export type CommandSource =
   | { type: "library"; name: string }
   | { type: "local_file"; path: string }
-  | { type: "inline"; content: string };
+  | { type: "inline"; content: string }
+  | {
+      type: "native_loop";
+      /** Backend id: `"claudecode"`, `"codex"`, … */
+      harness: string;
+      /** Slash command without the leading `/`. Today: `"goal"`. */
+      command: string;
+      /** Free-form per-command args. For `goal`: `{ objective: "..." }`. */
+      args?: Record<string, unknown> | null;
+    };
+
+/**
+ * Who drives iteration for this automation. `scheduler` is the historical
+ * behaviour — OA fires on `trigger`. `harness_loop` means the harness CLI
+ * (claudecode/codex `/goal`) runs its own continuation loop; OA only records
+ * iterations.
+ */
+export type AutomationDriver = "scheduler" | "harness_loop";
 
 export type TriggerType =
   | { type: "interval"; seconds: number }
@@ -47,6 +64,8 @@ export interface Automation {
     retry_delay_seconds: number;
     backoff_multiplier: number;
   };
+  /** Defaults to "scheduler" for back-compat with rows from the old schema. */
+  driver?: AutomationDriver;
   // Back-compat fields used by the UI
   command_name?: string;
   interval_seconds?: number;

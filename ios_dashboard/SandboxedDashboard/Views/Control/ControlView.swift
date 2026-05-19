@@ -393,31 +393,34 @@ struct ControlView: View {
             }
         }
         .task {
-            // Load workspaces for the workspace picker
-            await workspaceState.loadWorkspaces()
+            // Cold-start sequencing. Previously every step here was awaited
+            // serially — workspaces → loadMission → loadCurrentMission →
+            // refreshRunningMissions — which on a slow cellular link stacked
+            // up to a dozen sequential RTTs before the user could read or
+            // type anything. We now:
+            //   1. Kick off the SSE stream first so any live events for the
+            //      restored mission start arriving immediately (the stream
+            //      doesn't depend on which mission we end up viewing — it
+            //      receives all events and the view filters by id).
+            //   2. Fan out the three independent "context" fetches —
+            //      workspaces, mission history, running missions — using
+            //      `async let`. They share zero state at this stage; the
+            //      previous serial chain was incidental, not required.
+            //   3. Start the running-missions poller last; it's a 3s tick
+            //      and starting it before the first refresh is fine.
+            startStreaming()
 
-            // Check if we're being opened with a specific mission from History
-            if let pendingId = nav.consumePendingMission() {
-                await loadMission(id: pendingId)
-                // Also load the current mission in the background for main-session context
-                await loadCurrentMission(updateViewing: false)
-            } else if let savedId = UserDefaults.standard.string(forKey: Self.lastMissionIdKey) {
-                // Restore last viewed mission from previous session
-                await loadMission(id: savedId)
-                await loadCurrentMission(updateViewing: false)
-            } else {
-                await loadCurrentMission(updateViewing: true)
-            }
+            async let workspacesTask: Void = workspaceState.loadWorkspaces()
+            async let runningTask: Void = refreshRunningMissions()
+            async let missionTask: Void = loadInitialMission()
 
-            // Fetch initial running missions
-            await refreshRunningMissions()
+            _ = await (workspacesTask, runningTask, missionTask)
 
             // Auto-show bar if there are multiple running missions
             if runningMissions.count > 1 {
                 showRunningMissions = true
             }
 
-            startStreaming()
             startPollingRunningMissions()
         }
         .onChange(of: nav.pendingMissionId) { _, newId in
@@ -566,11 +569,19 @@ struct ControlView: View {
         .sheet(isPresented: $showQueueSheet) {
             QueueSheet(
                 items: queuedItems,
+                // Synchronous removes so swipe-to-delete shrinks the row in
+                // the same render frame as the gesture, even on a slow
+                // network (the API call is fire-and-forget; the optimistic
+                // update is rolled back on failure). The previous Task
+                // wrapper deferred the mutation by one runloop tick, which
+                // SwiftUI's `List.onDelete` interprets as "data source
+                // didn't shrink" — the row snapped back before
+                // disappearing.
                 onRemove: { messageId in
-                    Task { await removeFromQueue(messageId: messageId) }
+                    removeFromQueueOptimistic(messageId: messageId)
                 },
                 onClearAll: {
-                    Task { await clearQueue() }
+                    clearQueueOptimistic()
                 },
                 onDismiss: {
                     showQueueSheet = false
@@ -1081,12 +1092,14 @@ struct ControlView: View {
         case "codex": pool = catalog.codex ?? []
         case "claudecode": pool = catalog.claudecode
         case "opencode": pool = catalog.opencode
+        case "grok": pool = catalog.grok ?? []
         default:
             // No mission yet → show every backend's commands so the user
             // can preview what's available.
             pool = catalog.opencode
                 + catalog.claudecode
                 + (catalog.codex ?? [])
+                + (catalog.grok ?? [])
         }
         return pool.filter { $0.matchesPrefix(nameFragment) }
     }
@@ -1278,44 +1291,88 @@ struct ControlView: View {
     }
 
     private static let maxCachedMissions = 10  // Limit cache size
+    /// Legacy key prefix used when mission blobs lived in UserDefaults. Kept
+    /// only so the one-time migration below can purge them on first launch
+    /// after upgrade — every payload bloats cfprefsd's in-memory plist.
     private static let cachePrefix = "cached_mission_"
     private static let cacheKeysKey = "cached_mission_keys"
+    private static let didMigrateCacheKey = "did_migrate_mission_cache_v1"
 
-    // Cache mission with events for faster loading and consistent display
-    private func cacheMissionWithEvents(_ mission: Mission, events: [StoredEvent]) {
-        let key = Self.cachePrefix + mission.id
-        let cacheData = CachedMissionData(mission: mission, events: events, cachedAt: Date())
-
-        guard let encoded = try? JSONEncoder().encode(cacheData) else { return }
-
-        // Implement LRU eviction
-        var cachedKeys = UserDefaults.standard.stringArray(forKey: Self.cacheKeysKey) ?? []
-
-        // Remove this key if it exists (we'll re-add it at the end as most recent)
-        cachedKeys.removeAll { $0 == mission.id }
-
-        // If we've hit the limit, remove the oldest cached mission
-        if cachedKeys.count >= Self.maxCachedMissions {
-            if let oldestKey = cachedKeys.first {
-                UserDefaults.standard.removeObject(forKey: Self.cachePrefix + oldestKey)
-                cachedKeys.removeFirst()
+    /// One-shot migration: previous versions stored mission events as raw
+    /// JSON blobs in UserDefaults. Those blobs are loaded into memory by
+    /// cfprefsd at process start, costing RAM forever. Read each blob,
+    /// rewrite it to disk, then erase the UserDefaults key. Idempotent —
+    /// guarded by a separate flag so a clean install doesn't run the loop.
+    static func migrateMissionCacheIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: didMigrateCacheKey) else { return }
+        let keys = defaults.stringArray(forKey: cacheKeysKey) ?? []
+        for missionId in keys {
+            let legacyKey = cachePrefix + missionId
+            if let data = defaults.data(forKey: legacyKey) {
+                try? writeCachedMissionFile(missionId: missionId, data: data)
+                defaults.removeObject(forKey: legacyKey)
             }
         }
+        defaults.set(true, forKey: didMigrateCacheKey)
+    }
 
-        // Add new entry
-        cachedKeys.append(mission.id)
+    // Cache mission with events for faster loading and consistent display.
+    //
+    // Storage moved off `UserDefaults` (which loads its entire backing plist
+    // into the cfprefsd daemon and the app process at launch, then writes
+    // synchronously on the main thread) to per-mission JSON files in
+    // `Caches/`. Writes are dispatched to a background queue so a multi-MB
+    // event payload no longer freezes the chat thread while it serialises.
+    private func cacheMissionWithEvents(_ mission: Mission, events: [StoredEvent]) {
+        let missionId = mission.id
+        let cacheData = CachedMissionData(mission: mission, events: events, cachedAt: Date())
+
+        // LRU key list still lives in UserDefaults — it's a tiny string array
+        // so it's free, and keeping it there means the LRU survives Caches
+        // eviction by iOS (we'll just miss on the orphaned files).
+        var cachedKeys = UserDefaults.standard.stringArray(forKey: Self.cacheKeysKey) ?? []
+        cachedKeys.removeAll { $0 == missionId }
+
+        var evicted: String?
+        if cachedKeys.count >= Self.maxCachedMissions {
+            evicted = cachedKeys.first
+            cachedKeys.removeFirst()
+        }
+        cachedKeys.append(missionId)
         UserDefaults.standard.set(cachedKeys, forKey: Self.cacheKeysKey)
-        UserDefaults.standard.set(encoded, forKey: key)
+
+        // Encode on @MainActor (CachedMissionData transitively contains
+        // `AnyCodable.value: Any`, which isn't Sendable, so we can't ship
+        // the struct to a detached task), then hand the raw bytes off for
+        // the actual filesystem write. `Data` is Sendable, so the write
+        // dispatch is clean. The disk write is the bigger UI-thread hazard
+        // on large missions anyway — encoding is bounded CPU; writing is
+        // unbounded I/O blocked on the filesystem coordinator.
+        let encoded = try? JSONEncoder().encode(cacheData)
+        let evictedId = evicted
+        Task.detached(priority: .utility) {
+            if let evictedId {
+                Self.deleteCachedMissionFile(missionId: evictedId)
+            }
+            if let encoded {
+                try? Self.writeCachedMissionFile(missionId: missionId, data: encoded)
+            }
+        }
     }
 
     private func loadCachedMissionData(_ missionId: String) -> CachedMissionData? {
-        let key = Self.cachePrefix + missionId
-        guard let data = UserDefaults.standard.data(forKey: key),
+        // Synchronous read on the call site (cold start) — the file is
+        // bounded by `loadEarlierPageLimit` * StoredEvent size (~few MB
+        // worst case) and decoding it on @MainActor is unavoidable here
+        // because the caller needs the result immediately to render the
+        // first frame. Subsequent caches written in the background.
+        guard let url = Self.cacheFileURL(missionId: missionId),
+              let data = try? Data(contentsOf: url),
               let cached = try? JSONDecoder().decode(CachedMissionData.self, from: data) else {
             return nil
         }
 
-        // Update LRU order - move to end as most recently accessed
         if var cachedKeys = UserDefaults.standard.stringArray(forKey: Self.cacheKeysKey) {
             cachedKeys.removeAll { $0 == missionId }
             cachedKeys.append(missionId)
@@ -1326,14 +1383,48 @@ struct ControlView: View {
     }
 
     private func removeMissionFromCache(_ missionId: String) {
-        let key = Self.cachePrefix + missionId
-        UserDefaults.standard.removeObject(forKey: key)
+        Self.deleteCachedMissionFile(missionId: missionId)
 
         // Remove from LRU tracking
         if var cachedKeys = UserDefaults.standard.stringArray(forKey: Self.cacheKeysKey) {
             cachedKeys.removeAll { $0 == missionId }
             UserDefaults.standard.set(cachedKeys, forKey: Self.cacheKeysKey)
         }
+    }
+
+    /// Cache directory for mission JSON. `.cachesDirectory` is appropriate
+    /// here: iOS may evict files under memory pressure, but losing them only
+    /// means a cache miss on next open, which costs one network round-trip.
+    /// (Compared to `.documentDirectory` which would be backed-up to iCloud
+    /// and counted toward the app's storage quota.)
+    nonisolated private static func cacheFileURL(missionId: String) -> URL? {
+        guard let caches = try? FileManager.default.url(
+            for: .cachesDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) else { return nil }
+        let dir = caches.appendingPathComponent("missions", isDirectory: true)
+        // mkdir on first use. Best-effort — if it fails, the write below
+        // will fail too and the caller falls through to network.
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // mission IDs are server-generated UUIDs in practice; sanitise
+        // anyway so we never write `../etc/passwd`-style paths.
+        let safeId = missionId.replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "..", with: "_")
+        return dir.appendingPathComponent("\(safeId).json", isDirectory: false)
+    }
+
+    nonisolated private static func writeCachedMissionFile(missionId: String, data: Data) throws {
+        guard let url = cacheFileURL(missionId: missionId) else { return }
+        // Atomic write — partial files left after a crash would fail to
+        // decode on next open and trigger an unnecessary network fetch.
+        try data.write(to: url, options: [.atomic])
+    }
+
+    nonisolated private static func deleteCachedMissionFile(missionId: String) {
+        guard let url = cacheFileURL(missionId: missionId) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     private func applyViewingMission(_ mission: Mission, scrollToBottom: Bool = true) {
@@ -1470,6 +1561,25 @@ struct ControlView: View {
         recomputeGroupedItems()
     }
 
+    /// Decide what to load on cold start. The previous code did
+    /// `loadMission(savedId)` then *also* awaited `loadCurrentMission` as
+    /// "background context" — but the await was serial, so the user paid
+    /// for both round-trips before the UI became interactive. The
+    /// "background" fetch is now genuinely backgrounded: kick off the
+    /// secondary `loadCurrentMission` in a detached Task so the primary
+    /// mission's events render as soon as they arrive.
+    private func loadInitialMission() async {
+        if let pendingId = nav.consumePendingMission() {
+            await loadMission(id: pendingId)
+            Task { await self.loadCurrentMission(updateViewing: false) }
+        } else if let savedId = UserDefaults.standard.string(forKey: Self.lastMissionIdKey) {
+            await loadMission(id: savedId)
+            Task { await self.loadCurrentMission(updateViewing: false) }
+        } else {
+            await loadCurrentMission(updateViewing: true)
+        }
+    }
+
     private func loadCurrentMission(updateViewing: Bool) async {
         // Try to load cached version first for immediate display with consistent event-based rendering
         let hasCache: Bool
@@ -1540,6 +1650,13 @@ struct ControlView: View {
         let previousViewingId = viewingMissionId
         viewingMissionId = id
 
+        // Fire-and-forget: tell the backend the user opened this mission.
+        // First call (per AwaitingUser round) starts the 1h ack grace timer
+        // and paints the "opened" dot in Finished; later calls are no-ops.
+        Task { [api] in
+            _ = try? await api.markMissionOpened(id: id)
+        }
+
         // Clear stale workers from previous mission immediately
         childMissions = []
 
@@ -1559,8 +1676,10 @@ struct ControlView: View {
         }
 
         do {
-            // Fetch mission metadata first (required)
-            let mission = try await api.getMission(id: id)
+            async let metadataTask = api.getMission(id: id)
+            async let transcriptTask: MissionTranscriptResult? = try? await api.getMissionTranscript(id: id)
+            let mission = try await metadataTask
+            let transcriptResult = await transcriptTask
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -1571,42 +1690,76 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            // Try to fetch full event history (optional - fall back to basic history if it fails)
-            do {
-                // Fetch all relevant event types including thinking events (matching web dashboard behavior)
-                let result = try await api.getMissionEventsWithMeta(id: id, types: historyEventTypes, limit: Self.initialEventLimit, latest: true)
-                let events = result.events
-
-                // Race condition guard after the second await
-                guard fetchingMissionId == id else {
-                    return
-                }
-
+            if let transcript = transcriptResult {
+                let events = transcript.messages.map(\.storedEvent)
                 if events.isEmpty {
                     // Clear stale cache when events are empty to prevent visual flashing
                     removeMissionFromCache(mission.id)
                     applyViewingMission(mission)
                 } else {
-                    hasMoreHistory = events.count >= Self.initialEventLimit
+                    // Mirror the web client's transcript-meta fix: only
+                    // count event types the iOS app actually loads. The
+                    // backend's `event_counts` includes debug/status
+                    // events outside `historyEventTypes`; summing them
+                    // all inflates the total and keeps the "Load earlier
+                    // messages" affordance visible on missions that have
+                    // already shown every loadable event.
+                    let loadable = Set(historyEventTypes)
+                    let loadableTotal = transcript.eventCounts
+                        .filter { loadable.contains($0.key) }
+                        .values
+                        .reduce(0, +)
+                    hasMoreHistory = loadableTotal > events.count
                     applyViewingMissionWithEvents(mission, events: events)
+                    if transcript.latestSequence > 0 {
+                        missionMaxSeq[id] = transcript.latestSequence
+                    }
+                    cacheMissionWithEvents(mission, events: events)
+                    Task { [api] in
+                        if let trace = try? await api.getMissionTraceWithMeta(id: id, limit: Self.initialEventLimit, sinceSeq: 0),
+                           !trace.events.isEmpty {
+                            await MainActor.run {
+                                guard fetchingMissionId == id || viewingMissionId == id else { return }
+                                // Deduplicate by sequence — transcript and
+                                // trace endpoints can overlap on shared
+                                // sequence numbers (the web client does the
+                                // same via a Map keyed by sequence in its
+                                // `renderDeferredTraceRef`). Without dedup
+                                // any overlapping event would render twice
+                                // after the deferred trace fetch lands.
+                                var bySequence: [Int64: StoredEvent] = [:]
+                                bySequence.reserveCapacity(events.count + trace.events.count)
+                                for e in events { bySequence[e.sequence] = e }
+                                for e in trace.events { bySequence[e.sequence] = e }
+                                let merged = bySequence.values
+                                    .sorted { $0.sequence < $1.sequence }
+                                applyViewingMissionWithEvents(mission, events: merged)
+                                if let maxSeq = trace.maxSequence, maxSeq > 0 {
+                                    missionMaxSeq[id] = maxSeq
+                                }
+                                cacheMissionWithEvents(mission, events: merged)
+                            }
+                        }
+                    }
+                }
+            } else {
+                let fallback = try? await api.getMissionEventsWithMeta(
+                    id: id,
+                    types: historyEventTypes,
+                    limit: Self.initialEventLimit,
+                    latest: true
+                )
+                if let result = fallback, !result.events.isEmpty {
+                    hasMoreHistory = result.events.count >= Self.initialEventLimit
+                    applyViewingMissionWithEvents(mission, events: result.events)
                     if let maxSeq = result.maxSequence, maxSeq > 0 {
                         missionMaxSeq[id] = maxSeq
                     }
-                    // Cache the mission with events for next time
-                    cacheMissionWithEvents(mission, events: events)
-                }
-            } catch {
-                print("Failed to load mission events (falling back to basic history): \(error)")
-                guard fetchingMissionId == id else {
-                    return
-                }
-                // If we already displayed cached data, keep it and don't flash to basic view
-                // Only clear cache and fall back if we didn't have cached data to begin with
-                if !hasCache {
+                    cacheMissionWithEvents(mission, events: result.events)
+                } else if !hasCache {
                     removeMissionFromCache(mission.id)
                     applyViewingMission(mission)
                 }
-                // Otherwise: keep the cached view displayed, don't cause a flash
             }
 
             isLoading = false
@@ -1639,6 +1792,14 @@ struct ControlView: View {
         }
     }
 
+    /// Hard cap on the "Load earlier" payload. The previous implementation
+    /// passed `types:` only with no `limit`, asking the server for the entire
+    /// mission history — on a 50k-event mission that's a multi-MB JSON
+    /// download blocking the chat behind a spinner. Pull a single large page
+    /// instead; if the user truly needs to scroll past that, they can tap
+    /// again. Keeps cold-load worst-case bounded.
+    private static let loadEarlierPageLimit = 1000
+
     // Load earlier messages when user taps "Load earlier" button
     private func loadEarlierMessages() async {
         guard let missionId = viewingMissionId, !isLoadingEarlier else { return }
@@ -1646,12 +1807,18 @@ struct ControlView: View {
         defer { isLoadingEarlier = false }
 
         do {
-            // Fetch all events (no limit) to get the full history
-            let allEvents = try await api.getMissionEvents(id: missionId, types: historyEventTypes)
+            let allEvents = try await api.getMissionEvents(
+                id: missionId,
+                types: historyEventTypes,
+                limit: Self.loadEarlierPageLimit
+            )
             guard viewingMissionId == missionId else { return }
 
             if !allEvents.isEmpty, let mission = viewingMission {
-                hasMoreHistory = false
+                // Only mark history exhausted if we got fewer rows than the
+                // page cap. If the server returned a full page, more may
+                // remain — keep the button visible.
+                hasMoreHistory = allEvents.count >= Self.loadEarlierPageLimit
                 applyViewingMissionWithEvents(mission, events: allEvents, scrollToBottom: false)
                 cacheMissionWithEvents(mission, events: allEvents)
             }
@@ -1830,16 +1997,22 @@ struct ControlView: View {
 
     private func setMissionStatus(_ status: MissionStatus) async {
         guard let mission = viewingMission else { return }
-        
+        let previousStatus = mission.status
+        // Flip the status pill instantly on the menu tap; roll back on
+        // failure so the badge tracks the server's true state.
+        viewingMission?.status = status
+        if currentMission?.id == mission.id {
+            currentMission?.status = status
+        }
         do {
             try await api.setMissionStatus(id: mission.id, status: status)
-            viewingMission?.status = status
-            if currentMission?.id == mission.id {
-                currentMission?.status = status
-            }
             HapticService.success()
         } catch {
             print("Failed to set status: \(error)")
+            viewingMission?.status = previousStatus
+            if currentMission?.id == mission.id {
+                currentMission?.status = previousStatus
+            }
             HapticService.error()
         }
     }
@@ -2137,9 +2310,11 @@ struct ControlView: View {
         HapticService.lightTap()
 
         // Generate temp ID and add message optimistically BEFORE the API call
-        // This ensures messages appear in send order, not response order
+        // This ensures messages appear in send order, not response order.
+        // The `isPending` flag dims the bubble and shows a tiny spinner so
+        // users on a slow network don't re-tap. (UX audit item #11.)
         let tempId = "temp-\(UUID().uuidString)"
-        let tempMessage = ChatMessage(id: tempId, type: .user, content: content)
+        let tempMessage = ChatMessage(id: tempId, type: .user, content: content, isPending: true)
         messages.append(tempMessage)
         recomputeGroupedItems()
         scrollToBottomTick += 1
@@ -2149,10 +2324,17 @@ struct ControlView: View {
                 let (messageId, queued) = try await api.sendMessage(content: content)
 
                 // Replace temp ID with server-assigned ID, preserving timestamp
-                // This allows SSE handler to correctly deduplicate
+                // This allows SSE handler to correctly deduplicate. Pending
+                // state is cleared so the bubble snaps back to full opacity.
                 if let index = messages.firstIndex(where: { $0.id == tempId }) {
                     let originalTimestamp = messages[index].timestamp
-                    messages[index] = ChatMessage(id: messageId, type: .user, content: content, timestamp: originalTimestamp)
+                    messages[index] = ChatMessage(
+                        id: messageId,
+                        type: .user,
+                        content: content,
+                        timestamp: originalTimestamp,
+                        isPending: false
+                    )
                 }
 
                 // Update queue count when message was queued
@@ -2195,40 +2377,55 @@ struct ControlView: View {
         }
     }
 
-    private func removeFromQueue(messageId: String) async {
-        // Optimistic update
-        queuedItems.removeAll { $0.id == messageId }
-        queueLength = max(0, queueLength - 1)
-
-        do {
-            try await api.removeFromQueue(messageId: messageId)
-        } catch {
-            print("Failed to remove from queue: \(error)")
-            // Refresh from server on error to get actual state
-            await loadQueueItems()
-            queueLength = queuedItems.count
-            HapticService.error()
+    /// Synchronous optimistic remove — runs *during* the swipe gesture so
+    /// SwiftUI's `List.onDelete` animation has the new (smaller) data
+    /// source on the same render frame. Network call is fire-and-forget
+    /// in a detached `Task`. The previous implementation wrapped the whole
+    /// thing in `Task { await … }`, which deferred the array mutation by
+    /// one runloop tick — on a slow connection the row visibly snapped
+    /// back to its original position before re-disappearing.
+    private func removeFromQueueOptimistic(messageId: String) {
+        withAnimation(.easeOut(duration: 0.2)) {
+            queuedItems.removeAll { $0.id == messageId }
+            queueLength = max(0, queueLength - 1)
+        }
+        Task {
+            do {
+                try await api.removeFromQueue(messageId: messageId)
+            } catch {
+                print("Failed to remove from queue: \(error)")
+                // Reconcile with the server on error so the row reappears
+                // if the delete actually didn't take effect.
+                await loadQueueItems()
+                queueLength = queuedItems.count
+                HapticService.error()
+            }
         }
     }
 
-    private func clearQueue() async {
-        // Optimistic update
-        queuedItems = []
-        queueLength = 0
+    /// Synchronous optimistic clear — same rationale as
+    /// `removeFromQueueOptimistic`.
+    private func clearQueueOptimistic() {
+        withAnimation(.easeOut(duration: 0.2)) {
+            queuedItems = []
+            queueLength = 0
+        }
         showQueueSheet = false
-
-        do {
-            _ = try await api.clearQueue()
-            HapticService.success()
-        } catch {
-            print("Failed to clear queue: \(error)")
-            // Refresh from server on error to get actual state
-            await loadQueueItems()
-            queueLength = queuedItems.count
-            HapticService.error()
+        Task {
+            do {
+                _ = try await api.clearQueue()
+                HapticService.success()
+            } catch {
+                print("Failed to clear queue: \(error)")
+                // Reconcile with the server on error so any items that
+                // did not actually clear reappear.
+                await loadQueueItems()
+                queueLength = queuedItems.count
+                HapticService.error()
+            }
         }
     }
-    
+
     private func startStreaming() {
         streamTask = Task {
             // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
@@ -2372,7 +2569,21 @@ struct ControlView: View {
         // Clear stale workers from previous mission immediately
         childMissions = []
 
-        isLoading = true
+        // Cache-first render so mission switches don't blank the chat.
+        // `loadMission` has done this for a while; `switchToMission` (used by
+        // the mission switcher, running-mission chip, worker peek) used to
+        // skip the cache and show `LoadingView("Loading conversation…")`
+        // until both the metadata and the events round-trips returned —
+        // multi-second blank on a slow link even when the data was already
+        // on disk. (UX audit item #1.)
+        let hasCache: Bool
+        if let cached = loadCachedMissionData(id) {
+            applyViewingMissionWithEvents(cached.mission, events: cached.events)
+            hasCache = true
+        } else {
+            hasCache = false
+            isLoading = true
+        }
 
         // Determine the run state for this mission from runningMissions
         if let runningInfo = runningMissions.first(where: { $0.missionId == id }) {
@@ -2394,8 +2605,14 @@ struct ControlView: View {
         progress = nil
 
         do {
-            // Load the mission from API
-            let mission = try await api.getMission(id: id)
+            // Fan out metadata + events in parallel. They share only `id`, so
+            // the previous serial chain (getMission then
+            // getMissionEventsWithMeta) added one mandatory RTT for nothing.
+            // (UX audit item #2.)
+            async let metadataTask = api.getMission(id: id)
+            async let eventsTask: MissionEventsResult? = try? await api.getMissionEventsWithMeta(id: id, types: historyEventTypes)
+            let mission = try await metadataTask
+            let eventResult = await eventsTask
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -2407,19 +2624,16 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            // Fetch full event history to avoid partial history rendering.
-            // Use the meta variant so the `X-Max-Sequence` header seeds the
-            // delta-resume cursor — otherwise missions loaded via the switcher
-            // would always fall back to a full tail reload on reconnect.
-            if let result = try? await api.getMissionEventsWithMeta(id: id, types: historyEventTypes), !result.events.isEmpty {
-                guard fetchingMissionId == id else { return }
+            if let result = eventResult, !result.events.isEmpty {
                 applyViewingMissionWithEvents(mission, events: result.events)
                 if let maxSeq = result.maxSequence, maxSeq > 0 {
                     missionMaxSeq[id] = maxSeq
                 }
                 cacheMissionWithEvents(mission, events: result.events)
-            } else {
-                guard fetchingMissionId == id else { return }
+            } else if !hasCache {
+                // Only fall through to "no events" if we never rendered the
+                // cached transcript — otherwise an intermittent events
+                // failure would blow away a perfectly good cached view.
                 removeMissionFromCache(mission.id)
                 applyViewingMission(mission)
             }
@@ -2455,22 +2669,38 @@ struct ControlView: View {
     }
     
     private func cancelMission(id: String) async {
+        // Drop the chip from the running-missions bar immediately so the
+        // tap-to-cancel feels instant on slow networks. The
+        // `refreshRunningMissions` below reconciles with the server.
+        let removedRunning = runningMissions.first { $0.missionId == id }
+        if removedRunning != nil {
+            withAnimation(.easeOut(duration: 0.2)) {
+                runningMissions.removeAll { $0.missionId == id }
+            }
+        }
         do {
             try await api.cancelMission(id: id)
-            
+
             // Refresh running missions
             await refreshRunningMissions()
-            
+
             // If we were viewing this mission, switch to current
             if viewingMissionId == id {
                 if let currentId = currentMission?.id {
                     await switchToMission(id: currentId)
                 }
             }
-            
+
             HapticService.success()
         } catch {
             print("Failed to cancel mission: \(error)")
+            // Restore the chip on failure.
+            if let restored = removedRunning,
+               !runningMissions.contains(where: { $0.missionId == id }) {
+                withAnimation {
+                    runningMissions.append(restored)
+                }
+            }
             HapticService.error()
         }
     }
@@ -2823,6 +3053,8 @@ struct ControlView: View {
                 let isSseReconnectError = lower.contains("stream connection failed") ||
                                           lower.contains("sse connection") ||
                                           lower.contains("event stream") ||
+                                          lower.contains("stream idle") ||
+                                          lower.contains("stream rejected by server") ||
                                           lower == "timed out" ||
                                           lower == "connection reset" ||
                                           lower == "connection closed"
@@ -3158,6 +3390,19 @@ private struct MessageBubble: View {
                             topTrailingRadius: 20
                         )
                     )
+                    // While the message is awaiting server ack, dim the bubble
+                    // and overlay a small spinner so the user has unambiguous
+                    // feedback that the send is in flight. (UX audit item #11.)
+                    .opacity(message.isPending ? 0.55 : 1)
+                    .overlay(alignment: .bottomTrailing) {
+                        if message.isPending {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(.white)
+                                .padding(6)
+                        }
+                    }
+                    .animation(.easeOut(duration: 0.15), value: message.isPending)
                     .contextMenu {
                         Button {
                             onCopy?()
@@ -3430,6 +3675,10 @@ private struct SharedFileCardView: View {
 
         do {
             var request = URLRequest(url: url)
+            // Bound the per-image fetch to the same window as JSON requests so
+            // a stalled image host can't leave the cell spinning behind the
+            // 60s URLSession default.
+            request.timeoutInterval = APIService.requestTimeout
 
             // Add authentication token if available
             if let token = APIService.shared.authToken {
@@ -4991,9 +5240,11 @@ private struct MissionRow: View {
         switch status {
         case .pending: return Theme.warning
         case .active: return Theme.success
+        case .awaitingUser: return Theme.warning
+        case .acknowledged: return Theme.success
         case .completed: return Theme.textMuted
         case .failed: return Theme.error
-        case .interrupted, .blocked: return Theme.warning
+        case .interrupted, .blocked: return Theme.error
         case .notFeasible: return Theme.error
         case .unknown: return Theme.textMuted
         }
@@ -5006,6 +5257,8 @@ private struct MissionRow: View {
         switch status {
         case .pending: return "clock.fill"
         case .active: return "play.circle.fill"
+        case .awaitingUser: return "hand.wave.fill"
+        case .acknowledged: return "checkmark.circle.fill"
         case .completed: return "checkmark.circle.fill"
         case .failed: return "xmark.circle.fill"
         case .interrupted: return "pause.circle.fill"

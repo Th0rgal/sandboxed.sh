@@ -1,11 +1,11 @@
 ---
-title: Open Agent
+title: sandboxed.sh
 description: Self-hosted cloud orchestrator for AI coding agents
 ---
 
 import { Callout } from 'nextra/components'
 
-# Open Agent
+# sandboxed.sh
 
 Run AI coding agents on your own server. Start a task, close your laptop, check back tomorrow.
 
@@ -21,15 +21,15 @@ You're using Claude Code or Cursor. It's good. But:
 - **Your code goes somewhere.** Fine for side projects. Not fine for work.
 - **You can't customize it.** Same generic behavior for every project.
 
-Open Agent fixes all three.
+sandboxed.sh fixes all three.
 
 ## What It Actually Does
 
-Open Agent is a cloud orchestrator that runs on your server. You connect to it from a web dashboard, iOS app, or CLI. You tell an agent what to do. It works until it's done, whether that takes 10 minutes or 10 hours.
+sandboxed.sh is a cloud orchestrator that runs on your server. You connect to it from a web dashboard, iOS app, or CLI. You tell an agent what to do. It works until it's done, whether that takes 10 minutes or 10 hours.
 
 Your code stays on your machine. You define how the agent behaves through a git repo of skills, commands, and rules. Each project gets its own isolated container.
 
-Under the hood, it runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) for the actual agent work. Open Agent handles everything around it: starting tasks, streaming progress, managing environments, syncing configuration.
+Under the hood, it runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenCode](https://opencode.ai), Codex, Gemini, or Grok for the actual agent work. sandboxed.sh handles everything around it: starting tasks, streaming progress, managing environments, syncing configuration.
 
 ## When To Use This
 
@@ -61,14 +61,14 @@ Container workspaces isolate everything. Your Node project doesn't see your Pyth
 ┌─────────────────────────────────────────────────────────┐
 │                   Your Server (~$30/mo)                  │
 │  ┌─────────────────────────────────────────────────┐    │
-│  │              Open Agent                          │    │
+│  │              sandboxed.sh                          │    │
 │  │  • Starts and monitors agent tasks               │    │
 │  │  • Manages isolated container workspaces         │    │
 │  │  • Syncs skills and rules from your git repo     │    │
 │  └──────────────────────┬──────────────────────────┘    │
 │                         │                                │
 │  ┌──────────────────────▼──────────────────────────┐    │
-│  │          Claude Code / OpenCode                  │    │
+│  │   Claude Code / OpenCode / Codex / Gemini / Grok │    │
 │  │  • Runs the actual agent logic                   │    │
 │  │  • Executes tools, writes code                   │    │
 │  │  • Talks to Claude/GPT/local models              │    │
@@ -76,7 +76,7 @@ Container workspaces isolate everything. Your Node project doesn't see your Pyth
 └─────────────────────────────────────────────────────────┘
 ```
 
-Open Agent doesn't do AI. It manages the infrastructure around AI. The runtime (Claude Code or OpenCode) does the thinking. Open Agent makes sure it has somewhere to run, something to work on, and a way for you to watch.
+sandboxed.sh doesn't do AI. It manages the infrastructure around AI. The selected runtime does the thinking. sandboxed.sh makes sure it has somewhere to run, something to work on, and a way for you to watch.
 
 **Note**: The setup guide installs the **backend** on your server. For the dashboard, you have options:
 - **Vercel**: Host the Next.js dashboard for free
@@ -87,7 +87,7 @@ Open Agent doesn't do AI. It manages the infrastructure around AI. The runtime (
 
 If you have a server and a domain, tell Claude or Cursor:
 
-> "Deploy Open Agent on my server at `1.2.3.4` with domain `agent.example.com`. Read INSTALL.md for the full guide."
+> "Deploy sandboxed.sh on my server at `1.2.3.4` with domain `agent.example.com`. Read INSTALL.md for the full guide."
 
 It handles systemd, nginx, SSL, everything. Or [do it manually](/setup) if you prefer.
 
@@ -95,6 +95,6 @@ Don't have a server? Get one from [Hetzner](https://www.hetzner.com/) or Digital
 
 ## Next
 
-1. **[Setup](/setup)** to get Open Agent running on your server
+1. **[Setup](/setup)** to get sandboxed.sh running on your server
 2. **[First Mission](/first-mission)** to run your first agent task
 3. **[Library](/library)** to customize how your agents behave

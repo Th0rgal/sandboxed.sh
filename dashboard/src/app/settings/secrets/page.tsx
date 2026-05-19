@@ -16,8 +16,6 @@ import {
   revealSecret,
   getAuthStatus,
   changePassword,
-  type SecretsStatus,
-  type EncryptionStatus,
   type SecretInfo,
 } from '@/lib/api';
 import {
@@ -364,14 +362,6 @@ export default function SecretsPage() {
 
   const loading = authLoading || encryptionLoading || secretsLoading;
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
-        <Loader className="h-8 w-8 animate-spin text-white/40" />
-      </div>
-    );
-  }
-
   const hasSecrets = (secretsStatus?.registries ?? []).some(r => r.secret_count > 0);
 
   return (
@@ -385,6 +375,26 @@ export default function SecretsPage() {
         </p>
       </div>
 
+      {loading ? (
+        <div className="space-y-4">
+          {Array.from({ length: 3 }).map((_, index) => (
+            <div key={index} className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6">
+              <div className="flex items-center gap-3 mb-5">
+                <div className="h-9 w-9 rounded-lg bg-white/[0.06]" />
+                <div className="space-y-2">
+                  <div className="h-4 w-36 rounded bg-white/[0.06]" />
+                  <div className="h-3 w-52 rounded bg-white/[0.04]" />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="h-20 rounded-lg bg-white/[0.03] border border-white/[0.04]" />
+                <div className="h-20 rounded-lg bg-white/[0.03] border border-white/[0.04]" />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+      <>
       {/* Auth Status Card */}
       <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6">
         <div className="flex items-center gap-3 mb-4">
@@ -692,7 +702,7 @@ export default function SecretsPage() {
         ) : !hasSecrets ? (
           <div className="p-8 text-center">
             <p className="text-sm text-white/50">
-              No secrets stored. Click "Add Secret" to store credentials.
+              No secrets stored. Click &quot;Add Secret&quot; to store credentials.
             </p>
           </div>
         ) : (
@@ -813,6 +823,8 @@ export default function SecretsPage() {
           </div>
         )}
       </div>
+      </>
+      )}
       </div>
 
       {/* Initialize Dialog */}
@@ -1056,7 +1068,7 @@ export default function SecretsPage() {
                   <div className="py-4 text-center">
                     <p className="text-sm text-white/50 mb-2">No encryption key configured.</p>
                     <p className="text-xs text-white/40">
-                      Click "Set Key" to configure an encryption key for skill content.
+                      Click &quot;Set Key&quot; to configure an encryption key for skill content.
                     </p>
                   </div>
                 )}

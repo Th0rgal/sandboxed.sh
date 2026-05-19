@@ -47,11 +47,14 @@ struct TerminalView: View {
                     ForEach(workspaceState.workspaces) { workspace in
                         Button {
                             workspaceState.selectWorkspace(id: workspace.id)
-                            // Reconnect to the new workspace
+                            // Reconnect to the new workspace. The previous
+                            // 0.3 s delay between disconnect and connect was
+                            // a guess at "let URLSession clean up"; in
+                            // practice cancelling and re-resuming a
+                            // webSocketTask is synchronous enough that the
+                            // delay was just visible latency. (UX audit #18.)
                             disconnect()
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                connect()
-                            }
+                            connect()
                             HapticService.selectionChanged()
                         } label: {
                             HStack {
@@ -278,18 +281,34 @@ struct TerminalView: View {
         
         state.webSocketTask = URLSession.shared.webSocketTask(with: request)
         state.webSocketTask?.resume()
-        
-        // Start receiving messages
+
+        // Start receiving messages. The connection-status transition to
+        // `.connected` and the "Connected." line are driven by the first
+        // successful message receive (see `receiveMessages`) — typical
+        // shells print a prompt on open, so the fast path is "promote as
+        // soon as bytes flow". The previous fixed 500 ms timer added
+        // unnecessary latency on fast networks and masked failure on slow
+        // ones. (UX audit item #18.)
         receiveMessages()
-        
-        // Send initial resize message after a brief delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            if state.connectionStatus == .connecting {
-                state.connectionStatus = .connected
-                state.appendLine(TerminalLine(text: "Connected.", type: .system))
-            }
+
+        // Send initial resize immediately so the shell sizes correctly on
+        // open; this is just a control message and doesn't depend on the
+        // status transition.
+        sendResize(cols: 80, rows: 24)
+
+        // Fallback: a silent shell (waiting on input, slow init script,
+        // workspaces/<id>/shell endpoints that don't echo a banner) would
+        // otherwise leave us in "Connecting" forever because no inbound
+        // message ever triggers the promotion above. Promote after 3 s as
+        // long as the websocket is still attached and hasn't errored or
+        // been deliberately disconnected.
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            guard state.webSocketTask != nil,
+                  state.connectionStatus == .connecting else { return }
+            state.connectionStatus = .connected
             state.isConnecting = false
-            sendResize(cols: 80, rows: 24)
+            state.appendLine(TerminalLine(text: "Connected.", type: .system))
         }
     }
     
@@ -318,6 +337,15 @@ struct TerminalView: View {
         state.webSocketTask?.receive { [self] result in
             switch result {
             case .success(let message):
+                // Promote to `.connected` on the first successful message
+                // rather than after a hardcoded 0.5 s timer.
+                Task { @MainActor in
+                    if state.connectionStatus != .connected {
+                        state.connectionStatus = .connected
+                        state.isConnecting = false
+                        state.appendLine(TerminalLine(text: "Connected.", type: .system))
+                    }
+                }
                 switch message {
                 case .string(let text):
                     Task { @MainActor in
@@ -336,9 +364,10 @@ struct TerminalView: View {
                 Task { @MainActor in
                     receiveMessages()
                 }
-                
+
             case .failure(let error):
                 Task { @MainActor in
+                    state.isConnecting = false
                     if state.connectionStatus != .disconnected {
                         state.connectionStatus = .error
                         state.appendLine(TerminalLine(text: "Connection error: \(error.localizedDescription)", type: .error))

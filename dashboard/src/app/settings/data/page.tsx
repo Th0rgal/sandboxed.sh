@@ -280,14 +280,14 @@ export default function DataSettingsPage() {
             </div>
           </div>
 
-          {/* Open Agent Source */}
+          {/* sandboxed.sh Source */}
           <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
             <div className="flex items-center gap-3 mb-4">
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10">
                 <Archive className="h-5 w-5 text-emerald-400" />
               </div>
               <div>
-                <h2 className="text-sm font-medium text-white">Open Agent Source</h2>
+                <h2 className="text-sm font-medium text-white">sandboxed.sh Source</h2>
                 <p className="text-xs text-white/40">
                   Path to the sandboxed.sh git checkout used for updates
                 </p>
@@ -428,7 +428,7 @@ export default function DataSettingsPage() {
 
             <div className="space-y-3">
               <p className="text-xs text-white/50">
-                Backup includes: AI provider credentials, backend settings (Amp API key, etc.),
+                Backup includes: AI provider credentials, backend settings,
                 workspace definitions, MCP configurations, encrypted secrets, and the
                 library encryption key.
               </p>

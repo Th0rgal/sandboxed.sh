@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect, useMemo, memo } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef, memo } from "react";
 import { createRoot } from "react-dom/client";
 import Markdown, { Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -654,12 +654,24 @@ function InlineImagePreview({
   workspaceId?: string;
   missionId?: string;
 }) {
-  const resolvedPath = resolvePath(path, basePath);
+  const isAbsolute = path.startsWith("/") || /^[a-zA-Z]:/.test(path);
+  // A relative path can't be resolved until `basePath` is known. Returning a
+  // stable sentinel (null) keeps us in the loading state instead of firing
+  // a 404 fetch against `./artifacts/...` and then leaving a stale error
+  // pill when basePath later arrives and the effect re-runs.
+  const resolvedPath = isAbsolute || basePath ? resolvePath(path, basePath) : null;
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    // Reset between effect runs so a previous error/blob doesn't leak when
+    // `resolvedPath` changes (e.g. `basePath` resolves after first paint).
+    setImageUrl(null);
+    setError(null);
+    setLoading(true);
+    if (!resolvedPath) return;
+
     let cancelled = false;
     let acquired = false;
 
@@ -710,31 +722,44 @@ function InlineImagePreview({
     };
   }, [resolvedPath, workspaceId, missionId]);
 
+  // Shared placeholder box: same shape for loading and error so the layout
+  // doesn't jump and the error state reads as part of the same chrome as
+  // the skeleton. `<span>` (not `<div>`) keeps this valid inside the `<p>`
+  // that react-markdown wraps around `![alt](url)` so hydration doesn't
+  // tear the subtree.
+  const placeholderClass =
+    "my-2 block rounded-xl overflow-hidden border border-white/[0.06] bg-white/[0.03]";
+  const placeholderStyle = { maxWidth: 400, height: 200 } as const;
+
   if (error) {
     return (
-      <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-red-500/10 text-red-400 text-xs">
-        <Image className="h-3.5 w-3.5" />
-        {error}
+      <span
+        className={cn(placeholderClass, "flex items-center justify-center gap-2 text-xs text-white/40")}
+        style={placeholderStyle}
+        title={error}
+      >
+        <Image className="h-4 w-4" />
+        <span className="truncate max-w-[260px]">{error}</span>
       </span>
     );
   }
 
-  if (loading) {
+  if (loading || !imageUrl) {
     return (
-      <div className="my-2 rounded-xl overflow-hidden bg-white/[0.03] animate-pulse" style={{ maxWidth: 400, height: 200 }} />
+      <span className={cn(placeholderClass, "animate-pulse")} style={placeholderStyle} />
     );
   }
 
   return (
-    <div className="my-2">
+    <span className="my-2 block">
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
-        src={imageUrl!}
+        src={imageUrl}
         alt={alt}
         className="max-h-[300px] rounded-xl border border-white/[0.06] cursor-pointer hover:border-white/[0.12] transition-colors"
-        onClick={() => showFilePreviewModal(path, resolvedPath, workspaceId, missionId)}
+        onClick={() => showFilePreviewModal(path, resolvedPath ?? path, workspaceId, missionId)}
       />
-    </div>
+    </span>
   );
 }
 
@@ -849,6 +874,13 @@ function InlineFileCard({
   );
 }
 
+// P1-#10: messages larger than this render as plain <pre> with an opt-in
+// "Render markdown" button. The freeze trace on the verity missions
+// showed single assistant bubbles 200KB+ of repeated tokens that took
+// 5s+ to highlight + lay out. Past ~50KB the cost is no longer paying
+// for anything the user actually reads.
+const MARKDOWN_SIZE_CAP_BYTES = 50_000;
+
 // Memoized to prevent re-renders when parent re-renders with same props
 export const MarkdownContent = memo(function MarkdownContent({
   content,
@@ -857,8 +889,15 @@ export const MarkdownContent = memo(function MarkdownContent({
   workspaceId,
   missionId,
 }: MarkdownContentProps) {
+  const [forceMarkdown, setForceMarkdown] = useState(false);
+  const oversize = content.length > MARKDOWN_SIZE_CAP_BYTES;
+  const renderPlain = oversize && !forceMarkdown;
+
   // Pre-process content: transform <image> and <file> tags into markdown syntax
-  const processedContent = useMemo(() => transformRichTags(content), [content]);
+  const processedContent = useMemo(
+    () => (renderPlain ? "" : transformRichTags(content)),
+    [content, renderPlain]
+  );
 
   // Memoize components object to prevent react-markdown from re-creating DOM on every render
   const components: Components = useMemo(() => ({
@@ -987,6 +1026,30 @@ export const MarkdownContent = memo(function MarkdownContent({
     return defaultUrlTransform(url);
   }, []);
 
+  if (renderPlain) {
+    const sizeKb = (content.length / 1024).toFixed(0);
+    return (
+      <div className={cn("prose-glass text-sm [&_p]:my-2", className)}>
+        <div className="mb-2 flex items-center justify-between rounded border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          <span>
+            Large message ({sizeKb} KB). Markdown rendering skipped for
+            performance — code blocks, links, and images are not active.
+          </span>
+          <button
+            type="button"
+            onClick={() => setForceMarkdown(true)}
+            className="ml-3 shrink-0 rounded bg-amber-400/20 px-2 py-0.5 text-xs font-medium text-amber-100 hover:bg-amber-400/30"
+          >
+            Render markdown
+          </button>
+        </div>
+        <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words rounded bg-white/5 p-3 text-xs leading-relaxed">
+          {content}
+        </pre>
+      </div>
+    );
+  }
+
   return (
     <div className={cn("prose-glass text-sm [&_p]:my-2", className)}>
       <Markdown remarkPlugins={plugins} components={components} urlTransform={urlTransform}>
@@ -995,3 +1058,69 @@ export const MarkdownContent = memo(function MarkdownContent({
     </div>
   );
 });
+
+/**
+ * P2-#13: lazy-mount wrapper around `MarkdownContent`.
+ *
+ * Renders the raw text inside a `<pre>` until the first IntersectionObserver
+ * hit, then upgrades to the full markdown pipeline. One-way upgrade: once
+ * a bubble has been seen we keep the rich renderer mounted so scroll-out
+ * doesn't unmount + remount the syntax-highlighted code blocks.
+ *
+ * Bubbles smaller than the threshold skip the lazy path entirely — the
+ * setup cost of an IO observer + the placeholder swap isn't worth it for
+ * a 100-char ack message.
+ */
+const LAZY_THRESHOLD_BYTES = 1_000;
+
+export function LazyMarkdownContent(props: MarkdownContentProps) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const small = props.content.length < LAZY_THRESHOLD_BYTES;
+  const [visible, setVisible] = useState(small);
+
+  useEffect(() => {
+    if (visible) return;
+    const node = ref.current;
+    if (!node) return;
+    if (typeof IntersectionObserver === "undefined") {
+      // Older browser — just upgrade immediately. CSS content-visibility
+      // already provides the bulk of the win on the chat list.
+      setVisible(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            setVisible(true);
+            observer.disconnect();
+            break;
+          }
+        }
+      },
+      // 200px rootMargin so the upgrade fires just before the bubble
+      // scrolls into view; users almost never see the placeholder.
+      { rootMargin: "200px" }
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [visible]);
+
+  if (visible) {
+    return <MarkdownContent {...props} />;
+  }
+
+  // Placeholder: raw text in a pre block. Reserves a similar vertical
+  // footprint to the rendered markdown so scroll position stays stable
+  // when the upgrade swaps the children.
+  return (
+    <div
+      ref={ref}
+      className={cn("prose-glass text-sm [&_p]:my-2", props.className)}
+    >
+      <pre className="whitespace-pre-wrap break-words text-sm leading-relaxed text-white/80">
+        {props.content}
+      </pre>
+    </div>
+  );
+}

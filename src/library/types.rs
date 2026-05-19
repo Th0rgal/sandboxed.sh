@@ -508,15 +508,6 @@ pub struct ClaudeCodeConfig {
     pub attribution: Option<ClaudeCodeAttribution>,
 }
 
-/// Amp Code configuration stored in the Library.
-/// Controls default mode and settings for Amp backend.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AmpCodeConfig {
-    /// Default mode to use for Amp missions ("smart" or "rush").
-    #[serde(default)]
-    pub default_mode: Option<String>,
-}
-
 /// Codex configuration metadata stored in the Library.
 /// The actual config is TOML (not JSON), stored as raw text in .codex/config.toml.
 /// This struct provides dashboard metadata only.
@@ -553,12 +544,11 @@ pub struct ConfigProfileFile {
 }
 
 /// Full config profile with all harness configurations.
-/// A profile is an instance of configs for OpenCode, Claude Code, Amp, Codex, and Sandboxed.
+/// A profile is an instance of configs for OpenCode, Claude Code, Codex, and Sandboxed.
 ///
 /// Directory structure mirrors actual harness config directories:
 /// - `.opencode/` - OpenCode settings (settings.json, oh-my-opencode.json)
 /// - `.claudecode/` - Claude Code settings (settings.json)
-/// - `.ampcode/` - Amp settings (settings.json)
 /// - `.codex/` - Codex settings (config.toml, TOML format)
 /// - `.sandboxed-sh/` - Sandboxed config (config.json)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -582,9 +572,6 @@ pub struct ConfigProfile {
     /// Claude Code config - legacy, for backward compat
     #[serde(default)]
     pub claudecode_config: ClaudeCodeConfig,
-    /// Amp Code config
-    #[serde(default)]
-    pub ampcode_config: AmpCodeConfig,
     /// Codex config metadata (TOML-based, actual content in files list)
     #[serde(default)]
     pub codex_config: CodexProfileConfig,

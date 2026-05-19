@@ -16,7 +16,7 @@ import {
   type McpStatus,
   type ToolInfo,
 } from "@/lib/api";
-import { ShimmerCard } from "@/components/ui/shimmer";
+import { ShimmerMcpCard } from "@/components/ui/shimmer";
 import { CopyButton } from "@/components/ui/copy-button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
@@ -1021,9 +1021,9 @@ export default function ModulesPage() {
       {/* Content */}
       {loading ? (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <ShimmerCard />
-          <ShimmerCard />
-          <ShimmerCard />
+          <ShimmerMcpCard />
+          <ShimmerMcpCard />
+          <ShimmerMcpCard />
         </div>
       ) : activeTab === "installed" ? (
         filteredMcps.length === 0 ? (

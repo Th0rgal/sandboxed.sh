@@ -1,17 +1,17 @@
 ---
 title: Docker Install
-description: Run Open Agent locally or on a server using Docker Compose
+description: Run sandboxed.sh locally or on a server using Docker Compose
 ---
 
 # Docker Install
 
-Docker is the fastest way to run Open Agent locally or on a server. The Docker image bundles the backend, dashboard, and required CLIs in a single container.
+Docker is the fastest way to run sandboxed.sh locally or on a server. The Docker image bundles the backend, dashboard, and required CLIs in a single container.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/Th0rgal/openagent.git
-cd openagent
+git clone https://github.com/Th0rgal/sandboxed.sh.git
+cd sandboxed.sh
 cp .env.example .env
 # Edit .env — set DASHBOARD_PASSWORD and JWT_SECRET
 docker compose up -d
@@ -38,7 +38,7 @@ To enable isolated container workspaces, uncomment the privileged settings in `d
 
 ```yaml
 services:
-  openagent:
+  sandboxed.sh:
     privileged: true
     cgroup: host
 ```
@@ -53,7 +53,7 @@ docker compose down && docker compose up -d
 
 - The container exposes port **80** internally and maps it to **3000** on the host.
 - Use a reverse proxy (Caddy/Nginx) if you want TLS or a custom domain.
-- Keep `/root/.openagent` and `/root/.claude` on persistent volumes (already in `docker-compose.yml`).
+- Keep `/root/.sandboxed.sh` and `/root/.claude` on persistent volumes (already in `docker-compose.yml`).
 
 ## Dashboard Access
 

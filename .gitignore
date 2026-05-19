@@ -58,7 +58,7 @@ dashboard/package-lock.json
 library-template/
 
 # Local workspace artifacts
-workspaces/
+/workspaces/
 .openagent_context.json
 
 # Local experiments

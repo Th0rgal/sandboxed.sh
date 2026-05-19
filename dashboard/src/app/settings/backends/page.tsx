@@ -12,16 +12,16 @@ import {
   updateSettings,
   BackendProviderResponse,
 } from '@/lib/api';
-import { Server, Save, Loader, Key, Check } from 'lucide-react';
+import { Server, Save, Loader, Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getRuntimeApiBase, writeSavedSettings } from '@/lib/settings';
 import { ServerConnectionCard } from '@/components/server-connection-card';
 import { useBackendConfigs } from '@/lib/use-backend-configs';
 
-const SETTINGS_BACKEND_IDS = ['opencode', 'claudecode', 'amp'] as const;
+const SETTINGS_BACKEND_IDS = ['opencode', 'claudecode', 'grok'] as const;
 
 export default function BackendsPage() {
-  const [activeBackendTab, setActiveBackendTab] = useState<'opencode' | 'claudecode' | 'amp'>('opencode');
+  const [activeBackendTab, setActiveBackendTab] = useState<'opencode' | 'claudecode' | 'grok'>('opencode');
   const [savingBackend, setSavingBackend] = useState(false);
   const [savingMissionLimit, setSavingMissionLimit] = useState(false);
   const [savingTaskLimit, setSavingTaskLimit] = useState(false);
@@ -78,12 +78,9 @@ export default function BackendsPage() {
     api_key_configured: false,
     enabled: true,
   });
-  const [ampForm, setAmpForm] = useState({
+  const [grokForm, setGrokForm] = useState({
     cli_path: '',
-    default_mode: 'smart',
-    permissive: true,
     enabled: true,
-    api_key: '',
   });
 
   // SWR: fetch backends
@@ -92,6 +89,7 @@ export default function BackendsPage() {
     fallbackData: [
       { id: 'opencode', name: 'OpenCode' },
       { id: 'claudecode', name: 'Claude Code' },
+      { id: 'grok', name: 'Grok Build' },
     ],
   });
 
@@ -103,7 +101,7 @@ export default function BackendsPage() {
   );
   const opencodeBackendConfig = backendConfigs.opencode;
   const claudecodeBackendConfig = backendConfigs.claudecode;
-  const ampBackendConfig = backendConfigs.amp;
+  const grokBackendConfig = backendConfigs.grok;
 
   // Fetch Claude Code provider status (Anthropic provider configured for claudecode)
   const { data: claudecodeProvider } = useSWR<BackendProviderResponse>(
@@ -135,16 +133,13 @@ export default function BackendsPage() {
   }, [claudecodeBackendConfig]);
 
   useEffect(() => {
-    if (!ampBackendConfig?.settings) return;
-    const settings = ampBackendConfig.settings as Record<string, unknown>;
-    setAmpForm({
+    if (!grokBackendConfig?.settings) return;
+    const settings = grokBackendConfig.settings as Record<string, unknown>;
+    setGrokForm({
       cli_path: typeof settings.cli_path === 'string' ? settings.cli_path : '',
-      default_mode: typeof settings.default_mode === 'string' ? settings.default_mode : 'smart',
-      permissive: settings.permissive !== false,
-      enabled: ampBackendConfig.enabled,
-      api_key: typeof settings.api_key === 'string' ? settings.api_key : '',
+      enabled: grokBackendConfig.enabled,
     });
-  }, [ampBackendConfig]);
+  }, [grokBackendConfig]);
 
   useEffect(() => {
     const limit = serverSettings?.max_parallel_missions;
@@ -251,24 +246,19 @@ export default function BackendsPage() {
     }
   };
 
-  const handleSaveAmpBackend = async () => {
+  const handleSaveGrokBackend = async () => {
     setSavingBackend(true);
     try {
-      const settings: Record<string, unknown> = {
-        cli_path: ampForm.cli_path || null,
-        default_mode: ampForm.default_mode || 'smart',
-        permissive: ampForm.permissive,
-        api_key: ampForm.api_key || null,
-      };
-
-      const result = await updateBackendConfig('amp', settings, {
-        enabled: ampForm.enabled,
-      });
-      toast.success(result.message || 'Amp settings updated');
+      const result = await updateBackendConfig(
+        'grok',
+        { cli_path: grokForm.cli_path || null },
+        { enabled: grokForm.enabled }
+      );
+      toast.success(result.message || 'Grok Build settings updated');
       refreshBackendConfigs();
     } catch (err) {
       toast.error(
-        `Failed to update Amp settings: ${
+        `Failed to update Grok Build settings: ${
           err instanceof Error ? err.message : 'Unknown error'
         }`
       );
@@ -397,7 +387,7 @@ export default function BackendsPage() {
                 key={backend.id}
                 onClick={() =>
                   setActiveBackendTab(
-                    backend.id as 'opencode' | 'claudecode' | 'amp'
+                    backend.id as 'opencode' | 'claudecode' | 'grok'
                   )
                 }
                 className={cn(
@@ -494,9 +484,9 @@ export default function BackendsPage() {
                   <span className="text-base">🧠</span>
                   <span className="text-sm text-white/70">
                     {claudecodeProvider?.configured
-                      ? claudecodeProvider.oauth
+                      ? claudecodeProvider.auth_method === 'oauth'
                         ? 'OAuth'
-                        : claudecodeProvider.api_key
+                        : claudecodeProvider.auth_method === 'api_key'
                         ? 'API Key'
                         : 'Anthropic'
                       : 'Anthropic'}
@@ -546,90 +536,49 @@ export default function BackendsPage() {
                 </button>
               </div>
             </div>
-          ) : activeBackendTab === 'amp' ? (
+          ) : activeBackendTab === 'grok' ? (
             <div className="space-y-3">
               <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
                 <input
                   type="checkbox"
-                  checked={ampForm.enabled}
+                  checked={grokForm.enabled}
                   onChange={(e) =>
-                    setAmpForm((prev) => ({ ...prev, enabled: e.target.checked }))
+                    setGrokForm((prev) => ({ ...prev, enabled: e.target.checked }))
                   }
                   className="rounded border-white/20 cursor-pointer"
                 />
                 Enabled
               </label>
-              {/* Amp API Key */}
-              <div>
-                <label className="block text-xs text-white/60 mb-1.5">
-                  <span className="flex items-center gap-1.5">
-                    <Key className="h-3.5 w-3.5" />
-                    Amp API Key
-                  </span>
-                </label>
-                <input
-                  type="password"
-                  value={ampForm.api_key || ''}
-                  onChange={(e) =>
-                    setAmpForm((prev) => ({ ...prev, api_key: e.target.value }))
-                  }
-                  placeholder="Enter your Amp API key from ampcode.com"
-                  className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-indigo-500/50"
-                />
-                <p className="mt-1.5 text-xs text-white/30">
-                  Get your API key from{' '}
-                  <a
-                    href="https://ampcode.com/settings/tokens"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-indigo-400 hover:text-indigo-300"
-                  >
-                    ampcode.com/settings/tokens
-                  </a>
-                </p>
+              <div className="flex items-center justify-between py-2 px-3 rounded-lg border border-white/[0.06] bg-white/[0.02]">
+                <div className="flex items-center gap-2">
+                  <span className="text-base">𝕏</span>
+                  <span className="text-sm text-white/70">xAI provider or X login</span>
+                </div>
+                <a
+                  href="/settings/providers"
+                  className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+                >
+                  Configure provider →
+                </a>
               </div>
               <div>
                 <label className="block text-xs text-white/60 mb-1.5">CLI Path</label>
                 <input
                   type="text"
-                  value={ampForm.cli_path || ''}
+                  value={grokForm.cli_path || ''}
                   onChange={(e) =>
-                    setAmpForm((prev) => ({ ...prev, cli_path: e.target.value }))
+                    setGrokForm((prev) => ({ ...prev, cli_path: e.target.value }))
                   }
-                  placeholder="amp (uses PATH) or /path/to/amp"
+                  placeholder="grok (uses PATH) or /path/to/grok"
                   className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
                 />
                 <p className="mt-1.5 text-xs text-white/30">
-                  Path to the Amp CLI executable. Leave blank to use default from PATH.
+                  Grok opens a browser for X authentication on first launch. In headless environments, configure an xAI provider for Grok Build.
                 </p>
               </div>
-              <div>
-                <label className="block text-xs text-white/60 mb-1.5">Default Mode</label>
-                <select
-                  value={ampForm.default_mode}
-                  onChange={(e) =>
-                    setAmpForm((prev) => ({ ...prev, default_mode: e.target.value }))
-                  }
-                  className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
-                >
-                  <option value="smart">Smart Mode (full capability)</option>
-                  <option value="rush">Rush Mode (faster, cheaper)</option>
-                </select>
-              </div>
-              <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={ampForm.permissive}
-                  onChange={(e) =>
-                    setAmpForm((prev) => ({ ...prev, permissive: e.target.checked }))
-                  }
-                  className="rounded border-white/20 cursor-pointer"
-                />
-                Permissive mode (--dangerously-allow-all)
-              </label>
               <div className="flex items-center gap-2 pt-1">
                 <button
-                  onClick={handleSaveAmpBackend}
+                  onClick={handleSaveGrokBackend}
                   disabled={savingBackend}
                   className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
                 >
@@ -638,7 +587,7 @@ export default function BackendsPage() {
                   ) : (
                     <Save className="h-3.5 w-3.5" />
                   )}
-                  Save Amp
+                  Save Grok Build
                 </button>
               </div>
             </div>

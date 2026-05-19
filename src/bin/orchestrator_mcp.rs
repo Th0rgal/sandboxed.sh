@@ -7,6 +7,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 use std::sync::Arc;
 
+use tokio::sync::OnceCell;
+
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header};
 use sandboxed_sh::ai_providers::ProviderType;
@@ -102,7 +104,7 @@ struct CreateWorkerParams {
     title: String,
     #[serde(default)]
     agent: Option<String>,
-    /// Backend to use: "claudecode", "codex", "gemini", "opencode", "amp"
+    /// Backend to use: "claudecode", "codex", "gemini", "opencode"
     #[serde(default)]
     backend: Option<String>,
     #[serde(default)]
@@ -113,6 +115,12 @@ struct CreateWorkerParams {
     config_profile: Option<String>,
     #[serde(default)]
     working_directory: Option<String>,
+    /// Workspace to spawn the worker in. If omitted, the worker inherits the
+    /// boss mission's workspace so it sees the same container, mounts, and
+    /// installed tooling. Pass `"00000000-0000-0000-0000-000000000000"` to
+    /// explicitly target the host workspace.
+    #[serde(default)]
+    workspace_id: Option<String>,
     /// Initial prompt to send to the worker after creation.
     #[serde(default)]
     prompt: Option<String>,
@@ -248,6 +256,9 @@ struct OrchestratorMcp {
     api_url: String,
     api_token: Option<String>,
     client: reqwest::Client,
+    // Cached lookup of the boss mission's workspace_id, so workers default to the
+    // same workspace instead of silently falling back to the host (Uuid::nil).
+    boss_workspace_id: OnceCell<Option<String>>,
 }
 
 impl OrchestratorMcp {
@@ -257,7 +268,31 @@ impl OrchestratorMcp {
             api_url,
             api_token,
             client: reqwest::Client::new(),
+            boss_workspace_id: OnceCell::new(),
         }
+    }
+
+    /// Returns the workspace_id of the boss mission, or `None` if the lookup
+    /// fails (e.g. legacy mission without workspace_id). Caches the result for
+    /// the lifetime of the MCP process so we don't re-query on every worker.
+    async fn boss_workspace_id(&self) -> Option<String> {
+        self.boss_workspace_id
+            .get_or_init(|| async {
+                let response = self
+                    .api_get(&format!("/api/control/missions/{}", self.mission_id))
+                    .await
+                    .ok()?;
+                if !response.status().is_success() {
+                    return None;
+                }
+                let mission: Value = response.json().await.ok()?;
+                mission
+                    .get("workspace_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .await
+            .clone()
     }
 
     fn auth_header(&self) -> Option<(String, String)> {
@@ -284,7 +319,7 @@ impl OrchestratorMcp {
                     "properties": {
                         "backend": {
                             "type": "string",
-                            "enum": ["claudecode", "codex", "gemini", "opencode", "amp"],
+                            "enum": ["claudecode", "codex", "gemini", "opencode", "grok"],
                             "description": "Optional single backend to inspect. If omitted, returns all common backends."
                         }
                     }
@@ -292,7 +327,7 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "create_worker_mission".to_string(),
-                description: "Create a new worker mission (child of the current boss mission). The worker will start executing immediately. IMPORTANT: You must set the 'backend' field to match the harness you want (claudecode, codex, gemini, opencode). If omitted, defaults to the workspace default (usually claudecode).".to_string(),
+                description: "Create a new worker mission (child of the current boss mission). The worker will start executing immediately and runs in the same workspace as the boss by default, so it sees the boss's container, mounts, and installed tooling. IMPORTANT: You must set the 'backend' field to match the harness you want (claudecode, codex, gemini, grok, opencode). If omitted, defaults to the workspace default (usually claudecode).".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -303,12 +338,12 @@ impl OrchestratorMcp {
                         },
                         "backend": {
                             "type": "string",
-                            "enum": ["claudecode", "codex", "gemini", "opencode", "amp"],
-                            "description": "Backend/harness to use. MUST match the model: claudecode for Claude models, codex for OpenAI/GPT models, gemini for Gemini models, opencode for any model via provider routing, amp for Amp."
+                            "enum": ["claudecode", "codex", "gemini", "opencode", "grok"],
+                            "description": "Backend/harness to use. MUST match the model: claudecode for Claude models, codex for OpenAI/GPT models, gemini for Gemini models, grok for Grok models, opencode for any model via provider routing."
                         },
                         "model_override": {
                             "type": "string",
-                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.5') for codex, Gemini models for gemini, 'provider/model' format for opencode."
+                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.5') for codex, Gemini models for gemini, Grok models for grok, 'provider/model' format for opencode."
                         },
                         "model_effort": {
                             "type": "string",
@@ -326,6 +361,10 @@ impl OrchestratorMcp {
                         "working_directory": {
                             "type": "string",
                             "description": "Working directory for the worker (e.g. a git worktree path). If omitted, uses the boss mission's repo directory."
+                        },
+                        "workspace_id": {
+                            "type": "string",
+                            "description": "Workspace UUID to spawn the worker in. Defaults to the boss's workspace so the worker inherits the same container, mounts, and installed tooling. Pass the nil UUID to force the host workspace."
                         },
                         "prompt": {
                             "type": "string",
@@ -349,12 +388,13 @@ impl OrchestratorMcp {
                                 "required": ["title", "prompt"],
                                 "properties": {
                                     "title": { "type": "string" },
-                                    "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "amp"] },
+                                    "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "grok"] },
                                     "model_override": { "type": "string" },
                                     "model_effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
                                     "agent": { "type": "string" },
                                     "config_profile": { "type": "string" },
                                     "working_directory": { "type": "string" },
+                                    "workspace_id": { "type": "string" },
                                     "prompt": { "type": "string" }
                                 }
                             }
@@ -593,6 +633,16 @@ impl OrchestratorMcp {
             validate_working_directory_visible_to_worker(wd)?;
         }
 
+        // If the caller didn't specify a workspace, inherit the boss's so the
+        // worker runs in the same container the boss is in. Falling back to the
+        // host workspace (Uuid::nil) was surprising: the boss's installed
+        // tooling/symlinks aren't visible there, and a stale host environment
+        // could leave the worker unable to spawn its CLI.
+        let workspace_id = match params.workspace_id {
+            Some(ref id) if !id.trim().is_empty() => Some(id.trim().to_string()),
+            _ => self.boss_workspace_id().await,
+        };
+
         let body = json!({
             "title": params.title,
             "agent": params.agent,
@@ -602,6 +652,7 @@ impl OrchestratorMcp {
             "config_profile": params.config_profile,
             "parent_mission_id": self.mission_id.to_string(),
             "working_directory": params.working_directory,
+            "workspace_id": workspace_id,
         });
 
         let response = self.api_post("/api/control/missions", body).await?;
@@ -818,6 +869,7 @@ impl OrchestratorMcp {
                     "codex".to_string(),
                     "gemini".to_string(),
                     "opencode".to_string(),
+                    "grok".to_string(),
                 ]
             });
 
@@ -883,10 +935,13 @@ impl OrchestratorMcp {
                     "ready": true,
                     "reason": "OpenCode routes through configured providers; inspect provider selection separately.",
                 }),
-                "amp" => json!({
-                    "backend": "amp",
+                "grok" => json!({
+                    "backend": "grok",
                     "ready": true,
-                    "reason": "Amp auth is handled by AMP_API_KEY or provider store, not this tool.",
+                    "provider": "xAI",
+                    "provider_targeted": provider_targets_backend(&workspace_root, ProviderType::Xai, "grok"),
+                    "reason": "Grok Build can use a targeted xAI provider API key or the CLI's own X login cache.",
+                    "default_backends": default_backends_for_provider(ProviderType::Xai),
                 }),
                 other => json!({
                     "backend": other,

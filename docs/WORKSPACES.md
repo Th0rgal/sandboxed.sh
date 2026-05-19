@@ -41,7 +41,7 @@ When you create a workspace from a template, Sandboxed.sh:
 1. Creates a minimal root filesystem using `debootstrap` (Debian/Ubuntu) or
    `pacstrap` (Arch).
 2. Runs the init script inside the container.
-3. Bootstraps agent harnesses (Claude Code, OpenCode, Amp CLIs).
+3. Bootstraps agent harnesses (Claude Code, OpenCode, Grok, and related CLIs).
 4. Marks the workspace as `ready`.
 
 Rebuilding a workspace destroys the container and re-runs the full process.
@@ -56,8 +56,8 @@ Each mission targets a specific workspace. When a mission starts, Sandboxed.sh:
    directory).
 2. Syncs skills, tools, and MCP server configs from the Library into the
    workspace.
-3. Launches the chosen AI harness (Claude Code, OpenCode, or Amp) inside the
-   workspace.
+3. Launches the chosen AI harness (Claude Code, OpenCode, Codex, Gemini, or
+   Grok) inside the workspace.
 
 The harness runs natively in the workspace context --- shell commands, file
 operations, and git all execute inside the container (for container workspaces)

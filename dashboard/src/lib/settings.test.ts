@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   readSavedSettings,
   writeSavedSettings,
   getRuntimeApiBase,
   inferHostedApiBase,
+  inferLocalApiBase,
 } from "./settings";
 
 describe("readSavedSettings", () => {
@@ -68,16 +69,27 @@ describe("getRuntimeApiBase", () => {
     expect(getRuntimeApiBase()).toBe("http://custom:9999");
   });
 
+  it("does not preserve a saved local frontend origin as the API URL", () => {
+    localStorage.setItem(
+      "settings",
+      JSON.stringify({ apiUrl: window.location.origin })
+    );
+    expect(getRuntimeApiBase()).toBe("http://localhost:3000");
+  });
+
   it("returns env var when no saved setting", () => {
     process.env.NEXT_PUBLIC_API_URL = "http://env-host:8080";
     expect(getRuntimeApiBase()).toBe("http://env-host:8080");
   });
 
-  it("falls back to window.location.origin when no saved setting or env var", () => {
-    // The key behavior: uses window.location.origin instead of hardcoding :3000.
-    // In jsdom the origin is 'http://localhost' by default.
-    const result = getRuntimeApiBase();
-    expect(result).toBe(window.location.origin);
+  it("maps a local browser origin to the default backend port", () => {
+    window.history.replaceState({}, "", "/control");
+    expect(getRuntimeApiBase()).toBe("http://localhost:3000");
+  });
+
+  it("keeps same-origin when the local page already runs on the backend port", () => {
+    window.history.replaceState({}, "", "http://localhost:3000/control");
+    expect(getRuntimeApiBase()).toBe("http://localhost:3000");
   });
 
   it("strips trailing slash from returned URL", () => {
@@ -96,5 +108,17 @@ describe("inferHostedApiBase", () => {
 
   it("returns null for unknown hosts", () => {
     expect(inferHostedApiBase("example.com")).toBeNull();
+  });
+});
+
+describe("inferLocalApiBase", () => {
+  it("maps localhost frontend ports to :3000", () => {
+    expect(inferLocalApiBase(new URL("http://localhost:3001/control") as unknown as Location)).toBe(
+      "http://localhost:3000"
+    );
+  });
+
+  it("does not override non-local hosts", () => {
+    expect(inferLocalApiBase(new URL("https://example.com/control") as unknown as Location)).toBeNull();
   });
 });

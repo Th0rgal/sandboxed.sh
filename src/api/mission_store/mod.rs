@@ -97,6 +97,12 @@ pub struct Mission {
     /// stays current.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal_objective: Option<String>,
+    /// When the user first opened this mission *since it last entered
+    /// AwaitingUser*. Drives the 1-hour ack grace timer and the "opened"
+    /// dot on Finished missions. Cleared when the mission goes back to
+    /// Active via a new user message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_viewed_at: Option<String>,
 }
 
 fn default_backend() -> String {
@@ -129,6 +135,44 @@ pub struct StoredEvent {
     pub metadata: serde_json::Value,
 }
 
+/// Aggregated AI token/cost usage for a single (normalized) model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUsageStats {
+    /// Canonical model identifier (e.g. "claude-3-5-sonnet", "gpt-4o").
+    /// Empty string when the model was not recorded for an event.
+    pub model: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
+/// Aggregated AI usage for one UTC day.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyUsageStats {
+    /// ISO-8601 day (YYYY-MM-DD, UTC) derived from the event timestamp.
+    pub day: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
+/// Aggregated AI usage for one UTC hour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HourlyUsageStats {
+    /// `YYYY-MM-DDTHH` (UTC), e.g. "2026-05-19T08".
+    pub hour: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Automation Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -143,6 +187,19 @@ pub enum CommandSource {
     LocalFile { path: String },
     /// Inline command content
     Inline { content: String },
+    /// Harness-native loop (e.g. claudecode `/goal`, codex `/goal`). OA does
+    /// not drive iteration here — the harness CLI runs its own continuation
+    /// loop and we record each iteration as an `AutomationExecution`. See
+    /// `crate::backend::native_loops` for the per-harness adapters.
+    NativeLoop {
+        /// Backend id: `"claudecode"`, `"codex"`, `"opencode"`, …
+        harness: String,
+        /// Slash command, without the leading `/`. Today: `"goal"`.
+        command: String,
+        /// Free-form per-command args. For `goal`: `{ "objective": "..." }`.
+        #[serde(default)]
+        args: serde_json::Value,
+    },
 }
 
 /// Webhook configuration for webhook-triggered automations.
@@ -265,6 +322,20 @@ impl Default for RetryConfig {
     }
 }
 
+/// Who actually drives iteration for an automation.
+///
+/// `Scheduler` is the historical behavior — OA fires the command on a
+/// `TriggerType`. `HarnessLoop` means the harness CLI runs its own
+/// continuation loop (claudecode/codex `/goal`); OA records iterations
+/// but doesn't decide when they fire.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationDriver {
+    #[default]
+    Scheduler,
+    HarnessLoop,
+}
+
 /// An automation that triggers commands based on various triggers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Automation {
@@ -298,6 +369,10 @@ pub struct Automation {
     /// This is tracked internally and not persisted directly.
     #[serde(default, skip_serializing)]
     pub consecutive_failures: u32,
+    /// What drives iteration for this automation. Existing rows default to
+    /// `Scheduler` (OA-driven) so the field is back-compatible.
+    #[serde(default)]
+    pub driver: AutomationDriver,
 }
 
 /// Execution status for automation runs.
@@ -866,7 +941,7 @@ pub trait MissionStore: Send + Sync {
         metadata_version: Option<Option<&str>>,
     ) -> Result<(), String>;
 
-    /// Update mission session ID (for backends like Amp that generate their own IDs).
+    /// Update mission session ID (for backends that generate their own IDs).
     async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String>;
 
     /// Update cached goal-mode metadata for missions started with `/goal`.
@@ -903,6 +978,26 @@ pub trait MissionStore: Send + Sync {
 
     /// Get all missions currently in active status (for startup recovery).
     async fn get_all_active_missions(&self) -> Result<Vec<Mission>, String>;
+
+    /// Record the first time the user opened this mission, if not already set.
+    /// Returns `Some(timestamp)` if the field was set by this call, or `None`
+    /// if it was already populated (no-op). Used by the new
+    /// `POST /missions/:id/opened` endpoint to start the AwaitingUser ack
+    /// grace timer.
+    async fn set_mission_first_viewed_at_if_unset(
+        &self,
+        id: Uuid,
+        timestamp: &str,
+    ) -> Result<Option<String>, String>;
+
+    /// Atomically flip any AwaitingUser mission whose `first_viewed_at` is
+    /// older than `grace_seconds` to `Acknowledged`. Returns the IDs that
+    /// were promoted so the caller can broadcast `MissionStatusChanged`
+    /// events for them.
+    async fn acknowledge_stale_awaiting_user_missions(
+        &self,
+        grace_seconds: u64,
+    ) -> Result<Vec<Uuid>, String>;
 
     /// Get recently interrupted missions that were stopped by server shutdown.
     async fn get_recent_server_shutdown_mission_ids(
@@ -1025,6 +1120,30 @@ pub trait MissionStore: Send + Sync {
     /// Get cost in cents grouped by source, for events on or after `since` (ISO-8601).
     async fn get_cost_by_source_since(&self, _since: &str) -> Result<(u64, u64, u64), String> {
         Ok((0, 0, 0))
+    }
+
+    /// Aggregate AI usage per (normalized) model across all assistant_message events.
+    /// Returns per-model totals (requests, tokens, cost). Time-window optional.
+    async fn get_usage_by_model(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<ModelUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate AI usage per UTC day. Days with no usage are omitted; the
+    /// caller is responsible for filling gaps if a contiguous series is needed.
+    async fn get_usage_by_day(&self, _since: Option<&str>) -> Result<Vec<DailyUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate AI usage per UTC hour. Buckets with no usage are omitted.
+    /// Returned timestamps are in `YYYY-MM-DDTHH` form (no minutes/seconds).
+    async fn get_usage_by_hour(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<HourlyUsageStats>, String> {
+        Ok(Vec::new())
     }
 
     // === Automation methods (default no-op for backward compatibility) ===

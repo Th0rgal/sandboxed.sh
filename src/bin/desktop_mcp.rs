@@ -1,6 +1,6 @@
 //! MCP Server for Desktop Tools
 //!
-//! This binary exposes the Open Agent desktop tools (i3, Xvfb, screenshots, etc.)
+//! This binary exposes the sandboxed.sh desktop tools (i3, Xvfb, screenshots, etc.)
 //! as an MCP server that can be used with OpenCode or other MCP-compatible clients.
 //!
 //! Communicates over stdio using JSON-RPC 2.0.

@@ -34,6 +34,10 @@ interface StatusBreakdown {
   color: string;
 }
 
+function MetricSkeleton({ className }: { className?: string }) {
+  return <div className={`animate-pulse rounded bg-white/[0.06] ${className ?? ""}`} />;
+}
+
 export default function AnalyticsPage() {
   const [missions, setMissions] = useState<Mission[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
@@ -170,17 +174,6 @@ export default function AnalyticsPage() {
     return costByDay.reduce((sum, d) => sum + d.cost, 0);
   }, [costByDay]);
 
-  if (loading) {
-    return (
-      <div className="flex h-screen items-center justify-center">
-        <div className="flex items-center gap-3">
-          <div className="h-5 w-5 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
-          <span className="text-white/60">Loading analytics...</span>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="min-h-screen p-6">
       {/* Header */}
@@ -227,10 +220,10 @@ export default function AnalyticsPage() {
             <span className="text-xs text-white/50">Total Spent</span>
           </div>
           <div className="text-2xl font-semibold text-white">
-            {formatCents(missionStats.totalCost)}
+            {loading ? <MetricSkeleton className="h-8 w-28" /> : formatCents(missionStats.totalCost)}
           </div>
           <div className="text-xs text-white/40 mt-1">
-            {formatCents(periodTotalCost)} in selected period
+            {loading ? <MetricSkeleton className="h-3 w-36" /> : `${formatCents(periodTotalCost)} in selected period`}
           </div>
           {/* Cost source breakdown */}
           {(actualCostCents > 0 || estimatedCostCents > 0 || unknownCostCents > 0) && (
@@ -263,10 +256,10 @@ export default function AnalyticsPage() {
             <span className="text-xs text-white/50">Total Missions</span>
           </div>
           <div className="text-2xl font-semibold text-white">
-            {missions.length}
+            {loading ? <MetricSkeleton className="h-8 w-12" /> : missions.length}
           </div>
           <div className="text-xs text-white/40 mt-1">
-            {runs.length} runs total
+            {loading ? <MetricSkeleton className="h-3 w-20" /> : `${runs.length} runs total`}
           </div>
         </div>
 
@@ -276,7 +269,7 @@ export default function AnalyticsPage() {
             <span className="text-xs text-white/50">Avg Cost/Mission</span>
           </div>
           <div className="text-2xl font-semibold text-white">
-            {formatCents(Math.round(avgCostPerMission))}
+            {loading ? <MetricSkeleton className="h-8 w-24" /> : formatCents(Math.round(avgCostPerMission))}
           </div>
           <div className="text-xs text-white/40 mt-1">
             per completed run
@@ -289,10 +282,10 @@ export default function AnalyticsPage() {
             <span className="text-xs text-white/50">Mission Success Rate</span>
           </div>
           <div className="text-2xl font-semibold text-white">
-            {(missionStats.successRate * 100).toFixed(0)}%
+            {loading ? <MetricSkeleton className="h-8 w-16" /> : `${(missionStats.successRate * 100).toFixed(0)}%`}
           </div>
           <div className="text-xs text-white/40 mt-1">
-            {missionStats.completed} missions completed, {missionStats.failed} failed
+            {loading ? <MetricSkeleton className="h-3 w-40" /> : `${missionStats.completed} missions completed, ${missionStats.failed} failed`}
           </div>
         </div>
       </div>
@@ -309,38 +302,50 @@ export default function AnalyticsPage() {
           </div>
 
           {/* Simple bar chart */}
-          <div className="h-48 flex items-end gap-1">
-            {costByDay.slice(-14).map((day) => {
-              const height = maxDayCost > 0 ? (day.cost / maxDayCost) * 100 : 0;
-              const date = new Date(day.date);
-              const isWeekend = date.getDay() === 0 || date.getDay() === 6;
-
-              return (
+          {loading ? (
+            <div className="h-48 flex items-end gap-1 animate-pulse">
+              {Array.from({ length: 14 }).map((_, idx) => (
                 <div
-                  key={day.date}
-                  className="flex-1 flex flex-col items-center gap-1"
-                >
-                  <div className="relative w-full flex flex-col items-center">
-                    {day.cost > 0 && (
-                      <span className="text-[9px] text-white/40 mb-1">
-                        {formatCents(day.cost)}
-                      </span>
-                    )}
-                    <div
-                      className={`w-full rounded-t transition-all ${
-                        isWeekend ? "bg-indigo-500/30" : "bg-indigo-500/50"
-                      } hover:bg-indigo-500/70`}
-                      style={{ height: `${Math.max(height, 2)}%` }}
-                      title={`${day.date}: ${formatCents(day.cost)} (${day.missions} missions)`}
-                    />
+                  key={idx}
+                  className="flex-1 rounded-t bg-white/[0.06]"
+                  style={{ height: `${25 + (idx % 5) * 12}%` }}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="h-48 flex items-end gap-1">
+              {costByDay.slice(-14).map((day) => {
+                const height = maxDayCost > 0 ? (day.cost / maxDayCost) * 100 : 0;
+                const date = new Date(day.date);
+                const isWeekend = date.getDay() === 0 || date.getDay() === 6;
+
+                return (
+                  <div
+                    key={day.date}
+                    className="flex-1 flex flex-col items-center gap-1"
+                  >
+                    <div className="relative w-full flex flex-col items-center">
+                      {day.cost > 0 && (
+                        <span className="text-[9px] text-white/40 mb-1">
+                          {formatCents(day.cost)}
+                        </span>
+                      )}
+                      <div
+                        className={`w-full rounded-t transition-all ${
+                          isWeekend ? "bg-indigo-500/30" : "bg-indigo-500/50"
+                        } hover:bg-indigo-500/70`}
+                        style={{ height: `${Math.max(height, 2)}%` }}
+                        title={`${day.date}: ${formatCents(day.cost)} (${day.missions} missions)`}
+                      />
+                    </div>
+                    <span className="text-[9px] text-white/30">
+                      {date.getDate()}
+                    </span>
                   </div>
-                  <span className="text-[9px] text-white/30">
-                    {date.getDate()}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* Status Breakdown */}
@@ -351,7 +356,17 @@ export default function AnalyticsPage() {
           </h2>
 
           <div className="space-y-3">
-            {statusBreakdown.length > 0 ? (
+            {loading ? (
+              Array.from({ length: 5 }).map((_, idx) => (
+                <div key={idx} className="animate-pulse">
+                  <div className="mb-1 flex items-center justify-between">
+                    <MetricSkeleton className="h-3 w-20" />
+                    <MetricSkeleton className="h-3 w-12" />
+                  </div>
+                  <MetricSkeleton className="h-2 w-full" />
+                </div>
+              ))
+            ) : statusBreakdown.length > 0 ? (
               statusBreakdown.map((item) => {
                 const percentage = (item.count / missions.length) * 100;
                 return (

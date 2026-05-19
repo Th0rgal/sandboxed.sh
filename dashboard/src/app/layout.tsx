@@ -7,6 +7,7 @@ import { LibraryProvider } from "@/contexts/library-context";
 import { MissionSwitcherProvider } from "@/contexts/mission-switcher-context";
 import { ToastProvider } from "@/components/toast";
 import { DevFetchThrottleInstaller } from "@/components/dev-fetch-throttle-installer";
+import { BackendPreconnect } from "@/components/backend-preconnect";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -36,6 +37,7 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
+        <BackendPreconnect />
         <DevFetchThrottleInstaller />
         <AuthGate>
           <ToastProvider>

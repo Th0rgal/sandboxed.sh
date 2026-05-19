@@ -6,7 +6,6 @@ import useSWR from "swr";
 import { toast } from "@/components/toast";
 import { cn } from "@/lib/utils";
 import { listMissions, getMissionTree, deleteMission, cleanupEmptyMissions, Mission } from "@/lib/api";
-import { ShimmerTableRow } from "@/components/ui/shimmer";
 import { CopyButton } from "@/components/ui/copy-button";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { AgentTreeCanvas, type AgentNode } from "@/components/agent-tree";
@@ -41,6 +40,41 @@ const statusConfig: Record<string, { color: string; bg: string }> = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+// Cell shapes mirror the real missions table:
+// 1) status pill (icon + label)  2) icon + truncated title
+// 3) short numeric count          4) short relative-time text
+// 5) action button cluster
+function HistoryTableRowSkeleton() {
+  return (
+    <tr className="animate-pulse">
+      <td className="px-4 py-3">
+        <div className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 bg-white/[0.04]">
+          <div className="h-3 w-3 rounded-sm bg-white/[0.08]" />
+          <div className="h-3 w-14 rounded bg-white/[0.08]" />
+        </div>
+      </td>
+      <td className="px-4 py-3">
+        <div className="flex items-center gap-2">
+          <div className="h-4 w-4 rounded bg-indigo-500/20 shrink-0" />
+          <div className="h-4 w-64 max-w-md rounded bg-white/[0.06]" />
+        </div>
+      </td>
+      <td className="px-4 py-3">
+        <div className="h-4 w-8 rounded bg-white/[0.06]" />
+      </td>
+      <td className="px-4 py-3">
+        <div className="h-3 w-20 rounded bg-white/[0.04]" />
+      </td>
+      <td className="px-4 py-3">
+        <div className="flex items-center gap-2">
+          <div className="h-4 w-16 rounded bg-indigo-500/20" />
+          <div className="h-4 w-4 rounded bg-white/[0.04]" />
+        </div>
+      </td>
+    </tr>
+  );
 }
 
 type SortField = 'date' | 'status' | 'messages';
@@ -347,9 +381,9 @@ export default function HistoryPage() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/[0.04]">
-                      <ShimmerTableRow columns={5} />
-                      <ShimmerTableRow columns={5} />
-                      <ShimmerTableRow columns={5} />
+                      <HistoryTableRowSkeleton />
+                      <HistoryTableRowSkeleton />
+                      <HistoryTableRowSkeleton />
                     </tbody>
                   </table>
                 </div>

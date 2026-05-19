@@ -104,7 +104,6 @@ pub enum ProviderType {
     GithubCopilot,
     Zai,
     Minimax,
-    Amp,
     Custom,
 }
 
@@ -128,7 +127,6 @@ impl ProviderType {
             Self::GithubCopilot => "GitHub Copilot",
             Self::Zai => "Z.AI",
             Self::Minimax => "Minimax",
-            Self::Amp => "Amp",
             Self::Custom => "Custom",
         }
     }
@@ -152,7 +150,6 @@ impl ProviderType {
             Self::GithubCopilot => "github-copilot",
             Self::Zai => "zai",
             Self::Minimax => "minimax",
-            Self::Amp => "amp",
             Self::Custom => "custom",
         }
     }
@@ -177,7 +174,6 @@ impl ProviderType {
             "github-copilot" => Some(Self::GithubCopilot),
             "zai" => Some(Self::Zai),
             "minimax" => Some(Self::Minimax),
-            "amp" => Some(Self::Amp),
             "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -202,7 +198,6 @@ impl ProviderType {
             Self::GithubCopilot => None, // Uses OAuth
             Self::Zai => Some("ZHIPU_API_KEY"),
             Self::Minimax => Some("MINIMAX_API_KEY"),
-            Self::Amp => Some("AMP_API_KEY"),
             Self::Custom => None,
         }
     }
@@ -211,7 +206,7 @@ impl ProviderType {
     pub fn uses_oauth(&self) -> bool {
         matches!(
             self,
-            Self::Anthropic | Self::GithubCopilot | Self::OpenAI | Self::Google
+            Self::Anthropic | Self::GithubCopilot | Self::OpenAI | Self::Google | Self::Xai
         )
     }
 
@@ -271,6 +266,21 @@ impl ProviderType {
                     label: "Manually enter API Key".to_string(),
                     method_type: AuthMethodType::Api,
                     description: Some("Enter an existing Google AI API key".to_string()),
+                },
+            ],
+            Self::Xai => vec![
+                AuthMethod {
+                    label: "Grok Build OAuth".to_string(),
+                    method_type: AuthMethodType::Oauth,
+                    description: Some(
+                        "Use your grok.com account through Grok Build device authorization"
+                            .to_string(),
+                    ),
+                },
+                AuthMethod {
+                    label: "Manually enter API Key".to_string(),
+                    method_type: AuthMethodType::Api,
+                    description: Some("Enter an existing xAI API key".to_string()),
                 },
             ],
             _ => vec![AuthMethod {

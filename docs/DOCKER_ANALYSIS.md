@@ -22,7 +22,7 @@ A single `docker compose up` can serve both backend and dashboard.
 
 | Component | Technology | Build | Runtime Dependencies |
 |-----------|-----------|-------|---------------------|
-| **Backend** (`sandboxed_sh`) | Rust (Tokio + Axum) | `cargo build` | git, curl, npm/bun (for harness auto-install) |
+| **Backend** (`sandboxed-sh`) | Rust (Tokio + Axum) | `cargo build` | git, curl, npm/bun (for harness auto-install) |
 | **Dashboard** | Next.js 16 + React 19 | `bun build` / `next build` | Node/Bun runtime |
 | **desktop-mcp** | Rust binary | `cargo build` | Xvfb, i3, xdotool, scrot, tesseract |
 | **workspace-mcp** | Rust binary | `cargo build` | (none beyond backend) |
@@ -37,7 +37,7 @@ A single `docker compose up` can serve both backend and dashboard.
 **Image 1: `sandboxed.sh/backend`** (Rust backend + MCP binaries)
 
 Multi-stage build:
-1. **Builder stage** (`rust:1.75-bookworm`): compile `sandboxed_sh`,
+1. **Builder stage** (`rust:1.75-bookworm`): compile `sandboxed-sh`,
    `desktop-mcp`, `workspace-mcp`
 2. **Runtime stage** (`debian:bookworm-slim`): minimal runtime with git, curl,
    npm/bun, and the compiled binaries
@@ -201,7 +201,7 @@ makes host-mode the default without requiring code changes.
 | Git library sync | Yes | git available in container |
 | Claude Code CLI | Yes | npm-installable inside container |
 | OpenCode CLI | Yes | Binary available for linux/amd64 |
-| Amp CLI | Yes | npm-installable inside container |
+| Grok CLI | Yes | Installer available inside container |
 | OAuth flows | Yes | HTTP-only, no OS deps |
 
 ### 4.2 What Works with `--privileged` on macOS
@@ -351,7 +351,7 @@ need the SSH key injected. Options:
 
 ### 8.3 Harness Auto-Install
 
-On first mission, Sandboxed.sh auto-installs Claude Code / OpenCode / Amp CLIs
+On first mission, Sandboxed.sh auto-installs Claude Code / OpenCode / Grok CLIs
 via npm or curl. This requires internet access from the container. For air-gapped
 environments, pre-install these in the Docker image.
 
@@ -388,7 +388,7 @@ WORKDIR /build
 COPY --from=cook /build/target target
 COPY --from=cook /usr/local/cargo /usr/local/cargo
 COPY . .
-RUN cargo build --release --bin sandboxed_sh --bin desktop-mcp --bin workspace-mcp
+RUN cargo build --release --bin sandboxed-sh --bin desktop-mcp --bin workspace-mcp
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -406,7 +406,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=compile /build/target/release/sandboxed_sh /usr/local/bin/
+COPY --from=compile /build/target/release/sandboxed-sh /usr/local/bin/
 COPY --from=compile /build/target/release/desktop-mcp /usr/local/bin/
 COPY --from=compile /build/target/release/workspace-mcp /usr/local/bin/
 
@@ -419,7 +419,7 @@ ENV WORKING_DIR=/root
 EXPOSE 3000
 VOLUME ["/root/.sandboxed-sh"]
 
-CMD ["sandboxed_sh"]
+CMD ["sandboxed-sh"]
 ```
 
 ### 9.2 Dashboard Dockerfile
@@ -452,7 +452,7 @@ FROM debian:bookworm-slim
 # Install Caddy
 RUN apt-get update && apt-get install -y caddy && rm -rf /var/lib/apt/lists/*
 
-COPY --from=backend /usr/local/bin/sandboxed_sh /usr/local/bin/
+COPY --from=backend /usr/local/bin/sandboxed-sh /usr/local/bin/
 COPY --from=dashboard /app /opt/dashboard
 
 # Caddy reverse proxy config

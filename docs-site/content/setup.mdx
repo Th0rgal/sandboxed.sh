@@ -1,6 +1,6 @@
 ---
 title: Setup
-description: Get Open Agent running on your server
+description: Get sandboxed.sh running on your server
 ---
 
 # Setup
@@ -9,7 +9,7 @@ Choose your path based on comfort level. All paths end up with the same result.
 
 ## Quick Path: Docker (recommended)
 
-Docker is the fastest way to get Open Agent running on any machine (including macOS).
+Docker is the fastest way to get sandboxed.sh running on any machine (including macOS).
 Follow the [Docker Install](/install-docker) guide and you’ll have the backend and dashboard up in minutes.
 
 ## Quick Path: AI-Assisted (5 min)
@@ -17,12 +17,12 @@ Follow the [Docker Install](/install-docker) guide and you’ll have the backend
 Have an AI agent deploy for you. Open Claude, Cursor, or any coding assistant with terminal access and say:
 
 ```
-Deploy Open Agent on my server.
+Deploy sandboxed.sh on my server.
 - Server IP: YOUR_IP
 - Domain: agent.yourdomain.com
 - I have SSH access as root
 
-Read INSTALL.md from the Open Agent repo for the full guide.
+Read INSTALL.md from the sandboxed.sh repo for the full guide.
 ```
 
 The AI will handle systemd services, nginx/Caddy, SSL certificates, and everything else.
@@ -56,23 +56,23 @@ source /root/.cargo/env
 
 ### 2. Install OpenCode (optional server backend)
 
-OpenCode server is optional for mission execution. Open Agent runs OpenCode per-workspace via the CLI. Install the server if you want centralized provider/auth management or health checks.
+OpenCode server is optional for mission execution. sandboxed.sh runs OpenCode per-workspace via the CLI. Install the server if you want centralized provider/auth management or health checks.
 
 ```bash
 curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
 install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode
 ```
 
-### 3. Clone and build Open Agent
+### 3. Clone and build sandboxed.sh
 
 ```bash
-mkdir -p /opt/open_agent
-cd /opt/open_agent
-git clone https://github.com/Th0rgal/open-agent vaduz-v1
+mkdir -p /opt/sandboxed_sh
+cd /opt/sandboxed_sh
+git clone https://github.com/Th0rgal/sandboxed.sh.git vaduz-v1
 cd vaduz-v1
 
-cargo build --bin open_agent
-install -m 0755 target/debug/open_agent /usr/local/bin/open_agent
+cargo build --bin sandboxed-sh
+install -m 0755 target/debug/sandboxed-sh /usr/local/bin/sandboxed-sh
 
 # Optional: legacy MCP helpers
 # cargo build --bin workspace-mcp --bin desktop-mcp
@@ -82,11 +82,11 @@ install -m 0755 target/debug/open_agent /usr/local/bin/open_agent
 
 ### 4. Configure
 
-Create `/etc/open_agent/open_agent.env`:
+Create `/etc/sandboxed_sh/sandboxed_sh.env`:
 
 ```bash
-mkdir -p /etc/open_agent
-cat > /etc/open_agent/open_agent.env << 'EOF'
+mkdir -p /etc/sandboxed_sh
+cat > /etc/sandboxed_sh/sandboxed_sh.env << 'EOF'
 OPENCODE_BASE_URL=http://127.0.0.1:4096  # optional when using per-workspace CLI
 OPENCODE_PERMISSIVE=true
 HOST=0.0.0.0
@@ -118,18 +118,18 @@ Environment=HOME=/root
 WantedBy=multi-user.target
 ```
 
-**Open Agent** (`/etc/systemd/system/open_agent.service`):
+**sandboxed.sh** (`/etc/systemd/system/sandboxed_sh.service`):
 
 ```ini
 [Unit]
-Description=Open Agent
+Description=sandboxed.sh
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/open_agent/open_agent.env
-ExecStart=/usr/local/bin/open_agent
+EnvironmentFile=/etc/sandboxed_sh/sandboxed_sh.env
+ExecStart=/usr/local/bin/sandboxed-sh
 WorkingDirectory=/root
 Restart=on-failure
 
@@ -142,7 +142,7 @@ WantedBy=multi-user.target
 ```bash
 systemctl daemon-reload
 systemctl enable --now opencode.service
-systemctl enable --now open_agent.service
+systemctl enable --now sandboxed_sh.service
 ```
 
 ### 7. Set up reverse proxy (Caddy)
@@ -178,7 +178,7 @@ The backend URL is your server domain (e.g., `https://agent.yourdomain.com`). Al
 
 ## Full Documentation
 
-For advanced options (container workspaces, desktop automation, Tailscale exit nodes, multi-user auth), see the complete [INSTALL.md](https://github.com/Th0rgal/open-agent/blob/master/INSTALL.md) in the repository.
+For advanced options (container workspaces, desktop automation, Tailscale exit nodes, multi-user auth), see the complete [INSTALL.md](https://github.com/Th0rgal/sandboxed.sh/blob/master/INSTALL.md) in the repository.
 
 ## Next: Your First Mission
 

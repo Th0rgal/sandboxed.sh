@@ -10,7 +10,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   const [authRequired, setAuthRequired] = useState(false);
   const [isAuthed, setIsAuthed] = useState(true);
   const [authMode, setAuthMode] = useState<'disabled' | 'single_tenant' | 'multi_user'>('single_tenant');
-  const [username, setUsername] = useState(getStoredUsername() ?? '');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -19,6 +19,24 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let mounted = true;
+    // Fast path: when a valid JWT is already stored, render children
+    // immediately and revalidate auth state in the background — the 401
+    // path (`openagent:auth:required`) already exists to re-show this
+    // gate if the background revalidation rejects us. On a cold backend
+    // the health probe takes several seconds; gating the whole UI on it
+    // adds that to TTI for users who are already signed in. The flip
+    // happens in an effect rather than the initial render so the SSR
+    // and client first-paint markup match — without that we'd hit a
+    // hydration mismatch the first time the app loads.
+    if (getValidJwt()) {
+      setReady(true);
+    }
+    // Hydrate the stored username after mount for the same SSR-safety
+    // reason — `localStorage` isn't readable on the server.
+    const storedUsername = getStoredUsername();
+    if (storedUsername) {
+      setUsername(storedUsername);
+    }
     void (async () => {
       try {
         const health = await getHealth();

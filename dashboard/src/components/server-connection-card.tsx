@@ -31,7 +31,7 @@ const componentNames: Record<string, string> = {
   opencode: 'OpenCode',
   claude_code: 'Claude Code',
   codex: 'Codex',
-  amp: 'Amp',
+  grok: 'Grok Build',
   oh_my_opencode: 'oh-my-opencode',
 };
 
@@ -42,7 +42,7 @@ const componentIcons: Record<string, string> = {
   opencode: '⚡',
   claude_code: '🤖',
   codex: '🧠',
-  amp: '⚡',
+  grok: '𝕏',
   oh_my_opencode: '🎭',
 };
 

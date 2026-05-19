@@ -2,7 +2,7 @@
 
 import { useMemo } from 'react';
 import useSWR from 'swr';
-import { Loader, Wrench } from 'lucide-react';
+import { Wrench } from 'lucide-react';
 import { listTools, type ToolInfo } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
@@ -31,14 +31,6 @@ export default function ToolsPage() {
     return [...tools].sort((a, b) => a.name.localeCompare(b.name));
   }, [tools]);
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
-        <Loader className="h-8 w-8 animate-spin text-white/40" />
-      </div>
-    );
-  }
-
   return (
     <div className="min-h-screen flex flex-col p-6 max-w-6xl mx-auto space-y-4">
       <div>
@@ -56,7 +48,21 @@ export default function ToolsPage() {
           <span>Status</span>
         </div>
 
-        {sortedTools.length === 0 ? (
+        {loading ? (
+          <div className="divide-y divide-white/[0.04]">
+            {Array.from({ length: 10 }).map((_, index) => (
+              <div
+                key={index}
+                className="grid grid-cols-[minmax(180px,1.1fr)_minmax(160px,0.8fr)_minmax(280px,2fr)_minmax(110px,0.6fr)] gap-4 px-4 py-3"
+              >
+                <div className="h-4 w-32 rounded bg-white/[0.06]" />
+                <div className="h-4 w-24 rounded bg-white/[0.04]" />
+                <div className="h-4 w-full rounded bg-white/[0.04]" />
+                <div className="h-4 w-16 rounded bg-white/[0.04]" />
+              </div>
+            ))}
+          </div>
+        ) : sortedTools.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 text-white/40">
             <Wrench className="h-10 w-10 mb-3 text-white/20" />
             <p className="text-sm">No tools available</p>

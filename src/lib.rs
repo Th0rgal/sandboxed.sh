@@ -1,6 +1,6 @@
-//! # Open Agent Panel
+//! # sandboxed.sh Panel
 //!
-//! Cloud orchestrator for AI coding agents (Claude Code & OpenCode).
+//! Cloud orchestrator for AI coding agents.
 //!
 //! This library provides:
 //! - HTTP APIs for missions, workspaces, MCP tooling, and library sync

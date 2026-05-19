@@ -315,7 +315,7 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
     let mut components = Vec::new();
     let repo_path = resolve_sandboxed_repo_path(&state).await;
 
-    // Open Agent (self)
+    // sandboxed.sh (self)
     let current_version = env!("CARGO_PKG_VERSION");
     let update_available = check_sandboxed_update(Some(current_version), Some(&repo_path)).await;
     let status = if update_available.is_some() {
@@ -345,10 +345,6 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
     let codex_info = get_codex_info().await;
     components.push(codex_info);
 
-    // Amp
-    let amp_info = get_amp_info().await;
-    components.push(amp_info);
-
     // oh-my-opencode
     let omo_info = get_oh_my_opencode_info().await;
     components.push(omo_info);
@@ -357,7 +353,7 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
 }
 
 /// Components that support per-workspace installations. Order is preserved in the response.
-const PER_WORKSPACE_COMPONENTS: &[&str] = &["opencode", "claude_code", "codex", "amp"];
+const PER_WORKSPACE_COMPONENTS: &[&str] = &["opencode", "claude_code", "codex"];
 
 /// Get per-workspace version info for each component. Container workspaces are probed via nspawn
 /// in parallel with a per-probe timeout to keep the page responsive.
@@ -542,7 +538,6 @@ fn component_binary_name(component: &str) -> Option<&'static str> {
         "opencode" => Some("opencode"),
         "claude_code" => Some("claude"),
         "codex" => Some("codex"),
-        "amp" => Some("amp"),
         _ => None,
     }
 }
@@ -733,56 +728,6 @@ async fn which_opencode() -> Option<String> {
     which_binary("opencode", &[&user_local, "/usr/local/bin/opencode"]).await
 }
 
-/// Get Amp version and status.
-async fn get_amp_info() -> ComponentInfo {
-    // Try to run amp --version to check if it's installed
-    match Command::new("amp").arg("--version").output().await {
-        Ok(output) if output.status.success() => {
-            let mut version_str = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.trim().is_empty() {
-                if !version_str.is_empty() {
-                    version_str.push(' ');
-                }
-                version_str.push_str(stderr.trim());
-            }
-            // Parse version from output like "amp version 0.1.0" or "0.1.0"
-            let version = extract_version_token(&version_str);
-
-            let update_available = check_amp_update(version.as_deref()).await;
-            let status = if update_available.is_some() {
-                ComponentStatus::UpdateAvailable
-            } else {
-                ComponentStatus::Ok
-            };
-
-            ComponentInfo {
-                name: "amp".to_string(),
-                version,
-                installed: true,
-                update_available,
-                path: which_amp().await,
-                source_path: None,
-                status,
-            }
-        }
-        _ => ComponentInfo {
-            name: "amp".to_string(),
-            version: None,
-            installed: false,
-            update_available: None,
-            path: None,
-            source_path: None,
-            status: ComponentStatus::NotInstalled,
-        },
-    }
-}
-
-/// Find the path to the Amp binary.
-async fn which_amp() -> Option<String> {
-    which_binary("amp", &[]).await
-}
-
 /// Fetch the latest version string for an npm package from the registry.
 async fn fetch_npm_latest_version(package: &str) -> Option<String> {
     let url = format!("https://registry.npmjs.org/{package}/latest");
@@ -797,13 +742,6 @@ async fn fetch_npm_latest_version(package: &str) -> Option<String> {
     }
     let json: serde_json::Value = resp.json().await.ok()?;
     json.get("version")?.as_str().map(|s| s.to_string())
-}
-
-/// Check if there's a newer version of Amp available.
-async fn check_amp_update(current_version: Option<&str>) -> Option<String> {
-    let current = extract_version_token(current_version?)?;
-    let latest = fetch_npm_latest_version("@sourcegraph/amp").await?;
-    version_is_newer(&latest, &current).then_some(latest)
 }
 
 /// Check if there's a newer version of Claude Code available.
@@ -866,7 +804,7 @@ async fn check_opencode_update(current_version: Option<&str>) -> Option<String> 
     }
 }
 
-/// Check if there's a newer version of Open Agent available.
+/// Check if there's a newer version of sandboxed.sh available.
 /// First checks GitHub releases, then falls back to git tags if no releases exist.
 async fn check_sandboxed_update(
     current_version: Option<&str>,
@@ -1152,7 +1090,6 @@ fn host_update_stream(
         "opencode" => Ok(Sse::new(Box::pin(stream_opencode_update()))),
         "claude_code" => Ok(Sse::new(Box::pin(stream_claude_code_update()))),
         "codex" => Ok(Sse::new(Box::pin(stream_codex_update()))),
-        "amp" => Ok(Sse::new(Box::pin(stream_amp_update()))),
         "oh_my_opencode" => Ok(Sse::new(Box::pin(stream_oh_my_opencode_update()))),
         other => Err((
             StatusCode::BAD_REQUEST,
@@ -1228,9 +1165,6 @@ fn container_install_command(component: &str) -> Option<String> {
         "codex" => Some(
             "command -v bun >/dev/null 2>&1 && PM=bun || PM=npm; $PM install -g @openai/codex@latest".to_string(),
         ),
-        "amp" => Some(
-            "command -v bun >/dev/null 2>&1 && PM=bun || PM=npm; $PM install -g @sourcegraph/amp@latest".to_string(),
-        ),
         "opencode" => Some(
             "curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path".to_string(),
         ),
@@ -1251,7 +1185,6 @@ async fn uninstall_component(
         "opencode" => Ok(Sse::new(Box::pin(stream_opencode_uninstall()))),
         "claude_code" => Ok(Sse::new(Box::pin(stream_claude_code_uninstall()))),
         "codex" => Ok(Sse::new(Box::pin(stream_codex_uninstall()))),
-        "amp" => Ok(Sse::new(Box::pin(stream_amp_uninstall()))),
         "oh_my_opencode" => Ok(Sse::new(Box::pin(stream_oh_my_opencode_uninstall()))),
         _ => Err((
             StatusCode::BAD_REQUEST,
@@ -1260,13 +1193,13 @@ async fn uninstall_component(
     }
 }
 
-/// Stream the Open Agent update process.
+/// Stream the sandboxed.sh update process.
 /// Builds from source using git tags (no pre-built binaries needed).
 fn stream_sandboxed_update(
     state: Arc<AppState>,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
-        yield sse("log", "Starting Open Agent update...", Some(0));
+        yield sse("log", "Starting sandboxed.sh update...", Some(0));
 
         let repo_path_str = resolve_sandboxed_repo_path(&state).await;
         let repo_path = std::path::Path::new(&repo_path_str);
@@ -1370,7 +1303,7 @@ fn stream_sandboxed_update(
         }
 
         // Build the project
-        yield sse("log", "Building Open Agent (this may take a few minutes)...", Some(20));
+        yield sse("log", "Building sandboxed.sh (this may take a few minutes)...", Some(20));
 
         match Command::new("bash")
             .args(["-c", "source /root/.cargo/env && cargo build --bin sandboxed-sh --bin workspace-mcp --bin desktop-mcp"])
@@ -1415,7 +1348,7 @@ fn stream_sandboxed_update(
             .output()
             .await;
 
-        let src = format!("{}/target/debug/sandboxed_sh", repo_path.display());
+        let src = format!("{}/target/debug/{}", repo_path.display(), exe_name);
         match Command::new("install")
             .args(["-m", "0755", &src, &install_dest])
             .output()
@@ -1607,42 +1540,6 @@ fn stream_claude_code_update() -> impl Stream<Item = Result<Event, std::convert:
             }
             Err(e) => {
                 yield sse("error", format!("Failed to run {} install: {}", pm.bin(), e), None);
-            }
-        }
-    }
-}
-
-/// Stream the Amp update process.
-fn stream_amp_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    async_stream::stream! {
-        yield sse("log", "Starting Amp update...", Some(0));
-
-        let pm = crate::pkg_manager::preferred().await;
-        let Some(pm) = pm else {
-            yield sse("error", "No package manager (bun or npm) found. Please install Bun or Node.js first.", None);
-            return;
-        };
-
-        yield sse("log", format!("Running {} install -g @sourcegraph/amp@latest...", pm.bin()), Some(20));
-
-        match Command::new(pm.bin())
-            .args(pm.global_install_args("@sourcegraph/amp@latest"))
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let summary: String = stdout.lines().take(5).collect::<Vec<_>>().join("\n");
-                yield sse("log", format!("Installation output: {summary}"), Some(80));
-                yield sse("complete", "Amp updated successfully!", Some(100));
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                yield sse("error", format!("Failed to update Amp: {} {}", stderr, stdout), None);
-            }
-            Err(e) => {
-                yield sse("error", format!("Failed to run update: {}", e), None);
             }
         }
     }
@@ -1959,11 +1856,6 @@ fn stream_package_uninstall(
 /// Stream the Claude Code uninstall process.
 fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     stream_package_uninstall("@anthropic-ai/claude-code", ".claude", "Claude Code")
-}
-
-/// Stream the Amp uninstall process.
-fn stream_amp_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    stream_package_uninstall("@sourcegraph/amp", ".agents", "Amp")
 }
 
 /// Stream the oh-my-opencode uninstall process.

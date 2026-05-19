@@ -41,8 +41,10 @@ import { cn, formatCents } from '@/lib/utils';
 import { NewMissionDialog } from '@/components/new-mission-dialog';
 import {
   categorizeMissions,
+  finishedTone,
   getMissionTextColor,
   getMissionTitle,
+  isFinishedStatus,
   type MissionCategory,
 } from '@/lib/mission-status';
 import { inferMissionRole } from '@/lib/mission-role';
@@ -69,7 +71,8 @@ function CompactStatusIcon({
   className?: string;
 }) {
   if (isRunning || status === 'active') return <Loader className={className} />;
-  if (status === 'completed') return <CheckCircle className={className} />;
+  if (status === 'awaiting_user') return <Hand className={className} />;
+  if (status === 'completed' || status === 'acknowledged') return <CheckCircle className={className} />;
   if (status === 'failed' || status === 'not_feasible') return <XCircle className={className} />;
   if (status === 'interrupted' || status === 'blocked') return <Ban className={className} />;
   return <Clock className={className} />;
@@ -95,7 +98,11 @@ function CompactMissionCard({
   const color = getMissionTextColor(mission.status, isRunningForDisplay);
   const title = getMissionTitle(mission);
   const isResumable = !isRunningForDisplay && mission.resumable &&
-    (mission.status === 'interrupted' || mission.status === 'blocked' || mission.status === 'failed');
+    (mission.status === 'interrupted' || mission.status === 'blocked' || mission.status === 'failed' ||
+      mission.status === 'awaiting_user' || mission.status === 'acknowledged');
+  // Subtle "user has opened this since it last needed attention" indicator
+  // for missions parked in the Finished column.
+  const showOpenedDot = !isRunningForDisplay && isFinishedStatus(mission.status) && !!mission.first_viewed_at;
 
   return (
     <div className="group rounded-md bg-white/[0.02] border border-white/[0.06] hover:border-white/[0.12] px-2.5 py-2 transition-colors">
@@ -110,6 +117,13 @@ function CompactMissionCard({
             {title}
           </p>
         </Link>
+        {showOpenedDot && (
+          <span
+            className="shrink-0 h-1.5 w-1.5 rounded-full bg-white/40"
+            aria-label="Opened"
+            title="You've opened this mission"
+          />
+        )}
         {isBoss && (
           <span className="shrink-0 rounded bg-violet-500/10 border border-violet-500/20 px-1 py-0.5 text-[8px] font-medium text-violet-400">
             B
@@ -180,8 +194,7 @@ function NeedsYouInbox({
       missions
         .filter(
           (mission) =>
-            !runningMissionIds.has(mission.id) &&
-            (mission.status === 'interrupted' || mission.status === 'blocked')
+            !runningMissionIds.has(mission.id) && mission.status === 'awaiting_user'
         )
         .sort(
           (a, b) =>
@@ -211,8 +224,7 @@ function NeedsYouInbox({
         ) : (
           inboxMissions.map((mission) => {
             const title = getMissionTitle(mission, { maxLength: 72 });
-            const statusTone =
-              mission.status === 'blocked' ? 'text-orange-300' : 'text-amber-300';
+            const statusTone = 'text-amber-300';
             return (
               <div
                 key={mission.id}
@@ -230,7 +242,7 @@ function NeedsYouInbox({
                     </Link>
                     <div className="mt-1 flex items-center gap-2 text-[10px] text-white/35">
                       <span className={cn('capitalize', statusTone)}>
-                        {mission.status}
+                        Waiting on you
                       </span>
                       {mission.workspace_name && (
                         <>

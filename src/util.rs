@@ -242,7 +242,7 @@ pub fn resolve_config_path(
 /// Read a JSON/JSONC config file, returning `{}` if it doesn't exist.
 ///
 /// On parse failure, retries after stripping JSONC comments and trailing commas.
-/// `label` is used in error messages (e.g. "Amp config").
+/// `label` is used in error messages (e.g. "Claude Code config").
 pub async fn read_json_config(
     path: &std::path::Path,
     label: &str,
@@ -273,7 +273,7 @@ pub async fn read_json_config(
 
 /// Write a JSON config file, creating parent directories as needed.
 ///
-/// `label` is used in the log message (e.g. "Amp config").
+/// `label` is used in the log message (e.g. "Claude Code config").
 pub async fn write_json_config(
     path: &std::path::Path,
     config: &serde_json::Value,

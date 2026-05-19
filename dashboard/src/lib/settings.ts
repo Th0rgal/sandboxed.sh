@@ -33,8 +33,21 @@ const HOSTED_API_BASE_BY_HOSTNAME: Record<string, string> = {
   'agent.thomas.md': 'https://agent-backend.thomas.md',
 };
 
+const LOCAL_BACKEND_PORT = '3000';
+
 export function inferHostedApiBase(hostname: string): string | null {
   return HOSTED_API_BASE_BY_HOSTNAME[hostname] ?? null;
+}
+
+export function inferLocalApiBase(location: Location): string | null {
+  if (!['localhost', '127.0.0.1', '::1'].includes(location.hostname)) {
+    return null;
+  }
+  if (location.port === LOCAL_BACKEND_PORT) {
+    return null;
+  }
+  const host = location.hostname === '::1' ? '[::1]' : location.hostname;
+  return `${location.protocol}//${host}:${LOCAL_BACKEND_PORT}`;
 }
 
 export function getRuntimeApiBase(): string {
@@ -43,9 +56,17 @@ export function getRuntimeApiBase(): string {
     return normalizeBaseUrl(envBase || 'http://127.0.0.1:3000');
   }
   const saved = readSavedSettings().apiUrl;
-  if (saved) return normalizeBaseUrl(saved);
+  const localBase = inferLocalApiBase(window.location);
+  if (saved) {
+    const normalizedSaved = normalizeBaseUrl(saved);
+    if (localBase && normalizedSaved === normalizeBaseUrl(window.location.origin)) {
+      return normalizeBaseUrl(localBase);
+    }
+    return normalizedSaved;
+  }
   if (envBase) return normalizeBaseUrl(envBase);
   const hostedBase = inferHostedApiBase(window.location.hostname);
   if (hostedBase) return normalizeBaseUrl(hostedBase);
+  if (localBase) return normalizeBaseUrl(localBase);
   return normalizeBaseUrl(window.location.origin);
 }

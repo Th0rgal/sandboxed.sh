@@ -1,8 +1,8 @@
 # Harness System
 
 Sandboxed.sh supports multiple execution backends ("harnesses") for running agent
-missions. The current architecture is **per-workspace execution**: OpenCode and
-Claude Code run inside the selected workspace (host or container).
+missions. The current architecture is **per-workspace execution**: harness CLIs
+run inside the selected workspace (host or container).
 
 This document explains the harness architecture, configuration, and how to add
 new backends.
@@ -16,7 +16,9 @@ missions. Sandboxed.sh currently supports:
 |---------|-------------|---------------------|
 | **OpenCode** | OpenCode CLI executed inside each workspace | Per-workspace (`opencode.json`, `.opencode/`) |
 | **Claude Code** | Claude CLI executed inside each workspace | Per-workspace (`CLAUDE.md`, `.claude/settings.local.json`) |
-| **Amp** | Amp CLI executed inside each workspace | Per-workspace (`AGENTS.md`, `.agents/skills/`, `settings.json`) |
+| **Codex** | Codex CLI/app-server driver executed inside each workspace | Per-workspace (`.codex/config.toml`, `.codex/skills/`) |
+| **Gemini** | Gemini CLI executed inside each workspace | Per-workspace OpenCode-style MCP/tool config |
+| **Grok Build** | Grok CLI executed inside each workspace | Per-workspace OpenCode-style MCP/tool config |
 
 ## Architecture (per-workspace)
 
@@ -36,10 +38,9 @@ missions. Sandboxed.sh currently supports:
                │                               │
                ▼                               ▼
 ┌──────────────────────────┐    ┌──────────────────────────────────┐
-│     OpenCode CLI          │    │      Claude Code CLI            │
-│  (oh-my-opencode run)     │    │      (claude --stream-json)     │
-│  - embedded server        │    │      - built-in agents          │
-│  - per-workspace config   │    │      - per-workspace config     │
+│     OpenCode CLI          │    │  Claude/Codex/Gemini/Grok CLIs │
+│  (opencode or wrapper)    │    │  - native streaming protocols  │
+│  - per-workspace config   │    │  - per-workspace config        │
 └──────────────────────────┘    └──────────────────────────────────┘
 ```
 
@@ -106,52 +107,26 @@ credentials file to enable automatic token refresh during long-running missions:
 This allows Claude Code to refresh expired access tokens automatically instead of
 failing mid-mission. The credentials file includes the refresh token and expiry time.
 
-## Amp harness
+## Codex harness
 
-Amp (by Sourcegraph) is executed **per workspace** using the CLI:
+Codex is executed **per workspace** using the Codex CLI/app-server driver:
 
-- `AGENTS.md` provides per-workspace context (like `CLAUDE.md` for Claude Code).
-- `.agents/skills/<name>/SKILL.md` provides native skill support.
-- `settings.json` defines MCP servers and tool permissions.
-- Built-in `Bash` is enabled via `--dangerously-allow-all`.
+- `.codex/config.toml` defines MCP servers and Codex profile settings.
+- `.codex/skills/<name>/SKILL.md` provides native skill support.
+- OpenAI API keys and Codex/ChatGPT credentials are discovered by the backend
+  and rotated when rate limits require it.
+- Goal-mode missions keep the raw `/goal <objective>` prefix so the Codex
+  driver can route through goal APIs instead of a plain turn.
 
-### Amp modes
+## Gemini and Grok harnesses
 
-Amp supports two execution modes (passed as `agent` override):
+Gemini and Grok Build run through their native CLIs inside the workspace:
 
-- **smart**: Uses state-of-the-art models without constraints for maximum capability
-- **rush**: Faster, cheaper, suitable for small, well-defined tasks
-
-### CLI protocol (NDJSON)
-
-Amp uses the same NDJSON streaming format as Claude Code:
-
-```bash
-amp --execute "prompt" --stream-json --dangerously-allow-all
-```
-
-For multi-turn conversations:
-
-```bash
-amp threads continue T-<uuid> --execute "prompt" --stream-json
-```
-
-### Authentication
-
-Amp uses `AMP_API_KEY` for authentication. Set this environment variable with
-your access token from [ampcode.com/settings](https://ampcode.com/settings).
-
-### Using CLIProxyAPI (Optional)
-
-You can route Amp requests through [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
-to use your own OAuth credentials instead of Amp credits:
-
-```bash
-# Set the provider URL to your proxy
-export AMP_PROVIDER_URL="http://localhost:8317"
-```
-
-See [AMP_PROXY_SETUP.md](./AMP_PROXY_SETUP.md) for detailed configuration.
+- Gemini defaults to the configured Google/Gemini model when no override is
+  supplied.
+- Grok Build uses `GROK_CODE_XAI_API_KEY`, `XAI_API_KEY`, xAI provider entries,
+  or the Grok CLI's own login cache.
+- Both reuse the OpenCode-style workspace config generation for MCP/tool wiring.
 
 ### Harness bootstrap (auto-install)
 
@@ -160,25 +135,25 @@ CLIs during container build (best-effort):
 
 - `SANDBOXED_SH_BOOTSTRAP_CLAUDECODE=true` (default)
 - `SANDBOXED_SH_BOOTSTRAP_OPENCODE=true` (default)
+- `SANDBOXED_SH_BOOTSTRAP_GROK=true` (default)
 
 At runtime, harnesses can self-install on first use if missing:
 
 - `SANDBOXED_SH_AUTO_INSTALL_CLAUDECODE=true` (default)
 - `SANDBOXED_SH_AUTO_INSTALL_OPENCODE=true` (default)
-- `SANDBOXED_SH_AUTO_INSTALL_AMP=true` (default)
 
 OpenCode installation uses the official installer (`https://opencode.ai/install`)
 and copies the binary to `/usr/local/bin/opencode`. This requires `curl` inside
 the workspace. If `curl` is unavailable, the mission fails with a clear error
 message instructing you to add it to the workspace template.
 
-Claude Code, Amp, and oh-my-opencode installation uses `npm` in the workspace. If
+Claude Code and oh-my-opencode installation use `npm` in the workspace. If
 `npm` is unavailable, the mission fails with a clear error message instructing you
 to add Node/npm to the workspace template.
 
 ### CLI protocol (NDJSON)
 
-Claude Code and Amp communicate via compatible NDJSON streaming:
+Claude Code communicates via NDJSON streaming:
 
 ```bash
 echo "prompt" | claude \
@@ -203,7 +178,8 @@ Default per-workspace tool settings:
 
 - **OpenCode**: built-in `bash` enabled; `workspace_*` disabled by default.
 - **Claude Code**: built-in `Bash` enabled via permissions.
-- **Amp**: built-in `Bash` enabled via `--dangerously-allow-all`.
+- **Codex/Gemini/Grok**: native CLI tools run in the selected workspace and use
+  the generated MCP/tool configuration for that backend.
 
 MCP tools (desktop/playwright/workspace) can be enabled when needed.
 
@@ -240,8 +216,11 @@ inside the workspace execution context:
 
 ```rust
 let result = match backend_id.as_str() {
-    "claudecode" => run_claudecode_turn(...).await,
     "opencode" => run_opencode_turn(...).await,
+    "claudecode" => run_claudecode_turn(...).await,
+    "codex" => run_codex_turn(...).await,
+    "gemini" => run_gemini_turn(...).await,
+    "grok" => run_grok_turn(...).await,
     _ => Err(anyhow!("Unknown backend")),
 };
 ```

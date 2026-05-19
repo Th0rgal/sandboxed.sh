@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 use axum::middleware;
 use axum::{
     extract::{DefaultBodyLimit, Extension, Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, Sse},
         Json,
@@ -31,7 +31,7 @@ use axum::{
     Router,
 };
 use futures::stream::Stream;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -58,7 +58,6 @@ fn cli_available(name: &str) -> bool {
 use super::providers::ModelCatalog;
 
 use super::ai_providers as ai_providers_api;
-use super::ampcode as ampcode_api;
 use super::auth::{self, AuthUser};
 use super::backends as backends_api;
 use super::claudecode as claudecode_api;
@@ -68,6 +67,7 @@ use super::deferred_proxy as deferred_proxy_api;
 use super::desktop;
 use super::desktop_stream;
 use super::fs;
+use super::github_auth;
 use super::library as library_api;
 use super::mcp as mcp_api;
 use super::model_routing as model_routing_api;
@@ -104,6 +104,8 @@ pub struct AppState {
     /// Pending OAuth state for provider authorization
     pub pending_oauth:
         Arc<RwLock<HashMap<crate::ai_providers::ProviderType, crate::ai_providers::PendingOAuth>>>,
+    /// Pending GitHub OAuth login state, keyed by random nonce.
+    pub pending_github_oauth: Arc<RwLock<HashMap<String, super::github_auth::PendingGithubOAuth>>>,
     /// Secrets store for encrypted credentials
     pub secrets: Option<Arc<crate::secrets::SecretsStore>>,
     /// Console session pool for WebSocket reconnection
@@ -132,6 +134,14 @@ pub struct AppState {
     pub telegram_bridge: super::telegram::SharedTelegramBridge,
     /// FIDO signing relay hub (pending approval requests)
     pub fido_hub: Arc<super::fido::FidoSigningHub>,
+    /// In-process control-plane metrics (P0-#3). Tracks SSE chunk sizes,
+    /// /events + /running req rates, broadcast events per mission. Read
+    /// via `GET /api/control/metrics`.
+    pub control_metrics: Arc<super::control_metrics::ControlMetrics>,
+    /// Cache of per-provider live rate-limit / usage data. Filled lazily by
+    /// `/api/ai/providers/:id/usage` and refreshed in the background so the
+    /// dashboard sees fresh values without paying a round-trip latency cost.
+    pub provider_usage_cache: Arc<super::provider_usage_cache::ProviderUsageCache>,
 }
 
 /// Start the HTTP server.
@@ -174,6 +184,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         crate::ai_providers::AIProviderStore::new(config.working_dir.join(AI_PROVIDERS_PATH)).await,
     );
     let pending_oauth = Arc::new(RwLock::new(HashMap::new()));
+    let pending_github_oauth = Arc::new(RwLock::new(HashMap::new()));
 
     // Initialize provider health tracker and model chain store
     let health_tracker = Arc::new(crate::provider_health::ProviderHealthTracker::new());
@@ -262,9 +273,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             config.opencode_permissive,
         )),
         Box::new(crate::backend::claudecode::ClaudeCodeBackend::new()),
-        Box::new(crate::backend::amp::AmpBackend::new()),
         Box::new(crate::backend::codex::CodexBackend::new()),
         Box::new(crate::backend::gemini::GeminiBackend::new()),
+        Box::new(crate::backend::grok::GrokBackend::new()),
     ];
     struct BackendProbe {
         id: String,
@@ -340,7 +351,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // a fixed preference order. The preference list lives here (operational
     // policy) but the "is it available" answer comes from the probe map so
     // we don't restate CLI names.
-    const DEFAULT_BACKEND_PRIORITY: &[&str] = &["claudecode", "opencode", "amp", "gemini", "codex"];
+    const DEFAULT_BACKEND_PRIORITY: &[&str] =
+        &["claudecode", "opencode", "grok", "gemini", "codex"];
     let default_backend = config.default_backend.clone().unwrap_or_else(|| {
         let detected = |id: &str| {
             probes
@@ -374,9 +386,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         opencode_permissive,
     ));
     backend_registry.register(crate::backend::claudecode::registry_entry());
-    backend_registry.register(crate::backend::amp::registry_entry());
     backend_registry.register(crate::backend::codex::registry_entry());
     backend_registry.register(crate::backend::gemini::registry_entry());
+    backend_registry.register(crate::backend::grok::registry_entry());
     let backend_registry = Arc::new(RwLock::new(backend_registry));
     tracing::info!("Backend registry initialized with {} backends", 5);
 
@@ -457,6 +469,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         opencode_agents_cache: RwLock::new(opencode_api::OpenCodeAgentsCache::default()),
         ai_providers,
         pending_oauth,
+        pending_github_oauth,
         secrets,
         console_pool,
         settings,
@@ -486,7 +499,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         deferred_requests,
         telegram_bridge,
         fido_hub: Arc::new(super::fido::FidoSigningHub::new()),
+        control_metrics: Arc::new(super::control_metrics::ControlMetrics::new()),
+        provider_usage_cache: super::provider_usage_cache::ProviderUsageCache::new(),
     });
+
+    // Start background refresh of provider rate-limit / usage info so the
+    // dashboard always reads a fresh-enough cache.
+    super::ai_providers::spawn_usage_refresh_loop(Arc::clone(&state));
 
     // Initialize the metadata LLM client for AI-powered mission titles/descriptions
     {
@@ -556,6 +575,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let public_routes = Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/github/start", get(github_auth::start))
+        .route("/api/auth/github/callback", get(github_auth::callback))
         // Webhook receiver endpoint (no auth required - uses webhook secret validation)
         .route(
             "/api/webhooks/:mission_id/:webhook_id",
@@ -604,6 +625,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     let protected_routes = Router::new()
         .route("/api/stats", get(get_stats))
+        .route("/api/ai/usage/summary", get(get_ai_usage_summary))
         .route("/api/task", post(create_task))
         .route("/api/task/:id", get(get_task))
         .route("/api/task/:id/stop", post(stop_task))
@@ -660,8 +682,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(control::get_mission_events),
         )
         .route(
+            "/api/control/missions/:id/transcript",
+            get(control::get_mission_transcript),
+        )
+        .route(
+            "/api/control/missions/:id/trace",
+            get(control::get_mission_trace),
+        )
+        .route(
             "/api/control/missions/:id/load",
             post(control::load_mission),
+        )
+        .route(
+            "/api/control/missions/:id/opened",
+            post(control::mark_mission_opened),
         )
         .route(
             "/api/control/missions/:id/status",
@@ -853,6 +887,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/parallel/config",
             get(control::get_parallel_config),
         )
+        // P0-#3: in-process metrics for perf validation.
+        .route("/api/control/metrics", get(control::get_control_metrics))
+        // P5-#25: client health-budget telemetry sink.
+        .route(
+            "/api/control/telemetry/perf",
+            post(control::post_control_telemetry_perf),
+        )
         // Memory endpoints
         .route("/api/runs", get(list_runs))
         .route("/api/runs/:id", get(get_run))
@@ -918,11 +959,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/claudecode/config",
             axum::routing::put(claudecode_api::update_claudecode_config),
-        )
-        .route("/api/amp/config", get(ampcode_api::get_amp_config))
-        .route(
-            "/api/amp/config",
-            axum::routing::put(ampcode_api::update_amp_config),
         )
         .route(
             "/api/opencode/restart",
@@ -1145,7 +1181,7 @@ fn shutdown_cmdline() -> Option<String> {
 }
 
 /// Health check endpoint.
-async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+async fn health(State(state): State<Arc<AppState>>) -> (HeaderMap, Json<HealthResponse>) {
     let auth_mode = match state.config.auth.auth_mode(state.config.dev_mode) {
         AuthMode::Disabled => "disabled",
         AuthMode::SingleTenant => "single_tenant",
@@ -1153,15 +1189,30 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     };
     // Read library_remote from settings store (persisted to disk)
     let library_remote = state.settings.get_library_remote().await;
-    Json(HealthResponse {
-        status: "ok".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        dev_mode: state.config.dev_mode,
-        auth_required: state.config.auth.auth_required(state.config.dev_mode),
-        auth_mode: auth_mode.to_string(),
-        max_iterations: state.config.max_iterations,
-        library_remote,
-    })
+    // The dashboard probes `/api/health` from `AuthGate` and from a couple
+    // of other entry-point effects on every full page load, so the same
+    // request goes out 2–3 times in quick succession. A tiny browser-side
+    // freshness window lets the duplicates resolve from the HTTP cache
+    // without a round-trip. The body is keyed on server config rather
+    // than per-request state, so a few seconds of staleness is harmless.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=5"),
+    );
+    (
+        headers,
+        Json(HealthResponse {
+            status: "ok".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            dev_mode: state.config.dev_mode,
+            auth_required: state.config.auth.auth_required(state.config.dev_mode),
+            auth_mode: auth_mode.to_string(),
+            max_iterations: state.config.max_iterations,
+            library_remote,
+            github_enabled: state.config.auth.github_enabled(),
+        }),
+    )
 }
 
 /// Optional query parameters for the stats endpoint.
@@ -1280,6 +1331,214 @@ async fn get_stats(
         estimated_cost_cents,
         unknown_cost_cents,
         success_rate,
+    })
+}
+
+/// Optional query parameters for the AI usage summary endpoint.
+#[derive(Debug, Deserialize)]
+pub struct UsageSummaryQuery {
+    /// Time window: "24h", "7d", "30d", or "all". Default "all".
+    window: Option<String>,
+}
+
+/// Per-model usage row in the API response.
+#[derive(Debug, Serialize)]
+pub struct ModelUsageResponse {
+    pub model: String,
+    /// Inferred provider type (e.g. "anthropic", "openai", "google", "xai") or
+    /// `null` when unknown.
+    pub provider: Option<String>,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageSummaryTotals {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageSummaryResponse {
+    pub window: String,
+    pub since: Option<String>,
+    pub totals: UsageSummaryTotals,
+    pub by_model: Vec<ModelUsageResponse>,
+    pub by_day: Vec<DailyUsageResponse>,
+    /// Only populated for windows where hourly granularity makes sense (24h, 7d).
+    pub by_hour: Vec<HourlyUsageResponse>,
+}
+
+/// One day's worth of aggregated usage — used to draw the sparkline.
+#[derive(Debug, Serialize)]
+pub struct DailyUsageResponse {
+    pub day: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
+/// One hour's worth of aggregated usage — finer granularity for 24h/7d views.
+#[derive(Debug, Serialize)]
+pub struct HourlyUsageResponse {
+    /// `YYYY-MM-DDTHH` (UTC).
+    pub hour: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_cents: u64,
+}
+
+/// Map a normalized model identifier to a provider type id.
+fn infer_provider_for_model(model: &str) -> Option<String> {
+    let m = model.to_lowercase();
+    if m.contains("claude") {
+        Some("anthropic".to_string())
+    } else if m.contains("gpt")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("openai")
+    {
+        Some("openai".to_string())
+    } else if m.contains("gemini") {
+        Some("google".to_string())
+    } else if m.contains("grok") {
+        Some("xai".to_string())
+    } else if m.contains("glm") || m.contains("z-ai") || m.contains("zai") {
+        Some("zai".to_string())
+    } else if m.contains("minimax") || m.contains("abab") {
+        Some("minimax".to_string())
+    } else if m.contains("mistral") || m.contains("codestral") {
+        Some("mistral".to_string())
+    } else if m.contains("llama") && m.contains("groq") {
+        Some("groq".to_string())
+    } else if m.contains("command") || m.contains("cohere") {
+        Some("cohere".to_string())
+    } else if m.contains("qwen") || m.contains("deepseek") {
+        // Common open-router / together-ai models; default to open-router
+        Some("open-router".to_string())
+    } else {
+        None
+    }
+}
+
+/// GET /api/ai/usage/summary — aggregated AI token/cost usage.
+///
+/// Query params:
+/// - `window`: "24h" | "7d" | "30d" | "all" (default "all").
+async fn get_ai_usage_summary(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(params): Query<UsageSummaryQuery>,
+) -> Json<UsageSummaryResponse> {
+    let window = params.window.as_deref().unwrap_or("all");
+    let since: Option<String> = match window {
+        "24h" => Some((chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339()),
+        "7d" => Some((chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339()),
+        "30d" => Some((chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339()),
+        _ => None,
+    };
+
+    let control_state = state.control.get_or_spawn(&user).await;
+    let rows = control_state
+        .mission_store
+        .get_usage_by_model(since.as_deref())
+        .await
+        .unwrap_or_default();
+    let daily = control_state
+        .mission_store
+        .get_usage_by_day(since.as_deref())
+        .await
+        .unwrap_or_default();
+    // Only fetch hourly buckets for short windows — at 30d / all the count
+    // explodes into the thousands and the line chart becomes unreadable.
+    let hourly = if matches!(window, "24h" | "7d") {
+        control_state
+            .mission_store
+            .get_usage_by_hour(since.as_deref())
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let mut totals = UsageSummaryTotals {
+        requests: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+        cost_cents: 0,
+    };
+    let mut by_model: Vec<ModelUsageResponse> = Vec::with_capacity(rows.len());
+    for r in rows {
+        totals.requests = totals.requests.saturating_add(r.requests);
+        totals.input_tokens = totals.input_tokens.saturating_add(r.input_tokens);
+        totals.output_tokens = totals.output_tokens.saturating_add(r.output_tokens);
+        totals.cache_creation_tokens = totals
+            .cache_creation_tokens
+            .saturating_add(r.cache_creation_tokens);
+        totals.cache_read_tokens = totals.cache_read_tokens.saturating_add(r.cache_read_tokens);
+        totals.cost_cents = totals.cost_cents.saturating_add(r.cost_cents);
+        let provider = if r.model.is_empty() {
+            None
+        } else {
+            infer_provider_for_model(&r.model)
+        };
+        by_model.push(ModelUsageResponse {
+            model: r.model,
+            provider,
+            requests: r.requests,
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+            cache_creation_tokens: r.cache_creation_tokens,
+            cache_read_tokens: r.cache_read_tokens,
+            cost_cents: r.cost_cents,
+        });
+    }
+
+    let by_day = daily
+        .into_iter()
+        .map(|d| DailyUsageResponse {
+            day: d.day,
+            requests: d.requests,
+            input_tokens: d.input_tokens,
+            output_tokens: d.output_tokens,
+            cache_read_tokens: d.cache_read_tokens,
+            cost_cents: d.cost_cents,
+        })
+        .collect();
+
+    let by_hour = hourly
+        .into_iter()
+        .map(|h| HourlyUsageResponse {
+            hour: h.hour,
+            requests: h.requests,
+            input_tokens: h.input_tokens,
+            output_tokens: h.output_tokens,
+            cache_read_tokens: h.cache_read_tokens,
+            cost_cents: h.cost_cents,
+        })
+        .collect();
+
+    Json(UsageSummaryResponse {
+        window: window.to_string(),
+        since,
+        totals,
+        by_model,
+        by_day,
+        by_hour,
     })
 }
 

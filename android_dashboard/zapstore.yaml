@@ -1,0 +1,20 @@
+release_source: ./app/build/outputs/apk/release/app-release.apk
+repository: https://github.com/adrienlacombe/sandboxed.sh
+website: https://sandboxed.sh
+icon: ./metadata/icon.png
+
+name: Sandboxed
+summary: Mobile mission control for self-hosted AI coding agents
+description: |
+  Sandboxed is a mobile dashboard for self-hosted AI coding agent infrastructure.
+  It connects to Sandboxed.sh servers to monitor missions, control workspaces,
+  stream terminals, browse files, review runs, and handle FIDO approvals.
+
+tags:
+  - ai
+  - agents
+  - coding
+  - self-hosted
+  - developer-tools
+
+license: MIT

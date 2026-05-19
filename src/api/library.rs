@@ -12,7 +12,7 @@
 
 use axum::{
     extract::{Multipart, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -23,10 +23,10 @@ use tokio::sync::RwLock;
 
 use crate::library::{
     rename::{ItemType, RenameResult},
-    AmpCodeConfig, ClaudeCodeConfig, Command, CommandParam, CommandSummary, ConfigProfile,
-    ConfigProfileSummary, GitAuthor, InitScript, InitScriptSummary, LibraryAgent,
-    LibraryAgentSummary, LibraryStatus, LibraryStore, McpServer, MigrationReport, SandboxedConfig,
-    Skill, SkillSummary, WorkspaceTemplate, WorkspaceTemplateSummary,
+    ClaudeCodeConfig, Command, CommandParam, CommandSummary, ConfigProfile, ConfigProfileSummary,
+    GitAuthor, InitScript, InitScriptSummary, LibraryAgent, LibraryAgentSummary, LibraryStatus,
+    LibraryStore, McpServer, MigrationReport, SandboxedConfig, Skill, SkillSummary,
+    WorkspaceTemplate, WorkspaceTemplateSummary,
 };
 use crate::nspawn::NspawnDistro;
 use crate::util::{internal_error, not_found_or_internal, sanitize_skill_list};
@@ -263,14 +263,6 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route(
             "/config-profile/:name/claudecode/config",
             put(save_claudecode_config_for_profile),
-        )
-        .route(
-            "/config-profile/:name/ampcode/config",
-            get(get_ampcode_config_for_profile),
-        )
-        .route(
-            "/config-profile/:name/ampcode/config",
-            put(save_ampcode_config_for_profile),
         )
         // File-based config profile editing
         .route(
@@ -965,13 +957,36 @@ struct BuiltinCommandsResponse {
     /// Empty when the workspace's codex binary predates the goals feature flag.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     codex: Vec<CommandSummary>,
+    /// Commands for Grok Build. Today this carries the sandboxed.sh-driven
+    /// `/goal` loop (Grok has no native goal mode — see
+    /// `src/api/grok_goal.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    grok: Vec<CommandSummary>,
 }
 
 /// GET /api/library/builtin-commands - Get builtin slash commands for each backend.
 ///
 /// Returns the native slash commands available for OpenCode and Claude Code.
 /// These are runtime-specific commands that don't come from the Library.
-async fn get_builtin_commands() -> Json<BuiltinCommandsResponse> {
+///
+/// The response body is compiled into the binary and never changes for the
+/// lifetime of the process, so it's safe to cache aggressively in the
+/// browser. The dashboard re-fetches this on every full page load — a few
+/// minutes of HTTP-cache freshness skips the round-trip entirely on
+/// subsequent reloads. `stale-while-revalidate` keeps the next reload
+/// instant after the freshness window expires while a background revalidate
+/// picks up any change that could happen across a deploy.
+async fn get_builtin_commands() -> (HeaderMap, Json<BuiltinCommandsResponse>) {
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300, stale-while-revalidate=3600"),
+    );
+    let body = build_builtin_commands();
+    (response_headers, Json(body))
+}
+
+fn build_builtin_commands() -> BuiltinCommandsResponse {
     // OpenCode builtin commands (oh-my-opencode)
     let opencode_commands = vec![
         CommandSummary {
@@ -1116,11 +1131,29 @@ async fn get_builtin_commands() -> Json<BuiltinCommandsResponse> {
         }],
     }];
 
-    Json(BuiltinCommandsResponse {
+    // Grok builtin commands. Grok has no native goal mode; sandboxed.sh
+    // drives the loop via an AgentFinished automation that parses sentinel
+    // markers from each turn's output. See `src/api/grok_goal.rs`.
+    let grok_commands = vec![CommandSummary {
+        name: "goal".to_string(),
+        description: Some(
+            "Loop until the objective is achieved (sandboxed.sh-driven; works with any grok model)"
+                .to_string(),
+        ),
+        path: "builtin-grok".to_string(),
+        params: vec![CommandParam {
+            name: "objective".to_string(),
+            required: true,
+            description: Some("What the agent should keep iterating on until done".to_string()),
+        }],
+    }];
+
+    BuiltinCommandsResponse {
         opencode: opencode_commands,
         claudecode: claudecode_commands,
         codex: codex_commands,
-    })
+        grok: grok_commands,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2051,40 +2084,6 @@ async fn save_claudecode_config_for_profile(
             (
                 StatusCode::OK,
                 "Claude Code config saved successfully".to_string(),
-            )
-        })
-        .map_err(internal_error)
-}
-
-/// GET /api/library/config-profile/:name/ampcode/config - Get Amp Code config for a profile.
-async fn get_ampcode_config_for_profile(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<AmpCodeConfig>, (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .get_ampcode_config_for_profile(&name)
-        .await
-        .map(Json)
-        .map_err(internal_error)
-}
-
-/// PUT /api/library/config-profile/:name/ampcode/config - Save Amp Code config for a profile.
-async fn save_ampcode_config_for_profile(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    Json(config): Json<AmpCodeConfig>,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .save_ampcode_config_for_profile(&name, &config)
-        .await
-        .map(|_| {
-            (
-                StatusCode::OK,
-                "Amp Code config saved successfully".to_string(),
             )
         })
         .map_err(internal_error)

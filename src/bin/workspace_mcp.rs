@@ -1,6 +1,6 @@
 //! MCP Server for core host tools (filesystem + library updates).
 //!
-//! Exposes a minimal set of Open Agent tools to OpenCode via MCP.
+//! Exposes a minimal set of sandboxed.sh tools to OpenCode via MCP.
 //! Communicates over stdio using JSON-RPC 2.0.
 
 use std::collections::HashMap;

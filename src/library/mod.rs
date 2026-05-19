@@ -10,7 +10,6 @@
 //! - Config profiles (`configs/<profile>/`) with harness-specific settings:
 //!   - `.opencode/` - OpenCode settings (settings.json, oh-my-opencode.json)
 //!   - `.claudecode/` - Claude Code settings (settings.json)
-//!   - `.ampcode/` - Amp settings (settings.json)
 //!   - `.sandboxed-sh/` - Sandboxed config (config.json)
 
 pub mod env_crypto;
@@ -610,6 +609,25 @@ impl LibraryStore {
         // Reject names that start with a dot (hidden files)
         if name.starts_with('.') {
             anyhow::bail!("Name cannot start with a dot");
+        }
+
+        Ok(())
+    }
+
+    /// Validate a user-supplied relative file path before joining it to a
+    /// library-owned directory.
+    fn validate_relative_file_path(path: &str) -> Result<()> {
+        let candidate = Path::new(path);
+        if path.is_empty() || candidate.is_absolute() {
+            anyhow::bail!("Invalid file path");
+        }
+
+        for component in candidate.components() {
+            match component {
+                std::path::Component::Normal(part) if !part.is_empty() => {}
+                std::path::Component::CurDir => {}
+                _ => anyhow::bail!("Path traversal not allowed"),
+            }
         }
 
         Ok(())
@@ -1793,7 +1811,7 @@ impl LibraryStore {
     }
 
     /// Get a config profile by name with full content.
-    /// Uses new directory structure: .opencode/, .claudecode/, .ampcode/, .sandboxed-sh/
+    /// Uses new directory structure: .opencode/, .claudecode/, .codex/, .sandboxed-sh/
     pub async fn get_config_profile(&self, name: &str) -> Result<ConfigProfile> {
         Self::validate_name(name)?;
 
@@ -1802,7 +1820,6 @@ impl LibraryStore {
         // New paths (dot-prefixed to mirror harness directories)
         let opencode_settings_path = profile_dir.join(".opencode").join("settings.json");
         let claudecode_settings_path = profile_dir.join(".claudecode").join("settings.json");
-        let ampcode_settings_path = profile_dir.join(".ampcode").join("settings.json");
         let sandboxed_config_path = profile_dir.join(".sandboxed-sh").join("config.json");
 
         // Legacy paths for backward compatibility
@@ -1882,20 +1899,6 @@ impl LibraryStore {
             ClaudeCodeConfig::default()
         };
 
-        // Load Amp Code config (new only)
-        let ampcode_config = if ampcode_settings_path.exists() {
-            let content = fs::read_to_string(&ampcode_settings_path)
-                .await
-                .context("Failed to read ampcode config")?;
-            files.push(ConfigProfileFile {
-                path: ".ampcode/settings.json".to_string(),
-                content: content.clone(),
-            });
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            AmpCodeConfig::default()
-        };
-
         // Load Codex config (TOML-based)
         let codex_config_path = profile_dir.join(".codex").join("config.toml");
         let codex_config = if codex_config_path.exists() {
@@ -1921,13 +1924,12 @@ impl LibraryStore {
             opencode_settings,
             sandboxed_config,
             claudecode_config,
-            ampcode_config,
             codex_config,
         })
     }
 
     /// Save a config profile.
-    /// Uses new directory structure: .opencode/, .claudecode/, .ampcode/, .sandboxed-sh/
+    /// Uses new directory structure: .opencode/, .claudecode/, .codex/, .sandboxed-sh/
     pub async fn save_config_profile(&self, name: &str, profile: &ConfigProfile) -> Result<()> {
         Self::validate_name(name)?;
 
@@ -1937,12 +1939,10 @@ impl LibraryStore {
         let opencode_dir = profile_dir.join(".opencode");
         let sandboxed_dir = profile_dir.join(".sandboxed-sh");
         let claudecode_dir = profile_dir.join(".claudecode");
-        let ampcode_dir = profile_dir.join(".ampcode");
 
         fs::create_dir_all(&opencode_dir).await?;
         fs::create_dir_all(&sandboxed_dir).await?;
         fs::create_dir_all(&claudecode_dir).await?;
-        fs::create_dir_all(&ampcode_dir).await?;
 
         // Save OpenCode settings
         let opencode_content = serde_json::to_string_pretty(&profile.opencode_settings)?;
@@ -1961,12 +1961,6 @@ impl LibraryStore {
         fs::write(claudecode_dir.join("settings.json"), claudecode_content)
             .await
             .context("Failed to write claudecode config")?;
-
-        // Save Amp Code config
-        let ampcode_content = serde_json::to_string_pretty(&profile.ampcode_config)?;
-        fs::write(ampcode_dir.join("settings.json"), ampcode_content)
-            .await
-            .context("Failed to write ampcode config")?;
 
         // Save Codex config (TOML) if present in files list
         let codex_dir = profile_dir.join(".codex");
@@ -2031,7 +2025,6 @@ impl LibraryStore {
                 opencode_settings: base.opencode_settings,
                 sandboxed_config: base.sandboxed_config,
                 claudecode_config: base.claudecode_config,
-                ampcode_config: base.ampcode_config,
                 codex_config: base.codex_config,
             };
             self.save_config_profile(name, &new_profile).await?;
@@ -2047,7 +2040,6 @@ impl LibraryStore {
                 opencode_settings: serde_json::json!({}),
                 sandboxed_config: SandboxedConfig::default(),
                 claudecode_config: ClaudeCodeConfig::default(),
-                ampcode_config: AmpCodeConfig::default(),
                 codex_config: CodexProfileConfig::default(),
             })
         }
@@ -2247,51 +2239,14 @@ impl LibraryStore {
         Ok(())
     }
 
-    /// Get Amp Code config from a specific profile.
-    pub async fn get_ampcode_config_for_profile(&self, profile: &str) -> Result<AmpCodeConfig> {
-        Self::validate_name(profile)?;
-
-        let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
-        let path = profile_dir.join(".ampcode").join("settings.json");
-
-        if !path.exists() {
-            return Ok(AmpCodeConfig::default());
-        }
-
-        let content = fs::read_to_string(&path)
-            .await
-            .context("Failed to read ampcode config")?;
-
-        serde_json::from_str(&content).context("Failed to parse ampcode config")
-    }
-
-    /// Save Amp Code config to a specific profile.
-    pub async fn save_ampcode_config_for_profile(
-        &self,
-        profile: &str,
-        config: &AmpCodeConfig,
-    ) -> Result<()> {
-        Self::validate_name(profile)?;
-
-        let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
-        let ampcode_dir = profile_dir.join(".ampcode");
-
-        fs::create_dir_all(&ampcode_dir).await?;
-
-        let content = serde_json::to_string_pretty(config)?;
-        fs::write(ampcode_dir.join("settings.json"), content)
-            .await
-            .context("Failed to write ampcode config")?;
-
-        Ok(())
-    }
-
     /// Get a specific file from a config profile.
     pub async fn get_config_profile_file(&self, profile: &str, file_path: &str) -> Result<String> {
         Self::validate_name(profile)?;
+        Self::validate_relative_file_path(file_path)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
         let path = profile_dir.join(file_path);
+        self.validate_path_within(&profile_dir, &path)?;
 
         if !path.exists() {
             anyhow::bail!("File not found: {}", file_path);
@@ -2310,9 +2265,11 @@ impl LibraryStore {
         content: &str,
     ) -> Result<()> {
         Self::validate_name(profile)?;
+        Self::validate_relative_file_path(file_path)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
         let path = profile_dir.join(file_path);
+        self.validate_path_within(&profile_dir, &path)?;
 
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
@@ -2329,9 +2286,11 @@ impl LibraryStore {
     /// Delete a specific file from a config profile.
     pub async fn delete_config_profile_file(&self, profile: &str, file_path: &str) -> Result<()> {
         Self::validate_name(profile)?;
+        Self::validate_relative_file_path(file_path)?;
 
         let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
         let path = profile_dir.join(file_path);
+        self.validate_path_within(&profile_dir, &path)?;
 
         if !path.exists() {
             anyhow::bail!("File not found: {}", file_path);
@@ -2404,16 +2363,18 @@ impl LibraryStore {
     /// - opencode/oh-my-opencode.json
     /// - opencode/settings.json
     /// - claudecode/config.json
-    /// - ampcode/config.json
     /// - sandboxed/config.json
     pub async fn get_harness_default_file(&self, harness: &str, file_name: &str) -> Result<String> {
         // Validate harness name
-        let valid_harnesses = ["opencode", "claudecode", "ampcode", "sandboxed"];
+        let valid_harnesses = ["opencode", "claudecode", "codex", "sandboxed"];
         if !valid_harnesses.contains(&harness) {
             anyhow::bail!("Invalid harness: {}", harness);
         }
+        Self::validate_relative_file_path(file_name)?;
 
-        let path = self.path.join(harness).join(file_name);
+        let harness_dir = self.path.join(harness);
+        let path = harness_dir.join(file_name);
+        self.validate_path_within(&harness_dir, &path)?;
 
         if !path.exists() {
             anyhow::bail!("Harness default file not found: {}/{}", harness, file_name);
@@ -2427,7 +2388,7 @@ impl LibraryStore {
     /// List all default files for a harness.
     pub async fn list_harness_default_files(&self, harness: &str) -> Result<Vec<String>> {
         // Validate harness name
-        let valid_harnesses = ["opencode", "claudecode", "ampcode", "sandboxed"];
+        let valid_harnesses = ["opencode", "claudecode", "codex", "sandboxed"];
         if !valid_harnesses.contains(&harness) {
             anyhow::bail!("Invalid harness: {}", harness);
         }
@@ -2461,10 +2422,11 @@ impl LibraryStore {
         content: &str,
     ) -> Result<()> {
         // Validate harness name
-        let valid_harnesses = ["opencode", "claudecode", "ampcode", "sandboxed"];
+        let valid_harnesses = ["opencode", "claudecode", "codex", "sandboxed"];
         if !valid_harnesses.contains(&harness) {
             anyhow::bail!("Invalid harness: {}", harness);
         }
+        Self::validate_relative_file_path(file_name)?;
 
         let harness_dir = self.path.join(harness);
         if !harness_dir.exists() {
@@ -2472,6 +2434,7 @@ impl LibraryStore {
         }
 
         let path = harness_dir.join(file_name);
+        self.validate_path_within(&harness_dir, &path)?;
         fs::write(&path, content)
             .await
             .context("Failed to write harness default file")?;
@@ -2666,6 +2629,19 @@ This is the body."#;
     #[test]
     fn test_validate_name_rejects_empty() {
         assert!(LibraryStore::validate_name("").is_err());
+    }
+
+    #[test]
+    fn test_validate_relative_file_path_rejects_escape() {
+        assert!(LibraryStore::validate_relative_file_path("../config.json").is_err());
+        assert!(LibraryStore::validate_relative_file_path("/etc/passwd").is_err());
+        assert!(LibraryStore::validate_relative_file_path("nested/../../config.json").is_err());
+    }
+
+    #[test]
+    fn test_validate_relative_file_path_allows_profile_paths() {
+        assert!(LibraryStore::validate_relative_file_path(".opencode/settings.json").is_ok());
+        assert!(LibraryStore::validate_relative_file_path(".sandboxed-sh/config.json").is_ok());
     }
 }
 

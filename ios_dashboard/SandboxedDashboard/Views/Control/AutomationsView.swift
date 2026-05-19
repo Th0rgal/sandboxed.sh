@@ -147,6 +147,15 @@ struct AutomationsView: View {
     }
 
     private func setAutomationActive(_ automation: Automation, active: Bool) async {
+        // Flip the toggle instantly so the switch animates in the same
+        // frame the user tapped. On a slow connection the previous
+        // version left the switch in its old position until the network
+        // call returned, making the tap feel ignored.
+        let originalActive = automation.active
+        if let index = automations.firstIndex(where: { $0.id == automation.id }) {
+            automations[index].active = active
+        }
+        HapticService.selectionChanged()
         do {
             _ = try await api.updateAutomation(
                 id: automation.id,
@@ -157,12 +166,13 @@ struct AutomationsView: View {
                     active: active
                 )
             )
-            if let index = automations.firstIndex(where: { $0.id == automation.id }) {
-                automations[index].active = active
-            }
-            HapticService.selectionChanged()
         } catch {
             errorMessage = error.localizedDescription
+            // Roll back so the toggle reflects the server's true state.
+            if let index = automations.firstIndex(where: { $0.id == automation.id }) {
+                automations[index].active = originalActive
+            }
+            HapticService.error()
         }
     }
 
@@ -235,12 +245,23 @@ struct AutomationsView: View {
     }
 
     private func deleteAutomation(_ automation: Automation) async {
+        // Remove the row instantly so the list shrinks in the same frame
+        // as the Delete tap. Re-insert on failure.
+        let originalIndex = automations.firstIndex(where: { $0.id == automation.id })
+        withAnimation {
+            automations.removeAll { $0.id == automation.id }
+        }
         do {
             try await api.deleteAutomation(id: automation.id)
-            automations.removeAll { $0.id == automation.id }
             HapticService.success()
         } catch {
             errorMessage = error.localizedDescription
+            if let idx = originalIndex {
+                withAnimation {
+                    automations.insert(automation, at: min(idx, automations.count))
+                }
+            }
+            HapticService.error()
         }
     }
 }

@@ -1,8 +1,8 @@
-# Open Agent Documentation
+# sandboxed.sh Documentation
 # For AI Agents and LLMs
-# https://openagent.thomas.md
+# https://sandboxed.sh
 
-> Open Agent is a self-hosted cloud orchestrator for AI coding agents (Claude Code & OpenCode).
+> sandboxed.sh is a self-hosted cloud orchestrator for AI coding agents (Claude Code, OpenCode, Codex, Gemini, and Grok).
 > Isolated Linux workspaces, git-backed configuration, remote mission control.
 
 ## How to Access Documentation
@@ -21,7 +21,7 @@ ChatGPT-User, GPTBot, Claude-Web, ClaudeBot, PerplexityBot, Applebot, cohere-ai,
 ## Documentation Index
 
 ### Getting Started
-- /index.md - Overview: what Open Agent is and why
+- /index.md - Overview: what sandboxed.sh is and why
 - /setup.md - Installation guide (AI-assisted and manual)
 - /first-mission.md - Your first 10 minutes after setup
 
@@ -47,11 +47,11 @@ Your Devices (Dashboard, iOS, CLI)
 ┌───────────────────────────┐
 │      Your Server          │
 │  ┌─────────────────────┐  │
-│  │    Open Agent       │  │  ← Orchestration, workspaces, library
+│  │    sandboxed.sh       │  │  ← Orchestration, workspaces, library
 │  └──────────┬──────────┘  │
 │             ▼             │
 │  ┌─────────────────────┐  │
-│  │ Claude Code/OpenCode│  │  ← Model inference, tool execution
+│  │ Claude Code/OpenCode/Codex/Gemini/Grok │  │  ← Model inference, tool execution
 │  └─────────────────────┘  │
 └───────────────────────────┘
 ```
@@ -73,7 +73,7 @@ POST /api/workspaces              # Create workspace
 POST /api/workspaces/:id/exec     # Execute command
 ```
 
-## For AI Agents Deploying Open Agent
+## For AI Agents Deploying sandboxed.sh
 
 1. Ask user for: server IP, domain, SSH access
 2. Read `/api/docs/_all` for complete installation context
@@ -82,6 +82,6 @@ POST /api/workspaces/:id/exec     # Execute command
 
 ## Source
 
-- Repository: https://github.com/Th0rgal/open-agent
-- Library Template: https://github.com/Th0rgal/openagent-library-template
-- Docs: https://openagent.thomas.md
+- Repository: https://github.com/Th0rgal/sandboxed.sh
+- Library Template: https://github.com/Th0rgal/sandboxed-library-template
+- Docs: https://sandboxed.sh

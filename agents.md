@@ -23,9 +23,9 @@
 > Make this part of your pre-commit routine to avoid CI failures.
 
 This document describes how Sandboxed.sh executes missions after the per-workspace
-harness refactor ("ralph" plan). The core change: **OpenCode and Claude Code run
-inside the target workspace**, so native bash and file effects are scoped to the
-correct environment. The host proxy bash tools are no longer required for normal
+harness refactor ("ralph" plan). The core change: **agent harnesses run inside
+the target workspace**, so native bash and file effects are scoped to the correct
+environment. The host proxy bash tools are no longer required for normal
 missions.
 
 ## High-level flow
@@ -75,20 +75,25 @@ execution context:
   (or `/root/.claude/.credentials.json` in containers) to enable token refresh.
 - Built-in `Bash` is **enabled** in the permissions allowlist.
 
-### Amp
+### Codex
 
-- Runs **per workspace** using the Amp CLI.
+- Runs **per workspace** using the Codex CLI/app-server driver.
 - Configuration is written to each workspace:
-  - `AGENTS.md` (general workspace context, like `CLAUDE.md`)
-  - `.agents/skills/<name>/SKILL.md` (native skills with YAML frontmatter)
-  - `settings.json` (MCP servers + permissions)
-- Auth via `AMP_API_KEY` environment variable.
-- Uses `--dangerously-allow-all` for permissive tool access.
-- Modes: `smart` (full capability) or `rush` (faster, cheaper).
+  - `.codex/config.toml` (MCP servers and profile config)
+  - `.codex/skills/<name>/SKILL.md` (native skills with YAML frontmatter)
+- Auth uses OpenAI API keys or Codex/ChatGPT credentials discovered by the
+  backend.
+
+### Gemini and Grok
+
+- Run **per workspace** using their native CLI backends.
+- Reuse the OpenCode-style workspace config path for MCP/tool wiring.
+- Auth is provider-specific: Gemini uses Google credentials/API keys, while Grok
+  uses xAI API keys or the Grok CLI's own login cache.
 
 ## Tool policy
 
-- **Built-in bash is the default** for both OpenCode and Claude Code.
+- **Built-in bash is the default** for OpenCode and Claude Code.
 - Legacy MCP tool namespaces (`workspace_*`, `desktop_*`) are **disabled by
   default** in per-workspace OpenCode configs.
 - Desktop/Playwright tools remain available as optional MCPs when needed.
@@ -121,7 +126,7 @@ Files written per mission workspace:
 - `.claude/settings.local.json` (for Claude Code)
 - `.claude/skills/<name>/SKILL.md` (native Claude Code skills)
 - `CLAUDE.md` (general workspace context)
-- `AGENTS.md` (general workspace context for Amp)
+- `.codex/config.toml` and `.codex/skills/<name>/SKILL.md` (for Codex)
 
 ## Observability
 
@@ -150,8 +155,10 @@ Recommended smoke tests after changes:
    container workspace directory.
 2. **OpenCode (isolated)**: create a file and verify it exists inside the
    container workspace directory.
-3. **Claude Code (host)**: create a file in the host workspace.
-4. **OpenCode (host)**: create a file in the host workspace.
+3. **Codex/Gemini/Grok (isolated)**: create a file and verify it exists inside
+   the container workspace directory.
+4. **Claude Code (host)**: create a file in the host workspace.
+5. **OpenCode (host)**: create a file in the host workspace.
 
 If files appear in the wrong place, the harness is not running inside the
 workspace execution context.

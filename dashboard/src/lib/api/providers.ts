@@ -26,7 +26,6 @@ export type AIProviderType =
   | "zai"
   | "minimax"
   | "github-copilot"
-  | "amp"
   | "custom";
 
 export interface AIProviderTypeInfo {
@@ -103,13 +102,17 @@ export interface BackendProviderResponse {
   configured: boolean;
   provider_type: string | null;
   provider_name: string | null;
+  /** @deprecated raw key no longer returned by this endpoint — always null. */
   api_key: string | null;
+  /** @deprecated raw token no longer returned by this endpoint — always null. */
   oauth: {
     access_token: string;
     refresh_token: string;
     expires_at: number;
   } | null;
   has_credentials: boolean;
+  /** Credential type (`"api_key"` | `"oauth"`) without secret material. */
+  auth_method: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +316,85 @@ export interface ProviderUsage {
 
 export async function getProviderUsage(id: string): Promise<ProviderUsage> {
   return apiGet(`/api/ai/providers/${id}/usage`, "Failed to get provider usage");
+}
+
+/** Force-refresh a single provider's usage data (bypasses the server cache). */
+export async function refreshProviderUsage(id: string): Promise<ProviderUsage> {
+  return apiGet(
+    `/api/ai/providers/${id}/usage?force=true`,
+    "Failed to refresh provider usage"
+  );
+}
+
+/** Bulk usage snapshot for every provider that has cached data on the server. */
+export interface AllProviderUsageResponse {
+  entries: Record<string, ProviderUsage>;
+  refresh_after_seconds: number;
+}
+
+export async function getAllProviderUsage(): Promise<AllProviderUsageResponse> {
+  return apiGet("/api/ai/providers/usage", "Failed to load provider usage");
+}
+
+// ---------------------------------------------------------------------------
+// Aggregated usage summary (across all missions)
+// ---------------------------------------------------------------------------
+
+export type UsageWindow = "24h" | "7d" | "30d" | "all";
+
+export interface ModelUsageSummary {
+  model: string;
+  /** Inferred provider id ("anthropic", "openai", ...). Null if unknown. */
+  provider: string | null;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  cost_cents: number;
+}
+
+export interface DailyUsage {
+  day: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_cents: number;
+}
+
+export interface HourlyUsage {
+  /** `YYYY-MM-DDTHH` (UTC). */
+  hour: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_cents: number;
+}
+
+export interface UsageSummary {
+  window: UsageWindow;
+  since: string | null;
+  totals: {
+    requests: number;
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_tokens: number;
+    cache_read_tokens: number;
+    cost_cents: number;
+  };
+  by_model: ModelUsageSummary[];
+  by_day: DailyUsage[];
+  /** Only populated for windows where hourly granularity is useful (24h, 7d). */
+  by_hour: HourlyUsage[];
+}
+
+export async function getUsageSummary(window: UsageWindow = "all"): Promise<UsageSummary> {
+  return apiGet(
+    `/api/ai/usage/summary?window=${encodeURIComponent(window)}`,
+    "Failed to get usage summary"
+  );
 }
 
 export async function listProviders(options?: { includeAll?: boolean }): Promise<ProvidersResponse> {

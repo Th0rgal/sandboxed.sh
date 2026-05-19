@@ -122,6 +122,34 @@ describe("EnhancedInput composer behavior", () => {
 
     expect(onCanSubmitChange).toHaveBeenLastCalledWith(true);
   });
+
+  it("reports submit availability during the raw input event", async () => {
+    const onCanSubmitChange = vi.fn();
+
+    function ControlledInput() {
+      const [value, setValue] = useState("");
+      return (
+        <EnhancedInput
+          value={value}
+          onChange={setValue}
+          onSubmit={() => {}}
+          onCanSubmitChange={onCanSubmitChange}
+        />
+      );
+    }
+
+    const { container } = render(<ControlledInput />);
+    await Promise.resolve();
+
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+
+    fireEvent.input(textarea as HTMLTextAreaElement, {
+      target: { value: "hello" },
+    });
+
+    expect(onCanSubmitChange).toHaveBeenLastCalledWith(true);
+  });
 });
 
 describe("EnhancedInput command autocomplete backend filtering", () => {

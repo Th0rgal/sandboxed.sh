@@ -1,7 +1,7 @@
 //! Cost calculation from token usage and model pricing.
 //!
 //! This module provides a single source of truth for computing API costs
-//! from token usage across all backends (Claude Code, Amp, OpenCode).
+//! from token usage across all backends (Claude Code, OpenCode).
 
 /// Model pricing in nanodollars per token (1 USD = 1_000_000_000 nanodollars).
 /// Using nanodollars avoids floating-point rounding issues.
@@ -336,7 +336,7 @@ pub fn cost_cents_from_usage(model: &str, usage: &TokenUsage) -> u64 {
 
 /// Resolve cost and provenance from optional actual billing, model name, and
 /// token usage.  This is the canonical function used by all agent backends
-/// (Claude Code, Amp, OpenCode, Codex) to produce the `(cost_cents, CostSource)`
+/// (Claude Code, OpenCode, Codex) to produce the `(cost_cents, CostSource)`
 /// pair stored in mission event metadata.
 ///
 /// Priority:

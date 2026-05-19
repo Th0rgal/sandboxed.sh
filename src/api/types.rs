@@ -243,6 +243,12 @@ pub struct HealthResponse {
     /// Configured library remote URL (from LIBRARY_REMOTE env var)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub library_remote: Option<String>,
+
+    /// Whether "Sign in with GitHub" is configured and offered to clients.
+    /// Requires `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`,
+    /// `GITHUB_OAUTH_ALLOWLIST`, and `JWT_SECRET` to all be set.
+    #[serde(default)]
+    pub github_enabled: bool,
 }
 
 /// Login request for dashboard auth.

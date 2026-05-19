@@ -1,9 +1,7 @@
-//! Types and conversion logic shared between Claude Code and Amp backends.
+//! Types and conversion logic for the Claude Code CLI NDJSON streaming protocol.
 //!
-//! Both CLIs use the same NDJSON streaming protocol. Amp extends it with a few
-//! extra fields (`mcp_servers`, `usage`, `RedactedThinking`, error helpers).
-//! This module defines the superset type that deserializes events from either
-//! backend.
+//! This module defines the event shape consumed by Claude Code-compatible
+//! streaming integrations.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -18,7 +16,7 @@ use super::events::ExecutionEvent;
 
 // ── Process handle ────────────────────────────────────────────────
 
-/// Handle to a running CLI process (Claude Code or Amp).
+/// Handle to a running Claude Code CLI process.
 /// Call `kill()` to terminate the process when cancelling a mission.
 pub struct ProcessHandle {
     child: Arc<Mutex<Option<Child>>>,
@@ -67,7 +65,7 @@ impl ProcessHandle {
 
 // ── NDJSON event types ────────────────────────────────────────────
 
-/// Events emitted by Claude Code / Amp CLIs in stream-json mode.
+/// Events emitted by the Claude Code CLI in stream-json mode.
 ///
 /// The `Unknown` variant acts as a forward-compatibility catch-all: if a future
 /// CLI version introduces a new event type, it will be deserialized as `Unknown`
@@ -201,7 +199,6 @@ pub struct AssistantMessage {
     pub model: Option<String>,
     #[serde(default)]
     pub id: Option<String>,
-    /// Amp extension.
     #[serde(default)]
     pub usage: Option<Usage>,
 }
@@ -239,7 +236,6 @@ pub enum ContentBlock {
     },
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
-    /// Amp extension.
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
 }
@@ -361,10 +357,8 @@ pub struct ResultEvent {
     pub duration_ms: Option<u64>,
     #[serde(default)]
     pub num_turns: Option<u32>,
-    /// Amp extension: separate error field.
     #[serde(default)]
     pub error: Option<String>,
-    /// Amp extension: additional error context.
     #[serde(default)]
     pub message: Option<String>,
     /// Claude Code puts errors in an array field.
@@ -413,7 +407,7 @@ impl ResultEvent {
 
 // ── Event conversion ──────────────────────────────────────────────
 
-/// Convert a CLI event (Claude Code or Amp) to backend-agnostic ExecutionEvents.
+/// Convert a CLI event to backend-agnostic ExecutionEvents.
 pub fn convert_cli_event(
     event: CliEvent,
     pending_tools: &mut HashMap<String, String>,

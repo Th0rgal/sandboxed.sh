@@ -6,13 +6,11 @@ import { cn } from "@/lib/utils";
 import { getValidJwt } from "@/lib/auth";
 import { getRuntimeApiBase } from "@/lib/settings";
 import {
-  Monitor,
   MonitorOff,
   Play,
   Pause,
   RefreshCw,
   X,
-  Settings,
   Maximize2,
   Minimize2,
   PictureInPicture2,
@@ -72,8 +70,10 @@ export function DesktopStream({
   const qualityRef = useRef(initialQuality);
 
   // Keep refs in sync with state
-  fpsRef.current = fps;
-  qualityRef.current = quality;
+  useEffect(() => {
+    fpsRef.current = fps;
+    qualityRef.current = quality;
+  }, [fps, quality]);
 
   // Build WebSocket URL - uses refs to get current values without causing reconnections
   const buildWsUrl = useCallback(() => {
@@ -642,9 +642,11 @@ export function DesktopStream({
 
   // Check PiP support on mount
   useEffect(() => {
-    setIsPipSupported(
-      "pictureInPictureEnabled" in document && document.pictureInPictureEnabled
-    );
+    setTimeout(() => {
+      setIsPipSupported(
+        "pictureInPictureEnabled" in document && document.pictureInPictureEnabled
+      );
+    }, 0);
   }, []);
 
   // Cleanup PiP resources on unmount
@@ -663,8 +665,9 @@ export function DesktopStream({
 
   // Connect on mount
   useEffect(() => {
-    connect();
+    const timeout = window.setTimeout(() => connect(), 0);
     return () => {
+      window.clearTimeout(timeout);
       wsRef.current?.close();
     };
   }, [connect]);
@@ -805,9 +808,8 @@ export function DesktopStream({
             onWheel={handleWheel}
           />
         ) : connectionState === "connecting" ? (
-          <div className="flex flex-col items-center gap-3 text-white/60">
-            <Monitor className="w-12 h-12 animate-pulse" />
-            <span className="text-sm">Connecting to desktop...</span>
+          <div className="h-full w-full p-6">
+            <div className="h-full min-h-[220px] rounded-lg border border-white/[0.04] bg-white/[0.03] animate-pulse" />
           </div>
         ) : (
           <div className="flex flex-col items-center gap-4 text-white/60 px-6 py-8">

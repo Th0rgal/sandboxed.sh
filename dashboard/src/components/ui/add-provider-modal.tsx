@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { X, ExternalLink, Key, Loader, Cpu, Plus, Trash2 } from 'lucide-react';
+import { X, ExternalLink, Key, Loader, Plus, Trash2 } from 'lucide-react';
 import { toast } from '@/components/toast';
 import { cn } from '@/lib/utils';
 import {
@@ -26,8 +26,8 @@ const providerIcons: Record<string, string> = {
   'together-ai': '🤝',
   perplexity: '🔍',
   zai: '⚡',
+  xai: '𝕏',
   minimax: 'M',
-  amp: 'A',
   custom: '🔧',
 };
 
@@ -65,6 +65,16 @@ const getProviderAuthMethods = (providerType: AIProviderType): AIProviderAuthMet
         description: 'Use your Gemini plan/quotas (including free tier) via Google OAuth',
       },
       { label: 'Enter API Key', type: 'api', description: 'Use an existing Google AI API key' },
+    ];
+  }
+  if (providerType === 'xai') {
+    return [
+      {
+        label: 'Grok Build OAuth',
+        type: 'oauth',
+        description: 'Use your grok.com account through Grok Build',
+      },
+      { label: 'Enter API Key', type: 'api', description: 'Use an existing xAI API key' },
     ];
   }
   return [];
@@ -167,8 +177,8 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
       setSelectedBackends(['opencode', 'codex']);
     } else if (providerType === 'google') {
       setSelectedBackends(['opencode', 'gemini']);
-    } else if (providerType === 'amp') {
-      setSelectedBackends(['amp']);
+    } else if (providerType === 'xai') {
+      setSelectedBackends(['opencode', 'grok']);
     } else {
       setSelectedBackends(['opencode']);
     }
@@ -176,7 +186,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     // If provider has OAuth options, show method selection
     if (typeInfo?.uses_oauth && methods.length > 0) {
       setStep('select-method');
-    } else if (providerType === 'anthropic' || providerType === 'openai' || providerType === 'google') {
+    } else if (providerType === 'anthropic' || providerType === 'openai' || providerType === 'google' || providerType === 'xai') {
       // Providers with backend targeting go to backend selection even without OAuth
       setStep('select-backends');
     } else {
@@ -190,13 +200,20 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     setSelectedMethodIndex(methodIndex);
 
     // Providers that support multiple backends should select targeting first.
-    if (selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google') {
+    if (selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google' || selectedProvider === 'xai') {
       // For OpenAI, default backends depend on auth method.
       if (selectedProvider === 'openai') {
         setSelectedBackends(['opencode', 'codex']);
       }
       if (selectedProvider === 'google') {
         setSelectedBackends(['opencode', 'gemini']);
+      }
+      if (selectedProvider === 'xai') {
+        // Match the server's `default_backends_for_provider(ProviderType::Xai)`
+        // (`src/api/ai_providers.rs`) and the provider-level preselect at
+        // line ~181 — both return `["opencode", "grok"]`. Without this the
+        // OAuth-method path silently drops opencode targeting only for xAI.
+        setSelectedBackends(['opencode', 'grok']);
       }
       setStep('select-backends');
       return;
@@ -285,7 +302,8 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
   };
 
   const handleSubmitOAuthCode = async () => {
-    if (!oauthCode.trim() || !selectedProvider || selectedMethodIndex === null) return;
+    if (!selectedProvider || selectedMethodIndex === null) return;
+    if (!oauthCode.trim() && oauthResponse?.method !== 'auto') return;
 
     setLoading(true);
     try {
@@ -294,7 +312,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
         selectedMethodIndex,
         oauthCode,
         // Include backend targeting for supported providers
-        selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google'
+        selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google' || selectedProvider === 'xai'
           ? selectedBackends
           : undefined
       );
@@ -634,6 +652,35 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                     </label>
                   </>
                 )}
+
+                {selectedProvider === 'xai' && (
+                  <>
+                    <label className="flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] hover:bg-white/[0.02] transition-colors cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedBackends.includes('opencode')}
+                        onChange={() => toggleBackend('opencode')}
+                        className="rounded border-white/20 bg-white/[0.02] text-indigo-500 focus:ring-indigo-500/30 cursor-pointer"
+                      />
+                      <div className="flex-1">
+                        <div className="text-sm text-white">OpenCode</div>
+                        <div className="text-xs text-white/40">Use xAI models through OpenCode</div>
+                      </div>
+                    </label>
+                    <label className="flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] hover:bg-white/[0.02] transition-colors cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedBackends.includes('grok')}
+                        onChange={() => toggleBackend('grok')}
+                        className="rounded border-white/20 bg-white/[0.02] text-indigo-500 focus:ring-indigo-500/30 cursor-pointer"
+                      />
+                      <div className="flex-1">
+                        <div className="text-sm text-white">Grok Build</div>
+                        <div className="text-xs text-white/40">Use for Grok Build CLI missions</div>
+                      </div>
+                    </label>
+                  </>
+                )}
               </div>
               <button
                 onClick={handleContinueFromBackends}
@@ -687,9 +734,10 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                 type="text"
                 value={oauthCode}
                 onChange={(e) => setOauthCode(e.target.value)}
-                placeholder="sk-ant-oc01-...#..."
+                placeholder={oauthResponse.method === 'auto' ? 'No code required' : 'sk-ant-oc01-...#...'}
+                disabled={oauthResponse.method === 'auto'}
                 autoFocus
-                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:outline-none focus:border-indigo-500/50 font-mono"
+                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:outline-none focus:border-indigo-500/50 font-mono disabled:opacity-60"
               />
               <div className="flex gap-2">
                 <button
@@ -700,7 +748,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                 </button>
                 <button
                   onClick={handleSubmitOAuthCode}
-                  disabled={loading || !oauthCode.trim()}
+                  disabled={loading || (!oauthCode.trim() && oauthResponse.method !== 'auto')}
                   className="flex-1 rounded-xl bg-indigo-500 px-4 py-3 text-sm font-medium text-white hover:bg-indigo-600 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {loading ? <Loader className="h-4 w-4 animate-spin mx-auto" /> : 'Connect'}

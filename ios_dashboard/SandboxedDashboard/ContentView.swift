@@ -196,9 +196,9 @@ struct SetupSheet: View {
             _ = try await api.checkHealth()
             connectionSuccess = true
             HapticService.success()
-
-            // Brief delay to show success state
-            try? await Task.sleep(for: .milliseconds(500))
+            // No artificial delay before dismissing — the haptic + checkmark
+            // already convey success, and adding 500 ms here just felt slow.
+            // (UX audit item #24.)
             onComplete()
         } catch {
             // Restore original URL on failure

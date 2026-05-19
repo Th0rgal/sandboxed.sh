@@ -210,14 +210,28 @@ struct ChatMessage: Identifiable {
     var toolUI: ToolUIContent?
     var toolData: ToolCallData?
     let timestamp: Date
+    /// True while the optimistic user bubble is awaiting server acknowledgement.
+    /// Cleared as soon as `sendMessage` returns or the SSE roundtrip arrives.
+    /// The bubble renders dimmed with a small spinner while pending so users
+    /// don't re-tap send on slow networks. (UX audit item #11.)
+    var isPending: Bool
 
-    init(id: String = UUID().uuidString, type: ChatMessageType, content: String, toolUI: ToolUIContent? = nil, toolData: ToolCallData? = nil, timestamp: Date = Date()) {
+    init(
+        id: String = UUID().uuidString,
+        type: ChatMessageType,
+        content: String,
+        toolUI: ToolUIContent? = nil,
+        toolData: ToolCallData? = nil,
+        timestamp: Date = Date(),
+        isPending: Bool = false
+    ) {
         self.id = id
         self.type = type
         self.content = content
         self.toolUI = toolUI
         self.toolData = toolData
         self.timestamp = timestamp
+        self.isPending = isPending
     }
     
     var isUser: Bool {

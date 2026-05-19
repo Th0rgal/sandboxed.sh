@@ -1,6 +1,6 @@
 # Installing sandboxed.sh with Docker
 
-Docker is the easiest way to run sandboxed.sh (formerly Open Agent). One command gets you a complete environment with the Rust backend, Next.js dashboard, and all AI harness CLIs pre-installed.
+Docker is the easiest way to run sandboxed.sh (formerly Open Agent). One command gets you a complete environment with the Rust backend, Next.js dashboard, and the primary AI harness CLIs pre-installed.
 
 ## Prerequisites
 
@@ -10,7 +10,7 @@ Docker is the easiest way to run sandboxed.sh (formerly Open Agent). One command
 ## Quick Start
 
 ```bash
-git clone https://github.com/Th0rgal/sandboxed-sh.git
+git clone https://github.com/Th0rgal/sandboxed.sh.git
 cd sandboxed.sh
 cp .env.example .env
 # Edit .env — at minimum, set DASHBOARD_PASSWORD and JWT_SECRET
@@ -100,12 +100,12 @@ To back up your data, use `docker volume inspect` to find the volume paths, or b
 
 The multi-stage build produces a single image with everything pre-installed:
 
-- **Rust backend** — `sandboxed_sh`, `desktop-mcp`, `workspace-mcp` binaries
+- **Rust backend** — `sandboxed-sh`, `desktop-mcp`, `workspace-mcp` binaries
 - **Next.js dashboard** — standalone build served on port 3001 internally
 - **Caddy** — reverse proxy that unifies backend + dashboard on port 80
 - **Claude Code CLI** — installed via npm
 - **OpenCode CLI** — installed from opencode.ai
-- **Amp CLI** — installed via npm
+- **Grok CLI** — installed via npm when available
 - **Bun** and **Node.js 20**
 - **systemd-container + debootstrap** — for container workspace isolation
 - **Desktop automation** — Xvfb, i3, Chromium, xdotool, scrot, ImageMagick, Tesseract OCR

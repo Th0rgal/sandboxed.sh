@@ -572,23 +572,13 @@ fn default_providers_config() -> ProvidersConfig {
                 description: "Grok models via xAI API key".to_string(),
                 models: vec![
                     ProviderModel {
-                        id: "grok-4-fast".to_string(),
-                        name: "Grok 4 Fast".to_string(),
-                        description: Some("Most capable Grok model".to_string()),
+                        id: "grok-4.3".to_string(),
+                        name: "Grok 4.3".to_string(),
+                        description: Some("Current flagship Grok model".to_string()),
                     },
                     ProviderModel {
-                        id: "grok-3".to_string(),
-                        name: "Grok 3".to_string(),
-                        description: Some("Balanced capability and speed".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-3-fast".to_string(),
-                        name: "Grok 3 Fast".to_string(),
-                        description: Some("Fast Grok model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-3-mini".to_string(),
-                        name: "Grok 3 Mini".to_string(),
+                        id: "grok-4.3-latest".to_string(),
+                        name: "Grok 4.3 Latest".to_string(),
                         description: Some("Fast and economical".to_string()),
                     },
                 ],
@@ -1102,7 +1092,7 @@ fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String>
         }
     }
 
-    // 3. Check Open Agent provider config (.sandboxed-sh/ai_providers.json)
+    // 3. Check sandboxed.sh provider config (.sandboxed-sh/ai_providers.json)
     let ai_providers_path = working_dir.join(AI_PROVIDERS_PATH);
     if let Ok(contents) = std::fs::read_to_string(&ai_providers_path) {
         if let Ok(providers) =
@@ -1245,7 +1235,15 @@ pub async fn list_backend_model_options(
     push_options("codex", Some(&["openai"]), false, Some(codex_filter));
     push_options("gemini", Some(&["google"]), false, None);
     push_options("opencode", None, true, None);
-    backends.entry("amp".to_string()).or_default();
+    backends.insert(
+        "grok".to_string(),
+        vec![BackendModelOption {
+            value: "grok-build".to_string(),
+            label: "Grok Build".to_string(),
+            provider_id: Some("xai".to_string()),
+            description: Some("Default Grok Build CLI coding model".to_string()),
+        }],
+    );
 
     let codex_candidates: Vec<String> = backends
         .get("codex")
@@ -1301,11 +1299,6 @@ pub async fn validate_model_override(
     backend: &str,
     model_override: &str,
 ) -> Result<(), String> {
-    // Amp ignores model overrides, so no validation needed
-    if backend == "amp" {
-        return Ok(());
-    }
-
     let working_dir = state.config.working_dir.to_string_lossy().to_string();
     let mut config = load_providers_config(&working_dir);
 
@@ -1468,6 +1461,35 @@ pub async fn validate_model_override(
                         model_override
                     ))
                 }
+            }
+        }
+        "grok" => {
+            let xai = providers.iter().find(|p| p.id == "xai");
+            if let Some(provider) = xai {
+                if provider.models.iter().any(|m| m.id == model_override)
+                    || model_override.starts_with("grok-")
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use format 'grok-*'",
+                        model_override,
+                        provider
+                            .models
+                            .iter()
+                            .map(|m| &m.id)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                }
+            } else if model_override.starts_with("grok-") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.3'), got '{}'",
+                    model_override
+                ))
             }
         }
         _ => {

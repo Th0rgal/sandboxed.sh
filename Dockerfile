@@ -113,9 +113,9 @@ RUN curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path \
     && install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode \
     && echo "[docker] OpenCode CLI installed: $(opencode --version 2>/dev/null || echo 'unknown')" \
     || echo "[docker] WARNING: OpenCode CLI install failed (will be installed on first mission)"
-RUN bun install -g @sourcegraph/amp@latest \
-    && echo "[docker] Amp CLI installed: $(amp --version 2>/dev/null || echo 'unknown')" \
-    || echo "[docker] WARNING: Amp CLI install failed (will be installed on first mission)"
+RUN curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash \
+    && echo "[docker] Grok Build CLI installed: $(grok --version 2>/dev/null || echo 'unknown')" \
+    || echo "[docker] WARNING: Grok Build CLI install failed (will be installed on first mission)"
 
 # -- RTK (CLI output compressor for token savings) --
 RUN RTK_ARCH=$(case "$(uname -m)" in aarch64|arm64) echo "aarch64";; *) echo "x86_64";; esac) \

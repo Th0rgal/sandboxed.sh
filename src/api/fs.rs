@@ -19,6 +19,10 @@ use super::routes::AppState;
 use crate::util::{home_dir, internal_error};
 use crate::workspace::WorkspaceType;
 
+const MAX_CHUNK_UPLOAD_CHUNKS: u32 = 4096;
+const MAX_CHUNK_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_CHUNK_UPLOAD_CHUNK_BYTES: u64 = 128 * 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 struct RuntimeWorkspace {
     working_dir: Option<String>,
@@ -751,6 +755,32 @@ fn sanitize_path_component(s: &str) -> String {
         .to_string()
 }
 
+fn validate_chunk_upload_shape(
+    chunk_index: Option<u32>,
+    total_chunks: u32,
+) -> Result<(), (StatusCode, String)> {
+    if total_chunks == 0 || total_chunks > MAX_CHUNK_UPLOAD_CHUNKS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Invalid total_chunks: must be between 1 and {}",
+                MAX_CHUNK_UPLOAD_CHUNKS
+            ),
+        ));
+    }
+
+    if let Some(index) = chunk_index {
+        if index >= total_chunks {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "chunk_index must be less than total_chunks".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate a URL to prevent SSRF attacks.
 /// Blocks requests to:
 /// - localhost and loopback addresses (127.0.0.0/8, ::1)
@@ -1189,6 +1219,8 @@ pub async fn upload_chunk(
     if q.path.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Invalid path".to_string()));
     }
+    validate_chunk_upload_shape(Some(q.chunk_index), q.total_chunks)?;
+
     // Sanitize upload_id to prevent path traversal attacks
     let safe_upload_id = sanitize_path_component(&q.upload_id);
     if safe_upload_id.is_empty() {
@@ -1215,11 +1247,25 @@ pub async fn upload_chunk(
             .map_err(internal_error)?;
 
         let mut field = field;
+        let mut written: u64 = 0;
         while let Some(chunk) = field
             .chunk()
             .await
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
         {
+            written = written
+                .checked_add(chunk.len() as u64)
+                .ok_or((StatusCode::BAD_REQUEST, "Chunk too large".to_string()))?;
+            if written > MAX_CHUNK_UPLOAD_CHUNK_BYTES {
+                let _ = tokio::fs::remove_file(&chunk_path).await;
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "Chunk too large: limit is {} bytes",
+                        MAX_CHUNK_UPLOAD_CHUNK_BYTES
+                    ),
+                ));
+            }
             f.write_all(&chunk).await.map_err(internal_error)?;
         }
         f.flush().await.map_err(internal_error)?;
@@ -1251,6 +1297,8 @@ pub async fn upload_finalize(
     State(state): State<Arc<AppState>>,
     Json(req): Json<FinalizeUploadRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    validate_chunk_upload_shape(None, req.total_chunks)?;
+
     // If workspace_id is provided, resolve path relative to that workspace
     // If mission_id is also provided, context paths resolve to mission-specific directory
     let (base, workspace_for_display) = if let Some(workspace_id) = req.workspace_id {
@@ -1290,8 +1338,41 @@ pub async fn upload_finalize(
                 )
             })?;
 
+        let mut assembled_bytes: u64 = 0;
         for i in 0..req.total_chunks {
             let chunk_path = chunk_dir.join(format!("chunk_{:06}", i));
+            let chunk_len = tokio::fs::metadata(&chunk_path)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to stat chunk {}: {}", i, e),
+                    )
+                })?
+                .len();
+            if chunk_len > MAX_CHUNK_UPLOAD_CHUNK_BYTES {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "Chunk {} too large: limit is {} bytes",
+                        i, MAX_CHUNK_UPLOAD_CHUNK_BYTES
+                    ),
+                ));
+            }
+            assembled_bytes = assembled_bytes.checked_add(chunk_len).ok_or((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Assembled upload too large".to_string(),
+            ))?;
+            if assembled_bytes > MAX_CHUNK_UPLOAD_BYTES {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "Assembled upload too large: limit is {} bytes",
+                        MAX_CHUNK_UPLOAD_BYTES
+                    ),
+                ));
+            }
+
             let chunk_data = tokio::fs::read(&chunk_path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1372,12 +1453,24 @@ pub async fn download_from_url(
     // Validate URL to prevent SSRF attacks
     validate_url_for_ssrf(&req.url).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-    // Download to temp file
+    // Download to temp file. Follow up to 5 redirects, but re-validate each
+    // hop's URL with the same SSRF rules so a public redirect cannot bounce us
+    // to an internal host. Many file hosts (GitHub releases, CDNs) rely on
+    // redirects, so disabling them outright breaks common downloads.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300)) // 5 min timeout
-        // Do not follow redirects automatically. A redirected request to an
-        // internal host would already be an SSRF before post-response validation.
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            // `previous()` lists hops already followed, so the Nth attempt has
+            // N-1 entries. Using `> 5` allows the 5 hops promised by the
+            // comment above; `>= 5` would cap at 4.
+            if attempt.previous().len() > 5 {
+                return attempt.error("too many redirects");
+            }
+            if let Err(e) = validate_url_for_ssrf(attempt.url().as_str()) {
+                return attempt.error(format!("redirect blocked: {}", e));
+            }
+            attempt.follow()
+        }))
         .build()
         .map_err(|e| {
             (
@@ -1517,6 +1610,7 @@ mod tests {
     use super::{
         api_context_root_for_config, context_mirror_suffix, context_upload_suffix_for_dir,
         is_context_upload_path_for_dir, path_is_under_allowed_roots, sanitize_path_component,
+        validate_chunk_upload_shape, MAX_CHUNK_UPLOAD_CHUNKS,
     };
     use crate::config::Config;
     use std::path::{Path, PathBuf};
@@ -1596,6 +1690,15 @@ mod tests {
             "secret.txt"
         );
         assert_eq!(sanitize_path_component("..hidden\0.txt"), "hidden.txt");
+    }
+
+    #[test]
+    fn validate_chunk_upload_shape_rejects_invalid_counts() {
+        assert!(validate_chunk_upload_shape(Some(0), 0).is_err());
+        assert!(validate_chunk_upload_shape(Some(MAX_CHUNK_UPLOAD_CHUNKS), 1).is_err());
+        assert!(validate_chunk_upload_shape(None, MAX_CHUNK_UPLOAD_CHUNKS + 1).is_err());
+        assert!(validate_chunk_upload_shape(Some(0), 1).is_ok());
+        assert!(validate_chunk_upload_shape(Some(15), 16).is_ok());
     }
 
     #[test]

@@ -24,17 +24,17 @@ struct HistoryView: View {
     enum StatusFilter: String, CaseIterable {
         case all = "All"
         case active = "Active"
-        case interrupted = "Interrupted"
+        case needsYou = "Needs You"
         case completed = "Completed"
         case failed = "Failed"
-        
+
         var missionStatuses: [MissionStatus]? {
             switch self {
             case .all: return nil
             case .active: return [.pending, .active]
-            case .interrupted: return [.interrupted, .blocked, .unknown]
-            case .completed: return [.completed]
-            case .failed: return [.failed, .notFeasible]
+            case .needsYou: return [.awaitingUser]
+            case .completed: return [.completed, .acknowledged]
+            case .failed: return [.failed, .notFeasible, .interrupted, .blocked, .unknown]
             }
         }
     }
@@ -129,7 +129,17 @@ struct HistoryView: View {
                 // Content with floating cleanup button
                 ZStack(alignment: .bottomTrailing) {
                     if isLoading {
-                        LoadingView(message: "Loading history...")
+                        // Skeleton card scaffold — keeps the screen sized
+                        // while the list loads so we don't flash a centered
+                        // spinner. (UX audit item #29.)
+                        ScrollView {
+                            LazyVStack(spacing: 12) {
+                                ForEach(0..<6, id: \.self) { _ in
+                                    ShimmerMissionRow()
+                                }
+                            }
+                            .padding()
+                        }
                     } else if let error = errorMessage {
                         EmptyStateView(
                             icon: "exclamationmark.triangle",
@@ -279,15 +289,25 @@ struct HistoryView: View {
     }
 
     private func deleteMission(_ mission: Mission) async {
+        // Optimistic remove BEFORE the network call so the row slides out
+        // on the same frame as the swipe-to-delete gesture even on a slow
+        // connection. On failure we re-insert the mission so the UI
+        // reflects the server's actual state.
+        let removalIndex = missions.firstIndex(where: { $0.id == mission.id })
+        withAnimation {
+            missions.removeAll { $0.id == mission.id }
+        }
         do {
             _ = try await api.deleteMission(id: mission.id)
-            withAnimation {
-                missions.removeAll { $0.id == mission.id }
-            }
             HapticService.success()
         } catch {
             HapticService.error()
             errorMessage = "Failed to delete mission: \(error.localizedDescription)"
+            if let idx = removalIndex {
+                withAnimation {
+                    missions.insert(mission, at: min(idx, missions.count))
+                }
+            }
         }
     }
 
@@ -373,41 +393,64 @@ private struct FilterPill: View {
 
 private struct MissionRow: View {
     let mission: Mission
-    
+
     private var backendColor: Color {
-        switch mission.backend {
-        case "opencode": return Theme.success
-        case "claudecode": return Theme.accent
-        case "amp": return .orange
-        default: return Theme.accent
-        }
+        BackendAgentService.color(for: mission.backend)
     }
-    
+
     private var backendIcon: String {
-        switch mission.backend {
-        case "opencode": return "terminal"
-        case "claudecode": return "brain"
-        case "amp": return "bolt.fill"
-        default: return "target"
+        BackendAgentService.icon(for: mission.backend)
+    }
+
+    /// True when the mission lives under "Finished" (any terminal status)
+    /// AND the user has already opened it at least once. Drives the small
+    /// notification dot rendered next to the title, mirroring the web
+    /// dashboard's behaviour.
+    private var showOpenedDot: Bool {
+        guard mission.firstViewedAt != nil else { return false }
+        switch mission.status {
+        case .completed, .acknowledged, .failed, .interrupted, .blocked, .notFeasible:
+            return true
+        default:
+            return false
         }
     }
-    
+
     var body: some View {
         HStack(spacing: 14) {
-            // Icon based on backend
-            Image(systemName: mission.canResume ? "play.circle" : backendIcon)
+            // Leading tile always identifies the backend (codex / claudecode
+            // / opencode / gemini / grok). Previously this slot painted a
+            // yellow `play.circle` when `mission.canResume == true` to flag
+            // resumability — but `canResume` now also covers `awaiting_user`
+            // and `acknowledged` (added with the Needs You refactor), so
+            // *every* Needs You row went yellow regardless of backend while
+            // sibling rows in other columns kept their cyan/indigo/green
+            // backend tile. The StatusBadge directly below the title
+            // already conveys the "Needs You" / "Interrupted" / "Blocked"
+            // state in the right color, so the leading-tile override was
+            // redundant and visually inconsistent across buckets.
+            Image(systemName: backendIcon)
                 .font(.title3)
-                .foregroundStyle(mission.canResume ? Theme.warning : backendColor)
+                .foregroundStyle(backendColor)
                 .frame(width: 40, height: 40)
-                .background((mission.canResume ? Theme.warning : backendColor).opacity(0.15))
+                .background(backendColor.opacity(0.15))
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            
+
             // Content
             VStack(alignment: .leading, spacing: 4) {
-                Text(mission.displayTitle)
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(Theme.textPrimary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(mission.displayTitle)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(Theme.textPrimary)
+                        .lineLimit(1)
+
+                    if showOpenedDot {
+                        Circle()
+                            .fill(Theme.textMuted)
+                            .frame(width: 6, height: 6)
+                            .accessibilityLabel("Opened")
+                    }
+                }
                 
                 HStack(spacing: 6) {
                     StatusBadge(status: mission.status.statusType, compact: true)

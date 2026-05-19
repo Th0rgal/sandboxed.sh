@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import {
@@ -11,6 +11,8 @@ import {
   authenticateAIProvider,
   setDefaultAIProvider,
   getProviderUsage,
+  refreshProviderUsage,
+  getAllProviderUsage,
   AIProvider,
   AIProviderTypeInfo,
   ProviderUsage,
@@ -24,13 +26,14 @@ import {
   Loader,
   Key,
   BarChart3,
-  ChevronDown,
   ChevronUp,
   RefreshCw,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AddProviderModal } from '@/components/ui/add-provider-modal';
 import { AsyncButton } from '@/components/ui/async-button';
+import { UsageOverview } from '@/components/ui/usage-overview';
+import type { UsageWindow } from '@/lib/api';
 
 const providerConfig: Record<string, { color: string; icon: string }> = {
   anthropic: { color: 'bg-orange-500/10 text-orange-400', icon: '🧠' },
@@ -50,7 +53,6 @@ const providerConfig: Record<string, { color: string; icon: string }> = {
   'together-ai': { color: 'bg-orange-500/10 text-orange-400', icon: '🤝' },
   perplexity: { color: 'bg-cyan-500/10 text-cyan-400', icon: '🔍' },
   cohere: { color: 'bg-rose-500/10 text-rose-400', icon: '💬' },
-  amp: { color: 'bg-violet-500/10 text-violet-400', icon: 'A' },
   custom: { color: 'bg-white/10 text-white/60', icon: '🔧' },
 };
 
@@ -65,11 +67,10 @@ const defaultProviderTypes: AIProviderTypeInfo[] = [
   { id: 'open-router', name: 'OpenRouter', uses_oauth: false, env_var: 'OPENROUTER_API_KEY' },
   { id: 'groq', name: 'Groq', uses_oauth: false, env_var: 'GROQ_API_KEY' },
   { id: 'mistral', name: 'Mistral AI', uses_oauth: false, env_var: 'MISTRAL_API_KEY' },
-  { id: 'xai', name: 'xAI', uses_oauth: false, env_var: 'XAI_API_KEY' },
+  { id: 'xai', name: 'xAI', uses_oauth: true, env_var: 'XAI_API_KEY' },
   { id: 'zai', name: 'Z.AI', uses_oauth: false, env_var: 'ZHIPU_API_KEY' },
   { id: 'minimax', name: 'Minimax', uses_oauth: false, env_var: 'MINIMAX_API_KEY' },
   { id: 'github-copilot', name: 'GitHub Copilot', uses_oauth: true, env_var: null },
-  { id: 'amp', name: 'Amp', uses_oauth: false, env_var: 'AMP_API_KEY' },
 ];
 
 /** Format a number with commas */
@@ -316,6 +317,7 @@ export default function ProvidersPage() {
   const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
   const [usageData, setUsageData] = useState<Record<string, ProviderUsage>>({});
   const [usageLoading, setUsageLoading] = useState<Record<string, boolean>>({});
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>('7d');
   const [editForm, setEditForm] = useState<{
     name?: string;
     label?: string;
@@ -337,10 +339,34 @@ export default function ProvidersPage() {
     { revalidateOnFocus: false, fallbackData: defaultProviderTypes }
   );
 
-  const fetchUsage = useCallback(async (providerId: string) => {
+  // Pull the entire bulk cache so the rate-limit panel is instant the moment
+  // the user expands a provider. Refreshes itself on a slow tick — the server
+  // already refreshes in the background, so we just need to read the snapshot.
+  const { data: bulkUsage } = useSWR(
+    'ai-providers-usage-bulk',
+    getAllProviderUsage,
+    { revalidateOnFocus: false, refreshInterval: 60_000 }
+  );
+
+  // Merge the bulk snapshot into local usage state — only for providers we
+  // haven't already fetched fresh (or that have errored) so an explicit
+  // refresh doesn't get overwritten by the cache.
+  const cachedEntries = bulkUsage?.entries;
+  const cachedSeen = useMemo(() => {
+    if (!cachedEntries) return {};
+    const next: Record<string, ProviderUsage> = {};
+    for (const [k, v] of Object.entries(cachedEntries)) {
+      next[k] = v;
+    }
+    return next;
+  }, [cachedEntries]);
+
+  const fetchUsage = useCallback(async (providerId: string, force = false) => {
     setUsageLoading((prev) => ({ ...prev, [providerId]: true }));
     try {
-      const data = await getProviderUsage(providerId);
+      const data = force
+        ? await refreshProviderUsage(providerId)
+        : await getProviderUsage(providerId);
       setUsageData((prev) => ({ ...prev, [providerId]: data }));
     } catch {
       setUsageData((prev) => ({
@@ -362,11 +388,16 @@ export default function ProvidersPage() {
         setExpandedProvider(null);
       } else {
         setExpandedProvider(providerId);
-        // Fetch fresh usage when expanding
+        // Seed from the bulk cache immediately for an instant render…
+        if (!usageData[providerId] && cachedSeen[providerId]) {
+          setUsageData((prev) => ({ ...prev, [providerId]: cachedSeen[providerId] }));
+        }
+        // …then fetch via the cached endpoint (cheap, server returns cached
+        // copy if fresh).
         fetchUsage(providerId);
       }
     },
-    [expandedProvider, fetchUsage]
+    [expandedProvider, fetchUsage, usageData, cachedSeen]
   );
 
   const handleAuthenticate = async (provider: AIProvider) => {
@@ -469,15 +500,19 @@ export default function ProvidersPage() {
         providerTypes={providerTypes}
       />
 
-      <div className="w-full max-w-xl">
-        <div className="mb-8">
+      <div className="w-full max-w-4xl">
+        <div className="mb-6">
           <h1 className="text-xl font-semibold text-white">AI Providers</h1>
           <p className="mt-1 text-sm text-white/50">
             Manage API keys and authentication
           </p>
         </div>
 
-        <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+        <div className="mb-6">
+          <UsageOverview window={usageWindow} onWindowChange={setUsageWindow} />
+        </div>
+
+        <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 max-w-xl mx-auto">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-3">
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-violet-500/10">
@@ -644,6 +679,8 @@ export default function ProvidersPage() {
                                     ? 'Codex'
                                     : backend === 'gemini'
                                     ? 'Gemini'
+                                    : backend === 'grok'
+                                    ? 'Grok'
                                     : backend}
                                 </span>
                               ))}
@@ -717,7 +754,7 @@ export default function ProvidersPage() {
                             <div className="flex items-center justify-between pt-2 pb-1">
                               <span className="text-[11px] text-white/30 uppercase tracking-wider">Usage & Limits</span>
                               <button
-                                onClick={() => fetchUsage(provider.id)}
+                                onClick={() => fetchUsage(provider.id, true)}
                                 disabled={usageLoading[provider.id]}
                                 className="p-1 rounded text-white/20 hover:text-white/50 transition-colors cursor-pointer disabled:opacity-50"
                                 title="Refresh"

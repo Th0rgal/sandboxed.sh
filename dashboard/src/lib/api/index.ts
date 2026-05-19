@@ -115,6 +115,15 @@ export {
   listBackendModelOptions,
   type ProviderUsage,
   getProviderUsage,
+  type UsageWindow,
+  type ModelUsageSummary,
+  type DailyUsage,
+  type HourlyUsage,
+  type UsageSummary,
+  getUsageSummary,
+  refreshProviderUsage,
+  type AllProviderUsageResponse,
+  getAllProviderUsage,
 } from "./providers";
 
 // Model Routing

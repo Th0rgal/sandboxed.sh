@@ -30,11 +30,22 @@ Validates:
 - queued-message behavior
 - assistant model metadata (with optional per-backend expectations)
 
+For transcript-first loading changes, run this against the dev deployment and
+then inspect the created mission with `/api/control/missions/:id/transcript`,
+`/trace`, and `/events`: transcript should contain only user/final assistant
+messages, trace should contain hidden thinking/tool activity, and `/events`
+should remain backward-compatible.
+
 ### install_desktop.sh
 Installs desktop automation dependencies on the host (used by the desktop MCP).
 
 ### generate_ios_icons.js
 Generates iOS app icons for the SwiftUI dashboard.
+
+### setup_android_release_secrets.sh
+Generates an Android release signing keystore, stores a local backup under
+`android_dashboard/keys/`, and uploads the matching GitHub Actions secrets with
+`gh secret set`.
 
 ### validate_skill_isolation.sh
 Validates strong workspace skill isolation on the server (checks OpenCode env, global skill dirs, and latest mission skills).
