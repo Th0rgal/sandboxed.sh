@@ -6501,7 +6501,7 @@ async fn get_provider_usage(
 // layer so the dashboard sees fresh-but-instant data:
 //   * `get_provider_usage_cached` (GET /api/ai/providers/:id/usage) returns
 //     the cached value immediately when fresh, otherwise re-fetches live and
-//     repopulates the cache. Pass `?force=1` to bypass the freshness check.
+//     repopulates the cache. Pass `?force=true` to bypass the freshness check.
 //   * `list_all_provider_usage` (GET /api/ai/providers/usage) returns the full
 //     cache snapshot and spawns background refresh tasks for any stale entries
 //     so subsequent reads land on fresh data.
@@ -6539,7 +6539,7 @@ async fn get_provider_usage_cached(
             let is_fresh = cached.is_fresh();
             let is_stale = cached.is_stale();
             let fetched_at_iso = cached.fetched_at_iso.clone();
-            if is_fresh || q.cached_only {
+            if is_fresh || !is_stale || q.cached_only {
                 let mut value = cached.value;
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("cached".to_string(), serde_json::json!(true));

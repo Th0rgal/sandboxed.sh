@@ -269,6 +269,7 @@ function CostAreaChart({
     () => points.reduce((m, p) => Math.max(m, p.cost_cents), 0),
     [points]
   );
+  const rangeLabel = windowKey === 'all' ? 'All' : windowKey;
 
   // Internal SVG coordinates; preserveAspectRatio="none" stretches them.
   const W = 600;
@@ -348,8 +349,7 @@ function CostAreaChart({
           <span>Cost over time</span>
         </div>
         <div className="font-mono text-[11px] text-white/40 tabular-nums">
-          {formatCents(totalCost)} · {points.length}
-          {granularity === 'hour' ? 'h' : 'd'}
+          {formatCents(totalCost)} · {rangeLabel}
         </div>
       </div>
 
