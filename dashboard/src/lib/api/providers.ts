@@ -321,7 +321,7 @@ export async function getProviderUsage(id: string): Promise<ProviderUsage> {
 /** Force-refresh a single provider's usage data (bypasses the server cache). */
 export async function refreshProviderUsage(id: string): Promise<ProviderUsage> {
   return apiGet(
-    `/api/ai/providers/${id}/usage?force=1`,
+    `/api/ai/providers/${id}/usage?force=true`,
     "Failed to refresh provider usage"
   );
 }

@@ -167,6 +167,8 @@ function CostSparkline({
     () => series.reduce((s, d) => s + d.cost_cents, 0),
     [series]
   );
+  const rangeLabel =
+    windowKey === '24h' ? '24h' : windowKey === 'all' ? 'All' : `${series.length}d`;
 
   // Show day labels every ~5 bars (plus first + last)
   const labelStep = Math.max(1, Math.floor(series.length / 6));
@@ -182,7 +184,7 @@ function CostSparkline({
           <span>Cost over time</span>
         </div>
         <div className="font-mono text-[11px] text-white/40 tabular-nums">
-          {formatCents(totalCost)} · {series.length}d
+          {formatCents(totalCost)} · {rangeLabel}
         </div>
       </div>
 
