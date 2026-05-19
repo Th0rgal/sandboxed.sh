@@ -131,6 +131,10 @@ pub struct AppState {
     pub telegram_bridge: super::telegram::SharedTelegramBridge,
     /// FIDO signing relay hub (pending approval requests)
     pub fido_hub: Arc<super::fido::FidoSigningHub>,
+    /// In-process control-plane metrics (P0-#3). Tracks SSE chunk sizes,
+    /// /events + /running req rates, broadcast events per mission. Read
+    /// via `GET /api/control/metrics`.
+    pub control_metrics: Arc<super::control_metrics::ControlMetrics>,
 }
 
 /// Start the HTTP server.
@@ -486,6 +490,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         deferred_requests,
         telegram_bridge,
         fido_hub: Arc::new(super::fido::FidoSigningHub::new()),
+        control_metrics: Arc::new(super::control_metrics::ControlMetrics::new()),
     });
 
     // Initialize the metadata LLM client for AI-powered mission titles/descriptions
@@ -865,6 +870,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/parallel/config",
             get(control::get_parallel_config),
         )
+        // P0-#3: in-process metrics for perf validation.
+        .route("/api/control/metrics", get(control::get_control_metrics))
         // Memory endpoints
         .route("/api/runs", get(list_runs))
         .route("/api/runs/:id", get(get_run))

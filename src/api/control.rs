@@ -4605,6 +4605,7 @@ pub async fn get_mission_events(
     Path(mission_id): Path<Uuid>,
     axum::extract::Query(query): axum::extract::Query<GetEventsQuery>,
 ) -> Result<Response, (StatusCode, String)> {
+    state.control_metrics.record_events_request();
     let control = control_for_user(&state, &user).await;
 
     // Check mission exists
@@ -4844,6 +4845,7 @@ pub async fn get_mission_trace(
     Path(mission_id): Path<Uuid>,
     axum::extract::Query(query): axum::extract::Query<GetEventsQuery>,
 ) -> Result<Response, (StatusCode, String)> {
+    state.control_metrics.record_events_request();
     let control = control_for_user(&state, &user).await;
     let mission = control
         .mission_store
@@ -4960,9 +4962,18 @@ pub async fn list_running_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<super::mission_runner::RunningMissionInfo>>, (StatusCode, String)> {
+    state.control_metrics.record_running_request();
     let control = control_for_user(&state, &user).await;
     let running = get_running_missions(&control).await?;
     Ok(Json(running))
+}
+
+/// P0-#3: in-process metrics snapshot for perf validation.
+pub async fn get_control_metrics(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+) -> Json<super::control_metrics::MetricsSnapshot> {
+    Json(state.control_metrics.snapshot())
 }
 
 /// Request body for starting a mission in parallel.
@@ -5196,6 +5207,10 @@ pub async fn stream(
         username: user.username.clone(),
     };
 
+    // Clone the metrics Arc into the stream closure so we can record
+    // each delivered chunk + per-mission broadcast count (P0-#3).
+    let metrics = state.control_metrics.clone();
+
     let stream = async_stream::stream! {
         let _guard = drop_guard;
         match Event::default().event("status").json_data(AgentEvent::Status {
@@ -5261,8 +5276,19 @@ pub async fn stream(
                                     );
                                 }
                             }
-                            match Event::default().event(ev.event_name()).json_data(&ev) {
-                                Ok(sse) => yield Ok(sse),
+                            // Serialize once so we can both ship the SSE
+                            // frame and record an accurate byte count for
+                            // the metrics endpoint (P0-#3). The payload
+                            // size approximates the on-the-wire chunk
+                            // length closely enough for p50/p99 use.
+                            match serde_json::to_string(&ev) {
+                                Ok(payload) => {
+                                    metrics.record_sse_chunk(payload.len());
+                                    metrics.record_broadcast(mission_id);
+                                    yield Ok(Event::default()
+                                        .event(ev.event_name())
+                                        .data(payload));
+                                }
                                 Err(e) => {
                                     tracing::error!(
                                         stream_id = %stream_id,
