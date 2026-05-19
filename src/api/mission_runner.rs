@@ -12724,11 +12724,15 @@ pub async fn run_opencode_turn(
     result
 }
 
-fn grok_event_text(value: &serde_json::Value) -> Option<String> {
-    if value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
+fn grok_event_is_reasoning_type(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
         let lower = t.to_ascii_lowercase();
         lower == "reasoning" || lower == "thinking" || lower == "reasoning_delta"
-    }) {
+    })
+}
+
+fn grok_event_text(value: &serde_json::Value) -> Option<String> {
+    if grok_event_is_reasoning_type(value) {
         return None;
     }
 
@@ -12798,6 +12802,8 @@ fn grok_event_text(value: &serde_json::Value) -> Option<String> {
 /// CLI version bump doesn't accidentally show user-visible noise as
 /// reasoning.
 fn grok_event_reasoning(value: &serde_json::Value) -> Option<String> {
+    let is_reasoning_type = grok_event_is_reasoning_type(value);
+
     if let Some(delta) = value.get("delta") {
         for key in ["reasoning_content", "reasoning", "thinking"] {
             if let Some(text) = delta.get(key).and_then(|v| v.as_str()) {
@@ -12806,12 +12812,18 @@ fn grok_event_reasoning(value: &serde_json::Value) -> Option<String> {
                 }
             }
         }
+        if is_reasoning_type {
+            for key in ["text", "content"] {
+                if let Some(text) = delta.get(key).and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        }
     }
 
-    if value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
-        let lower = t.to_ascii_lowercase();
-        lower == "reasoning" || lower == "thinking" || lower == "reasoning_delta"
-    }) {
+    if is_reasoning_type {
         for key in ["data", "text", "content", "reasoning"] {
             if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
                 if !text.is_empty() {
@@ -12991,7 +13003,7 @@ pub async fn run_grok_turn(
     let stderr = child.stderr.take();
     let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
     let stderr_capture_clone = stderr_capture.clone();
-    let stderr_handle = stderr.map(|stderr| {
+    let mut stderr_handle = stderr.map(|stderr| {
         tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
@@ -13023,16 +13035,17 @@ pub async fn run_grok_turn(
     let mut reasoning_delta_coalescer = TextDeltaCoalescer::new();
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
+    let mut cancelled = false;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 let _ = child.kill().await;
-                if let Some(handle) = stderr_handle {
+                if let Some(handle) = stderr_handle.take() {
                     handle.abort();
                 }
-                return AgentResult::failure("Cancelled".to_string(), 0)
-                    .with_terminal_reason(TerminalReason::Cancelled);
+                cancelled = true;
+                break;
             }
             line_result = lines.next_line() => {
                 match line_result {
@@ -13182,10 +13195,18 @@ pub async fn run_grok_turn(
     }
     let _ = last_reasoning_len;
 
+    let cancel_marker = if cancelled {
+        Some(cancel_or_shutdown_failure())
+    } else {
+        None
+    };
+
     if final_result.trim().is_empty() {
         let stderr_content = stderr_capture.lock().await;
         if let Some(reasoning) = reasoning_for_fallback {
             final_result = reasoning;
+        } else if let Some(marker) = cancel_marker.as_ref() {
+            final_result = marker.output.clone();
         } else if !stderr_content.trim().is_empty() {
             final_result = format!(
                 "Grok Build error: {}",
@@ -13205,6 +13226,9 @@ pub async fn run_grok_turn(
     let success = exit_status.map(|status| status.success()).unwrap_or(false) && !had_error;
     let mut result = if success {
         AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::TurnComplete)
+    } else if let Some(marker) = cancel_marker {
+        AgentResult::failure(final_result, 0)
+            .with_terminal_reason(marker.terminal_reason.unwrap_or(TerminalReason::Cancelled))
     } else {
         AgentResult::failure(final_result, 0).with_terminal_reason(TerminalReason::LlmError)
     };
@@ -14893,6 +14917,22 @@ mod tests {
         let event = json!({
             "type": "reasoning",
             "content": "private reasoning"
+        });
+
+        assert_eq!(
+            grok_event_reasoning(&event).as_deref(),
+            Some("private reasoning")
+        );
+        assert_eq!(grok_event_text(&event), None);
+    }
+
+    #[test]
+    fn grok_reasoning_delta_text_is_reasoning_not_answer_text() {
+        let event = json!({
+            "type": "reasoning_delta",
+            "delta": {
+                "text": "private reasoning"
+            }
         });
 
         assert_eq!(
