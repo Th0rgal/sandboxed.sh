@@ -204,6 +204,47 @@ fn translate_to_container_display_path(
     }
 }
 
+fn upload_display_path(
+    config_working_dir: &Path,
+    remote_path: &Path,
+    workspace: Option<&crate::workspace::Workspace>,
+    mission_id: Option<uuid::Uuid>,
+    requested_path: &str,
+) -> PathBuf {
+    let Some(workspace) = workspace else {
+        return remote_path.to_path_buf();
+    };
+
+    if workspace.workspace_type == WorkspaceType::Container
+        && is_context_upload_path(requested_path)
+    {
+        if let Some(mission_id) = mission_id {
+            let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "context".to_string());
+            let context_root = configured_context_root(config_working_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| configured_context_root(config_working_dir));
+            let mission_context = context_root.join(mission_id.to_string());
+            let container_context_root = PathBuf::from("/root").join(&context_dir_name);
+
+            if let Some(suffix) = context_mirror_suffix(
+                remote_path,
+                &mission_context,
+                &container_context_root,
+                mission_id,
+            ) {
+                return container_context_root
+                    .join(mission_id.to_string())
+                    .join(suffix);
+            }
+        }
+    }
+
+    translate_to_container_display_path(remote_path, workspace)
+}
+
 fn is_context_upload_path(path: &str) -> bool {
     let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
         .ok()
@@ -1181,12 +1222,14 @@ pub async fn upload(
         )
         .await;
 
-        // For container workspaces, return the container-internal path so the
-        // [Uploaded: ...] tag points to a path the agent can actually access.
-        let display_path = match &workspace_for_display {
-            Some(ws) => translate_to_container_display_path(&remote_path, ws),
-            None => remote_path,
-        };
+        // Return a path that the agent can access from its execution context.
+        let display_path = upload_display_path(
+            &state.config.working_dir,
+            &remote_path,
+            workspace_for_display.as_ref(),
+            q.mission_id,
+            &q.path,
+        );
 
         return Ok(Json(serde_json::json!({
             "ok": true,
@@ -1424,10 +1467,13 @@ pub async fn upload_finalize(
     )
     .await;
 
-    let display_path = match &workspace_for_display {
-        Some(ws) => translate_to_container_display_path(&remote_path, ws),
-        None => remote_path,
-    };
+    let display_path = upload_display_path(
+        &state.config.working_dir,
+        &remote_path,
+        workspace_for_display.as_ref(),
+        req.mission_id,
+        &req.path,
+    );
 
     Ok(Json(
         serde_json::json!({ "ok": true, "path": display_path, "name": safe_file_name }),
@@ -1596,7 +1642,13 @@ pub async fn download_from_url(
     .await;
 
     let display_path = match &workspace_for_display {
-        Some(ws) => translate_to_container_display_path(&remote_path, ws),
+        Some(ws) => upload_display_path(
+            &state.config.working_dir,
+            &remote_path,
+            Some(ws),
+            req.mission_id,
+            &req.path,
+        ),
         None => remote_path,
     };
 
@@ -1610,9 +1662,10 @@ mod tests {
     use super::{
         api_context_root_for_config, context_mirror_suffix, context_upload_suffix_for_dir,
         is_context_upload_path_for_dir, path_is_under_allowed_roots, sanitize_path_component,
-        validate_chunk_upload_shape, MAX_CHUNK_UPLOAD_CHUNKS,
+        upload_display_path, validate_chunk_upload_shape, MAX_CHUNK_UPLOAD_CHUNKS,
     };
     use crate::config::Config;
+    use crate::workspace::Workspace;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
@@ -1754,5 +1807,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(suffix, PathBuf::from("papers/Toward.pdf"));
+    }
+
+    #[test]
+    fn upload_display_path_returns_container_context_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::parse_str("95e6bd13-0963-4b19-a485-c2c3f59aeb02").unwrap();
+        let remote_path = temp
+            .path()
+            .join("context")
+            .join(mission_id.to_string())
+            .join("keel-compressed.jpg");
+        let workspace = Workspace::new_container("test".to_string(), temp.path().join("container"));
+
+        let display = upload_display_path(
+            temp.path(),
+            &remote_path,
+            Some(&workspace),
+            Some(mission_id),
+            "./context/",
+        );
+
+        assert_eq!(
+            display,
+            PathBuf::from("/root/context")
+                .join(mission_id.to_string())
+                .join("keel-compressed.jpg")
+        );
     }
 }

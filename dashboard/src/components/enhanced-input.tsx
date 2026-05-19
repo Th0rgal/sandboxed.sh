@@ -121,6 +121,7 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
   // (e.g., clearing after submit, inserting upload notes).
   const [value, setValueState] = useState(externalValue);
   const lastExternalValueRef = useRef(externalValue);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
 
   // Sync external → internal only when the parent pushes a genuinely new value
   useEffect(() => {
@@ -643,6 +644,38 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
     return () => textarea.removeEventListener("paste", handlePaste);
   }, [onFilePaste]);
 
+  const getFileDropContext = useCallback((): FilePasteContext => {
+    const textarea = textareaRef.current;
+    return {
+      selectionStart: textarea?.selectionStart ?? displayValue.length,
+      selectionEnd: textarea?.selectionEnd ?? displayValue.length,
+    };
+  }, [displayValue.length]);
+
+  const handleDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!onFilePaste) return;
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setIsDraggingFiles(true);
+  }, [onFilePaste]);
+
+  const handleDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setIsDraggingFiles(false);
+    }
+  }, []);
+
+  const handleDrop = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!onFilePaste) return;
+    const files = Array.from(event.dataTransfer.files || []);
+    if (files.length === 0) return;
+    event.preventDefault();
+    setIsDraggingFiles(false);
+    onFilePaste(files, getFileDropContext());
+    textareaRef.current?.focus();
+  }, [getFileDropContext, onFilePaste]);
+
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newValue = e.target.value;
     const currentValue = lockedAgent ? displayValue : value;
@@ -709,8 +742,12 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
   return (
     <div className="relative flex-1">
       <div
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
         className={cn(
           "flex items-center gap-2 w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 transition-[border-color] duration-150 ease-out focus-within:border-indigo-500/50",
+          isDraggingFiles && "border-indigo-400/70 bg-indigo-500/10",
           className
         )}
         style={{ minHeight: "46px" }}

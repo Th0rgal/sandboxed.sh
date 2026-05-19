@@ -82,7 +82,6 @@ import {
   getCurrentMission,
   uploadFile,
   uploadFileChunked,
-  downloadFromUrl,
   formatBytes,
   getProgress,
   getRunningMissions,
@@ -138,7 +137,6 @@ import {
   RefreshCw,
   RotateCcw,
   PlayCircle,
-  Link2,
   ListPlus,
   X,
   Wrench,
@@ -1829,14 +1827,25 @@ function ThinkingPanel({
     return items
       .filter((item) => {
         const trimmed = item.content.trim();
-        if (!trimmed) return false;
         if (!item.done) return true;
+        if (!trimmed) return false;
         if (seenDoneContent.has(trimmed)) return false;
         seenDoneContent.add(trimmed);
         return true;
       })
       .map((item) => ({ item }));
   }, [items]);
+  const thoughtsAnchorKey = useMemo(
+    () =>
+      panelRows
+        .slice(-8)
+        .map(
+          ({ item }) =>
+            `${item.id}:${item.done ? "done" : "active"}:${item.content.length}`,
+        )
+        .join("|"),
+    [panelRows],
+  );
   const thoughtsVirtualizer = useVirtualizer({
     count: panelRows.length,
     getScrollElement: () => scrollRef.current,
@@ -1859,12 +1868,7 @@ function ThinkingPanel({
     scrollElementRef: scrollRef,
     virtualizer: thoughtsVirtualizer,
     itemCount: panelRows.length,
-    changeKey: panelRows
-      .map(
-        ({ item }) =>
-          `${item.id}:${item.done ? "done" : "active"}:${item.content.length}`,
-      )
-      .join("|"),
+    changeKey: thoughtsAnchorKey,
     resetKey: missionId ?? null,
   });
 
@@ -3896,9 +3900,6 @@ export default function ControlClient() {
     fileName: string;
     progress: UploadProgress;
   } | null>(null);
-  const [showUrlInput, setShowUrlInput] = useState(false);
-  const [urlInput, setUrlInput] = useState("");
-  const [urlDownloading, setUrlDownloading] = useState(false);
 
   // Server configuration (fetched from health endpoint)
   const [maxIterations, setMaxIterations] = useState<number>(50); // Default fallback
@@ -4374,28 +4375,35 @@ export default function ControlClient() {
     },
     overscan: 8,
   });
+  const chatAnchorKey = useMemo(
+    () =>
+      groupedItems
+        .slice(-8)
+        .map((item) => {
+          const key = getGroupedItemKey(item);
+          if (item.kind === "thinking_group") {
+            const tailThoughts = item.thoughts.slice(-4);
+            return `${key}:${item.thoughts.length}:${tailThoughts.map((thought) => `${thought.id}:${thought.done ? "done" : "active"}:${thought.content.length}`).join(",")}`;
+          }
+          if (item.kind === "tool_group") {
+            return `${key}:${item.tools.length}`;
+          }
+          if (item.kind === "thinking" || item.kind === "stream") {
+            return `${key}:${item.done ? "done" : "active"}:${item.content.length}`;
+          }
+          if (item.kind === "assistant" || item.kind === "user") {
+            return `${key}:${item.content.length}`;
+          }
+          return key;
+        })
+        .join("|"),
+    [groupedItems],
+  );
   const { isAtBottom, scrollToBottom } = useVirtualTimelineAnchor({
     scrollElementRef: containerRef,
     virtualizer: chatVirtualizer,
     itemCount: groupedItems.length,
-    changeKey: groupedItems
-      .map((item) => {
-        const key = getGroupedItemKey(item);
-        if (item.kind === "thinking_group") {
-          return `${key}:${item.thoughts.map((thought) => `${thought.id}:${thought.done ? "done" : "active"}:${thought.content.length}`).join(",")}`;
-        }
-        if (item.kind === "tool_group") {
-          return `${key}:${item.tools.length}`;
-        }
-        if (item.kind === "thinking" || item.kind === "stream") {
-          return `${key}:${item.done ? "done" : "active"}:${item.content.length}`;
-        }
-        if (item.kind === "assistant" || item.kind === "user") {
-          return `${key}:${item.content.length}`;
-        }
-        return key;
-      })
-      .join("|"),
+    changeKey: chatAnchorKey,
     resetKey: viewingMissionId,
   });
 
@@ -4854,44 +4862,6 @@ export default function ControlClient() {
     },
     [compressImageFile, currentMission, viewingMission],
   );
-
-  // Handle URL download
-  const handleUrlDownload = useCallback(async () => {
-    if (!urlInput.trim()) return;
-
-    setUrlDownloading(true);
-    try {
-      const contextPath = "./context/";
-
-      // Get workspace_id and mission_id from current or viewing mission
-      const mission = viewingMission ?? currentMission;
-      const workspaceId = mission?.workspace_id;
-      const missionId = mission?.id;
-
-      const result = await downloadFromUrl(
-        urlInput.trim(),
-        contextPath,
-        undefined,
-        workspaceId,
-        missionId,
-      );
-      toast.success(`Downloaded ${result.name}`);
-
-      // Add a message about the download at the beginning (use full path)
-      setInput((prev) => {
-        const downloadNote = `[Downloaded: ${result.path}]`;
-        return prev ? `${downloadNote}\n${prev}` : downloadNote;
-      });
-
-      setUrlInput("");
-      setShowUrlInput(false);
-    } catch (error) {
-      console.error("URL download failed:", error);
-      toast.error(`Failed to download from URL`);
-    } finally {
-      setUrlDownloading(false);
-    }
-  }, [urlInput, currentMission, viewingMission]);
 
   // Handle file input change
   const handleFileChange = async (
@@ -10422,60 +10392,6 @@ export default function ControlClient() {
                 </div>
               )}
 
-              {/* URL Input */}
-              {showUrlInput && (
-                <div className="mx-auto max-w-3xl mb-3">
-                  <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-                    <Link2 className="h-4 w-4 text-white/40 shrink-0" />
-                    <input
-                      type="url"
-                      value={urlInput}
-                      onChange={(e) => setUrlInput(e.target.value)}
-                      placeholder="Paste URL to download (Dropbox, Google Drive, direct link...)"
-                      className="flex-1 bg-transparent text-sm text-white placeholder:text-white/30 focus:outline-none"
-                      autoFocus
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          e.preventDefault();
-                          handleUrlDownload();
-                        } else if (e.key === "Escape") {
-                          setShowUrlInput(false);
-                          setUrlInput("");
-                        }
-                      }}
-                    />
-                    {urlDownloading ? (
-                      <Loader className="h-4 w-4 animate-spin text-indigo-400" />
-                    ) : (
-                      <>
-                        <button
-                          type="button"
-                          onClick={handleUrlDownload}
-                          disabled={!urlInput.trim()}
-                          className="text-sm text-indigo-400 hover:text-indigo-300 disabled:text-white/20 disabled:cursor-not-allowed"
-                        >
-                          Download
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShowUrlInput(false);
-                            setUrlInput("");
-                          }}
-                          className="text-white/40 hover:text-white/70"
-                        >
-                          <X className="h-4 w-4" />
-                        </button>
-                      </>
-                    )}
-                  </div>
-                  <p className="text-xs text-white/30 mt-1.5 px-1">
-                    Server will download the file directly — faster for large
-                    files
-                  </p>
-                </div>
-              )}
-
               {/* Show resume buttons for interrupted/blocked missions, otherwise show normal input */}
               {/* Both are always rendered to prevent unmounting the input (which loses typed text) */}
               {showResumeUI && (
@@ -10529,24 +10445,14 @@ export default function ControlClient() {
                   onSubmit={(e) => e.preventDefault()}
                   className="flex gap-3 items-end"
                 >
-                  <div className="flex gap-1">
-                    <button
-                      type="button"
-                      onClick={() => fileInputRef.current?.click()}
-                      className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
-                      title="Attach files"
-                    >
-                      <Paperclip className="h-5 w-5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setShowUrlInput(!showUrlInput)}
-                      className={`p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0 ${showUrlInput ? "text-indigo-400 border-indigo-500/30" : ""}`}
-                      title="Download from URL"
-                    >
-                      <Link2 className="h-5 w-5" />
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
+                    title="Attach files"
+                  >
+                    <Paperclip className="h-5 w-5" />
+                  </button>
 
                   <EnhancedInput
                     ref={enhancedInputRef}

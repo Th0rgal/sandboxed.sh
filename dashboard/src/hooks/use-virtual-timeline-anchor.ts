@@ -31,6 +31,37 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
   const isAtBottomRef = useRef(true);
   const rafRef = useRef<number | null>(null);
 
+  const cancelPendingScroll = useCallback(() => {
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+  }, []);
+
+  const scheduleBottomCorrection = useCallback(
+    (targetIndex: number, behavior?: ScrollBehavior) => {
+      cancelPendingScroll();
+      rafRef.current = requestAnimationFrame(() => {
+        virtualizer.scrollToIndex(targetIndex, {
+          align: "end",
+          behavior,
+        });
+        rafRef.current = requestAnimationFrame(() => {
+          rafRef.current = null;
+          virtualizer.scrollToIndex(targetIndex, {
+            align: "end",
+            behavior,
+          });
+          const el = scrollElementRef.current;
+          if (el) {
+            el.scrollTop = el.scrollHeight;
+          }
+        });
+      });
+    },
+    [cancelPendingScroll, scrollElementRef, virtualizer],
+  );
+
   const updateAnchorFromScroll = useCallback(() => {
     const el = scrollElementRef.current;
     if (!el) return;
@@ -50,18 +81,9 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
         align: "end",
         behavior,
       });
-      requestAnimationFrame(() => {
-        virtualizer.scrollToIndex(itemCount - 1, {
-          align: "end",
-          behavior,
-        });
-        const el = scrollElementRef.current;
-        if (el) {
-          el.scrollTop = el.scrollHeight;
-        }
-      });
+      scheduleBottomCorrection(itemCount - 1, behavior);
     },
-    [itemCount, scrollElementRef, virtualizer],
+    [itemCount, scheduleBottomCorrection, virtualizer],
   );
 
   useEffect(() => {
@@ -76,19 +98,9 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
     isAtBottomRef.current = true;
     setIsAtBottom(true);
     if (itemCount > 0) {
-      rafRef.current = requestAnimationFrame(() => {
-        virtualizer.scrollToIndex(itemCount - 1, {
-          align: "end",
-          behavior: "instant",
-        });
-      });
+      scheduleBottomCorrection(itemCount - 1, "instant");
     }
-    return () => {
-      if (rafRef.current !== null) {
-        cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
-      }
-    };
+    return cancelPendingScroll;
     // Reset only when the timeline identity changes; ordinary item changes
     // are handled by the anchor-preserving layout effect below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -98,32 +110,11 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
     if (!isAtBottomRef.current) {
       return;
     }
-    if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
+    if (itemCount <= 0) return;
+    scheduleBottomCorrection(itemCount - 1);
 
-    rafRef.current = requestAnimationFrame(() => {
-      rafRef.current = null;
-      if (itemCount <= 0) return;
-
-      virtualizer.scrollToIndex(itemCount - 1, { align: "end" });
-      requestAnimationFrame(() => {
-        virtualizer.scrollToIndex(itemCount - 1, { align: "end" });
-        const el = scrollElementRef.current;
-        if (el) {
-          el.scrollTop = el.scrollHeight;
-        }
-      });
-    });
-
-    return () => {
-      if (rafRef.current !== null) {
-        cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
-      }
-    };
-  }, [changeKey, itemCount, scrollElementRef, virtualizer]);
+    return cancelPendingScroll;
+  }, [cancelPendingScroll, changeKey, itemCount, scheduleBottomCorrection]);
 
   return {
     isAtBottom,
