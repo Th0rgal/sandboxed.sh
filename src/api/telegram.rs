@@ -9,14 +9,16 @@
 //! 3. The webhook handler routes the message as `ControlCommand::UserMessage`
 //! 4. A response task streams `TextDelta` events back via `editMessageText`
 
-use crate::api::control::{AgentEvent, ControlCommand};
+use crate::api::control::{AgentEvent, ControlCommand, MissionStatus};
 use crate::api::mission_store::{
-    now_string, MissionMode, MissionStore, TelegramActionExecution, TelegramActionExecutionKind,
-    TelegramActionExecutionStatus, TelegramChannel, TelegramChatMission, TelegramConversation,
-    TelegramConversationMessage, TelegramConversationMessageDirection, TelegramScheduledMessage,
+    now_string, Mission, MissionMode, MissionStore, StoredEvent, TelegramActionExecution,
+    TelegramActionExecutionKind, TelegramActionExecutionStatus, TelegramAlert,
+    TelegramAlertPreference, TelegramChannel, TelegramChatMission, TelegramConversation,
+    TelegramConversationMessage, TelegramConversationMessageDirection,
+    TelegramMissionInterestLevel, TelegramMissionSubscription, TelegramScheduledMessage,
     TelegramScheduledMessageStatus, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
-    TelegramStructuredMemoryScope, TelegramTriggerMode, TelegramWorkflow, TelegramWorkflowEvent,
-    TelegramWorkflowKind, TelegramWorkflowStatus,
+    TelegramStructuredMemoryScope, TelegramTriggerMode, TelegramUser, TelegramUserRole,
+    TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use reqwest::Client;
@@ -62,6 +64,8 @@ struct TelegramReplyRecord {
 const TELEGRAM_UPDATE_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
 const TELEGRAM_REPLY_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
 const TELEGRAM_SCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const DEFAULT_PALOMA_OWNER_TELEGRAM_ID: i64 = 1_139_694_048;
+const DEFAULT_PALOMA_TRUSTED_FRIEND_TELEGRAM_ID: i64 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TelegramActionKind {
@@ -147,6 +151,681 @@ fn workflow_requires_direct_reply(workflow: &TelegramWorkflow) -> bool {
         workflow.target_chat_type.as_deref(),
         Some("group") | Some("supergroup")
     )
+}
+
+fn configured_telegram_id(env_name: &str, default_value: i64) -> Option<i64> {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .or_else(|| (default_value != 0).then_some(default_value))
+}
+
+fn paloma_role_for_user(user_id: i64) -> TelegramUserRole {
+    if configured_telegram_id("PALOMA_TELEGRAM_OWNER_ID", DEFAULT_PALOMA_OWNER_TELEGRAM_ID)
+        == Some(user_id)
+    {
+        TelegramUserRole::Owner
+    } else if configured_telegram_id(
+        "PALOMA_TELEGRAM_TRUSTED_FRIEND_ID",
+        DEFAULT_PALOMA_TRUSTED_FRIEND_TELEGRAM_ID,
+    ) == Some(user_id)
+    {
+        TelegramUserRole::TrustedFriend
+    } else {
+        TelegramUserRole::Observer
+    }
+}
+
+fn telegram_display_name(user: &User) -> String {
+    match user.last_name.as_deref() {
+        Some(last) if !last.is_empty() => format!("{} {}", user.first_name, last),
+        _ => user.first_name.clone(),
+    }
+}
+
+async fn remember_paloma_user(ctx: &ChannelContext, msg: &Message) -> Option<TelegramUser> {
+    let from = msg.from.as_ref()?;
+    let now = now_string();
+    let user = TelegramUser {
+        id: Uuid::new_v4(),
+        telegram_user_id: from.id,
+        username: from.username.clone(),
+        display_name: Some(telegram_display_name(from)),
+        role: paloma_role_for_user(from.id),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    match ctx.mission_store.upsert_telegram_user(user.clone()).await {
+        Ok(user) => Some(user),
+        Err(err) => {
+            tracing::warn!("Failed to upsert Telegram user role: {}", err);
+            Some(user)
+        }
+    }
+}
+
+fn is_owner_dm(user: Option<&TelegramUser>, msg: &Message) -> bool {
+    msg.chat.chat_type == "private"
+        && user
+            .map(|u| u.role == TelegramUserRole::Owner)
+            .unwrap_or(false)
+}
+
+fn is_paloma_command(text: &str, name: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed == name || trimmed.starts_with(&format!("{name} "))
+}
+
+fn redact_for_telegram(text: &str) -> String {
+    let token_re = regex::Regex::new(
+        r#"(?i)(bot[0-9]{6,}:[A-Za-z0-9_-]{20,}|[A-Za-z0-9_]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|api[_-]?hash\s*[:=]\s*[A-Za-z0-9]{16,}|token\s*[:=]\s*\S+|secret\s*[:=]\s*\S+)"#,
+    )
+    .expect("telegram redaction regex must compile");
+    let path_re = regex::Regex::new(r#"(/(?:root|home|workspaces|tmp)/[^\s,)]+)"#)
+        .expect("telegram path redaction regex must compile");
+    let redacted = token_re.replace_all(text, "[redacted]");
+    path_re
+        .replace_all(&redacted, "[path redacted]")
+        .to_string()
+}
+
+fn mission_label(mission: &Mission) -> String {
+    mission
+        .title
+        .as_deref()
+        .or(mission.short_description.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Untitled mission")
+        .chars()
+        .take(80)
+        .collect()
+}
+
+fn event_summary_line(mission: &Mission, event: &StoredEvent) -> Option<String> {
+    let title = mission_label(mission);
+    match event.event_type.as_str() {
+        "mission_status_changed" => {
+            let status = event
+                .metadata
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("updated");
+            Some(format!("{} is now {}.", title, status))
+        }
+        "assistant_message" => {
+            if event.content.trim().is_empty() {
+                None
+            } else {
+                let text = redact_for_telegram(event.content.trim());
+                let first = text.lines().next().unwrap_or("").trim();
+                if first.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "{} replied: {}",
+                        title,
+                        first.chars().take(140).collect::<String>()
+                    ))
+                }
+            }
+        }
+        "error" => Some(format!("{} reported an error.", title)),
+        "tool_call" => event
+            .tool_name
+            .as_deref()
+            .map(|tool| format!("{} used {}.", title, tool)),
+        _ => None,
+    }
+}
+
+fn mission_rank(mission: &Mission, interest: TelegramMissionInterestLevel) -> i32 {
+    let mut score = match interest {
+        TelegramMissionInterestLevel::High => 100,
+        TelegramMissionInterestLevel::Normal => 20,
+        TelegramMissionInterestLevel::Muted => -100,
+    };
+    score += match mission.status {
+        MissionStatus::Blocked | MissionStatus::Failed => 60,
+        MissionStatus::AwaitingUser => 50,
+        MissionStatus::Active => 40,
+        MissionStatus::Pending => 25,
+        MissionStatus::Interrupted => 20,
+        MissionStatus::Acknowledged | MissionStatus::Completed | MissionStatus::NotFeasible => 0,
+    };
+    if mission.parent_mission_id.is_none() {
+        score += 5;
+    }
+    score
+}
+
+async fn build_paloma_status(
+    ctx: &ChannelContext,
+    telegram_user_id: i64,
+) -> Result<(String, String), String> {
+    let cursor = ctx
+        .mission_store
+        .get_or_create_telegram_user_cursor(telegram_user_id)
+        .await?;
+    let since = cursor
+        .last_dashboard_seen_at
+        .as_deref()
+        .or(cursor.last_status_at.as_deref())
+        .map(|value| value.to_string());
+    let missions = ctx.mission_store.list_missions(80, 0).await?;
+    let mut lines = Vec::new();
+    let mut max_sequences = serde_json::Map::new();
+
+    for mission in &missions {
+        let events = ctx
+            .mission_store
+            .get_events(mission.id, None, Some(200), None)
+            .await
+            .unwrap_or_default();
+        if let Some(max) = events.iter().map(|event| event.sequence).max() {
+            max_sequences.insert(mission.id.to_string(), serde_json::json!(max));
+        }
+        for event in events {
+            if let Some(since) = since.as_deref() {
+                if event.timestamp.as_str() <= since {
+                    continue;
+                }
+            }
+            if let Some(line) = event_summary_line(mission, &event) {
+                lines.push(line);
+            }
+            if lines.len() >= 8 {
+                break;
+            }
+        }
+        if lines.len() >= 8 {
+            break;
+        }
+    }
+
+    let body = if lines.is_empty() {
+        match since {
+            Some(_) => "No meaningful changes since your last status check.".to_string(),
+            None => "No meaningful mission changes found yet.".to_string(),
+        }
+    } else {
+        let mut body = format!(
+            "{} meaningful change{} since you last checked.",
+            lines.len(),
+            if lines.len() == 1 { "" } else { "s" }
+        );
+        for (idx, line) in lines.into_iter().enumerate() {
+            body.push_str(&format!("\n\n{}. {}", idx + 1, line));
+        }
+        redact_for_telegram(&body)
+    };
+
+    Ok((body, serde_json::Value::Object(max_sequences).to_string()))
+}
+
+async fn build_paloma_missions(
+    ctx: &ChannelContext,
+    telegram_user_id: i64,
+) -> Result<String, String> {
+    let subscriptions = ctx
+        .mission_store
+        .list_telegram_mission_subscriptions(telegram_user_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|sub| (sub.mission_id, sub.interest_level))
+        .collect::<HashMap<_, _>>();
+    let mut missions = ctx.mission_store.list_missions(50, 0).await?;
+    missions.sort_by_key(|mission| {
+        let interest = subscriptions
+            .get(&mission.id)
+            .copied()
+            .unwrap_or(TelegramMissionInterestLevel::Normal);
+        -mission_rank(mission, interest)
+    });
+
+    let mut high = Vec::new();
+    let mut other_count = 0usize;
+    for mission in missions {
+        let interest = subscriptions
+            .get(&mission.id)
+            .copied()
+            .unwrap_or(TelegramMissionInterestLevel::Normal);
+        if interest == TelegramMissionInterestLevel::Muted {
+            continue;
+        }
+        let line = format!("- {}: {}", mission_label(&mission), mission.status);
+        if high.len() < 8 && mission_rank(&mission, interest) >= 40 {
+            high.push(line);
+        } else {
+            other_count += 1;
+        }
+    }
+
+    let mut body = "Active missions".to_string();
+    if high.is_empty() {
+        body.push_str("\n\nNo high-interest active missions.");
+    } else {
+        body.push_str("\n\nHigh interest");
+        for line in high {
+            body.push('\n');
+            body.push_str(&line);
+        }
+    }
+    if other_count > 0 {
+        body.push_str(&format!(
+            "\n\nOther\n- {} lower-priority mission{}",
+            other_count,
+            if other_count == 1 { "" } else { "s" }
+        ));
+    }
+    Ok(redact_for_telegram(&body))
+}
+
+fn parse_paloma_selector_and_payload<'a>(
+    text: &'a str,
+    command: &str,
+) -> Option<(&'a str, &'a str)> {
+    let tail = text.trim().strip_prefix(command)?.trim();
+    let (selector, payload) = tail.split_once(char::is_whitespace)?;
+    let payload = payload.trim();
+    if selector.trim().is_empty() || payload.is_empty() {
+        None
+    } else {
+        Some((selector.trim(), payload))
+    }
+}
+
+fn feedback_mutes_alerts(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    normalized.contains("don't tell me about this again")
+        || normalized.contains("dont tell me about this again")
+        || normalized.contains("mute this")
+        || normalized.contains("stop alerting me about this")
+}
+
+fn feedback_raises_interest(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    normalized.contains("tell me more about this")
+        || normalized.contains("keep me posted")
+        || normalized.contains("mark this high")
+}
+
+fn paloma_command_error_response(err: &str) -> &str {
+    if err.starts_with("Usage:") {
+        err
+    } else {
+        "I couldn't read mission status right now."
+    }
+}
+
+async fn select_paloma_mission(ctx: &ChannelContext, selector: &str) -> Result<Mission, String> {
+    let selector = selector.trim();
+    let missions = ctx.mission_store.list_missions(80, 0).await?;
+    if selector.eq_ignore_ascii_case("latest") || selector.eq_ignore_ascii_case("current") {
+        return missions
+            .into_iter()
+            .next()
+            .ok_or_else(|| "No missions are available.".to_string());
+    }
+    if let Ok(id) = Uuid::parse_str(selector) {
+        return ctx
+            .mission_store
+            .get_mission(id)
+            .await?
+            .ok_or_else(|| format!("Mission {} was not found.", id));
+    }
+
+    let needle = selector.to_ascii_lowercase();
+    missions
+        .into_iter()
+        .find(|mission| {
+            mission_label(mission)
+                .to_ascii_lowercase()
+                .contains(&needle)
+        })
+        .ok_or_else(|| format!("No mission matched '{}'.", selector))
+}
+
+async fn latest_interesting_mission(ctx: &ChannelContext) -> Result<Mission, String> {
+    let mut missions = ctx.mission_store.list_missions(80, 0).await?;
+    missions.sort_by_key(|mission| -mission_rank(mission, TelegramMissionInterestLevel::Normal));
+    missions
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No missions are available.".to_string())
+}
+
+async fn build_paloma_summary(
+    ctx: &ChannelContext,
+    selector: Option<&str>,
+) -> Result<String, String> {
+    let mission = match selector.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(selector) => select_paloma_mission(ctx, selector).await?,
+        None => latest_interesting_mission(ctx).await?,
+    };
+    let events = ctx
+        .mission_store
+        .get_events(mission.id, None, Some(80), None)
+        .await
+        .unwrap_or_default();
+    let mut lines = Vec::new();
+    for event in events.into_iter().rev() {
+        if let Some(line) = event_summary_line(&mission, &event) {
+            lines.push(line);
+        }
+        if lines.len() >= 4 {
+            break;
+        }
+    }
+
+    let mut body = format!("{}: {}", mission_label(&mission), mission.status);
+    if lines.is_empty() {
+        body.push_str("\n\nNo concise recent summary is available yet.");
+    } else {
+        for line in lines {
+            body.push_str("\n- ");
+            body.push_str(&line);
+        }
+    }
+    Ok(redact_for_telegram(&body))
+}
+
+async fn send_paloma_mission_message(
+    ctx: &ChannelContext,
+    selector: &str,
+    payload: &str,
+) -> Result<String, String> {
+    let mission = select_paloma_mission(ctx, selector).await?;
+    let (queued_tx, _queued_rx) = tokio::sync::oneshot::channel();
+    ctx.cmd_tx
+        .send(ControlCommand::UserMessage {
+            id: Uuid::new_v4(),
+            content: payload.to_string(),
+            agent: None,
+            target_mission_id: Some(mission.id),
+            respond: queued_tx,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Sent to {}.", mission_label(&mission)))
+}
+
+async fn apply_paloma_interest_feedback(
+    ctx: &ChannelContext,
+    user: &TelegramUser,
+    msg: &Message,
+    level: TelegramMissionInterestLevel,
+    rule_text: &str,
+) -> Result<String, String> {
+    let mission = latest_interesting_mission(ctx).await?;
+    let now = now_string();
+    let subscription = TelegramMissionSubscription {
+        id: Uuid::new_v4(),
+        telegram_user_id: user.telegram_user_id,
+        mission_id: mission.id,
+        interest_level: level,
+        reason: Some(rule_text.to_string()),
+        expires_at: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    ctx.mission_store
+        .upsert_telegram_mission_subscription(subscription)
+        .await?;
+    let _ = ctx
+        .mission_store
+        .create_telegram_alert_preference(TelegramAlertPreference {
+            id: Uuid::new_v4(),
+            telegram_user_id: user.telegram_user_id,
+            scope: "mission".to_string(),
+            scope_value: Some(mission.id.to_string()),
+            rule_text: rule_text.to_string(),
+            enabled: true,
+            created_from_message_id: Some(msg.message_id),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .await;
+    let response = match level {
+        TelegramMissionInterestLevel::Muted => {
+            format!(
+                "Noted. I muted routine alerts for {}.",
+                mission_label(&mission)
+            )
+        }
+        TelegramMissionInterestLevel::High => {
+            format!(
+                "Noted. I will prioritize updates for {}.",
+                mission_label(&mission)
+            )
+        }
+        TelegramMissionInterestLevel::Normal => {
+            format!(
+                "Noted. I reset {} to normal interest.",
+                mission_label(&mission)
+            )
+        }
+    };
+    Ok(redact_for_telegram(&response))
+}
+
+fn paloma_alert_kind_for_status(status: MissionStatus) -> Option<&'static str> {
+    match status {
+        MissionStatus::Completed => Some("mission_completed"),
+        MissionStatus::Failed => Some("mission_failed"),
+        MissionStatus::Blocked => Some("mission_blocked"),
+        MissionStatus::Interrupted => Some("mission_interrupted"),
+        _ => None,
+    }
+}
+
+async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
+    let Some(owner_id) =
+        configured_telegram_id("PALOMA_TELEGRAM_OWNER_ID", DEFAULT_PALOMA_OWNER_TELEGRAM_ID)
+    else {
+        return;
+    };
+    let subscriptions = ctx
+        .mission_store
+        .list_telegram_mission_subscriptions(owner_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|sub| (sub.mission_id, sub.interest_level))
+        .collect::<HashMap<_, _>>();
+    let missions = match ctx.mission_store.list_missions(80, 0).await {
+        Ok(missions) => missions,
+        Err(err) => {
+            tracing::warn!("Failed to load missions for Telegram alerts: {}", err);
+            return;
+        }
+    };
+
+    for mission in missions {
+        let Some(kind) = paloma_alert_kind_for_status(mission.status) else {
+            continue;
+        };
+        if subscriptions
+            .get(&mission.id)
+            .is_some_and(|level| *level == TelegramMissionInterestLevel::Muted)
+        {
+            continue;
+        }
+        let title = mission_label(&mission);
+        let body = redact_for_telegram(&format!("{} is now {}.", title, mission.status));
+        let now = now_string();
+        let _ = ctx
+            .mission_store
+            .create_telegram_alert_if_absent(TelegramAlert {
+                id: Uuid::new_v4(),
+                telegram_user_id: owner_id,
+                mission_id: Some(mission.id),
+                event_kind: kind.to_string(),
+                importance: "high".to_string(),
+                title,
+                body,
+                status: "pending".to_string(),
+                telegram_message_id: None,
+                last_error: None,
+                created_at: now,
+                sent_at: None,
+                acknowledged_at: None,
+            })
+            .await;
+    }
+
+    let pending = ctx
+        .mission_store
+        .list_pending_telegram_alerts(owner_id, 5)
+        .await
+        .unwrap_or_default();
+    if pending.is_empty() {
+        return;
+    }
+    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+    for alert in pending {
+        let text = format!("{}\n\n{}", alert.title, alert.body);
+        match send_message(http, &base_url, owner_id, &text, None).await {
+            Ok(message_id) => {
+                let _ = ctx
+                    .mission_store
+                    .mark_telegram_alert_sent(alert.id, Some(message_id), &now_string())
+                    .await;
+            }
+            Err(err) => {
+                tracing::warn!("Failed to send Telegram alert {}: {}", alert.id, err);
+                let _ = ctx
+                    .mission_store
+                    .mark_telegram_alert_failed(alert.id, &err)
+                    .await;
+            }
+        }
+    }
+}
+
+async fn handle_paloma_command(
+    ctx: &ChannelContext,
+    msg: &Message,
+    http: &Client,
+    user: Option<&TelegramUser>,
+    clean_text: &str,
+) -> bool {
+    let is_known_command = is_paloma_command(clean_text, "/status")
+        || is_paloma_command(clean_text, "/missions")
+        || is_paloma_command(clean_text, "/summary")
+        || is_paloma_command(clean_text, "/send")
+        || is_paloma_command(clean_text, "/approve");
+    let owner_feedback = user
+        .filter(|_| msg.chat.chat_type == "private")
+        .filter(|u| u.role == TelegramUserRole::Owner)
+        .and_then(|u| {
+            if feedback_mutes_alerts(clean_text) {
+                Some((
+                    u,
+                    TelegramMissionInterestLevel::Muted,
+                    "mute from Telegram feedback",
+                ))
+            } else if feedback_raises_interest(clean_text) {
+                Some((
+                    u,
+                    TelegramMissionInterestLevel::High,
+                    "high interest from Telegram feedback",
+                ))
+            } else {
+                None
+            }
+        });
+
+    if !is_known_command && owner_feedback.is_none() {
+        return false;
+    }
+
+    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+    if !is_owner_dm(user, msg) {
+        let _ = send_message(
+            http,
+            &base_url,
+            msg.chat.id,
+            "I can only show mission state to Thomas in DM.",
+            Some(msg.message_id),
+        )
+        .await;
+        return true;
+    }
+
+    let result = if let Some((user, level, rule_text)) = owner_feedback {
+        apply_paloma_interest_feedback(ctx, user, msg, level, rule_text)
+            .await
+            .map(|body| (body, None))
+    } else if is_paloma_command(clean_text, "/status") {
+        match user {
+            Some(user) => build_paloma_status(ctx, user.telegram_user_id)
+                .await
+                .map(|(body, sequences)| (body, Some(sequences))),
+            None => Err("Missing Telegram user identity.".to_string()),
+        }
+    } else if is_paloma_command(clean_text, "/missions") {
+        match user {
+            Some(user) => build_paloma_missions(ctx, user.telegram_user_id)
+                .await
+                .map(|body| (body, None)),
+            None => Err("Missing Telegram user identity.".to_string()),
+        }
+    } else if is_paloma_command(clean_text, "/summary") {
+        let selector = clean_text.trim().strip_prefix("/summary").map(str::trim);
+        build_paloma_summary(ctx, selector)
+            .await
+            .map(|body| (body, None))
+    } else if is_paloma_command(clean_text, "/send") {
+        match parse_paloma_selector_and_payload(clean_text, "/send") {
+            Some((selector, payload)) => send_paloma_mission_message(ctx, selector, payload)
+                .await
+                .map(|body| (body, None)),
+            None => Err("Usage: /send <mission selector> <message>".to_string()),
+        }
+    } else if is_paloma_command(clean_text, "/approve") {
+        let answer = clean_text
+            .trim()
+            .strip_prefix("/approve")
+            .unwrap_or("")
+            .trim();
+        if answer.is_empty() {
+            Err("Usage: /approve <answer>".to_string())
+        } else {
+            send_paloma_mission_message(ctx, "latest", answer)
+                .await
+                .map(|body| (body, None))
+        }
+    } else {
+        Err("Unknown Paloma command.".to_string())
+    };
+
+    match result {
+        Ok((body, sequence_json)) => {
+            if send_message(http, &base_url, msg.chat.id, &body, Some(msg.message_id))
+                .await
+                .is_ok()
+            {
+                if let (Some(user), Some(sequence_json)) = (user, sequence_json) {
+                    let _ = ctx
+                        .mission_store
+                        .update_telegram_user_last_status_at(
+                            user.telegram_user_id,
+                            &now_string(),
+                            &sequence_json,
+                        )
+                        .await;
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!("Paloma command failed: {}", err);
+            let body = paloma_command_error_response(&err);
+            let _ = send_message(http, &base_url, msg.chat.id, body, Some(msg.message_id)).await;
+        }
+    }
+    true
 }
 
 fn telegram_internal_action_secret() -> Option<String> {
@@ -396,6 +1075,8 @@ impl TelegramBridge {
                 .cloned()
                 .collect();
             for ctx in channels {
+                plan_and_deliver_paloma_alerts(&ctx, &self.http).await;
+
                 let due = match ctx
                     .mission_store
                     .list_due_telegram_scheduled_messages(ctx.channel.id, &now_string(), 32)
@@ -1455,6 +2136,10 @@ pub async fn process_webhook_message(
     remember_telegram_chat_title(ctx, &msg.chat).await;
 
     let clean_text = strip_bot_mention(text, &ctx.bot_username);
+    let paloma_user = remember_paloma_user(ctx, msg).await;
+    if handle_paloma_command(ctx, msg, http, paloma_user.as_ref(), &clean_text).await {
+        return;
+    }
     let memory_subject = telegram_memory_subject(msg, &sender_name);
 
     // Resolve target mission: auto-create per chat or legacy single-mission
@@ -3984,13 +4669,17 @@ pub async fn get_bot_username(http: &Client, base_url: &str) -> Result<String, S
 mod tests {
     use super::{
         build_internal_telegram_action_token, extract_structured_memory_from_text,
-        extract_telegram_actions, format_structured_memory_context, markdown_to_telegram_html,
-        merge_telegram_chat_metadata, render_telegram_chunk, sanitize_telegram_visible_text,
+        extract_telegram_actions, feedback_mutes_alerts, feedback_raises_interest,
+        format_structured_memory_context, is_paloma_command, markdown_to_telegram_html,
+        merge_telegram_chat_metadata, mission_label, paloma_alert_kind_for_status,
+        paloma_command_error_response, paloma_role_for_user, parse_paloma_selector_and_payload,
+        redact_for_telegram, render_telegram_chunk, sanitize_telegram_visible_text,
         scope_for_extracted_memory, telegram_action_target_matches, telegram_chat_display_title,
         truncate_for_telegram, verify_internal_telegram_action_token, workflow_reply_text,
-        workflow_request_delivery_text, Chat, ExtractedTelegramMemory, TelegramAction,
-        TelegramActionKind, TelegramBridge, TelegramMemorySubject, TelegramStructuredMemoryEntry,
-        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
+        workflow_request_delivery_text, Chat, ExtractedTelegramMemory, Mission, MissionMode,
+        MissionStatus, TelegramAction, TelegramActionKind, TelegramBridge, TelegramMemorySubject,
+        TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
+        TelegramUserRole,
     };
     use uuid::Uuid;
 
@@ -4057,6 +4746,107 @@ mod tests {
             bridge.get_sent_reply_message(channel_id, 123, 999).await,
             None
         );
+    }
+
+    #[test]
+    fn paloma_command_matching_is_exact_command_or_argument_tail() {
+        assert!(is_paloma_command("/status", "/status"));
+        assert!(is_paloma_command("/status latest", "/status"));
+        assert!(!is_paloma_command("/statusplease", "/status"));
+        assert!(!is_paloma_command("status", "/status"));
+    }
+
+    #[test]
+    fn paloma_owner_role_defaults_to_thomas_and_others_observer() {
+        assert_eq!(paloma_role_for_user(1_139_694_048), TelegramUserRole::Owner);
+        assert_eq!(paloma_role_for_user(42), TelegramUserRole::Observer);
+    }
+
+    #[test]
+    fn paloma_redaction_removes_secrets_and_private_paths() {
+        let text =
+            "token=abc12345678901234567890 path /root/.sandboxed-sh/missions/missions-dev.db";
+        let redacted = redact_for_telegram(text);
+        assert!(redacted.contains("[redacted]"));
+        assert!(redacted.contains("[path redacted]"));
+        assert!(!redacted.contains("abc12345678901234567890"));
+        assert!(!redacted.contains("/root/.sandboxed-sh"));
+    }
+
+    #[test]
+    fn paloma_selector_parser_requires_selector_and_payload() {
+        assert_eq!(
+            parse_paloma_selector_and_payload("/send latest focus on tests", "/send"),
+            Some(("latest", "focus on tests"))
+        );
+        assert_eq!(
+            parse_paloma_selector_and_payload("/send latest", "/send"),
+            None
+        );
+    }
+
+    #[test]
+    fn paloma_feedback_parser_recognizes_interest_changes() {
+        assert!(feedback_mutes_alerts("Don't tell me about this again."));
+        assert!(feedback_raises_interest("Keep me posted on this."));
+        assert!(!feedback_mutes_alerts("what changed?"));
+    }
+
+    #[test]
+    fn paloma_command_error_response_preserves_usage_errors() {
+        assert_eq!(
+            paloma_command_error_response("Usage: /approve <answer>"),
+            "Usage: /approve <answer>"
+        );
+        assert_eq!(
+            paloma_command_error_response("database unavailable"),
+            "I couldn't read mission status right now."
+        );
+    }
+
+    #[test]
+    fn paloma_alert_kind_only_covers_terminal_attention_states() {
+        assert_eq!(
+            paloma_alert_kind_for_status(MissionStatus::Completed),
+            Some("mission_completed")
+        );
+        assert_eq!(paloma_alert_kind_for_status(MissionStatus::Active), None);
+    }
+
+    #[test]
+    fn mission_label_uses_public_metadata_without_ids() {
+        let mission = Mission {
+            id: Uuid::new_v4(),
+            status: MissionStatus::Active,
+            title: Some("Proof deployment".to_string()),
+            short_description: None,
+            metadata_updated_at: None,
+            metadata_source: None,
+            metadata_model: None,
+            metadata_version: None,
+            workspace_id: Uuid::new_v4(),
+            workspace_name: None,
+            agent: None,
+            model_override: None,
+            model_effort: None,
+            backend: "opencode".to_string(),
+            config_profile: None,
+            history: vec![],
+            created_at: "2026-05-20T00:00:00Z".to_string(),
+            updated_at: "2026-05-20T00:00:00Z".to_string(),
+            interrupted_at: None,
+            resumable: false,
+            desktop_sessions: vec![],
+            session_id: None,
+            terminal_reason: None,
+            parent_mission_id: None,
+            working_directory: None,
+            mission_mode: MissionMode::Task,
+            goal_mode: false,
+            goal_objective: None,
+            first_viewed_at: None,
+        };
+        assert_eq!(mission_label(&mission), "Proof deployment");
     }
 
     #[test]

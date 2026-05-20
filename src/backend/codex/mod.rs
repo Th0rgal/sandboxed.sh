@@ -318,19 +318,17 @@ async fn send_message_streaming_app_server(
             let _ = session_arc.shutdown().await;
             return Err(anyhow::anyhow!("codex thread/goal/set failed: {}", e));
         }
-    } else {
-        if let Err(e) = session_for_rpc
-            .turn_start(TurnStartParams {
-                thread_id: thread_id.clone(),
-                input: vec![UserInputItem::Text {
-                    text: user_payload.clone(),
-                }],
-            })
-            .await
-        {
-            let _ = session_arc.shutdown().await;
-            return Err(anyhow::anyhow!("codex turn/start failed: {}", e));
-        }
+    } else if let Err(e) = session_for_rpc
+        .turn_start(TurnStartParams {
+            thread_id: thread_id.clone(),
+            input: vec![UserInputItem::Text {
+                text: user_payload.clone(),
+            }],
+        })
+        .await
+    {
+        let _ = session_arc.shutdown().await;
+        return Err(anyhow::anyhow!("codex turn/start failed: {}", e));
     }
 
     let session_id = session.id.clone();

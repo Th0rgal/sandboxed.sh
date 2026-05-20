@@ -5,10 +5,12 @@ use super::{
     ExecutionStatus, FreshSession, HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode,
     MissionStatus, MissionStore, ModelUsageStats, RetryConfig, StopPolicy, StoredEvent,
     TelegramActionExecution, TelegramActionExecutionKind, TelegramActionExecutionStatus,
-    TelegramChannel, TelegramChatMission, TelegramConversation, TelegramConversationMessage,
-    TelegramConversationMessageDirection, TelegramScheduledMessage, TelegramScheduledMessageStatus,
-    TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
-    TelegramStructuredMemorySearchHit, TelegramWorkflow, TelegramWorkflowEvent,
+    TelegramAlert, TelegramAlertPreference, TelegramChannel, TelegramChatMission,
+    TelegramConversation, TelegramConversationMessage, TelegramConversationMessageDirection,
+    TelegramMissionInterestLevel, TelegramMissionSubscription, TelegramScheduledMessage,
+    TelegramScheduledMessageStatus, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
+    TelegramStructuredMemoryScope, TelegramStructuredMemorySearchHit, TelegramUser,
+    TelegramUserCursor, TelegramUserRole, TelegramWorkflow, TelegramWorkflowEvent,
     TelegramWorkflowKind, TelegramWorkflowStatus, TriggerType, WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo, TextOp};
@@ -1443,6 +1445,83 @@ impl SqliteMissionStore {
                 e
             );
         }
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS telegram_users (
+                id TEXT PRIMARY KEY NOT NULL,
+                telegram_user_id INTEGER NOT NULL UNIQUE,
+                username TEXT,
+                display_name TEXT,
+                role TEXT NOT NULL DEFAULT 'observer',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tusers_role
+                ON telegram_users(role);
+
+            CREATE TABLE IF NOT EXISTS telegram_user_cursors (
+                id TEXT PRIMARY KEY NOT NULL,
+                telegram_user_id INTEGER NOT NULL UNIQUE,
+                last_status_at TEXT,
+                last_dashboard_seen_at TEXT,
+                last_alert_ack_at TEXT,
+                last_digest_at TEXT,
+                last_seen_event_sequence_by_mission_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS telegram_mission_subscriptions (
+                id TEXT PRIMARY KEY NOT NULL,
+                telegram_user_id INTEGER NOT NULL,
+                mission_id TEXT NOT NULL,
+                interest_level TEXT NOT NULL DEFAULT 'normal',
+                reason TEXT,
+                expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(telegram_user_id, mission_id),
+                FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_tsub_user_interest
+                ON telegram_mission_subscriptions(telegram_user_id, interest_level);
+            CREATE INDEX IF NOT EXISTS idx_tsub_mission
+                ON telegram_mission_subscriptions(mission_id);
+
+            CREATE TABLE IF NOT EXISTS telegram_alert_preferences (
+                id TEXT PRIMARY KEY NOT NULL,
+                telegram_user_id INTEGER NOT NULL,
+                scope TEXT NOT NULL,
+                scope_value TEXT,
+                rule_text TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_from_message_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_talert_pref_user_scope
+                ON telegram_alert_preferences(telegram_user_id, scope, scope_value);
+
+            CREATE TABLE IF NOT EXISTS telegram_alerts (
+                id TEXT PRIMARY KEY NOT NULL,
+                telegram_user_id INTEGER NOT NULL,
+                mission_id TEXT,
+                event_kind TEXT NOT NULL,
+                importance TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                telegram_message_id INTEGER,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                sent_at TEXT,
+                acknowledged_at TEXT,
+                UNIQUE(telegram_user_id, mission_id, event_kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_talerts_user_status
+                ON telegram_alerts(telegram_user_id, status, created_at);",
+        )
+        .map_err(|e| format!("Failed to create Paloma Telegram state tables: {}", e))?;
 
         // Create telegram_chat_missions table if it doesn't exist
         conn.execute_batch(
@@ -5251,6 +5330,359 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn upsert_telegram_user(&self, user: TelegramUser) -> Result<TelegramUser, String> {
+        let conn = self.conn.clone();
+        let u = user.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_users
+                 (id, telegram_user_id, username, display_name, role, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    username = excluded.username,
+                    display_name = excluded.display_name,
+                    role = excluded.role,
+                    updated_at = excluded.updated_at",
+                params![
+                    u.id.to_string(),
+                    u.telegram_user_id,
+                    u.username,
+                    u.display_name,
+                    telegram_user_role_to_str(u.role),
+                    u.created_at,
+                    u.updated_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(user)
+    }
+
+    async fn get_telegram_user(
+        &self,
+        telegram_user_id: i64,
+    ) -> Result<Option<TelegramUser>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT id, telegram_user_id, username, display_name, role, created_at, updated_at
+                 FROM telegram_users WHERE telegram_user_id = ?1",
+                params![telegram_user_id],
+                row_to_telegram_user,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_or_create_telegram_user_cursor(
+        &self,
+        telegram_user_id: i64,
+    ) -> Result<TelegramUserCursor, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            if let Some(cursor) = conn
+                .query_row(
+                    "SELECT id, telegram_user_id, last_status_at, last_dashboard_seen_at,
+                            last_alert_ack_at, last_digest_at,
+                            last_seen_event_sequence_by_mission_json, created_at, updated_at
+                     FROM telegram_user_cursors WHERE telegram_user_id = ?1",
+                    params![telegram_user_id],
+                    row_to_telegram_user_cursor,
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(cursor);
+            }
+
+            let now = now_string();
+            let cursor = TelegramUserCursor {
+                id: Uuid::new_v4(),
+                telegram_user_id,
+                last_status_at: None,
+                last_dashboard_seen_at: None,
+                last_alert_ack_at: None,
+                last_digest_at: None,
+                last_seen_event_sequence_by_mission_json: "{}".to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            conn.execute(
+                "INSERT INTO telegram_user_cursors
+                 (id, telegram_user_id, last_status_at, last_dashboard_seen_at, last_alert_ack_at,
+                  last_digest_at, last_seen_event_sequence_by_mission_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    cursor.id.to_string(),
+                    cursor.telegram_user_id,
+                    cursor.last_status_at,
+                    cursor.last_dashboard_seen_at,
+                    cursor.last_alert_ack_at,
+                    cursor.last_digest_at,
+                    cursor.last_seen_event_sequence_by_mission_json,
+                    cursor.created_at,
+                    cursor.updated_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(cursor)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn update_telegram_user_last_status_at(
+        &self,
+        telegram_user_id: i64,
+        last_status_at: &str,
+        last_seen_event_sequence_by_mission_json: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let last_status_at = last_status_at.to_string();
+        let sequence_json = last_seen_event_sequence_by_mission_json.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO telegram_user_cursors
+                 (id, telegram_user_id, last_status_at, last_seen_event_sequence_by_mission_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    last_status_at = excluded.last_status_at,
+                    last_seen_event_sequence_by_mission_json = excluded.last_seen_event_sequence_by_mission_json,
+                    updated_at = excluded.updated_at",
+                params![
+                    Uuid::new_v4().to_string(),
+                    telegram_user_id,
+                    last_status_at,
+                    sequence_json,
+                    now,
+                    now,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn upsert_telegram_mission_subscription(
+        &self,
+        subscription: TelegramMissionSubscription,
+    ) -> Result<TelegramMissionSubscription, String> {
+        let conn = self.conn.clone();
+        let s = subscription.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_mission_subscriptions
+                 (id, telegram_user_id, mission_id, interest_level, reason, expires_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(telegram_user_id, mission_id) DO UPDATE SET
+                    interest_level = excluded.interest_level,
+                    reason = excluded.reason,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at",
+                params![
+                    s.id.to_string(),
+                    s.telegram_user_id,
+                    s.mission_id.to_string(),
+                    telegram_interest_to_str(s.interest_level),
+                    s.reason,
+                    s.expires_at,
+                    s.created_at,
+                    s.updated_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(subscription)
+    }
+
+    async fn list_telegram_mission_subscriptions(
+        &self,
+        telegram_user_id: i64,
+    ) -> Result<Vec<TelegramMissionSubscription>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, telegram_user_id, mission_id, interest_level, reason, expires_at,
+                            created_at, updated_at
+                     FROM telegram_mission_subscriptions
+                     WHERE telegram_user_id = ?1
+                     ORDER BY updated_at DESC",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    params![telegram_user_id],
+                    row_to_telegram_mission_subscription,
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_telegram_alert_preference(
+        &self,
+        preference: TelegramAlertPreference,
+    ) -> Result<TelegramAlertPreference, String> {
+        let conn = self.conn.clone();
+        let p = preference.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_alert_preferences
+                 (id, telegram_user_id, scope, scope_value, rule_text, enabled,
+                  created_from_message_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    p.id.to_string(),
+                    p.telegram_user_id,
+                    p.scope,
+                    p.scope_value,
+                    p.rule_text,
+                    if p.enabled { 1 } else { 0 },
+                    p.created_from_message_id,
+                    p.created_at,
+                    p.updated_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(preference)
+    }
+
+    async fn create_telegram_alert_if_absent(
+        &self,
+        alert: TelegramAlert,
+    ) -> Result<Option<TelegramAlert>, String> {
+        let conn = self.conn.clone();
+        let a = alert.clone();
+        let inserted = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let changed = conn
+                .execute(
+                    "INSERT OR IGNORE INTO telegram_alerts
+                     (id, telegram_user_id, mission_id, event_kind, importance, title, body,
+                      status, telegram_message_id, last_error, created_at, sent_at, acknowledged_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        a.id.to_string(),
+                        a.telegram_user_id,
+                        a.mission_id.map(|id| id.to_string()),
+                        a.event_kind,
+                        a.importance,
+                        a.title,
+                        a.body,
+                        a.status,
+                        a.telegram_message_id,
+                        a.last_error,
+                        a.created_at,
+                        a.sent_at,
+                        a.acknowledged_at,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(changed > 0)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(inserted.then_some(alert))
+    }
+
+    async fn list_pending_telegram_alerts(
+        &self,
+        telegram_user_id: i64,
+        limit: usize,
+    ) -> Result<Vec<TelegramAlert>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, telegram_user_id, mission_id, event_kind, importance, title, body,
+                            status, telegram_message_id, last_error, created_at, sent_at, acknowledged_at
+                     FROM telegram_alerts
+                     WHERE telegram_user_id = ?1 AND status = 'pending'
+                     ORDER BY created_at ASC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![telegram_user_id, limit as i64], row_to_telegram_alert)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn mark_telegram_alert_sent(
+        &self,
+        id: Uuid,
+        telegram_message_id: Option<i64>,
+        sent_at: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let sent_at = sent_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_alerts
+                 SET status = 'sent', telegram_message_id = ?2, sent_at = ?3, last_error = NULL
+                 WHERE id = ?1",
+                params![id.to_string(), telegram_message_id, sent_at],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn mark_telegram_alert_failed(&self, id: Uuid, error: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let error = error.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_alerts
+                 SET status = 'failed', last_error = ?2
+                 WHERE id = ?1",
+                params![id.to_string(), error],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn get_telegram_chat_mission(
         &self,
         channel_id: Uuid,
@@ -7214,6 +7646,111 @@ impl MissionStore for SqliteMissionStore {
     }
 }
 
+fn telegram_user_role_to_str(role: TelegramUserRole) -> &'static str {
+    match role {
+        TelegramUserRole::Owner => "owner",
+        TelegramUserRole::TrustedFriend => "trusted_friend",
+        TelegramUserRole::Observer => "observer",
+        TelegramUserRole::Blocked => "blocked",
+    }
+}
+
+fn parse_telegram_user_role(raw: String) -> TelegramUserRole {
+    match raw.as_str() {
+        "owner" => TelegramUserRole::Owner,
+        "trusted_friend" => TelegramUserRole::TrustedFriend,
+        "blocked" => TelegramUserRole::Blocked,
+        _ => TelegramUserRole::Observer,
+    }
+}
+
+fn telegram_interest_to_str(level: TelegramMissionInterestLevel) -> &'static str {
+    match level {
+        TelegramMissionInterestLevel::Muted => "muted",
+        TelegramMissionInterestLevel::Normal => "normal",
+        TelegramMissionInterestLevel::High => "high",
+    }
+}
+
+fn parse_telegram_interest(raw: String) -> TelegramMissionInterestLevel {
+    match raw.as_str() {
+        "muted" => TelegramMissionInterestLevel::Muted,
+        "high" => TelegramMissionInterestLevel::High,
+        _ => TelegramMissionInterestLevel::Normal,
+    }
+}
+
+fn row_to_telegram_user(row: &rusqlite::Row<'_>) -> Result<TelegramUser, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let role_str: String = row.get(4)?;
+    Ok(TelegramUser {
+        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+        telegram_user_id: row.get(1)?,
+        username: row.get(2)?,
+        display_name: row.get(3)?,
+        role: parse_telegram_user_role(role_str),
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn row_to_telegram_user_cursor(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramUserCursor, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    Ok(TelegramUserCursor {
+        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+        telegram_user_id: row.get(1)?,
+        last_status_at: row.get(2)?,
+        last_dashboard_seen_at: row.get(3)?,
+        last_alert_ack_at: row.get(4)?,
+        last_digest_at: row.get(5)?,
+        last_seen_event_sequence_by_mission_json: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn row_to_telegram_mission_subscription(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramMissionSubscription, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let mission_id_str: String = row.get(2)?;
+    let interest_str: String = row.get(3)?;
+    Ok(TelegramMissionSubscription {
+        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+        telegram_user_id: row.get(1)?,
+        mission_id: Uuid::parse_str(&mission_id_str).unwrap_or_default(),
+        interest_level: parse_telegram_interest(interest_str),
+        reason: row.get(4)?,
+        expires_at: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+fn row_to_telegram_alert(row: &rusqlite::Row<'_>) -> Result<TelegramAlert, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let mission_id_str: Option<String> = row.get(2)?;
+    Ok(TelegramAlert {
+        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+        telegram_user_id: row.get(1)?,
+        mission_id: mission_id_str
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok()),
+        event_kind: row.get(3)?,
+        importance: row.get(4)?,
+        title: row.get(5)?,
+        body: row.get(6)?,
+        status: row.get(7)?,
+        telegram_message_id: row.get(8)?,
+        last_error: row.get(9)?,
+        created_at: row.get(10)?,
+        sent_at: row.get(11)?,
+        acknowledged_at: row.get(12)?,
+    })
+}
+
 /// Parse a Telegram channel from a SQLite row.
 /// Column order: id(0), mission_id(1), bot_token(2), bot_username(3),
 ///   allowed_chat_ids(4), trigger_mode(5), active(6), webhook_secret(7),
@@ -7534,11 +8071,12 @@ mod tests {
     use super::{assistant_message_metadata, AssistantMessageMetadataInput, SqliteMissionStore};
     use crate::agents::CostSource;
     use crate::api::mission_store::{
-        MissionMode, MissionStatus, MissionStore, TelegramChannel, TelegramConversation,
-        TelegramConversationMessage, TelegramConversationMessageDirection,
-        TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
-        TelegramTriggerMode, TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind,
-        TelegramWorkflowStatus,
+        MissionMode, MissionStatus, MissionStore, TelegramAlert, TelegramAlertPreference,
+        TelegramChannel, TelegramConversation, TelegramConversationMessage,
+        TelegramConversationMessageDirection, TelegramMissionInterestLevel,
+        TelegramMissionSubscription, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
+        TelegramStructuredMemoryScope, TelegramTriggerMode, TelegramUser, TelegramUserRole,
+        TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus,
     };
     use crate::cost::TokenUsage;
     use rusqlite::params;
@@ -7611,6 +8149,143 @@ mod tests {
             .await
             .expect("telegram channel");
         channel.id
+    }
+
+    #[tokio::test]
+    async fn telegram_paloma_user_cursor_and_subscription_round_trip() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Paloma state"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        let user = store
+            .upsert_telegram_user(TelegramUser {
+                id: Uuid::new_v4(),
+                telegram_user_id: 1_139_694_048,
+                username: Some("thomas".to_string()),
+                display_name: Some("Thomas".to_string()),
+                role: TelegramUserRole::Owner,
+                created_at: "2026-05-20T10:00:00Z".to_string(),
+                updated_at: "2026-05-20T10:00:00Z".to_string(),
+            })
+            .await
+            .expect("upsert user");
+        assert_eq!(user.role, TelegramUserRole::Owner);
+
+        let loaded = store
+            .get_telegram_user(1_139_694_048)
+            .await
+            .expect("get user")
+            .expect("user exists");
+        assert_eq!(loaded.username.as_deref(), Some("thomas"));
+
+        let cursor = store
+            .get_or_create_telegram_user_cursor(1_139_694_048)
+            .await
+            .expect("cursor");
+        assert!(cursor.last_status_at.is_none());
+        store
+            .update_telegram_user_last_status_at(
+                1_139_694_048,
+                "2026-05-20T10:10:00Z",
+                "{\"mission\":7}",
+            )
+            .await
+            .expect("update cursor");
+        let cursor = store
+            .get_or_create_telegram_user_cursor(1_139_694_048)
+            .await
+            .expect("cursor reload");
+        assert_eq!(
+            cursor.last_status_at.as_deref(),
+            Some("2026-05-20T10:10:00Z")
+        );
+        assert_eq!(
+            cursor.last_seen_event_sequence_by_mission_json,
+            "{\"mission\":7}"
+        );
+
+        store
+            .upsert_telegram_mission_subscription(TelegramMissionSubscription {
+                id: Uuid::new_v4(),
+                telegram_user_id: 1_139_694_048,
+                mission_id: mission.id,
+                interest_level: TelegramMissionInterestLevel::High,
+                reason: Some("status command".to_string()),
+                expires_at: None,
+                created_at: "2026-05-20T10:00:00Z".to_string(),
+                updated_at: "2026-05-20T10:00:00Z".to_string(),
+            })
+            .await
+            .expect("subscription");
+        let subscriptions = store
+            .list_telegram_mission_subscriptions(1_139_694_048)
+            .await
+            .expect("subscriptions");
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(
+            subscriptions[0].interest_level,
+            TelegramMissionInterestLevel::High
+        );
+
+        store
+            .create_telegram_alert_preference(TelegramAlertPreference {
+                id: Uuid::new_v4(),
+                telegram_user_id: 1_139_694_048,
+                scope: "mission".to_string(),
+                scope_value: Some(mission.id.to_string()),
+                rule_text: "mute from Telegram feedback".to_string(),
+                enabled: true,
+                created_from_message_id: Some(12),
+                created_at: "2026-05-20T10:00:00Z".to_string(),
+                updated_at: "2026-05-20T10:00:00Z".to_string(),
+            })
+            .await
+            .expect("alert preference");
+
+        let alert = TelegramAlert {
+            id: Uuid::new_v4(),
+            telegram_user_id: 1_139_694_048,
+            mission_id: Some(mission.id),
+            event_kind: "mission_completed".to_string(),
+            importance: "high".to_string(),
+            title: "Paloma state".to_string(),
+            body: "Paloma state is now completed.".to_string(),
+            status: "pending".to_string(),
+            telegram_message_id: None,
+            last_error: None,
+            created_at: "2026-05-20T10:00:00Z".to_string(),
+            sent_at: None,
+            acknowledged_at: None,
+        };
+        assert!(store
+            .create_telegram_alert_if_absent(alert.clone())
+            .await
+            .expect("first alert")
+            .is_some());
+        assert!(store
+            .create_telegram_alert_if_absent(alert)
+            .await
+            .expect("duplicate alert")
+            .is_none());
+        let pending = store
+            .list_pending_telegram_alerts(1_139_694_048, 10)
+            .await
+            .expect("pending alerts");
+        assert_eq!(pending.len(), 1);
+        store
+            .mark_telegram_alert_sent(pending[0].id, Some(99), "2026-05-20T10:01:00Z")
+            .await
+            .expect("mark sent");
+        assert!(store
+            .list_pending_telegram_alerts(1_139_694_048, 10)
+            .await
+            .expect("pending alerts after sent")
+            .is_empty());
     }
 
     #[tokio::test]

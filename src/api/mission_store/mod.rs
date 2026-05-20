@@ -488,6 +488,102 @@ pub struct TelegramChannel {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramUser {
+    pub id: Uuid,
+    pub telegram_user_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub role: TelegramUserRole,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramUserRole {
+    Owner,
+    TrustedFriend,
+    Observer,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramUserCursor {
+    pub id: Uuid,
+    pub telegram_user_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dashboard_seen_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_alert_ack_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_digest_at: Option<String>,
+    pub last_seen_event_sequence_by_mission_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramMissionSubscription {
+    pub id: Uuid,
+    pub telegram_user_id: i64,
+    pub mission_id: Uuid,
+    pub interest_level: TelegramMissionInterestLevel,
+    pub reason: Option<String>,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramMissionInterestLevel {
+    Muted,
+    Normal,
+    High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramAlertPreference {
+    pub id: Uuid,
+    pub telegram_user_id: i64,
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_value: Option<String>,
+    pub rule_text: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_from_message_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramAlert {
+    pub id: Uuid,
+    pub telegram_user_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<Uuid>,
+    pub event_kind: String,
+    pub importance: String,
+    pub title: String,
+    pub body: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_message_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_at: Option<String>,
+}
+
 /// A mapping from a Telegram chat to an auto-created mission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramChatMission {
@@ -1390,6 +1486,108 @@ pub trait MissionStore: Send + Sync {
     /// List all Telegram channels (both legacy and auto-create).
     async fn list_all_telegram_channels(&self) -> Result<Vec<TelegramChannel>, String> {
         Ok(vec![])
+    }
+
+    /// Upsert a Telegram user identity and role.
+    async fn upsert_telegram_user(&self, user: TelegramUser) -> Result<TelegramUser, String> {
+        let _ = user;
+        Err("Not supported".to_string())
+    }
+
+    /// Get a Telegram user by Telegram user id.
+    async fn get_telegram_user(
+        &self,
+        telegram_user_id: i64,
+    ) -> Result<Option<TelegramUser>, String> {
+        let _ = telegram_user_id;
+        Ok(None)
+    }
+
+    /// Get or create a per-user Telegram cursor row.
+    async fn get_or_create_telegram_user_cursor(
+        &self,
+        telegram_user_id: i64,
+    ) -> Result<TelegramUserCursor, String> {
+        let _ = telegram_user_id;
+        Err("Not supported".to_string())
+    }
+
+    /// Update the /status cursor after successful delivery.
+    async fn update_telegram_user_last_status_at(
+        &self,
+        telegram_user_id: i64,
+        last_status_at: &str,
+        last_seen_event_sequence_by_mission_json: &str,
+    ) -> Result<(), String> {
+        let _ = (
+            telegram_user_id,
+            last_status_at,
+            last_seen_event_sequence_by_mission_json,
+        );
+        Err("Not supported".to_string())
+    }
+
+    /// Upsert a mission subscription/interest row.
+    async fn upsert_telegram_mission_subscription(
+        &self,
+        subscription: TelegramMissionSubscription,
+    ) -> Result<TelegramMissionSubscription, String> {
+        let _ = subscription;
+        Err("Not supported".to_string())
+    }
+
+    /// List mission subscriptions for a Telegram user.
+    async fn list_telegram_mission_subscriptions(
+        &self,
+        telegram_user_id: i64,
+    ) -> Result<Vec<TelegramMissionSubscription>, String> {
+        let _ = telegram_user_id;
+        Ok(vec![])
+    }
+
+    /// Store an explicit Telegram alert preference learned from feedback.
+    async fn create_telegram_alert_preference(
+        &self,
+        preference: TelegramAlertPreference,
+    ) -> Result<TelegramAlertPreference, String> {
+        let _ = preference;
+        Err("Not supported".to_string())
+    }
+
+    /// Insert an alert unless an equivalent alert already exists.
+    async fn create_telegram_alert_if_absent(
+        &self,
+        alert: TelegramAlert,
+    ) -> Result<Option<TelegramAlert>, String> {
+        let _ = alert;
+        Ok(None)
+    }
+
+    /// List pending Telegram alerts for a user.
+    async fn list_pending_telegram_alerts(
+        &self,
+        telegram_user_id: i64,
+        limit: usize,
+    ) -> Result<Vec<TelegramAlert>, String> {
+        let _ = (telegram_user_id, limit);
+        Ok(vec![])
+    }
+
+    /// Mark an alert as sent.
+    async fn mark_telegram_alert_sent(
+        &self,
+        id: Uuid,
+        telegram_message_id: Option<i64>,
+        sent_at: &str,
+    ) -> Result<(), String> {
+        let _ = (id, telegram_message_id, sent_at);
+        Err("Not supported".to_string())
+    }
+
+    /// Mark an alert as failed.
+    async fn mark_telegram_alert_failed(&self, id: Uuid, error: &str) -> Result<(), String> {
+        let _ = (id, error);
+        Err("Not supported".to_string())
     }
 
     // === Telegram Chat-Mission mapping methods ===
