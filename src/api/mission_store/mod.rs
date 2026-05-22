@@ -584,6 +584,45 @@ pub struct TelegramAlert {
     pub acknowledged_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PalomaDecision {
+    pub id: Uuid,
+    pub event_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<i64>,
+    pub channel: String,
+    pub reason_code: String,
+    pub proposed_action: String,
+    pub allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppression_reason: Option<String>,
+    pub policy_snapshot_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_text_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_text_preview: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PalomaSchedulerJob {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_finished_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub run_count: i64,
+    pub updated_at: String,
+}
+
 /// A mapping from a Telegram chat to an auto-created mission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramChatMission {
@@ -1527,6 +1566,26 @@ pub trait MissionStore: Send + Sync {
         Err("Not supported".to_string())
     }
 
+    /// Update the last successful Telegram alert digest delivery timestamp.
+    async fn update_telegram_user_last_digest_at(
+        &self,
+        telegram_user_id: i64,
+        last_digest_at: &str,
+    ) -> Result<(), String> {
+        let _ = (telegram_user_id, last_digest_at);
+        Err("Not supported".to_string())
+    }
+
+    /// Update the last Telegram alert acknowledgement timestamp.
+    async fn update_telegram_user_last_alert_ack_at(
+        &self,
+        telegram_user_id: i64,
+        last_alert_ack_at: &str,
+    ) -> Result<(), String> {
+        let _ = (telegram_user_id, last_alert_ack_at);
+        Err("Not supported".to_string())
+    }
+
     /// Upsert a mission subscription/interest row.
     async fn upsert_telegram_mission_subscription(
         &self,
@@ -1552,6 +1611,15 @@ pub trait MissionStore: Send + Sync {
     ) -> Result<TelegramAlertPreference, String> {
         let _ = preference;
         Err("Not supported".to_string())
+    }
+
+    /// List explicit Telegram alert preferences for a user.
+    async fn list_telegram_alert_preferences(
+        &self,
+        telegram_user_id: i64,
+    ) -> Result<Vec<TelegramAlertPreference>, String> {
+        let _ = telegram_user_id;
+        Ok(vec![])
     }
 
     /// Insert an alert unless an equivalent alert already exists.
@@ -1584,6 +1652,16 @@ pub trait MissionStore: Send + Sync {
         Err("Not supported".to_string())
     }
 
+    /// Find a sent Telegram alert by its Telegram message id.
+    async fn get_telegram_alert_by_message_id(
+        &self,
+        telegram_user_id: i64,
+        telegram_message_id: i64,
+    ) -> Result<Option<TelegramAlert>, String> {
+        let _ = (telegram_user_id, telegram_message_id);
+        Ok(None)
+    }
+
     /// Acknowledge queued alerts for a mission so they will not be delivered.
     async fn acknowledge_pending_telegram_alerts_for_mission(
         &self,
@@ -1595,10 +1673,85 @@ pub trait MissionStore: Send + Sync {
         Ok(0)
     }
 
+    /// Acknowledge a single queued alert so it will not be delivered.
+    async fn acknowledge_pending_telegram_alert(
+        &self,
+        telegram_user_id: i64,
+        alert_id: Uuid,
+        acknowledged_at: &str,
+    ) -> Result<bool, String> {
+        let _ = (telegram_user_id, alert_id, acknowledged_at);
+        Ok(false)
+    }
+
     /// Record a delivery failure without removing the alert from the retry queue.
     async fn mark_telegram_alert_failed(&self, id: Uuid, error: &str) -> Result<(), String> {
         let _ = (id, error);
         Err("Not supported".to_string())
+    }
+
+    /// Clear stale pending alert delivery errors so future scans can retry cleanly.
+    async fn recover_stale_telegram_alerts(
+        &self,
+        before: &str,
+        limit: usize,
+    ) -> Result<usize, String> {
+        let _ = (before, limit);
+        Ok(0)
+    }
+
+    /// Append an auditable Paloma decision record.
+    async fn create_paloma_decision(
+        &self,
+        decision: PalomaDecision,
+    ) -> Result<PalomaDecision, String> {
+        let _ = decision;
+        Err("Not supported".to_string())
+    }
+
+    /// List recent Paloma decisions for debugging/canary review.
+    async fn list_paloma_decisions(&self, limit: usize) -> Result<Vec<PalomaDecision>, String> {
+        let _ = limit;
+        Ok(vec![])
+    }
+
+    /// Claim a named Paloma scheduler job if no live lease exists.
+    async fn claim_paloma_scheduler_job(
+        &self,
+        name: &str,
+        lease_owner: &str,
+        now: &str,
+        lease_expires_at: &str,
+    ) -> Result<bool, String> {
+        let _ = (name, lease_owner, now, lease_expires_at);
+        Ok(false)
+    }
+
+    /// Finish a named Paloma scheduler job and append its latest result.
+    async fn finish_paloma_scheduler_job(
+        &self,
+        name: &str,
+        lease_owner: &str,
+        finished_at: &str,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let _ = (name, lease_owner, finished_at, error);
+        Ok(())
+    }
+
+    /// List named Paloma scheduler job state/history.
+    async fn list_paloma_scheduler_jobs(&self) -> Result<Vec<PalomaSchedulerJob>, String> {
+        Ok(vec![])
+    }
+
+    /// Consolidate explicit Telegram memory rows, keeping the latest user-provided rule/fact.
+    async fn consolidate_telegram_structured_memory(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<usize, String> {
+        let _ = (channel_id, limit);
+        Ok(0)
     }
 
     // === Telegram Chat-Mission mapping methods ===

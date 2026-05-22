@@ -851,6 +851,8 @@ function missionStatusLabel(
   }
 
   switch (status) {
+    case "pending":
+      return { label: "Pending", className: "bg-zinc-500/20 text-zinc-400" };
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
     case "awaiting_user":

@@ -842,6 +842,18 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(control::list_bot_action_executions),
         )
         .route(
+            "/api/control/paloma/decisions",
+            get(control::list_paloma_decisions),
+        )
+        .route(
+            "/api/control/paloma/jobs",
+            get(control::list_paloma_scheduler_jobs),
+        )
+        .route(
+            "/api/control/paloma/queue",
+            get(control::get_paloma_queue_metrics),
+        )
+        .route(
             "/api/control/telegram/bots/:id/conversations",
             get(control::list_bot_conversations),
         )

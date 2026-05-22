@@ -14027,6 +14027,54 @@ pub async fn list_bot_action_executions(
     Ok(Json(executions))
 }
 
+pub async fn list_paloma_decisions(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::PalomaDecision>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let decisions = control
+        .mission_store
+        .list_paloma_decisions(query.limit.clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(decisions))
+}
+
+pub async fn list_paloma_scheduler_jobs(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<super::mission_store::PalomaSchedulerJob>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let jobs = control
+        .mission_store
+        .list_paloma_scheduler_jobs()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(jobs))
+}
+
+pub async fn get_paloma_queue_metrics(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<super::paloma::queue::QueueMetrics>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let channels = control
+        .mission_store
+        .list_all_telegram_channels()
+        .await
+        .map_err(internal_error)?;
+    let channel_ids: HashSet<String> = channels
+        .into_iter()
+        .map(|channel| channel.id.to_string())
+        .collect();
+    let metrics = state
+        .telegram_bridge
+        .paloma_queue_metrics_for_channels(&channel_ids)
+        .await;
+    Ok(Json(metrics))
+}
+
 pub async fn list_bot_conversations(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,

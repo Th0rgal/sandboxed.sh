@@ -40,6 +40,7 @@ mod model_routing;
 mod monitoring;
 mod native_loop_observer;
 pub mod opencode;
+pub mod paloma;
 mod provider_usage_cache;
 mod providers;
 pub(crate) mod proxy;

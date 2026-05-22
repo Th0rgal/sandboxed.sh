@@ -1365,7 +1365,7 @@ fn stream_sandboxed_update(
         let src = format!("{}/target/debug/{}", repo_path.display(), exe_name);
 
         let install_result = if versioned_install {
-            install_versioned_binary(&repo_path, &exe_name, &latest_tag, &install_dest).await
+            install_versioned_binary(repo_path, &exe_name, &latest_tag, &install_dest).await
         } else {
             // Legacy path: write straight to `install_dest`. Keep until the
             // operator opts into versioned installs.

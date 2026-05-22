@@ -3,15 +3,16 @@
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, DailyUsageStats,
     ExecutionStatus, FreshSession, HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode,
-    MissionStatus, MissionStore, ModelUsageStats, RetryConfig, StopPolicy, StoredEvent,
-    TelegramActionExecution, TelegramActionExecutionKind, TelegramActionExecutionStatus,
-    TelegramAlert, TelegramAlertPreference, TelegramChannel, TelegramChatMission,
-    TelegramConversation, TelegramConversationMessage, TelegramConversationMessageDirection,
-    TelegramMissionInterestLevel, TelegramMissionSubscription, TelegramScheduledMessage,
-    TelegramScheduledMessageStatus, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
-    TelegramStructuredMemoryScope, TelegramStructuredMemorySearchHit, TelegramUser,
-    TelegramUserCursor, TelegramUserRole, TelegramWorkflow, TelegramWorkflowEvent,
-    TelegramWorkflowKind, TelegramWorkflowStatus, TriggerType, WebhookConfig,
+    MissionStatus, MissionStore, ModelUsageStats, PalomaDecision, PalomaSchedulerJob, RetryConfig,
+    StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
+    TelegramActionExecutionStatus, TelegramAlert, TelegramAlertPreference, TelegramChannel,
+    TelegramChatMission, TelegramConversation, TelegramConversationMessage,
+    TelegramConversationMessageDirection, TelegramMissionInterestLevel,
+    TelegramMissionSubscription, TelegramScheduledMessage, TelegramScheduledMessageStatus,
+    TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
+    TelegramStructuredMemorySearchHit, TelegramUser, TelegramUserCursor, TelegramUserRole,
+    TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus,
+    TriggerType, WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo, TextOp};
 use async_trait::async_trait;
@@ -1523,7 +1524,38 @@ impl SqliteMissionStore {
                 UNIQUE(telegram_user_id, mission_id, event_kind)
             );
             CREATE INDEX IF NOT EXISTS idx_talerts_user_status
-                ON telegram_alerts(telegram_user_id, status, created_at);",
+                ON telegram_alerts(telegram_user_id, status, created_at);
+
+            CREATE TABLE IF NOT EXISTS paloma_decisions (
+                id TEXT PRIMARY KEY NOT NULL,
+                event_source TEXT NOT NULL,
+                mission_id TEXT,
+                user_id INTEGER,
+                channel TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                proposed_action TEXT NOT NULL,
+                allowed INTEGER NOT NULL,
+                suppression_reason TEXT,
+                policy_snapshot_json TEXT NOT NULL,
+                generated_text_hash TEXT,
+                generated_text_preview TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_paloma_decisions_created
+                ON paloma_decisions(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_paloma_decisions_mission
+                ON paloma_decisions(mission_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS paloma_scheduler_jobs (
+                name TEXT PRIMARY KEY NOT NULL,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                last_started_at TEXT,
+                last_finished_at TEXT,
+                last_error TEXT,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );",
         )
         .map_err(|e| format!("Failed to create Paloma Telegram state tables: {}", e))?;
 
@@ -5503,6 +5535,70 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn update_telegram_user_last_digest_at(
+        &self,
+        telegram_user_id: i64,
+        last_digest_at: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let last_digest_at = last_digest_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO telegram_user_cursors
+                 (id, telegram_user_id, last_digest_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    last_digest_at = excluded.last_digest_at,
+                    updated_at = excluded.updated_at",
+                params![
+                    Uuid::new_v4().to_string(),
+                    telegram_user_id,
+                    last_digest_at,
+                    now,
+                    now,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn update_telegram_user_last_alert_ack_at(
+        &self,
+        telegram_user_id: i64,
+        last_alert_ack_at: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let last_alert_ack_at = last_alert_ack_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO telegram_user_cursors
+                 (id, telegram_user_id, last_alert_ack_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    last_alert_ack_at = excluded.last_alert_ack_at,
+                    updated_at = excluded.updated_at",
+                params![
+                    Uuid::new_v4().to_string(),
+                    telegram_user_id,
+                    last_alert_ack_at,
+                    now,
+                    now,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn upsert_telegram_mission_subscription(
         &self,
         subscription: TelegramMissionSubscription,
@@ -5602,6 +5698,33 @@ impl MissionStore for SqliteMissionStore {
         Ok(preference)
     }
 
+    async fn list_telegram_alert_preferences(
+        &self,
+        telegram_user_id: i64,
+    ) -> Result<Vec<TelegramAlertPreference>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, telegram_user_id, scope, scope_value, rule_text, enabled,
+                            created_from_message_id, created_at, updated_at
+                     FROM telegram_alert_preferences
+                     WHERE telegram_user_id = ?1 AND enabled = 1
+                     ORDER BY updated_at DESC, created_at DESC",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![telegram_user_id], row_to_telegram_alert_preference)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn create_telegram_alert_if_absent(
         &self,
         alert: TelegramAlert,
@@ -5692,6 +5815,48 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn get_telegram_alert_by_message_id(
+        &self,
+        telegram_user_id: i64,
+        telegram_message_id: i64,
+    ) -> Result<Option<TelegramAlert>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM telegram_alerts
+                     WHERE telegram_user_id = ?1
+                       AND telegram_message_id = ?2",
+                    params![telegram_user_id, telegram_message_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if count != 1 {
+                if count > 1 {
+                    return Err("ambiguous_digest_reply".to_string());
+                }
+                return Ok(None);
+            }
+            conn.query_row(
+                "SELECT id, telegram_user_id, mission_id, event_kind, importance, title, body,
+                        status, telegram_message_id, last_error, created_at, sent_at, acknowledged_at
+                 FROM telegram_alerts
+                 WHERE telegram_user_id = ?1
+                   AND telegram_message_id = ?2
+                 ORDER BY sent_at DESC, created_at DESC
+                 LIMIT 1",
+                params![telegram_user_id, telegram_message_id],
+                row_to_telegram_alert,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn acknowledge_pending_telegram_alerts_for_mission(
         &self,
         telegram_user_id: i64,
@@ -5718,6 +5883,32 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn acknowledge_pending_telegram_alert(
+        &self,
+        telegram_user_id: i64,
+        alert_id: Uuid,
+        acknowledged_at: &str,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let acknowledged_at = acknowledged_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let changed = conn
+                .execute(
+                    "UPDATE telegram_alerts
+                     SET status = 'acknowledged', acknowledged_at = ?3, last_error = NULL
+                     WHERE telegram_user_id = ?1
+                       AND id = ?2
+                       AND status = 'pending'",
+                    params![telegram_user_id, alert_id.to_string(), acknowledged_at],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(changed > 0)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn mark_telegram_alert_failed(&self, id: Uuid, error: &str) -> Result<(), String> {
         let conn = self.conn.clone();
         let error = error.to_string();
@@ -5731,6 +5922,290 @@ impl MissionStore for SqliteMissionStore {
             )
             .map_err(|e| e.to_string())?;
             Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn recover_stale_telegram_alerts(
+        &self,
+        before: &str,
+        limit: usize,
+    ) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        let before = before.to_string();
+        let limit = limit.clamp(1, 10_000) as i64;
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let ids = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id
+                         FROM telegram_alerts
+                         WHERE status = 'pending'
+                           AND last_error IS NOT NULL
+                           AND created_at <= ?1
+                         ORDER BY created_at ASC
+                         LIMIT ?2",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![before, limit], |row| row.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                rows
+            };
+
+            for id in &ids {
+                conn.execute(
+                    "UPDATE telegram_alerts
+                     SET last_error = NULL
+                     WHERE id = ?1 AND status = 'pending'",
+                    params![id],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+
+            Ok(ids.len())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn create_paloma_decision(
+        &self,
+        decision: PalomaDecision,
+    ) -> Result<PalomaDecision, String> {
+        let conn = self.conn.clone();
+        let stored = decision.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO paloma_decisions (
+                    id, event_source, mission_id, user_id, channel, reason_code,
+                    proposed_action, allowed, suppression_reason, policy_snapshot_json,
+                    generated_text_hash, generated_text_preview, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    decision.id.to_string(),
+                    decision.event_source,
+                    decision.mission_id.map(|id| id.to_string()),
+                    decision.user_id,
+                    decision.channel,
+                    decision.reason_code,
+                    decision.proposed_action,
+                    if decision.allowed { 1 } else { 0 },
+                    decision.suppression_reason,
+                    decision.policy_snapshot_json,
+                    decision.generated_text_hash,
+                    decision.generated_text_preview,
+                    decision.created_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(stored)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_paloma_decisions(&self, limit: usize) -> Result<Vec<PalomaDecision>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, event_source, mission_id, user_id, channel, reason_code,
+                            proposed_action, allowed, suppression_reason, policy_snapshot_json,
+                            generated_text_hash, generated_text_preview, created_at
+                     FROM paloma_decisions
+                     ORDER BY created_at DESC
+                     LIMIT ?1",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![limit as i64], row_to_paloma_decision)
+                .map_err(|e| e.to_string())?;
+            let mut decisions = Vec::new();
+            for row in rows {
+                decisions.push(row.map_err(|e| e.to_string())?);
+            }
+            Ok(decisions)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn claim_paloma_scheduler_job(
+        &self,
+        name: &str,
+        lease_owner: &str,
+        now: &str,
+        lease_expires_at: &str,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let name = name.to_string();
+        let lease_owner = lease_owner.to_string();
+        let now = now.to_string();
+        let lease_expires_at = lease_expires_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT OR IGNORE INTO paloma_scheduler_jobs
+                 (name, run_count, updated_at)
+                 VALUES (?1, 0, ?2)",
+                params![name, now],
+            )
+            .map_err(|e| e.to_string())?;
+            let changed = conn
+                .execute(
+                    "UPDATE paloma_scheduler_jobs
+                     SET lease_owner = ?2,
+                         lease_expires_at = ?4,
+                         last_started_at = ?3,
+                         updated_at = ?3
+                     WHERE name = ?1
+                       AND (lease_expires_at IS NULL OR lease_expires_at <= ?3 OR lease_owner = ?2)",
+                    params![name, lease_owner, now, lease_expires_at],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(changed > 0)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn finish_paloma_scheduler_job(
+        &self,
+        name: &str,
+        lease_owner: &str,
+        finished_at: &str,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let name = name.to_string();
+        let lease_owner = lease_owner.to_string();
+        let finished_at = finished_at.to_string();
+        let error = error.map(ToOwned::to_owned);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE paloma_scheduler_jobs
+                 SET lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     last_finished_at = ?3,
+                     last_error = ?4,
+                     run_count = run_count + 1,
+                     updated_at = ?3
+                 WHERE name = ?1 AND lease_owner = ?2",
+                params![name, lease_owner, finished_at, error],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_paloma_scheduler_jobs(&self) -> Result<Vec<PalomaSchedulerJob>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, lease_owner, lease_expires_at, last_started_at,
+                            last_finished_at, last_error, run_count, updated_at
+                     FROM paloma_scheduler_jobs
+                     ORDER BY name ASC",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], row_to_paloma_scheduler_job)
+                .map_err(|e| e.to_string())?;
+            let mut jobs = Vec::new();
+            for row in rows {
+                jobs.push(row.map_err(|e| e.to_string())?);
+            }
+            Ok(jobs)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn consolidate_telegram_structured_memory(
+        &self,
+        channel_id: Uuid,
+        limit: usize,
+    ) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        let channel_id = channel_id.to_string();
+        let limit = limit.clamp(1, 10_000) as i64;
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "WITH ranked AS (
+                         SELECT id, channel_id, scope, chat_id, subject_user_id, normalized_label,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY channel_id, scope, chat_id,
+                                                 COALESCE(subject_user_id, -9223372036854775808),
+                                                 normalized_label
+                                    ORDER BY updated_at DESC, created_at DESC
+                                ) AS row_rank,
+                                MAX(updated_at) OVER (
+                                    PARTITION BY channel_id, scope, chat_id,
+                                                 COALESCE(subject_user_id, -9223372036854775808),
+                                                 normalized_label
+                                ) AS group_updated_at
+                         FROM telegram_structured_memory
+                         WHERE channel_id = ?1
+                           AND kind IN ('fact', 'preference')
+                           AND normalized_label IS NOT NULL
+                           AND source_role = 'user'
+                     ),
+                     selected_groups AS (
+                         SELECT DISTINCT channel_id, scope, chat_id, subject_user_id,
+                                         normalized_label, group_updated_at
+                         FROM ranked
+                         ORDER BY group_updated_at DESC
+                         LIMIT ?2
+                     )
+                     SELECT ranked.id
+                     FROM ranked
+                     WHERE ranked.row_rank > 1
+                       AND EXISTS (
+                           SELECT 1
+                           FROM selected_groups
+                           WHERE selected_groups.channel_id = ranked.channel_id
+                             AND selected_groups.scope = ranked.scope
+                             AND selected_groups.chat_id = ranked.chat_id
+                             AND COALESCE(selected_groups.subject_user_id, -9223372036854775808)
+                                 = COALESCE(ranked.subject_user_id, -9223372036854775808)
+                             AND selected_groups.normalized_label = ranked.normalized_label
+                       )",
+                )
+                .map_err(|e| e.to_string())?;
+            let delete_ids = stmt
+                .query_map(params![channel_id, limit], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            for id in &delete_ids {
+                conn.execute(
+                    "DELETE FROM telegram_structured_memory WHERE id = ?1",
+                    params![id],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "DELETE FROM telegram_structured_memory_fts WHERE entry_id = ?1",
+                    params![id],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+
+            Ok(delete_ids.len())
         })
         .await
         .map_err(|e| e.to_string())?
@@ -7804,6 +8279,24 @@ fn row_to_telegram_alert(row: &rusqlite::Row<'_>) -> Result<TelegramAlert, rusql
     })
 }
 
+fn row_to_telegram_alert_preference(
+    row: &rusqlite::Row<'_>,
+) -> Result<TelegramAlertPreference, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let enabled: i32 = row.get(5)?;
+    Ok(TelegramAlertPreference {
+        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+        telegram_user_id: row.get(1)?,
+        scope: row.get(2)?,
+        scope_value: row.get(3)?,
+        rule_text: row.get(4)?,
+        enabled: enabled != 0,
+        created_from_message_id: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
 /// Parse a Telegram channel from a SQLite row.
 /// Column order: id(0), mission_id(1), bot_token(2), bot_username(3),
 ///   allowed_chat_ids(4), trigger_mode(5), active(6), webhook_secret(7),
@@ -7839,6 +8332,40 @@ fn row_to_telegram_channel(row: &rusqlite::Row<'_>) -> TelegramChannel {
         created_at: row.get(9).unwrap_or_default(),
         updated_at: row.get(10).unwrap_or_default(),
     }
+}
+
+fn row_to_paloma_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<PalomaDecision> {
+    let id_str: String = row.get(0)?;
+    let mission_id_str: Option<String> = row.get(2)?;
+    let allowed: i32 = row.get(7)?;
+    Ok(PalomaDecision {
+        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+        event_source: row.get(1)?,
+        mission_id: mission_id_str.and_then(|id| Uuid::parse_str(&id).ok()),
+        user_id: row.get(3)?,
+        channel: row.get(4)?,
+        reason_code: row.get(5)?,
+        proposed_action: row.get(6)?,
+        allowed: allowed != 0,
+        suppression_reason: row.get(8)?,
+        policy_snapshot_json: row.get(9)?,
+        generated_text_hash: row.get(10)?,
+        generated_text_preview: row.get(11)?,
+        created_at: row.get(12)?,
+    })
+}
+
+fn row_to_paloma_scheduler_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<PalomaSchedulerJob> {
+    Ok(PalomaSchedulerJob {
+        name: row.get(0)?,
+        lease_owner: row.get(1)?,
+        lease_expires_at: row.get(2)?,
+        last_started_at: row.get(3)?,
+        last_finished_at: row.get(4)?,
+        last_error: row.get(5)?,
+        run_count: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
 }
 
 fn parse_telegram_scheduled_status(raw: String) -> TelegramScheduledMessageStatus {
@@ -8127,8 +8654,8 @@ mod tests {
     };
     use crate::api::mission_store::{
         now_string, Automation, AutomationDriver, CommandSource, FreshSession, MissionMode,
-        MissionStatus, MissionStore, RetryConfig, StopPolicy, TelegramAlert,
-        TelegramAlertPreference, TelegramChannel, TelegramConversation,
+        MissionStatus, MissionStore, PalomaDecision, PalomaSchedulerJob, RetryConfig, StopPolicy,
+        TelegramAlert, TelegramAlertPreference, TelegramChannel, TelegramConversation,
         TelegramConversationMessage, TelegramConversationMessageDirection,
         TelegramMissionInterestLevel, TelegramMissionSubscription, TelegramStructuredMemoryEntry,
         TelegramStructuredMemoryKind, TelegramStructuredMemoryScope, TelegramTriggerMode,
@@ -8265,6 +8792,42 @@ mod tests {
             cursor.last_seen_event_sequence_by_mission_json,
             "{\"mission\":7}"
         );
+        store
+            .update_telegram_user_last_digest_at(1_139_694_048, "2026-05-20T10:20:00Z")
+            .await
+            .expect("update digest cursor");
+        let cursor = store
+            .get_or_create_telegram_user_cursor(1_139_694_048)
+            .await
+            .expect("cursor after digest update");
+        assert_eq!(
+            cursor.last_digest_at.as_deref(),
+            Some("2026-05-20T10:20:00Z")
+        );
+        assert_eq!(
+            cursor.last_status_at.as_deref(),
+            Some("2026-05-20T10:10:00Z")
+        );
+        assert_eq!(
+            cursor.last_seen_event_sequence_by_mission_json,
+            "{\"mission\":7}"
+        );
+        store
+            .update_telegram_user_last_alert_ack_at(1_139_694_048, "2026-05-20T10:30:00Z")
+            .await
+            .expect("update alert ack cursor");
+        let cursor = store
+            .get_or_create_telegram_user_cursor(1_139_694_048)
+            .await
+            .expect("cursor after alert ack update");
+        assert_eq!(
+            cursor.last_alert_ack_at.as_deref(),
+            Some("2026-05-20T10:30:00Z")
+        );
+        assert_eq!(
+            cursor.last_digest_at.as_deref(),
+            Some("2026-05-20T10:20:00Z")
+        );
 
         store
             .upsert_telegram_mission_subscription(TelegramMissionSubscription {
@@ -8303,6 +8866,15 @@ mod tests {
             })
             .await
             .expect("alert preference");
+        let preferences = store
+            .list_telegram_alert_preferences(1_139_694_048)
+            .await
+            .expect("alert preferences");
+        assert_eq!(preferences.len(), 1);
+        assert_eq!(
+            preferences[0].rule_text,
+            "mute from Telegram feedback".to_string()
+        );
 
         let alert = TelegramAlert {
             id: Uuid::new_v4(),
@@ -8347,10 +8919,59 @@ mod tests {
             retryable[0].last_error.as_deref(),
             Some("temporary Telegram outage")
         );
+        assert_eq!(
+            store
+                .recover_stale_telegram_alerts("2026-05-20T10:00:30Z", 10)
+                .await
+                .expect("recover stale alert"),
+            1
+        );
+        let recovered = store
+            .list_pending_telegram_alerts(1_139_694_048, 10)
+            .await
+            .expect("recovered alerts");
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].last_error.is_none());
         store
-            .mark_telegram_alert_sent(retryable[0].id, Some(99), "2026-05-20T10:01:00Z")
+            .mark_telegram_alert_sent(recovered[0].id, Some(99), "2026-05-20T10:01:00Z")
             .await
             .expect("mark sent");
+        let sent_alert = store
+            .get_telegram_alert_by_message_id(1_139_694_048, 99)
+            .await
+            .expect("sent alert by message id")
+            .expect("sent alert exists");
+        assert_eq!(sent_alert.mission_id, Some(mission.id));
+        let second_digest_alert_id = Uuid::new_v4();
+        store
+            .create_telegram_alert_if_absent(TelegramAlert {
+                id: second_digest_alert_id,
+                telegram_user_id: 1_139_694_048,
+                mission_id: Some(mission.id),
+                event_kind: "mission_failed".to_string(),
+                importance: "high".to_string(),
+                title: "Paloma state".to_string(),
+                body: "Paloma state failed.".to_string(),
+                status: "pending".to_string(),
+                telegram_message_id: None,
+                last_error: None,
+                created_at: "2026-05-20T10:01:30Z".to_string(),
+                sent_at: None,
+                acknowledged_at: None,
+            })
+            .await
+            .expect("second digest alert");
+        store
+            .mark_telegram_alert_sent(second_digest_alert_id, Some(99), "2026-05-20T10:01:40Z")
+            .await
+            .expect("mark second digest alert sent");
+        assert_eq!(
+            store
+                .get_telegram_alert_by_message_id(1_139_694_048, 99)
+                .await
+                .expect_err("ambiguous digest alert lookup"),
+            "ambiguous_digest_reply"
+        );
         assert!(store
             .list_pending_telegram_alerts(1_139_694_048, 10)
             .await
@@ -8402,6 +9023,120 @@ mod tests {
             .await
             .expect("pending alerts after late failure")
             .is_empty());
+
+        let failure_alert_id = Uuid::new_v4();
+        let routine_alert_id = Uuid::new_v4();
+        let scoped_ack_mission_id = Uuid::new_v4();
+        for (id, event_kind, created_at) in [
+            (failure_alert_id, "mission_failed", "2026-05-20T10:04:00Z"),
+            (
+                routine_alert_id,
+                "mission_not_feasible",
+                "2026-05-20T10:04:01Z",
+            ),
+        ] {
+            store
+                .create_telegram_alert_if_absent(TelegramAlert {
+                    id,
+                    telegram_user_id: 1_139_694_048,
+                    mission_id: Some(scoped_ack_mission_id),
+                    event_kind: event_kind.to_string(),
+                    importance: "high".to_string(),
+                    title: "Paloma state".to_string(),
+                    body: format!("Paloma state: {event_kind}."),
+                    status: "pending".to_string(),
+                    telegram_message_id: None,
+                    last_error: None,
+                    created_at: created_at.to_string(),
+                    sent_at: None,
+                    acknowledged_at: None,
+                })
+                .await
+                .expect("create scoped ack alert");
+        }
+        assert!(store
+            .acknowledge_pending_telegram_alert(
+                1_139_694_048,
+                routine_alert_id,
+                "2026-05-20T10:05:00Z",
+            )
+            .await
+            .expect("acknowledge one pending alert"));
+        let pending_after_single_ack = store
+            .list_pending_telegram_alerts(1_139_694_048, 10)
+            .await
+            .expect("pending alerts after single ack");
+        assert_eq!(pending_after_single_ack.len(), 1);
+        assert_eq!(pending_after_single_ack[0].id, failure_alert_id);
+
+        let decision = PalomaDecision {
+            id: Uuid::new_v4(),
+            event_source: "scheduler".to_string(),
+            mission_id: Some(mission.id),
+            user_id: Some(1_139_694_048),
+            channel: "telegram".to_string(),
+            reason_code: "long_running".to_string(),
+            proposed_action: "create_alert".to_string(),
+            allowed: true,
+            suppression_reason: None,
+            policy_snapshot_json: serde_json::json!({
+                "long_running_minutes": 30,
+                "quiet_after_user_message_minutes": 30,
+            })
+            .to_string(),
+            generated_text_hash: Some("abc123".to_string()),
+            generated_text_preview: Some("Paloma state is still running.".to_string()),
+            created_at: "2026-05-20T10:04:00Z".to_string(),
+        };
+        store
+            .create_paloma_decision(decision.clone())
+            .await
+            .expect("paloma decision");
+        let decisions = store
+            .list_paloma_decisions(10)
+            .await
+            .expect("paloma decisions");
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0], decision);
+
+        assert!(store
+            .claim_paloma_scheduler_job(
+                "paloma_alert_scan",
+                "worker-a",
+                "2026-05-20T10:05:00Z",
+                "2026-05-20T10:06:00Z",
+            )
+            .await
+            .expect("claim scheduler job"));
+        assert!(!store
+            .claim_paloma_scheduler_job(
+                "paloma_alert_scan",
+                "worker-b",
+                "2026-05-20T10:05:30Z",
+                "2026-05-20T10:06:30Z",
+            )
+            .await
+            .expect("blocked by active lease"));
+        store
+            .finish_paloma_scheduler_job(
+                "paloma_alert_scan",
+                "worker-a",
+                "2026-05-20T10:05:40Z",
+                None,
+            )
+            .await
+            .expect("finish scheduler job");
+        let jobs: Vec<PalomaSchedulerJob> = store
+            .list_paloma_scheduler_jobs()
+            .await
+            .expect("scheduler jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "paloma_alert_scan");
+        assert_eq!(jobs[0].run_count, 1);
+        assert_eq!(
+            jobs[0].last_finished_at.as_deref(),
+            Some("2026-05-20T10:05:40Z")
+        );
     }
 
     #[tokio::test]
@@ -9626,6 +10361,75 @@ mod tests {
         assert_eq!(hits[0].entry.label.as_deref(), Some("identifiant prod"));
         assert_eq!(hits[0].entry.value, "POLARIS-19");
         assert!(hits[0].score > hits.last().map(|hit| hit.score).unwrap_or(0.0));
+    }
+
+    #[tokio::test]
+    async fn paloma_memory_consolidation_deletes_older_explicit_rules_and_search_rows() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let channel_id = create_test_channel(&store).await;
+        let older_id = Uuid::new_v4();
+        let newer_id = Uuid::new_v4();
+        let channel_id_str = channel_id.to_string();
+
+        {
+            let conn = store.conn.lock().await;
+            for (id, value, updated_at) in [
+                (older_id, "tell me everything", "2026-05-20T10:00:00Z"),
+                (newer_id, "only failures", "2026-05-20T11:00:00Z"),
+            ] {
+                conn.execute(
+                    "INSERT INTO telegram_structured_memory (
+                        id, channel_id, chat_id, mission_id, scope, kind, label, normalized_label,
+                        value, subject_user_id, subject_username, subject_display_name,
+                        source_message_id, source_role, created_at, updated_at
+                     ) VALUES (?1, ?2, 10, NULL, 'user', 'preference', 'alerts', 'alerts',
+                        ?3, 42, 'th0rgal', '@th0rgal', 1, 'user',
+                        '2026-05-20T09:00:00Z', ?4)",
+                    params![id.to_string(), channel_id_str, value, updated_at],
+                )
+                .expect("insert duplicate memory");
+                conn.execute(
+                    "INSERT INTO telegram_structured_memory_fts (
+                        entry_id, channel_id, chat_id, scope, subject_user_id, search_text
+                     ) VALUES (?1, ?2, 10, 'user', 42, ?3)",
+                    params![
+                        id.to_string(),
+                        channel_id_str,
+                        format!("preference alerts {}", value)
+                    ],
+                )
+                .expect("insert duplicate memory search row");
+            }
+        }
+
+        let deleted = store
+            .consolidate_telegram_structured_memory(channel_id, 1)
+            .await
+            .expect("consolidate memory");
+        assert_eq!(deleted, 1);
+
+        let entries = store
+            .list_telegram_structured_memory(channel_id, Some(10), Some(42), 10)
+            .await
+            .expect("list memory");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, newer_id);
+        assert_eq!(entries[0].value, "only failures");
+
+        let old_hits = store
+            .search_telegram_memory_context(channel_id, 10, Some(42), "everything", 10)
+            .await
+            .expect("search old memory");
+        assert!(old_hits.is_empty());
+        let new_hits = store
+            .search_telegram_memory_context(channel_id, 10, Some(42), "failures", 10)
+            .await
+            .expect("search new memory");
+        assert_eq!(new_hits.len(), 1);
+        assert_eq!(new_hits[0].id, newer_id);
     }
 
     #[tokio::test]
